@@ -1,0 +1,20 @@
+[tasks.chat_companion]
+model = "deepseek/deepseek-chat-v3.2"
+fallback = "x-ai/grok-4-fast"
+temperature = 0.85
+max_tokens = 600
+
+[tasks.insight_extraction]
+model = "x-ai/grok-4-mini"
+fallback = "deepseek/deepseek-chat-v3.2"
+temperature = 0.3
+max_tokens = 400
+
+[tasks.pde_decision]
+model = "x-ai/grok-4-mini"
+temperature = 0.5
+max_tokens = 200
+
+[tasks.embedding]
+model = "voyage-3-lite"
+dimensions = 512
