@@ -2,3 +2,4 @@
 //! Pure-domain logic with no I/O.
 
 pub mod affinity;
+pub mod ghost;
