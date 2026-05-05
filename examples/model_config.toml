@@ -1,6 +1,10 @@
 [tasks.chat_companion]
-model = "deepseek/deepseek-chat-v3.2"
-fallback = "x-ai/grok-4-fast"
+# Grok primary: most permissive among the cheap-and-fast tier; xAI's policy
+# explicitly avoids over-refusal on intimate adult dialogue.
+# DeepSeek fallback covers multilingual depth (esp. zh) and is cheap enough
+# to absorb traffic spikes.
+model = "x-ai/grok-4-fast"
+fallback = "deepseek/deepseek-chat-v3.2"
 temperature = 0.85
 max_tokens = 600
 

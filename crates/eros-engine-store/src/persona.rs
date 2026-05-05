@@ -146,11 +146,12 @@ impl<'a> PersonaRepo<'a> {
         }))
     }
 
-    /// Insert a new persona genome. Idempotent on `name`: if a row with the
-    /// same name already exists, returns the existing id without overwriting
-    /// the system prompt or metadata. Used by `seed-personas` to keep repeated
-    /// runs safe against a populated database.
-    pub async fn create_genome(
+    /// Upsert a persona genome by `name`. New row → INSERT, returns
+    /// `(uuid, true)`. Existing row → UPDATE in place (id stable, content
+    /// refreshed), returns `(uuid, false)`. Used by `seed-personas` so
+    /// editing a TOML file and re-running picks up the changes without
+    /// dropping foreign-key references from `persona_instances`.
+    pub async fn upsert_genome(
         &self,
         name: &str,
         system_prompt: &str,
@@ -159,7 +160,6 @@ impl<'a> PersonaRepo<'a> {
         art_metadata: serde_json::Value,
         is_active: bool,
     ) -> Result<(Uuid, bool), sqlx::Error> {
-        // Try existing first.
         if let Some(id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM engine.persona_genomes WHERE name = $1",
         )
@@ -167,6 +167,23 @@ impl<'a> PersonaRepo<'a> {
         .fetch_optional(self.pool)
         .await?
         {
+            sqlx::query(
+                "UPDATE engine.persona_genomes SET \
+                    system_prompt = $2, \
+                    tip_personality = $3, \
+                    avatar_url = $4, \
+                    art_metadata = $5, \
+                    is_active = $6 \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(system_prompt)
+            .bind(tip_personality)
+            .bind(avatar_url)
+            .bind(art_metadata)
+            .bind(is_active)
+            .execute(self.pool)
+            .await?;
             return Ok((id, false));
         }
         let id = sqlx::query_scalar::<_, Uuid>(

@@ -91,7 +91,7 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
             .with_context(|| format!("parse {path:?}"))?;
 
         let (id, created) = repo
-            .create_genome(
+            .upsert_genome(
                 &f.name,
                 &f.system_prompt,
                 f.tip_personality.as_deref(),
@@ -100,12 +100,12 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
                 true,
             )
             .await
-            .with_context(|| format!("insert {}", f.name))?;
+            .with_context(|| format!("upsert {}", f.name))?;
         if created {
             tracing::info!(name = %f.name, %id, "persona inserted");
             inserted += 1;
         } else {
-            tracing::info!(name = %f.name, %id, "persona already exists, skipped");
+            tracing::info!(name = %f.name, %id, "persona refreshed");
             skipped += 1;
         }
     }
