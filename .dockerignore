@@ -1,0 +1,14 @@
+.git/
+target/
+.env
+.env.local
+*.swp
+.DS_Store
+.vscode/
+.idea/
+docs/
+README.md
+CONTRIBUTING.md
+CLA.md
+CODE_OF_CONDUCT.md
+.github/

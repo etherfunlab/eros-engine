@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# eros-engine — public-benefit deployment.
+# Custom domain: erosnx.etherfun.net (set up after first deploy).
+# Database + auth realm shared with eros-gateway (same Supabase project,
+# eros-engine writes only to the `engine` Postgres schema).
+
+app = "eros-engine"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "docker/Dockerfile"
+
+[deploy]
+  # Apply pending sqlx migrations before swapping traffic to the new release.
+  release_command = "/usr/local/bin/eros-engine migrate"
+
+[env]
+  BIND_ADDR = "0.0.0.0:8080"
+  EXPOSE_AFFINITY_DEBUG = "true"
+  EMA_INERTIA = "0.8"
+  MODEL_CONFIG_PATH = "/etc/eros-engine/model_config.toml"
+  RUST_LOG = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 100
+    hard_limit = 200
+
+[[http_service.checks]]
+  interval = "15s"
+  timeout = "2s"
+  grace_period = "20s"
+  method = "get"
+  path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
