@@ -40,7 +40,7 @@ impl<'a> ChatRepo<'a> {
         instance_id: Uuid,
     ) -> Result<ChatSession, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
-            "INSERT INTO chat_sessions (user_id, instance_id) \
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
              VALUES ($1, $2) \
              RETURNING *",
         )
@@ -52,7 +52,7 @@ impl<'a> ChatRepo<'a> {
 
     /// Look up a session by id.
     pub async fn get_session(&self, session_id: Uuid) -> Result<Option<ChatSession>, sqlx::Error> {
-        sqlx::query_as::<_, ChatSession>("SELECT * FROM chat_sessions WHERE id = $1")
+        sqlx::query_as::<_, ChatSession>("SELECT * FROM engine.chat_sessions WHERE id = $1")
             .bind(session_id)
             .fetch_optional(self.pool)
             .await
@@ -65,7 +65,7 @@ impl<'a> ChatRepo<'a> {
         instance_id: Uuid,
     ) -> Result<ChatSession, sqlx::Error> {
         if let Some(existing) = sqlx::query_as::<_, ChatSession>(
-            "SELECT * FROM chat_sessions \
+            "SELECT * FROM engine.chat_sessions \
              WHERE user_id = $1 AND instance_id = $2 \
              ORDER BY last_active_at DESC LIMIT 1",
         )
@@ -74,7 +74,7 @@ impl<'a> ChatRepo<'a> {
         .fetch_optional(self.pool)
         .await?
         {
-            sqlx::query("UPDATE chat_sessions SET last_active_at = now() WHERE id = $1")
+            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
                 .bind(existing.id)
                 .execute(self.pool)
                 .await?;
@@ -92,7 +92,7 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<Uuid, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO chat_messages (session_id, role, content) \
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
              VALUES ($1, $2, $3) RETURNING id",
         )
         .bind(session_id)
@@ -100,7 +100,7 @@ impl<'a> ChatRepo<'a> {
         .bind(content)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE chat_sessions SET last_active_at = now() WHERE id = $1")
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
@@ -119,7 +119,7 @@ impl<'a> ChatRepo<'a> {
         // backwards), then reverse to ASC for the caller. This matches the
         // gateway's `get_history` semantics.
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT * FROM chat_messages \
+            "SELECT * FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
              LIMIT $2 OFFSET $3",
@@ -136,7 +136,7 @@ impl<'a> ChatRepo<'a> {
     /// All sessions belonging to a user, most-recently-active first.
     pub async fn list_sessions(&self, user_id: Uuid) -> Result<Vec<ChatSession>, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
-            "SELECT * FROM chat_sessions \
+            "SELECT * FROM engine.chat_sessions \
              WHERE user_id = $1 \
              ORDER BY last_active_at DESC",
         )

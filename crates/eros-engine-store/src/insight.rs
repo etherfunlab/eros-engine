@@ -72,7 +72,7 @@ pub struct InsightRepo<'a> {
 impl<'a> InsightRepo<'a> {
     pub async fn load(&self, user_id: Uuid) -> Result<Option<CompanionInsightsRow>, sqlx::Error> {
         sqlx::query_as::<_, CompanionInsightsRow>(
-            "SELECT * FROM companion_insights WHERE user_id = $1",
+            "SELECT * FROM engine.companion_insights WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(self.pool)
@@ -95,7 +95,7 @@ impl<'a> InsightRepo<'a> {
         let level = compute_training_level(&merged);
 
         let row = sqlx::query_as::<_, CompanionInsightsRow>(
-            "INSERT INTO companion_insights (user_id, insights, training_level) \
+            "INSERT INTO engine.companion_insights (user_id, insights, training_level) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (user_id) DO UPDATE SET \
                  insights       = EXCLUDED.insights, \

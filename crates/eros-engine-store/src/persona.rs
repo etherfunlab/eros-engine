@@ -61,7 +61,7 @@ impl<'a> PersonaRepo<'a> {
         let rows = sqlx::query_as::<_, GenomeRow>(
             "SELECT id, name, system_prompt, tip_personality, avatar_url, \
                     art_metadata, is_active \
-             FROM persona_genomes \
+             FROM engine.persona_genomes \
              WHERE is_active = true \
              ORDER BY name",
         )
@@ -74,7 +74,7 @@ impl<'a> PersonaRepo<'a> {
         let row = sqlx::query_as::<_, GenomeRow>(
             "SELECT id, name, system_prompt, tip_personality, avatar_url, \
                     art_metadata, is_active \
-             FROM persona_genomes \
+             FROM engine.persona_genomes \
              WHERE id = $1",
         )
         .bind(genome_id)
@@ -118,8 +118,8 @@ impl<'a> PersonaRepo<'a> {
                 pg.avatar_url       AS avatar_url, \
                 pg.art_metadata     AS art_metadata, \
                 pg.is_active        AS is_active \
-             FROM persona_instances pi \
-             JOIN persona_genomes pg ON pg.id = pi.genome_id \
+             FROM engine.persona_instances pi \
+             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
         )
         .bind(instance_id)
@@ -153,7 +153,7 @@ impl<'a> PersonaRepo<'a> {
         owner_uid: Uuid,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "INSERT INTO persona_instances (genome_id, owner_uid) \
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
              VALUES ($1, $2) RETURNING id",
         )
         .bind(genome_id)
@@ -174,7 +174,7 @@ mod tests {
         art: serde_json::Value,
     ) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO persona_genomes (name, system_prompt, art_metadata, is_active) \
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
         .bind(name)
@@ -241,7 +241,7 @@ mod tests {
         let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
         let instance_id = repo.create_instance(genome_id, owner).await.unwrap();
 
-        sqlx::query("UPDATE persona_instances SET status = 'archived' WHERE id = $1")
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
             .bind(instance_id)
             .execute(&pool)
             .await

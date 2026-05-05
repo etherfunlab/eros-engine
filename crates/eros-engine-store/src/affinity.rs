@@ -88,7 +88,7 @@ impl<'a> AffinityRepo<'a> {
     /// Load the affinity row for `session_id`, if one exists.
     pub async fn load(&self, session_id: Uuid) -> Result<Option<Affinity>, sqlx::Error> {
         let row = sqlx::query_as::<_, AffinityRow>(
-            "SELECT * FROM companion_affinity WHERE session_id = $1",
+            "SELECT * FROM engine.companion_affinity WHERE session_id = $1",
         )
         .bind(session_id)
         .fetch_optional(self.pool)
@@ -108,7 +108,7 @@ impl<'a> AffinityRepo<'a> {
         }
 
         let row = sqlx::query_as::<_, AffinityRow>(
-            "INSERT INTO companion_affinity (session_id, user_id, instance_id) \
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
              VALUES ($1, $2, $3) RETURNING *",
         )
         .bind(session_id)
@@ -136,7 +136,7 @@ impl<'a> AffinityRepo<'a> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "UPDATE companion_affinity \
+            "UPDATE engine.companion_affinity \
              SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
                  patience = $6, tension = $7, \
                  relationship_label = $8, updated_at = now() \
@@ -155,7 +155,7 @@ impl<'a> AffinityRepo<'a> {
 
         let deltas_json = serde_json::to_value(deltas).unwrap_or_default();
         sqlx::query(
-            "INSERT INTO companion_affinity_events (affinity_id, event_type, deltas, context) \
+            "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, deltas, context) \
              VALUES ($1, $2, $3, $4)",
         )
         .bind(affinity.id)
@@ -176,7 +176,7 @@ impl<'a> AffinityRepo<'a> {
         affinity.last_ghost_at = Some(Utc::now());
 
         sqlx::query(
-            "UPDATE companion_affinity \
+            "UPDATE engine.companion_affinity \
              SET ghost_streak = $2, total_ghosts = $3, \
                  last_ghost_at = $4, updated_at = now() \
              WHERE id = $1",
@@ -189,7 +189,7 @@ impl<'a> AffinityRepo<'a> {
         .await?;
 
         sqlx::query(
-            "INSERT INTO companion_affinity_events (affinity_id, event_type, deltas, context) \
+            "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, deltas, context) \
              VALUES ($1, 'ghost', '{}'::jsonb, '{}'::jsonb)",
         )
         .bind(affinity.id)
@@ -206,7 +206,7 @@ mod tests {
 
     async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO chat_sessions (user_id, instance_id) \
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
              VALUES ($1, $2) RETURNING id",
         )
         .bind(user_id)
@@ -277,7 +277,7 @@ mod tests {
 
         // One event row was logged.
         let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM companion_affinity_events WHERE affinity_id = $1",
+            "SELECT COUNT(*) FROM engine.companion_affinity_events WHERE affinity_id = $1",
         )
         .bind(a.id)
         .fetch_one(&pool)

@@ -66,7 +66,7 @@ impl<'a> MemoryRepo<'a> {
         let vec_text = format_vector(embedding);
 
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO companion_memories \
+            "INSERT INTO engine.companion_memories \
                  (session_id, user_id, instance_id, content, embedding) \
              VALUES ($1, $2, $3, $4, $5::vector) RETURNING id",
         )
@@ -97,7 +97,7 @@ impl<'a> MemoryRepo<'a> {
             Some(pid) => {
                 sqlx::query_as::<_, MemoryRow>(
                     "SELECT id, session_id, user_id, instance_id, content, created_at \
-                     FROM companion_memories \
+                     FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id = $2 \
                      ORDER BY embedding <=> $3::vector \
                      LIMIT $4",
@@ -112,7 +112,7 @@ impl<'a> MemoryRepo<'a> {
             None => {
                 sqlx::query_as::<_, MemoryRow>(
                     "SELECT id, session_id, user_id, instance_id, content, created_at \
-                     FROM companion_memories \
+                     FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id IS NULL \
                      ORDER BY embedding <=> $2::vector \
                      LIMIT $3",
@@ -140,7 +140,7 @@ mod tests {
 
     async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Option<Uuid>) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO chat_sessions (user_id, instance_id) \
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
              VALUES ($1, $2) RETURNING id",
         )
         .bind(user_id)

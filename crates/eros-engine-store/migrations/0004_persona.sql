@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
-CREATE TABLE persona_genomes (
+CREATE TABLE engine.persona_genomes (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name             TEXT NOT NULL,
     system_prompt    TEXT NOT NULL,
@@ -10,12 +10,12 @@ CREATE TABLE persona_genomes (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE persona_instances (
+CREATE TABLE engine.persona_instances (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    genome_id   UUID NOT NULL REFERENCES persona_genomes(id) ON DELETE RESTRICT,
+    genome_id   UUID NOT NULL REFERENCES engine.persona_genomes(id) ON DELETE RESTRICT,
     owner_uid   UUID NOT NULL,
     status      TEXT NOT NULL DEFAULT 'active',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(genome_id, owner_uid)
 );
-CREATE INDEX idx_persona_instances_owner ON persona_instances(owner_uid);
+CREATE INDEX idx_persona_instances_owner ON engine.persona_instances(owner_uid);
