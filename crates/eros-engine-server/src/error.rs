@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// TODO(T11): variants are unused until companion routes return them.
+#![allow(dead_code)]
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},

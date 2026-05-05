@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+mod auth;
 mod error;
 mod openapi;
 mod routes;
 mod state;
+
+// TODO(T12): Construct AppState (pool + auth + config) and wire the
+// `auth::middleware::require_auth` layer onto protected route groups once
+// DATABASE_URL handling and the Supabase JWT secret env wiring land.
 
 use axum::Router;
 use utoipa_axum::router::OpenApiRouter;
