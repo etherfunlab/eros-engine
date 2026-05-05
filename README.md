@@ -74,6 +74,14 @@ Four crates under `crates/`:
 
 Embed `core + llm + store` as a library to build your own service, or run `eros-engine-server` as a standalone HTTP API.
 
+Deeper docs:
+- [Architecture](docs/architecture.md) — crate boundaries, pipeline phases, data flow
+- [Affinity model](docs/affinity-model.md) — 6 dimensions, EMA, time decay, relationship labels
+- [Ghost mechanics](docs/ghost-mechanics.md) — score formula + protection rules + worked examples
+- [Memory layers](docs/memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
+- [Deploying](docs/deploying.md) — Fly.io, Docker compose, bring-your-own-Postgres / IdP
+- [API reference](docs/api-reference.md) — every `/comp/*` endpoint
+
 ## Quickstart
 
 ```bash
