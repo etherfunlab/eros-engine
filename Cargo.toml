@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/etherfunlab/eros-engine"
-authors = ["etherfunlab <oss@etherfunlab.dev>"]
+authors = ["etherfunlab <henrylin@etherfun.xyz>"]
 
 [workspace.dependencies]
 tokio = { version = "1.40", features = ["full"] }

@@ -1,6 +1,6 @@
 # eros-engine
 
-> **Open-source AI companion engine** — chat + 6-dimensional intimacy/affinity model + ghost mechanics + pgvector memory. The intimacy-modeling backbone of the [Eros](https://eros.ai) dating platform.
+> **Open-source AI companion engine** — chat + 6-dimensional intimacy/affinity model + ghost mechanics + pgvector memory. The intimacy-modeling backbone of the [Eros](https://eros.etherfun.xyz) dating platform.
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -32,4 +32,4 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md). All contributors must accept the [`CL
 
 ## License
 
-AGPL-3.0. Commercial licensing available — contact `oss@etherfunlab.dev`.
+AGPL-3.0. Commercial licensing available — contact `henrylin@etherfun.xyz`.
