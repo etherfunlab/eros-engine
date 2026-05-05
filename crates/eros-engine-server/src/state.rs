@@ -11,6 +11,9 @@ pub struct AppState {
     pub pool: PgPool,
     pub auth: Arc<dyn crate::auth::AuthValidator>,
     pub config: ServerConfig,
+    pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
+    pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
+    pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
 }
 
 #[derive(Clone, Debug)]

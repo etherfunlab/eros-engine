@@ -2,6 +2,8 @@
 mod auth;
 mod error;
 mod openapi;
+mod pipeline;
+mod prompt;
 mod routes;
 mod state;
 
