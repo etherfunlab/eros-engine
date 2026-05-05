@@ -200,7 +200,7 @@ Live 6-dim vector + ghost stats + relationship label. Gated by `EXPOSE_AFFINITY_
 }
 ```
 
-Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). The OSS demo turns it on so the live radar visualisation in `eros-engine-web` works.
+Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). Turn it on if your frontend wants to render a live radar of the vector.
 
 ## Error responses
 

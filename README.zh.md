@@ -93,7 +93,7 @@ cp .env.example .env       # 填入：DATABASE_URL、OPENROUTER_API_KEY、
 docker compose -f docker/docker-compose.yml up
 ```
 
-引擎在 `:8080` 上監聽。OpenAPI / Scalar 文檔界面在 `/docs`。配上 [`eros-engine-web`](https://github.com/etherfunlab/eros-engine-web) 就有一個會把好感度向量實時畫成雷達圖的對話 UI。
+引擎在 `:8080` 上監聽。OpenAPI / Scalar 文檔界面在 `/docs`。官方的網頁前端（Eros Chat）是閉源的——eros-engine 本身可以獨立運行，前端自己接一個就行。
 
 要連去現有的 Supabase 項目：所有表都建在 `engine` schema 之下，跟你原有的 `public` schema 不會撞名。
 

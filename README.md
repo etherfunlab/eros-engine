@@ -93,7 +93,7 @@ cp .env.example .env       # fill in: DATABASE_URL, OPENROUTER_API_KEY,
 docker compose -f docker/docker-compose.yml up
 ```
 
-Engine listens on `:8080`. OpenAPI/Scalar reference at `/docs`. Pair with [`eros-engine-web`](https://github.com/etherfunlab/eros-engine-web) for a chat UI that visualises the affinity vector live.
+Engine listens on `:8080`. OpenAPI/Scalar reference at `/docs`. The official hosted web client (Eros Chat) is closed-source — eros-engine itself runs standalone, bring your own UI.
 
 For self-hosters running against an existing Supabase project: tables live under the `engine` Postgres schema, so they coexist cleanly with your other tables.
 

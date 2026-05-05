@@ -163,7 +163,7 @@ If you're sharing a database with another service, the engine's tables stay in `
 
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The OpenAPI JSON is at `/api-docs/openapi.json`.
-- **Affinity debug:** `GET /comp/affinity/{session_id}` is gated by `EXPOSE_AFFINITY_DEBUG=true`. Production deploys typically leave it off; the OSS demo turns it on so the radar visualisation in `eros-engine-web` works.
+- **Affinity debug:** `GET /comp/affinity/{session_id}` is gated by `EXPOSE_AFFINITY_DEBUG=true`. Production deploys typically leave it off; turn it on if your frontend renders a live radar of the affinity vector.
 - **Logs:** `RUST_LOG=info` is the default. Set `RUST_LOG=debug,sqlx=warn` to see everything except SQLx query churn.
 - **Cost:** the OSS deployment defaults to grok-4-fast (cheap) for chat and grok-4-mini for insight extraction. A typical chat turn costs ≪ $0.001 in token spend plus a Voyage embedding call (~$0.000003 for a memory-worthy fact). 10k chat turns costs single-digit dollars.
 
