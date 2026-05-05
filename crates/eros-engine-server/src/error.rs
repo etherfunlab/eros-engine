@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// TODO(T11): variants are unused until companion routes return them.
-#![allow(dead_code)]
 
 use axum::{
     http::StatusCode,
@@ -14,6 +12,10 @@ use thiserror::Error;
 pub enum AppError {
     #[error("not found: {0}")]
     NotFound(String),
+    // The auth middleware returns StatusCode::UNAUTHORIZED directly rather
+    // than going through AppError, so this variant is reserved for future
+    // route-level 401 use (e.g. expired-token reauth handlers).
+    #[allow(dead_code)]
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("bad request: {0}")]

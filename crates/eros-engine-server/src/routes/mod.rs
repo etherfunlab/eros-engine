@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// TODO(T12): `router` is unused until main.rs constructs an AppState.
-#![allow(dead_code)]
-
 //! Top-level route composition.
 //!
 //! The HTTP surface is split into:

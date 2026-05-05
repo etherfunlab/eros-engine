@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// TODO(T12): AppState is constructed in T12 once DATABASE_URL + Supabase JWT
-// secret env wiring lands. ServerConfig fields are read by routes in T11.
-#![allow(dead_code)]
 
 use sqlx::PgPool;
 use std::sync::Arc;
