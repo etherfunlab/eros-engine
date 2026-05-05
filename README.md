@@ -7,6 +7,8 @@
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
+English · [中文](README.zh.md)
+
 ## What it does
 
 eros-engine is the conversational layer of a dating platform, carved out as a standalone service. Two things happen in every chat turn:
