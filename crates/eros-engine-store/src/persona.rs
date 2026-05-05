@@ -146,6 +146,45 @@ impl<'a> PersonaRepo<'a> {
         }))
     }
 
+    /// Insert a new persona genome. Idempotent on `name`: if a row with the
+    /// same name already exists, returns the existing id without overwriting
+    /// the system prompt or metadata. Used by `seed-personas` to keep repeated
+    /// runs safe against a populated database.
+    pub async fn create_genome(
+        &self,
+        name: &str,
+        system_prompt: &str,
+        tip_personality: Option<&str>,
+        avatar_url: Option<&str>,
+        art_metadata: serde_json::Value,
+        is_active: bool,
+    ) -> Result<(Uuid, bool), sqlx::Error> {
+        // Try existing first.
+        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM engine.persona_genomes WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(self.pool)
+        .await?
+        {
+            return Ok((id, false));
+        }
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes \
+                (name, system_prompt, tip_personality, avatar_url, art_metadata, is_active) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(name)
+        .bind(system_prompt)
+        .bind(tip_personality)
+        .bind(avatar_url)
+        .bind(art_metadata)
+        .bind(is_active)
+        .fetch_one(self.pool)
+        .await?;
+        Ok((id, true))
+    }
+
     /// Create a new persona instance for `(genome_id, owner_uid)`.
     pub async fn create_instance(
         &self,

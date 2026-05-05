@@ -40,6 +40,7 @@ RUN apt-get update && \
 
 COPY --from=builder /eros-engine /usr/local/bin/eros-engine
 COPY examples/model_config.toml /etc/eros-engine/model_config.toml
+COPY examples/personas /etc/eros-engine/personas
 
 # sqlx::migrate!() embeds migration files at compile time, but the
 # release_command will also need them resolvable from CWD just in case.

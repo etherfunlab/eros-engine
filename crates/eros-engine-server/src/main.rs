@@ -29,20 +29,88 @@ async fn main() -> Result<()> {
 
     // Subcommand dispatch.
     // Usage:
-    //   eros-engine            run the HTTP service (default)
-    //   eros-engine serve      same as above, explicit
-    //   eros-engine migrate    apply pending sqlx migrations and exit
-    //                          (used as Fly.io's release_command)
+    //   eros-engine                       run the HTTP service (default)
+    //   eros-engine serve                 same as above, explicit
+    //   eros-engine migrate               apply sqlx migrations and exit
+    //                                     (Fly.io release_command)
+    //   eros-engine seed-personas <dir>   load every *.toml in <dir> as a
+    //                                     persona genome (idempotent on name)
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("migrate") => run_migrations().await,
+        Some("seed-personas") => {
+            let dir = args
+                .next()
+                .unwrap_or_else(|| "/etc/eros-engine/personas".to_string());
+            run_seed_personas(&dir).await
+        }
         Some("serve") | None => run_server().await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: eros-engine [serve|migrate]");
+            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>]");
             std::process::exit(2);
         }
     }
+}
+
+/// Read a directory of `*.toml` persona files and insert each into
+/// `engine.persona_genomes`. Idempotent: rows are matched by `name`,
+/// so re-running won't duplicate or overwrite.
+async fn run_seed_personas(dir: &str) -> Result<()> {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct PersonaFile {
+        name: String,
+        avatar_url: Option<String>,
+        tip_personality: Option<String>,
+        system_prompt: String,
+        #[serde(default)]
+        art_metadata: serde_json::Value,
+    }
+
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let pool = eros_engine_store::pool::build(&database_url)
+        .await
+        .context("failed to connect to DATABASE_URL")?;
+    let repo = eros_engine_store::persona::PersonaRepo { pool: &pool };
+
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("read_dir({dir}) failed"))?;
+    let mut inserted = 0u32;
+    let mut skipped = 0u32;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {path:?}"))?;
+        let f: PersonaFile = toml::from_str(&text)
+            .with_context(|| format!("parse {path:?}"))?;
+
+        let (id, created) = repo
+            .create_genome(
+                &f.name,
+                &f.system_prompt,
+                f.tip_personality.as_deref(),
+                f.avatar_url.as_deref(),
+                f.art_metadata,
+                true,
+            )
+            .await
+            .with_context(|| format!("insert {}", f.name))?;
+        if created {
+            tracing::info!(name = %f.name, %id, "persona inserted");
+            inserted += 1;
+        } else {
+            tracing::info!(name = %f.name, %id, "persona already exists, skipped");
+            skipped += 1;
+        }
+    }
+    tracing::info!(inserted, skipped, "seed-personas complete");
+    Ok(())
 }
 
 /// Apply all sqlx migrations and exit. Fly.io invokes this as the

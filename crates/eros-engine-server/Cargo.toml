@@ -31,3 +31,4 @@ jsonwebtoken = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 utoipa-scalar = { workspace = true }
+toml = "0.8"
