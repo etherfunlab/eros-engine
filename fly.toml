@@ -12,7 +12,9 @@ primary_region = "nrt"
 
 [deploy]
   # Apply pending sqlx migrations before swapping traffic to the new release.
-  release_command = "/usr/local/bin/eros-engine migrate"
+  # Fly appends release_command as argv to ENTRYPOINT, so just "migrate"
+  # (not the full binary path) — the entrypoint is already eros-engine.
+  release_command = "migrate"
 
 [env]
   BIND_ADDR = "0.0.0.0:8080"
