@@ -13,7 +13,6 @@ use utoipa::OpenApi;
                        Source of truth: src/routes/."
     ),
     servers(
-        (url = "https://erosnx.etherfun.net", description = "Production (Fly.io Tokyo NRT)"),
         (url = "http://localhost:8080", description = "Local dev")
     ),
     tags(

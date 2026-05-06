@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# eros-engine — public-benefit deployment.
-# Custom domain: erosnx.etherfun.net (set up after first deploy).
-# Database + auth realm shared with eros-gateway (same Supabase project,
-# eros-engine writes only to the `engine` Postgres schema).
+# eros-engine — example Fly.io config. Adapt app name / region / domain
+# to your own deployment; this repo does not run a shared hosted instance.
 
 app = "eros-engine"
 primary_region = "nrt"

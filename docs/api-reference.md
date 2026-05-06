@@ -2,7 +2,7 @@
 
 [English](api-reference.md) · [中文](api-reference.zh.md)
 
-A live, browsable reference is at **`/docs`** on any running instance (Scalar UI generated from utoipa annotations). Live demo: <https://erosnx.etherfun.net/docs>.
+A live, browsable reference is at **`/docs`** on any running instance (Scalar UI generated from utoipa annotations).
 
 This page is a hand-written summary of the endpoints worth knowing. The Scalar UI is the authoritative spec.
 
@@ -19,7 +19,7 @@ Every `/comp/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The JW
 Liveness. No auth.
 
 ```bash
-curl https://erosnx.etherfun.net/healthz
+curl http://localhost:8080/healthz
 ```
 
 ```json
@@ -39,7 +39,7 @@ List active persona genomes. Auth required.
 
 ```bash
 curl -H "Authorization: Bearer $JWT" \
-  https://erosnx.etherfun.net/comp/personas
+  http://localhost:8080/comp/personas
 ```
 
 ```json
@@ -67,7 +67,7 @@ Open a new chat session against a persona genome. The server creates a `persona_
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"genome_id":"11d6a45a-1fd9-4fe6-a943-3f049035eb68"}' \
-  https://erosnx.etherfun.net/comp/chat/start
+  http://localhost:8080/comp/chat/start
 ```
 
 ```json
@@ -87,7 +87,7 @@ Synchronous chat turn. Blocks until the LLM responds.
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"hi, what are you reading today?"}' \
-  https://erosnx.etherfun.net/comp/chat/<session_id>/message
+  http://localhost:8080/comp/chat/<session_id>/message
 ```
 
 ```json
@@ -170,7 +170,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
         "label": "rose",
         "metadata": {"source": "frontend-shop", "amount": 100}
       }' \
-  https://erosnx.etherfun.net/comp/chat/<session_id>/event/gift
+  http://localhost:8080/comp/chat/<session_id>/event/gift
 ```
 
 The gift route does **not** invoke an LLM reaction in v0.1 (`reply` is `null`). The persona acknowledges the gift on the next user turn, where the new affinity state shapes the reply. A synchronous-reaction variant is a future enhancement.

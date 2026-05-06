@@ -4,7 +4,7 @@
 
 Three supported paths, in order of effort:
 
-1. **Fly.io** — what we run for `erosnx.etherfun.net`. ~10 minutes if you've used Fly before.
+1. **Fly.io** — what the included `fly.toml` is wired up for. ~10 minutes if you've used Fly before.
 2. **Docker compose self-host** — single-host VPS, brings its own Postgres+pgvector.
 3. **Embed as a library** — `core + llm + store` into your own service, no HTTP layer.
 
@@ -17,7 +17,7 @@ Three supported paths, in order of effort:
 
 ## Path 1: Fly.io
 
-The `fly.toml` in the repo root is the production config we use. App name `eros-engine`, region `nrt`, `shared-cpu-1x` 512MB, scale-to-zero. Custom domain via Fly certs.
+The `fly.toml` in the repo root is a ready-to-use production config. App name `eros-engine`, region `nrt`, `shared-cpu-1x` 512MB, scale-to-zero. Custom domain via Fly certs. Rename the app and pick a region that suits you before deploying.
 
 ```bash
 # 1. App
@@ -169,7 +169,7 @@ If you're sharing a database with another service, the engine's tables stay in `
 
 ## Source
 
-- `fly.toml` — the production config we run
+- `fly.toml` — ready-to-use Fly.io production config
 - `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime)
 - `docker/docker-compose.yml` — self-host stack
 - `crates/eros-engine-server/src/main.rs` — the three subcommands

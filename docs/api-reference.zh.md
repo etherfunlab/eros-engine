@@ -2,7 +2,7 @@
 
 [English](api-reference.md) · [中文](api-reference.zh.md)
 
-任何運行中的實例 **`/docs`** 路徑下都有實時、可瀏覽的參考文檔（utoipa 註解生成的 Scalar UI）。在線 demo：<https://erosnx.etherfun.net/docs>。
+任何運行中的實例 **`/docs`** 路徑下都有實時、可瀏覽的參考文檔（utoipa 註解生成的 Scalar UI）。
 
 這個頁面是手寫的端點摘要。Scalar UI 是權威 spec。
 
@@ -19,7 +19,7 @@
 存活探針。無需鑒權。
 
 ```bash
-curl https://erosnx.etherfun.net/healthz
+curl http://localhost:8080/healthz
 ```
 
 ```json
@@ -39,7 +39,7 @@ curl https://erosnx.etherfun.net/healthz
 
 ```bash
 curl -H "Authorization: Bearer $JWT" \
-  https://erosnx.etherfun.net/comp/personas
+  http://localhost:8080/comp/personas
 ```
 
 ```json
@@ -67,7 +67,7 @@ curl -H "Authorization: Bearer $JWT" \
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"genome_id":"11d6a45a-1fd9-4fe6-a943-3f049035eb68"}' \
-  https://erosnx.etherfun.net/comp/chat/start
+  http://localhost:8080/comp/chat/start
 ```
 
 ```json
@@ -87,7 +87,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"嗨，今天讀甚麼書？"}' \
-  https://erosnx.etherfun.net/comp/chat/<session_id>/message
+  http://localhost:8080/comp/chat/<session_id>/message
 ```
 
 ```json
@@ -170,7 +170,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
         "label": "玫瑰",
         "metadata": {"source": "frontend-shop", "amount": 100}
       }' \
-  https://erosnx.etherfun.net/comp/chat/<session_id>/event/gift
+  http://localhost:8080/comp/chat/<session_id>/event/gift
 ```
 
 v0.1 的禮物路由 **不會** 觸發 LLM 反應（`reply` 為 `null`）。人格在用戶下一輪消息裡承認這份禮物，那時新的好感度狀態塑造回覆。同步反應變體是後續增強。

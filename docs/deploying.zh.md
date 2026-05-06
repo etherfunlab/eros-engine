@@ -4,7 +4,7 @@
 
 三條支持的路徑，按工作量排：
 
-1. **Fly.io**——`erosnx.etherfun.net` 用的就是這個。如果之前用過 Fly，大約 10 分鐘搞定。
+1. **Fly.io**——倉庫裏的 `fly.toml` 直接配好了。如果之前用過 Fly，大約 10 分鐘搞定。
 2. **Docker compose 自托管**——單機 VPS，自帶 Postgres+pgvector。
 3. **作為庫嵌入**——`core + llm + store` 進你自己的服務，不要 HTTP 層。
 
@@ -17,7 +17,7 @@
 
 ## 路徑 1：Fly.io
 
-倉庫根目錄的 `fly.toml` 是我們在生產用的配置。app 名 `eros-engine`、region `nrt`、`shared-cpu-1x` 512MB、scale-to-zero。自定義域名走 Fly certs。
+倉庫根目錄的 `fly.toml` 是一份可以直接用的生產配置。app 名 `eros-engine`、region `nrt`、`shared-cpu-1x` 512MB、scale-to-zero。自定義域名走 Fly certs。部署前把 app 名換成自己的、region 挑一個合適的。
 
 ```bash
 # 1. 建 app
@@ -169,7 +169,7 @@ impl AuthValidator for MyValidator {
 
 ## 源碼
 
-- `fly.toml`——我們生產跑的配置
+- `fly.toml`——可直接套用的 Fly.io 生產配置
 - `docker/Dockerfile`——多階段構建（Rust 1.88 構建器 → debian:bookworm-slim 運行時）
 - `docker/docker-compose.yml`——自托管 stack
 - `crates/eros-engine-server/src/main.rs`——三個子命令
