@@ -80,9 +80,14 @@ pub async fn run(
     // engine has no credit ledger to look them up from.
     let chat_req = match plan.action_type {
         ActionType::Reply => {
-            ReplyHandler { state, session_id }
-                .handle(&input, &plan)
-                .await?
+            ReplyHandler {
+                state,
+                session_id,
+                user_id,
+                instance_id,
+            }
+            .handle(&input, &plan)
+            .await?
         }
         ActionType::Ghost => {
             GhostHandler { state, session_id }
@@ -98,6 +103,8 @@ pub async fn run(
             GiftHandler {
                 state,
                 session_id,
+                user_id,
+                instance_id,
                 deltas: plan.affinity_deltas.clone(),
                 pending: vec![], // TODO(T11): inject from request body
             }
