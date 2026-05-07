@@ -123,6 +123,14 @@ async fn recall_memory(
             return (vec![], vec![]);
         }
     };
+    // Observation hook for recall-quality investigation (RUST_LOG=...=debug).
+    // Cheap fields only: scalars + lengths, no content / no PII.
+    tracing::debug!(
+        user_id = %user_id,
+        query_len = query_text.chars().count(),
+        embedding_dim = embedding.len(),
+        "recall_memory: embedded query, dispatching pgvector search"
+    );
     recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding).await
 }
 
@@ -148,13 +156,25 @@ async fn recall_memory_with_embedding(
             vec![]
         }
     };
-    let relationship = match rel_res {
+    let relationship: Vec<String> = match rel_res {
         Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
         Err(e) => {
             tracing::warn!("relationship-layer memory search failed: {e}");
             vec![]
         }
     };
+    // Observation hook — see `recall_memory` for rationale. Includes total
+    // bytes per layer so an operator can spot "lots of short fragments vs
+    // few long fragments" patterns when tuning K or threshold.
+    tracing::debug!(
+        user_id = %user_id,
+        instance_id = %instance_id,
+        profile_hits = profile.len(),
+        relationship_hits = relationship.len(),
+        profile_total_chars = profile.iter().map(|s| s.chars().count()).sum::<usize>(),
+        relationship_total_chars = relationship.iter().map(|s| s.chars().count()).sum::<usize>(),
+        "recall_memory_with_embedding: completed"
+    );
     (profile, relationship)
 }
 
