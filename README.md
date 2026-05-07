@@ -1,149 +1,195 @@
 # eros-engine
 
-> **An AI companion that learns who you are — and feels like a real person doing it.**
+> **An open-source Rust engine for AI companions with memory, relationship state, and structured user insight.**
 >
-> The same intimacy + memory pipeline that powers [Eros](https://eros.etherfun.xyz)'s dating product, open-sourced. Talk to a persona; the engine quietly builds a structured profile of you for matchmaking and runs a six-dimensional affinity model so the companion behaves like a person, not a chatbot.
+> `eros-engine` is the companion-chat core behind [Eros](https://eros.etherfun.xyz), extracted into a standalone service. It turns conversation into three durable signals: a structured user profile, two-layer long-term memory, and a six-dimensional affinity model that changes how a persona behaves over time.
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 English · [中文](README.zh.md)
 
+## Why this exists
+
+Most AI character apps treat memory as a prompt append and relationship as a paragraph of instructions. That works for a demo, but it drifts in long sessions and is hard to debug.
+
+`eros-engine` moves those concerns into explicit state:
+
+- **Memory** lives in Postgres + pgvector, split into profile memory and relationship memory.
+- **Affinity** is a numeric vector updated with EMA smoothing and real-time decay.
+- **User insight** is a structured JSONB profile that downstream products can query.
+- **Persona behavior** is planned through a rules-based Persona Decision Engine (PDE), then rendered by an LLM.
+
+The result is not a generic agent framework. It is a focused engine for products where a persona talks to the same user across many sessions: AI companions, journaling companions, coaching agents, language tutors, and character chat.
+
 ## Key features
 
-- **Memory that grows with the user** — Two pgvector layers (cross-session profile + per-session relationship callbacks). The persona still remembers what you said weeks ago without re-stuffing the context window every turn. "She remembers" is structural, not prompt-engineered.
+### Two-layer memory
 
-- **Deterministic affinity, not prompt drift** — Closeness between user and persona is a six-dimensional numeric vector mutated every turn, not a paragraph of "you feel warmer toward the user now" baked into a system prompt. Numbers behave; prompt-injected feelings drift over a long session.
+`eros-engine` stores memory in two semantic scopes:
 
-- **User profile, structured and queryable** — Each turn quietly mines facts about the user (city, MBTI signals, love values, life rhythm, …) into a JSONB profile with a weighted training level. If you're building a companion, a journaling app, a coaching agent, or anything where actually knowing the user matters, the profile is structured — not a black-box vector — so you can drive whatever logic you want from it.
+| Layer | Scope | Purpose |
+|---|---|---|
+| Profile memory | `user_id`, with `instance_id IS NULL` | Stable user facts shared across sessions and personas. |
+| Relationship memory | `user_id + persona instance` | Callbacks, shared moments, unresolved threads, and relationship-specific context. |
 
-## What it does
+Embeddings use Voyage `voyage-3-lite` with 512-dimensional vectors. Retrieval runs through pgvector IVFFlat cosine search.
 
-eros-engine is the conversational layer of a dating platform, carved out as a standalone service. Two things happen in every chat turn:
+### Six-dimensional affinity
 
-### 1. Profile-building pipeline (`companion_insights`)
+Each chat session has a relationship vector:
 
-Every user message is mined for facts about the user: city, occupation, interests, MBTI signals, love values, emotional needs, life rhythm, personality traits, matching preferences. These get merged into a single JSONB profile per user with a weighted **training level** that climbs as more dimensions fill in. The profile is structured the way a matchmaker would think — not a vector blob you can't introspect — so it can drive real matchmaking later.
+| Axis | Range | Controls |
+|---|---:|---|
+| `warmth` | -1.0 to 1.0 | Tone and address, from distant to affectionate. |
+| `trust` | 0.0 to 1.0 | Topic depth and willingness to disclose. |
+| `intrigue` | 0.0 to 1.0 | Curiosity and follow-up behavior. |
+| `intimacy` | 0.0 to 1.0 | Nicknames, inside jokes, and callbacks. |
+| `patience` | 0.0 to 1.0 | Tolerance for low-effort or repeated messages. |
+| `tension` | 0.0 to 1.0 | Push-pull, friction, and playful resistance. |
 
-A user who chats freely for a few hours produces a richer dating profile than one who fills out a form, because they're answering the questions they didn't know were being asked.
+Updates are smoothed with exponential moving average (EMA), so the persona does not jump between emotional states. `intrigue`, `patience`, and `tension` also decay or recover with real time.
 
-### 2. Six-dimensional affinity (the "feels like a real person" part)
+Relationship labels such as `stranger`, `slow_burn`, `friend`, `frenemy`, and `romantic` emerge from threshold rules. They are internal state, not user-facing badges.
 
-Most chatbots are stateless. eros-engine isn't. Each chat session carries a six-axis vector that mutates with every turn:
+### Deterministic ghost mechanics
 
-| Axis | Range | What it controls |
-|------|------|------|
-| **warmth** | −1.0 ↔ 1.0 | Tone and address — cold to affectionate |
-| **trust** | 0.0 ↔ 1.0 | Topic depth, willingness to disclose |
-| **intrigue** | 0.0 ↔ 1.0 | Curiosity, follow-up questions |
-| **intimacy** | 0.0 ↔ 1.0 | Inside jokes, nicknames, callbacks |
-| **patience** | 0.0 ↔ 1.0 | Threshold for short or low-effort messages |
-| **tension** | 0.0 ↔ 1.0 | Push-pull, playful friction |
+The same affinity vector drives a deterministic ghost decision. When patience and intrigue drop far enough, the persona can choose not to reply.
 
-Updates use exponential-moving-average smoothing so the persona doesn't lurch, and three axes (intrigue, patience, tension) decay or recover with real time when no one's around. Five relationship labels — `stranger`, `slow_burn`, `friend`, `frenemy`, `romantic` — emerge from the vector by threshold rule, not by being assigned. They're not user-facing; they shape the system prompt the persona generates from.
+Four protection rules keep this from feeling arbitrary:
 
-The vector also drives a deterministic **ghost decision** — when patience and intrigue dip past a threshold, the persona simply doesn't reply. With four protection rules layered on top (no ghosting before message 10, no two ghosts in a row, 1-hour cooldown, raised threshold after a recent ghost) it produces the texture of being slightly absent rather than always available. That single mechanic does more for the "talking to a person" feeling than any prompt-engineering trick.
+- no ghosting before message 10;
+- no two ghosts in a row;
+- one-hour cooldown after a ghost;
+- a higher threshold after a recent ghost.
 
-### Plus a memory layer
+This is implemented as domain logic in Rust, not as a prompt suggestion.
 
-Two pgvector tables hold what the persona remembers about you:
+### Structured user insight
 
-- **Profile layer** — cross-session facts (`instance_id IS NULL`), the things any version of any persona could pull up.
-- **Relationship layer** — per-session callbacks ("the bookshop you were in that rainy day"), which is what makes someone feel known across weeks of conversation rather than helpfully assistant-shaped.
+The `companion_insights` table stores a JSONB profile per user: city, occupation, interests, MBTI signals, relationship values, emotional needs, life rhythm, personality traits, and matching preferences.
 
-Embeddings are 512-dimensional via Voyage's `voyage-3-lite`. Retrieval is cosine over IVFFlat.
+Each field contributes to a weighted `training_level`. That makes the profile useful outside the chat loop: matchmaking, onboarding completion, coaching logic, analytics, and product gating can all query structured fields instead of parsing free text.
 
 ## Architecture
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────┐
 │ /comp/* HTTP routes  ←  Supabase JWT middleware          │
 │         │                                                │
 │         ▼                                                │
-│   pipeline orchestrator: pre → PDE → handler → chat → post
+│ pipeline orchestrator: load → PDE → handler → chat → post│
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
-│  │ post-process (background, per turn)            │     │
-│  │   • affinity persist (LLM-evaluated 6-dim Δ)   │     │
-│  │   • memory   (Voyage embed → pgvector upsert)  │     │
-│  │   • insight  (extract facts → companion_insights)
+│  │ post-process, spawned after reply              │     │
+│  │   • affinity: persist 6D delta + EMA           │     │
+│  │   • memory:   Voyage embed → pgvector upsert   │     │
+│  │   • insight:  extract facts → JSONB merge      │     │
 │  └────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Four crates under `crates/`:
+The workspace is split into four crates:
 
 | Crate | Role |
-|-------|------|
-| `eros-engine-core` | Pure-domain logic — affinity vector math, ghost decision, persona decision engine. Zero I/O. |
-| `eros-engine-llm` | OpenRouter chat client + Voyage embedding client + TOML model-config loader. |
-| `eros-engine-store` | Postgres + pgvector persistence. All tables namespaced under the `engine` schema. |
-| `eros-engine-server` | Axum HTTP service + Supabase JWT middleware + pipeline wiring. |
+|---|---|
+| `eros-engine-core` | Pure domain logic: affinity math, ghost decision, PDE, persona types. Zero I/O. |
+| `eros-engine-llm` | OpenRouter chat client, Voyage embedding client, TOML model-config loader. |
+| `eros-engine-store` | Postgres + pgvector persistence, with all tables under the `engine` schema. |
+| `eros-engine-server` | Axum HTTP service, Supabase JWT middleware, OpenAPI docs, and pipeline wiring. |
 
-Embed `core + llm + store` as a library to build your own service, or run `eros-engine-server` as a standalone HTTP API.
+You can run `eros-engine-server` as an HTTP API, or embed `core + llm + store` directly in your own Rust service.
 
-Deeper docs:
-- [Architecture](docs/architecture.md) — crate boundaries, pipeline phases, data flow
-- [Affinity model](docs/affinity-model.md) — 6 dimensions, EMA, time decay, relationship labels
-- [Ghost mechanics](docs/ghost-mechanics.md) — score formula + protection rules + worked examples
-- [Memory layers](docs/memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
-- [Deploying](docs/deploying.md) — Fly.io, Docker compose, bring-your-own-Postgres / IdP
-- [API reference](docs/api-reference.md) — every `/comp/*` endpoint
+## Documentation
+
+- [Architecture](docs/architecture.md) — crate boundaries, pipeline phases, data flow.
+- [Affinity model](docs/affinity-model.md) — six dimensions, EMA, time decay, relationship labels.
+- [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
+- [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
+- [Deploying](docs/deploying.md) — Fly.io, Docker, bring-your-own Postgres / IdP.
+- [API reference](docs/api-reference.md) — every `/comp/*` endpoint.
 
 ## Quickstart
+
+Prerequisites:
+
+- Rust toolchain from `rust-toolchain.toml`.
+- Postgres 16+ with the `pgvector` extension.
+- OpenRouter API key.
+- Voyage API key.
+- Supabase JWT secret, or your own `AuthValidator` implementation.
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env       # fill in: DATABASE_URL, OPENROUTER_API_KEY,
-                           #          VOYAGE_API_KEY, SUPABASE_URL,
-                           #          SUPABASE_JWT_SECRET
-docker compose -f docker/docker-compose.yml up
+cp .env.example .env
 ```
 
-Engine listens on `:8080`. OpenAPI/Scalar reference at `/docs`. The official hosted web client (Eros Chat) is closed-source — eros-engine itself runs standalone, bring your own UI.
+Fill in `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and `SUPABASE_JWT_SECRET`, then run:
 
-For self-hosters running against an existing Supabase project: tables live under the `engine` Postgres schema, so they coexist cleanly with your other tables.
+```bash
+cargo run -p eros-engine-server -- migrate
+cargo run -p eros-engine-server -- seed-personas examples/personas
+cargo run -p eros-engine-server -- serve
+```
+
+The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`, and the OpenAPI JSON is available at `/api-docs/openapi.json`.
+
+The official Eros Chat web client is closed-source. `eros-engine` is designed to run standalone; bring your own UI or embed the crates in another service.
 
 ## API surface
 
-Full reference at `/docs` once running. Highlights:
+All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default.
 
-- `POST /comp/chat/start` — open a session against a persona
-- `POST /comp/chat/{session_id}/message` — synchronous chat turn
-- `GET  /comp/chat/{session_id}/history` — paginated history
-- `GET  /comp/user/{user_id}/profile` — current `companion_insights` + training level
-- `GET  /comp/affinity/{session_id}` — live 6-dim vector (env-gated for OSS demo; off in prod-flavoured deploys)
+Highlights:
 
-Auth: Bearer Supabase JWT on every `/comp/*` route. The `AuthValidator` trait is pluggable if you bring a different IdP.
+- `GET  /comp/personas` — list active persona genomes.
+- `POST /comp/chat/start` — open a chat session against a persona.
+- `POST /comp/chat/{session_id}/message` — synchronous chat turn.
+- `POST /comp/chat/{session_id}/message_async` — async chat turn with pending-status polling.
+- `GET  /comp/chat/{session_id}/pending/{message_id}` — poll async completion.
+- `GET  /comp/chat/{session_id}/history` — paginated chat history.
+- `GET  /comp/chat/{user_id}/sessions` — list a user's sessions.
+- `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
+- `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
+- `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
+- `GET  /comp/affinity/{session_id}` — debug-only live affinity vector, enabled by `EXPOSE_AFFINITY_DEBUG=true`.
+
+The `AuthValidator` trait is pluggable if you use a different identity provider.
 
 ## Configuration
 
 | Env var | Required | Notes |
-|---------|----------|-------|
-| `DATABASE_URL` | yes | Postgres with `pgvector` extension. Engine creates its tables in the `engine` schema. |
-| `OPENROUTER_API_KEY` | yes | Chat completions. Routed via `examples/model_config.toml`. |
-| `VOYAGE_API_KEY` | yes | Embeddings. Failure modes are loud — empty key fails server boot. |
-| `SUPABASE_URL` | yes | Project URL. |
-| `SUPABASE_JWT_SECRET` | yes | Project JWT secret. eros-engine validates every incoming token. |
+|---|---|---|
+| `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
+| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
+| `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
+| `SUPABASE_URL` | no | Supabase project URL. Kept in `.env.example` for client/deploy conventions; the server does not read it today. |
+| `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |
+| `BIND_ADDR` | no | Defaults to `0.0.0.0:8080`. |
 | `EXPOSE_AFFINITY_DEBUG` | no | Set `true` to enable `/comp/affinity/{session_id}`. |
-| `EMA_INERTIA` | no | Default `0.8`. |
-| `MODEL_CONFIG_PATH` | no | Default `examples/model_config.toml`. |
+| `EMA_INERTIA` | no | Defaults to `0.8`. |
+| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
+| `RUST_LOG` | no | Defaults to `info`. |
 
-## What's not here
+## What is deliberately out of scope
 
-This repo is the conversational + intimacy core. Things deliberately out of scope:
+This repository is the conversation, memory, and relationship-state core. It does not include:
 
-- **Match-making algorithm** — the multi-stage filter + soft scoring + LLM agent-to-agent simulation lives in the closed-source product. eros-engine builds the *profiles* that feed it, but doesn't pair people up.
-- **Full social product UX** — onboarding, video, voice, billing, photos.
-- **Companion provenance / lineage** — proprietary.
+- **Matchmaking** — multi-stage filtering, soft scoring, and agent-to-agent matching simulation remain in the closed-source product.
+- **Full social UX** — onboarding, video, voice, billing, photos, moderation UI, and mobile clients.
+- **Persona provenance / marketplace logic** — commercial product code, not part of the engine.
 
-If you want to build a different product on top — a journaling companion, a language tutor, a coaching agent — the affinity + memory + insight pipeline is the part you'd reuse.
+If you are building a different product, the reusable part is the affinity + memory + insight pipeline.
+
+## Content note
+
+The example personas under `examples/personas/` are written as adult character-chat examples. They can flirt and express desire when the relationship state reaches that point, while still refusing disrespectful or boundary-crossing behavior. If your product needs a SFW default, replace those persona files before deploying.
 
 ## Contributing
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md). All contributors must accept the [`CLA`](CLA.md) via cla-assistant.io on first PR (one-time, covers all future PRs).
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md). All contributors must accept the [`CLA`](CLA.md) through cla-assistant.io on their first PR.
 
 ## License
 
-AGPL-3.0. If AGPL doesn't fit your distribution model, commercial licensing is available — `henrylin@etherfun.xyz`.
+`eros-engine` is licensed under AGPL-3.0-only. If AGPL does not fit your distribution model, commercial licensing is available: `henrylin@etherfun.xyz`.
