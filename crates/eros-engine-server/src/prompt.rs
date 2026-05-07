@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Companion system prompt builder — ported from eros-gateway with these
-//! deliberate changes for the open-source engine:
+//! All LLM prompts used by the engine, kept in a single module so future
+//! syncs from the closed-source eros-gateway have an obvious destination.
 //!
-//! - Output is plain-text reply (no JSON evaluation segment)
-//! - Affinity deltas are NOT requested from the LLM (PDE predicts them)
-//! - lead_score / training_progress moved to post_process/insight
-//! - Reply style directive injected based on PDE's decision
-//! - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
-//!   JSONB instead of a flat `CompanionPersona` DTO
+//! Two families today:
+//!
+//! 1. **Chat companion prompt** (`build_prompt`) — assembles the per-turn
+//!    system prompt for the chat LLM. Ported from eros-gateway with these
+//!    deliberate changes for the open-source engine:
+//!    - Output is plain-text reply (no JSON evaluation segment)
+//!    - Affinity deltas are NOT requested from the LLM (PDE predicts them)
+//!    - lead_score / training_progress moved to post_process/insight
+//!    - Reply style directive injected based on PDE's decision
+//!    - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
+//!      JSONB instead of a flat `CompanionPersona` DTO
+//!
+//! 2. **Insight extraction prompts** (`extract_facts_prompt`,
+//!    `extract_structured_insights_prompt`) — drive the post-process
+//!    `companion_insights` pipeline. The schema description constant
+//!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
+//!
+//! Memory-layer "prompts" are not LLM-driven (Voyage embedding only) and
+//! so don't live here. Future port targets (dream / proactive) should be
+//! added as new families in this file.
 
 use chrono::{Timelike, Utc};
 
@@ -290,6 +304,85 @@ pub fn build_prompt(
     )
 }
 
+// ─── Insight extraction prompts ────────────────────────────────────
+//
+// These were inline `format!()` blocks inside `pipeline/post_process.rs`
+// until 2026-05-08 — moved here so all LLM prompt strings live in one
+// module and future syncs from the closed-source `eros-gateway/src/ai/
+// prompts.rs` have a clear destination. String contents are byte-identical
+// to the previous inline versions; this is a pure relocation refactor.
+//
+// Note: the second prompt mixes Traditional Chinese with the rest of the
+// codebase's Simplified Chinese — that's a copy-paste artefact from the
+// gateway. Not normalised here because changing prompt strings can shift
+// LLM behaviour subtly; treat as a separate i18n cleanup ticket.
+
+/// Schema description used in `extract_structured_insights_prompt`. Mirrors
+/// the JSONB shape that `InsightRepo::merge` accepts, with each field's
+/// `compute_training_level` weight implicitly determined by presence.
+pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
+companion_insights schema (all fields optional, only include if confident):
+{
+  "city": "string — user's city",
+  "occupation": "string — job/career",
+  "mbti_guess": "string — e.g. INFP",
+  "love_values": "string — attitude toward love & relationships",
+  "interests": ["list", "of", "hobbies"],
+  "emotional_needs": "string — what emotional support they need",
+  "life_rhythm": "string — e.g. 夜貓子, 早睡早起",
+  "matching_preferences": {
+    "preferred_gender": "string",
+    "age_range": [min_int, max_int],
+    "deal_breakers": ["list"]
+  },
+  "personality_traits": ["list", "of", "traits"]
+}
+Return ONLY a JSON object with the fields you are confident about.
+Do not invent or guess anything not clearly supported by the facts.
+"#;
+
+/// Stage-1 insight extraction prompt: ask the LLM to mine fresh user
+/// facts from a single chat turn. Output expected as
+/// `{"facts": ["...", "..."]}` — `parse_facts` in `post_process.rs`
+/// handles regex fallback for fenced / wrapped JSON.
+pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
+    format!(
+        "分析以下一轮对话，列出你对用户的新事实发现（仅限用户，不是 AI）。\n\n\
+         用户: {user_msg}\n\
+         AI:   {assistant_msg}\n\n\
+         如果没有新的用户事实，返回空数组 []。\n\
+         严格输出 JSON，格式: {{\"facts\": [\"事实1\", \"事实2\"]}}",
+    )
+}
+
+/// Stage-2 insight extraction prompt: take the bullet list of facts mined
+/// in stage 1 plus the user's existing `companion_insights` JSONB, and
+/// fill in whatever fields the LLM is confident about. Output expected
+/// as a JSON object matching `COMPANION_INSIGHTS_SCHEMA`.
+pub fn extract_structured_insights_prompt(
+    facts: &[String],
+    existing_insights: Option<&serde_json::Value>,
+) -> String {
+    let facts_str = facts
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing_str = existing_insights
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+
+    format!(
+        "以下是從對話中提取的用戶事實：\n\
+         {facts_str}\n\n\
+         現有的 companion_insights（供參考，不要重複已知信息）：\n\
+         {existing_str}\n\n\
+         請根據上方的事實，填充以下 schema 中你有信心的字段：\n\
+         {COMPANION_INSIGHTS_SCHEMA}\n\n\
+         僅輸出 JSON，不要任何解釋。",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +399,37 @@ mod tests {
     #[test]
     fn test_gift_reaction_empty_when_no_gifts() {
         assert!(gift_reaction_context(&[], "normal").is_empty());
+    }
+
+    // ─── Insight prompt tests ──────────────────────────────────────
+
+    #[test]
+    fn extract_facts_prompt_embeds_both_turns_verbatim() {
+        let p = extract_facts_prompt("我住在上海", "嗯嗯，魔都人");
+        assert!(p.contains("用户: 我住在上海"));
+        assert!(p.contains("AI:   嗯嗯，魔都人"));
+        // Output schema instruction must be present.
+        assert!(p.contains(r#"{"facts": ["事实1", "事实2"]}"#));
+    }
+
+    #[test]
+    fn extract_structured_insights_prompt_renders_facts_as_bullets() {
+        let facts = vec!["住在上海".to_string(), "夜猫子".to_string()];
+        let p = extract_structured_insights_prompt(&facts, None);
+        assert!(p.contains("- 住在上海"));
+        assert!(p.contains("- 夜猫子"));
+        // Empty existing_insights renders as "{}".
+        assert!(p.contains("{}"));
+        // Schema description must be embedded.
+        assert!(p.contains("companion_insights schema"));
+    }
+
+    #[test]
+    fn extract_structured_insights_prompt_includes_existing_jsonb() {
+        let existing = serde_json::json!({ "city": "Shanghai", "mbti_guess": "INFP" });
+        let p = extract_structured_insights_prompt(&[], Some(&existing));
+        // Pretty-printed existing object should appear in the prompt.
+        assert!(p.contains("\"city\": \"Shanghai\""));
+        assert!(p.contains("\"mbti_guess\": \"INFP\""));
     }
 }

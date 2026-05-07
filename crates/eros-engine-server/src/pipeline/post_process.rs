@@ -251,27 +251,6 @@ fn find_json_block(raw: &str) -> Option<&str> {
     None
 }
 
-const SCHEMA_DESC: &str = r#"
-companion_insights schema (all fields optional, only include if confident):
-{
-  "city": "string — user's city",
-  "occupation": "string — job/career",
-  "mbti_guess": "string — e.g. INFP",
-  "love_values": "string — attitude toward love & relationships",
-  "interests": ["list", "of", "hobbies"],
-  "emotional_needs": "string — what emotional support they need",
-  "life_rhythm": "string — e.g. 夜貓子, 早睡早起",
-  "matching_preferences": {
-    "preferred_gender": "string",
-    "age_range": [min_int, max_int],
-    "deal_breakers": ["list"]
-  },
-  "personality_traits": ["list", "of", "traits"]
-}
-Return ONLY a JSON object with the fields you are confident about.
-Do not invent or guess anything not clearly supported by the facts.
-"#;
-
 const INSIGHT_TASK: &str = "insight_extraction";
 
 /// Top-level entry: extract facts → structured insights → InsightRepo merge.
@@ -321,13 +300,7 @@ async fn extract_facts(
     if user_msg.trim().is_empty() {
         return vec![];
     }
-    let prompt = format!(
-        "分析以下一轮对话，列出你对用户的新事实发现（仅限用户，不是 AI）。\n\n\
-         用户: {user_msg}\n\
-         AI:   {assistant_msg}\n\n\
-         如果没有新的用户事实，返回空数组 []。\n\
-         严格输出 JSON，格式: {{\"facts\": [\"事实1\", \"事实2\"]}}",
-    );
+    let prompt = crate::prompt::extract_facts_prompt(user_msg, assistant_msg);
 
     let resolved = model_config.resolve(INSIGHT_TASK, None);
     let req = ChatRequest {
@@ -385,24 +358,7 @@ async fn extract_structured_insights(
         return serde_json::Value::Object(serde_json::Map::new());
     }
 
-    let facts_str = facts
-        .iter()
-        .map(|f| format!("- {f}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let existing_str = existing_insights
-        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|| "{}".into());
-
-    let prompt = format!(
-        "以下是從對話中提取的用戶事實：\n\
-         {facts_str}\n\n\
-         現有的 companion_insights（供參考，不要重複已知信息）：\n\
-         {existing_str}\n\n\
-         請根據上方的事實，填充以下 schema 中你有信心的字段：\n\
-         {SCHEMA_DESC}\n\n\
-         僅輸出 JSON，不要任何解釋。",
-    );
+    let prompt = crate::prompt::extract_structured_insights_prompt(facts, existing_insights);
 
     let resolved = model_config.resolve(INSIGHT_TASK, None);
     let req = ChatRequest {
