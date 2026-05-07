@@ -160,12 +160,11 @@ impl<'a> PersonaRepo<'a> {
         art_metadata: serde_json::Value,
         is_active: bool,
     ) -> Result<(Uuid, bool), sqlx::Error> {
-        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM engine.persona_genomes WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(self.pool)
-        .await?
+        if let Some(id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM engine.persona_genomes WHERE name = $1")
+                .bind(name)
+                .fetch_optional(self.pool)
+                .await?
         {
             sqlx::query(
                 "UPDATE engine.persona_genomes SET \

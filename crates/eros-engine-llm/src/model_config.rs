@@ -243,7 +243,12 @@ description  = "reserved — Voyage hard-codes its own model"
         assert_eq!(cfg.defaults.fallback_max_tokens, Some(200));
 
         // All four committed task names are present.
-        for name in ["chat_companion", "insight_extraction", "pde_decision", "embedding"] {
+        for name in [
+            "chat_companion",
+            "insight_extraction",
+            "pde_decision",
+            "embedding",
+        ] {
             assert!(
                 cfg.tasks.contains_key(name),
                 "compat fixture missing task `{name}`"
@@ -253,7 +258,10 @@ description  = "reserved — Voyage hard-codes its own model"
         // chat_companion — every field round-trips.
         let chat = cfg.tasks.get("chat_companion").unwrap();
         assert_eq!(chat.model, "x-ai/grok-4-fast");
-        assert_eq!(chat.fallback.as_deref(), Some("deepseek/deepseek-chat-v3.2"));
+        assert_eq!(
+            chat.fallback.as_deref(),
+            Some("deepseek/deepseek-chat-v3.2")
+        );
         assert_eq!(chat.temperature, Some(0.85));
         assert_eq!(chat.max_tokens, Some(600));
         assert_eq!(chat.description, "AI companion chat");
@@ -282,7 +290,10 @@ description  = "reserved — Voyage hard-codes its own model"
         // Resolution behaviour on the live tasks.
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.model, "x-ai/grok-4-fast");
-        assert_eq!(r.fallback_model.as_deref(), Some("deepseek/deepseek-chat-v3.2"));
+        assert_eq!(
+            r.fallback_model.as_deref(),
+            Some("deepseek/deepseek-chat-v3.2")
+        );
         assert_eq!(r.temperature, 0.85);
         assert_eq!(r.max_tokens, 600);
 

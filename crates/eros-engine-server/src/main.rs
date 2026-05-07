@@ -82,8 +82,7 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
         .context("failed to connect to DATABASE_URL")?;
     let repo = eros_engine_store::persona::PersonaRepo { pool: &pool };
 
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("read_dir({dir}) failed"))?;
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read_dir({dir}) failed"))?;
     let mut inserted = 0u32;
     let mut skipped = 0u32;
     for entry in entries {
@@ -92,10 +91,8 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
         if path.extension().and_then(|s| s.to_str()) != Some("toml") {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {path:?}"))?;
-        let f: PersonaFile = toml::from_str(&text)
-            .with_context(|| format!("parse {path:?}"))?;
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {path:?}"))?;
+        let f: PersonaFile = toml::from_str(&text).with_context(|| format!("parse {path:?}"))?;
 
         let (id, created) = repo
             .upsert_genome(
