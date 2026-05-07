@@ -32,3 +32,8 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 utoipa-scalar = { workspace = true }
 toml = "0.8"
+# Loaded once at server start so the documented `cp .env.example .env`
+# quickstart actually works without an explicit `set -a; source .env`.
+# In production (Fly.io / Docker) the file is absent, dotenv() returns
+# Err, and we silently fall through to the real environment.
+dotenvy = "0.15"

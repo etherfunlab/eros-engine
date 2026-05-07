@@ -367,6 +367,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "dotenvy",
  "eros-engine-core",
  "eros-engine-llm",
  "eros-engine-store",

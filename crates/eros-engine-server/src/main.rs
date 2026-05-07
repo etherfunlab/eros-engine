@@ -22,6 +22,13 @@ use crate::state::{AppState, ServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pull `.env` into the process environment if present. Production
+    // deployments (Fly.io secrets, Docker run --env, k8s secrets) won't
+    // have a file here and dotenv() returns Err — we ignore it and fall
+    // through to the real env. Local quickstart `cp .env.example .env`
+    // now works without an explicit `set -a; source .env`.
+    let _ = dotenvy::dotenv();
+
     // The workspace pins `tracing-subscriber` without the `env-filter` feature,
     // so we use the plain fmt initialiser. RUST_LOG is honoured via the
     // tracing-log bridge once the subscriber is installed.

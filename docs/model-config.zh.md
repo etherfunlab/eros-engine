@@ -8,8 +8,9 @@
 
 - 默认路径: `examples/model_config.toml`(相对于工作目录)
 - 覆盖: `MODEL_CONFIG_PATH` 环境变量
-- 启动时一次性载入,走 `ModelConfig::load()`(`crates/eros-engine-llm/src/model_config.rs`)
+- 服务启动时由 `eros-engine-server/src/main.rs` 一次性载入(直接读 `MODEL_CONFIG_PATH` + `ModelConfig::from_toml_str`)。`crates/eros-engine-llm/src/model_config.rs` 里的 `ModelConfig::load()` 是给 library embedder 用的便利方法,默认路径一致
 - 以 `Arc<ModelConfig>` 形式挂在 `AppState` 上,所有 chat / post-process 轮共享
+- Server 启动时还会调一次 `dotenvy::dotenv()`,所以快速开始里 `cp .env.example .env` 之后可以直接 `cargo run`,不需要手动 `source .env`
 
 ## Schema
 
