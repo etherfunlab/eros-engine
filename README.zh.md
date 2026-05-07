@@ -106,6 +106,7 @@ Workspace 拆成四個 crate：
 - [好感度模型](docs/affinity-model.zh.md)——六個維度、EMA、時間衰退、關係標籤。
 - [Ghost 機制](docs/ghost-mechanics.zh.md)——score formula、保護規則、示例。
 - [記憶層](docs/memory-layers.zh.md)——profile vs relationship memory、Voyage、pgvector retrieval。
+- [模型配置](docs/model-config.zh.md)——`model_config.toml` schema、任務名、解析優先級、0.x 穩定性承諾。
 - [部署](docs/deploying.zh.md)——Fly.io、Docker、自帶 Postgres / IdP。
 - [API 參考](docs/api-reference.zh.md)——每個 `/comp/*` endpoint。
 

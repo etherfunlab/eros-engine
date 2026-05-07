@@ -14,11 +14,18 @@ fallback = "deepseek/deepseek-chat-v3.2"
 temperature = 0.3
 max_tokens = 400
 
+# Reserved — not consumed by current code. The PDE in
+# `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a
+# placeholder for a future optional LLM decision layer.
 [tasks.pde_decision]
 model = "x-ai/grok-4-mini"
 temperature = 0.5
 max_tokens = 200
 
+# Reserved — not consumed by current code. `VoyageClient` reads
+# `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
+# This entry exists for future generalisation if we ever support a
+# pluggable embedding provider.
 [tasks.embedding]
 model = "voyage-3-lite"
 dimensions = 512

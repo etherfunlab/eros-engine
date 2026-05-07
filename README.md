@@ -106,6 +106,7 @@ You can run `eros-engine-server` as an HTTP API, or embed `core + llm + store` d
 - [Affinity model](docs/affinity-model.md) — six dimensions, EMA, time decay, relationship labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
 - [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
+- [Model config](docs/model-config.md) — `model_config.toml` schema, task names, resolution rules, 0.x stability commitments.
 - [Deploying](docs/deploying.md) — Fly.io, Docker, bring-your-own Postgres / IdP.
 - [API reference](docs/api-reference.md) — every `/comp/*` endpoint.
 

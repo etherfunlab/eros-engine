@@ -182,4 +182,110 @@ max_tokens = 600
         assert_eq!(r.temperature, 0.5); // defaults
         assert_eq!(r.max_tokens, 200); // defaults
     }
+
+    // ─── Public schema compat fixture ─────────────────────────────────
+    //
+    // This test locks the full set of fields and task names that the
+    // OSS engine commits to supporting in 0.x — see
+    // `docs/model-config.md` § "Stability commitments".
+    //
+    // Adding optional fields / new task names is fine. Renaming or
+    // removing a field, or making an existing field required, will
+    // break this test.
+
+    const COMPAT_FIXTURE: &str = r#"
+[defaults]
+fallback_model       = "x-ai/grok-4-mini"
+fallback_temperature = 0.5
+fallback_max_tokens  = 200
+
+[tasks.chat_companion]
+model        = "x-ai/grok-4-fast"
+fallback     = "deepseek/deepseek-chat-v3.2"
+temperature  = 0.85
+max_tokens   = 600
+description  = "AI companion chat"
+
+[tasks.insight_extraction]
+model        = "x-ai/grok-4-mini"
+fallback     = "deepseek/deepseek-chat-v3.2"
+temperature  = 0.3
+max_tokens   = 400
+description  = "extract user facts from a chat turn"
+
+[tasks.pde_decision]
+model        = "x-ai/grok-4-mini"
+temperature  = 0.5
+max_tokens   = 200
+description  = "reserved — current PDE is rule-based"
+
+[tasks.embedding]
+model        = "voyage-3-lite"
+dimensions   = 512
+description  = "reserved — Voyage hard-codes its own model"
+"#;
+
+    #[test]
+    fn compat_fixture_locks_full_schema() {
+        let cfg = ModelConfig::from_toml_str(COMPAT_FIXTURE).expect("fixture must parse");
+
+        // [defaults] — all fields preserved.
+        assert_eq!(
+            cfg.defaults.fallback_model.as_deref(),
+            Some("x-ai/grok-4-mini")
+        );
+        assert_eq!(cfg.defaults.fallback_temperature, Some(0.5));
+        assert_eq!(cfg.defaults.fallback_max_tokens, Some(200));
+
+        // All four committed task names are present.
+        for name in ["chat_companion", "insight_extraction", "pde_decision", "embedding"] {
+            assert!(
+                cfg.tasks.contains_key(name),
+                "compat fixture missing task `{name}`"
+            );
+        }
+
+        // chat_companion — every field round-trips.
+        let chat = cfg.tasks.get("chat_companion").unwrap();
+        assert_eq!(chat.model, "x-ai/grok-4-fast");
+        assert_eq!(chat.fallback.as_deref(), Some("deepseek/deepseek-chat-v3.2"));
+        assert_eq!(chat.temperature, Some(0.85));
+        assert_eq!(chat.max_tokens, Some(600));
+        assert_eq!(chat.description, "AI companion chat");
+
+        // insight_extraction — same shape.
+        let insight = cfg.tasks.get("insight_extraction").unwrap();
+        assert_eq!(insight.model, "x-ai/grok-4-mini");
+        assert_eq!(
+            insight.fallback.as_deref(),
+            Some("deepseek/deepseek-chat-v3.2")
+        );
+        assert_eq!(insight.temperature, Some(0.3));
+        assert_eq!(insight.max_tokens, Some(400));
+
+        // pde_decision — reserved, partial fields.
+        let pde = cfg.tasks.get("pde_decision").unwrap();
+        assert_eq!(pde.model, "x-ai/grok-4-mini");
+        assert_eq!(pde.fallback, None);
+        assert_eq!(pde.temperature, Some(0.5));
+
+        // embedding — reserved, with `dimensions` set.
+        let emb = cfg.tasks.get("embedding").unwrap();
+        assert_eq!(emb.model, "voyage-3-lite");
+        assert_eq!(emb.dimensions, Some(512));
+
+        // Resolution behaviour on the live tasks.
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.model, "x-ai/grok-4-fast");
+        assert_eq!(r.fallback_model.as_deref(), Some("deepseek/deepseek-chat-v3.2"));
+        assert_eq!(r.temperature, 0.85);
+        assert_eq!(r.max_tokens, 600);
+
+        // Persona override only touches `model`; temperature / max_tokens
+        // stay on the task config.
+        let r = cfg.resolve("chat_companion", Some("anthropic/claude-sonnet-4"));
+        assert_eq!(r.model, "anthropic/claude-sonnet-4");
+        assert_eq!(r.temperature, 0.85);
+        assert_eq!(r.max_tokens, 600);
+    }
 }
