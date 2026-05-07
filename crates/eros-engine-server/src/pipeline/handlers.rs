@@ -18,6 +18,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
@@ -101,10 +102,11 @@ fn assemble_chat_request(
 
 // ─── Memory recall + insight injection helpers ────────────────────
 
-/// Embed `query_text` once, then fan out to profile + relationship layers
-/// in parallel. All errors degrade silently to empty vecs — recall failure
-/// must never block a chat reply (the persona just looks slightly less
-/// "with it" for that turn).
+/// Embed `query_text` once, then delegate to `recall_memory_with_embedding`.
+/// Empty query → returns (empty, empty) without hitting Voyage. Voyage
+/// failure also degrades silently to (empty, empty) — recall failure must
+/// never block a chat reply (the persona just looks slightly less "with
+/// it" for that turn).
 async fn recall_memory(
     state: &AppState,
     user_id: Uuid,
@@ -121,15 +123,23 @@ async fn recall_memory(
             return (vec![], vec![]);
         }
     };
-    let repo = MemoryRepo { pool: &state.pool };
+    recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding).await
+}
+
+/// Pure-DB inner half of memory recall. Takes a pre-computed embedding,
+/// fans out to profile + relationship layers in parallel via `tokio::join!`,
+/// and returns each layer's hits as `Vec<String>`. Split out from
+/// `recall_memory` so integration tests don't need a live Voyage client.
+async fn recall_memory_with_embedding(
+    pool: &PgPool,
+    user_id: Uuid,
+    instance_id: Uuid,
+    embedding: &[f32],
+) -> (Vec<String>, Vec<String>) {
+    let repo = MemoryRepo { pool };
     let (profile_res, rel_res) = tokio::join!(
-        repo.search(user_id, None, &embedding, PROFILE_RECALL_K),
-        repo.search(
-            user_id,
-            Some(instance_id),
-            &embedding,
-            RELATIONSHIP_RECALL_K,
-        ),
+        repo.search(user_id, None, embedding, PROFILE_RECALL_K),
+        repo.search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K),
     );
     let profile = match profile_res {
         Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
@@ -150,9 +160,11 @@ async fn recall_memory(
 
 /// Load `companion_insights` for the user and render the structured fields
 /// as Chinese-language bullets that fit naturally into the
-/// `【你对他的了解（通用画像）】` prompt section.
-async fn load_insight_bullets(state: &AppState, user_id: Uuid) -> Vec<String> {
-    let repo = InsightRepo { pool: &state.pool };
+/// `【你对他的了解（通用画像）】` prompt section. Takes `&PgPool` directly
+/// (not `&AppState`) so it's reachable from sqlx integration tests without
+/// constructing the full state.
+async fn load_insight_bullets(pool: &PgPool, user_id: Uuid) -> Vec<String> {
+    let repo = InsightRepo { pool };
     let row = match repo.load(user_id).await {
         Ok(Some(row)) => row,
         Ok(None) => return vec![],
@@ -243,7 +255,7 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
         // T14: prepend structured insights so the LLM sees both the JSONB
         // profile (e.g. city/MBTI) and the pgvector profile-layer recalls
         // in the same `【你对他的了解（通用画像）】` section.
-        let insight_bullets = load_insight_bullets(self.state, self.user_id).await;
+        let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
         if !insight_bullets.is_empty() {
             let mut combined = insight_bullets;
             combined.append(&mut profile_facts);
@@ -354,7 +366,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
         let (mut profile_facts, relationship_facts) =
             recall_memory(self.state, self.user_id, self.instance_id, query_text).await;
 
-        let insight_bullets = load_insight_bullets(self.state, self.user_id).await;
+        let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
         if !insight_bullets.is_empty() {
             let mut combined = insight_bullets;
             combined.append(&mut profile_facts);
@@ -512,6 +524,227 @@ mod tests {
                 "职业：工程师".to_string(),
                 "兴趣：登山".to_string(),
                 "性格特质：真诚".to_string(),
+            ]
+        );
+    }
+
+    // ─── Integration tests: recall_memory_with_embedding + load_insight_bullets ───
+    //
+    // These exercise the pure-DB halves of the recall pipeline against a
+    // live Postgres (via `#[sqlx::test]`). The Voyage-dependent outer
+    // wrapper `recall_memory` is intentionally not tested here — it would
+    // either need a live Voyage key or a trait-mock indirection that
+    // doesn't justify its weight for a single thin function.
+
+    use eros_engine_store::insight::InsightRepo;
+    use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+    use sqlx::PgPool;
+
+    /// Deterministic 512-dim "unit" vector with a single hot index. Two
+    /// different seeds produce orthogonal vectors → cosine distance = 1.0;
+    /// same seed → distance = 0.0. Lets us prove nearest-neighbour ordering
+    /// without floating-point fuzz.
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Option<Uuid>) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_empty_db_returns_empty(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let (profile, relationship) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(7)).await;
+        assert!(profile.is_empty());
+        assert!(relationship.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_isolates_layers(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // Same content text + same seed embedding written to BOTH layers
+        // — differentiated only by instance_id presence.
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "profile fact",
+            &unit_embedding(11),
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "relationship fact",
+            &unit_embedding(11),
+        )
+        .await
+        .unwrap();
+
+        let (profile, relationship) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(11)).await;
+        assert_eq!(profile, vec!["profile fact".to_string()]);
+        assert_eq!(relationship, vec!["relationship fact".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_respects_top_k(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // Insert 6 profile rows (K=4) and 5 relationship rows (K=3) with
+        // distinct embeddings so cosine ordering is well-defined.
+        for i in 0..6 {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                &format!("profile-{i}"),
+                &unit_embedding(100 + i),
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..5 {
+            repo.upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                user_id,
+                Some(instance_id),
+                &format!("relationship-{i}"),
+                &unit_embedding(200 + i),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (profile, relationship) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(100)).await;
+
+        assert_eq!(profile.len(), PROFILE_RECALL_K as usize);
+        assert_eq!(relationship.len(), RELATIONSHIP_RECALL_K as usize);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_picks_nearest_per_layer(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // Profile-layer target at seed 42, with two decoys.
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "profile target",
+            &unit_embedding(42),
+        )
+        .await
+        .unwrap();
+        for i in 0..2 {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                &format!("profile decoy-{i}"),
+                &unit_embedding(300 + i),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Relationship-layer target at seed 99, with one decoy.
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "relationship target",
+            &unit_embedding(99),
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "relationship decoy",
+            &unit_embedding(400),
+        )
+        .await
+        .unwrap();
+
+        // Query embedding hits the profile target seed exactly.
+        let (profile, _relationship) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(42)).await;
+        assert_eq!(profile.first().map(String::as_str), Some("profile target"));
+
+        // Query at the relationship target seed.
+        let (_profile2, relationship2) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(99)).await;
+        assert_eq!(
+            relationship2.first().map(String::as_str),
+            Some("relationship target"),
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_insight_bullets_returns_empty_when_no_row(pool: PgPool) {
+        let bullets = load_insight_bullets(&pool, Uuid::new_v4()).await;
+        assert!(bullets.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_insight_bullets_renders_after_merge(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let repo = InsightRepo { pool: &pool };
+
+        repo.merge(
+            user_id,
+            json!({
+                "city": "上海",
+                "mbti_guess": "INFP",
+                "interests": ["登山", "精酿"],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let bullets = load_insight_bullets(&pool, user_id).await;
+        assert_eq!(
+            bullets,
+            vec![
+                "城市：上海".to_string(),
+                "MBTI：INFP".to_string(),
+                "兴趣：登山、精酿".to_string(),
             ]
         );
     }
