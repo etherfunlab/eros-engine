@@ -9,9 +9,6 @@
 //! - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
 //!   JSONB instead of a flat `CompanionPersona` DTO
 
-// TODO(T11): used once chat routes call into the pipeline.
-#![allow(dead_code)]
-
 use chrono::{Timelike, Utc};
 
 use eros_engine_core::affinity::Affinity;

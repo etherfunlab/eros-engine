@@ -12,9 +12,6 @@
 //!   through `persist_with_event`.
 //! - `state.chat_engine` → `state.openrouter`.
 
-// TODO(T11): orchestrator becomes reachable once chat routes wire in.
-#![allow(dead_code)]
-
 pub mod handlers;
 pub mod post_process;
 

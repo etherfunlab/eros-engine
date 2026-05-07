@@ -16,9 +16,6 @@
 //! - `gift_records.affinity_applied` flip is dropped — there is no gift
 //!   ledger table in OSS.
 
-// TODO(T11): exercised end-to-end once chat routes are wired.
-#![allow(dead_code)]
-
 use uuid::Uuid;
 
 use eros_engine_core::types::{ActionPlan, ActionType, ChatResponse, Event};

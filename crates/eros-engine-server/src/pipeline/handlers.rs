@@ -16,9 +16,6 @@
 //!   no shop item / gift-record lookup since the OSS engine has no
 //!   credit ledger.
 
-// TODO(T11): handlers are exercised once chat routes are wired in.
-#![allow(dead_code)]
-
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
@@ -285,6 +282,11 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
 
 // ─── Ghost ──────────────────────────────────────────────────────────
 
+/// Ghost handler is intentionally a no-op at the chat-request layer:
+/// the affinity row update happens in `pipeline::post_process`. The
+/// `state` / `session_id` fields are kept for future tracing hooks and
+/// for symmetry with the other handlers.
+#[allow(dead_code)]
 pub struct GhostHandler<'a> {
     pub state: &'a AppState,
     pub session_id: Uuid,
@@ -317,7 +319,8 @@ pub struct GiftHandler<'a> {
     pub user_id: Uuid,
     pub instance_id: Uuid,
     /// Caller-supplied deltas — passed through to the post-process step
-    /// via the ActionPlan / event channel; not consumed here.
+    /// via the ActionPlan / event channel; not consumed inside `handle()`.
+    #[allow(dead_code)]
     pub deltas: AffinityDeltas,
     /// Caller-supplied pending gifts (possibly empty) for prompt context.
     pub pending: Vec<PendingGift>,
@@ -387,6 +390,10 @@ impl<'a> ActionHandler for GiftHandler<'a> {
 
 // ─── Proactive ──────────────────────────────────────────────────────
 
+/// Proactive handler is a stub today — Phase 6 in the gateway / a
+/// later OSS milestone produces an outbound message here. Fields kept
+/// for the eventual implementation.
+#[allow(dead_code)]
 pub struct ProactiveHandler<'a> {
     pub state: &'a AppState,
     pub session_id: Uuid,
