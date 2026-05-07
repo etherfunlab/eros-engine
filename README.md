@@ -9,6 +9,14 @@
 
 English · [中文](README.zh.md)
 
+## Key features
+
+- **Memory that grows with the user** — Two pgvector layers (cross-session profile + per-session relationship callbacks). The persona still remembers what you said weeks ago without re-stuffing the context window every turn. "She remembers" is structural, not prompt-engineered.
+
+- **Deterministic affinity, not prompt drift** — Closeness between user and persona is a six-dimensional numeric vector mutated every turn, not a paragraph of "you feel warmer toward the user now" baked into a system prompt. Numbers behave; prompt-injected feelings drift over a long session.
+
+- **User profile, structured and queryable** — Each turn quietly mines facts about the user (city, MBTI signals, love values, life rhythm, …) into a JSONB profile with a weighted training level. If you're building a companion, a journaling app, a coaching agent, or anything where actually knowing the user matters, the profile is structured — not a black-box vector — so you can drive whatever logic you want from it.
+
 ## What it does
 
 eros-engine is the conversational layer of a dating platform, carved out as a standalone service. Two things happen in every chat turn:
