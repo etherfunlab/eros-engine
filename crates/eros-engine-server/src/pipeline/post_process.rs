@@ -23,6 +23,7 @@ use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_llm::voyage::VoyageClient;
 use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 
@@ -102,6 +103,23 @@ async fn persist_affinity(
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
+    // Demo sessions get a faster blend so meters move within the turn budget.
+    // Stored on the session as `metadata.is_demo` at start-chat time.
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let is_demo = match chat_repo.get_session(session_id).await {
+        Ok(Some(s)) => s
+            .metadata
+            .get("is_demo")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    };
+    let ema_inertia = if is_demo {
+        state.config.demo_ema_inertia
+    } else {
+        state.config.ema_inertia
+    };
+
     let mut affinity = match repo.load_or_create(session_id, user_id, instance_id).await {
         Ok(mut a) => {
             a.apply_time_decay();
@@ -130,7 +148,7 @@ async fn persist_affinity(
                 .persist_with_event(
                     &mut affinity,
                     &deltas,
-                    state.config.ema_inertia,
+                    ema_inertia,
                     event_type,
                     serde_json::json!({}),
                 )

@@ -39,13 +39,27 @@ impl<'a> ChatRepo<'a> {
         user_id: Uuid,
         instance_id: Uuid,
     ) -> Result<ChatSession, sqlx::Error> {
+        self.create_session_with_metadata(user_id, instance_id, serde_json::json!({}))
+            .await
+    }
+
+    /// Create a session and seed `metadata` as the JSONB column. Used by
+    /// callers that need session-scoped flags (e.g. `is_demo`) the
+    /// pipeline reads later.
+    pub async fn create_session_with_metadata(
+        &self,
+        user_id: Uuid,
+        instance_id: Uuid,
+        metadata: serde_json::Value,
+    ) -> Result<ChatSession, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
-             VALUES ($1, $2) \
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, metadata) \
+             VALUES ($1, $2, $3) \
              RETURNING *",
         )
         .bind(user_id)
         .bind(instance_id)
+        .bind(metadata)
         .fetch_one(self.pool)
         .await
     }
