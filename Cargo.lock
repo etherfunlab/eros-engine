@@ -372,6 +372,7 @@ dependencies = [
  "eros-engine-llm",
  "eros-engine-store",
  "jsonwebtoken",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

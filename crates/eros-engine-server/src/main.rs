@@ -158,9 +158,39 @@ async fn run_server() -> Result<()> {
     }
     let voyage = Arc::new(eros_engine_llm::voyage::VoyageClient::new(voyage_key));
 
-    let jwt_secret =
-        std::env::var("SUPABASE_JWT_SECRET").context("SUPABASE_JWT_SECRET is required")?;
-    let auth: Arc<dyn AuthValidator> = Arc::new(SupabaseJwtValidator::new(jwt_secret));
+    // Auth: prefer JWKS (asymmetric, the post-2025 Supabase default) and
+    // fall back to a legacy HS256 shared secret if one is configured. At
+    // least one source must be wired or the server boots with a validator
+    // that rejects every token (fail-closed).
+    //
+    // - SUPABASE_JWKS_URL: explicit override.
+    // - SUPABASE_URL: derive `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
+    // - SUPABASE_JWT_SECRET: legacy HS256 shared secret (optional).
+    let mut validator = SupabaseJwtValidator::new();
+    let jwks_url = std::env::var("SUPABASE_JWKS_URL").ok().or_else(|| {
+        std::env::var("SUPABASE_URL")
+            .ok()
+            .map(|u| format!("{}/auth/v1/.well-known/jwks.json", u.trim_end_matches('/')))
+    });
+    if let Some(url) = jwks_url.as_deref() {
+        validator = validator
+            .with_jwks_url(url)
+            .await
+            .with_context(|| format!("failed to load Supabase JWKS from {url}"))?;
+    }
+    if let Ok(secret) = std::env::var("SUPABASE_JWT_SECRET") {
+        if !secret.is_empty() {
+            validator = validator.with_legacy_secret(secret);
+        }
+    }
+    if jwks_url.is_none() && std::env::var("SUPABASE_JWT_SECRET").ok().is_none() {
+        anyhow::bail!(
+            "no JWT validation source configured: set SUPABASE_URL (preferred) \
+             or SUPABASE_JWKS_URL for asymmetric JWT validation, and/or \
+             SUPABASE_JWT_SECRET for the legacy HS256 path"
+        );
+    }
+    let auth: Arc<dyn AuthValidator> = Arc::new(validator);
 
     // model_config: env override > examples/model_config.toml dev default.
     // T14's Dockerfile sets MODEL_CONFIG_PATH=/etc/eros-engine/model_config.toml
