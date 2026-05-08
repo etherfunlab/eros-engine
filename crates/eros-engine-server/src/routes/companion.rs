@@ -906,7 +906,8 @@ mod tests {
     }
 
     fn test_state(pool: PgPool) -> AppState {
-        let auth: Arc<dyn AuthValidator> = Arc::new(SupabaseJwtValidator::new(TEST_SECRET.into()));
+        let auth: Arc<dyn AuthValidator> =
+            Arc::new(SupabaseJwtValidator::new().with_legacy_secret(TEST_SECRET.into()));
         AppState {
             pool,
             auth,
