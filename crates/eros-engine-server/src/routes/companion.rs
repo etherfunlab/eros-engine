@@ -81,6 +81,12 @@ pub struct StartChatRequest {
     pub instance_id: Option<Uuid>,
     /// Optional genome id. Required when `instance_id` is absent.
     pub genome_id: Option<Uuid>,
+    /// Mark the new session as a demo. Persisted to `metadata.is_demo` and
+    /// read by the affinity pipeline to apply `demo_ema_inertia` instead
+    /// of the global value, so meters move visibly within the turn budget.
+    /// Ignored when resuming an existing session.
+    #[serde(default)]
+    pub is_demo: Option<bool>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -430,7 +436,14 @@ async fn start_chat(
             (s.id, false)
         }
         None => {
-            let s = chat_repo.create_session(user_id, instance_id).await?;
+            let metadata = if req.is_demo.unwrap_or(false) {
+                serde_json::json!({ "is_demo": true })
+            } else {
+                serde_json::json!({})
+            };
+            let s = chat_repo
+                .create_session_with_metadata(user_id, instance_id, metadata)
+                .await?;
             (s.id, true)
         }
     };
@@ -914,6 +927,7 @@ mod tests {
             config: crate::state::ServerConfig {
                 expose_affinity_debug: true,
                 ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
+                demo_ema_inertia: 0.0,
                 bind_addr: "127.0.0.1:0".into(),
             },
             openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
