@@ -930,9 +930,10 @@ mod tests {
                 demo_ema_inertia: 0.0,
                 bind_addr: "127.0.0.1:0".into(),
                 // Sweeper disabled in tests — unit tests don't spawn it
-                // and the field is just for AppState completeness.
+                // and the fields are just for AppState completeness.
                 dreaming_tick: std::time::Duration::ZERO,
                 dreaming_idle_threshold: std::time::Duration::from_secs(1800),
+                dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
             },
             openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
                 "stub".into(),

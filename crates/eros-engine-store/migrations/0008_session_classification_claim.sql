@@ -1,0 +1,26 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Multi-instance safe claim sentinel for the dreaming-lite sweeper.
+--
+-- The picker now runs as
+--   UPDATE chat_sessions SET classification_claimed_at = now()
+--   WHERE id IN (
+--     SELECT id FROM chat_sessions
+--     WHERE classified_at IS NULL
+--       AND last_active_at < $cutoff
+--       AND (classification_claimed_at IS NULL
+--            OR classification_claimed_at < $stale_cutoff)
+--     ORDER BY last_active_at LIMIT $batch
+--     FOR UPDATE SKIP LOCKED)
+--   RETURNING id, user_id, instance_id;
+--
+-- so two sweeper instances racing on the same row see one of them get
+-- the SKIP LOCKED brush-off rather than both processing the same session.
+-- The claim is set in a single atomic statement — no transaction stays
+-- open across the subsequent LLM / Voyage HTTP calls.
+--
+-- Recovery: if a worker crashes after claiming but before stamping
+-- classified_at, the row sits with a non-NULL classification_claimed_at
+-- and NULL classified_at. After DREAMING_CLAIM_STALE_SECS (default 600)
+-- the next tick will treat the claim as stale and re-pick it.
+ALTER TABLE engine.chat_sessions
+    ADD COLUMN classification_claimed_at TIMESTAMPTZ;
