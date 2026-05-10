@@ -223,9 +223,19 @@ async fn embed_and_upsert(
         .embed_document(content)
         .await
         .map_err(|e| format!("voyage embed failed: {e}"))?;
-    repo.upsert(layer, session_id, user_id, instance_id, content, &embedding)
-        .await
-        .map_err(|e| format!("memory insert failed: {e}"))?;
+    // category=None: this writer dumps raw turns. The classifier extraction
+    // step (future) will write its own rows with category populated.
+    repo.upsert(
+        layer,
+        session_id,
+        user_id,
+        instance_id,
+        content,
+        &embedding,
+        None,
+    )
+    .await
+    .map_err(|e| format!("memory insert failed: {e}"))?;
     Ok(())
 }
 

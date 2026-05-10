@@ -608,6 +608,7 @@ mod tests {
             None,
             "profile fact",
             &unit_embedding(11),
+            None,
         )
         .await
         .unwrap();
@@ -618,6 +619,7 @@ mod tests {
             Some(instance_id),
             "relationship fact",
             &unit_embedding(11),
+            None,
         )
         .await
         .unwrap();
@@ -645,6 +647,7 @@ mod tests {
                 None,
                 &format!("profile-{i}"),
                 &unit_embedding(100 + i),
+                None,
             )
             .await
             .unwrap();
@@ -657,6 +660,7 @@ mod tests {
                 Some(instance_id),
                 &format!("relationship-{i}"),
                 &unit_embedding(200 + i),
+                None,
             )
             .await
             .unwrap();
@@ -684,6 +688,7 @@ mod tests {
             None,
             "profile target",
             &unit_embedding(42),
+            None,
         )
         .await
         .unwrap();
@@ -695,6 +700,7 @@ mod tests {
                 None,
                 &format!("profile decoy-{i}"),
                 &unit_embedding(300 + i),
+                None,
             )
             .await
             .unwrap();
@@ -708,6 +714,7 @@ mod tests {
             Some(instance_id),
             "relationship target",
             &unit_embedding(99),
+            None,
         )
         .await
         .unwrap();
@@ -718,6 +725,7 @@ mod tests {
             Some(instance_id),
             "relationship decoy",
             &unit_embedding(400),
+            None,
         )
         .await
         .unwrap();

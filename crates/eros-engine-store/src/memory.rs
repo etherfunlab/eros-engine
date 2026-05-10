@@ -40,6 +40,10 @@ pub struct MemoryRow {
     pub user_id: Uuid,
     pub instance_id: Option<Uuid>,
     pub content: String,
+    /// Optional classifier tag (e.g. `"fact"`, `"preference"`, `"event"`).
+    /// `None` for rows written by the raw-turn writer; populated once the
+    /// classifier extraction step lands.
+    pub category: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -50,6 +54,9 @@ pub struct MemoryRepo<'a> {
 impl<'a> MemoryRepo<'a> {
     /// Insert a memory row. For `Profile`, `instance_id` is forced to `None`.
     /// For `Relationship`, the caller MUST pass `Some(instance_id)`.
+    /// `category` is an optional classifier tag — pass `None` from
+    /// the raw-turn writer; the future extraction step will populate it.
+    #[allow(clippy::too_many_arguments)] // each arg is a distinct concern
     pub async fn upsert(
         &self,
         layer: MemoryLayer,
@@ -58,6 +65,7 @@ impl<'a> MemoryRepo<'a> {
         instance_id: Option<Uuid>,
         content: &str,
         embedding: &[f32],
+        category: Option<&str>,
     ) -> Result<Uuid, sqlx::Error> {
         let resolved_instance = match layer {
             MemoryLayer::Profile => None,
@@ -67,14 +75,15 @@ impl<'a> MemoryRepo<'a> {
 
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.companion_memories \
-                 (session_id, user_id, instance_id, content, embedding) \
-             VALUES ($1, $2, $3, $4, $5::vector) RETURNING id",
+                 (session_id, user_id, instance_id, content, embedding, category) \
+             VALUES ($1, $2, $3, $4, $5::vector, $6) RETURNING id",
         )
         .bind(session_id)
         .bind(user_id)
         .bind(resolved_instance)
         .bind(content)
         .bind(vec_text)
+        .bind(category)
         .fetch_one(self.pool)
         .await?;
         Ok(id)
@@ -96,7 +105,7 @@ impl<'a> MemoryRepo<'a> {
         match instance_id {
             Some(pid) => {
                 sqlx::query_as::<_, MemoryRow>(
-                    "SELECT id, session_id, user_id, instance_id, content, created_at \
+                    "SELECT id, session_id, user_id, instance_id, content, category, created_at \
                      FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id = $2 \
                      ORDER BY embedding <=> $3::vector \
@@ -111,7 +120,7 @@ impl<'a> MemoryRepo<'a> {
             }
             None => {
                 sqlx::query_as::<_, MemoryRow>(
-                    "SELECT id, session_id, user_id, instance_id, content, created_at \
+                    "SELECT id, session_id, user_id, instance_id, content, category, created_at \
                      FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id IS NULL \
                      ORDER BY embedding <=> $2::vector \
@@ -166,6 +175,7 @@ mod tests {
                 Some(instance_id),
                 "user lives in shanghai",
                 &emb,
+                None,
             )
             .await
             .unwrap();
@@ -195,6 +205,7 @@ mod tests {
                 Some(instance_id),
                 "target",
                 &unit_embedding(42),
+                None,
             )
             .await
             .unwrap();
@@ -205,6 +216,7 @@ mod tests {
             Some(instance_id),
             "decoy a",
             &unit_embedding(100),
+            None,
         )
         .await
         .unwrap();
@@ -215,6 +227,7 @@ mod tests {
             Some(instance_id),
             "decoy b",
             &unit_embedding(200),
+            None,
         )
         .await
         .unwrap();
@@ -225,6 +238,48 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, target_id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn category_roundtrips_through_search(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "tagged",
+            &unit_embedding(33),
+            Some("preference"),
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "untagged",
+            &unit_embedding(34),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut hits = repo
+            .search(user_id, Some(instance_id), &unit_embedding(33), 10)
+            .await
+            .unwrap();
+        hits.sort_by_key(|r| r.content.clone());
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].content, "tagged");
+        assert_eq!(hits[0].category.as_deref(), Some("preference"));
+        assert_eq!(hits[1].content, "untagged");
+        assert_eq!(hits[1].category, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -242,6 +297,7 @@ mod tests {
             Some(instance_id), // ignored
             "profile fact",
             &unit_embedding(11),
+            None,
         )
         .await
         .unwrap();
@@ -253,6 +309,7 @@ mod tests {
             Some(instance_id),
             "relationship fact",
             &unit_embedding(11),
+            None,
         )
         .await
         .unwrap();
