@@ -2,6 +2,7 @@
 
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,6 +23,13 @@ pub struct ServerConfig {
     /// visibly across an 8-turn demo. Falls back to `ema_inertia` if unset.
     pub demo_ema_inertia: f64,
     pub bind_addr: String,
+    /// How often the dreaming-lite sweeper wakes up to look for idle
+    /// sessions. Set to `Duration::ZERO` (env `DREAMING_DISABLED=1`) to
+    /// skip spawning the sweeper entirely — useful for unit-test runs.
+    pub dreaming_tick: Duration,
+    /// Minimum idle time on `chat_sessions.last_active_at` before a
+    /// session becomes eligible for classification.
+    pub dreaming_idle_threshold: Duration,
 }
 
 impl ServerConfig {
@@ -30,6 +38,25 @@ impl ServerConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.8);
+        let dreaming_disabled = std::env::var("DREAMING_DISABLED")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let dreaming_tick = if dreaming_disabled {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(
+                std::env::var("DREAMING_TICK_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300),
+            )
+        };
+        let dreaming_idle_threshold = Duration::from_secs(
+            std::env::var("DREAMING_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800),
+        );
         Self {
             expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
                 .map(|v| v == "true" || v == "1")
@@ -40,6 +67,8 @@ impl ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.3),
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            dreaming_tick,
+            dreaming_idle_threshold,
         }
     }
 }

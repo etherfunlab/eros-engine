@@ -14,6 +14,17 @@ fallback = "deepseek/deepseek-chat-v3.2"
 temperature = 0.3
 max_tokens = 400
 
+# Session-end memory extraction (dreaming-lite). Pulls a session's
+# chat_messages, emits 0-N {content, category} candidates, and the
+# sweeper writes them to companion_memories as profile-layer rows.
+# Haiku 4.5 is the cheapest model with reliable structured-JSON output;
+# grok-4-mini fallback keeps the no-OpenAI invariant if Anthropic is down.
+[tasks.memory_extraction]
+model = "anthropic/claude-haiku-4-5"
+fallback = "x-ai/grok-4-mini"
+temperature = 0.2
+max_tokens = 800
+
 # Reserved — not consumed by current code. The PDE in
 # `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a
 # placeholder for a future optional LLM decision layer.

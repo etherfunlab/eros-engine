@@ -221,6 +221,12 @@ async fn run_server() -> Result<()> {
         .merge(routes::router(state.clone()))
         .split_for_parts();
 
+    // Spawn the dreaming-lite sweeper alongside the HTTP service. Returns
+    // immediately when DREAMING_DISABLED=1 (or tick=0) is set, so unit
+    // tests and self-hosters who want only synchronous behaviour can opt out.
+    // Cloned because the next line moves `state` into the router.
+    tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))

@@ -15,6 +15,9 @@ pub struct ChatSession {
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
+    /// Set by the dreaming-lite sweeper after a classification pass.
+    /// `None` means the session is still eligible for the next sweep tick.
+    pub classified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
