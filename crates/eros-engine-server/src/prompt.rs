@@ -200,10 +200,16 @@ fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<Str
 }
 
 /// Build the full companion system prompt (plain-text reply schema).
+///
+/// `profile_groups` is a list of `(label, bullets)` pairs that get rendered
+/// as labeled sub-sections under `【你对他的了解（通用画像）】`. Caller
+/// decides labels — typically `("基础画像", insight_bullets)` first, then
+/// one entry per memory category (`客观事实` / `偏好` / `最近发生` / etc.)
+/// from the dreaming-lite classifier. Empty groups are dropped.
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
 pub fn build_prompt(
     persona: &CompanionPersona,
-    profile_facts: &[String],
+    profile_groups: &[(String, Vec<String>)],
     relationship_facts: &[String],
     affinity: Option<&Affinity>,
     pending_gifts: &[PendingGift],
@@ -223,14 +229,25 @@ pub fn build_prompt(
     let topics_str =
         meta_string_array_joined(persona, "topics").unwrap_or_else(|| "日常生活、感情观".into());
 
-    let profile_str = if profile_facts.is_empty() {
+    let non_empty_groups: Vec<&(String, Vec<String>)> = profile_groups
+        .iter()
+        .filter(|(_, items)| !items.is_empty())
+        .collect();
+    let profile_str = if non_empty_groups.is_empty() {
         "（刚认识，还不了解他）".to_string()
     } else {
-        profile_facts
+        non_empty_groups
             .iter()
-            .map(|f| format!("- {f}"))
+            .map(|(label, items)| {
+                let bullets = items
+                    .iter()
+                    .map(|f| format!("- {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("[{label}]\n{bullets}")
+            })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
     };
     let rel_str = if relationship_facts.is_empty() {
         "（还没有专属记忆，慢慢来）".to_string()

@@ -36,6 +36,10 @@ use crate::state::AppState;
 /// (`profile=4`, `relationship=3`). Tunable later if recall quality drifts.
 const PROFILE_RECALL_K: i32 = 4;
 const RELATIONSHIP_RECALL_K: i32 = 3;
+/// Per-category top-K for the dreaming-lite categorised profile rows.
+/// Five categories × 2 = at most 10 lines of grouped profile context;
+/// kept small so the prompt doesn't bloat once classification fills in.
+const K_PER_CATEGORY: i32 = 2;
 
 /// Task key used by all chat handlers. Matches the gateway's task router.
 const CHAT_TASK: &str = "chat_companion";
@@ -112,7 +116,7 @@ async fn recall_memory(
     user_id: Uuid,
     instance_id: Uuid,
     query_text: &str,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     if query_text.trim().is_empty() {
         return (vec![], vec![]);
     }
@@ -135,27 +139,35 @@ async fn recall_memory(
 }
 
 /// Pure-DB inner half of memory recall. Takes a pre-computed embedding,
-/// fans out to profile + relationship layers in parallel via `tokio::join!`,
-/// and returns each layer's hits as `Vec<String>`. Split out from
-/// `recall_memory` so integration tests don't need a live Voyage client.
+/// fans out to profile (categorised + raw fallback) + relationship layers
+/// in parallel via `tokio::join!`, and returns:
+/// - profile_groups: `Vec<(label, bullets)>` — categorised rows grouped by
+///   `category` if any exist; otherwise a single `("近况", raw_rows)` group
+///   so users with no classified sessions yet still get profile context.
+/// - relationship: flat `Vec<String>` — relationship rows are full turn
+///   dumps and not categorised by the dreaming-lite pass.
 async fn recall_memory_with_embedding(
     pool: &PgPool,
     user_id: Uuid,
     instance_id: Uuid,
     embedding: &[f32],
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     let repo = MemoryRepo { pool };
-    let (profile_res, rel_res) = tokio::join!(
+    let (grouped_res, raw_res, rel_res) = tokio::join!(
+        repo.search_profile_grouped(user_id, embedding, K_PER_CATEGORY),
         repo.search(user_id, None, embedding, PROFILE_RECALL_K),
         repo.search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K),
     );
-    let profile = match profile_res {
-        Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
-        Err(e) => {
-            tracing::warn!("profile-layer memory search failed: {e}");
-            vec![]
-        }
-    };
+    let grouped_rows = grouped_res.unwrap_or_else(|e| {
+        tracing::warn!("profile-layer grouped search failed: {e}");
+        vec![]
+    });
+    let raw_rows = raw_res.unwrap_or_else(|e| {
+        tracing::warn!("profile-layer raw search failed: {e}");
+        vec![]
+    });
+    let profile_groups = build_profile_groups(grouped_rows, raw_rows);
+
     let relationship: Vec<String> = match rel_res {
         Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
         Err(e) => {
@@ -163,19 +175,69 @@ async fn recall_memory_with_embedding(
             vec![]
         }
     };
-    // Observation hook — see `recall_memory` for rationale. Includes total
-    // bytes per layer so an operator can spot "lots of short fragments vs
-    // few long fragments" patterns when tuning K or threshold.
+
+    let profile_total_chars: usize = profile_groups
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|s| s.chars().count()))
+        .sum();
     tracing::debug!(
         user_id = %user_id,
         instance_id = %instance_id,
-        profile_hits = profile.len(),
+        profile_groups = profile_groups.len(),
+        profile_total_chars,
         relationship_hits = relationship.len(),
-        profile_total_chars = profile.iter().map(|s| s.chars().count()).sum::<usize>(),
         relationship_total_chars = relationship.iter().map(|s| s.chars().count()).sum::<usize>(),
         "recall_memory_with_embedding: completed"
     );
-    (profile, relationship)
+    (profile_groups, relationship)
+}
+
+/// Map a raw category tag (`fact` / `preference` / ...) to its Chinese
+/// section label as it should appear in the prompt. Unknown tags fall
+/// back to "其他" — the dreaming-lite classifier already normalises to a
+/// fixed vocabulary, so this branch should be unreachable in practice.
+fn category_label(category: &str) -> &'static str {
+    match category {
+        "fact" => "客观事实",
+        "preference" => "偏好",
+        "event" => "最近发生",
+        "emotion" => "情绪倾向",
+        "relation" => "人际关系",
+        _ => "其他",
+    }
+}
+
+/// Turn the SQL outputs into the grouped shape `build_prompt` expects.
+///
+/// - If any categorised rows exist: render only those, grouped by
+///   category, in the order returned by SQL (already sorted by category
+///   then per-category proximity).
+/// - Otherwise: fall back to the flat top-K raw rows under a single
+///   "近况" label so newly-onboarded users still get profile context
+///   before their first dreaming sweep runs.
+fn build_profile_groups(
+    grouped_rows: Vec<eros_engine_store::memory::MemoryRow>,
+    raw_rows: Vec<eros_engine_store::memory::MemoryRow>,
+) -> Vec<(String, Vec<String>)> {
+    if !grouped_rows.is_empty() {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in grouped_rows {
+            let cat = row.category.clone().unwrap_or_default();
+            let label = category_label(&cat).to_string();
+            match out.last_mut() {
+                Some((existing, items)) if existing == &label => items.push(row.content),
+                _ => out.push((label, vec![row.content])),
+            }
+        }
+        return out;
+    }
+    if !raw_rows.is_empty() {
+        return vec![(
+            "近况".into(),
+            raw_rows.into_iter().map(|r| r.content).collect(),
+        )];
+    }
+    vec![]
 }
 
 /// Load `companion_insights` for the user and render the structured fields
@@ -269,17 +331,18 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
             _ => "",
         };
 
-        let (mut profile_facts, relationship_facts) =
+        let (mut profile_groups, relationship_facts) =
             recall_memory(self.state, self.user_id, self.instance_id, query_text).await;
 
-        // T14: prepend structured insights so the LLM sees both the JSONB
-        // profile (e.g. city/MBTI) and the pgvector profile-layer recalls
-        // in the same `【你对他的了解（通用画像）】` section.
+        // T14: prepend structured insights as a labelled group so the LLM
+        // sees both the JSONB profile (city/MBTI/...) and the categorised
+        // pgvector recalls under the same `【你对他的了解（通用画像）】`
+        // section. "基础画像" anchors at position 0 so it always renders
+        // first regardless of which categories the dreaming-lite pass
+        // happens to have populated.
         let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
         if !insight_bullets.is_empty() {
-            let mut combined = insight_bullets;
-            combined.append(&mut profile_facts);
-            profile_facts = combined;
+            profile_groups.insert(0, ("基础画像".into(), insight_bullets));
         }
 
         let tip_personality = input
@@ -294,7 +357,7 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
 
         let system_prompt = build_prompt(
             &input.persona,
-            &profile_facts,
+            &profile_groups,
             &relationship_facts,
             Some(&input.affinity),
             &pending_gifts,
@@ -383,14 +446,12 @@ impl<'a> ActionHandler for GiftHandler<'a> {
             .map(|m| m.content.as_str())
             .unwrap_or("");
 
-        let (mut profile_facts, relationship_facts) =
+        let (mut profile_groups, relationship_facts) =
             recall_memory(self.state, self.user_id, self.instance_id, query_text).await;
 
         let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
         if !insight_bullets.is_empty() {
-            let mut combined = insight_bullets;
-            combined.append(&mut profile_facts);
-            profile_facts = combined;
+            profile_groups.insert(0, ("基础画像".into(), insight_bullets));
         }
 
         let tip_personality = input
@@ -402,7 +463,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
 
         let system_prompt = build_prompt(
             &input.persona,
-            &profile_facts,
+            &profile_groups,
             &relationship_facts,
             Some(&input.affinity),
             &self.pending,
@@ -600,7 +661,9 @@ mod tests {
         let repo = MemoryRepo { pool: &pool };
 
         // Same content text + same seed embedding written to BOTH layers
-        // — differentiated only by instance_id presence.
+        // — differentiated only by instance_id presence. Both have
+        // category=NULL so the profile side hits the raw-fallback branch,
+        // surfacing under the "近况" group label.
         repo.upsert(
             MemoryLayer::Profile,
             session_id,
@@ -624,10 +687,76 @@ mod tests {
         .await
         .unwrap();
 
-        let (profile, relationship) =
+        let (profile_groups, relationship) =
             recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(11)).await;
-        assert_eq!(profile, vec!["profile fact".to_string()]);
+        assert_eq!(
+            profile_groups,
+            vec![("近况".to_string(), vec!["profile fact".to_string()])]
+        );
         assert_eq!(relationship, vec!["relationship fact".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_groups_categorised_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // A categorised profile row trumps the raw-fallback branch.
+        // Mix categorised + raw to confirm the raw row is excluded once
+        // any categorised row exists.
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "lives in shanghai",
+            &unit_embedding(7),
+            Some("fact"),
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "loves coffee",
+            &unit_embedding(8),
+            Some("preference"),
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "raw turn dump — should be filtered out",
+            &unit_embedding(9),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (profile_groups, _relationship) =
+            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(7)).await;
+
+        // Categorised rows surfaced; raw row dropped because grouped path won.
+        let labels: Vec<&str> = profile_groups.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"客观事实"));
+        assert!(labels.contains(&"偏好"));
+        assert!(!labels.contains(&"近况"));
+        let all_contents: Vec<&String> = profile_groups
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .collect();
+        assert!(all_contents
+            .iter()
+            .any(|s| s.as_str() == "lives in shanghai"));
+        assert!(all_contents.iter().any(|s| s.as_str() == "loves coffee"));
+        assert!(!all_contents.iter().any(|s| s.contains("raw turn dump")));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -666,10 +795,14 @@ mod tests {
             .unwrap();
         }
 
-        let (profile, relationship) =
+        let (profile_groups, relationship) =
             recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(100)).await;
 
-        assert_eq!(profile.len(), PROFILE_RECALL_K as usize);
+        // No categorised rows exist → raw fallback fires under "近况"
+        // with PROFILE_RECALL_K entries from the cosine top-K.
+        assert_eq!(profile_groups.len(), 1);
+        assert_eq!(profile_groups[0].0, "近况");
+        assert_eq!(profile_groups[0].1.len(), PROFILE_RECALL_K as usize);
         assert_eq!(relationship.len(), RELATIONSHIP_RECALL_K as usize);
     }
 
@@ -730,10 +863,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Query embedding hits the profile target seed exactly.
-        let (profile, _relationship) =
+        // Query embedding hits the profile target seed exactly. All rows
+        // here are uncategorised, so the raw fallback fires under "近况"
+        // and its first item is the cosine-nearest one.
+        let (profile_groups, _relationship) =
             recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(42)).await;
-        assert_eq!(profile.first().map(String::as_str), Some("profile target"));
+        assert_eq!(profile_groups.len(), 1);
+        assert_eq!(profile_groups[0].0, "近况");
+        assert_eq!(
+            profile_groups[0].1.first().map(String::as_str),
+            Some("profile target"),
+        );
 
         // Query at the relationship target seed.
         let (_profile2, relationship2) =
