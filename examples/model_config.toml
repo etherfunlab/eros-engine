@@ -20,7 +20,7 @@ max_tokens = 400
 # Haiku 4.5 is the cheapest model with reliable structured-JSON output;
 # grok-4-mini fallback keeps the no-OpenAI invariant if Anthropic is down.
 [tasks.memory_extraction]
-model = "anthropic/claude-haiku-4-5"
+model = "anthropic/claude-haiku-4.5"
 fallback = "x-ai/grok-4-mini"
 temperature = 0.2
 max_tokens = 800
