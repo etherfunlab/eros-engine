@@ -7,9 +7,14 @@
 //! written to `engine.companion_memories` as profile-layer rows; the
 //! session's `classified_at` is then stamped to suppress re-sweeps.
 //!
-//! Single-instance assumption: with multiple replicas the picker query
-//! would need `FOR UPDATE SKIP LOCKED` to avoid double-classifying the
-//! same session. OSS v1 ships single-instance.
+//! Multi-instance safety: the picker uses an atomic
+//! `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
+//! RETURNING ...` to claim rows in one statement. Concurrent sweepers
+//! see disjoint sets and don't race on the same session. A separate
+//! `classification_claimed_at` column carries the claim sentinel; if a
+//! worker crashes after claiming but before stamping `classified_at`,
+//! the row is re-eligible after `DREAMING_CLAIM_STALE_SECS` (default
+//! 600s).
 //!
 //! Failure handling:
 //! - Network/DB error during pick or stamp → propagate, retry next tick.
@@ -42,17 +47,18 @@ struct MemoryCandidate {
 pub async fn sweeper(state: AppState) {
     let interval = state.config.dreaming_tick;
     let idle = state.config.dreaming_idle_threshold;
+    let claim_stale = state.config.dreaming_claim_stale_threshold;
     if interval.is_zero() {
         tracing::info!("dreaming sweeper disabled (DREAMING_DISABLED=1 or tick=0)");
         return;
     }
-    tracing::info!(?interval, ?idle, "dreaming sweeper starting");
+    tracing::info!(?interval, ?idle, ?claim_stale, "dreaming sweeper starting");
 
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        match scan_and_classify(&state, idle).await {
+        match scan_and_classify(&state, idle, claim_stale).await {
             Ok(0) => {} // quiet — common case on a low-traffic instance
             Ok(n) => tracing::info!(processed = n, "dreaming: sessions classified"),
             Err(e) => tracing::warn!("dreaming scan failed: {e}"),
@@ -60,16 +66,43 @@ pub async fn sweeper(state: AppState) {
     }
 }
 
-/// One sweep tick: pick eligible sessions, classify each in turn.
-async fn scan_and_classify(state: &AppState, idle: Duration) -> Result<usize, sqlx::Error> {
-    let cutoff = Utc::now() - chrono::Duration::from_std(idle).unwrap_or_default();
+/// Atomically claim eligible sessions and classify each in turn.
+///
+/// The picker fuses "find idle sessions" and "stamp them as claimed" into
+/// a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
+/// RETURNING ...` statement so concurrent sweeper instances can't both
+/// pick the same row. The claim is set in this one quick statement — no
+/// transaction stays open across the LLM / Voyage HTTP calls that follow.
+///
+/// Stale claim recovery: rows with `classification_claimed_at < now() -
+/// claim_stale` are eligible again, so a worker that crashed mid-pass
+/// gets re-tried automatically.
+async fn scan_and_classify(
+    state: &AppState,
+    idle: Duration,
+    claim_stale: Duration,
+) -> Result<usize, sqlx::Error> {
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::from_std(idle).unwrap_or_default();
+    let stale_cutoff = now - chrono::Duration::from_std(claim_stale).unwrap_or_default();
+
     let sessions: Vec<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
-        "SELECT id, user_id, instance_id FROM engine.chat_sessions \
-         WHERE classified_at IS NULL AND last_active_at < $1 \
-         ORDER BY last_active_at \
-         LIMIT $2",
+        "UPDATE engine.chat_sessions \
+         SET classification_claimed_at = now() \
+         WHERE id IN ( \
+             SELECT id FROM engine.chat_sessions \
+             WHERE classified_at IS NULL \
+               AND last_active_at < $1 \
+               AND (classification_claimed_at IS NULL \
+                    OR classification_claimed_at < $2) \
+             ORDER BY last_active_at \
+             LIMIT $3 \
+             FOR UPDATE SKIP LOCKED \
+         ) \
+         RETURNING id, user_id, instance_id",
     )
     .bind(cutoff)
+    .bind(stale_cutoff)
     .bind(PICK_BATCH)
     .fetch_all(&state.pool)
     .await?;

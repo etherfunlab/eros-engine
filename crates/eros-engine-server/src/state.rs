@@ -30,6 +30,11 @@ pub struct ServerConfig {
     /// Minimum idle time on `chat_sessions.last_active_at` before a
     /// session becomes eligible for classification.
     pub dreaming_idle_threshold: Duration,
+    /// How long a `classification_claimed_at` claim is considered fresh.
+    /// Older than this and the picker treats it as a crashed worker and
+    /// re-claims the row. Should comfortably exceed the worst-case
+    /// processing time (one LLM call + N voyage embeddings).
+    pub dreaming_claim_stale_threshold: Duration,
 }
 
 impl ServerConfig {
@@ -57,6 +62,12 @@ impl ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
         );
+        let dreaming_claim_stale_threshold = Duration::from_secs(
+            std::env::var("DREAMING_CLAIM_STALE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+        );
         Self {
             expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
                 .map(|v| v == "true" || v == "1")
@@ -69,6 +80,7 @@ impl ServerConfig {
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             dreaming_tick,
             dreaming_idle_threshold,
+            dreaming_claim_stale_threshold,
         }
     }
 }

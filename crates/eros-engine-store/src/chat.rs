@@ -18,6 +18,13 @@ pub struct ChatSession {
     /// Set by the dreaming-lite sweeper after a classification pass.
     /// `None` means the session is still eligible for the next sweep tick.
     pub classified_at: Option<DateTime<Utc>>,
+    /// Set by the dreaming-lite picker when it claims a session for
+    /// processing — the claim sentinel that makes multi-instance
+    /// sweepers safe via `FOR UPDATE SKIP LOCKED`. A non-NULL value
+    /// older than `DREAMING_CLAIM_STALE_SECS` is treated as a crashed
+    /// worker and re-claimable. Cleared implicitly by `classified_at`
+    /// being set on a successful pass.
+    pub classification_claimed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
