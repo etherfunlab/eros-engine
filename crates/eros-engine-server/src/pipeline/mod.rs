@@ -12,6 +12,7 @@
 //!   through `persist_with_event`.
 //! - `state.chat_engine` → `state.openrouter`.
 
+pub mod dreaming;
 pub mod handlers;
 pub mod post_process;
 

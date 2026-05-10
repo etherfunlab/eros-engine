@@ -355,6 +355,39 @@ pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
     )
 }
 
+/// Session-end memory extraction prompt: feed the LLM all turns from a
+/// finished (idle) session and ask it to emit 0-N memory candidates with
+/// a category tag. Output expected as
+/// `{"memories": [{"content": "...", "category": "fact"}, ...]}` —
+/// `parse_memory_candidates` in `pipeline::dreaming` handles the
+/// fenced-JSON fallback the same way `parse_facts` does.
+///
+/// `turns` is the chronologically ordered list of `用户：X / AI：Y` lines
+/// (or whatever pre-format the caller chose); the prompt does not assume
+/// a specific shape beyond "this is the conversation".
+pub fn extract_memories_prompt(turns: &[String]) -> String {
+    let convo = turns.join("\n");
+    format!(
+        "下面是一段已经结束的对话。提取 0-10 条值得长期记住的关于「用户」的记忆条目，\
+         每条带一个 category 标签。\n\n\
+         category 取值（只能用这五种之一）：\n\
+         - fact: 客观事实，如住在哪、做什么工作、家庭状况\n\
+         - preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味\n\
+         - event: 发生的事件，如最近发生了什么、经历过什么\n\
+         - emotion: 情绪/心理状态，如对某事的感受、长期心理倾向\n\
+         - relation: 与他人的关系，如朋友、家人、同事\n\n\
+         过滤规则：\n\
+         - 只记关于用户的，不记关于 AI 的\n\
+         - 不记 AI 单方面的回复内容\n\
+         - 不记一次性的寒暄、玩笑\n\
+         - 同一事实合并成一条，不要重复\n\
+         - 没有任何值得记的就返回空数组\n\n\
+         对话：\n{convo}\n\n\
+         严格输出 JSON，格式：\
+         {{\"memories\": [{{\"content\": \"...\", \"category\": \"fact\"}}]}}",
+    )
+}
+
 /// Stage-2 insight extraction prompt: take the bullet list of facts mined
 /// in stage 1 plus the user's existing `companion_insights` JSONB, and
 /// fill in whatever fields the LLM is confident about. Output expected
