@@ -89,6 +89,46 @@ impl<'a> MemoryRepo<'a> {
         Ok(id)
     }
 
+    /// Top-K profile-layer rows per category, for rows with `category` set
+    /// (i.e. produced by the dreaming-lite classifier — not raw write_turn
+    /// dumps). Single SQL using `ROW_NUMBER() OVER (PARTITION BY category
+    /// ORDER BY embedding <=> $emb)` so the database picks the per-category
+    /// nearest neighbours in one round-trip.
+    ///
+    /// Result is ordered by `(category ASC, rn ASC)`, so callers can group
+    /// by streaming through the vector — no hash needed to preserve
+    /// per-category proximity ordering.
+    pub async fn search_profile_grouped(
+        &self,
+        user_id: Uuid,
+        query_embedding: &[f32],
+        k_per_category: i32,
+    ) -> Result<Vec<MemoryRow>, sqlx::Error> {
+        let vec_text = format_vector(query_embedding);
+        sqlx::query_as::<_, MemoryRow>(
+            "SELECT id, session_id, user_id, instance_id, content, category, created_at \
+             FROM ( \
+                 SELECT id, session_id, user_id, instance_id, content, category, \
+                        embedding, created_at, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY category \
+                            ORDER BY embedding <=> $2::vector \
+                        ) AS rn \
+                 FROM engine.companion_memories \
+                 WHERE user_id = $1 \
+                   AND instance_id IS NULL \
+                   AND category IS NOT NULL \
+             ) ranked \
+             WHERE rn <= $3 \
+             ORDER BY category, rn",
+        )
+        .bind(user_id)
+        .bind(vec_text)
+        .bind(k_per_category as i64)
+        .fetch_all(self.pool)
+        .await
+    }
+
     /// Cosine-distance nearest-neighbour search.
     ///
     /// `instance_id = None` → profile layer (cross-persona).
@@ -238,6 +278,80 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, target_id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_profile_grouped_picks_top_k_per_category(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, None).await;
+
+        // Three categories with varying counts and embedding distances.
+        // Within each category, the lower seed = nearer to query seed=10.
+        let inserts: &[(&str, usize)] = &[
+            ("fact", 10),        // nearest
+            ("fact", 50),        // mid
+            ("fact", 100),       // far
+            ("preference", 10),  // nearest
+            ("preference", 200), // far
+            ("event", 10),       // single
+            ("emotion", 300),    // category exists but far
+        ];
+        for (cat, seed) in inserts {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                &format!("{cat}-{seed}"),
+                &unit_embedding(*seed),
+                Some(cat),
+            )
+            .await
+            .unwrap();
+        }
+        // An uncategorised row that should be excluded entirely.
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "raw-untagged",
+            &unit_embedding(10),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = repo
+            .search_profile_grouped(user_id, &unit_embedding(10), 2)
+            .await
+            .unwrap();
+
+        // 2 fact + 2 preference + 1 event + 1 emotion = 6.
+        assert_eq!(rows.len(), 6);
+        for r in &rows {
+            assert!(r.category.is_some());
+            assert_ne!(r.content, "raw-untagged");
+        }
+
+        // Group by category, preserving SQL order.
+        let mut by_cat: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            by_cat
+                .entry(r.category.clone().unwrap())
+                .or_default()
+                .push(r.content.clone());
+        }
+        // Top-2 per category — fact/preference saturate, event/emotion truncate to 1.
+        assert_eq!(by_cat.get("fact").map(Vec::len), Some(2));
+        assert_eq!(by_cat.get("preference").map(Vec::len), Some(2));
+        assert_eq!(by_cat.get("event").map(Vec::len), Some(1));
+        assert_eq!(by_cat.get("emotion").map(Vec::len), Some(1));
+
+        // Within fact: the seed=10 row (cosine distance 0) must come first.
+        assert_eq!(by_cat["fact"][0], "fact-10");
     }
 
     #[sqlx::test(migrations = "./migrations")]
