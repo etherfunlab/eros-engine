@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Pure-domain types and rules for the eros-engine AI companion engine: persona, six-dimensional affinity, PDE decisions, and ghost-message logic with no I/O."
+readme = "README.md"
+keywords = ["companion", "ai", "persona", "affinity", "memory"]
+categories = ["data-structures"]
 
 [dependencies]
 serde = { workspace = true }

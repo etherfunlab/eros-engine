@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "HTTP clients for OpenRouter (chat) and Voyage (embeddings), plus a TOML task→model config used by the eros-engine AI companion engine."
+readme = "README.md"
+keywords = ["companion", "openrouter", "voyage", "embeddings", "llm"]
+categories = ["api-bindings"]
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
