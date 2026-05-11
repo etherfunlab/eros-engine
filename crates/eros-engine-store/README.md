@@ -15,7 +15,7 @@ Postgres + pgvector persistence for the [`eros-engine`](https://github.com/ether
 - `persona` — persona instances per user.
 - `pool` — `PgPool` construction helpers.
 
-Schema migrations live in the [eros-engine repo](https://github.com/etherfunlab/eros-engine/tree/main/crates/eros-engine-server/migrations).
+SQL migrations ship inside this crate under [`migrations/`](https://github.com/etherfunlab/eros-engine/tree/main/crates/eros-engine-store/migrations) and can be applied with [`sqlx migrate run --source <path>`](https://docs.rs/sqlx).
 
 ## Use it
 

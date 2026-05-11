@@ -62,4 +62,6 @@ jobs:
           path-to-signatures: 'cla-signatures.json'
           path-to-document: 'https://github.com/etherfunlab/eros-engine/blob/main/CLA.md'
           branch: 'main'
-          allowlist: dependabot[bot]
+          # enriquephl is the etherfunlab maintainer; external contributors
+          # still go through the CLA flow once CLA_BOT_TOKEN is configured.
+          allowlist: dependabot[bot],enriquephl
