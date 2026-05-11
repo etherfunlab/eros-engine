@@ -9,6 +9,7 @@
 [![Crates.io: core](https://img.shields.io/crates/v/eros-engine-core.svg?label=eros-engine-core)](https://crates.io/crates/eros-engine-core)
 [![Crates.io: store](https://img.shields.io/crates/v/eros-engine-store.svg?label=eros-engine-store)](https://crates.io/crates/eros-engine-store)
 [![Crates.io: llm](https://img.shields.io/crates/v/eros-engine-llm.svg?label=eros-engine-llm)](https://crates.io/crates/eros-engine-llm)
+[![GHCR: eros-engine](https://img.shields.io/badge/ghcr.io-etherfunlab%2Feros--engine-blue)](https://github.com/etherfunlab/eros-engine/pkgs/container/eros-engine)
 
 English · [中文](README.zh.md)
 
@@ -118,7 +119,26 @@ eros-engine-store = "0.1"   # only if you want the Postgres + pgvector layer
 eros-engine-llm   = "0.1"   # only if you want the OpenRouter + Voyage clients
 ```
 
-`eros-engine-server` is intentionally not published to crates.io — it ships as a binary in this repo and as a Docker image. Run it from source or deploy via `docker/` and `fly.toml`.
+`eros-engine-server` is intentionally not published to crates.io. See the next section to run it as a Docker image.
+
+## Run as a Docker image
+
+Multi-arch (`linux/amd64`, `linux/arm64`) images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag:
+
+```bash
+docker pull ghcr.io/etherfunlab/eros-engine:0.1.0
+# or track the latest tagged release
+docker pull ghcr.io/etherfunlab/eros-engine:latest
+```
+
+Minimal run (you bring Postgres + your own `.env`):
+
+```bash
+docker run --rm -p 8080:8080 --env-file .env \
+  ghcr.io/etherfunlab/eros-engine:0.1.0 serve
+```
+
+The Dockerfile under `docker/` and `fly.toml` in the repo root are the same artifacts used by this image and by the Fly.io example deployment.
 
 ## Documentation
 
