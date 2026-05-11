@@ -6,6 +6,9 @@
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Crates.io: core](https://img.shields.io/crates/v/eros-engine-core.svg?label=eros-engine-core)](https://crates.io/crates/eros-engine-core)
+[![Crates.io: store](https://img.shields.io/crates/v/eros-engine-store.svg?label=eros-engine-store)](https://crates.io/crates/eros-engine-store)
+[![Crates.io: llm](https://img.shields.io/crates/v/eros-engine-llm.svg?label=eros-engine-llm)](https://crates.io/crates/eros-engine-llm)
 
 English · [中文](README.zh.md)
 
@@ -99,6 +102,23 @@ The workspace is split into four crates:
 | `eros-engine-server` | Axum HTTP service, Supabase JWT middleware, OpenAPI docs, and pipeline wiring. |
 
 You can run `eros-engine-server` as an HTTP API, or embed `core + llm + store` directly in your own Rust service.
+
+## Use as a library
+
+The three library crates are on crates.io ([core](https://crates.io/crates/eros-engine-core) · [store](https://crates.io/crates/eros-engine-store) · [llm](https://crates.io/crates/eros-engine-llm)):
+
+```bash
+cargo add eros-engine-core eros-engine-store eros-engine-llm
+```
+
+```toml
+[dependencies]
+eros-engine-core  = "0.1"
+eros-engine-store = "0.1"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.1"   # only if you want the OpenRouter + Voyage clients
+```
+
+`eros-engine-server` is intentionally not published to crates.io — it ships as a binary in this repo and as a Docker image. Run it from source or deploy via `docker/` and `fly.toml`.
 
 ## Documentation
 
