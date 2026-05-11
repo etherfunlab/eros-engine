@@ -54,7 +54,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      # Non-blocking until CLA_BOT_TOKEN is configured in repo secrets.
+      # Without the PAT the bot can't create/update cla-signatures.json, so
+      # every PR currently fails on a 404 read. Flip continue-on-error back
+      # to false once the secret is set and signatures.json is seeded.
       - uses: contributor-assistant/github-action@v2.4.0
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_BOT_TOKEN }}
@@ -62,6 +67,4 @@ jobs:
           path-to-signatures: 'cla-signatures.json'
           path-to-document: 'https://github.com/etherfunlab/eros-engine/blob/main/CLA.md'
           branch: 'main'
-          # enriquephl is the etherfunlab maintainer; external contributors
-          # still go through the CLA flow once CLA_BOT_TOKEN is configured.
           allowlist: dependabot[bot],enriquephl
