@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Postgres + pgvector persistence layer for the eros-engine AI companion engine: chat history, two-layer long-term memory, affinity, and structured user insight."
+readme = "README.md"
+keywords = ["companion", "memory", "pgvector", "postgres", "sqlx"]
+categories = ["database"]
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.1.0" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
