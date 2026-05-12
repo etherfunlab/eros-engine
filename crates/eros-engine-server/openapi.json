@@ -1,0 +1,1074 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "eros-engine API",
+    "description": "Open-source AI companion engine — chat + 6-dim affinity + memory. Source of truth: src/routes/.",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local dev"
+    }
+  ],
+  "paths": {
+    "/comp/affinity/{session_id}": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Inspect the live affinity vector for a session. The session must be\nowned by the JWT user; otherwise 403.",
+        "operationId": "get_affinity",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AffinityDebugResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session has no affinity"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/start": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Start (or resume) a chat session for the JWT user.",
+        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else: the only active genome the user already has an instance of\n    wins; otherwise 400.",
+        "operationId": "start_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartChatResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "missing genome_id and no existing instance"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "404": {
+            "description": "instance/genome not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/event/gift": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Send a gift event to the session.",
+        "description": "Replaces the gateway's `tip` + `gift` endpoints. The OSS engine has\nno credit ledger / inventory, so the caller supplies the deltas\n(validated by client UX) and the optional human label. The route\ninserts a `gift_user` `chat_messages` row and applies the deltas via\n`AffinityRepo::persist_with_event` (which logs a `gift` row in\n`companion_affinity_events`). It deliberately does NOT call\n`pipeline::run` — the LLM-driven gift reaction reply is delegated to\nthe next user message turn so this route's HTTP+DB side-effects can\nbe exercised in tests without a live LLM.",
+        "operationId": "event_gift",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GiftEventBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GiftEventResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/history": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Paginated chat history (oldest-first) for the given session.",
+        "operationId": "get_history",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 20, capped at 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/message": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Send a user message and synchronously return the AI reply.",
+        "operationId": "send_message",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionReplyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/message_async": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Accept a user message and process it in the background. The client\nthen polls `/pending/{message_id}` for the assistant reply.",
+        "operationId": "send_message_async",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncSendResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/pending/{message_id}": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Poll for the AI reply to a user message. Returns `processing` until\nthe assistant or system_error row appears, then `completed` / `error`.",
+        "operationId": "check_pending",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "User message id to poll on",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingCheckResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{user_id}/sessions": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "All sessions for the JWT user. The `{user_id}` path parameter MUST\nmatch the JWT's user_id; mismatch returns 403.",
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/personas": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "List active platform-owned persona genomes available for new sessions.",
+        "operationId": "list_personas",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPersonasResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/user/{user_id}/profile": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Companion insights + computed training level for the JWT user. The\npath `user_id` MUST match the JWT's user_id; mismatch returns 403.",
+        "operationId": "get_profile",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness probe.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AffinityDebugResponse": {
+        "type": "object",
+        "required": [
+          "warmth",
+          "trust",
+          "intrigue",
+          "intimacy",
+          "patience",
+          "tension",
+          "ghost_streak",
+          "total_ghosts",
+          "updated_at"
+        ],
+        "properties": {
+          "ghost_streak": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "relationship_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "total_ghosts": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "AffinityDeltasDto": {
+        "type": "object",
+        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
+        "properties": {
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "AsyncSendResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "user_message_id",
+          "session_id"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "user_message_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ChatHistoryEntry": {
+        "type": "object",
+        "required": [
+          "role",
+          "content",
+          "sent_at",
+          "extracted_facts"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "extracted_facts": {
+            "type": "object"
+          },
+          "role": {
+            "type": "string"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CompanionReplyPayload": {
+        "type": "object",
+        "required": [
+          "reply",
+          "message_id",
+          "lead_score",
+          "should_show_cta",
+          "agent_training_level",
+          "sent_at"
+        ],
+        "properties": {
+          "agent_training_level": {
+            "type": "number",
+            "format": "double"
+          },
+          "lead_score": {
+            "type": "number",
+            "format": "double"
+          },
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reply": {
+            "type": "string"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "should_show_cta": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CompanionReplyResponse": {
+        "type": "object",
+        "required": [
+          "reply",
+          "session_id",
+          "lead_score",
+          "should_show_cta",
+          "typing_delay_ms",
+          "agent_training_level"
+        ],
+        "properties": {
+          "agent_training_level": {
+            "type": "number",
+            "format": "double"
+          },
+          "lead_score": {
+            "type": "number",
+            "format": "double"
+          },
+          "reply": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "should_show_cta": {
+            "type": "boolean"
+          },
+          "typing_delay_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "GiftEventBody": {
+        "type": "object",
+        "description": "Body for `POST /comp/chat/{session_id}/event/gift`.\n\nReplaces the gateway's `tip` + `gift` endpoints. The OSS engine has\nno credit ledger, so the caller supplies the affinity deltas\ndirectly. `label` is the human-readable description (e.g. `\"rose\"`)\nand is also used as the `chat_messages.content` for the gift turn.",
+        "required": [
+          "deltas",
+          "metadata"
+        ],
+        "properties": {
+          "deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      },
+      "GiftEventResponse": {
+        "type": "object",
+        "required": [
+          "applied_deltas"
+        ],
+        "properties": {
+          "applied_deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto"
+          },
+          "relationship_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "Health check response.",
+        "required": [
+          "status",
+          "service",
+          "version",
+          "timestamp"
+        ],
+        "properties": {
+          "service": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "HistoryResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "total"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatHistoryEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ListPersonasResponse": {
+        "type": "object",
+        "required": [
+          "personas"
+        ],
+        "properties": {
+          "personas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonaGenomeDto"
+            }
+          }
+        }
+      },
+      "ListSessionsResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionListEntry"
+            }
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "PendingCheckResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "message": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CompanionReplyPayload"
+              }
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonaGenomeDto": {
+        "type": "object",
+        "description": "Genome row exposed on `GET /comp/personas`. Matches\n`eros_engine_core::persona::PersonaGenome` field-for-field but with\n`ToSchema` so utoipa can render it.",
+        "required": [
+          "id",
+          "name",
+          "system_prompt",
+          "art_metadata",
+          "is_active"
+        ],
+        "properties": {
+          "art_metadata": {
+            "type": "object"
+          },
+          "avatar_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": "string"
+          },
+          "tip_personality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ProfileResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "companion_insights",
+          "agent_training_level"
+        ],
+        "properties": {
+          "agent_training_level": {
+            "type": "number",
+            "format": "double"
+          },
+          "companion_insights": {
+            "type": "object"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionListEntry": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "lead_score",
+          "is_converted",
+          "last_active_at"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "is_converted": {
+            "type": "boolean"
+          },
+          "last_active_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lead_score": {
+            "type": "number",
+            "format": "double"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "StartChatRequest": {
+        "type": "object",
+        "properties": {
+          "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Optional genome id. Required when `instance_id` is absent."
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Optional explicit instance id. If absent, the server picks (or\nauto-creates) the user's instance for the supplied genome."
+          },
+          "is_demo": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Mark the new session as a demo. Persisted to `metadata.is_demo` and\nread by the affinity pipeline to apply `demo_ema_inertia` instead\nof the global value, so meters move visibly within the turn budget.\nIgnored when resuming an existing session."
+          }
+        }
+      },
+      "StartChatResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "instance_id",
+          "persona_name",
+          "is_new"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_new": {
+            "type": "boolean"
+          },
+          "persona_name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness probe"
+    },
+    {
+      "name": "companion",
+      "description": "Chat sessions, messages, affinity, profile"
+    },
+    {
+      "name": "debug",
+      "description": "Env-gated introspection (affinity vector exposure)"
+    }
+  ]
+}

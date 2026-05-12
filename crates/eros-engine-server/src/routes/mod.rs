@@ -35,3 +35,14 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
 }
+
+/// Same shape as [`router`] for OpenAPI extraction purposes, minus the auth
+/// middleware (which doesn't affect the spec) and minus any need for a real
+/// `AppState` (which would otherwise require a live DB pool). Used by the
+/// `print-openapi` subcommand and the CI drift check.
+pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .merge(health::router())
+        .merge(companion::router())
+        .merge(debug::router(expose_affinity_debug))
+}

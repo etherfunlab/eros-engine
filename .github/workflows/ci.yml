@@ -50,6 +50,25 @@ jobs:
         run: sqlx migrate run --source crates/eros-engine-store/migrations
       - run: cargo test --workspace --all-features
 
+  openapi-snapshot:
+    name: openapi-snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate OpenAPI spec
+        run: |
+          cargo run -p eros-engine-server --quiet -- print-openapi \
+            > /tmp/openapi.fresh.json
+      - name: Diff against committed snapshot
+        run: |
+          if ! diff -u crates/eros-engine-server/openapi.json /tmp/openapi.fresh.json; then
+            echo "::error::OpenAPI snapshot drift detected — a handler or schema changed without updating crates/eros-engine-server/openapi.json"
+            echo "::error::Regenerate locally: cargo run -p eros-engine-server -- print-openapi > crates/eros-engine-server/openapi.json"
+            exit 1
+          fi
+
   cla:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
