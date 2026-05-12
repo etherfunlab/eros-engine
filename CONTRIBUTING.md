@@ -17,11 +17,22 @@ docker compose -f docker/docker-compose.yml up -d postgres
 cargo test --workspace
 ```
 
+## OpenAPI snapshot
+
+The HTTP surface is checked in CI against a committed snapshot to catch handlers or schemas added without `#[utoipa::path]` / `ToSchema` wiring. If you add, remove, or change any `/comp/*` (or `/healthz`) route or any request/response struct, regenerate the snapshot:
+
+```bash
+cargo run -p eros-engine-server -- print-openapi > crates/eros-engine-server/openapi.json
+```
+
+Commit the updated `openapi.json` alongside the change. The CI job `openapi-snapshot` fails fast on drift.
+
 ## PR checklist
 
 - [ ] CLA accepted via cla-assistant.io
 - [ ] `cargo fmt --all`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
+- [ ] If the HTTP surface changed: `cargo run -p eros-engine-server -- print-openapi > crates/eros-engine-server/openapi.json`
 - [ ] New behavior has tests
 - [ ] DCO sign-off on every commit (`git commit -s`)
