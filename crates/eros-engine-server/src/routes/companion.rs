@@ -45,12 +45,39 @@ use eros_engine_core::types::Event;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
+use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::pipeline;
 use crate::state::AppState;
+
+/// NFT-ownership gate. Returns `Ok(())` immediately if `asset_id` is `None`
+/// (legacy seed-persona genome). Otherwise joins persona_ownership with
+/// wallet_links (linked=true) and returns 403 on no match.
+///
+/// Called at chat-start (before create_instance) and at every chat message
+/// (sync + async). The join is a single indexed PK lookup followed by an
+/// index lookup on wallet_pubkey — sub-ms.
+pub(crate) async fn enforce_nft_ownership(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    asset_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(asset_id) = asset_id else {
+        return Ok(());
+    };
+    let owns = OwnershipRepo { pool }
+        .owns(user_id, asset_id)
+        .await
+        .map_err(AppError::from)?;
+    if owns {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("nft_ownership_required".into()))
+    }
+}
 
 // ─── DTOs ───────────────────────────────────────────────────────────
 
@@ -1233,6 +1260,47 @@ mod tests {
     }
 
     // ─── Bonus: debug affinity endpoint round-trips when enabled ────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_passes_for_legacy_genome(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let res = enforce_nft_ownership(&pool, user, None).await;
+        assert!(res.is_ok(), "asset_id=None must always pass");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_rejects_when_not_owner(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let res =
+            enforce_nft_ownership(&pool, user, Some("11111111111111111111111111111111")).await;
+        match res {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_passes_for_owner(pool: PgPool) {
+        use chrono::Utc;
+        use eros_engine_store::ownership::OwnershipRepo;
+        use eros_engine_store::wallets::WalletLinkRepo;
+
+        let user = Uuid::new_v4();
+        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
+        let asset = "11111111111111111111111111111131";
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, true, Utc::now())
+            .await
+            .unwrap();
+        OwnershipRepo { pool: &pool }
+            .upsert(asset, "p-1", wallet, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(enforce_nft_ownership(&pool, user, Some(asset))
+            .await
+            .is_ok());
+    }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn debug_affinity_returns_vector_for_owner(pool: PgPool) {
