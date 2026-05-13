@@ -6,3 +6,6 @@ Cargo.lock.bak
 .DS_Store
 .vscode/
 .idea/
+
+# Local test override; never commit.
+.test-env
