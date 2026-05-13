@@ -5,6 +5,7 @@ pub mod affinity;
 pub mod chat;
 pub mod insight;
 pub mod memory;
+pub mod ownership;
 pub mod persona;
 pub mod pool;
 pub mod pubkey;
