@@ -404,6 +404,11 @@ async fn start_chat(
                     "instance not owned by this user".into(),
                 ));
             }
+            // NEW: NFT gate (orthogonal to owner_uid — NFT ownership is wallet-bound).
+            let asset_id_opt = persona_repo
+                .get_asset_id_for_genome(companion.instance.genome_id)
+                .await?;
+            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
             iid
         }
         None => {
@@ -419,6 +424,12 @@ async fn start_chat(
             if !genome.is_active {
                 return Err(AppError::BadRequest("genome is not active".into()));
             }
+
+            // NEW: NFT gate runs BEFORE looking for an instance or creating one.
+            // A non-owner who hits the create_instance fallback would otherwise
+            // leave behind an empty persona_instances row.
+            let asset_id_opt = persona_repo.get_asset_id_for_genome(genome_id).await?;
+            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
 
             // Look for an existing active instance for this user×genome.
             let existing: Option<(Uuid,)> = sqlx::query_as(
@@ -1300,6 +1311,70 @@ mod tests {
         assert!(enforce_nft_ownership(&pool, user, Some(asset))
             .await
             .is_ok());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_chat_403_on_unowned_nft_genome(pool: PgPool) {
+        // Seed an NFT-backed genome whose asset_id no one currently owns.
+        let genome_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true,
+                     '11111111111111111111111111111131')",
+        )
+        .bind(genome_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(Uuid::new_v4());
+
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Crucially: NO instance row was created.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM engine.persona_instances WHERE genome_id = $1")
+                .bind(genome_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "non-owner must not create a hidden persona_instance"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_chat_passes_for_legacy_genome(pool: PgPool) {
+        // Unchanged path: legacy seed-persona must still work.
+        let genome_id = seed_genome(&pool, "Echo").await;
+        let user = Uuid::new_v4();
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user);
+
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
