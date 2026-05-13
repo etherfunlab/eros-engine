@@ -72,6 +72,25 @@ pub fn sign(secret: &[u8], canonical: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Build the (timestamp, signature) headers for an outbound s2s request.
+/// The caller is responsible for setting `canonical_query` to the
+/// already-canonicalized query string (use `canonicalize_query` for raw input).
+pub fn build_outbound_signature(
+    method: &str,
+    path: &str,
+    canonical_query: &str,
+    body: &[u8],
+    secret: &[u8],
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let body_hash = Sha256::digest(body);
+    let body_hex = hex::encode(body_hash);
+    let canonical = canonical_signing_string(method, path, canonical_query, &timestamp, &body_hex);
+    let sig = sign(secret, &canonical);
+    (timestamp, sig)
+}
+
 fn verify_against(secret: &[u8], canonical: &str, provided_hex: &str) -> bool {
     let provided = match hex::decode(provided_hex) {
         Ok(b) => b,
@@ -202,5 +221,29 @@ mod tests {
     #[test]
     fn verify_rejects_non_hex_signature() {
         assert!(!verify_against(b"k", "anything", "not-hex"));
+    }
+
+    #[test]
+    fn build_outbound_signed_request_components() {
+        let (ts, sig) = build_outbound_signature(
+            "GET",
+            "/s2s/ownership/since",
+            "cursor_pk=&cursor_ts=&limit=10",
+            b"",
+            b"test-secret",
+            DateTime::<Utc>::from_timestamp(1700000000, 0).unwrap(),
+        );
+        assert_eq!(ts, "2023-11-14T22:13:20Z");
+
+        // Re-verify the signature with the same canonical reconstruction.
+        let body_hex = hex::encode(Sha256::digest(b""));
+        let canonical = canonical_signing_string(
+            "GET",
+            "/s2s/ownership/since",
+            "cursor_pk=&cursor_ts=&limit=10",
+            &ts,
+            &body_hex,
+        );
+        assert!(verify_against(b"test-secret", &canonical, &sig));
     }
 }
