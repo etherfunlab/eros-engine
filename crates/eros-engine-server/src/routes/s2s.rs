@@ -84,10 +84,20 @@ pub struct OwnershipSinceResponse {
     )
 )]
 async fn wallets_upsert(
-    State(_state): State<AppState>,
-    Json(_req): Json<WalletUpsertRequest>,
+    State(state): State<AppState>,
+    Json(req): Json<WalletUpsertRequest>,
 ) -> Result<StatusCode, AppError> {
-    Err(AppError::Internal("not implemented".into()))
+    let pubkey = validate_solana_pubkey(&req.wallet_pubkey)
+        .map_err(|e| AppError::BadRequest(format!("invalid wallet_pubkey: {e}")))?;
+    let applied = WalletLinkRepo { pool: &state.pool }
+        .upsert(req.user_id, &pubkey, req.linked, req.source_updated_at)
+        .await
+        .map_err(AppError::from)?;
+    if applied {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::CONFLICT)
+    }
 }
 
 /// Stub — implemented in Task 14.
