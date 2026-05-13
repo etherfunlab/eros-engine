@@ -136,10 +136,22 @@ async fn wallets_since(
     )
 )]
 async fn ownership_upsert(
-    State(_state): State<AppState>,
-    Json(_req): Json<OwnershipUpsertRequest>,
+    State(state): State<AppState>,
+    Json(req): Json<OwnershipUpsertRequest>,
 ) -> Result<StatusCode, AppError> {
-    Err(AppError::Internal("not implemented".into()))
+    let asset = validate_solana_pubkey(&req.asset_id)
+        .map_err(|e| AppError::BadRequest(format!("invalid asset_id: {e}")))?;
+    let owner = validate_solana_pubkey(&req.owner_wallet)
+        .map_err(|e| AppError::BadRequest(format!("invalid owner_wallet: {e}")))?;
+    let applied = OwnershipRepo { pool: &state.pool }
+        .upsert(&asset, &req.persona_id, &owner, req.source_updated_at)
+        .await
+        .map_err(AppError::from)?;
+    if applied {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::CONFLICT)
+    }
 }
 
 /// Stub — implemented in Task 14.
