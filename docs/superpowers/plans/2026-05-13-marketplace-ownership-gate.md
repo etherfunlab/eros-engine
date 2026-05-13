@@ -4,7 +4,7 @@
 
 **Goal:** Add NFT-ownership awareness to `eros-engine` so `eros-marketplace-svc` (P4) can gate chat access on `(asset_id, owner_wallet, user_id)` without coupling the OSS engine to the closed-source marketplace.
 
-**Architecture:** Mirror marketplace ownership + wallet binding state inside `engine.*` schema (two new tables + nullable column on `persona_genomes`). Expose HMAC-authenticated `/internal/*` push/pull endpoints. Gate `/comp/chat/start` (before instance creation) and every `/comp/chat/{session_id}/message{,_async}` route via a single indexed SQL join. Self-heal task pulls svc cursors when `MARKETPLACE_SVC_URL` is configured. OSS deploys without those env vars run identically to today.
+**Architecture:** Mirror marketplace ownership + wallet binding state inside `engine.*` schema (two new tables + nullable column on `persona_genomes`). Expose HMAC-authenticated `/s2s/*` push/pull endpoints. Gate `/comp/chat/start` (before instance creation) and every `/comp/chat/{session_id}/message{,_async}` route via a single indexed SQL join. Self-heal task pulls svc cursors when `MARKETPLACE_SVC_URL` is configured. OSS deploys without those env vars run identically to today.
 
 **Tech Stack:** Rust workspace (`-core`/`-llm`/`-store`/`-server`), axum 0.8, sqlx 0.8 (Postgres), utoipa 5 OpenAPI, jsonwebtoken 9, reqwest 0.12. Adds `bs58`, `hmac`, `sha2`, `subtle`, `hex` to the workspace.
 
@@ -30,8 +30,8 @@
 | `crates/eros-engine-server/Cargo.toml` | Modify | Pull in `hmac`, `sha2`, `subtle`, `hex`. |
 | `crates/eros-engine-server/src/auth/s2s.rs` | Create | HMAC s2s middleware (5-line canonical signing, 1 MiB body cap, current + previous secret). |
 | `crates/eros-engine-server/src/auth/mod.rs` | Modify | `pub mod s2s;`. |
-| `crates/eros-engine-server/src/routes/internal.rs` | Create | Four `/internal/*` handlers + payload structs + base58 validators. |
-| `crates/eros-engine-server/src/routes/mod.rs` | Modify | Merge internal subrouter OUTSIDE the JWT layer, keep `router_for_openapi` parity. |
+| `crates/eros-engine-server/src/routes/s2s.rs` | Create | Four `/s2s/*` handlers + payload structs + base58 validators. |
+| `crates/eros-engine-server/src/routes/mod.rs` | Modify | Merge s2s subrouter OUTSIDE the JWT layer, keep `router_for_openapi` parity. |
 | `crates/eros-engine-server/src/routes/companion.rs` | Modify | `enforce_nft_ownership` helper; call before `create_instance` in `start_chat` (both paths); call in `send_message` + `send_message_async`. |
 | `crates/eros-engine-server/src/state.rs` | Modify | Add `marketplace_svc_url`, `marketplace_s2s_secret`, `marketplace_s2s_secret_previous`, `http_client`. |
 | `crates/eros-engine-server/src/pipeline/sync.rs` | Create | Self-heal loop with compound cursor; signs outgoing GETs. |
@@ -40,7 +40,7 @@
 | `crates/eros-engine-server/src/openapi.rs` | Modify | Register `hmac_signature` security scheme. |
 | `README.md` | Modify | Add env vars to the table. |
 | `docs/deploying.md` | Modify | Document `MARKETPLACE_SVC_URL` / `_S2S_SECRET` / `_S2S_SECRET_PREVIOUS`. |
-| `docs/api-reference.md` | Modify | Document `/internal/*` surface under a separate section. |
+| `docs/api-reference.md` | Modify | Document `/s2s/*` surface under a separate section. |
 
 Twenty-two files: twelve new, ten modified.
 
@@ -51,7 +51,7 @@ Twenty-two files: twelve new, ten modified.
 Each phase leaves the tree green. Strict TDD: red → green → commit. No task leaves migrations un-runnable or tests broken.
 
 - **E1 (Schema + repos):** workspace deps → 3 migrations → pubkey validator → 3 new repos → 1 repo extension. Nothing in this phase touches the HTTP surface. CI green when all sqlx tests pass.
-- **E2 (S2S middleware + routes):** HMAC middleware → 4 internal handlers → router composition + OpenAPI + state + boot validation. CI green when middleware tests + handler tests + drift check all pass.
+- **E2 (S2S middleware + routes):** HMAC middleware → 4 s2s handlers → router composition + OpenAPI + state + boot validation. CI green when middleware tests + handler tests + drift check all pass.
 - **E3 (Gate):** helper → start_chat (both paths) → message routes. CI green when legacy genome paths still pass and new ownership paths reject correctly.
 - **E4 (Self-heal):** s2s outbound signing helper → pull loop → conditional spawn. CI green when configured deploy advances cursors and unconfigured deploy boots cleanly.
 
@@ -524,7 +524,7 @@ Create `crates/eros-engine-store/src/wallets.rs`:
 
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Wallet ↔ user binding mirror, fed by /internal/wallets/upsert and the
+//! Wallet ↔ user binding mirror, fed by /s2s/wallets/upsert and the
 //! self-heal /since pull. Maintains the invariant that "one wallet is
 //! bound to at most one user at a time" via the partial unique index
 //! defined in migration 0009.
@@ -719,7 +719,7 @@ Create `crates/eros-engine-store/src/ownership.rs`:
 
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Persona-ownership mirror, fed by /internal/ownership/upsert and the
+//! Persona-ownership mirror, fed by /s2s/ownership/upsert and the
 //! self-heal /since pull. Also exposes the gate-decision `owns()` join
 //! that the chat-start and per-message handlers call.
 
@@ -1170,7 +1170,7 @@ Create `crates/eros-engine-server/src/auth/s2s.rs`:
 
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
-//! HMAC-SHA256 server-to-server authentication for /internal/* routes.
+//! HMAC-SHA256 server-to-server authentication for /s2s/* routes.
 //!
 //! Canonical signing string is a deterministic five-line ASCII layout:
 //!     method + "\n"
@@ -1255,7 +1255,7 @@ fn verify_against(secret: &[u8], canonical: &str, provided_hex: &str) -> bool {
 }
 
 /// Axum middleware: verifies the incoming HMAC and passes the buffered
-/// body through to the handler. Mount only on /internal/*.
+/// body through to the handler. Mount only on /s2s/*.
 pub async fn require_s2s(
     State(state): State<AppState>,
     mut req: Request,
@@ -1337,14 +1337,14 @@ mod tests {
     fn canonical_string_layout_is_stable() {
         let s = canonical_signing_string(
             "POST",
-            "/internal/ownership/upsert",
+            "/s2s/ownership/upsert",
             "",
             "2026-05-13T08:00:00Z",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
         assert_eq!(
             s,
-            "POST\n/internal/ownership/upsert\n\n2026-05-13T08:00:00Z\n\
+            "POST\n/s2s/ownership/upsert\n\n2026-05-13T08:00:00Z\n\
              e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -1360,7 +1360,7 @@ mod tests {
     #[test]
     fn sign_then_verify_roundtrips() {
         let secret = b"test-secret";
-        let canonical = "GET\n/internal/wallets/since\ncursor_pk=&cursor_ts=&limit=10\n2026-05-13T00:00:00Z\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let canonical = "GET\n/s2s/wallets/since\ncursor_pk=&cursor_ts=&limit=10\n2026-05-13T00:00:00Z\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let sig = sign(secret, canonical);
         assert!(verify_against(secret, canonical, &sig));
     }
@@ -1405,22 +1405,22 @@ git commit -m "feat(server): HMAC s2s middleware — 5-line canonical signing + 
 
 ---
 
-### Task 11: Internal routes module skeleton
+### Task 11: S2S routes module skeleton
 
-Create `routes/internal.rs` with shared types, the base58 validator wrapper, and the empty handler shells (returning 501) so the router composition in Task 14 has something to wire.
+Create `routes/s2s.rs` with shared types, the base58 validator wrapper, and the empty handler shells (returning 501) so the router composition in Task 14 has something to wire.
 
 **Files:**
-- Create: `crates/eros-engine-server/src/routes/internal.rs`
+- Create: `crates/eros-engine-server/src/routes/s2s.rs`
 - Modify: `crates/eros-engine-server/src/routes/mod.rs`
 
 - [ ] **Step 1: Create the file with handler stubs**
 
-Create `crates/eros-engine-server/src/routes/internal.rs`:
+Create `crates/eros-engine-server/src/routes/s2s.rs`:
 
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Server-to-server endpoints called by eros-marketplace-svc. Mounted at
-//! /internal/* with HMAC auth (see auth::s2s); deliberately outside the
+//! /s2s/* with HMAC auth (see auth::s2s); deliberately outside the
 //! Supabase JWT layer that gates /comp/*.
 //!
 //! Wire shape mirrors svc's expected /since cursor pagination and stale-
@@ -1478,8 +1478,8 @@ pub struct OwnershipSinceResponse {
 /// Stub — implemented in Task 12.
 #[utoipa::path(
     post,
-    path = "/internal/wallets/upsert",
-    tag = "internal",
+    path = "/s2s/wallets/upsert",
+    tag = "s2s",
     security(("hmac_signature" = [])),
     request_body = WalletUpsertRequest,
     responses(
@@ -1498,8 +1498,8 @@ async fn wallets_upsert(
 /// Stub — implemented in Task 14.
 #[utoipa::path(
     get,
-    path = "/internal/wallets/since",
-    tag = "internal",
+    path = "/s2s/wallets/since",
+    tag = "s2s",
     security(("hmac_signature" = [])),
     params(
         ("cursor_ts" = Option<DateTime<Utc>>, Query, description = "compound cursor: source_updated_at"),
@@ -1520,8 +1520,8 @@ async fn wallets_since(
 /// Stub — implemented in Task 13.
 #[utoipa::path(
     post,
-    path = "/internal/ownership/upsert",
-    tag = "internal",
+    path = "/s2s/ownership/upsert",
+    tag = "s2s",
     security(("hmac_signature" = [])),
     request_body = OwnershipUpsertRequest,
     responses(
@@ -1540,8 +1540,8 @@ async fn ownership_upsert(
 /// Stub — implemented in Task 14.
 #[utoipa::path(
     get,
-    path = "/internal/ownership/since",
-    tag = "internal",
+    path = "/s2s/ownership/since",
+    tag = "s2s",
     security(("hmac_signature" = [])),
     params(
         ("cursor_ts" = Option<DateTime<Utc>>, Query),
@@ -1559,7 +1559,7 @@ async fn ownership_since(
     Err(AppError::Internal("not implemented".into()))
 }
 
-/// Build the /internal/* subrouter. The HMAC layer is applied at router
+/// Build the /s2s/* subrouter. The HMAC layer is applied at router
 /// composition time (routes/mod.rs), not here.
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -1575,7 +1575,7 @@ pub fn router() -> OpenApiRouter<AppState> {
 In `crates/eros-engine-server/src/routes/mod.rs`, add:
 
 ```rust
-pub mod internal;
+pub mod s2s;
 ```
 
 (Composition into the app router lands in Task 14 — keep the existing `router()` body unchanged for now.)
@@ -1588,23 +1588,23 @@ Expected: clean exit code 0 (handlers exist as stubs returning errors, but compi
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/eros-engine-server/src/routes/internal.rs \
+git add crates/eros-engine-server/src/routes/s2s.rs \
         crates/eros-engine-server/src/routes/mod.rs
-git commit -m "feat(server): /internal/* routes module + payload schemas (handler stubs)"
+git commit -m "feat(server): /s2s/* routes module + payload schemas (handler stubs)"
 ```
 
 ---
 
-### Task 12: `POST /internal/wallets/upsert` handler
+### Task 12: `POST /s2s/wallets/upsert` handler
 
 Validates the wallet pubkey, calls `WalletLinkRepo::upsert`, returns `204` or `409`.
 
 **Files:**
-- Modify: `crates/eros-engine-server/src/routes/internal.rs`
+- Modify: `crates/eros-engine-server/src/routes/s2s.rs`
 
 - [ ] **Step 1: Replace the stub with the real handler**
 
-Replace `wallets_upsert` in `routes/internal.rs`:
+Replace `wallets_upsert` in `routes/s2s.rs`:
 
 ```rust
 async fn wallets_upsert(
@@ -1635,18 +1635,18 @@ Expected: clean.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/eros-engine-server/src/routes/internal.rs
-git commit -m "feat(server): implement POST /internal/wallets/upsert handler"
+git add crates/eros-engine-server/src/routes/s2s.rs
+git commit -m "feat(server): implement POST /s2s/wallets/upsert handler"
 ```
 
 ---
 
-### Task 13: `POST /internal/ownership/upsert` handler
+### Task 13: `POST /s2s/ownership/upsert` handler
 
 Same shape; validates `asset_id` and `owner_wallet`.
 
 **Files:**
-- Modify: `crates/eros-engine-server/src/routes/internal.rs`
+- Modify: `crates/eros-engine-server/src/routes/s2s.rs`
 
 - [ ] **Step 1: Replace the stub**
 
@@ -1681,24 +1681,24 @@ Expected: clean.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/eros-engine-server/src/routes/internal.rs
-git commit -m "feat(server): implement POST /internal/ownership/upsert handler"
+git add crates/eros-engine-server/src/routes/s2s.rs
+git commit -m "feat(server): implement POST /s2s/ownership/upsert handler"
 ```
 
 ---
 
-### Task 14: `GET /internal/*/since` handlers + router composition + state + boot validation
+### Task 14: `GET /s2s/*/since` handlers + router composition + state + boot validation
 
 This is the largest task in E2. It wires:
 - The two `/since` handlers (compound cursor read + next_cursor computation).
-- The `/internal/*` subrouter into the app, **outside** the JWT layer.
+- The `/s2s/*` subrouter into the app, **outside** the JWT layer.
 - The new fields on `AppState`.
 - Boot-time validation: `MARKETPLACE_SVC_URL` set without `_SECRET` → bail.
 - The `hmac_signature` security scheme in OpenAPI.
 - An integration test that exercises the HMAC middleware end-to-end.
 
 **Files:**
-- Modify: `crates/eros-engine-server/src/routes/internal.rs`
+- Modify: `crates/eros-engine-server/src/routes/s2s.rs`
 - Modify: `crates/eros-engine-server/src/routes/mod.rs`
 - Modify: `crates/eros-engine-server/src/state.rs`
 - Modify: `crates/eros-engine-server/src/main.rs`
@@ -1706,7 +1706,7 @@ This is the largest task in E2. It wires:
 
 - [ ] **Step 1: Implement `/since` handlers**
 
-Replace `wallets_since` and `ownership_since` in `routes/internal.rs`:
+Replace `wallets_since` and `ownership_since` in `routes/s2s.rs`:
 
 ```rust
 use axum::extract::Query;
@@ -1798,9 +1798,9 @@ pub struct AppState {
 
 Update any `AppState { ... }` construction in test helpers (`test_state` in `companion.rs`) to set these to `None` / `reqwest::Client::new()` so existing tests stay green.
 
-- [ ] **Step 3: Compose `/internal/*` outside the JWT layer**
+- [ ] **Step 3: Compose `/s2s/*` outside the JWT layer**
 
-In `crates/eros-engine-server/src/routes/mod.rs`, rewrite `router` to add a third top-level sub-router for internal routes with the s2s middleware:
+In `crates/eros-engine-server/src/routes/mod.rs`, rewrite `router` to add a third top-level sub-router for s2s routes with the s2s middleware:
 
 ```rust
 use axum::middleware::from_fn_with_state;
@@ -1813,7 +1813,7 @@ use crate::state::AppState;
 pub mod companion;
 pub mod debug;
 pub mod health;
-pub mod internal;
+pub mod s2s;
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let comp = OpenApiRouter::new()
@@ -1821,7 +1821,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(debug::router(state.config.expose_affinity_debug))
         .layer(from_fn_with_state(state.clone(), require_auth));
 
-    let internal_routes = internal::router()
+    let internal_routes = s2s::router()
         .layer(from_fn_with_state(state.clone(), require_s2s));
 
     OpenApiRouter::new()
@@ -1835,7 +1835,7 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(health::router())
         .merge(companion::router())
         .merge(debug::router(expose_affinity_debug))
-        .merge(internal::router())
+        .merge(s2s::router())
 }
 ```
 
@@ -1907,7 +1907,7 @@ let state = AppState {
 
 - [ ] **Step 5: Integration test — end-to-end HMAC + handler**
 
-Append to `crates/eros-engine-server/src/routes/internal.rs`:
+Append to `crates/eros-engine-server/src/routes/s2s.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1951,7 +1951,7 @@ mod tests {
         let app = build_app_with_secret(pool, "test-secret");
         let req = Request::builder()
             .method("POST")
-            .uri("/internal/wallets/upsert")
+            .uri("/s2s/wallets/upsert")
             .body(Body::empty())
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
@@ -1972,7 +1972,7 @@ mod tests {
         let sig = sign_request(
             "test-secret",
             "POST",
-            "/internal/wallets/upsert",
+            "/s2s/wallets/upsert",
             &body_bytes,
             &ts,
         );
@@ -1980,7 +1980,7 @@ mod tests {
         let app = build_app_with_secret(pool.clone(), "test-secret");
         let req = Request::builder()
             .method("POST")
-            .uri("/internal/wallets/upsert")
+            .uri("/s2s/wallets/upsert")
             .header("content-type", "application/json")
             .header("x-s2s-timestamp", ts)
             .header("x-s2s-signature", sig)
@@ -2008,7 +2008,7 @@ You may need to make `test_state` and `build_router` in `companion.rs` `pub(crat
 The drift-check CI (`9fd3499`) will catch new routes that lack `#[utoipa::path]` or schema additions. Regenerate locally:
 
 Run: `cargo run -p eros-engine-server --bin eros-engine -- print-openapi > crates/eros-engine-server/openapi.json`
-Expected: snapshot updated with the four new `/internal/*` paths and the `hmac_signature` security scheme.
+Expected: snapshot updated with the four new `/s2s/*` paths and the `hmac_signature` security scheme.
 
 - [ ] **Step 7: Run the full test suite**
 
@@ -2021,18 +2021,18 @@ Expected: all green.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/eros-engine-server/src/routes/internal.rs \
+git add crates/eros-engine-server/src/routes/s2s.rs \
         crates/eros-engine-server/src/routes/mod.rs \
         crates/eros-engine-server/src/routes/companion.rs \
         crates/eros-engine-server/src/state.rs \
         crates/eros-engine-server/src/main.rs \
         crates/eros-engine-server/src/openapi.rs \
         crates/eros-engine-server/openapi.json
-git commit -m "feat(server): wire /internal/* routes — handlers + HMAC layer + boot validation
+git commit -m "feat(server): wire /s2s/* routes — handlers + HMAC layer + boot validation
 
 - /since handlers compute next_cursor with the same-timestamp tie-break.
-- Internal subrouter merged OUTSIDE the JWT layer; /healthz public,
-  /comp/* JWT, /internal/* HMAC.
+- S2S subrouter merged OUTSIDE the JWT layer; /healthz public,
+  /comp/* JWT, /s2s/* HMAC.
 - AppState gains marketplace_svc_url + 2 secrets + reqwest client.
 - main.rs bails at boot if MARKETPLACE_SVC_URL is set without the secret.
 - OpenAPI snapshot regenerated with the four new paths + hmac_signature
@@ -2418,7 +2418,7 @@ Append to `auth/s2s.rs`'s `#[cfg(test)]` block:
     fn build_outbound_signed_request_components() {
         let (ts, sig) = build_outbound_signature(
             "GET",
-            "/internal/ownership/since",
+            "/s2s/ownership/since",
             "cursor_pk=&cursor_ts=&limit=10",
             b"",
             b"test-secret",
@@ -2430,7 +2430,7 @@ Append to `auth/s2s.rs`'s `#[cfg(test)]` block:
         let body_hex = hex::encode(Sha256::digest(b""));
         let canonical = canonical_signing_string(
             "GET",
-            "/internal/ownership/since",
+            "/s2s/ownership/since",
             "cursor_pk=&cursor_ts=&limit=10",
             &ts,
             &body_hex,
@@ -2497,7 +2497,7 @@ Create `crates/eros-engine-server/src/pipeline/sync.rs`:
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Self-heal pull: when MARKETPLACE_SVC_URL is configured, periodically
-//! call svc's /internal/{ownership,wallets}/since to pick up any pushes
+//! call svc's /s2s/{ownership,wallets}/since to pick up any pushes
 //! the engine missed. Cursors persisted in engine.sync_cursors.
 
 use chrono::Utc;
@@ -2554,7 +2554,7 @@ pub async fn run(state: AppState) {
 
 async fn tick_ownership(state: &AppState, svc_url: &str, secret: &str) -> anyhow::Result<()> {
     let cursor = SyncCursorRepo { pool: &state.pool }.get("ownership").await?;
-    let path = "/internal/ownership/since";
+    let path = "/s2s/ownership/since";
     let query_raw = format!(
         "cursor_pk={}&cursor_ts={}&limit={}",
         urlencoding::encode(&cursor.cursor_pk),
@@ -2591,7 +2591,7 @@ async fn tick_ownership(state: &AppState, svc_url: &str, secret: &str) -> anyhow
 
 async fn tick_wallets(state: &AppState, svc_url: &str, secret: &str) -> anyhow::Result<()> {
     let cursor = SyncCursorRepo { pool: &state.pool }.get("wallets").await?;
-    let path = "/internal/wallets/since";
+    let path = "/s2s/wallets/since";
     let query_raw = format!(
         "cursor_pk={}&cursor_ts={}&limit={}",
         urlencoding::encode(&cursor.cursor_pk),
@@ -2693,7 +2693,7 @@ Edit `README.md` and append rows to the Configuration table:
 
 ```
 | `MARKETPLACE_SVC_URL` | no | Base URL of eros-marketplace-svc. When set, the engine pulls /since cursors every 5 min as a self-heal recovery path. Requires `MARKETPLACE_SVC_S2S_SECRET`. |
-| `MARKETPLACE_SVC_S2S_SECRET` | no | HMAC secret shared with eros-marketplace-svc. Gates the `/internal/*` routes the svc pushes into. Without it, /internal/* always 401s. |
+| `MARKETPLACE_SVC_S2S_SECRET` | no | HMAC secret shared with eros-marketplace-svc. Gates the `/s2s/*` routes the svc pushes into. Without it, /s2s/* always 401s. |
 | `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` | no | Verify-only secret used during rolling rotation. Engine accepts requests signed with either current or previous secret; outbound calls always sign with current. |
 ```
 
@@ -2707,12 +2707,12 @@ Append a short section to `docs/deploying.md`:
 If you run `eros-marketplace-svc` alongside this engine, set the three
 `MARKETPLACE_SVC_*` env vars (see README) on both sides. The engine
 
-- exposes `/internal/{ownership,wallets}/{upsert,since}` for the svc to push to
+- exposes `/s2s/{ownership,wallets}/{upsert,since}` for the svc to push to
 - pulls the same `/since` endpoints on the svc every 5 min as a fallback
 - gates `/comp/chat/start` and every chat message on NFT ownership for
   any persona genome whose `asset_id` is populated
 
-Without these env vars, the engine runs in OSS mode: `/internal/*` routes
+Without these env vars, the engine runs in OSS mode: `/s2s/*` routes
 return 401, no self-heal task is spawned, and the gate is a no-op for
 legacy seed-persona genomes (`asset_id IS NULL`). Migration to a marketplace-
 backed deploy is purely additive — set the env vars and `INSERT` rows.
@@ -2724,7 +2724,7 @@ after one sync cycle (5 minutes).
 
 - [ ] **Step 4: API reference**
 
-Append to `docs/api-reference.md` a section that lists the four `/internal/*` routes, with example request bodies + signature header layout. Reference §4.3 of the spec for the canonical signing string.
+Append to `docs/api-reference.md` a section that lists the four `/s2s/*` routes, with example request bodies + signature header layout. Reference §4.3 of the spec for the canonical signing string.
 
 - [ ] **Step 5: Regenerate OpenAPI snapshot (one more time, just in case)**
 
@@ -2746,7 +2746,7 @@ git commit -m "feat(server): conditional self-heal spawn + operator docs
 
 When MARKETPLACE_SVC_URL is set, the engine spawns the self-heal task at
 boot. Documents the three new env vars, the rolling-rotation procedure,
-and the /internal/* surface for operators bringing up the marketplace
+and the /s2s/* surface for operators bringing up the marketplace
 coordination."
 ```
 

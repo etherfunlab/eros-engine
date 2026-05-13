@@ -10,8 +10,8 @@
 
 - `engine.persona_ownership` table — mirror of marketplace-side ownership
 - `engine.wallet_links` table — mirror of marketplace-side wallet bindings
-- `POST /internal/{ownership,wallets}/upsert` — svc-to-engine push endpoints
-- `GET  /internal/{ownership,wallets}/since` — engine-to-svc self-heal pull
+- `POST /s2s/{ownership,wallets}/upsert` — svc-to-engine push endpoints
+- `GET  /s2s/{ownership,wallets}/since` — engine-to-svc self-heal pull
 - Gate on `POST /comp/chat/start` — reject if caller doesn't own the persona's NFT
 
 Until those land, the marketplace can mint cNFTs and reconcile ownership in its own DB, but `eros-engine` will happily let any signed-in user start a chat with any persona — the chat access gate that justifies the NFT does not exist.
@@ -21,7 +21,7 @@ This PR adds those surfaces. The OSS engine continues to be usable without a mar
 ## 2. Goals
 
 1. Mirror marketplace ownership + wallet-binding state inside `engine.*` schema so chat-access decisions are a single SQL join, not a remote call.
-2. Expose HMAC-authenticated `/internal/*` endpoints for svc → engine push and engine ↔ svc self-heal pull, with no Supabase JWT involvement.
+2. Expose HMAC-authenticated `/s2s/*` endpoints for svc → engine push and engine ↔ svc self-heal pull, with no Supabase JWT involvement.
 3. Gate `POST /comp/chat/start` on NFT ownership **only when** the requested genome carries an `asset_id`. Genomes without `asset_id` (seed-persona TOML loads, existing OSS deployments) keep current behavior unchanged.
 4. Preserve OSS independence: an engine deploy without `MARKETPLACE_SVC_URL` configured runs identically to today, with no marketplace coupling at runtime.
 
@@ -31,7 +31,7 @@ This PR adds those surfaces. The OSS engine continues to be usable without a mar
 - **Frontend wallet linking flow.** `eros-engine-web`'s `/me/wallets/*` UI plus wallet-adapter signature flow live in that repo; this PR exposes only the engine-side data plane that mirrors svc state.
 - **Bulk ownership queries.** "Which assets does user U own?" is a single-row probe per chat-start in v0.1. Aggregate endpoints (catalog joins, batch ownership) come later.
 - **Eros-nft-extended (trained-persona transfer).** This PR's `asset_id` on `genomes` deliberately leaves room for a future instance-level transfer surface; we do not pre-build it.
-- **OpenAPI changes for `/comp/*`.** The bearer security scheme stays as-is. Only `/internal/*` adds a new `hmac_signature` security scheme.
+- **OpenAPI changes for `/comp/*`.** The bearer security scheme stays as-is. Only `/s2s/*` adds a new `hmac_signature` security scheme.
 
 ## 4. Architecture
 
@@ -78,7 +78,7 @@ CREATE INDEX wallet_links_source_updated_at_idx
     ON engine.wallet_links (source_updated_at, user_id, wallet_pubkey);
 ```
 
-`linked` is the tombstone bit: unlink writes `linked=false`, never `DELETE`. This is required because `GET /internal/wallets/since` (the self-heal pull) cannot represent a deletion as the absence of a row — a downstream consumer that polls by cursor would never observe a missing row. Tombstones flow through `since` exactly like upserts. `source_updated_at` is the svc's authoritative event time, used both for cursor ordering and stale-write protection (§4.4); `updated_at` is local cache freshness for observability.
+`linked` is the tombstone bit: unlink writes `linked=false`, never `DELETE`. This is required because `GET /s2s/wallets/since` (the self-heal pull) cannot represent a deletion as the absence of a row — a downstream consumer that polls by cursor would never observe a missing row. Tombstones flow through `since` exactly like upserts. `source_updated_at` is the svc's authoritative event time, used both for cursor ordering and stale-write protection (§4.4); `updated_at` is local cache freshness for observability.
 
 ```sql
 -- 0010_persona_ownership.sql
@@ -126,7 +126,7 @@ Nullable to keep every existing seed-persona genome untouched. Partial unique in
 
 ### 4.3 HMAC s2s middleware
 
-New `crates/eros-engine-server/src/auth/s2s.rs`, parallel to the existing JWT `auth/middleware.rs`. Mounted on `/internal/*` only.
+New `crates/eros-engine-server/src/auth/s2s.rs`, parallel to the existing JWT `auth/middleware.rs`. Mounted on `/s2s/*` only.
 
 **Canonical signing string:**
 
@@ -142,7 +142,7 @@ canonical_string = method + "\n"
 
 Where:
 - `method` is uppercase (`GET`, `POST`).
-- `path` is the request path with no query string (e.g. `/internal/ownership/since`).
+- `path` is the request path with no query string (e.g. `/s2s/ownership/since`).
 - `canonical_query` is the query string with parameters sorted by name, percent-encoded per RFC 3986; empty string if no query.
 - `timestamp` is the value of `X-S2S-Timestamp`, an RFC 3339 UTC timestamp.
 - `body_sha256_hex` is the lowercase hex SHA-256 of the raw request body (`e3b0c4...` for the empty body — defined for `GET` requests).
@@ -167,18 +167,18 @@ The 1 MiB cap exists because the middleware must buffer the full body **before**
 
 **Secret rotation:** `MARKETPLACE_SVC_S2S_SECRET` is the active signing secret. `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` (optional) is accepted for verification only — never for outgoing signing. Rotation procedure: (a) set `_PREVIOUS = current`, deploy; (b) set new `current`, deploy; (c) after svc-side rotation is also complete, unset `_PREVIOUS`. This avoids the dead window where one side has rotated and the other hasn't.
 
-**OSS-mode posture:** `MARKETPLACE_SVC_S2S_SECRET` gates verification, period. When the secret is unset, every `/internal/*` request fails at step 6 (no candidate secret) and returns `401`. The routes are mounted for API discoverability and uniform behavior, but reject in practice. `MARKETPLACE_SVC_URL` controls whether the self-heal pull task spawns (§4.6); a deploy that wants to **receive** pushes but not poll svc back can set the secret without the URL.
+**OSS-mode posture:** `MARKETPLACE_SVC_S2S_SECRET` gates verification, period. When the secret is unset, every `/s2s/*` request fails at step 6 (no candidate secret) and returns `401`. The routes are mounted for API discoverability and uniform behavior, but reject in practice. `MARKETPLACE_SVC_URL` controls whether the self-heal pull task spawns (§4.6); a deploy that wants to **receive** pushes but not poll svc back can set the secret without the URL.
 
 ### 4.4 S2S routes
 
-New `crates/eros-engine-server/src/routes/internal.rs`. All four routes share the s2s middleware layer.
+New `crates/eros-engine-server/src/routes/s2s.rs`. All four routes share the s2s middleware layer.
 
 | Method | Path | Body / query | Response |
 |---|---|---|---|
-| `POST` | `/internal/wallets/upsert` | `{ user_id: UUID, wallet_pubkey: String, linked: bool, source_updated_at: RFC3339 }` | `204` or `409` if stale |
-| `GET` | `/internal/wallets/since` | `?cursor_ts=<RFC3339>&cursor_pk=<user_id:wallet_pubkey>&limit=<1..1000>` | `{ rows: [WalletLink…], next_cursor: { ts, pk } or null }` |
-| `POST` | `/internal/ownership/upsert` | `{ asset_id: String, persona_id: String, owner_wallet: String, source_updated_at: RFC3339 }` | `204` or `409` if stale |
-| `GET` | `/internal/ownership/since` | `?cursor_ts=<RFC3339>&cursor_pk=<asset_id>&limit=<1..1000>` | `{ rows: [Ownership…], next_cursor: { ts, pk } or null }` |
+| `POST` | `/s2s/wallets/upsert` | `{ user_id: UUID, wallet_pubkey: String, linked: bool, source_updated_at: RFC3339 }` | `204` or `409` if stale |
+| `GET` | `/s2s/wallets/since` | `?cursor_ts=<RFC3339>&cursor_pk=<user_id:wallet_pubkey>&limit=<1..1000>` | `{ rows: [WalletLink…], next_cursor: { ts, pk } or null }` |
+| `POST` | `/s2s/ownership/upsert` | `{ asset_id: String, persona_id: String, owner_wallet: String, source_updated_at: RFC3339 }` | `204` or `409` if stale |
+| `GET` | `/s2s/ownership/since` | `?cursor_ts=<RFC3339>&cursor_pk=<asset_id>&limit=<1..1000>` | `{ rows: [Ownership…], next_cursor: { ts, pk } or null }` |
 
 **Input validation (boundary, before SQL):**
 
@@ -282,14 +282,14 @@ SELECT EXISTS (
 
 ### 4.6 Optional self-heal task
 
-When `MARKETPLACE_SVC_URL` is configured, the server spawns a background task at boot that periodically pulls svc's `since` endpoints and replays them through the same internal repos used by `/internal/*/upsert`. This is the recovery path for missed pushes; the **primary** path is svc → engine push.
+When `MARKETPLACE_SVC_URL` is configured, the server spawns a background task at boot that periodically pulls svc's `since` endpoints and replays them through the same store repos used by `/s2s/*/upsert`. This is the recovery path for missed pushes; the **primary** path is svc → engine push.
 
 **Boot config validation:** if `MARKETPLACE_SVC_URL` is set but `MARKETPLACE_SVC_S2S_SECRET` is unset, the server fails boot with `anyhow::bail!("MARKETPLACE_SVC_URL set without MARKETPLACE_SVC_S2S_SECRET …")`. Silently spawning a task that will fail forever is the wrong default. Either both are configured (full coordination) or neither is (OSS-only). The inverse — secret without URL — is allowed: it means "accept pushes but don't poll back."
 
 ```
 loop every 5 minutes:
     cursor_o = SELECT (cursor_ts, cursor_pk) FROM sync_cursors WHERE name='ownership'
-    fetch GET {svc_url}/internal/ownership/since
+    fetch GET {svc_url}/s2s/ownership/since
         ?cursor_ts={cursor_o.ts}&cursor_pk={cursor_o.pk}&limit=500
         with X-S2S-Timestamp + X-S2S-Signature (signed per §4.3)
     for each row → OwnershipRepo::upsert with stale-write check (§4.4)
@@ -307,7 +307,7 @@ If `MARKETPLACE_SVC_URL` is unset, the task is not spawned. Same outcome as toda
 
 ### 4.7 OpenAPI
 
-The four `/internal/*` routes get `#[utoipa::path]` annotations with a new `security = [("hmac_signature" = [])]` scheme alongside the existing `bearer`. Each route lives under an `internal` tag so the Scalar UI groups them apart from `/comp/*`. The drift-check CI (added in `9fd3499`) catches any handler that forgets the annotation.
+The four `/s2s/*` routes get `#[utoipa::path]` annotations with a new `security = [("hmac_signature" = [])]` scheme alongside the existing `bearer`. Each route lives under an `s2s` tag so the Scalar UI groups them apart from `/comp/*`. The drift-check CI (added in `9fd3499`) catches any handler that forgets the annotation.
 
 ## 5. Crate impact
 
@@ -324,9 +324,9 @@ crates/eros-engine-server/src/
     companion.rs     # MODIFY: enforce_nft_ownership helper; gate at start_chat
                      #         BEFORE create_instance; per-message gate in
                      #         send_message + send_message_async
-    internal.rs      # NEW: 4 routes + base58/UUID validators
-    mod.rs           # MODIFY: merge internal subrouter OUTSIDE the JWT layer;
-                     #         /healthz public, /comp/* JWT, /internal/* HMAC
+    s2s.rs           # NEW: 4 routes + base58/UUID validators
+    mod.rs           # MODIFY: merge s2s subrouter OUTSIDE the JWT layer;
+                     #         /healthz public, /comp/* JWT, /s2s/* HMAC
   state.rs           # MODIFY: marketplace_svc_url, marketplace_s2s_secret,
                      #         marketplace_s2s_secret_previous, http_client
   pipeline/
@@ -356,7 +356,7 @@ Approximately 11 files: 7 new, 4 modified. No `-core` or `-llm` touch.
 | Phase | Scope | Definition of done |
 |---|---|---|
 | **E1 — Schema + repos** | Three migrations, `OwnershipRepo`, `WalletLinkRepo`, `PersonaGenome.asset_id` plumbing, sync_cursors helper | sqlx unit tests for UPSERT + `since` cursor pagination green; CI green |
-| **E2 — S2S middleware + routes** | `auth/s2s.rs`, `routes/internal.rs`, OpenAPI registration, env wiring | Integration tests: HMAC pass/fail, timestamp skew rejection, body-tamper rejection, idempotent UPSERT |
+| **E2 — S2S middleware + routes** | `auth/s2s.rs`, `routes/s2s.rs`, OpenAPI registration, env wiring | Integration tests: HMAC pass/fail, timestamp skew rejection, body-tamper rejection, idempotent UPSERT |
 | **E3 — Chat-start gate** | `start_chat` gate block, tests | New tests: legacy genome (asset_id NULL) still passes; NFT genome without wallet_link rejects 403; NFT genome with correct ownership chain passes |
 | **E4 — Self-heal task** | `pipeline/sync.rs`, conditional spawn in `main.rs`, env var docs | Configured deploy pulls svc cursors; unconfigured deploy doesn't spawn; logs include cursor advancement |
 
@@ -374,9 +374,9 @@ E1 lands first (data model). E2 unlocks svc → engine push. E3 closes the gate.
 | 6 | `asset_id TEXT`, not `BYTEA` | Solana pubkeys are conventionally base58 strings; engine doesn't decode them; downstream tooling (logs, Grafana) is text-friendly | Switching to BYTEA later means a one-shot migration if performance demands it; not on the horizon |
 | 7 | Legacy seed-persona genomes (`asset_id IS NULL`) are permanently exempt from the gate | Zero regression for current OSS users; the gate adds capability, doesn't remove it | Requiring all genomes to be NFT-backed would break every public OSS deploy |
 | 8 | Self-heal is pull (engine → svc), not double-push (svc retries) | Engine controls its own catch-up cadence; svc isn't responsible for guaranteeing eventual delivery of every push | If we move to event-streaming infra later, the cursor pull is replaced by stream resume — same shape |
-| 9 | `/internal/*` exists in OSS engine even without `MARKETPLACE_SVC_S2S_SECRET` (rejects in practice) | API discoverability; anyone running their own marketplace can use the surface by setting their own secret | Gating the route registration on env presence is silently confusing — better to mount and reject |
+| 9 | `/s2s/*` exists in OSS engine even without `MARKETPLACE_SVC_S2S_SECRET` (rejects in practice) | API discoverability; anyone running their own marketplace can use the surface by setting their own secret | Gating the route registration on env presence is silently confusing — better to mount and reject |
 | 10 | Ownership recheck runs on **every chat message**, not just `chat/start` | Without per-message recheck, a previous owner can keep chatting through an existing session after sale or unlink. The recheck is a single PK join (~ms); cost is dominated by the LLM round-trip that comes next | Session-expiry-on-ownership-change (mark sessions stale on webhook) would save the per-message check but requires extra schema + webhook side effects; not worth it at v0.1 message volume |
-| 11 | Every `/internal/*/upsert` payload carries `source_updated_at` and SQL applies it as a stale-write guard | Webhooks and self-heal pulls can deliver events out of order; a `now()`-only write would let an older event silently revert ownership | Removing this guard re-introduces correctness bugs under any non-trivial concurrency or replay |
+| 11 | Every `/s2s/*/upsert` payload carries `source_updated_at` and SQL applies it as a stale-write guard | Webhooks and self-heal pulls can deliver events out of order; a `now()`-only write would let an older event silently revert ownership | Removing this guard re-introduces correctness bugs under any non-trivial concurrency or replay |
 | 12 | Unlink uses a tombstone row (`linked = false`), not `DELETE` | `GET /since` cursor pull cannot represent deletion as absence — an engine that polls would never observe a missing row. Tombstones flow through the cursor exactly like inserts and updates | The partial unique index on `(wallet_pubkey) WHERE linked = true` keeps the "one wallet → one user" invariant intact |
 | 13 | Compound cursor `(source_updated_at, pk)` for `/since` endpoints | A simple `updated_at >` cursor drops rows that share a timestamp across page boundaries. Compound key with PK tie-break is the standard fix | Switching to a sequence-number cursor would also work, but `source_updated_at` is already mandated for stale-write protection and reusing it avoids a second source-of-truth |
 | 14 | HMAC signing string is canonical 5-line layout (method + path + query + ts + body_sha256) | Body-only signatures are replayable across endpoints with the same body. Method+path+query binding makes each signed request specific. Defining canonical_query as sorted+percent-encoded avoids two valid encodings of the same query producing different signatures | The wire format is now fixed; downstream changes require coordinated svc+engine rollouts |
@@ -389,24 +389,24 @@ E1 lands first (data model). E2 unlocks svc → engine push. E3 closes the gate.
 |---|---|
 | **svc push fails and self-heal disabled (env unset) → engine state permanently stale** | Boot-time validation: setting `MARKETPLACE_SVC_URL` without the secret fails boot; the OSS-only mode (neither set) accepts no marketplace coordination at all. No silent half-state. |
 | **HMAC secret leaks** | Secret lives in fly secrets / Supabase env vault, never in code or CI logs. Rotation uses `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` for verification during transition; deploy new secret, wait one sync cycle, drop previous. |
-| **Reordered webhooks revert ownership to a stale owner** | Every `/internal/*/upsert` carries `source_updated_at`; the SQL `ON CONFLICT … WHERE incoming > existing` clause silently drops older events. Self-heal pulls hit the same guard. |
+| **Reordered webhooks revert ownership to a stale owner** | Every `/s2s/*/upsert` carries `source_updated_at`; the SQL `ON CONFLICT … WHERE incoming > existing` clause silently drops older events. Self-heal pulls hit the same guard. |
 | **Same-timestamp rows split across cursor pages → dropped from self-heal** | Compound cursor `(source_updated_at, pk)` with deterministic tie-break by primary key. Standard fix. |
-| **HMAC body-only signature replayed across endpoints** | Signing string includes method + path + canonical_query, not just body. A signature for `POST /internal/ownership/upsert` cannot match `POST /internal/wallets/upsert` even if both carry the same JSON. |
+| **HMAC body-only signature replayed across endpoints** | Signing string includes method + path + canonical_query, not just body. A signature for `POST /s2s/ownership/upsert` cannot match `POST /s2s/wallets/upsert` even if both carry the same JSON. |
 | **HMAC middleware memory DoS via huge body** | 1 MiB hard cap on body read in middleware, returning 413 before HMAC computation. Cap is well above any legitimate payload (single UPSERT < 1 KiB). |
 | **Engine receives ownership row for an `asset_id` whose `persona_genomes.asset_id` hasn't been set yet** | Gate join falls through to empty → 403 on chat-start. Acceptable v0.1 behavior; the future content-ingestion PR will sequence pushes so genome lands before ownership. Operator-facing reconciliation report flags drift. |
 | **Previous owner keeps chatting through existing session after sale** | Per-message gate (§4.5) catches this on the next message. Latency cost is one indexed PK join, dominated by the LLM round-trip. |
 | **Wallet rebinding race** (svc unlinks W from user_A, links W to user_B; engine sees them out of order) | Stale-write protection on `source_updated_at` plus tombstone rows mean the later event wins regardless of arrival order. The partial unique index on `(wallet_pubkey) WHERE linked = true` permits exactly one active binding at any time. |
 | **Hidden `persona_instance` row created for non-owner** | Gate runs **before** `create_instance` in the genome path of `start_chat`. Non-owners get 403 with no DB side effect. |
 | **Catalog leakage**: `/comp/personas` lists genomes whose `asset_id` the caller doesn't own | Recorded as a follow-up (§9). v0.1 lets non-owners *see* a genome's existence but not chat with it; the marketplace UI surfaces ownership state separately. Filtering at the catalog endpoint is a future privacy-hardening step. |
-| **Webhook-style replay attacks against `/internal/*`** | Timestamp window (±5 min) + per-request HMAC binding to method/path/query/body. Cursor `since` endpoints are idempotent reads — replays are safe by construction; replay of writes hits the stale-write guard. |
+| **Webhook-style replay attacks against `/s2s/*`** | Timestamp window (±5 min) + per-request HMAC binding to method/path/query/body. Cursor `since` endpoints are idempotent reads — replays are safe by construction; replay of writes hits the stale-write guard. |
 | **Migration on a live engine** | Migrations are additive (new tables + nullable column). Zero existing row affected. Roll-forward only. |
 
 ## 9. Out-of-scope (recorded for next-round PRs)
 
-- **Marketplace persona content ingestion** — `svc → /internal/genomes/upsert` plus KMS-unwrap-on-chat-load to materialize encrypted prompts. Separate PR, blocks the user-visible chat-with-NFT loop end-to-end.
+- **Marketplace persona content ingestion** — `svc → /s2s/genomes/upsert` plus KMS-unwrap-on-chat-load to materialize encrypted prompts. Separate PR, blocks the user-visible chat-with-NFT loop end-to-end.
 - **Frontend wallet-linking flow** — `eros-engine-web` adds wallet adapter, `/me/wallets/challenge` + `/me/wallets/confirm` client-side flow.
 - **Bulk ownership queries** — admin or catalog routes that list "all assets owned by user U" / "all owners of genome G." Not needed by chat-gating.
-- **`eros-nft-extended` trained-persona transfer** — instance-level state transfer would add a `POST /internal/instance-transfer` surface and migration of affinity/memory rows. Entirely separate spec lineage.
+- **`eros-nft-extended` trained-persona transfer** — instance-level state transfer would add a `POST /s2s/instance-transfer` surface and migration of affinity/memory rows. Entirely separate spec lineage.
 - **Catalog filtering** — `/comp/personas` currently lists every active genome regardless of NFT ownership. A future PR can filter or annotate NFT-backed genomes by caller ownership state. Not a v0.1 requirement; the marketplace UI is the surface where ownership is rendered.
 - **Observability instrumentation** — sync lag, rejected stale events (count + last reason), HMAC failures, cursor age per entity, gate deny reason counts. The implementation plan should add these as a thin metrics layer; the spec records the requirement here.
 - **Dangling ownership row cleanup** — if a `persona_genomes` row is set inactive or its `asset_id` cleared, the corresponding `persona_ownership` row becomes orphaned (the gate cannot resolve it back to a genome). A reconciliation report is enough at v0.1; a future PR can add periodic cleanup or a `FOREIGN KEY` after the ingestion PR establishes genome→asset_id as the authoritative source.
@@ -427,7 +427,7 @@ M crates/eros-engine-store/src/persona.rs
 M crates/eros-engine-store/src/lib.rs
 A crates/eros-engine-server/src/auth/s2s.rs
 M crates/eros-engine-server/src/auth/mod.rs
-A crates/eros-engine-server/src/routes/internal.rs
+A crates/eros-engine-server/src/routes/s2s.rs
 M crates/eros-engine-server/src/routes/companion.rs
 M crates/eros-engine-server/src/routes/mod.rs
 M crates/eros-engine-server/src/state.rs
