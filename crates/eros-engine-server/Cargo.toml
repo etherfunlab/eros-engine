@@ -44,3 +44,4 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
+urlencoding = "2"
