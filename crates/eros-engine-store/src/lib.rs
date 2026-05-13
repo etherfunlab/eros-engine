@@ -68,4 +68,45 @@ mod migration_tests {
         .await
         .expect("insert into sync_cursors");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persona_genomes_gains_nullable_asset_id(pool: PgPool) {
+        // The legacy seed-persona path inserts WITHOUT asset_id and must keep working.
+        let legacy_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active)
+             VALUES ($1, 'LegacyGenome', 'prompt', '{}'::jsonb, true)",
+        )
+        .bind(legacy_id)
+        .execute(&pool)
+        .await
+        .expect("legacy insert without asset_id");
+
+        // A new NFT-backed genome carries asset_id.
+        let nft_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'NftGenome', 'prompt', '{}'::jsonb, true, $2)",
+        )
+        .bind(nft_id)
+        .bind("11111111111111111111111111111112")
+        .execute(&pool)
+        .await
+        .expect("nft insert with asset_id");
+
+        // Partial unique: the same non-NULL asset_id cannot be claimed twice.
+        let dup_id = uuid::Uuid::new_v4();
+        let dup_res = sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'Dup', 'prompt', '{}'::jsonb, true, $2)",
+        )
+        .bind(dup_id)
+        .bind("11111111111111111111111111111112")
+        .execute(&pool)
+        .await;
+        assert!(dup_res.is_err(), "duplicate asset_id must be rejected");
+    }
 }
