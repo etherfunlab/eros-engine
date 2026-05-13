@@ -167,6 +167,25 @@ If you're sharing a database with another service, the engine's tables stay in `
 - **Logs:** `RUST_LOG=info` is the default. Set `RUST_LOG=debug,sqlx=warn` to see everything except SQLx query churn.
 - **Cost:** the OSS deployment defaults to grok-4-fast (cheap) for chat and grok-4-mini for insight extraction. A typical chat turn costs ≪ $0.001 in token spend plus a Voyage embedding call (~$0.000003 for a memory-worthy fact). 10k chat turns costs single-digit dollars.
 
+## Marketplace coordination (optional)
+
+If you run `eros-marketplace-svc` alongside this engine, set the three
+`MARKETPLACE_SVC_*` env vars (see README) on both sides. The engine
+
+- exposes `/s2s/{ownership,wallets}/{upsert,since}` for the svc to push to
+- pulls the same `/since` endpoints on the svc every 5 min as a fallback
+- gates `/comp/chat/start` and every chat message on NFT ownership for
+  any persona genome whose `asset_id` is populated
+
+Without these env vars, the engine runs in OSS mode: `/s2s/*` routes
+return 401, no self-heal task is spawned, and the gate is a no-op for
+legacy seed-persona genomes (`asset_id IS NULL`). Migration to a marketplace-
+backed deploy is purely additive — set the env vars and `INSERT` rows.
+
+For secret rotation, set `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS = old`, deploy,
+then set `MARKETPLACE_SVC_S2S_SECRET = new`, deploy, then drop `_PREVIOUS`
+after one sync cycle (5 minutes).
+
 ## Source
 
 - `fly.toml` — ready-to-use Fly.io production config

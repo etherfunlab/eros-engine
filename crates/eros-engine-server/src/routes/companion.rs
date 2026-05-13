@@ -45,12 +45,39 @@ use eros_engine_core::types::Event;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
+use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::pipeline;
 use crate::state::AppState;
+
+/// NFT-ownership gate. Returns `Ok(())` immediately if `asset_id` is `None`
+/// (legacy seed-persona genome). Otherwise joins persona_ownership with
+/// wallet_links (linked=true) and returns 403 on no match.
+///
+/// Called at chat-start (before create_instance) and at every chat message
+/// (sync + async). The join is a single indexed PK lookup followed by an
+/// index lookup on wallet_pubkey — sub-ms.
+pub(crate) async fn enforce_nft_ownership(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    asset_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(asset_id) = asset_id else {
+        return Ok(());
+    };
+    let owns = OwnershipRepo { pool }
+        .owns(user_id, asset_id)
+        .await
+        .map_err(AppError::from)?;
+    if owns {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("nft_ownership_required".into()))
+    }
+}
 
 // ─── DTOs ───────────────────────────────────────────────────────────
 
@@ -377,6 +404,11 @@ async fn start_chat(
                     "instance not owned by this user".into(),
                 ));
             }
+            // NEW: NFT gate (orthogonal to owner_uid — NFT ownership is wallet-bound).
+            let asset_id_opt = persona_repo
+                .get_asset_id_for_genome(companion.instance.genome_id)
+                .await?;
+            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
             iid
         }
         None => {
@@ -392,6 +424,12 @@ async fn start_chat(
             if !genome.is_active {
                 return Err(AppError::BadRequest("genome is not active".into()));
             }
+
+            // NEW: NFT gate runs BEFORE looking for an instance or creating one.
+            // A non-owner who hits the create_instance fallback would otherwise
+            // leave behind an empty persona_instances row.
+            let asset_id_opt = persona_repo.get_asset_id_for_genome(genome_id).await?;
+            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
 
             // Look for an existing active instance for this user×genome.
             let existing: Option<(Uuid,)> = sqlx::query_as(
@@ -477,10 +515,24 @@ async fn send_message(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<CompanionReplyResponse>, AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
+    let session = require_session_for_user(&state, session_id, user_id).await?;
 
     if req.message.trim().is_empty() {
         return Err(AppError::BadRequest("message must not be empty".into()));
+    }
+
+    // Per-message NFT ownership recheck — a previous owner cannot keep
+    // messaging through an existing session after sale or wallet unlink.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    if let Some(instance_id) = session.instance_id {
+        let companion = persona_repo
+            .load_companion(instance_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+        let asset_id_opt = persona_repo
+            .get_asset_id_for_genome(companion.instance.genome_id)
+            .await?;
+        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
     // Persist the user message up-front so the engine sees it in history.
@@ -544,10 +596,23 @@ async fn send_message_async(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(axum::http::StatusCode, Json<AsyncSendResponse>), AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
+    let session = require_session_for_user(&state, session_id, user_id).await?;
 
     if req.message.trim().is_empty() {
         return Err(AppError::BadRequest("message must not be empty".into()));
+    }
+
+    // Per-message NFT ownership recheck — see `send_message`.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    if let Some(instance_id) = session.instance_id {
+        let companion = persona_repo
+            .load_companion(instance_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+        let asset_id_opt = persona_repo
+            .get_asset_id_for_genome(companion.instance.genome_id)
+            .await?;
+        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -874,6 +939,53 @@ pub fn router() -> OpenApiRouter<AppState> {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Test helpers — visible to other modules' #[cfg(test)] blocks so the
+// /s2s/* integration tests in routes/s2s.rs can reuse `test_state`.
+// Lives outside the inner `tests` module on purpose; Rust's visibility
+// rules don't let a sibling module reach into a private `mod tests`.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+pub(crate) const TEST_SECRET: &str = "test-secret-companion-routes";
+
+#[cfg(test)]
+pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
+    use crate::auth::supabase::SupabaseJwtValidator;
+    use crate::auth::AuthValidator;
+    use std::sync::Arc;
+
+    let auth: Arc<dyn AuthValidator> =
+        Arc::new(SupabaseJwtValidator::new().with_legacy_secret(TEST_SECRET.into()));
+    AppState {
+        pool,
+        auth,
+        config: crate::state::ServerConfig {
+            expose_affinity_debug: true,
+            ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
+            demo_ema_inertia: 0.0,
+            bind_addr: "127.0.0.1:0".into(),
+            // Sweeper disabled in tests — unit tests don't spawn it
+            // and the fields are just for AppState completeness.
+            dreaming_tick: std::time::Duration::ZERO,
+            dreaming_idle_threshold: std::time::Duration::from_secs(1800),
+            dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
+        },
+        openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
+            "stub".into(),
+        )),
+        voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
+        model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
+        // s2s middleware is opted-out in companion tests (no secret
+        // configured → /s2s/* returns 401). The s2s integration tests
+        // in routes/s2s.rs override `marketplace_s2s_secret` after
+        // calling this helper.
+        marketplace_svc_url: None,
+        marketplace_s2s_secret: None,
+        marketplace_s2s_secret_previous: None,
+        http_client: reqwest::Client::new(),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Integration tests
 //
 // These exercise the route module's HTTP+DB side-effects against a
@@ -898,13 +1010,7 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::{json, Value};
     use sqlx::PgPool;
-    use std::sync::Arc;
     use tower::Service;
-
-    use crate::auth::supabase::SupabaseJwtValidator;
-    use crate::auth::AuthValidator;
-
-    const TEST_SECRET: &str = "test-secret-companion-routes";
 
     // ─── Test helpers ───────────────────────────────────────────────
 
@@ -916,31 +1022,6 @@ mod tests {
             &EncodingKey::from_secret(TEST_SECRET.as_ref()),
         )
         .expect("test jwt encodes")
-    }
-
-    fn test_state(pool: PgPool) -> AppState {
-        let auth: Arc<dyn AuthValidator> =
-            Arc::new(SupabaseJwtValidator::new().with_legacy_secret(TEST_SECRET.into()));
-        AppState {
-            pool,
-            auth,
-            config: crate::state::ServerConfig {
-                expose_affinity_debug: true,
-                ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
-                demo_ema_inertia: 0.0,
-                bind_addr: "127.0.0.1:0".into(),
-                // Sweeper disabled in tests — unit tests don't spawn it
-                // and the fields are just for AppState completeness.
-                dreaming_tick: std::time::Duration::ZERO,
-                dreaming_idle_threshold: std::time::Duration::from_secs(1800),
-                dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
-            },
-            openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
-                "stub".into(),
-            )),
-            voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
-            model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
-        }
     }
 
     fn build_router(state: AppState) -> Router {
@@ -1217,6 +1298,177 @@ mod tests {
     }
 
     // ─── Bonus: debug affinity endpoint round-trips when enabled ────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_passes_for_legacy_genome(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let res = enforce_nft_ownership(&pool, user, None).await;
+        assert!(res.is_ok(), "asset_id=None must always pass");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_rejects_when_not_owner(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let res =
+            enforce_nft_ownership(&pool, user, Some("11111111111111111111111111111111")).await;
+        match res {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn enforce_passes_for_owner(pool: PgPool) {
+        use chrono::Utc;
+        use eros_engine_store::ownership::OwnershipRepo;
+        use eros_engine_store::wallets::WalletLinkRepo;
+
+        let user = Uuid::new_v4();
+        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
+        let asset = "11111111111111111111111111111131";
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, true, Utc::now())
+            .await
+            .unwrap();
+        OwnershipRepo { pool: &pool }
+            .upsert(asset, "p-1", wallet, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(enforce_nft_ownership(&pool, user, Some(asset))
+            .await
+            .is_ok());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_chat_403_on_unowned_nft_genome(pool: PgPool) {
+        // Seed an NFT-backed genome whose asset_id no one currently owns.
+        let genome_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true,
+                     '11111111111111111111111111111131')",
+        )
+        .bind(genome_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(Uuid::new_v4());
+
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Crucially: NO instance row was created.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM engine.persona_instances WHERE genome_id = $1")
+                .bind(genome_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "non-owner must not create a hidden persona_instance"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_chat_passes_for_legacy_genome(pool: PgPool) {
+        // Unchanged path: legacy seed-persona must still work.
+        let genome_id = seed_genome(&pool, "Echo").await;
+        let user = Uuid::new_v4();
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user);
+
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn message_403_after_unlink(pool: PgPool) {
+        use chrono::Utc;
+        use eros_engine_store::ownership::OwnershipRepo;
+        use eros_engine_store::wallets::WalletLinkRepo;
+
+        // Setup: NFT genome, owner, started a session.
+        let user = Uuid::new_v4();
+        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
+        let asset = "11111111111111111111111111111131";
+        let genome_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true, $2)",
+        )
+        .bind(genome_id)
+        .bind(asset)
+        .execute(&pool)
+        .await
+        .unwrap();
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, true, Utc::now())
+            .await
+            .unwrap();
+        OwnershipRepo { pool: &pool }
+            .upsert(asset, "p-1", wallet, Utc::now())
+            .await
+            .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user);
+
+        // Start a chat (passes the gate).
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "start should succeed: {resp}");
+        let session_id = resp["session_id"].as_str().unwrap().to_string();
+
+        // Unlink the wallet — ownership chain now broken.
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, false, Utc::now())
+            .await
+            .unwrap();
+
+        // Sending a message should now 403.
+        let body = serde_json::to_vec(&serde_json::json!({ "message": "hi" })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn debug_affinity_returns_vector_for_owner(pool: PgPool) {
