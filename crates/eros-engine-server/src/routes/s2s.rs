@@ -8,14 +8,18 @@
 //! boundary (base58 32-byte for pubkeys/asset_ids) so non-canonical
 //! representations cannot create logical duplicates downstream.
 
-// Tasks 12-14 wire the store imports into handler bodies and the
-// router into routes::router() composition; until then everything in
-// this module is dead from the binary's POV (the integration tests
-// added alongside the real handlers will exercise it directly, same
-// pattern as companion.rs).
-#![allow(dead_code, unused_imports)]
+// Handlers are reachable in the production binary as of Task 14 (routes
+// composed into the public router via routes::router). The `dead_code`
+// allow remains because some DTO fields (e.g. SinceCursor) are only
+// touched through serde at the network boundary and aren't otherwise
+// read by Rust code; same convention as companion.rs.
+#![allow(dead_code)]
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::pubkey::validate_solana_pubkey;
@@ -48,6 +52,28 @@ pub struct OwnershipUpsertRequest {
 pub struct SinceCursor {
     pub ts: DateTime<Utc>,
     pub pk: String,
+}
+
+/// Query params for both /since endpoints. All three fields are
+/// optional: missing `cursor_ts` starts from the unix epoch, missing
+/// `cursor_pk` starts before the lexicographically-smallest pk, and
+/// missing `limit` defaults to 100 (clamped to 1..=1000).
+#[derive(Debug, Deserialize)]
+pub struct SinceParams {
+    pub cursor_ts: Option<DateTime<Utc>>,
+    pub cursor_pk: Option<String>,
+    pub limit: Option<i64>,
+}
+
+impl SinceParams {
+    fn resolved(self) -> (DateTime<Utc>, String, i64) {
+        let ts = self
+            .cursor_ts
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let pk = self.cursor_pk.unwrap_or_default();
+        let limit = self.limit.unwrap_or(100).clamp(1, 1000);
+        (ts, pk, limit)
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -100,7 +126,11 @@ async fn wallets_upsert(
     }
 }
 
-/// Stub — implemented in Task 14.
+/// Cursor-paginated read of wallet links since a given (ts, pk) point.
+/// `next_cursor` is `None` when fewer rows than `limit` were returned,
+/// signalling that the consumer has caught up. The compound cursor uses
+/// `"{user_id}:{wallet_pubkey}"` as the pk component to break ties
+/// among rows sharing a `source_updated_at`.
 #[utoipa::path(
     get,
     path = "/s2s/wallets/since",
@@ -117,9 +147,23 @@ async fn wallets_upsert(
     )
 )]
 async fn wallets_since(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Query(params): Query<SinceParams>,
 ) -> Result<Json<WalletsSinceResponse>, AppError> {
-    Err(AppError::Internal("not implemented".into()))
+    let (ts, pk, limit) = params.resolved();
+    let rows = WalletLinkRepo { pool: &state.pool }
+        .since(ts, &pk, limit)
+        .await
+        .map_err(AppError::from)?;
+    let next_cursor = if (rows.len() as i64) < limit {
+        None
+    } else {
+        rows.last().map(|last| SinceCursor {
+            ts: last.source_updated_at,
+            pk: format!("{}:{}", last.user_id, last.wallet_pubkey),
+        })
+    };
+    Ok(Json(WalletsSinceResponse { rows, next_cursor }))
 }
 
 /// Stub — implemented in Task 13.
@@ -154,7 +198,10 @@ async fn ownership_upsert(
     }
 }
 
-/// Stub — implemented in Task 14.
+/// Cursor-paginated read of ownership rows since a given (ts, asset_id)
+/// point. Same `next_cursor` semantics as `wallets_since`. The pk
+/// component is `asset_id` (it's already globally unique within the
+/// table, no compound key needed).
 #[utoipa::path(
     get,
     path = "/s2s/ownership/since",
@@ -171,9 +218,23 @@ async fn ownership_upsert(
     )
 )]
 async fn ownership_since(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Query(params): Query<SinceParams>,
 ) -> Result<Json<OwnershipSinceResponse>, AppError> {
-    Err(AppError::Internal("not implemented".into()))
+    let (ts, pk, limit) = params.resolved();
+    let rows = OwnershipRepo { pool: &state.pool }
+        .since(ts, &pk, limit)
+        .await
+        .map_err(AppError::from)?;
+    let next_cursor = if (rows.len() as i64) < limit {
+        None
+    } else {
+        rows.last().map(|last| SinceCursor {
+            ts: last.source_updated_at,
+            pk: last.asset_id.clone(),
+        })
+    };
+    Ok(Json(OwnershipSinceResponse { rows, next_cursor }))
 }
 
 /// Build the /s2s/* subrouter. The HMAC layer is applied at router
@@ -184,4 +245,95 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(wallets_since))
         .routes(routes!(ownership_upsert))
         .routes(routes!(ownership_since))
+}
+
+// End-to-end /s2s/* integration tests. These exercise the full middleware
+// stack (`require_s2s` layered on the merged sub-router via
+// `routes::router`) against a real Postgres, so a signed upsert really
+// does land a row in `engine.wallet_links`.
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    /// Build a test app with `marketplace_s2s_secret` pre-set so the HMAC
+    /// middleware accepts signed requests. The companion test_state
+    /// helper is reused so the JWT validator is wired identically to the
+    /// /comp/* tests — keeps the two test surfaces in lock-step.
+    fn build_app_with_secret(pool: PgPool, secret: &str) -> axum::Router {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.marketplace_s2s_secret = Some(secret.to_string());
+        let (open_router, _api) = crate::routes::router(state.clone()).split_for_parts();
+        open_router.with_state(state)
+    }
+
+    /// Build a canonical signing string + sign it, mirroring exactly what
+    /// the marketplace-svc client will do at runtime.
+    fn sign_request(
+        secret: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        timestamp: &str,
+    ) -> String {
+        use sha2::Digest;
+        let body_hash = sha2::Sha256::digest(body);
+        let body_hex = hex::encode(body_hash);
+        let canonical =
+            crate::auth::s2s::canonical_signing_string(method, path, "", timestamp, &body_hex);
+        crate::auth::s2s::sign(secret.as_bytes(), &canonical)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn rejects_request_without_signature(pool: PgPool) {
+        let app = build_app_with_secret(pool, "test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/s2s/wallets/upsert")
+            .body(Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signed_upsert_persists(pool: PgPool) {
+        let user = uuid::Uuid::new_v4();
+        let body = serde_json::json!({
+            "user_id": user,
+            "wallet_pubkey": "11111111111111111111111111111111",
+            "linked": true,
+            "source_updated_at": Utc::now(),
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let ts = Utc::now().to_rfc3339();
+        let sig = sign_request(
+            "test-secret",
+            "POST",
+            "/s2s/wallets/upsert",
+            &body_bytes,
+            &ts,
+        );
+
+        let app = build_app_with_secret(pool.clone(), "test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/s2s/wallets/upsert")
+            .header("content-type", "application/json")
+            .header("x-s2s-timestamp", ts)
+            .header("x-s2s-signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM engine.wallet_links WHERE user_id = $1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
+    }
 }

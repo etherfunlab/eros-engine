@@ -12,13 +12,27 @@ pub struct AppState {
     pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
     pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
+    /// Base URL of the marketplace service used by the self-heal /since
+    /// puller. `None` runs the engine in OSS-only mode (no outbound pull
+    /// loop spawned). Populated from `MARKETPLACE_SVC_URL` in main.rs.
+    /// Read by the puller task — added in a follow-up task; the field is
+    /// wired here so the env / boot-validation layer can land first.
+    #[allow(dead_code)]
+    pub marketplace_svc_url: Option<String>,
     /// Active HMAC secret used by `auth::s2s` middleware to verify (and
-    /// sign outbound) /s2s/* requests. Wiring from env happens in Task 14;
-    /// for now this is always `None` at every construction site.
+    /// sign outbound) /s2s/* requests. Populated from
+    /// `MARKETPLACE_SVC_S2S_SECRET` in main.rs.
     pub marketplace_s2s_secret: Option<String>,
     /// Previous HMAC secret retained during rotation. Verify-only — never
-    /// used to sign outbound. Same Task-14-wiring caveat as above.
+    /// used to sign outbound. Populated from
+    /// `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` in main.rs.
     pub marketplace_s2s_secret_previous: Option<String>,
+    /// Shared reqwest client used by the self-heal /since puller for
+    /// outbound calls to the marketplace service. Cheaply cloneable
+    /// (internally Arc'd); construct once at boot with a sensible
+    /// per-request timeout. Consumer task lands in a follow-up.
+    #[allow(dead_code)]
+    pub http_client: reqwest::Client,
 }
 
 #[derive(Clone, Debug)]

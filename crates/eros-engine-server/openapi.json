@@ -542,6 +542,193 @@
           }
         }
       }
+    },
+    "/s2s/ownership/since": {
+      "get": {
+        "tags": [
+          "s2s"
+        ],
+        "summary": "Cursor-paginated read of ownership rows since a given (ts, asset_id)\npoint. Same `next_cursor` semantics as `wallets_since`. The pk\ncomponent is `asset_id` (it's already globally unique within the\ntable, no compound key needed).",
+        "operationId": "ownership_since",
+        "parameters": [
+          {
+            "name": "cursor_ts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "cursor_pk",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnershipSinceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid HMAC"
+          }
+        },
+        "security": [
+          {
+            "hmac_signature": []
+          }
+        ]
+      }
+    },
+    "/s2s/ownership/upsert": {
+      "post": {
+        "tags": [
+          "s2s"
+        ],
+        "summary": "Stub — implemented in Task 13.",
+        "operationId": "ownership_upsert",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnershipUpsertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "applied"
+          },
+          "401": {
+            "description": "missing or invalid HMAC"
+          },
+          "409": {
+            "description": "stale event"
+          }
+        },
+        "security": [
+          {
+            "hmac_signature": []
+          }
+        ]
+      }
+    },
+    "/s2s/wallets/since": {
+      "get": {
+        "tags": [
+          "s2s"
+        ],
+        "summary": "Cursor-paginated read of wallet links since a given (ts, pk) point.\n`next_cursor` is `None` when fewer rows than `limit` were returned,\nsignalling that the consumer has caught up. The compound cursor uses\n`\"{user_id}:{wallet_pubkey}\"` as the pk component to break ties\namong rows sharing a `source_updated_at`.",
+        "operationId": "wallets_since",
+        "parameters": [
+          {
+            "name": "cursor_ts",
+            "in": "query",
+            "description": "compound cursor: source_updated_at",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "cursor_pk",
+            "in": "query",
+            "description": "compound cursor: user_id:wallet_pubkey",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..1000, default 100",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletsSinceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid HMAC"
+          }
+        },
+        "security": [
+          {
+            "hmac_signature": []
+          }
+        ]
+      }
+    },
+    "/s2s/wallets/upsert": {
+      "post": {
+        "tags": [
+          "s2s"
+        ],
+        "summary": "Stub — implemented in Task 12.",
+        "operationId": "wallets_upsert",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WalletUpsertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "applied"
+          },
+          "401": {
+            "description": "missing or invalid HMAC"
+          },
+          "409": {
+            "description": "stale event (source_updated_at older than existing)"
+          }
+        },
+        "security": [
+          {
+            "hmac_signature": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -875,6 +1062,54 @@
           }
         }
       },
+      "OwnershipSinceResponse": {
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "next_cursor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SinceCursor"
+              }
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "OwnershipUpsertRequest": {
+        "type": "object",
+        "required": [
+          "asset_id",
+          "persona_id",
+          "owner_wallet",
+          "source_updated_at"
+        ],
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          },
+          "owner_wallet": {
+            "type": "string"
+          },
+          "persona_id": {
+            "type": "string"
+          },
+          "source_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "PendingCheckResponse": {
         "type": "object",
         "required": [
@@ -1002,6 +1237,22 @@
           }
         }
       },
+      "SinceCursor": {
+        "type": "object",
+        "required": [
+          "ts",
+          "pk"
+        ],
+        "properties": {
+          "pk": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "StartChatRequest": {
         "type": "object",
         "properties": {
@@ -1054,6 +1305,55 @@
             "format": "uuid"
           }
         }
+      },
+      "WalletUpsertRequest": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "wallet_pubkey",
+          "linked",
+          "source_updated_at"
+        ],
+        "properties": {
+          "linked": {
+            "type": "boolean"
+          },
+          "source_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "wallet_pubkey": {
+            "type": "string"
+          }
+        }
+      },
+      "WalletsSinceResponse": {
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "next_cursor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SinceCursor"
+              }
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -1062,6 +1362,12 @@
         "scheme": "bearer",
         "bearerFormat": "JWT",
         "description": "Supabase JWT bearer token"
+      },
+      "hmac_signature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-S2S-Signature",
+        "description": "HMAC-SHA256 signature over the canonical signing string. Requires companion `X-S2S-Timestamp` header. See auth::s2s for the canonical layout."
       }
     }
   },
@@ -1077,6 +1383,10 @@
     {
       "name": "debug",
       "description": "Env-gated introspection (affinity vector exposure)"
+    },
+    {
+      "name": "s2s",
+      "description": "Server-to-server endpoints for the marketplace svc (HMAC-signed; do not expose to user-agent traffic)"
     }
   ]
 }

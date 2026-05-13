@@ -874,6 +874,53 @@ pub fn router() -> OpenApiRouter<AppState> {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Test helpers — visible to other modules' #[cfg(test)] blocks so the
+// /s2s/* integration tests in routes/s2s.rs can reuse `test_state`.
+// Lives outside the inner `tests` module on purpose; Rust's visibility
+// rules don't let a sibling module reach into a private `mod tests`.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+pub(crate) const TEST_SECRET: &str = "test-secret-companion-routes";
+
+#[cfg(test)]
+pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
+    use crate::auth::supabase::SupabaseJwtValidator;
+    use crate::auth::AuthValidator;
+    use std::sync::Arc;
+
+    let auth: Arc<dyn AuthValidator> =
+        Arc::new(SupabaseJwtValidator::new().with_legacy_secret(TEST_SECRET.into()));
+    AppState {
+        pool,
+        auth,
+        config: crate::state::ServerConfig {
+            expose_affinity_debug: true,
+            ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
+            demo_ema_inertia: 0.0,
+            bind_addr: "127.0.0.1:0".into(),
+            // Sweeper disabled in tests — unit tests don't spawn it
+            // and the fields are just for AppState completeness.
+            dreaming_tick: std::time::Duration::ZERO,
+            dreaming_idle_threshold: std::time::Duration::from_secs(1800),
+            dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
+        },
+        openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
+            "stub".into(),
+        )),
+        voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
+        model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
+        // s2s middleware is opted-out in companion tests (no secret
+        // configured → /s2s/* returns 401). The s2s integration tests
+        // in routes/s2s.rs override `marketplace_s2s_secret` after
+        // calling this helper.
+        marketplace_svc_url: None,
+        marketplace_s2s_secret: None,
+        marketplace_s2s_secret_previous: None,
+        http_client: reqwest::Client::new(),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Integration tests
 //
 // These exercise the route module's HTTP+DB side-effects against a
@@ -898,13 +945,7 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::{json, Value};
     use sqlx::PgPool;
-    use std::sync::Arc;
     use tower::Service;
-
-    use crate::auth::supabase::SupabaseJwtValidator;
-    use crate::auth::AuthValidator;
-
-    const TEST_SECRET: &str = "test-secret-companion-routes";
 
     // ─── Test helpers ───────────────────────────────────────────────
 
@@ -916,35 +957,6 @@ mod tests {
             &EncodingKey::from_secret(TEST_SECRET.as_ref()),
         )
         .expect("test jwt encodes")
-    }
-
-    fn test_state(pool: PgPool) -> AppState {
-        let auth: Arc<dyn AuthValidator> =
-            Arc::new(SupabaseJwtValidator::new().with_legacy_secret(TEST_SECRET.into()));
-        AppState {
-            pool,
-            auth,
-            config: crate::state::ServerConfig {
-                expose_affinity_debug: true,
-                ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
-                demo_ema_inertia: 0.0,
-                bind_addr: "127.0.0.1:0".into(),
-                // Sweeper disabled in tests — unit tests don't spawn it
-                // and the fields are just for AppState completeness.
-                dreaming_tick: std::time::Duration::ZERO,
-                dreaming_idle_threshold: std::time::Duration::from_secs(1800),
-                dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
-            },
-            openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
-                "stub".into(),
-            )),
-            voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
-            model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
-            // s2s middleware is not exercised by companion unit tests; Task 14
-            // adds integration tests that populate these.
-            marketplace_s2s_secret: None,
-            marketplace_s2s_secret_previous: None,
-        }
     }
 
     fn build_router(state: AppState) -> Router {
