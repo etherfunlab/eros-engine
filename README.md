@@ -212,6 +212,9 @@ The `AuthValidator` trait is pluggable if you use a different identity provider.
 | `EMA_INERTIA` | no | Defaults to `0.8`. |
 | `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
 | `RUST_LOG` | no | Defaults to `info`. |
+| `MARKETPLACE_SVC_URL` | no | Base URL of eros-marketplace-svc. When set, the engine pulls /since cursors every 5 min as a self-heal recovery path. Requires `MARKETPLACE_SVC_S2S_SECRET`. |
+| `MARKETPLACE_SVC_S2S_SECRET` | no | HMAC secret shared with eros-marketplace-svc. Gates the `/s2s/*` routes the svc pushes into. Without it, `/s2s/*` always 401s. |
+| `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` | no | Verify-only secret used during rolling rotation. Engine accepts requests signed with either current or previous secret; outbound calls always sign with current. |
 
 ## What is deliberately out of scope
 

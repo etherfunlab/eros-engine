@@ -214,9 +214,78 @@ All errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`:
 | 404 | `not_found` | Unknown session / persona / message id |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
 
+## Server-to-server (`/s2s/*`)
+
+Mounted at `/s2s/*` and gated by HMAC-SHA256, not the Supabase JWT layer.
+Intended exclusively for `eros-marketplace-svc`; see
+[deploying.md](deploying.md#marketplace-coordination-optional) for env vars.
+The OpenAPI spec at `/docs` is the authoritative reference; this section
+is a quick orientation.
+
+Four routes:
+
+- `POST /s2s/ownership/upsert` — apply a single ownership change (NFT bought / sold).
+- `GET  /s2s/ownership/since?cursor_ts=&cursor_pk=&limit=` — keyset-paginated pull of recent ownership rows.
+- `POST /s2s/wallets/upsert` — apply a single wallet-link change (user linked / unlinked a wallet).
+- `GET  /s2s/wallets/since?cursor_ts=&cursor_pk=&limit=` — keyset-paginated pull of recent wallet-link rows.
+
+Example upsert bodies:
+
+```json
+// POST /s2s/ownership/upsert
+{
+  "asset_id":         "<base58 32-byte>",
+  "persona_id":       "<base58 32-byte>",
+  "owner_wallet":     "<base58 32-byte>",
+  "source_updated_at": "2026-05-13T08:00:00Z"
+}
+```
+
+```json
+// POST /s2s/wallets/upsert
+{
+  "user_id":           "11d6a45a-1fd9-4fe6-a943-3f049035eb68",
+  "wallet_pubkey":     "<base58 32-byte>",
+  "linked":            true,
+  "source_updated_at": "2026-05-13T08:00:00Z"
+}
+```
+
+### HMAC headers
+
+Each request must carry:
+
+- `x-s2s-timestamp` — RFC3339, `±5 min` skew tolerated.
+- `x-s2s-signature` — hex HMAC-SHA256 over the canonical signing string,
+  using `MARKETPLACE_SVC_S2S_SECRET`.
+
+The canonical signing string is a five-line ASCII layout (see
+`crates/eros-engine-server/src/auth/s2s.rs` for the authoritative
+definition and helper functions):
+
+```
+METHOD\n
+path\n
+canonical_query\n
+timestamp\n
+body_sha256_hex
+```
+
+where `canonical_query` is the request's query string with `&`-separated
+pairs sorted lexicographically (empty if no query), and `body_sha256_hex`
+is the lowercase hex SHA-256 of the raw request body (empty body still
+hashes to the SHA-256 of zero bytes). Body is buffered up to 1 MiB; larger
+requests are rejected with 413 without computing the hash.
+
+During secret rotation both `MARKETPLACE_SVC_S2S_SECRET` and
+`MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` are accepted for inbound; outbound
+calls always sign with the current secret only.
+
 ## Source
 
 - `crates/eros-engine-server/src/routes/companion.rs` — handler implementations
 - `crates/eros-engine-server/src/routes/debug.rs` — affinity debug route
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
+- `crates/eros-engine-server/src/routes/s2s.rs` — `/s2s/*` handlers
+- `crates/eros-engine-server/src/auth/s2s.rs` — HMAC canonical signing layout
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

@@ -279,6 +279,11 @@ async fn run_server() -> Result<()> {
     // Cloned because the next line moves `state` into the router.
     tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
 
+    if state.marketplace_svc_url.is_some() {
+        tokio::spawn(crate::pipeline::sync::run(state.clone()));
+        tracing::info!("marketplace self-heal task spawned");
+    }
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))

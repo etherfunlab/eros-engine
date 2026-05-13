@@ -2,11 +2,6 @@
 //! Self-heal pull: when MARKETPLACE_SVC_URL is configured, periodically
 //! call svc's /s2s/{ownership,wallets}/since to pick up any pushes
 //! the engine missed. Cursors persisted in engine.sync_cursors.
-//
-// Task 20 wires `run` into the boot sequence via `tokio::spawn`; until
-// then the symbols here are dead from the compiler's perspective. The
-// blanket allow keeps `-D warnings` clippy green in the interim.
-#![allow(dead_code)]
 
 use chrono::Utc;
 use eros_engine_store::ownership::{Ownership, OwnershipRepo};
