@@ -30,3 +30,8 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 jsonwebtoken = "9"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+bs58 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.5"
+hex = "0.4"
