@@ -515,10 +515,24 @@ async fn send_message(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<CompanionReplyResponse>, AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
+    let session = require_session_for_user(&state, session_id, user_id).await?;
 
     if req.message.trim().is_empty() {
         return Err(AppError::BadRequest("message must not be empty".into()));
+    }
+
+    // Per-message NFT ownership recheck — a previous owner cannot keep
+    // messaging through an existing session after sale or wallet unlink.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    if let Some(instance_id) = session.instance_id {
+        let companion = persona_repo
+            .load_companion(instance_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+        let asset_id_opt = persona_repo
+            .get_asset_id_for_genome(companion.instance.genome_id)
+            .await?;
+        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
     // Persist the user message up-front so the engine sees it in history.
@@ -582,10 +596,23 @@ async fn send_message_async(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(axum::http::StatusCode, Json<AsyncSendResponse>), AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
+    let session = require_session_for_user(&state, session_id, user_id).await?;
 
     if req.message.trim().is_empty() {
         return Err(AppError::BadRequest("message must not be empty".into()));
+    }
+
+    // Per-message NFT ownership recheck — see `send_message`.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    if let Some(instance_id) = session.instance_id {
+        let companion = persona_repo
+            .load_companion(instance_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+        let asset_id_opt = persona_repo
+            .get_asset_id_for_genome(companion.instance.genome_id)
+            .await?;
+        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -1375,6 +1402,72 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn message_403_after_unlink(pool: PgPool) {
+        use chrono::Utc;
+        use eros_engine_store::ownership::OwnershipRepo;
+        use eros_engine_store::wallets::WalletLinkRepo;
+
+        // Setup: NFT genome, owner, started a session.
+        let user = Uuid::new_v4();
+        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
+        let asset = "11111111111111111111111111111131";
+        let genome_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true, $2)",
+        )
+        .bind(genome_id)
+        .bind(asset)
+        .execute(&pool)
+        .await
+        .unwrap();
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, true, Utc::now())
+            .await
+            .unwrap();
+        OwnershipRepo { pool: &pool }
+            .upsert(asset, "p-1", wallet, Utc::now())
+            .await
+            .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user);
+
+        // Start a chat (passes the gate).
+        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "start should succeed: {resp}");
+        let session_id = resp["session_id"].as_str().unwrap().to_string();
+
+        // Unlink the wallet — ownership chain now broken.
+        WalletLinkRepo { pool: &pool }
+            .upsert(user, wallet, false, Utc::now())
+            .await
+            .unwrap();
+
+        // Sending a message should now 403.
+        let body = serde_json::to_vec(&serde_json::json!({ "message": "hi" })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
