@@ -21,7 +21,9 @@ pub enum PubkeyError {
 /// in `engine.*` tables so non-canonical input encodings cannot create
 /// logical duplicates of the same key.
 pub fn validate_solana_pubkey(s: &str) -> Result<String, PubkeyError> {
-    let bytes = bs58::decode(s).into_vec().map_err(|_| PubkeyError::InvalidBase58)?;
+    let bytes = bs58::decode(s)
+        .into_vec()
+        .map_err(|_| PubkeyError::InvalidBase58)?;
     if bytes.len() != 32 {
         return Err(PubkeyError::WrongLength(bytes.len()));
     }
