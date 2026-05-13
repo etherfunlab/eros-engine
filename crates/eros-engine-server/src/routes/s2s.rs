@@ -96,7 +96,8 @@ pub struct OwnershipSinceResponse {
     pub next_cursor: Option<SinceCursor>,
 }
 
-/// Stub — implemented in Task 12.
+/// Apply a single wallet-link change (link or unlink). Idempotent under
+/// stale-write protection (older source_updated_at → 409).
 #[utoipa::path(
     post,
     path = "/s2s/wallets/upsert",
@@ -166,7 +167,8 @@ async fn wallets_since(
     Ok(Json(WalletsSinceResponse { rows, next_cursor }))
 }
 
-/// Stub — implemented in Task 13.
+/// Apply a single ownership change (NFT bought / sold / transferred).
+/// Idempotent under stale-write protection (older source_updated_at → 409).
 #[utoipa::path(
     post,
     path = "/s2s/ownership/upsert",

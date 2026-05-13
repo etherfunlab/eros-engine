@@ -16,17 +16,25 @@ use crate::state::AppState;
 const TICK_SECS: u64 = 5 * 60;
 const PAGE_LIMIT: i64 = 500;
 
+// `next_cursor` is still part of svc's wire shape, but we no longer
+// trust it for cursor advancement — svc returns `None` on the catch-up
+// page (rows < limit), which would otherwise leave our cursor stuck at
+// the previous page boundary and re-pull the tail slice every tick.
+// We advance off `rows.last()` instead (see `tick_*` below).
 #[derive(serde::Deserialize)]
 struct OwnershipSinceResp {
     rows: Vec<Ownership>,
+    #[allow(dead_code)]
     next_cursor: Option<SinceCursorWire>,
 }
 #[derive(serde::Deserialize)]
 struct WalletsSinceResp {
     rows: Vec<WalletLink>,
+    #[allow(dead_code)]
     next_cursor: Option<SinceCursorWire>,
 }
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct SinceCursorWire {
     ts: chrono::DateTime<chrono::Utc>,
     pk: String,
@@ -92,13 +100,17 @@ async fn tick_ownership(state: &AppState, svc_url: &str, secret: &str) -> anyhow
         .await?;
     }
 
-    if let Some(next) = resp.next_cursor {
+    // Advance the cursor whenever we received any rows. Don't depend on
+    // svc's next_cursor being Some — svc returns next_cursor=None on the
+    // catch-up page (fewer rows than limit), and we still need to remember
+    // where we got to.
+    if let Some(last) = resp.rows.last() {
         SyncCursorRepo { pool: &state.pool }
             .set(
                 "ownership",
                 &Cursor {
-                    cursor_ts: next.ts,
-                    cursor_pk: next.pk,
+                    cursor_ts: last.source_updated_at,
+                    cursor_pk: last.asset_id.clone(),
                 },
             )
             .await?;
@@ -141,13 +153,15 @@ async fn tick_wallets(state: &AppState, svc_url: &str, secret: &str) -> anyhow::
         .await?;
     }
 
-    if let Some(next) = resp.next_cursor {
+    // Same self-heal advancement rule as tick_ownership: key off the last
+    // row we saw, not next_cursor (which is None on the catch-up page).
+    if let Some(last) = resp.rows.last() {
         SyncCursorRepo { pool: &state.pool }
             .set(
                 "wallets",
                 &Cursor {
-                    cursor_ts: next.ts,
-                    cursor_pk: next.pk,
+                    cursor_ts: last.source_updated_at,
+                    cursor_pk: format!("{}:{}", last.user_id, last.wallet_pubkey),
                 },
             )
             .await?;

@@ -605,7 +605,7 @@
         "tags": [
           "s2s"
         ],
-        "summary": "Stub — implemented in Task 13.",
+        "summary": "Apply a single ownership change (NFT bought / sold / transferred).\nIdempotent under stale-write protection (older source_updated_at → 409).",
         "operationId": "ownership_upsert",
         "requestBody": {
           "content": {
@@ -700,7 +700,7 @@
         "tags": [
           "s2s"
         ],
-        "summary": "Stub — implemented in Task 12.",
+        "summary": "Apply a single wallet-link change (link or unlink). Idempotent under\nstale-write protection (older source_updated_at → 409).",
         "operationId": "wallets_upsert",
         "requestBody": {
           "content": {
