@@ -8,6 +8,7 @@ pub mod memory;
 pub mod persona;
 pub mod pool;
 pub mod pubkey;
+pub mod wallets;
 
 pub use sqlx::PgPool;
 
