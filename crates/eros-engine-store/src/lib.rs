@@ -44,4 +44,28 @@ mod migration_tests {
         // so a tombstone for the same pubkey but different user_id is allowed.
         assert!(res.is_ok(), "tombstone insert must succeed: {res:?}");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persona_ownership_and_sync_cursors_schema(pool: PgPool) {
+        // persona_ownership: PK = asset_id, must accept source_updated_at.
+        let asset = "11111111111111111111111111111111";
+        sqlx::query(
+            "INSERT INTO engine.persona_ownership
+                (asset_id, persona_id, owner_wallet, source_updated_at)
+             VALUES ($1, 'persona-test', 'OwnerWallet1111111111111111111111', now())",
+        )
+        .bind(asset)
+        .execute(&pool)
+        .await
+        .expect("insert into persona_ownership");
+
+        // sync_cursors: PK = name, compound (cursor_ts, cursor_pk) writeable.
+        sqlx::query(
+            "INSERT INTO engine.sync_cursors (name, cursor_ts, cursor_pk)
+             VALUES ('ownership', now(), '')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert into sync_cursors");
+    }
 }
