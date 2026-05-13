@@ -216,6 +216,22 @@ impl<'a> PersonaRepo<'a> {
         .fetch_one(self.pool)
         .await
     }
+
+    /// Returns the `asset_id` for an NFT-backed genome, or `None` for legacy
+    /// seed-persona rows where the column is NULL. Used by the chat-start
+    /// and per-message gates to decide whether to invoke the NFT ownership
+    /// check.
+    pub async fn get_asset_id_for_genome(
+        &self,
+        genome_id: uuid::Uuid,
+    ) -> sqlx::Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT asset_id FROM engine.persona_genomes WHERE id = $1")
+                .bind(genome_id)
+                .fetch_optional(self.pool)
+                .await?;
+        Ok(row.and_then(|(opt,)| opt))
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +320,50 @@ mod tests {
 
         let companion = repo.load_companion(instance_id).await.unwrap();
         assert!(companion.is_none());
+    }
+}
+
+#[cfg(test)]
+mod ownership_lookup_tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn returns_none_for_legacy_genome(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active)
+             VALUES ($1, 'Legacy', 'p', '{}'::jsonb, true)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(repo.get_asset_id_for_genome(id).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn returns_some_for_nft_genome(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let id = uuid::Uuid::new_v4();
+        let asset = "11111111111111111111111111111111";
+        sqlx::query(
+            "INSERT INTO engine.persona_genomes
+                (id, name, system_prompt, art_metadata, is_active, asset_id)
+             VALUES ($1, 'Nft', 'p', '{}'::jsonb, true, $2)",
+        )
+        .bind(id)
+        .bind(asset)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_asset_id_for_genome(id).await.unwrap().as_deref(),
+            Some(asset)
+        );
     }
 }
