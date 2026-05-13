@@ -17,6 +17,7 @@ use crate::state::AppState;
 pub mod companion;
 pub mod debug;
 pub mod health;
+pub mod s2s;
 
 /// Compose the full app router. The auth middleware is applied to the
 /// `/comp/*` subtree only.
