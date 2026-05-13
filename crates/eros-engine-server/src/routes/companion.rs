@@ -940,6 +940,10 @@ mod tests {
             )),
             voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
             model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
+            // s2s middleware is not exercised by companion unit tests; Task 14
+            // adds integration tests that populate these.
+            marketplace_s2s_secret: None,
+            marketplace_s2s_secret_previous: None,
         }
     }
 

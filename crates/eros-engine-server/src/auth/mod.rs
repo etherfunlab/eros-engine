@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 pub mod middleware;
+pub mod s2s;
 pub mod supabase;
 
 #[derive(Debug, thiserror::Error)]

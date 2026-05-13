@@ -12,6 +12,13 @@ pub struct AppState {
     pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
     pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
+    /// Active HMAC secret used by `auth::s2s` middleware to verify (and
+    /// sign outbound) /s2s/* requests. Wiring from env happens in Task 14;
+    /// for now this is always `None` at every construction site.
+    pub marketplace_s2s_secret: Option<String>,
+    /// Previous HMAC secret retained during rotation. Verify-only — never
+    /// used to sign outbound. Same Task-14-wiring caveat as above.
+    pub marketplace_s2s_secret_previous: Option<String>,
 }
 
 #[derive(Clone, Debug)]

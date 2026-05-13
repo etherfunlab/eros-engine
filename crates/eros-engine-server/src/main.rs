@@ -233,6 +233,9 @@ async fn run_server() -> Result<()> {
         openrouter,
         voyage,
         model_config,
+        // Task 14 will parse MARKETPLACE_SVC_S2S_SECRET[_PREVIOUS] from env.
+        marketplace_s2s_secret: None,
+        marketplace_s2s_secret_previous: None,
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth

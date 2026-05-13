@@ -40,3 +40,7 @@ toml = "0.8"
 # In production (Fly.io / Docker) the file is absent, dotenv() returns
 # Err, and we silently fall through to the real environment.
 dotenvy = "0.15"
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+hex = { workspace = true }
