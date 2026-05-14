@@ -29,8 +29,25 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::auth::s2s::TIMESTAMP_SKEW_SECS;
 use crate::error::AppError;
 use crate::state::AppState;
+
+/// Reject a `source_updated_at` that is too far in the future. A
+/// future-dated event would poison the repos' stale-write guard
+/// (`incoming > existing.source_updated_at`), silently dropping every
+/// later legitimate event as stale until wall-clock catches up. Past
+/// timestamps are intentionally allowed — replaying old events is
+/// exactly what stale-write protection exists to absorb.
+fn reject_future_source_ts(source_updated_at: DateTime<Utc>) -> Result<(), AppError> {
+    let skew = (source_updated_at - Utc::now()).num_seconds();
+    if skew > TIMESTAMP_SKEW_SECS {
+        return Err(AppError::BadRequest(format!(
+            "source_updated_at is {skew}s in the future (max {TIMESTAMP_SKEW_SECS}s skew)"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct WalletUpsertRequest {
@@ -116,6 +133,7 @@ async fn wallets_upsert(
 ) -> Result<StatusCode, AppError> {
     let pubkey = validate_solana_pubkey(&req.wallet_pubkey)
         .map_err(|e| AppError::BadRequest(format!("invalid wallet_pubkey: {e}")))?;
+    reject_future_source_ts(req.source_updated_at)?;
     let applied = WalletLinkRepo { pool: &state.pool }
         .upsert(req.user_id, &pubkey, req.linked, req.source_updated_at)
         .await
@@ -189,6 +207,7 @@ async fn ownership_upsert(
         .map_err(|e| AppError::BadRequest(format!("invalid asset_id: {e}")))?;
     let owner = validate_solana_pubkey(&req.owner_wallet)
         .map_err(|e| AppError::BadRequest(format!("invalid owner_wallet: {e}")))?;
+    reject_future_source_ts(req.source_updated_at)?;
     let applied = OwnershipRepo { pool: &state.pool }
         .upsert(&asset, &req.persona_id, &owner, req.source_updated_at)
         .await
@@ -285,6 +304,81 @@ mod tests {
         let canonical =
             crate::auth::s2s::canonical_signing_string(method, path, "", timestamp, &body_hex);
         crate::auth::s2s::sign(secret.as_bytes(), &canonical)
+    }
+
+    #[test]
+    fn reject_future_source_ts_allows_past_now_and_within_skew() {
+        use chrono::Duration;
+        assert!(super::reject_future_source_ts(Utc::now() - Duration::days(30)).is_ok());
+        assert!(super::reject_future_source_ts(Utc::now()).is_ok());
+        assert!(super::reject_future_source_ts(Utc::now() + Duration::seconds(60)).is_ok());
+    }
+
+    #[test]
+    fn reject_future_source_ts_rejects_far_future() {
+        use chrono::Duration;
+        let err = super::reject_future_source_ts(Utc::now() + Duration::hours(1)).unwrap_err();
+        assert!(matches!(err, crate::error::AppError::BadRequest(_)));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn wallets_upsert_rejects_future_source_ts(pool: PgPool) {
+        let body = serde_json::json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "wallet_pubkey": "11111111111111111111111111111111",
+            "linked": true,
+            "source_updated_at": Utc::now() + chrono::Duration::hours(1),
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let ts = Utc::now().to_rfc3339();
+        let sig = sign_request(
+            "test-secret",
+            "POST",
+            "/s2s/wallets/upsert",
+            &body_bytes,
+            &ts,
+        );
+        let app = build_app_with_secret(pool, "test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/s2s/wallets/upsert")
+            .header("content-type", "application/json")
+            .header("x-s2s-timestamp", ts)
+            .header("x-s2s-signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ownership_upsert_rejects_future_source_ts(pool: PgPool) {
+        let body = serde_json::json!({
+            "asset_id": "11111111111111111111111111111111",
+            "persona_id": "persona-1",
+            "owner_wallet": "11111111111111111111111111111111",
+            "source_updated_at": Utc::now() + chrono::Duration::hours(1),
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let ts = Utc::now().to_rfc3339();
+        let sig = sign_request(
+            "test-secret",
+            "POST",
+            "/s2s/ownership/upsert",
+            &body_bytes,
+            &ts,
+        );
+        let app = build_app_with_secret(pool, "test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/s2s/ownership/upsert")
+            .header("content-type", "application/json")
+            .header("x-s2s-timestamp", ts)
+            .header("x-s2s-signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), 400);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
