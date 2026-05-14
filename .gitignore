@@ -9,3 +9,5 @@ Cargo.lock.bak
 
 # Local test override; never commit.
 .test-env
+
+docs/superpowers/
