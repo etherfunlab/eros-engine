@@ -103,7 +103,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `reply: null` 意味著人格在這一輪 ghost 了你（看 [Ghost 機制](ghost-mechanics.zh.md)）。HTTP 狀態仍是 200。
 
 **可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
-详见 [prompt-traits.md](prompt-traits.md)。示例：
+详见 [prompt-traits.zh.md](prompt-traits.zh.md)。示例：
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
