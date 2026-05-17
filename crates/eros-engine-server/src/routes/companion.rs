@@ -384,26 +384,37 @@ fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, A
             )));
         }
         // text: non-empty after trim, length-capped by char count (not bytes)
-        if dto.text.trim().is_empty() {
+        // of the TRIMMED form so leading/trailing whitespace doesn't eat the
+        // budget. Both checks use the same `trimmed` slice — matches the
+        // `1 ≤ chars ≤ 2000 (after trim)` contract in docs/prompt-traits.md.
+        let trimmed = dto.text.trim();
+        if trimmed.is_empty() {
             return Err(AppError::BadRequest(format!(
                 "prompt_traits[{i}].text must not be blank"
             )));
         }
-        if dto.text.chars().count() > MAX_PROMPT_TRAIT_TEXT_CHARS {
+        if trimmed.chars().count() > MAX_PROMPT_TRAIT_TEXT_CHARS {
             return Err(AppError::BadRequest(format!(
-                "prompt_traits[{i}].text exceeds {MAX_PROMPT_TRAIT_TEXT_CHARS} chars"
+                "prompt_traits[{i}].text exceeds {MAX_PROMPT_TRAIT_TEXT_CHARS} chars after trim"
             )));
         }
-        // text: no embedded control characters (newlines / tabs / etc.)
-        // would break the bullet rendering in `build_prompt`.
-        if dto.text.chars().any(char::is_control) {
+        // text: no characters that would break the single-line bullet
+        // rendering in `build_prompt`. `char::is_control` covers
+        // \n / \r / \t / DEL / C1 controls; we additionally reject the
+        // Unicode LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR
+        // (U+2029) which are NOT in Cc but DO start a new line.
+        if dto
+            .text
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+        {
             return Err(AppError::BadRequest(format!(
-                "prompt_traits[{i}].text must not contain control characters"
+                "prompt_traits[{i}].text must not contain line-break or control characters"
             )));
         }
         out.push(PromptTrait {
             tag: dto.tag.clone(),
-            text: dto.text.clone(),
+            text: trimmed.to_string(),
         });
     }
     Ok(out)
@@ -1679,6 +1690,20 @@ mod tests {
             matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
             "embedded newline must be rejected so bullet rendering stays safe"
         );
+    }
+
+    #[test]
+    fn validate_traits_rejects_text_with_unicode_line_separators() {
+        for sep in ["a\u{2028}b", "a\u{2029}b"] {
+            let dtos = vec![PromptTraitDto {
+                tag: "ok".into(),
+                text: sep.into(),
+            }];
+            assert!(
+                matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
+                "Unicode line separator in text must be rejected: {sep:?}"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
