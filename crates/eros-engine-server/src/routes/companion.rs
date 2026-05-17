@@ -135,6 +135,10 @@ pub struct StartChatResponse {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SendMessageRequest {
     pub message: String,
+    /// Optional caller-supplied prompt-injection fragments. See
+    /// `docs/prompt-traits.md`. Missing field → empty list.
+    #[serde(default)]
+    pub prompt_traits: Option<Vec<PromptTraitDto>>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -607,6 +611,10 @@ async fn send_message(
         enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
+    let prompt_traits = validate_prompt_traits(
+        req.prompt_traits.as_deref().unwrap_or(&[]),
+    )?;
+
     // Persist the user message up-front so the engine sees it in history.
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
@@ -616,7 +624,7 @@ async fn send_message(
     let event = Event::UserMessage {
         content: req.message.clone(),
         message_id: user_message_id,
-        prompt_traits: Vec::new(),
+        prompt_traits,
     };
     let response = pipeline::run(&state, session_id, event).await?;
 
@@ -688,6 +696,11 @@ async fn send_message_async(
         enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
+    // Validate BEFORE we persist the user message so a bad request leaves no row.
+    let prompt_traits = validate_prompt_traits(
+        req.prompt_traits.as_deref().unwrap_or(&[]),
+    )?;
+
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
         .append_message(session_id, "user", &req.message)
@@ -695,11 +708,12 @@ async fn send_message_async(
 
     let state_bg = state.clone();
     let msg_copy = req.message.clone();
+    let traits_copy = prompt_traits;
     tokio::spawn(async move {
         let event = Event::UserMessage {
             content: msg_copy,
             message_id: user_message_id,
-            prompt_traits: Vec::new(),
+            prompt_traits: traits_copy,
         };
         if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
             tracing::error!("engine pipeline failed for session {session_id}: {e}");

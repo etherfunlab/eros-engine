@@ -73,6 +73,18 @@ pub async fn run(
         plan.reply_style,
     );
 
+    if let Event::UserMessage { prompt_traits, .. } = &event {
+        if !prompt_traits.is_empty() {
+            let tags: Vec<&str> = prompt_traits.iter().map(|t| t.tag.as_str()).collect();
+            tracing::info!(
+                session = %session_id,
+                traits_count = prompt_traits.len(),
+                trait_tags = ?tags,
+                "engine: prompt_traits applied"
+            );
+        }
+    }
+
     // 7. Dispatch to handler. The Gift branch passes `plan.affinity_deltas`
     // through; T11 will replace this with deltas supplied directly by the
     // `/comp/chat/{id}/event/gift` route's request body, since the OSS
