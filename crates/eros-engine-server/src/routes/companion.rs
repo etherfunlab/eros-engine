@@ -374,7 +374,11 @@ fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, A
                 "prompt_traits[{i}].tag must be 1..={MAX_PROMPT_TRAIT_TAG_LEN} chars"
             )));
         }
-        if !dto.tag.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_')) {
+        if !dto
+            .tag
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        {
             return Err(AppError::BadRequest(format!(
                 "prompt_traits[{i}].tag must match [a-z0-9_]+"
             )));
@@ -611,9 +615,7 @@ async fn send_message(
         enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
-    let prompt_traits = validate_prompt_traits(
-        req.prompt_traits.as_deref().unwrap_or(&[]),
-    )?;
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
 
     // Persist the user message up-front so the engine sees it in history.
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -697,9 +699,7 @@ async fn send_message_async(
     }
 
     // Validate BEFORE we persist the user message so a bad request leaves no row.
-    let prompt_traits = validate_prompt_traits(
-        req.prompt_traits.as_deref().unwrap_or(&[]),
-    )?;
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
@@ -1599,8 +1599,14 @@ mod tests {
     #[test]
     fn validate_traits_accepts_two_well_formed_entries() {
         let dtos = vec![
-            PromptTraitDto { tag: "nsfw_boost".into(), text: "x".into() },
-            PromptTraitDto { tag: "politics_open".into(), text: "y".into() },
+            PromptTraitDto {
+                tag: "nsfw_boost".into(),
+                text: "x".into(),
+            },
+            PromptTraitDto {
+                tag: "politics_open".into(),
+                text: "y".into(),
+            },
         ];
         let out = validate_prompt_traits(&dtos).expect("ok");
         assert_eq!(out.len(), 2);
@@ -1622,20 +1628,40 @@ mod tests {
     #[test]
     fn validate_traits_rejects_oversized_text() {
         let big = "a".repeat(2001);
-        let dtos = vec![PromptTraitDto { tag: "ok".into(), text: big }];
-        assert!(matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))));
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: big,
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn validate_traits_rejects_empty_text_after_trim() {
-        let dtos = vec![PromptTraitDto { tag: "ok".into(), text: "   ".into() }];
-        assert!(matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))));
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: "   ".into(),
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn validate_traits_rejects_invalid_tag_regex() {
-        for bad in ["", "NSFW", "with space", "too_long_tag_xxxxxxxxxxxxxxxxxxxxxxx"] {
-            let dtos = vec![PromptTraitDto { tag: bad.into(), text: "x".into() }];
+        for bad in [
+            "",
+            "NSFW",
+            "with space",
+            "too_long_tag_xxxxxxxxxxxxxxxxxxxxxxx",
+        ] {
+            let dtos = vec![PromptTraitDto {
+                tag: bad.into(),
+                text: "x".into(),
+            }];
             assert!(
                 matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
                 "tag {bad:?} must be rejected"
@@ -1686,13 +1712,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // No user message persisted on a 400.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1821,13 +1846,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // Async route also validates BEFORE persisting — no user row.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0);
     }
 }

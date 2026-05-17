@@ -494,7 +494,10 @@ mod tests {
             &[],
             &[],
         );
-        assert!(!p.contains("【附加指引】"), "empty traits must not render section");
+        assert!(
+            !p.contains("【附加指引】"),
+            "empty traits must not render section"
+        );
         // Byte-level invariant proving "byte-for-byte identical to legacy"
         // for the empty-traits case: topics → time-context joins with the
         // pre-existing `\n\n` separator, no leftover whitespace from the
@@ -508,8 +511,14 @@ mod tests {
     #[test]
     fn build_prompt_renders_traits_as_bullets_under_label() {
         let traits = vec![
-            PromptTrait { tag: "nsfw_boost".into(), text: "be more daring".into() },
-            PromptTrait { tag: "politics_open".into(), text: "discuss politics openly".into() },
+            PromptTrait {
+                tag: "nsfw_boost".into(),
+                text: "be more daring".into(),
+            },
+            PromptTrait {
+                tag: "politics_open".into(),
+                text: "discuss politics openly".into(),
+            },
         ];
         let p = build_prompt(
             &fixture_persona(),
@@ -551,8 +560,10 @@ mod tests {
         let topics_idx = p.find("【擅长话题】").expect("topics header");
         let traits_idx = p.find("【附加指引】").expect("traits header");
         let time_idx = p.find("【今日情境】").expect("time-context header");
-        assert!(topics_idx < traits_idx && traits_idx < time_idx,
-                "order: 擅长话题 → 附加指引 → 今日情境");
+        assert!(
+            topics_idx < traits_idx && traits_idx < time_idx,
+            "order: 擅长话题 → 附加指引 → 今日情境"
+        );
     }
 
     #[test]
