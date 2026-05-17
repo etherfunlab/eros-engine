@@ -1654,4 +1654,180 @@ mod tests {
             "embedded newline must be rejected so bullet rendering stays safe"
         );
     }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_too_many_prompt_traits(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let traits: Vec<Value> = (0..9)
+            .map(|i| json!({ "tag": format!("t{i}"), "text": "x" }))
+            .collect();
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": traits,
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // No user message persisted on a 400.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_oversized_trait_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "ok", "text": "a".repeat(2001) }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_invalid_tag_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "NSFW Boost", "text": "x" }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_accepts_missing_prompt_traits_field(pool: PgPool) {
+        // A body without `prompt_traits` deserialises fine and reaches the
+        // pipeline. We only assert that the validator did not reject the
+        // request — the downstream LLM call may or may not succeed against
+        // the stubbed OpenRouter key in test state.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({ "message": "hi" })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "missing prompt_traits must NOT be rejected"
+        );
+        // The user message row should have been appended either way.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_rejects_invalid_tag_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "BadTag", "text": "x" }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Async route also validates BEFORE persisting — no user row.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
 }
