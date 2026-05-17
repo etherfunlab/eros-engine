@@ -355,6 +355,11 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
         // Reply path never has pending gifts — those flow through GiftHandler.
         let pending_gifts: Vec<PendingGift> = vec![];
 
+        let prompt_traits: &[eros_engine_core::types::PromptTrait] = match &input.event {
+            Event::UserMessage { prompt_traits, .. } => prompt_traits.as_slice(),
+            _ => &[],
+        };
+
         let system_prompt = build_prompt(
             &input.persona,
             &profile_groups,
@@ -364,6 +369,7 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
             tip_personality,
             plan.reply_style,
             &plan.context_hints,
+            prompt_traits,
         );
 
         Ok(Some(assemble_chat_request(
@@ -470,6 +476,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
             tip_personality,
             plan.reply_style,
             &plan.context_hints,
+            &[],
         );
 
         Ok(Some(assemble_chat_request(
