@@ -86,7 +86,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"嗨，今天讀甚麼書？"}' \
+  -d '{"message":"嗨，今天讀甚麼書？"}' \
   http://localhost:8080/comp/chat/<session_id>/message
 ```
 
@@ -101,6 +101,25 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 `reply: null` 意味著人格在這一輪 ghost 了你（看 [Ghost 機制](ghost-mechanics.zh.md)）。HTTP 狀態仍是 200。
+
+**可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
+详见 [prompt-traits.md](prompt-traits.md)。示例：
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{
+        "message": "hi",
+        "prompt_traits": [
+          {"tag": "nsfw_boost", "text": "<your injection text>"}
+        ]
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message
+```
+
+限制：最多 8 条，`tag` 满足 `[a-z0-9_]{1,32}`，`text` ≤ 2000 字符
+（trim 后非空）。违反返回 `400 BadRequest`。
+
+`/message_async` 接受同一字段。
 
 ### `POST /comp/chat/{session_id}/message_async`
 
