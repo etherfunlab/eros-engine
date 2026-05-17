@@ -154,6 +154,9 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 - `GET  /comp/user/{user_id}/profile`——讀取目前的 `companion_insights` 和 `training_level`。
 - `POST /comp/chat/{session_id}/event/gift`——套用外部 gift event 與 affinity delta。
 - `GET  /comp/chat/{session_id}/gifts`——列出某個 session 的 gift events。
+- `POST /comp/chat/{session_id}/message` 與 `/message_async` 接受可選的
+  `prompt_traits` 欄位，用於 per-request system-prompt 注入——詳見
+  [docs/prompt-traits.md](docs/prompt-traits.md)。
 - `GET  /comp/affinity/{session_id}`——debug-only 即時 affinity vector，由 `EXPOSE_AFFINITY_DEBUG=true` 開啟。
 
 如果你不用 Supabase，可以實現 `AuthValidator` trait 接自己的 identity provider。
@@ -186,6 +189,11 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 ## 內容說明
 
 `examples/personas/` 裡的人格是成人 character-chat 示例。當 relationship state 走到相應位置，它們可以調情、表達慾望；同時仍會拒絕不尊重或越界的要求。如果你的產品需要 SFW default，部署前請替換這些 persona files。
+
+每一輪的行為還可以透過 message routes 上的
+[`prompt_traits`](docs/prompt-traits.md) 欄位再調整——engine 把傳入的文字
+當成 opaque string 處理，這些 traits 實際代表什麼策略，完全交給你的
+frontend / middleware 決定。
 
 ## 貢獻
 

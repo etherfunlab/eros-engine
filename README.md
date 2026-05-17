@@ -194,6 +194,9 @@ Highlights:
 - `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
 - `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
 - `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
+- `POST /comp/chat/{session_id}/message` and `/message_async` accept an optional
+  `prompt_traits` field for per-request system-prompt injection — see
+  [docs/prompt-traits.md](docs/prompt-traits.md).
 - `GET  /comp/affinity/{session_id}` — debug-only live affinity vector, enabled by `EXPOSE_AFFINITY_DEBUG=true`.
 
 The `AuthValidator` trait is pluggable if you use a different identity provider.
@@ -228,7 +231,16 @@ If you are building a different product, the reusable part is the affinity + mem
 
 ## Content note
 
-The example personas under `examples/personas/` are written as adult character-chat examples. They can flirt and express desire when the relationship state reaches that point, while still refusing disrespectful or boundary-crossing behavior. If your product needs a SFW default, replace those persona files before deploying.
+The example personas under `examples/personas/` are written as adult
+character-chat examples. They can flirt and express desire when the
+relationship state reaches that point, while still refusing disrespectful or
+boundary-crossing behavior. If your product needs a SFW default, replace
+those persona files before deploying.
+
+Per-request behaviour can be further modulated via the
+[`prompt_traits`](docs/prompt-traits.md) field on the message routes —
+the engine treats the supplied text as opaque, so the policy of what
+those traits encode lives entirely in your frontend / middleware.
 
 ## Contributing
 

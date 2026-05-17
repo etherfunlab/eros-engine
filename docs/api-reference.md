@@ -86,7 +86,7 @@ Synchronous chat turn. Blocks until the LLM responds.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"hi, what are you reading today?"}' \
+  -d '{"message":"hi, what are you reading today?"}' \
   http://localhost:8080/comp/chat/<session_id>/message
 ```
 
@@ -101,6 +101,25 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 `reply: null` when the persona ghosted this turn (see [ghost mechanics](ghost-mechanics.md)). The HTTP status is still 200.
+
+**Optional: per-request prompt traits.** The body may include a
+`prompt_traits` array — see [prompt-traits.md](prompt-traits.md). Example:
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{
+        "message": "hi",
+        "prompt_traits": [
+          {"tag": "nsfw_boost", "text": "<your injection text here>"}
+        ]
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message
+```
+
+Limits: ≤ 8 entries, `tag` matches `[a-z0-9_]{1,32}`, `text` ≤ 2000 chars
+(non-blank). Violations return `400 BadRequest`.
+
+The same field is accepted by `/message_async`.
 
 ### `POST /comp/chat/{session_id}/message_async`
 

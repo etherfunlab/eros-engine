@@ -27,6 +27,7 @@ use chrono::{Timelike, Utc};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
+use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::ReplyStyle;
 
 /// A pending gift/tip that the prompt builder must surface to the LLM.
@@ -216,6 +217,7 @@ pub fn build_prompt(
     tip_personality: &str,
     style: ReplyStyle,
     hints: &[String],
+    prompt_traits: &[PromptTrait],
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -228,6 +230,17 @@ pub fn build_prompt(
         meta_string_array_joined(persona, "quirks").unwrap_or_else(|| "无特定口癖".into());
     let topics_str =
         meta_string_array_joined(persona, "topics").unwrap_or_else(|| "日常生活、感情观".into());
+
+    let traits_section = if prompt_traits.is_empty() {
+        String::new()
+    } else {
+        let bullets = prompt_traits
+            .iter()
+            .map(|t| format!("- {}", t.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\n【附加指引】\n{bullets}")
+    };
 
     let non_empty_groups: Vec<&(String, Vec<String>)> = profile_groups
         .iter()
@@ -294,7 +307,7 @@ pub fn build_prompt(
          \n\
          【说话风格】{speech_style}\n\
          【口癖/习惯】{quirks_str}\n\
-         【擅长话题】{topics_str}\n\
+         【擅长话题】{topics_str}{traits_section}\n\
          \n\
          【今日情境】\n{tc}\n\
          \n\
@@ -436,6 +449,122 @@ pub fn extract_structured_insights_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn fixture_persona() -> CompanionPersona {
+        use eros_engine_core::persona::{PersonaGenome, PersonaInstance};
+        let uid = Uuid::nil();
+        CompanionPersona {
+            instance_id: uid,
+            genome: PersonaGenome {
+                id: uid,
+                name: "Aria".into(),
+                system_prompt: "p".into(),
+                tip_personality: Some("normal".into()),
+                avatar_url: None,
+                art_metadata: serde_json::json!({
+                    "age": 24,
+                    "mbti": "INFP",
+                    "backstory": "back",
+                    "speech_style": "soft",
+                    "quirks": ["q1"],
+                    "topics": ["t1"]
+                }),
+                is_active: true,
+            },
+            instance: PersonaInstance {
+                id: uid,
+                genome_id: uid,
+                owner_uid: uid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn build_prompt_with_empty_traits_omits_section_and_preserves_layout() {
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(
+            !p.contains("【附加指引】"),
+            "empty traits must not render section"
+        );
+        // Byte-level invariant proving "byte-for-byte identical to legacy"
+        // for the empty-traits case: topics → time-context joins with the
+        // pre-existing `\n\n` separator, no leftover whitespace from the
+        // new `{traits_section}` placeholder.
+        assert!(
+            p.contains("【擅长话题】t1\n\n【今日情境】"),
+            "topics → time-context separator must be exactly '\\n\\n'"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_traits_as_bullets_under_label() {
+        let traits = vec![
+            PromptTrait {
+                tag: "nsfw_boost".into(),
+                text: "be more daring".into(),
+            },
+            PromptTrait {
+                tag: "politics_open".into(),
+                text: "discuss politics openly".into(),
+            },
+        ];
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &traits,
+        );
+        assert!(p.contains("【附加指引】"), "section header present");
+        assert!(p.contains("- be more daring"));
+        assert!(p.contains("- discuss politics openly"));
+        // Ordering preserved.
+        let i1 = p.find("be more daring").unwrap();
+        let i2 = p.find("discuss politics openly").unwrap();
+        assert!(i1 < i2, "traits render in input order");
+    }
+
+    #[test]
+    fn build_prompt_section_sits_between_topics_and_time_context() {
+        let traits = vec![PromptTrait {
+            tag: "x".into(),
+            text: "trait body".into(),
+        }];
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &traits,
+        );
+        let topics_idx = p.find("【擅长话题】").expect("topics header");
+        let traits_idx = p.find("【附加指引】").expect("traits header");
+        let time_idx = p.find("【今日情境】").expect("time-context header");
+        assert!(
+            topics_idx < traits_idx && traits_idx < time_idx,
+            "order: 擅长话题 → 附加指引 → 今日情境"
+        );
+    }
 
     #[test]
     fn test_style_directive_for_all_styles() {

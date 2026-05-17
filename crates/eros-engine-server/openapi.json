@@ -1193,6 +1193,24 @@
           }
         }
       },
+      "PromptTraitDto": {
+        "type": "object",
+        "description": "Caller-supplied prompt-injection fragment. See `docs/prompt-traits.md`.",
+        "required": [
+          "tag",
+          "text"
+        ],
+        "properties": {
+          "tag": {
+            "type": "string",
+            "description": "ASCII identifier, regex `^[a-z0-9_]{1,32}$`. Used for logging."
+          },
+          "text": {
+            "type": "string",
+            "description": "Verbatim text inserted under `【附加指引】` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
+          }
+        }
+      },
       "SendMessageRequest": {
         "type": "object",
         "required": [
@@ -1201,6 +1219,16 @@
         "properties": {
           "message": {
             "type": "string"
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            },
+            "description": "Optional caller-supplied prompt-injection fragments. See\n`docs/prompt-traits.md`. Missing field → empty list."
           }
         }
       },

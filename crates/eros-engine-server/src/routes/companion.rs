@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::Event;
+use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
@@ -52,6 +53,13 @@ use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::pipeline;
 use crate::state::AppState;
+
+/// Per-request prompt-injection limits. Conservative defaults; deployers
+/// can tighten by editing these consts. Kept in one block so future env
+/// overrides land here.
+const MAX_PROMPT_TRAITS: usize = 8;
+const MAX_PROMPT_TRAIT_TEXT_CHARS: usize = 2000;
+const MAX_PROMPT_TRAIT_TAG_LEN: usize = 32;
 
 /// NFT-ownership gate. Returns `Ok(())` immediately if `asset_id` is `None`
 /// (legacy seed-persona genome). Otherwise joins persona_ownership with
@@ -127,6 +135,10 @@ pub struct StartChatResponse {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SendMessageRequest {
     pub message: String,
+    /// Optional caller-supplied prompt-injection fragments. See
+    /// `docs/prompt-traits.md`. Missing field → empty list.
+    #[serde(default)]
+    pub prompt_traits: Option<Vec<PromptTraitDto>>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -265,6 +277,16 @@ impl From<&AffinityDeltasDto> for AffinityDeltas {
     }
 }
 
+/// Caller-supplied prompt-injection fragment. See `docs/prompt-traits.md`.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct PromptTraitDto {
+    /// ASCII identifier, regex `^[a-z0-9_]{1,32}$`. Used for logging.
+    pub tag: String,
+    /// Verbatim text inserted under `【附加指引】` in the system prompt.
+    /// 1 ≤ chars ≤ 2000 after trim.
+    pub text: String,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GiftEventResponse {
     pub reply: Option<String>,
@@ -327,6 +349,75 @@ fn typing_delay_ms_from(seed: Uuid) -> u64 {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]);
     800 + (n % 1700)
+}
+
+/// Validate a caller-supplied list of `PromptTraitDto` and convert to the
+/// core `PromptTrait` shape. Empty input is allowed and returns `vec![]`.
+///
+/// Rules (all violations → `400 BadRequest`):
+/// - `traits.len()` ≤ `MAX_PROMPT_TRAITS`
+/// - `tag` matches `^[a-z0-9_]+$` and `1..=MAX_PROMPT_TRAIT_TAG_LEN` chars
+/// - `text.trim()` non-empty
+/// - `text.chars().count()` ≤ `MAX_PROMPT_TRAIT_TEXT_CHARS`
+/// - `text` contains no control characters (would break bullet rendering)
+fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, AppError> {
+    if dtos.len() > MAX_PROMPT_TRAITS {
+        return Err(AppError::BadRequest(format!(
+            "too many prompt_traits (max {MAX_PROMPT_TRAITS})"
+        )));
+    }
+    let mut out = Vec::with_capacity(dtos.len());
+    for (i, dto) in dtos.iter().enumerate() {
+        // tag: 1..=MAX bytes, all [a-z0-9_]
+        if dto.tag.is_empty() || dto.tag.len() > MAX_PROMPT_TRAIT_TAG_LEN {
+            return Err(AppError::BadRequest(format!(
+                "prompt_traits[{i}].tag must be 1..={MAX_PROMPT_TRAIT_TAG_LEN} chars"
+            )));
+        }
+        if !dto
+            .tag
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        {
+            return Err(AppError::BadRequest(format!(
+                "prompt_traits[{i}].tag must match [a-z0-9_]+"
+            )));
+        }
+        // text: non-empty after trim, length-capped by char count (not bytes)
+        // of the TRIMMED form so leading/trailing whitespace doesn't eat the
+        // budget. Both checks use the same `trimmed` slice — matches the
+        // `1 ≤ chars ≤ 2000 (after trim)` contract in docs/prompt-traits.md.
+        let trimmed = dto.text.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "prompt_traits[{i}].text must not be blank"
+            )));
+        }
+        if trimmed.chars().count() > MAX_PROMPT_TRAIT_TEXT_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "prompt_traits[{i}].text exceeds {MAX_PROMPT_TRAIT_TEXT_CHARS} chars after trim"
+            )));
+        }
+        // text: no characters that would break the single-line bullet
+        // rendering in `build_prompt`. `char::is_control` covers
+        // \n / \r / \t / DEL / C1 controls; we additionally reject the
+        // Unicode LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR
+        // (U+2029) which are NOT in Cc but DO start a new line.
+        if dto
+            .text
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+        {
+            return Err(AppError::BadRequest(format!(
+                "prompt_traits[{i}].text must not contain line-break or control characters"
+            )));
+        }
+        out.push(PromptTrait {
+            tag: dto.tag.clone(),
+            text: trimmed.to_string(),
+        });
+    }
+    Ok(out)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -535,6 +626,8 @@ async fn send_message(
         enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
+
     // Persist the user message up-front so the engine sees it in history.
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
@@ -544,6 +637,7 @@ async fn send_message(
     let event = Event::UserMessage {
         content: req.message.clone(),
         message_id: user_message_id,
+        prompt_traits,
     };
     let response = pipeline::run(&state, session_id, event).await?;
 
@@ -615,6 +709,9 @@ async fn send_message_async(
         enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
     }
 
+    // Validate BEFORE we persist the user message so a bad request leaves no row.
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
+
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
         .append_message(session_id, "user", &req.message)
@@ -622,10 +719,12 @@ async fn send_message_async(
 
     let state_bg = state.clone();
     let msg_copy = req.message.clone();
+    let traits_copy = prompt_traits;
     tokio::spawn(async move {
         let event = Event::UserMessage {
             content: msg_copy,
             message_id: user_message_id,
+            prompt_traits: traits_copy,
         };
         if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
             tracing::error!("engine pipeline failed for session {session_id}: {e}");
@@ -1498,5 +1597,286 @@ mod tests {
         // Defaults from migration: warmth=0.3, intrigue=0.5
         assert!((body["warmth"].as_f64().unwrap() - 0.3).abs() < 1e-9);
         assert!((body["intrigue"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    // ─── Prompt-traits validator unit tests ─────────────────────────
+
+    #[test]
+    fn validate_traits_accepts_empty_input() {
+        let out = validate_prompt_traits(&[]).expect("empty ok");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn validate_traits_accepts_two_well_formed_entries() {
+        let dtos = vec![
+            PromptTraitDto {
+                tag: "nsfw_boost".into(),
+                text: "x".into(),
+            },
+            PromptTraitDto {
+                tag: "politics_open".into(),
+                text: "y".into(),
+            },
+        ];
+        let out = validate_prompt_traits(&dtos).expect("ok");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].tag, "nsfw_boost");
+    }
+
+    #[test]
+    fn validate_traits_rejects_more_than_max() {
+        let dtos: Vec<PromptTraitDto> = (0..9)
+            .map(|i| PromptTraitDto {
+                tag: format!("t{i}"),
+                text: "x".into(),
+            })
+            .collect();
+        let err = validate_prompt_traits(&dtos).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_traits_rejects_oversized_text() {
+        let big = "a".repeat(2001);
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: big,
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn validate_traits_rejects_empty_text_after_trim() {
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: "   ".into(),
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn validate_traits_rejects_invalid_tag_regex() {
+        for bad in [
+            "",
+            "NSFW",
+            "with space",
+            "too_long_tag_xxxxxxxxxxxxxxxxxxxxxxx",
+        ] {
+            let dtos = vec![PromptTraitDto {
+                tag: bad.into(),
+                text: "x".into(),
+            }];
+            assert!(
+                matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
+                "tag {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_traits_rejects_text_with_newlines() {
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: "first line\nsecond line".into(),
+        }];
+        assert!(
+            matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
+            "embedded newline must be rejected so bullet rendering stays safe"
+        );
+    }
+
+    #[test]
+    fn validate_traits_rejects_text_with_unicode_line_separators() {
+        for sep in ["a\u{2028}b", "a\u{2029}b"] {
+            let dtos = vec![PromptTraitDto {
+                tag: "ok".into(),
+                text: sep.into(),
+            }];
+            assert!(
+                matches!(validate_prompt_traits(&dtos), Err(AppError::BadRequest(_))),
+                "Unicode line separator in text must be rejected: {sep:?}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_too_many_prompt_traits(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let traits: Vec<Value> = (0..9)
+            .map(|i| json!({ "tag": format!("t{i}"), "text": "x" }))
+            .collect();
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": traits,
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // No user message persisted on a 400.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_oversized_trait_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "ok", "text": "a".repeat(2001) }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_rejects_invalid_tag_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "NSFW Boost", "text": "x" }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_accepts_missing_prompt_traits_field(pool: PgPool) {
+        // A body without `prompt_traits` deserialises fine and reaches the
+        // pipeline. We only assert that the validator did not reject the
+        // request — the downstream LLM call may or may not succeed against
+        // the stubbed OpenRouter key in test state.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({ "message": "hi" })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "missing prompt_traits must NOT be rejected"
+        );
+        // The user message row should have been appended either way.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_rejects_invalid_tag_regex(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "prompt_traits": [{ "tag": "BadTag", "text": "x" }],
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Async route also validates BEFORE persisting — no user row.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 }

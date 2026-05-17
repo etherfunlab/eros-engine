@@ -7,11 +7,32 @@ use uuid::Uuid;
 use crate::affinity::{Affinity, AffinityDeltas};
 use crate::persona::CompanionPersona;
 
+/// A caller-supplied system-prompt fragment. The engine treats `text` as
+/// opaque — it is inserted verbatim under the `【附加指引】` section of
+/// the persona system prompt. `tag` is for logging/observability only and
+/// is constrained to `[a-z0-9_]{1,32}` by the HTTP layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptTrait {
+    pub tag: String,
+    pub text: String,
+}
+
 /// Events that drive the engine pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
-    UserMessage { content: String, message_id: Uuid },
-    Gift { gift_id: Uuid, amount: i64 },
+    UserMessage {
+        content: String,
+        message_id: Uuid,
+        /// Optional caller-supplied prompt traits. Empty for clients that
+        /// don't send the field — preserves the legacy system-prompt output
+        /// byte-for-byte.
+        #[serde(default)]
+        prompt_traits: Vec<PromptTrait>,
+    },
+    Gift {
+        gift_id: Uuid,
+        amount: i64,
+    },
     ProactiveTrigger,
     AppOpen,
 }
@@ -67,4 +88,32 @@ pub struct DecisionInput {
     pub affinity: Affinity,
     pub persona: CompanionPersona,
     pub signals: ConversationSignals,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_user_message_defaults_prompt_traits_to_empty_vec() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
+        match ev {
+            Event::UserMessage { prompt_traits, .. } => {
+                assert!(prompt_traits.is_empty(), "missing field must default to []");
+            }
+            _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
+    fn prompt_trait_round_trips_through_serde() {
+        let t = PromptTrait {
+            tag: "nsfw_boost".into(),
+            text: "be more daring".into(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: PromptTrait = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
 }

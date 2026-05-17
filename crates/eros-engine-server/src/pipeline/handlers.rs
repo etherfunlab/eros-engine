@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
-use eros_engine_core::types::{ActionPlan, DecisionInput, Event};
+use eros_engine_core::types::{ActionPlan, DecisionInput, Event, PromptTrait};
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::insight::InsightRepo;
@@ -355,6 +355,11 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
         // Reply path never has pending gifts — those flow through GiftHandler.
         let pending_gifts: Vec<PendingGift> = vec![];
 
+        let prompt_traits: &[PromptTrait] = match &input.event {
+            Event::UserMessage { prompt_traits, .. } => prompt_traits.as_slice(),
+            _ => &[],
+        };
+
         let system_prompt = build_prompt(
             &input.persona,
             &profile_groups,
@@ -364,6 +369,7 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
             tip_personality,
             plan.reply_style,
             &plan.context_hints,
+            prompt_traits,
         );
 
         Ok(Some(assemble_chat_request(
@@ -461,6 +467,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
             .as_deref()
             .unwrap_or("normal");
 
+        // Gift path: prompt_traits flow only from UserMessage; ignore for gift reactions.
         let system_prompt = build_prompt(
             &input.persona,
             &profile_groups,
@@ -470,6 +477,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
             tip_personality,
             plan.reply_style,
             &plan.context_hints,
+            &[],
         );
 
         Ok(Some(assemble_chat_request(
