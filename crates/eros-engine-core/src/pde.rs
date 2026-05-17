@@ -206,6 +206,7 @@ mod tests {
         Event::UserMessage {
             content: content.into(),
             message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
         }
     }
 

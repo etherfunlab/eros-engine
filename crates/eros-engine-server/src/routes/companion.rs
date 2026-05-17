@@ -544,6 +544,7 @@ async fn send_message(
     let event = Event::UserMessage {
         content: req.message.clone(),
         message_id: user_message_id,
+        prompt_traits: Vec::new(),
     };
     let response = pipeline::run(&state, session_id, event).await?;
 
@@ -626,6 +627,7 @@ async fn send_message_async(
         let event = Event::UserMessage {
             content: msg_copy,
             message_id: user_message_id,
+            prompt_traits: Vec::new(),
         };
         if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
             tracing::error!("engine pipeline failed for session {session_id}: {e}");
