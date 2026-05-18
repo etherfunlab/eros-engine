@@ -11,3 +11,6 @@ Cargo.lock.bak
 .test-env
 
 docs/superpowers/
+
+# Supabase CLI scratch state (created by `supabase link`).
+**/supabase/.temp/
