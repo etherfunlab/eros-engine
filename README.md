@@ -2,7 +2,7 @@
 
 > **An open-source Rust engine for AI companions with memory, relationship state, and structured user insight.**
 >
-> `eros-engine` is the companion-chat core behind [Eros](https://eros.etherfun.xyz), extracted into a standalone service. It turns conversation into three durable signals: a structured user profile, two-layer long-term memory, and a six-dimensional affinity model that changes how a persona behaves over time.
+> `eros-engine` is the companion-chat core behind [Eros Chat](https://chat.etherfun.xyz), extracted into a standalone service. It turns conversation into three durable signals: a structured user profile, two-layer long-term memory, and a six-dimensional affinity model that changes how a persona behaves over time.
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)

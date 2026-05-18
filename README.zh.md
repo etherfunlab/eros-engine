@@ -2,7 +2,7 @@
 
 > **一個用 Rust 寫的開源 AI 伴侶引擎：記憶、關係狀態、結構化用戶洞察。**
 >
-> `eros-engine` 是 [Eros](https://eros.etherfun.xyz) 背後的 companion-chat 核心，現在抽成可獨立部署的服務。它把每輪對話轉成三種可持久化的信號：結構化用戶畫像、雙層長期記憶，以及會持續影響 persona 行為的六維好感度模型。
+> `eros-engine` 是 [Eros Chat](https://chat.etherfun.xyz) 背後的 companion-chat 核心，現在抽成可獨立部署的服務。它把每輪對話轉成三種可持久化的信號：結構化用戶畫像、雙層長期記憶，以及會持續影響 persona 行為的六維好感度模型。
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
