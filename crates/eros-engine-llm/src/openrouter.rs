@@ -95,6 +95,80 @@ struct WireResponse {
     choices: Vec<WireChoice>,
 }
 
+// ── SSE streaming types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct UsageBlock {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// OpenRouter sometimes includes a `cost` field (USD). Kept here so
+    /// callers that want to log it have access; the spec's `done.usage`
+    /// schema only requires the three token counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeltaChunk {
+    pub content: Option<String>,
+    pub finish_reason: Option<String>,
+    pub usage: Option<UsageBlock>,
+    pub generation_id: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Opaque wrapper around a boxed SSE delta stream. Implements [`Debug`] so
+/// callers can use `.expect_err()` / `.unwrap()` in tests without the
+/// underlying `dyn Stream` trait-object imposing a `Debug` bound.
+pub struct DeltaStream(pub futures_util::stream::BoxStream<'static, Result<DeltaChunk, LlmError>>);
+
+impl std::fmt::Debug for DeltaStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaStream").finish_non_exhaustive()
+    }
+}
+
+impl futures_util::Stream for DeltaStream {
+    type Item = Result<DeltaChunk, LlmError>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::pin::Pin;
+        Pin::new(&mut self.0).poll_next(cx)
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WireStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WireStreamChoice {
+    #[serde(default)]
+    delta: WireStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireStreamFrame {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageBlock>,
+    #[serde(default)]
+    choices: Vec<WireStreamChoice>,
+}
+
 /// App-Attribution headers sent on every outbound OpenRouter call.
 /// Skipping `None` fields avoids emitting blank-but-set headers, which
 /// OpenRouter would record as a real attribution. Both `None` reverts
@@ -281,6 +355,80 @@ impl OpenRouterClient {
             model: parsed.model,
             usage: parsed.usage,
         })
+    }
+
+    /// Open a streaming chat completion against a single model. Fallback
+    /// chain handling is the caller's responsibility (pipeline layer).
+    pub async fn execute_stream(&self, req: ChatRequest) -> Result<DeltaStream, LlmError> {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        if self.api_key.is_empty() {
+            return Err(LlmError::Config("openrouter: api key not set".into()));
+        }
+        if req.model.is_empty() {
+            return Err(LlmError::Config(
+                "openrouter: execute_stream requires a non-empty model".into(),
+            ));
+        }
+
+        let wire = serde_json::json!({
+            "model": req.model,
+            "messages": req.messages,
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens,
+            "stream": true,
+            // Forward audit fields when set.
+            "user": req.user,
+            "session_id": req.session_id,
+            "metadata": req.metadata,
+        });
+
+        let resp = self
+            .http
+            .post(&self.base_url)
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&wire)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Status(status, text));
+        }
+
+        let stream = resp
+            .bytes_stream()
+            .eventsource()
+            .filter_map(|ev| async move {
+                match ev {
+                    Ok(e) => {
+                        if e.data == "[DONE]" {
+                            return None;
+                        }
+                        match serde_json::from_str::<WireStreamFrame>(&e.data) {
+                            Ok(frame) => {
+                                let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                Some(Ok(DeltaChunk {
+                                    content: choice.delta.content.filter(|s| !s.is_empty()),
+                                    finish_reason: choice.finish_reason,
+                                    usage: frame.usage,
+                                    generation_id: frame.id,
+                                    model: frame.model,
+                                }))
+                            }
+                            Err(_) => Some(Err(LlmError::StreamParse(
+                                e.data.chars().take(256).collect(),
+                            ))),
+                        }
+                    }
+                    Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
+                }
+            });
+
+        Ok(DeltaStream(stream.boxed()))
     }
 }
 
@@ -810,5 +958,156 @@ mod tests {
             .await
             .expect("non-empty fallback succeeds");
         assert_eq!(resp.reply, "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_stream_yields_deltas_then_terminal_usage() {
+        use futures_util::StreamExt;
+
+        let server = MockServer::start().await;
+        // Two delta frames + a terminal frame with usage + the `[DONE]`
+        // sentinel. Crucially, the body chunks arrive as a single raw text
+        // body — wiremock does not flush per-chunk, but the eventsource-stream
+        // parser tolerates the whole body arriving at once because it splits
+        // on the wire-level `\n\n` boundary itself.
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5},\"id\":\"gen-xyz\",\"model\":\"x-ai/grok-4-fast\"}\n\n\
+data: [DONE]\n\n";
+
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                fallback_model: Vec::new(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens");
+
+        let mut contents = Vec::new();
+        let mut last_usage: Option<UsageBlock> = None;
+        let mut last_gen_id: Option<String> = None;
+        let mut last_model: Option<String> = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("delta chunk parses");
+            if let Some(c) = chunk.content {
+                contents.push(c);
+            }
+            if chunk.usage.is_some() {
+                last_usage = chunk.usage;
+            }
+            if chunk.generation_id.is_some() {
+                last_gen_id = chunk.generation_id;
+            }
+            if chunk.model.is_some() {
+                last_model = chunk.model;
+            }
+        }
+        assert_eq!(contents, vec!["你".to_string(), "好".to_string()]);
+        let u = last_usage.expect("usage present on terminal chunk");
+        assert_eq!(u.prompt_tokens, 3);
+        assert_eq!(u.completion_tokens, 2);
+        assert_eq!(u.total_tokens, 5);
+        assert_eq!(last_gen_id.as_deref(), Some("gen-xyz"));
+        assert_eq!(last_model.as_deref(), Some("x-ai/grok-4-fast"));
+    }
+
+    #[tokio::test]
+    async fn execute_stream_returns_status_error_when_upstream_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate-limited"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("4xx → Err before any stream yielded");
+        assert!(
+            matches!(err, LlmError::Status(s, _) if s.as_u16() == 429),
+            "expected Status(429), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_yields_parse_error_on_bad_frame() {
+        use futures_util::StreamExt;
+        let server = MockServer::start().await;
+        let body = "data: not-json\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let item = stream.next().await.expect("at least one item");
+        assert!(
+            matches!(item, Err(LlmError::StreamParse(_))),
+            "expected StreamParse error, got {item:?}"
+        );
     }
 }

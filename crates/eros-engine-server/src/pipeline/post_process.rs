@@ -18,7 +18,7 @@
 
 use uuid::Uuid;
 
-use eros_engine_core::types::{ActionPlan, ActionType, ChatResponse, Event};
+use eros_engine_core::types::{ActionPlan, ActionType, Event};
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_llm::voyage::VoyageClient;
@@ -28,6 +28,21 @@ use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 
 use crate::state::AppState;
+
+// ─── ProducedMessage ───────────────────────────────────────────────
+
+/// One assistant message persisted during a burst (sync or streaming path).
+/// `action` mirrors the spec's `meta.action_type` discriminator. `message_id`
+/// and `action` are unused by today's per-message side-effects but are kept
+/// on the struct for the audit / lead-score hooks that a future task will
+/// thread per-message.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ProducedMessage {
+    pub message_id: Uuid,
+    pub full_text: String,
+    pub action: ActionType,
+}
 
 // ─── Top-level dispatcher ──────────────────────────────────────────
 
@@ -39,26 +54,34 @@ pub async fn run(
     instance_id: Uuid,
     event: Event,
     plan: ActionPlan,
-    response: Option<ChatResponse>,
+    produced: Vec<ProducedMessage>,
 ) {
     let user_msg = match &event {
         Event::UserMessage { content, .. } => content.clone(),
         _ => String::new(),
     };
-    let reply = response
-        .as_ref()
-        .map(|r| r.reply.clone())
-        .unwrap_or_default();
 
     let fut_insight = async {
-        if !user_msg.is_empty() && !reply.is_empty() {
-            extract_insights(&state, session_id, user_id, &user_msg, &reply).await;
+        for m in &produced {
+            if !user_msg.is_empty() && !m.full_text.is_empty() {
+                extract_insights(&state, session_id, user_id, &user_msg, &m.full_text).await;
+            }
         }
     };
 
     let fut_memory = async {
-        if !user_msg.is_empty() && !reply.is_empty() {
-            write_turn(&state, session_id, user_id, instance_id, &user_msg, &reply).await;
+        for m in &produced {
+            if !user_msg.is_empty() && !m.full_text.is_empty() {
+                write_turn(
+                    &state,
+                    session_id,
+                    user_id,
+                    instance_id,
+                    &user_msg,
+                    &m.full_text,
+                )
+                .await;
+            }
         }
     };
 

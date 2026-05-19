@@ -80,7 +80,57 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 `is_new=false` if you call `/start` again with the same `genome_id` for the same user — the engine resumes the existing session rather than creating a duplicate.
 
+### `POST /comp/chat/{session_id}/message/stream`
+
+Streaming chat turn. Returns `text/event-stream` with the
+`meta → delta* → done → final` state machine described in the
+[SSE streaming chat 0.2 design spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md).
+
+The body **must** include `client_msg_id` (26..36 ASCII-printable chars,
+any UUID or ULID). Replays of the same `(session_id, client_msg_id)` within
+24 h reconstruct the original frames from the database without re-calling
+OpenRouter.
+
+```bash
+curl -N -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+Sample frames (one JSON object per `data:` line):
+
+```text
+data: {"type":"meta","message_id":"01J...","action_type":"reply","model":"x-ai/grok-4-fast"}
+
+data: {"type":"delta","message_id":"01J...","content":"你好"}
+
+data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
+
+data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18}
+```
+
+Concurrent active streams per user are capped at 3. The keep-alive heartbeat
+(`: ping`) is emitted every 15 s so reverse-proxies don't time out the
+idle connection.
+
+Pre-stream errors (HTTP 4xx/5xx before the first SSE byte) carry a JSON
+body with `code`, `message`, `user_message` and — for
+`409 duplicate_in_progress` — an `original_user_message_id`. See the
+[spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)
+for the full code table.
+
+Once the first SSE byte has been written, terminal failures arrive as an
+in-band `error` frame and the stream closes; the HTTP response has already
+committed `200 OK`.
+
 ### `POST /comp/chat/{session_id}/message`
+
+> **Deprecated in 0.2.** Prefer `/message/stream` for new integrations.
+> The sync endpoint is retained through the 0.2.x patch window and
+> removed in 0.3.0.
 
 Synchronous chat turn. Blocks until the LLM responds.
 
@@ -108,9 +158,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `usage` / `generation_id` / `model` are optional echoes of OpenRouter's
 response. They are omitted when upstream didn't return them or when no
 LLM call was made for this turn. The engine treats `usage` as an opaque
-JSON object — callers deserialize as needed. Only on `/message`; the
-`/message_async` route does not surface these fields (see
-[llm-audit.md](llm-audit.md)).
+JSON object — callers deserialize as needed. See [llm-audit.md](llm-audit.md).
 
 **Optional: per-request prompt traits.** The body may include a
 `prompt_traits` array — see [prompt-traits.md](prompt-traits.md). Example:
@@ -149,27 +197,6 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 Caps: `audit.user` and `audit.session_id` ≤ 256 chars; `audit.metadata`
 ≤ 16 keys, key matches `[A-Za-z0-9_.-]{1,64}`, value is a string ≤ 512
 chars. Violations return `400 BadRequest`.
-
-Both `prompt_traits` and `audit` are accepted by `/message_async` as
-well — the async route does not surface `usage` / `generation_id` /
-`model` on its response, but the audit fields still ride through to
-OpenRouter.
-
-### `POST /comp/chat/{session_id}/message_async`
-
-Same shape as `/message` but returns a `message_id` immediately. The LLM call runs in background; poll `/pending/{message_id}` until it's ready.
-
-### `GET /comp/chat/{session_id}/pending/{message_id}`
-
-```json
-{ "ready": false }
-```
-
-or:
-
-```json
-{ "ready": true, "reply": { /* same shape as /message response */ } }
-```
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 

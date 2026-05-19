@@ -36,6 +36,26 @@ pub struct ChatMessage {
     pub content: String,
     pub extracted_facts: Option<serde_json::Value>,
     pub sent_at: DateTime<Utc>,
+
+    // Streaming + idempotency metadata (added in migration 0012).
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub ghost_decision: bool,
+    #[serde(default)]
+    pub user_message_id: Option<Uuid>,
+    #[serde(default)]
+    pub continues_from_message_id: Option<Uuid>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
+    #[serde(default)]
+    pub generation_id: Option<String>,
+    #[serde(default)]
+    pub assistant_action_type: Option<String>,
 }
 
 pub struct ChatRepo<'a> {
@@ -170,6 +190,174 @@ impl<'a> ChatRepo<'a> {
     }
 }
 
+/// One assistant row to insert in a burst.
+#[derive(Debug, Clone)]
+pub struct AssistantInsert {
+    pub id: Uuid,
+    pub content: String,
+    pub assistant_action_type: String, // "reply" | "gift_reaction"
+    pub continues_from_message_id: Option<Uuid>,
+    pub truncated: bool,
+    pub model: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    pub generation_id: Option<String>,
+}
+
+/// Outcome of `upsert_user_message_idempotent`. The application uses this
+/// to decide between normal processing, replay, and 409.
+#[derive(Debug)]
+pub enum UpsertUserOutcome {
+    /// First time seeing `(session_id, client_msg_id)`.
+    Inserted { message_id: Uuid },
+    /// Original request completed. Caller should synthesise SSE frames from
+    /// the persisted rows (assistant_chain may be empty for a ghost outcome).
+    Replay {
+        user_message_id: Uuid,
+        ghost: bool,
+        assistant_chain: Vec<ChatMessage>,
+    },
+    /// Same key seen, but no assistant row and no ghost flag — the original
+    /// request is still in flight. Caller should return HTTP 409.
+    DuplicateInProgress { user_message_id: Uuid },
+}
+
+impl<'a> ChatRepo<'a> {
+    /// Insert a user message keyed by `client_msg_id` with permanent
+    /// idempotency. The partial unique index on `(session_id, client_msg_id)`
+    /// has no time component, so deduplication is permanent: any prior row
+    /// with the same key is a replay candidate. A future janitor can GC old
+    /// rows, but the application treats any prior `(session_id, client_msg_id)`
+    /// row as authoritative. Resolves the outcome under one short-lived
+    /// transaction so the dedup decision and write happen against a consistent
+    /// snapshot.
+    pub async fn upsert_user_message_idempotent(
+        &self,
+        session_id: Uuid,
+        content: &str,
+        client_msg_id: &str,
+    ) -> Result<UpsertUserOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        // Look for an existing user row with the same (session_id, client_msg_id).
+        // The partial unique index guarantees at most one match if any.
+        let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages \
+             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(row) = existing {
+            let assistant_chain: Vec<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
+                "SELECT * FROM engine.chat_messages \
+                 WHERE user_message_id = $1 AND role = 'assistant' \
+                 ORDER BY sent_at ASC",
+            )
+            .bind(row.id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            return Ok(if !assistant_chain.is_empty() {
+                UpsertUserOutcome::Replay {
+                    user_message_id: row.id,
+                    ghost: false,
+                    assistant_chain,
+                }
+            } else if row.ghost_decision {
+                UpsertUserOutcome::Replay {
+                    user_message_id: row.id,
+                    ghost: true,
+                    assistant_chain: vec![],
+                }
+            } else {
+                UpsertUserOutcome::DuplicateInProgress {
+                    user_message_id: row.id,
+                }
+            });
+        }
+
+        // First time: insert + bump last_active_at.
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'user', $2, $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(content)
+        .bind(client_msg_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(UpsertUserOutcome::Inserted { message_id: id })
+    }
+
+    /// Mark a user message as having received a `ghost` decision from the
+    /// pipeline. Idempotent — re-marking is a no-op.
+    pub async fn mark_user_message_ghosted(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET ghost_decision = true \
+             WHERE id = $1 AND role = 'user' AND ghost_decision = false",
+        )
+        .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a burst of assistant messages keyed back to the driving user
+    /// message. Caller picks the ULID-shaped `id` so the streamed `meta.message_id`
+    /// matches the DB row. Bumps `last_active_at` once at the end.
+    pub async fn insert_assistant_batch(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        rows: &[AssistantInsert],
+    ) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages \
+                   (id, session_id, role, content, user_message_id, \
+                    continues_from_message_id, truncated, model, usage, generation_id, \
+                    assistant_action_type) \
+                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(row.id)
+            .bind(session_id)
+            .bind(&row.content)
+            .bind(user_message_id)
+            .bind(row.continues_from_message_id)
+            .bind(row.truncated)
+            .bind(&row.model)
+            .bind(&row.usage)
+            .bind(&row.generation_id)
+            .bind(&row.assistant_action_type)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +426,140 @@ mod tests {
         let first = repo.create_session(user_id, instance_id).await.unwrap();
         let resumed = repo.create_or_resume(user_id, instance_id).await.unwrap();
         assert_eq!(first.id, resumed.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_idempotent_first_insert(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let outcome = repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::Inserted { message_id } => {
+                assert_ne!(message_id, Uuid::nil());
+            }
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_idempotent_replay_after_done(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let first = match repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            o => panic!("expected Inserted, got {o:?}"),
+        };
+
+        repo.insert_assistant_batch(
+            s.id,
+            first,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "hi back".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("x-ai/grok-4-fast".into()),
+                usage: Some(
+                    serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}),
+                ),
+                generation_id: Some("gen-1".into()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let outcome = repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::Replay {
+                user_message_id,
+                ghost,
+                assistant_chain,
+            } => {
+                assert_eq!(user_message_id, first);
+                assert!(!ghost);
+                assert_eq!(assistant_chain.len(), 1);
+                assert_eq!(assistant_chain[0].content, "hi back");
+            }
+            other => panic!("expected Replay, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_idempotent_409_when_no_assistant_and_not_ghost(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let first = match repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            o => panic!("expected Inserted, got {o:?}"),
+        };
+
+        match repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
+                assert_eq!(user_message_id, first);
+            }
+            other => panic!("expected DuplicateInProgress, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_idempotent_replay_when_ghost(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let first = match repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            o => panic!("expected Inserted, got {o:?}"),
+        };
+        repo.mark_user_message_ghosted(first).await.unwrap();
+
+        match repo
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Replay {
+                ghost,
+                assistant_chain,
+                ..
+            } => {
+                assert!(ghost);
+                assert!(assistant_chain.is_empty());
+            }
+            other => panic!("expected Replay, got {other:?}"),
+        }
     }
 }

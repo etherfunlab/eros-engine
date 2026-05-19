@@ -80,7 +80,51 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 `is_new=false` 表示同一用戶用同一個 `genome_id` 再調 `/start`——引擎恢復已有 session 而不是建重複的。
 
+### `POST /comp/chat/{session_id}/message/stream`
+
+流式聊天，返回 `text/event-stream`，使用 `meta → delta* → done → final`
+状态机（详见 [SSE streaming chat 0.2 设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md)）。
+
+请求体必须包含 `client_msg_id`（26..36 个 ASCII 可打印字符，任意 UUID 或
+ULID）。24 小时内同一对 `(session_id, client_msg_id)` 的重复请求将从
+数据库重放历史帧，不会再次调用 OpenRouter。
+
+```bash
+curl -N -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+示例帧（每行 `data:` 后跟一个 JSON 对象）：
+
+```text
+data: {"type":"meta","message_id":"01J...","action_type":"reply","model":"x-ai/grok-4-fast"}
+
+data: {"type":"delta","message_id":"01J...","content":"你好"}
+
+data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
+
+data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18}
+```
+
+每个用户最多 3 条并发活跃流。保活心跳（`: ping`）每 15 秒发一次，
+防止反向代理因空闲超时断开连接。
+
+流前错误（第一个 SSE 字节写出之前的 HTTP 4xx/5xx）携带含 `code`、
+`message`、`user_message` 字段的 JSON 响应体；`409 duplicate_in_progress`
+时还会带 `original_user_message_id`。完整错误码表见
+[设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)。
+
+一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
+此时 HTTP 响应已提交 `200 OK`。
+
 ### `POST /comp/chat/{session_id}/message`
+
+> **0.2 弃用。** 新接入请改用 `/message/stream`。同步端点在 0.2.x 期间
+> 保留兼容，在 0.3.0 中正式移除。
 
 同步對話一輪。阻塞到 LLM 響應為止。
 
@@ -107,8 +151,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 `usage` / `generation_id` / `model` 是 OpenRouter 响应的可选回显。
 上游未返回或本轮没有 LLM 调用时省略。引擎把 `usage` 当作不透明 JSON
-对象，调用方按需反序列化。只有 `/message` 会带，`/message_async`
-不在响应里暴露这三个字段（详见 [llm-audit.zh.md](llm-audit.zh.md)）。
+对象，调用方按需反序列化。详见 [llm-audit.zh.md](llm-audit.zh.md)。
 
 **可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
 详见 [prompt-traits.zh.md](prompt-traits.zh.md)。示例：
@@ -147,26 +190,6 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 限制：`audit.user` 与 `audit.session_id` ≤ 256 字符；`audit.metadata`
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反返回 `400 BadRequest`。
-
-`prompt_traits` 与 `audit` 同样被 `/message_async` 接受 —— 异步路由
-的响应里不带 `usage` / `generation_id` / `model`，但 audit 字段仍会
-透传到 OpenRouter。
-
-### `POST /comp/chat/{session_id}/message_async`
-
-跟 `/message` 形狀一樣，但立即返回一個 `message_id`。LLM 調用在後台跑；輪詢 `/pending/{message_id}` 直到 ready。
-
-### `GET /comp/chat/{session_id}/pending/{message_id}`
-
-```json
-{ "ready": false }
-```
-
-或者：
-
-```json
-{ "ready": true, "reply": { /* 跟 /message 響應形狀一致 */ } }
-```
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 

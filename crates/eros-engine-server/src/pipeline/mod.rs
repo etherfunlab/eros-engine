@@ -15,6 +15,7 @@
 pub mod dreaming;
 pub mod handlers;
 pub mod post_process;
+pub mod stream;
 pub mod sync;
 
 use uuid::Uuid;
@@ -52,7 +53,7 @@ pub async fn run(
     let affinity = load_affinity_with_decay(state, session_id, user_id, instance_id).await?;
 
     // 4. Conversation signals.
-    let signals = compute_signals(state, session_id, &affinity).await?;
+    let signals = compute_signals_for_session(&state.pool, session_id, &affinity).await?;
 
     // 5. Build decision input.
     let input = DecisionInput {
@@ -180,12 +181,19 @@ pub async fn run(
         }
     }
 
-    // 10. Spawn post-process. AppState is `Clone`; the openrouter / voyage
-    // / model_config inside it are `Arc`-wrapped so the clone is cheap and
-    // the spawned future is `'static` (no `&'a` borrows leak in).
+    // 10. Spawn post-process. Wrap the (at most one) assistant message into
+    // a single-element Vec so the post-process signature matches the
+    // streaming path's multi-message bursts.
+    let produced: Vec<post_process::ProducedMessage> = match &response {
+        Some(r) => vec![post_process::ProducedMessage {
+            message_id: Uuid::nil(), // sync path does not produce a streamable id
+            full_text: r.reply.clone(),
+            action: plan.action_type,
+        }],
+        None => vec![],
+    };
     let state_bg = state.clone();
     let plan_bg = plan.clone();
-    let response_bg = response.clone();
     let event_bg = event;
     tokio::spawn(async move {
         post_process::run(
@@ -195,7 +203,7 @@ pub async fn run(
             instance_id,
             event_bg,
             plan_bg,
-            response_bg,
+            produced,
         )
         .await;
     });
@@ -266,8 +274,8 @@ async fn load_affinity_with_decay(
     Ok(affinity)
 }
 
-async fn compute_signals(
-    state: &AppState,
+pub async fn compute_signals_for_session(
+    pool: &sqlx::PgPool,
     session_id: Uuid,
     affinity: &Affinity,
 ) -> Result<ConversationSignals, AppError> {
@@ -275,7 +283,7 @@ async fn compute_signals(
         "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
     )
     .bind(session_id)
-    .fetch_one(&state.pool)
+    .fetch_one(pool)
     .await
     .unwrap_or(0);
 
@@ -283,7 +291,7 @@ async fn compute_signals(
         "SELECT MAX(sent_at) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
     )
     .bind(session_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await
     .ok()
     .flatten();

@@ -186,25 +186,36 @@ Highlights:
 
 - `GET  /comp/personas` — list active persona genomes.
 - `POST /comp/chat/start` — open a chat session against a persona.
-- `POST /comp/chat/{session_id}/message` — synchronous chat turn.
-- `POST /comp/chat/{session_id}/message_async` — async chat turn with pending-status polling.
-- `GET  /comp/chat/{session_id}/pending/{message_id}` — poll async completion.
+- `POST /comp/chat/{session_id}/message/stream` — streaming chat turn (SSE, recommended).
+- `POST /comp/chat/{session_id}/message` — synchronous chat turn (deprecated in 0.2, removed in 0.3).
 - `GET  /comp/chat/{session_id}/history` — paginated chat history.
 - `GET  /comp/chat/{user_id}/sessions` — list a user's sessions.
 - `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
 - `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
 - `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
-- `POST /comp/chat/{session_id}/message` and `/message_async` accept two
-  optional caller-supplied fields:
+- `/message/stream` and `/message` accept two optional caller-supplied fields:
   - `prompt_traits` — per-request system-prompt injection, see
     [docs/prompt-traits.md](docs/prompt-traits.md).
   - `audit` — opaque OpenRouter passthrough (`user` / `session_id` /
     `metadata`) for per-user / per-session attribution on OpenRouter
-    dashboards. Sync `/message` also echoes `usage` / `generation_id` /
-    `model` on its response. See [docs/llm-audit.md](docs/llm-audit.md).
+    dashboards. See [docs/llm-audit.md](docs/llm-audit.md).
 - `GET  /comp/affinity/{session_id}` — debug-only live affinity vector, enabled by `EXPOSE_AFFINITY_DEBUG=true`.
 
 The `AuthValidator` trait is pluggable if you use a different identity provider.
+
+### Streaming chat
+
+```bash
+curl -N -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+See [docs/api-reference.md](docs/api-reference.md#post-compchatsession_idmessagestream)
+for frame layout and error semantics.
 
 ## Configuration
 

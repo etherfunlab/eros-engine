@@ -45,7 +45,7 @@ use eros_engine_core::types::Event;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
+use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
 use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::persona::PersonaRepo;
@@ -175,29 +175,6 @@ pub struct CompanionReplyResponse {
     /// Omitted when not returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AsyncSendResponse {
-    pub status: String,
-    pub user_message_id: Uuid,
-    pub session_id: Uuid,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct CompanionReplyPayload {
-    pub reply: String,
-    pub message_id: Uuid,
-    pub lead_score: f64,
-    pub should_show_cta: bool,
-    pub agent_training_level: f64,
-    pub sent_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct PendingCheckResponse {
-    pub status: String,
-    pub message: Option<CompanionReplyPayload>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -405,7 +382,9 @@ fn typing_delay_ms_from(seed: Uuid) -> u64 {
 /// - `text.trim()` non-empty
 /// - `text.chars().count()` ≤ `MAX_PROMPT_TRAIT_TEXT_CHARS`
 /// - `text` contains no control characters (would break bullet rendering)
-fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, AppError> {
+pub(crate) fn validate_prompt_traits(
+    dtos: &[PromptTraitDto],
+) -> Result<Vec<PromptTrait>, AppError> {
     if dtos.len() > MAX_PROMPT_TRAITS {
         return Err(AppError::BadRequest(format!(
             "too many prompt_traits (max {MAX_PROMPT_TRAITS})"
@@ -497,7 +476,7 @@ fn filter_usage_keys(
 /// Validate a caller-supplied `audit` object against the documented caps.
 /// Returns `Ok(None)` when the field is absent. `Err(BadRequest)` for any
 /// cap violation — first failure wins so the message points at one cause.
-fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppError> {
+pub(crate) fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppError> {
     let Some(dto) = dto else { return Ok(None) };
 
     if let Some(ref u) = dto.user {
@@ -811,162 +790,6 @@ async fn send_message(
     }))
 }
 
-/// Accept a user message and process it in the background. The client
-/// then polls `/pending/{message_id}` for the assistant reply.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/{session_id}/message_async",
-    tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
-    request_body = SendMessageRequest,
-    responses(
-        (status = 202, body = AsyncSendResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn send_message_async(
-    State(state): State<AppState>,
-    Path(session_id): Path<Uuid>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(mut req): Json<SendMessageRequest>,
-) -> Result<(axum::http::StatusCode, Json<AsyncSendResponse>), AppError> {
-    let session = require_session_for_user(&state, session_id, user_id).await?;
-
-    if req.message.trim().is_empty() {
-        return Err(AppError::BadRequest("message must not be empty".into()));
-    }
-
-    // Per-message NFT ownership recheck — see `send_message`.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    if let Some(instance_id) = session.instance_id {
-        let companion = persona_repo
-            .load_companion(instance_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-        let asset_id_opt = persona_repo
-            .get_asset_id_for_genome(companion.instance.genome_id)
-            .await?;
-        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
-    }
-
-    // Validate BEFORE we persist the user message so a bad request leaves no row.
-    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
-    let audit = validate_llm_audit(req.audit.take())?;
-
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let user_message_id = chat_repo
-        .append_message(session_id, "user", &req.message)
-        .await?;
-
-    let state_bg = state.clone();
-    let msg_copy = req.message.clone();
-    let traits_copy = prompt_traits;
-    let audit_copy = audit;
-    tokio::spawn(async move {
-        let event = Event::UserMessage {
-            content: msg_copy,
-            message_id: user_message_id,
-            prompt_traits: traits_copy,
-            audit: audit_copy,
-        };
-        if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
-            tracing::error!("engine pipeline failed for session {session_id}: {e}");
-            let repo = ChatRepo {
-                pool: &state_bg.pool,
-            };
-            let _ = repo
-                .append_message(session_id, "system_error", &format!("AI reply failed: {e}"))
-                .await;
-        }
-    });
-
-    Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(AsyncSendResponse {
-            status: "processing".into(),
-            user_message_id,
-            session_id,
-        }),
-    ))
-}
-
-/// Poll for the AI reply to a user message. Returns `processing` until
-/// the assistant or system_error row appears, then `completed` / `error`.
-#[utoipa::path(
-    get,
-    path = "/comp/chat/{session_id}/pending/{message_id}",
-    tag = "companion",
-    params(
-        ("session_id" = Uuid, Path, description = "Chat session id"),
-        ("message_id" = Uuid, Path, description = "User message id to poll on")
-    ),
-    responses(
-        (status = 200, body = PendingCheckResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn check_pending(
-    State(state): State<AppState>,
-    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<PendingCheckResponse>, AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
-
-    let reply: Option<StoreChatMessage> = sqlx::query_as::<_, StoreChatMessage>(
-        "SELECT * FROM engine.chat_messages \
-         WHERE session_id = $1 \
-           AND sent_at > (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-           AND role IN ('assistant', 'system_error') \
-         ORDER BY sent_at ASC LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(message_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match reply {
-        Some(msg) if msg.role == "assistant" => {
-            let lead_score: f64 =
-                sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
-                    .bind(session_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0.0);
-
-            let training_level = read_training_level(&state, user_id).await;
-            let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
-
-            Ok(Json(PendingCheckResponse {
-                status: "completed".into(),
-                message: Some(CompanionReplyPayload {
-                    reply: msg.content,
-                    message_id: msg.id,
-                    lead_score,
-                    should_show_cta,
-                    agent_training_level: training_level,
-                    sent_at: msg.sent_at,
-                }),
-            }))
-        }
-        Some(_) => Ok(Json(PendingCheckResponse {
-            status: "error".into(),
-            message: None,
-        })),
-        None => Ok(Json(PendingCheckResponse {
-            status: "processing".into(),
-            message: None,
-        })),
-    }
-}
-
 /// Paginated chat history (oldest-first) for the given session.
 #[utoipa::path(
     get,
@@ -1175,8 +998,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_personas))
         .routes(routes!(start_chat))
         .routes(routes!(send_message))
-        .routes(routes!(send_message_async))
-        .routes(routes!(check_pending))
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
@@ -1221,6 +1042,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         )),
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
+        stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
         // s2s middleware is opted-out in companion tests (no secret
         // configured → /s2s/* returns 401). The s2s integration tests
         // in routes/s2s.rs override `marketplace_s2s_secret` after
@@ -2182,194 +2004,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_invalid_tag_regex(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "prompt_traits": [{ "tag": "BadTag", "text": "x" }],
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        // Async route also validates BEFORE persisting — no user row.
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    // ─── LlmAudit HTTP integration tests ────────────────────────────
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_oversized_audit_user(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "user": "x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1) },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(count, 0, "validation must fire before persistence");
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_too_many_metadata_keys(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let mut metadata = serde_json::Map::new();
-        for i in 0..(MAX_LLM_AUDIT_METADATA_KEYS + 1) {
-            metadata.insert(format!("k{i}"), Value::String("v".into()));
-        }
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "metadata": metadata },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_non_string_metadata_value(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "metadata": { "feature": 123 } },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_accepts_valid_audit(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": {
-                "user": "u_abc",
-                "session_id": "conv_xyz",
-                "metadata": { "feature": "chat", "plan": "pro" }
-            },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-
-        let user_msg_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(user_msg_count, 1);
-
-        let leak_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND (content LIKE '%u_abc%' OR content LIKE '%conv_xyz%')",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            leak_count, 0,
-            "audit strings must never appear in chat_messages.content"
-        );
     }
 }

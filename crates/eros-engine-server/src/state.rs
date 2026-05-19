@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use sqlx::PgPool;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -13,6 +14,7 @@ pub struct AppState {
     pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
     pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
+    pub stream_slots: Arc<StreamSlots>,
     /// Base URL of the marketplace service used by the self-heal /since
     /// puller. `None` runs the engine in OSS-only mode (no outbound pull
     /// loop spawned). Populated from `MARKETPLACE_SVC_URL` in main.rs.
@@ -48,6 +50,62 @@ pub(crate) fn parse_usage_hidden_keys(raw: Option<&str>) -> HashSet<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Per-user in-flight SSE stream counter. Used by the
+/// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
+/// active streams per user, returning HTTP 429 over the cap).
+///
+/// Lock contention is negligible: each handler hits the map twice — once
+/// to acquire, once to release — and the map is small (one entry per
+/// active user). A Mutex<HashMap> beats taking on a `dashmap` dependency
+/// for a hot path that runs at chat cadence.
+#[derive(Debug, Default)]
+pub struct StreamSlots {
+    inner: Mutex<HashMap<Uuid, u32>>,
+}
+
+impl StreamSlots {
+    /// Attempt to acquire a stream slot for `user_id`.
+    ///
+    /// Returns `Some(StreamSlotGuard)` if the current count is below `cap`,
+    /// or `None` if the cap is already reached. The guard is `'static` (it
+    /// holds an `Arc<StreamSlots>`) so it can be moved into SSE stream bodies
+    /// without lifetime trouble.
+    pub fn try_acquire(self: &Arc<Self>, user_id: Uuid, cap: u32) -> Option<StreamSlotGuard> {
+        let mut guard = self.inner.lock().expect("StreamSlots mutex poisoned");
+        let entry = guard.entry(user_id).or_insert(0);
+        if *entry >= cap {
+            return None;
+        }
+        *entry += 1;
+        Some(StreamSlotGuard {
+            slots: Arc::clone(self),
+            user_id,
+        })
+    }
+}
+
+/// An RAII guard that decrements the per-user stream count when dropped.
+///
+/// Holds an `Arc<StreamSlots>` so it is `'static` and can be moved into
+/// long-lived futures / SSE stream bodies.
+pub struct StreamSlotGuard {
+    slots: Arc<StreamSlots>,
+    user_id: Uuid,
+}
+
+impl Drop for StreamSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slots.inner.lock() {
+            if let Some(count) = guard.get_mut(&self.user_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    guard.remove(&self.user_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,5 +232,18 @@ mod tests {
     fn usage_hidden_keys_from_env_empty_when_blank() {
         let out = parse_usage_hidden_keys(Some(""));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stream_slots_acquire_until_cap_then_blocks() {
+        let slots = Arc::new(StreamSlots::default());
+        let uid = Uuid::new_v4();
+
+        let g1 = slots.try_acquire(uid, 2).expect("1st acquire under cap");
+        let g2 = slots.try_acquire(uid, 2).expect("2nd acquire at cap-1");
+        assert!(slots.try_acquire(uid, 2).is_none(), "3rd at cap rejected");
+        drop(g1);
+        let _g3 = slots.try_acquire(uid, 2).expect("acquire after drop ok");
+        drop(g2);
     }
 }

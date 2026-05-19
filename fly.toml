@@ -21,6 +21,12 @@ primary_region = "nrt"
   MODEL_CONFIG_PATH = "/etc/eros-engine/model_config.toml"
   RUST_LOG = "info"
 
+# Long SSE streams (POST /comp/chat/{id}/message/stream): the server's
+# 15s keepalive comment (`: ping`) lands well inside Fly's default proxy
+# idle window, so the stream stays open as long as the handler is alive.
+# The machines `[http_service]` schema does not expose a per-request
+# timeout knob; if a stream needs to exceed Fly's response budget, the
+# fix is a server-side 120s hard cap (spec §1.9), not a fly.toml change.
 [http_service]
   internal_port = 8080
   force_https = true

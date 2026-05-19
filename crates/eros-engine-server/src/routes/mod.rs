@@ -21,6 +21,7 @@ use crate::auth::s2s::require_s2s;
 use crate::state::AppState;
 
 pub mod companion;
+pub mod companion_stream;
 pub mod debug;
 pub mod health;
 pub mod s2s;
@@ -35,6 +36,7 @@ pub mod s2s;
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let comp = OpenApiRouter::new()
         .merge(companion::router())
+        .merge(companion_stream::router())
         .merge(debug::router(state.config.expose_affinity_debug))
         .layer(from_fn_with_state(state.clone(), require_auth));
 
@@ -54,6 +56,7 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
     OpenApiRouter::new()
         .merge(health::router())
         .merge(companion::router())
+        .merge(companion_stream::router())
         .merge(debug::router(expose_affinity_debug))
         .merge(s2s::router())
 }
