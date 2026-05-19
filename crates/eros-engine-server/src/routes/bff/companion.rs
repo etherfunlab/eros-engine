@@ -9,15 +9,18 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
-use crate::routes::companion::{require_session_for_user, HistoryQuery};
+use crate::routes::companion::resolve_or_create_session;
+use crate::routes::companion::{require_session_for_user, HistoryQuery, StartChatRequest};
+use crate::routes::dto::AffinitySnapshot;
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
@@ -38,6 +41,44 @@ pub struct BffHistoryResponse {
     /// total row count for the session — pagination doesn't know how many
     /// rows remain. Mirrors `HistoryResponse::total`.
     pub total: usize,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BffStartRequest {
+    pub instance_id: Option<Uuid>,
+    pub genome_id: Option<Uuid>,
+    #[serde(default)]
+    pub is_demo: Option<bool>,
+    /// History page size for the bundled history. Default 50, capped at 50.
+    /// BFF-only field; not present in the canonical /comp/chat/start body.
+    #[serde(default)]
+    pub history_limit: Option<i64>,
+}
+
+impl From<&BffStartRequest> for StartChatRequest {
+    fn from(b: &BffStartRequest) -> Self {
+        StartChatRequest {
+            instance_id: b.instance_id,
+            genome_id: b.genome_id,
+            is_demo: b.is_demo,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BffStartResponse {
+    pub session_id: Uuid,
+    pub instance_id: Uuid,
+    pub persona_name: String,
+    pub is_new: bool,
+    /// Most-recent N messages, oldest-first. Empty for brand-new sessions.
+    pub history: Vec<BffHistoryEntry>,
+    /// Affinity snapshot. `None` covers three cases the FE treats identically
+    /// as "no calibration to show":
+    ///   1. `EXPOSE_AFFINITY_DEBUG=false` — debug gate closed.
+    ///   2. Brand-new session — no row created yet.
+    ///   3. Resumed session that has never had an affinity-producing event.
+    pub affinity: Option<AffinitySnapshot>,
 }
 
 // ─── Handler ────────────────────────────────────────────────────────
@@ -95,10 +136,79 @@ async fn bff_get_history(
     }))
 }
 
+/// Cold-mount bundle: resolves (or creates) the session, then returns
+/// history + affinity in a single round-trip. Replaces three sequential
+/// calls (start + history + affinity) for `eros-engine-web` cold-mount.
+#[utoipa::path(
+    post,
+    path = "/bff/v1/comp/chat/start",
+    tag = "bff-companion",
+    request_body = BffStartRequest,
+    responses(
+        (status = 200, body = BffStartResponse),
+        (status = 400, description = "missing genome_id and no existing instance"),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "not your instance / nft gate"),
+        (status = 404, description = "instance/genome not found")
+    ),
+    security(("bearer" = []))
+)]
+async fn bff_start_chat(
+    State(state): State<AppState>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<BffStartRequest>,
+) -> Result<Json<BffStartResponse>, AppError> {
+    let canonical_req = StartChatRequest::from(&req);
+    let resolved = resolve_or_create_session(&state, user_id, &canonical_req).await?;
+    let history_limit = req.history_limit.unwrap_or(50).clamp(1, 50);
+
+    let history_fut = async {
+        Ok::<_, AppError>(
+            ChatRepo { pool: &state.pool }
+                .history_slim(resolved.session_id, history_limit, 0)
+                .await?,
+        )
+    };
+    let affinity_fut = async {
+        if !state.config.expose_affinity_debug {
+            return Ok::<Option<AffinitySnapshot>, AppError>(None);
+        }
+        let snapshot = AffinityRepo { pool: &state.pool }
+            .load(resolved.session_id)
+            .await?
+            .map(|mut a| {
+                a.apply_time_decay();
+                AffinitySnapshot::from(a)
+            });
+        Ok(snapshot)
+    };
+    let (rows, affinity) = tokio::try_join!(history_fut, affinity_fut)?;
+
+    let history = rows
+        .into_iter()
+        .map(|r| BffHistoryEntry {
+            role: r.role,
+            content: r.content,
+            sent_at: r.sent_at,
+        })
+        .collect();
+
+    Ok(Json(BffStartResponse {
+        session_id: resolved.session_id,
+        instance_id: resolved.instance_id,
+        persona_name: resolved.persona_name,
+        is_new: resolved.is_new,
+        history,
+        affinity,
+    }))
+}
+
 // ─── Router ─────────────────────────────────────────────────────────
 
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(bff_get_history))
+    OpenApiRouter::new()
+        .routes(routes!(bff_get_history))
+        .routes(routes!(bff_start_chat))
 }
 
 #[cfg(test)]
@@ -281,5 +391,238 @@ mod tests {
         let (status, _body) =
             send_request(&mut app, bff_history_request(&token, missing, "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ─── Plan C: POST /bff/v1/comp/chat/start tests ─────────────────
+
+    fn bff_start_request(token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/bff/v1/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_brand_new_session_returns_empty_history_no_affinity(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        assert!(body["is_new"].as_bool().unwrap());
+        assert_eq!(body["persona_name"], "Aria");
+        assert!(body["session_id"].is_string());
+        assert!(body["instance_id"].is_string());
+        assert!(body["history"].as_array().unwrap().is_empty());
+        // No affinity row yet for a brand-new session — spec §3.4 case 2.
+        assert!(body["affinity"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_resumed_session_returns_history(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'hello'), ($1, 'assistant', 'hi back')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(!body["is_new"].as_bool().unwrap());
+        assert_eq!(body["session_id"], json!(session_id.to_string()));
+        let history = body["history"].as_array().expect("history array");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_history_limit_clamped_to_50(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        for n in 0..60 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                         VALUES ($1, 'user', $2)",
+            )
+            .bind(session_id)
+            .bind(format!("m{n}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(
+                &token,
+                json!({ "genome_id": genome_id, "history_limit": 999 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["history"].as_array().unwrap().len(), 50);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_affinity_null_when_debug_gate_closed(pool: PgPool) {
+        // Spec §3.4 case 1: affinity field hidden when EXPOSE_AFFINITY_DEBUG=false.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        // Pre-seed an affinity row so the field would otherwise be non-null.
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, warmth) \
+             VALUES ($1, $2, $3, 0.42)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = test_state(pool);
+        state.config.expose_affinity_debug = false; // close the gate
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["affinity"].is_null(),
+            "affinity must be hidden when EXPOSE_AFFINITY_DEBUG=false; got {body}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_affinity_present_when_debug_gate_open(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, warmth) \
+             VALUES ($1, $2, $3, 0.42)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool); // expose_affinity_debug=true by default in tests
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let affinity = &body["affinity"];
+        assert!(
+            affinity.is_object(),
+            "expected affinity object, got {affinity}"
+        );
+        assert!((affinity["warmth"].as_f64().unwrap() - 0.42).abs() < 1e-9);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_403_on_nft_unowned_genome(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active, asset_id) \
+             VALUES ('Locked', 'sys', '{}'::jsonb, true, 'asset-x') RETURNING id",
+        )
+        .fetch_one(&pool).await.unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, _body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_matches_canonical_start_session_id(pool: PgPool) {
+        // Same input on both endpoints should resolve to the same session for the
+        // same JWT user. Confirms resolve_or_create_session is the only mover.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // First: canonical
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "genome_id": genome_id })).unwrap(),
+            ))
+            .unwrap();
+        let (status, canon) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let canonical_session_id = canon["session_id"].as_str().unwrap().to_string();
+
+        // Then: BFF on the same input — must resume the same session.
+        let (status, bff) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bff["session_id"].as_str().unwrap(), canonical_session_id);
+        assert!(!bff["is_new"].as_bool().unwrap()); // canonical already created it
     }
 }
