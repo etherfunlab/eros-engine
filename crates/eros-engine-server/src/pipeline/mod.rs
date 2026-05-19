@@ -181,12 +181,19 @@ pub async fn run(
         }
     }
 
-    // 10. Spawn post-process. AppState is `Clone`; the openrouter / voyage
-    // / model_config inside it are `Arc`-wrapped so the clone is cheap and
-    // the spawned future is `'static` (no `&'a` borrows leak in).
+    // 10. Spawn post-process. Wrap the (at most one) assistant message into
+    // a single-element Vec so the post-process signature matches the
+    // streaming path's multi-message bursts.
+    let produced: Vec<post_process::ProducedMessage> = match &response {
+        Some(r) => vec![post_process::ProducedMessage {
+            message_id: Uuid::nil(), // sync path does not produce a streamable id
+            full_text: r.reply.clone(),
+            action: plan.action_type,
+        }],
+        None => vec![],
+    };
     let state_bg = state.clone();
     let plan_bg = plan.clone();
-    let response_bg = response.clone();
     let event_bg = event;
     tokio::spawn(async move {
         post_process::run(
@@ -196,7 +203,7 @@ pub async fn run(
             instance_id,
             event_bg,
             plan_bg,
-            response_bg,
+            produced,
         )
         .await;
     });
