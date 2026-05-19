@@ -20,9 +20,18 @@ use crate::error::AppError;
 use crate::routes::dto::AffinitySnapshot;
 use crate::state::AppState;
 
-/// Back-compat alias retained for one release so external OpenAPI consumers
-/// that referenced the old type name don't break instantly. Will be removed
+/// Back-compat alias retained for one release so in-crate callers that
+/// referenced the old type name don't break instantly. Will be removed
 /// in the next minor; new code uses `AffinitySnapshot` directly.
+///
+/// Note: this alias does NOT help external OpenAPI consumers — utoipa
+/// resolves `pub type` transparently so the snapshot already renames
+/// to `AffinitySnapshot`. Any OpenAPI codegen will see the rename
+/// immediately on upgrade.
+#[deprecated(
+    since = "0.2.1",
+    note = "use `crate::routes::dto::AffinitySnapshot` directly; alias will be removed next minor"
+)]
 pub type AffinityDebugResponse = AffinitySnapshot;
 
 /// Inspect the live affinity vector for a session. The session must be
