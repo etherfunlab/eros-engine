@@ -16,6 +16,54 @@
     }
   ],
   "paths": {
+    "/bff/v1/comp/chat/start": {
+      "post": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Cold-mount bundle: resolves (or creates) the session, then returns\nhistory + affinity in a single round-trip. Replaces three sequential\ncalls (start + history + affinity) for `eros-engine-web` cold-mount.",
+        "operationId": "bff_start_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BffStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffStartResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "missing genome_id and no existing instance"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your instance / nft gate"
+          },
+          "404": {
+            "description": "instance/genome not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/bff/v1/comp/chat/{session_id}/history": {
       "get": {
         "tags": [
@@ -923,6 +971,83 @@
             "type": "integer",
             "description": "Count of `messages` in this response (== `messages.len()`). NOT the\ntotal row count for the session — pagination doesn't know how many\nrows remain. Mirrors `HistoryResponse::total`.",
             "minimum": 0
+          }
+        }
+      },
+      "BffStartRequest": {
+        "type": "object",
+        "properties": {
+          "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "history_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "History page size for the bundled history. Default 50, capped at 50.\nBFF-only field; not present in the canonical /comp/chat/start body."
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "is_demo": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "BffStartResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "instance_id",
+          "persona_name",
+          "is_new",
+          "history"
+        ],
+        "properties": {
+          "affinity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinitySnapshot",
+                "description": "Affinity snapshot. `None` covers three cases the FE treats identically\nas \"no calibration to show\":\n  1. `EXPOSE_AFFINITY_DEBUG=false` — debug gate closed.\n  2. Brand-new session — no row created yet.\n  3. Resumed session that has never had an affinity-producing event."
+              }
+            ]
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            },
+            "description": "Most-recent N messages, oldest-first. Empty for brand-new sessions."
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_new": {
+            "type": "boolean"
+          },
+          "persona_name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
