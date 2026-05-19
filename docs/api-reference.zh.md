@@ -96,11 +96,19 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "lead_score": 4.2,
   "should_show_cta": false,
   "typing_delay_ms": 1340,
-  "agent_training_level": 0.18
+  "agent_training_level": 0.18,
+  "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": 0.0004 },
+  "generation_id": "gen-abc123",
+  "model": "openai/gpt-5.2"
 }
 ```
 
 `reply: null` 意味著人格在這一輪 ghost 了你（看 [Ghost 機制](ghost-mechanics.zh.md)）。HTTP 狀態仍是 200。
+
+`usage` / `generation_id` / `model` 是 OpenRouter 响应的可选回显。
+上游未返回或本轮没有 LLM 调用时省略。引擎把 `usage` 当作不透明 JSON
+对象，调用方按需反序列化。只有 `/message` 会带，`/message_async`
+不在响应里暴露这三个字段（详见 [llm-audit.zh.md](llm-audit.zh.md)）。
 
 **可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
 详见 [prompt-traits.zh.md](prompt-traits.zh.md)。示例：
@@ -119,7 +127,30 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 限制：最多 8 条，`tag` 满足 `[a-z0-9_]{1,32}`，`text` ≤ 2000 字符
 （trim 后非空）。违反返回 `400 BadRequest`。
 
-`/message_async` 接受同一字段。
+**可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，
+原样作为 wire 级别的 `user` / `session_id` / `metadata` 发送给
+OpenRouter —— 详见 [llm-audit.zh.md](llm-audit.zh.md)。示例：
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{
+        "message": "hi",
+        "audit": {
+          "user": "u_<hash>",
+          "session_id": "conv_xyz",
+          "metadata": { "feature": "chat", "plan": "pro" }
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message
+```
+
+限制：`audit.user` 与 `audit.session_id` ≤ 256 字符；`audit.metadata`
+≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
+且 ≤ 512 字符。违反返回 `400 BadRequest`。
+
+`prompt_traits` 与 `audit` 同样被 `/message_async` 接受 —— 异步路由
+的响应里不带 `usage` / `generation_id` / `model`，但 audit 字段仍会
+透传到 OpenRouter。
 
 ### `POST /comp/chat/{session_id}/message_async`
 
