@@ -465,6 +465,33 @@ fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, A
     Ok(out)
 }
 
+/// Deployer-controlled suppression of wholesale cost fields from the
+/// sync `/message` response. Operator tracing is unaffected — this
+/// only touches the value before it leaves the HTTP layer.
+///
+/// Remove the configured top-level keys from a `usage` JSON object in
+/// place. No-op when `hidden` is empty, when `usage` is `None`, or
+/// when the value is not a JSON object. Caller passes the
+/// `Option<Value>` by mutable reference so the public response struct
+/// is touched at most once per request.
+///
+/// Only top-level keys are affected; nested sub-keys inside a retained
+/// object (e.g. `prompt_tokens.details`) are out of scope — list the
+/// parent key to suppress the whole subtree.
+fn filter_usage_keys(
+    usage: &mut Option<serde_json::Value>,
+    hidden: &std::collections::HashSet<String>,
+) {
+    if hidden.is_empty() {
+        return;
+    }
+    let Some(value) = usage.as_mut() else { return };
+    let Some(obj) = value.as_object_mut() else { return };
+    for key in hidden {
+        obj.remove(key);
+    }
+}
+
 /// Validate a caller-supplied `audit` object against the documented caps.
 /// Returns `Ok(None)` when the field is absent. `Err(BadRequest)` for any
 /// cap violation — first failure wins so the message points at one cause.
@@ -763,10 +790,11 @@ async fn send_message(
     let training_level = read_training_level(&state, user_id).await;
     let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
 
-    let (usage, generation_id, model) = response
+    let (mut usage, generation_id, model) = response
         .as_ref()
         .map(|r| (r.usage.clone(), r.generation_id.clone(), r.model.clone()))
         .unwrap_or((None, None, None));
+    filter_usage_keys(&mut usage, &state.config.openrouter_usage_hidden_keys);
 
     Ok(Json(CompanionReplyResponse {
         reply: reply_text,
@@ -1963,6 +1991,55 @@ mod tests {
             validate_llm_audit(Some(dto)),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    // ─── filter_usage_keys unit tests ───────────────────────────────
+
+    #[test]
+    fn usage_filter_strips_configured_keys() {
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert("cost".to_string());
+        hidden.insert("cost_details".to_string());
+        let mut usage = Some(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 8,
+            "total_tokens": 18,
+            "cost": 0.0004,
+            "cost_details": { "upstream": 0.0003 }
+        }));
+        filter_usage_keys(&mut usage, &hidden);
+        let out = usage.expect("usage still Some");
+        assert_eq!(out.get("prompt_tokens").and_then(|v| v.as_u64()), Some(10));
+        assert_eq!(out.get("total_tokens").and_then(|v| v.as_u64()), Some(18));
+        assert!(out.get("cost").is_none(), "cost must be stripped");
+        assert!(out.get("cost_details").is_none(), "cost_details must be stripped");
+    }
+
+    #[test]
+    fn usage_filter_no_op_when_set_empty() {
+        let hidden = std::collections::HashSet::new();
+        let original = serde_json::json!({"prompt_tokens": 10, "cost": 0.0004});
+        let mut usage = Some(original.clone());
+        filter_usage_keys(&mut usage, &hidden);
+        assert_eq!(usage, Some(original));
+    }
+
+    #[test]
+    fn usage_filter_no_op_when_usage_is_none() {
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert("cost".to_string());
+        let mut usage: Option<serde_json::Value> = None;
+        filter_usage_keys(&mut usage, &hidden);
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn usage_filter_no_op_when_value_not_object() {
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert("cost".to_string());
+        let mut usage = Some(serde_json::Value::String("opaque".into()));
+        filter_usage_keys(&mut usage, &hidden);
+        assert_eq!(usage, Some(serde_json::Value::String("opaque".into())));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

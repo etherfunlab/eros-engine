@@ -76,8 +76,6 @@ pub struct ServerConfig {
     /// Tracing fields are unaffected — operator observability stays
     /// intact regardless of this setting. Populated from
     /// `OPENROUTER_USAGE_HIDDEN_KEYS` (comma-separated).
-    /// Consumer (send_message route) lands in Task 4.
-    #[allow(dead_code)]
     pub openrouter_usage_hidden_keys: HashSet<String>,
 }
 
