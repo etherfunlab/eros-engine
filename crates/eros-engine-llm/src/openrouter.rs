@@ -24,18 +24,35 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub model: String,
     pub fallback_model: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// Opaque OpenRouter wire passthrough — `user` field. Engine never
+    /// inspects this; callers are responsible for hashing PII out.
+    pub user: Option<String>,
+    /// Opaque OpenRouter wire passthrough — caller's session/conversation
+    /// grouping id. Distinct from the engine's URL-path `session_id`.
+    pub session_id: Option<String>,
+    /// Opaque OpenRouter wire passthrough — analytics dimensions. Caps
+    /// (≤16 keys, key ≤64 chars, value ≤512 chars) are enforced at the
+    /// HTTP boundary, not here.
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatResponse {
     pub reply: String,
+    /// OpenRouter response `id` — opaque generation handle.
+    pub generation_id: Option<String>,
+    /// Model actually served (may differ from request when fallback hit).
+    pub model: Option<String>,
+    /// OpenRouter `usage` block — tokens / cost. Opaque to engine;
+    /// caller deserialises as needed.
+    pub usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +61,12 @@ struct WireRequest<'a> {
     messages: &'a [ChatMessage],
     temperature: f32,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,13 +155,21 @@ impl OpenRouterClient {
 
     /// Execute a chat completion. If `fallback_model` is set and the primary
     /// call fails (transport error or non-2xx status), retry once with the
-    /// fallback model.
+    /// fallback model. Audit passthrough fields ride along on both attempts.
     pub async fn execute(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
         match self
-            .call_once(&req.model, &req.messages, req.temperature, req.max_tokens)
+            .call_once(
+                &req.model,
+                &req.messages,
+                req.temperature,
+                req.max_tokens,
+                req.user.as_deref(),
+                req.session_id.as_deref(),
+                req.metadata.as_ref(),
+            )
             .await
         {
-            Ok(reply) => Ok(ChatResponse { reply }),
+            Ok(resp) => Ok(resp),
             Err(primary_err) => {
                 if let Some(fallback) = req.fallback_model.as_deref() {
                     tracing::warn!(
@@ -147,10 +178,16 @@ impl OpenRouterClient {
                         error = %primary_err,
                         "openrouter: primary failed, retrying with fallback"
                     );
-                    let reply = self
-                        .call_once(fallback, &req.messages, req.temperature, req.max_tokens)
-                        .await?;
-                    Ok(ChatResponse { reply })
+                    self.call_once(
+                        fallback,
+                        &req.messages,
+                        req.temperature,
+                        req.max_tokens,
+                        req.user.as_deref(),
+                        req.session_id.as_deref(),
+                        req.metadata.as_ref(),
+                    )
+                    .await
                 } else {
                     Err(primary_err)
                 }
@@ -164,7 +201,10 @@ impl OpenRouterClient {
         messages: &[ChatMessage],
         temperature: f32,
         max_tokens: u32,
-    ) -> Result<String, LlmError> {
+        req_user: Option<&str>,
+        req_session_id: Option<&str>,
+        req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<ChatResponse, LlmError> {
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
         }
@@ -174,6 +214,9 @@ impl OpenRouterClient {
             messages,
             temperature,
             max_tokens,
+            user: req_user,
+            session_id: req_session_id,
+            metadata: req_metadata,
         };
 
         let resp = self
@@ -191,13 +234,20 @@ impl OpenRouterClient {
         }
 
         let parsed: WireResponse = resp.json().await?;
+        // .iter() (not into_iter()) so `parsed` stays available for Task 4
+        // to read id / model / usage off the same value below.
         let raw = parsed
             .choices
-            .into_iter()
+            .iter()
             .next()
-            .and_then(|c| c.message.content)
+            .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
-        Ok(clean_response(raw.trim()))
+        Ok(ChatResponse {
+            reply: clean_response(raw.trim()),
+            generation_id: None,
+            model: None,
+            usage: None,
+        })
     }
 }
 
@@ -266,6 +316,7 @@ mod tests {
                 }],
                 temperature: 0.0,
                 max_tokens: 16,
+                ..Default::default()
             })
             .await
             .expect("call succeeds");
@@ -295,6 +346,7 @@ mod tests {
                 }],
                 temperature: 0.0,
                 max_tokens: 16,
+                ..Default::default()
             })
             .await
             .expect("call succeeds");
@@ -338,6 +390,7 @@ mod tests {
                 }],
                 temperature: 0.0,
                 max_tokens: 16,
+                ..Default::default()
             })
             .await
             .expect("call succeeds despite dropped header");
@@ -369,5 +422,58 @@ mod tests {
     #[test]
     fn test_clean_response_passthrough_plain() {
         assert_eq!(clean_response("hello"), "hello");
+    }
+
+    #[test]
+    fn wire_request_omits_audit_fields_when_none() {
+        let req = ChatRequest {
+            model: "openai/gpt-5.2".into(),
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let wire = WireRequest {
+            model: &req.model,
+            messages: &req.messages,
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            user: req.user.as_deref(),
+            session_id: req.session_id.as_deref(),
+            metadata: req.metadata.as_ref(),
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
+        assert!(!s.contains("\"session_id\":"), "session_id key must be absent: {s}");
+        assert!(!s.contains("\"metadata\":"), "metadata key must be absent: {s}");
+    }
+
+    #[test]
+    fn wire_request_includes_audit_fields_when_set() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("feature".into(), serde_json::Value::String("chat".into()));
+        let req = ChatRequest {
+            model: "openai/gpt-5.2".into(),
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            temperature: 0.0,
+            max_tokens: 16,
+            user: Some("u_abc".into()),
+            session_id: Some("conv_xyz".into()),
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        let wire = WireRequest {
+            model: &req.model,
+            messages: &req.messages,
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            user: req.user.as_deref(),
+            session_id: req.session_id.as_deref(),
+            metadata: req.metadata.as_ref(),
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(s.contains("\"user\":\"u_abc\""), "{s}");
+        assert!(s.contains("\"session_id\":\"conv_xyz\""), "{s}");
+        assert!(s.contains("\"metadata\":{\"feature\":\"chat\"}"), "{s}");
     }
 }

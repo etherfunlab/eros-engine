@@ -101,6 +101,7 @@ fn assemble_chat_request(
         messages,
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        ..Default::default()
     }
 }
 
