@@ -177,28 +177,6 @@ pub struct CompanionReplyResponse {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AsyncSendResponse {
-    pub status: String,
-    pub user_message_id: Uuid,
-    pub session_id: Uuid,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct CompanionReplyPayload {
-    pub reply: String,
-    pub message_id: Uuid,
-    pub lead_score: f64,
-    pub should_show_cta: bool,
-    pub agent_training_level: f64,
-    pub sent_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct PendingCheckResponse {
-    pub status: String,
-    pub message: Option<CompanionReplyPayload>,
-}
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct HistoryQuery {
@@ -811,161 +789,7 @@ async fn send_message(
     }))
 }
 
-/// Accept a user message and process it in the background. The client
-/// then polls `/pending/{message_id}` for the assistant reply.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/{session_id}/message_async",
-    tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
-    request_body = SendMessageRequest,
-    responses(
-        (status = 202, body = AsyncSendResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn send_message_async(
-    State(state): State<AppState>,
-    Path(session_id): Path<Uuid>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(mut req): Json<SendMessageRequest>,
-) -> Result<(axum::http::StatusCode, Json<AsyncSendResponse>), AppError> {
-    let session = require_session_for_user(&state, session_id, user_id).await?;
 
-    if req.message.trim().is_empty() {
-        return Err(AppError::BadRequest("message must not be empty".into()));
-    }
-
-    // Per-message NFT ownership recheck — see `send_message`.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    if let Some(instance_id) = session.instance_id {
-        let companion = persona_repo
-            .load_companion(instance_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-        let asset_id_opt = persona_repo
-            .get_asset_id_for_genome(companion.instance.genome_id)
-            .await?;
-        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
-    }
-
-    // Validate BEFORE we persist the user message so a bad request leaves no row.
-    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
-    let audit = validate_llm_audit(req.audit.take())?;
-
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let user_message_id = chat_repo
-        .append_message(session_id, "user", &req.message)
-        .await?;
-
-    let state_bg = state.clone();
-    let msg_copy = req.message.clone();
-    let traits_copy = prompt_traits;
-    let audit_copy = audit;
-    tokio::spawn(async move {
-        let event = Event::UserMessage {
-            content: msg_copy,
-            message_id: user_message_id,
-            prompt_traits: traits_copy,
-            audit: audit_copy,
-        };
-        if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
-            tracing::error!("engine pipeline failed for session {session_id}: {e}");
-            let repo = ChatRepo {
-                pool: &state_bg.pool,
-            };
-            let _ = repo
-                .append_message(session_id, "system_error", &format!("AI reply failed: {e}"))
-                .await;
-        }
-    });
-
-    Ok((
-        axum::http::StatusCode::ACCEPTED,
-        Json(AsyncSendResponse {
-            status: "processing".into(),
-            user_message_id,
-            session_id,
-        }),
-    ))
-}
-
-/// Poll for the AI reply to a user message. Returns `processing` until
-/// the assistant or system_error row appears, then `completed` / `error`.
-#[utoipa::path(
-    get,
-    path = "/comp/chat/{session_id}/pending/{message_id}",
-    tag = "companion",
-    params(
-        ("session_id" = Uuid, Path, description = "Chat session id"),
-        ("message_id" = Uuid, Path, description = "User message id to poll on")
-    ),
-    responses(
-        (status = 200, body = PendingCheckResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn check_pending(
-    State(state): State<AppState>,
-    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-) -> Result<Json<PendingCheckResponse>, AppError> {
-    require_session_for_user(&state, session_id, user_id).await?;
-
-    let reply: Option<StoreChatMessage> = sqlx::query_as::<_, StoreChatMessage>(
-        "SELECT * FROM engine.chat_messages \
-         WHERE session_id = $1 \
-           AND sent_at > (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
-           AND role IN ('assistant', 'system_error') \
-         ORDER BY sent_at ASC LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(message_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match reply {
-        Some(msg) if msg.role == "assistant" => {
-            let lead_score: f64 =
-                sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
-                    .bind(session_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0.0);
-
-            let training_level = read_training_level(&state, user_id).await;
-            let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
-
-            Ok(Json(PendingCheckResponse {
-                status: "completed".into(),
-                message: Some(CompanionReplyPayload {
-                    reply: msg.content,
-                    message_id: msg.id,
-                    lead_score,
-                    should_show_cta,
-                    agent_training_level: training_level,
-                    sent_at: msg.sent_at,
-                }),
-            }))
-        }
-        Some(_) => Ok(Json(PendingCheckResponse {
-            status: "error".into(),
-            message: None,
-        })),
-        None => Ok(Json(PendingCheckResponse {
-            status: "processing".into(),
-            message: None,
-        })),
-    }
-}
 
 /// Paginated chat history (oldest-first) for the given session.
 #[utoipa::path(
@@ -1175,8 +999,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_personas))
         .routes(routes!(start_chat))
         .routes(routes!(send_message))
-        .routes(routes!(send_message_async))
-        .routes(routes!(check_pending))
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
