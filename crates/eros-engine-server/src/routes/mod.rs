@@ -3,7 +3,7 @@
 //!
 //! The HTTP surface is split into three independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
-//!   * Bearer JWT:    `/comp/*`  — Supabase JWT (see auth::middleware)
+//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`  — Supabase JWT (see auth::middleware)
 //!   * HMAC S2S:      `/s2s/*`   — shared-secret signature (see auth::s2s)
 //!
 //! Auth layers are applied to the per-subtree merge, NOT the top-level
@@ -60,5 +60,6 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(debug::router(expose_affinity_debug))
+        .merge(bff::router())
         .merge(s2s::router())
 }
