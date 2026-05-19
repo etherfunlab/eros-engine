@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
-use eros_engine_core::types::{ActionPlan, DecisionInput, Event, PromptTrait};
+use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::insight::InsightRepo;
@@ -67,12 +67,26 @@ fn persona_model_override(input: &DecisionInput) -> Option<String> {
         .map(String::from)
 }
 
+/// Extract the caller-supplied OpenRouter audit passthrough off the
+/// `Event` driving this turn. Returns `None` for non-`UserMessage` events
+/// (gift / proactive paths cannot supply audit today — out of scope for
+/// the v1 audit feature).
+fn audit_from_event(event: &Event) -> Option<&LlmAudit> {
+    match event {
+        Event::UserMessage { audit, .. } => audit.as_ref(),
+        _ => None,
+    }
+}
+
 /// Materialise a ChatRequest from a system prompt + chronological history.
+/// `audit` carries the caller's OpenRouter passthrough fields when the
+/// driving event was a `UserMessage`; gift / proactive paths pass `None`.
 fn assemble_chat_request(
     state: &AppState,
     input: &DecisionInput,
     system_prompt: String,
     history: Vec<eros_engine_store::chat::ChatMessage>,
+    audit: Option<&LlmAudit>,
 ) -> ChatRequest {
     let mut messages = Vec::with_capacity(history.len() + 1);
     messages.push(ChatMessage {
@@ -95,13 +109,19 @@ fn assemble_chat_request(
         .model_config
         .resolve(CHAT_TASK, persona_model_override(input).as_deref());
 
+    let (audit_user, audit_session, audit_metadata) = audit
+        .map(|a| (a.user.clone(), a.session_id.clone(), a.metadata.clone()))
+        .unwrap_or_default();
+
     ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
         messages,
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
-        ..Default::default()
+        user: audit_user,
+        session_id: audit_session,
+        metadata: audit_metadata,
     }
 }
 
@@ -378,6 +398,7 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
             input,
             system_prompt,
             history,
+            audit_from_event(&input.event),
         )))
     }
 }
@@ -486,6 +507,7 @@ impl<'a> ActionHandler for GiftHandler<'a> {
             input,
             system_prompt,
             history,
+            None,
         )))
     }
 }
@@ -924,5 +946,32 @@ mod tests {
                 "兴趣：登山、精酿".to_string(),
             ]
         );
+    }
+
+    // ─── audit_from_event ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_audit_from_user_message() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("feature".into(), serde_json::Value::String("chat".into()));
+        let audit = LlmAudit {
+            user: Some("u_abc".into()),
+            session_id: Some("conv_xyz".into()),
+            metadata: Some(metadata.clone()),
+        };
+        let ev = Event::UserMessage {
+            content: "hi".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: vec![],
+            audit: Some(audit.clone()),
+        };
+        let extracted = audit_from_event(&ev);
+        assert_eq!(extracted, Some(&audit));
+    }
+
+    #[test]
+    fn extract_audit_from_non_user_message_is_none() {
+        let ev = Event::ProactiveTrigger;
+        assert!(audit_from_event(&ev).is_none());
     }
 }
