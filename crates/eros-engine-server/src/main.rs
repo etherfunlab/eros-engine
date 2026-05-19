@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 mod auth;
 mod error;
+mod middleware;
 mod openapi;
 mod pipeline;
 mod prompt;
@@ -297,6 +298,7 @@ async fn run_server() -> Result<()> {
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))
+        .layer(crate::middleware::SseHeadersLayer)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
