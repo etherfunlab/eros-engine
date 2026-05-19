@@ -469,6 +469,70 @@ async fn compute_final_frame(
     }
 }
 
+/// Build a frame stream from previously persisted assistant rows for a
+/// given user_message_id. The chain is given in original chronological
+/// order; emits one (meta, single-delta, done) trio per row, then one
+/// `final` computed from current session state. Ghost replay emits a
+/// synthetic Meta+Done(no usage, not truncated) followed by Final.
+pub fn replay_stream(
+    state: Arc<AppState>,
+    session_id: Uuid,
+    user_id: Uuid,
+    ghost: bool,
+    rows: Vec<eros_engine_store::chat::ChatMessage>,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    async_stream::stream! {
+        if ghost {
+            let msg_id = Ulid::new();
+            yield ProtocolFrame::Meta {
+                message_id: ulid_string(msg_id),
+                action_type: FrameActionType::Ghost,
+                model: String::new(),
+                continues_from: None,
+            };
+            yield ProtocolFrame::Done {
+                message_id: ulid_string(msg_id),
+                truncated: false,
+                usage: None,
+                generation_id: None,
+            };
+        } else {
+            for row in &rows {
+                let msg_ulid = Ulid::from(row.id);
+                let prev_ulid = row.continues_from_message_id.map(Ulid::from);
+                let action = match row.assistant_action_type.as_deref() {
+                    Some("gift_reaction") => FrameActionType::GiftReaction,
+                    _ => FrameActionType::Reply,
+                };
+                yield ProtocolFrame::Meta {
+                    message_id: ulid_string(msg_ulid),
+                    action_type: action,
+                    model: row.model.clone().unwrap_or_default(),
+                    continues_from: prev_ulid.map(ulid_string),
+                };
+                if !row.content.is_empty() {
+                    yield ProtocolFrame::Delta {
+                        message_id: ulid_string(msg_ulid),
+                        content: row.content.clone(),
+                    };
+                }
+                let usage = row
+                    .usage
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                yield ProtocolFrame::Done {
+                    message_id: ulid_string(msg_ulid),
+                    truncated: row.truncated,
+                    usage,
+                    generation_id: row.generation_id.clone(),
+                };
+            }
+        }
+        let final_frame = compute_final_frame(&state, session_id, user_id).await;
+        yield final_frame;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

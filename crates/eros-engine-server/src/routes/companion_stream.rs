@@ -20,7 +20,7 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
-use crate::pipeline::stream::{run_stream, PersistedUserMessage, ProtocolFrame};
+use crate::pipeline::stream::{replay_stream, run_stream, PersistedUserMessage, ProtocolFrame};
 use crate::routes::companion::enforce_nft_ownership;
 use crate::state::AppState;
 
@@ -185,43 +185,42 @@ pub async fn send_message_stream(
             IDEMPOTENCY_WINDOW_HOURS,
         )
         .await?;
-    let user_message_id = match outcome {
-        UpsertUserOutcome::Inserted { message_id } => message_id,
-        UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::CONFLICT,
-                code: "duplicate_in_progress",
-                message: "same (session_id, client_msg_id) is still generating".into(),
-                user_message: "上一条消息正在处理中，请稍候".into(),
-                original_user_message_id: Some(user_message_id),
-            }));
-        }
-        UpsertUserOutcome::Replay { .. } => {
-            // T15 implements the replay path. Until then, signal 409 so we
-            // don't double-bill OpenRouter for repeat requests.
-            return Err(AppError::StreamPre(StreamPreError {
-                status: StatusCode::CONFLICT,
-                code: "duplicate_in_progress",
-                message: "replay path not yet implemented (T15)".into(),
-                user_message: "请稍后重试".into(),
-                original_user_message_id: None,
-            }));
-        }
-    };
-
-    let state_arc = Arc::new(state.clone());
-    let user_msg = PersistedUserMessage {
-        user_message_id,
-        session_id,
-        user_id,
-        instance_id,
-        content: req.content.clone(),
-    };
+    // Resolve the proto stream. Replay returns early with a boxed stream;
+    // Inserted continues to run_stream below. Boxing erases the concrete type
+    // so both branches can feed the same SSE wrapper.
+    let proto: std::pin::Pin<Box<dyn futures_util::Stream<Item = ProtocolFrame> + Send>> =
+        match outcome {
+            UpsertUserOutcome::Inserted { message_id } => {
+                let state_arc = Arc::new(state.clone());
+                let user_msg = PersistedUserMessage {
+                    user_message_id: message_id,
+                    session_id,
+                    user_id,
+                    instance_id,
+                    content: req.content.clone(),
+                };
+                Box::pin(run_stream(state_arc, user_msg))
+            }
+            UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::CONFLICT,
+                    code: "duplicate_in_progress",
+                    message: "same (session_id, client_msg_id) is still generating".into(),
+                    user_message: "上一条消息正在处理中，请稍候".into(),
+                    original_user_message_id: Some(user_message_id),
+                }));
+            }
+            UpsertUserOutcome::Replay { ghost, assistant_chain, .. } => {
+                let state_arc = Arc::new(state.clone());
+                Box::pin(replay_stream(
+                    state_arc, session_id, user_id, ghost, assistant_chain,
+                ))
+            }
+        };
 
     // Move the StreamSlotGuard into the stream so it is released only when
     // the response body finishes. `StreamSlotGuard` holds `Arc<StreamSlots>`
     // so it satisfies the `'static` bound required by axum's `Sse`.
-    let proto = run_stream(state_arc, user_msg);
     let sse = futures_util::StreamExt::map(
         async_stream::stream! {
             let _guard = guard;
@@ -309,5 +308,73 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], "unprocessable");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_replay_emits_same_frames_for_repeat_client_msg_id(pool: PgPool) {
+        use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
+             VALUES ('R', 'p', '{}'::jsonb, true) RETURNING id",
+        )
+        .fetch_one(&pool).await.unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        ).bind(user_id).bind(instance_id).fetch_one(&pool).await.unwrap();
+
+        // Pre-seed an original-request outcome.
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_msg_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", 24)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let assistant_uuid: Uuid = ulid::Ulid::new().into();
+        chat_repo
+            .insert_assistant_batch(
+                session_id,
+                user_msg_id,
+                &[AssistantInsert {
+                    id: assistant_uuid,
+                    content: "replayed reply".into(),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    model: Some("primary".into()),
+                    usage: Some(serde_json::json!({"prompt_tokens":1,"completion_tokens":2,"total_tokens":3})),
+                    generation_id: Some("gen-1".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({"content":"hi","client_msg_id":"01J3333333333333333333333A"})).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct.starts_with("text/event-stream"));
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&bytes).unwrap();
+        // The replayed delta carries the persisted content verbatim.
+        assert!(body_text.contains("replayed reply"), "body: {body_text}");
+        // And the final frame closes the stream.
+        assert!(body_text.contains("\"type\":\"final\""), "body: {body_text}");
     }
 }
