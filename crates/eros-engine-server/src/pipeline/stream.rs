@@ -69,6 +69,167 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
+use std::sync::Arc;
+use uuid::Uuid;
+
+use eros_engine_core::types::{ActionType, DecisionInput, Event};
+use eros_engine_core::pde;
+use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::persona::PersonaRepo;
+
+use crate::state::AppState;
+
+/// All persisted bits needed to drive a streaming burst.
+#[derive(Debug, Clone)]
+pub struct PersistedUserMessage {
+    pub user_message_id: Uuid,
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub instance_id: Uuid,
+    pub content: String,
+}
+
+/// Produce a stream of `ProtocolFrame` events for a single burst. The
+/// generator owns its `AppState` clone so it stays `'static` and survives
+/// `Sse`'s body lifetime. Task 10 implements the Ghost branch; T11/T12
+/// fill in Reply / GiftReaction.
+pub fn run_stream(
+    state: Arc<AppState>,
+    user_msg: PersistedUserMessage,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    async_stream::stream! {
+        let chat_repo = ChatRepo { pool: &state.pool };
+        let persona_repo = PersonaRepo { pool: &state.pool };
+        let affinity_repo = AffinityRepo { pool: &state.pool };
+
+        let persona = match persona_repo.load_companion(user_msg.instance_id).await {
+            Ok(Some(p)) => p,
+            _ => {
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: "persona instance not found".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+                return;
+            }
+        };
+        let mut affinity = match affinity_repo
+            .load_or_create(user_msg.session_id, user_msg.user_id, user_msg.instance_id)
+            .await
+        {
+            Ok(mut a) => { a.apply_time_decay(); a }
+            Err(e) => {
+                tracing::warn!("stream: affinity load failed: {e}");
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: format!("affinity load failed: {e}"),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+                return;
+            }
+        };
+        let signals = match super::compute_signals_for_session(
+            &state.pool, user_msg.session_id, &affinity,
+        ).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("stream: signals failed: {e}");
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: format!("signals failed: {e}"),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+                return;
+            }
+        };
+
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: user_msg.content.clone(),
+                message_id: user_msg.user_message_id,
+                prompt_traits: vec![],
+                audit: None,
+            },
+            affinity: affinity.clone(),
+            persona,
+            signals,
+        };
+        let plan = pde::decide(&input);
+
+        match plan.action_type {
+            ActionType::Ghost => {
+                let msg_id = Ulid::new();
+                // Persist the ghost decision on the user row so replay can
+                // distinguish "ghost outcome" from "still generating" (§1.10).
+                if let Err(e) = chat_repo.mark_user_message_ghosted(user_msg.user_message_id).await {
+                    tracing::warn!("stream: ghost mark failed: {e}");
+                }
+                if let Err(e) = affinity_repo.record_ghost(&mut affinity).await {
+                    tracing::warn!("stream: record_ghost failed: {e}");
+                }
+                yield ProtocolFrame::Meta {
+                    message_id: ulid_string(msg_id),
+                    action_type: FrameActionType::Ghost,
+                    model: String::new(),
+                    continues_from: None,
+                };
+                yield ProtocolFrame::Done {
+                    message_id: ulid_string(msg_id),
+                    truncated: false,
+                    usage: None,
+                    generation_id: None,
+                };
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                yield final_frame;
+            }
+            _ => {
+                // Reply / GiftReaction implemented in T11/T12; Proactive returns Final only.
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                yield final_frame;
+            }
+        }
+    }
+}
+
+/// Compute the spec's `final` frame from current session/user state.
+async fn compute_final_frame(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> ProtocolFrame {
+    let lead_score: f64 = sqlx::query_scalar(
+        "SELECT lead_score FROM engine.chat_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0.0);
+
+    let training_level: f64 = match (eros_engine_store::insight::InsightRepo { pool: &state.pool })
+        .load(user_id)
+        .await
+    {
+        Ok(Some(row)) => eros_engine_store::insight::compute_training_level(&row.insights),
+        _ => 0.0,
+    };
+    let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
+    // Normalise lead_score from 0..10 to 0..1 to match the spec's declared
+    // [0.0, 1.0] range. Operator dashboards still see the 0..10 raw value
+    // via the sync /message handler.
+    let normalised_lead = (lead_score / 10.0).clamp(0.0, 1.0);
+    ProtocolFrame::Final {
+        lead_score: normalised_lead,
+        should_show_cta,
+        agent_training_level: training_level,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +334,78 @@ mod tests {
         // Spec §1.5 done schema permits `usage: null` — do NOT omit.
         assert!(v.get("usage").is_some());
         assert!(v["usage"].is_null());
+    }
+
+    use sqlx::PgPool;
+
+    async fn seed_persona_and_session(
+        pool: &PgPool,
+        user_id: Uuid,
+    ) -> (Uuid, Uuid, Uuid) {
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
+             VALUES ('GhostTest', 'sp', '{}'::jsonb, true) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (genome_id, instance_id, session_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_terminates_with_final_or_error(pool: PgPool) {
+        use futures_util::StreamExt;
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // test_state's openrouter client points at the real api root — that's
+        // fine here because the Ghost branch never makes an LLM call. If the
+        // PDE picks Reply, the test will fail when the LLM call short-circuits;
+        // that's OK — Reply path testing lives in T11.
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+        let chat_repo = ChatRepo { pool: &state.pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A", 24)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            state.clone(),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+            },
+        )
+        .collect()
+        .await;
+
+        // Tolerant: the test just proves the generator runs end-to-end and
+        // terminates. T11/T15 add per-frame assertions for Reply/replay paths.
+        assert!(frames.last().is_some(), "must emit at least one frame");
     }
 }

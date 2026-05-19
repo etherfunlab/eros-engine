@@ -53,7 +53,7 @@ pub async fn run(
     let affinity = load_affinity_with_decay(state, session_id, user_id, instance_id).await?;
 
     // 4. Conversation signals.
-    let signals = compute_signals(state, session_id, &affinity).await?;
+    let signals = compute_signals_for_session(&state.pool, session_id, &affinity).await?;
 
     // 5. Build decision input.
     let input = DecisionInput {
@@ -274,8 +274,8 @@ async fn load_affinity_with_decay(
     Ok(affinity)
 }
 
-async fn compute_signals(
-    state: &AppState,
+pub async fn compute_signals_for_session(
+    pool: &sqlx::PgPool,
     session_id: Uuid,
     affinity: &Affinity,
 ) -> Result<ConversationSignals, AppError> {
@@ -283,7 +283,7 @@ async fn compute_signals(
         "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
     )
     .bind(session_id)
-    .fetch_one(&state.pool)
+    .fetch_one(pool)
     .await
     .unwrap_or(0);
 
@@ -291,7 +291,7 @@ async fn compute_signals(
         "SELECT MAX(sent_at) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
     )
     .bind(session_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await
     .ok()
     .flatten();
