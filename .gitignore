@@ -10,7 +10,10 @@ Cargo.lock.bak
 # Local test override; never commit.
 .test-env
 
-docs/superpowers/
+# Superpowers specs are open-source design records (committed); plans are
+# local working notes (ignored). See docs/superpowers/specs/ for the
+# canonical design docs that release notes / READMEs link to.
+docs/superpowers/plans/
 
 # Supabase CLI scratch state (created by `supabase link`).
 **/supabase/.temp/
