@@ -85,6 +85,140 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::state::AppState;
 
+/// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
+/// per attempt, persists each logical message before its Done, and yields
+/// a final Error{UpstreamUnavailable} if the chain exhausts. On a clean
+/// burst, returns the produced messages via `produced_out` for the caller
+/// to spawn post_process with. Does NOT yield Final — the caller emits it
+/// after the burst so it reflects post-burst state.
+fn drive_chat_burst(
+    state: Arc<AppState>,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &'static str, // "reply" | "gift_reaction"
+    plan_action: ActionType,
+    req: eros_engine_llm::openrouter::ChatRequest,
+    produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>>,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    async_stream::stream! {
+        let chat_repo = ChatRepo { pool: &state.pool };
+        let chain: Vec<String> = std::iter::once(req.model.clone())
+            .chain(req.fallback_model.iter().cloned())
+            .filter(|s| !s.is_empty())
+            .take(MAX_STREAM_FALLBACK_DEPTH)
+            .collect();
+        if chain.is_empty() {
+            yield ProtocolFrame::Error {
+                code: StreamErrorCode::Internal,
+                retryable: false,
+                message: "no models configured".into(),
+                user_message: "服务出现问题，请稍后再试".into(),
+            };
+            return;
+        }
+        let mut continues_from: Option<Ulid> = None;
+        for (idx, model_id) in chain.iter().enumerate() {
+            let msg_ulid = Ulid::new();
+            let msg_uuid: Uuid = msg_ulid.into();
+            let mut acc = String::new();
+            let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+            let mut last_gen_id: Option<String> = None;
+            let mut truncated = false;
+
+            yield ProtocolFrame::Meta {
+                message_id: ulid_string(msg_ulid),
+                action_type: frame_action,
+                model: model_id.clone(),
+                continues_from: continues_from.map(ulid_string),
+            };
+
+            let mut per_model_req = req.clone();
+            per_model_req.model = model_id.clone();
+            per_model_req.fallback_model = Vec::new();
+
+            match state.openrouter.execute_stream(per_model_req).await {
+                Ok(mut s) => {
+                    use futures_util::StreamExt as _;
+                    while let Some(item) = s.next().await {
+                        match item {
+                            Ok(c) => {
+                                if let Some(content) = c.content {
+                                    acc.push_str(&content);
+                                    yield ProtocolFrame::Delta {
+                                        message_id: ulid_string(msg_ulid),
+                                        content,
+                                    };
+                                }
+                                if c.usage.is_some()         { last_usage = c.usage; }
+                                if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                            }
+                            Err(e) => {
+                                tracing::warn!("stream: upstream chunk err: {e}");
+                                truncated = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !truncated && acc.is_empty() {
+                        truncated = true;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("stream: upstream open err: {e}");
+                    truncated = true;
+                }
+            }
+
+            // Persist BEFORE yielding Done (spec §2.3 risk R7).
+            let row = eros_engine_store::chat::AssistantInsert {
+                id: msg_uuid,
+                content: acc.clone(),
+                assistant_action_type: persist_action.into(),
+                continues_from_message_id: continues_from.map(Into::into),
+                truncated,
+                model: Some(model_id.clone()),
+                usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                generation_id: last_gen_id.clone(),
+            };
+            if let Err(e) = chat_repo
+                .insert_assistant_batch(session_id, user_message_id, &[row])
+                .await
+            {
+                tracing::warn!("stream: assistant persist failed: {e}");
+            }
+            if let Ok(mut p) = produced_out.lock() {
+                p.push(crate::pipeline::post_process::ProducedMessage {
+                    message_id: msg_uuid,
+                    full_text: acc.clone(),
+                    action: plan_action,
+                });
+            }
+
+            yield ProtocolFrame::Done {
+                message_id: ulid_string(msg_ulid),
+                truncated,
+                usage: last_usage,
+                generation_id: last_gen_id,
+            };
+
+            if !truncated {
+                return;
+            }
+            if idx + 1 == chain.len() {
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::UpstreamUnavailable,
+                    retryable: true,
+                    message: "all fallback models truncated".into(),
+                    user_message: "AI 服务暂时不可用，稍后再试".into(),
+                };
+                return;
+            }
+            continues_from = Some(msg_ulid);
+        }
+    }
+}
+
 /// All persisted bits needed to drive a streaming burst.
 #[derive(Debug, Clone)]
 pub struct PersistedUserMessage {
@@ -191,136 +325,65 @@ pub fn run_stream(
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
                 yield final_frame;
             }
-            ActionType::Reply => {
-                let req = match crate::pipeline::handlers::build_reply_request(
-                    &state, &input, &plan, user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                ).await {
+            ActionType::Reply | ActionType::GiftReaction => {
+                let is_gift = matches!(plan.action_type, ActionType::GiftReaction);
+                let req_res = if is_gift {
+                    crate::pipeline::handlers::build_gift_request(
+                        &state, &input, &plan,
+                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        &[],
+                    ).await
+                } else {
+                    crate::pipeline::handlers::build_reply_request(
+                        &state, &input, &plan,
+                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                    ).await
+                };
+                let req = match req_res {
                     Ok(r) => r,
                     Err(e) => {
                         yield ProtocolFrame::Error {
                             code: StreamErrorCode::Internal,
                             retryable: false,
-                            message: format!("build_reply_request failed: {e}"),
+                            message: format!("build_*_request failed: {e}"),
                             user_message: "服务出现问题，请稍后再试".into(),
                         };
                         return;
                     }
                 };
-                let chain: Vec<String> = std::iter::once(req.model.clone())
-                    .chain(req.fallback_model.iter().cloned())
-                    .filter(|s| !s.is_empty())
-                    .take(MAX_STREAM_FALLBACK_DEPTH)
-                    .collect();
-                if chain.is_empty() {
-                    yield ProtocolFrame::Error {
-                        code: StreamErrorCode::Internal,
-                        retryable: false,
-                        message: "no models configured".into(),
-                        user_message: "服务出现问题，请稍后再试".into(),
-                    };
-                    return;
-                }
-                let mut produced: Vec<crate::pipeline::post_process::ProducedMessage> = Vec::new();
-                let mut continues_from: Option<Ulid> = None;
-                let mut yielded_any_done = false;
+                let (frame_action, persist_action, plan_action) = if is_gift {
+                    (FrameActionType::GiftReaction, "gift_reaction", ActionType::GiftReaction)
+                } else {
+                    (FrameActionType::Reply, "reply", ActionType::Reply)
+                };
 
-                'fallback: for (idx, model_id) in chain.iter().enumerate() {
-                    let msg_ulid = Ulid::new();
-                    let msg_uuid: Uuid = msg_ulid.into();
-                    let mut acc = String::new();
-                    let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
-                    let mut last_gen_id: Option<String> = None;
-                    let mut truncated = false;
-
-                    yield ProtocolFrame::Meta {
-                        message_id: ulid_string(msg_ulid),
-                        action_type: FrameActionType::Reply,
-                        model: model_id.clone(),
-                        continues_from: continues_from.map(ulid_string),
-                    };
-
-                    let mut per_model_req = req.clone();
-                    per_model_req.model = model_id.clone();
-                    per_model_req.fallback_model = Vec::new();
-
-                    match state.openrouter.execute_stream(per_model_req).await {
-                        Ok(mut s) => {
-                            use futures_util::StreamExt as _;
-                            while let Some(item) = s.next().await {
-                                match item {
-                                    Ok(c) => {
-                                        if let Some(content) = c.content {
-                                            acc.push_str(&content);
-                                            yield ProtocolFrame::Delta {
-                                                message_id: ulid_string(msg_ulid),
-                                                content,
-                                            };
-                                        }
-                                        if c.usage.is_some()         { last_usage = c.usage; }
-                                        if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("stream: upstream chunk err: {e}");
-                                        truncated = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !truncated && acc.is_empty() {
-                                truncated = true;
-                            }
+                let produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let burst = drive_chat_burst(
+                    state.clone(),
+                    user_msg.session_id,
+                    user_msg.user_message_id,
+                    frame_action,
+                    persist_action,
+                    plan_action,
+                    req,
+                    produced_out.clone(),
+                );
+                {
+                    use futures_util::StreamExt as _;
+                    let mut burst = Box::pin(burst);
+                    while let Some(frame) = burst.next().await {
+                        if matches!(frame, ProtocolFrame::Error { .. }) {
+                            yield frame;
+                            return;
                         }
-                        Err(e) => {
-                            tracing::warn!("stream: upstream open err: {e}");
-                            truncated = true;
-                        }
+                        yield frame;
                     }
-
-                    // Persist BEFORE yielding Done (spec §2.3 risk R7).
-                    let row = eros_engine_store::chat::AssistantInsert {
-                        id: msg_uuid,
-                        content: acc.clone(),
-                        assistant_action_type: "reply".into(),
-                        continues_from_message_id: continues_from.map(Into::into),
-                        truncated,
-                        model: Some(model_id.clone()),
-                        usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
-                        generation_id: last_gen_id.clone(),
-                    };
-                    if let Err(e) = chat_repo
-                        .insert_assistant_batch(user_msg.session_id, user_msg.user_message_id, &[row])
-                        .await
-                    {
-                        tracing::warn!("stream: assistant persist failed: {e}");
-                    }
-                    produced.push(crate::pipeline::post_process::ProducedMessage {
-                        message_id: msg_uuid,
-                        full_text: acc.clone(),
-                        action: eros_engine_core::types::ActionType::Reply,
-                    });
-                    yielded_any_done = true;
-
-                    yield ProtocolFrame::Done {
-                        message_id: ulid_string(msg_ulid),
-                        truncated,
-                        usage: last_usage,
-                        generation_id: last_gen_id,
-                    };
-
-                    if !truncated {
-                        break 'fallback;
-                    }
-                    if idx + 1 == chain.len() {
-                        yield ProtocolFrame::Error {
-                            code: StreamErrorCode::UpstreamUnavailable,
-                            retryable: true,
-                            message: "all fallback models truncated".into(),
-                            user_message: "AI 服务暂时不可用，稍后再试".into(),
-                        };
-                        return;
-                    }
-                    continues_from = Some(msg_ulid);
                 }
+                let produced: Vec<crate::pipeline::post_process::ProducedMessage> = produced_out
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
 
                 // Reset ghost streak (mirrors sync pipeline policy).
                 if let Err(e) = sqlx::query(
@@ -334,15 +397,13 @@ pub fn run_stream(
                     tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
-                if yielded_any_done {
-                    let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
-                    yield final_frame;
-                }
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                yield final_frame;
 
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
                 let plan_bg = plan.clone();
-                let event_bg = eros_engine_core::types::Event::UserMessage {
+                let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,
                     prompt_traits: vec![],
@@ -363,11 +424,6 @@ pub fn run_stream(
                     )
                     .await;
                 });
-            }
-            ActionType::GiftReaction => {
-                // T12 fills this in. For now, yield Final-only so the stream terminates.
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
-                yield final_frame;
             }
             _ => {
                 // Proactive and any future variants: Final-only.

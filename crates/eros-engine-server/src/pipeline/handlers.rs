@@ -386,6 +386,57 @@ pub(super) async fn build_reply_request(
     ))
 }
 
+/// Build a ChatRequest for the GiftReaction action. Shared by the sync
+/// `GiftHandler` and the streaming `pipeline::stream::run_stream`.
+pub(super) async fn build_gift_request(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    pending: &[PendingGift],
+) -> Result<ChatRequest, AppError> {
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
+
+    let query_text = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+
+    let (mut profile_groups, relationship_facts) =
+        recall_memory(state, user_id, instance_id, query_text).await;
+
+    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
+    if !insight_bullets.is_empty() {
+        profile_groups.insert(0, ("基础画像".into(), insight_bullets));
+    }
+
+    let tip_personality = input
+        .persona
+        .genome
+        .tip_personality
+        .as_deref()
+        .unwrap_or("normal");
+
+    let system_prompt = build_prompt(
+        &input.persona,
+        &profile_groups,
+        &relationship_facts,
+        Some(&input.affinity),
+        pending,
+        tip_personality,
+        plan.reply_style,
+        &plan.context_hints,
+        &[],
+    );
+
+    Ok(assemble_chat_request(state, input, system_prompt, history, None))
+}
+
 pub struct ReplyHandler<'a> {
     pub state: &'a AppState,
     pub session_id: Uuid,
@@ -461,59 +512,17 @@ impl<'a> ActionHandler for GiftHandler<'a> {
         input: &DecisionInput,
         plan: &ActionPlan,
     ) -> Result<Option<ChatRequest>, AppError> {
-        let chat_repo = ChatRepo {
-            pool: &self.state.pool,
-        };
-        let history = chat_repo
-            .history(self.session_id, HISTORY_WINDOW, 0)
-            .await?;
-
-        // Gift events have no user message of their own. Fall back to the
-        // most recent user turn from history so memory recall still has a
-        // semantic anchor (e.g. user said "I miss you" → tipped → reaction
-        // can reference what they were just talking about).
-        let query_text = history
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-
-        let (mut profile_groups, relationship_facts) =
-            recall_memory(self.state, self.user_id, self.instance_id, query_text).await;
-
-        let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
-        if !insight_bullets.is_empty() {
-            profile_groups.insert(0, ("基础画像".into(), insight_bullets));
-        }
-
-        let tip_personality = input
-            .persona
-            .genome
-            .tip_personality
-            .as_deref()
-            .unwrap_or("normal");
-
-        // Gift path: prompt_traits flow only from UserMessage; ignore for gift reactions.
-        let system_prompt = build_prompt(
-            &input.persona,
-            &profile_groups,
-            &relationship_facts,
-            Some(&input.affinity),
-            &self.pending,
-            tip_personality,
-            plan.reply_style,
-            &plan.context_hints,
-            &[],
-        );
-
-        Ok(Some(assemble_chat_request(
+        let req = build_gift_request(
             self.state,
             input,
-            system_prompt,
-            history,
-            None,
-        )))
+            plan,
+            self.session_id,
+            self.user_id,
+            self.instance_id,
+            &self.pending,
+        )
+        .await?;
+        Ok(Some(req))
     }
 }
 
