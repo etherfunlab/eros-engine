@@ -27,7 +27,11 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub model: String,
-    pub fallback_model: Option<String>,
+    /// Ordered fallback chain (empty = no fallback). Singular-named
+    /// despite being a Vec because semantically the chain resolves to
+    /// ONE actually-served model per call — entries are sequentially
+    /// tried candidates, not parallel fan-out.
+    pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub max_tokens: u32,
@@ -159,46 +163,71 @@ impl OpenRouterClient {
         }
     }
 
-    /// Execute a chat completion. If `fallback_model` is set and the primary
-    /// call fails (transport error or non-2xx status), retry once with the
-    /// fallback model. Audit passthrough fields ride along on both attempts.
+    /// Execute a chat completion, walking the candidate chain
+    /// (`req.model` + `req.fallback_model` entries) sequentially.
+    /// First success wins; each failure is logged at warn level.
+    /// Empty model strings are filtered out so a misconfigured TOML
+    /// (e.g. `model = ""` or `fallback = [""]`) is caught locally as
+    /// `LlmError::Config` rather than producing a remote 400.
+    /// Audit passthrough fields ride along on every attempt.
     pub async fn execute(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        match self
-            .call_once(
-                &req.model,
-                &req.messages,
-                req.temperature,
-                req.max_tokens,
-                req.user.as_deref(),
-                req.session_id.as_deref(),
-                req.metadata.as_ref(),
-            )
-            .await
-        {
-            Ok(resp) => Ok(resp),
-            Err(primary_err) => {
-                if let Some(fallback) = req.fallback_model.as_deref() {
-                    tracing::warn!(
-                        primary = %req.model,
-                        fallback = %fallback,
-                        error = %primary_err,
-                        "openrouter: primary failed, retrying with fallback"
-                    );
-                    self.call_once(
-                        fallback,
-                        &req.messages,
-                        req.temperature,
-                        req.max_tokens,
-                        req.user.as_deref(),
-                        req.session_id.as_deref(),
-                        req.metadata.as_ref(),
-                    )
-                    .await
-                } else {
-                    Err(primary_err)
+        let candidates: Vec<&str> = std::iter::once(req.model.as_str())
+            .chain(req.fallback_model.iter().map(String::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Err(LlmError::Config(
+                "openrouter: no models configured (primary empty, no fallbacks)".into(),
+            ));
+        }
+
+        let mut last_err: Option<LlmError> = None;
+        for (i, model) in candidates.iter().enumerate() {
+            match self
+                .call_once(
+                    model,
+                    &req.messages,
+                    req.temperature,
+                    req.max_tokens,
+                    req.user.as_deref(),
+                    req.session_id.as_deref(),
+                    req.metadata.as_ref(),
+                )
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    let remaining = candidates.len() - i - 1;
+                    let msg = if remaining == 0 {
+                        "openrouter: all candidates exhausted"
+                    } else if i == 0 {
+                        "openrouter: primary failed, trying fallbacks"
+                    } else {
+                        "openrouter: fallback failed, trying next"
+                    };
+                    if i == 0 {
+                        tracing::warn!(
+                            primary = %req.model,
+                            error = %e,
+                            fallbacks_remaining = remaining,
+                            "{msg}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            primary = %req.model,
+                            fallback = %model,
+                            fallback_index = i - 1,
+                            error = %e,
+                            fallbacks_remaining = remaining,
+                            "{msg}"
+                        );
+                    }
+                    last_err = Some(e);
                 }
             }
         }
+
+        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -313,7 +342,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -343,7 +372,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -387,7 +416,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -580,5 +609,206 @@ mod tests {
         assert!(resp.generation_id.is_none());
         assert!(resp.model.is_none());
         assert!(resp.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_on_primary_failure() {
+        let server = MockServer::start().await;
+        // Primary "p" returns 500; fallback "f1" returns 200.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback succeeds");
+        assert_eq!(resp.reply, "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_walks_full_fallback_chain() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("p down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("f1 down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f2"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into(), "f2".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("second fallback succeeds");
+        assert_eq!(resp.reply, "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_returns_last_error_when_all_fail() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("all fail");
+        assert!(
+            matches!(err, LlmError::Status(s, _) if s.as_u16() == 500),
+            "expected last 500, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_returns_config_err_when_chain_empty() {
+        // No mocks — empty primary + empty fallback chain must short-circuit
+        // BEFORE any HTTP request reaches the server.
+        let server = MockServer::start().await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: String::new(),
+                fallback_model: Vec::new(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("empty chain must Err");
+        assert!(
+            matches!(err, LlmError::Config(_)),
+            "expected Config error, got {err:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "no HTTP request should have been made"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_skips_empty_string_candidates() {
+        let server = MockServer::start().await;
+        // Only "x" should be hit; primary "" must be filtered out before
+        // any HTTP call is attempted.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "x"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: String::new(),
+                fallback_model: vec!["x".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("non-empty fallback succeeds");
+        assert_eq!(resp.reply, "ok");
     }
 }

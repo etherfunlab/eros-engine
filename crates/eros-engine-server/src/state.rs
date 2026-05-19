@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,20 @@ pub struct AppState {
     pub http_client: reqwest::Client,
 }
 
+/// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
+/// Comma-separated; whitespace trimmed around each entry; empty
+/// entries skipped. `None` or blank input → empty set (pass-through).
+/// Extracted as a free function so tests don't have to mutate process
+/// env to exercise edge cases.
+pub(crate) fn parse_usage_hidden_keys(raw: Option<&str>) -> HashSet<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub expose_affinity_debug: bool,
@@ -56,6 +71,12 @@ pub struct ServerConfig {
     /// re-claims the row. Should comfortably exceed the worst-case
     /// processing time (one LLM call + N voyage embeddings).
     pub dreaming_claim_stale_threshold: Duration,
+    /// Top-level keys removed from `CompanionReplyResponse.usage`
+    /// before the response leaves the engine. Empty = pass-through.
+    /// Tracing fields are unaffected — operator observability stays
+    /// intact regardless of this setting. Populated from
+    /// `OPENROUTER_USAGE_HIDDEN_KEYS` (comma-separated).
+    pub openrouter_usage_hidden_keys: HashSet<String>,
 }
 
 impl ServerConfig {
@@ -102,6 +123,56 @@ impl ServerConfig {
             dreaming_tick,
             dreaming_idle_threshold,
             dreaming_claim_stale_threshold,
+            openrouter_usage_hidden_keys: parse_usage_hidden_keys(
+                std::env::var("OPENROUTER_USAGE_HIDDEN_KEYS")
+                    .ok()
+                    .as_deref(),
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_hidden_keys_from_env_parses_comma_separated() {
+        let out = parse_usage_hidden_keys(Some("cost,cost_details"));
+        assert!(out.contains("cost"));
+        assert!(out.contains("cost_details"));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn usage_hidden_keys_from_env_trims_whitespace() {
+        let out = parse_usage_hidden_keys(Some(" cost , cost_details "));
+        assert!(out.contains("cost"));
+        assert!(out.contains("cost_details"));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn usage_hidden_keys_from_env_skips_empty_entries() {
+        let out = parse_usage_hidden_keys(Some("cost,,cost_details,"));
+        assert!(out.contains("cost"));
+        assert!(out.contains("cost_details"));
+        assert_eq!(
+            out.len(),
+            2,
+            "empty entries from extra commas must be skipped"
+        );
+    }
+
+    #[test]
+    fn usage_hidden_keys_from_env_empty_when_unset() {
+        let out = parse_usage_hidden_keys(None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn usage_hidden_keys_from_env_empty_when_blank() {
+        let out = parse_usage_hidden_keys(Some(""));
+        assert!(out.is_empty());
     }
 }
