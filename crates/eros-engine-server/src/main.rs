@@ -268,6 +268,7 @@ async fn run_server() -> Result<()> {
         openrouter,
         voyage,
         model_config,
+        stream_slots: Arc::new(crate::state::StreamSlots::default()),
         marketplace_svc_url,
         marketplace_s2s_secret,
         marketplace_s2s_secret_previous,
