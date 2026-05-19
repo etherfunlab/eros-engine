@@ -25,4 +25,26 @@ pub enum LlmError {
 
     #[error("provider error: {0}")]
     Provider(String),
+
+    /// Wraps a mid-stream parse failure (`data:` line that did not decode as
+    /// an OpenRouter-compatible delta envelope). The string is the raw
+    /// payload trimmed to a reasonable size for logs.
+    #[error("openrouter stream parse error: {0}")]
+    StreamParse(String),
+
+    /// Wraps a transport-level interruption while reading the SSE body
+    /// (connection reset, TLS error after the response headers arrived).
+    #[error("openrouter stream transport error: {0}")]
+    Stream(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_parse_variant_renders_message() {
+        let e = LlmError::StreamParse("bad delta envelope".into());
+        assert_eq!(e.to_string(), "openrouter stream parse error: bad delta envelope");
+    }
 }
