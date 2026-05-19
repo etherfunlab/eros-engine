@@ -12,7 +12,7 @@ max_tokens = 600
 
 [tasks.insight_extraction]
 model = "x-ai/grok-4.1-fast"
-fallback = "deepseek/deepseek-v4-flash"
+fallback = ["anthropic/claude-haiku-4.5","deepseek/deepseek-v4-flash"]
 temperature = 0.3
 max_tokens = 400
 
@@ -22,8 +22,8 @@ max_tokens = 400
 # Haiku 4.5 is the cheapest model with reliable structured-JSON output;
 # grok-4.1-fast fallback keeps the no-OpenAI invariant if Anthropic is down.
 [tasks.memory_extraction]
-model = "anthropic/claude-haiku-4.5"
-fallback = "x-ai/grok-4.1-fast"
+model = "x-ai/grok-4.1-fast"
+fallback = ["anthropic/claude-haiku-4.5","deepseek/deepseek-v4-flash"]
 temperature = 0.2
 max_tokens = 800
 
