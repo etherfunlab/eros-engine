@@ -10,6 +10,14 @@ use crate::error::LlmError;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// OpenRouter app-attribution header names. Pinned to the current
+/// `https://openrouter.ai/docs/app-attribution` spec. If OpenRouter
+/// renames either header in the future, update the value here; today's
+/// names become legacy and (if a transition window applies) get added as
+/// a parallel alias below.
+const HEADER_REFERER: &str = "HTTP-Referer";
+const HEADER_TITLE: &str = "X-Title";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -54,17 +62,71 @@ struct WireResponse {
     choices: Vec<WireChoice>,
 }
 
+/// App-Attribution headers sent on every outbound OpenRouter call.
+/// Skipping `None` fields avoids emitting blank-but-set headers, which
+/// OpenRouter would record as a real attribution. Both `None` reverts
+/// to today's no-header behaviour.
+#[derive(Debug, Clone, Default)]
+pub struct AppAttribution {
+    /// Sent as `HTTP-Referer`. Identifies the deploying app to OpenRouter.
+    pub referer: Option<String>,
+    /// Sent as `X-Title`. Display name in OpenRouter's app analytics.
+    pub title: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct OpenRouterClient {
     http: reqwest::Client,
     api_key: String,
+    base_url: String,
 }
 
 impl OpenRouterClient {
-    pub fn new(api_key: String) -> Self {
+    /// Production constructor. Pins to OpenRouter's canonical URL and
+    /// bakes attribution headers into the shared reqwest client at boot.
+    pub fn new(api_key: String, attribution: AppAttribution) -> Self {
+        Self::with_base_url(api_key, attribution, BASE_URL.to_string())
+    }
+
+    /// Low-level constructor that lets callers override the OpenRouter
+    /// endpoint. Intended for integration tests (workspace-internal and
+    /// downstream) that wire a wiremock or fake server in front of the
+    /// client. Production code should use `new`, which pins to OpenRouter's
+    /// canonical URL.
+    pub fn with_base_url(api_key: String, attribution: AppAttribution, base_url: String) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(ref referer) = attribution.referer {
+            match reqwest::header::HeaderValue::from_str(referer) {
+                Ok(v) => {
+                    headers.insert(HEADER_REFERER, v);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    header = HEADER_REFERER,
+                    "openrouter: dropping invalid attribution value"
+                ),
+            }
+        }
+        if let Some(ref title) = attribution.title {
+            match reqwest::header::HeaderValue::from_str(title) {
+                Ok(v) => {
+                    headers.insert(HEADER_TITLE, v);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    header = HEADER_TITLE,
+                    "openrouter: dropping invalid attribution value"
+                ),
+            }
+        }
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("reqwest client build never fails with empty config");
         Self {
-            http: reqwest::Client::new(),
+            http,
             api_key,
+            base_url,
         }
     }
 
@@ -116,7 +178,7 @@ impl OpenRouterClient {
 
         let resp = self
             .http
-            .post(BASE_URL)
+            .post(&self.base_url)
             .bearer_auth(&self.api_key)
             .json(&wire)
             .send()
@@ -165,6 +227,126 @@ pub fn clean_response(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use wiremock::matchers::{header, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ok_response() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })
+    }
+
+    #[tokio::test]
+    async fn client_sends_app_attribution_headers_when_set() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(header("HTTP-Referer", "https://eros.example"))
+            .and(header("X-Title", "Eros"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution {
+                referer: Some("https://eros.example".into()),
+                title: Some("Eros".into()),
+            },
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let _ = client
+            .execute(ChatRequest {
+                model: "test/model".into(),
+                fallback_model: None,
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+            })
+            .await
+            .expect("call succeeds");
+    }
+
+    #[tokio::test]
+    async fn client_omits_app_attribution_headers_when_default() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let _ = client
+            .execute(ChatRequest {
+                model: "test/model".into(),
+                fallback_model: None,
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+            })
+            .await
+            .expect("call succeeds");
+
+        for req in server.received_requests().await.unwrap_or_default() {
+            assert!(
+                req.headers.get("http-referer").is_none(),
+                "HTTP-Referer must be absent when unset"
+            );
+            assert!(
+                req.headers.get("x-title").is_none(),
+                "X-Title must be absent when unset"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_drops_invalid_attribution_value() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution {
+                referer: Some("bad\nvalue".into()),
+                title: Some("also\rbad".into()),
+            },
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let _ = client
+            .execute(ChatRequest {
+                model: "test/model".into(),
+                fallback_model: None,
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+            })
+            .await
+            .expect("call succeeds despite dropped header");
+
+        for req in server.received_requests().await.unwrap_or_default() {
+            assert!(req.headers.get("http-referer").is_none(), "HTTP-Referer must be dropped");
+            assert!(req.headers.get("x-title").is_none(), "X-Title must be dropped");
+        }
+    }
 
     #[test]
     fn test_clean_response_strips_code_fence() {

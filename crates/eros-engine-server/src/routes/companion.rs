@@ -1072,6 +1072,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
         )),
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
