@@ -60,6 +60,30 @@ The async route (`/message_async`) and the polling route
 (`/pending/{message_id}`) do **not** carry these fields. Use the sync
 route if you need per-turn audit data.
 
+### Hiding fields from the response
+
+Deployers can strip specific top-level keys from the `usage` echo by
+setting `OPENROUTER_USAGE_HIDDEN_KEYS` (comma-separated) on the server.
+Typical use: hide wholesale `cost` / `cost_details` from downstream
+customers without losing visibility for the operator.
+
+```bash
+OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
+```
+
+Behaviour:
+
+- Applies to the sync `/comp/chat/{id}/message` response only.
+- Does **not** affect `tracing::info!` output — operator observability
+  stays intact regardless of this setting.
+- Async route (`/message_async`), polling route, and background paths
+  (dreaming / post_process) already don't return `usage` to clients,
+  so the env var has no effect on them.
+- Only top-level keys are stripped; to suppress a whole subtree, list
+  its parent key (`cost_details` removes the entire object, not just
+  its members).
+- Unset or empty → today's pass-through behaviour.
+
 Background paths (`pipeline::dreaming`, `pipeline::post_process`) emit
 usage only as `tracing::info!` fields:
 
