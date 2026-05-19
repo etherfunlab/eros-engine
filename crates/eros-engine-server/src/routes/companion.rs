@@ -1067,38 +1067,44 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
 // pipeline" — this is exactly what the gift-event test does, and it
 // matches the route's chosen implementation strategy.
 // ────────────────────────────────────────────────────────────────────
-#[cfg(test)]
-mod tests {
-    use super::*;
 
+// Test helpers shared with sibling test modules (e.g. routes::bff::companion).
+// Lives outside `mod tests` so other modules' `#[cfg(test)]` blocks can reach
+// them via `crate::routes::companion::testutil` — `mod tests` is private by convention.
+#[cfg(test)]
+pub(crate) mod testutil {
     use axum::{
         body::{to_bytes, Body},
-        http::{header, Request, StatusCode},
+        http::{Request, StatusCode},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::{json, Value};
     use sqlx::PgPool;
     use tower::Service;
+    use uuid::Uuid;
 
-    // ─── Test helpers ───────────────────────────────────────────────
+    use crate::state::AppState;
 
-    fn mint_test_jwt(uid: Uuid) -> String {
+    pub(crate) fn mint_test_jwt(uid: Uuid) -> String {
         let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
         encode(
             &Header::default(),
             &json!({ "sub": uid.to_string(), "exp": exp }),
-            &EncodingKey::from_secret(TEST_SECRET.as_ref()),
+            &EncodingKey::from_secret(super::TEST_SECRET.as_ref()),
         )
         .expect("test jwt encodes")
     }
 
-    fn build_router(state: AppState) -> Router {
+    pub(crate) fn build_router(state: AppState) -> Router {
         let (axum_router, _api) = crate::routes::router(state.clone()).split_for_parts();
         axum_router.with_state(state)
     }
 
-    async fn send_request(router: &mut Router, req: Request<Body>) -> (StatusCode, Value) {
+    pub(crate) async fn send_request(
+        router: &mut Router,
+        req: Request<Body>,
+    ) -> (StatusCode, Value) {
         let resp = router.call(req).await.expect("router call infallible");
         let status = resp.status();
         let body_bytes = to_bytes(resp.into_body(), 1024 * 1024)
@@ -1112,7 +1118,7 @@ mod tests {
         (status, json)
     }
 
-    async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
+    pub(crate) async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
              VALUES ($1, 'you are a companion', '{}'::jsonb, true) RETURNING id",
@@ -1123,7 +1129,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
+    pub(crate) async fn seed_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) \
              VALUES ($1, $2) RETURNING id",
@@ -1135,7 +1141,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_instance(pool: &PgPool, genome_id: Uuid, owner: Uuid) -> Uuid {
+    pub(crate) async fn seed_instance(pool: &PgPool, genome_id: Uuid, owner: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
              VALUES ($1, $2) RETURNING id",
@@ -1146,6 +1152,21 @@ mod tests {
         .await
         .unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::{
+        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session, send_request,
+    };
+    use super::*;
+
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
 
     // ─── Test 1: public /healthz still works without bearer ─────────
 
