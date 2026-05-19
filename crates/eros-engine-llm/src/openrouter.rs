@@ -82,6 +82,12 @@ struct WireChoice {
 
 #[derive(Debug, Deserialize)]
 struct WireResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
     choices: Vec<WireChoice>,
 }
 
@@ -234,8 +240,6 @@ impl OpenRouterClient {
         }
 
         let parsed: WireResponse = resp.json().await?;
-        // .iter() (not into_iter()) so `parsed` stays available for Task 4
-        // to read id / model / usage off the same value below.
         let raw = parsed
             .choices
             .iter()
@@ -244,9 +248,9 @@ impl OpenRouterClient {
             .unwrap_or_default();
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
-            generation_id: None,
-            model: None,
-            usage: None,
+            generation_id: parsed.id,
+            model: parsed.model,
+            usage: parsed.usage,
         })
     }
 }
@@ -475,5 +479,79 @@ mod tests {
         assert!(s.contains("\"user\":\"u_abc\""), "{s}");
         assert!(s.contains("\"session_id\":\"conv_xyz\""), "{s}");
         assert!(s.contains("\"metadata\":{\"feature\":\"chat\"}"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn wire_response_parses_id_model_usage() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-abc123",
+                "model": "openai/gpt-5.2",
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 8,
+                    "total_tokens": 20,
+                    "cost": 0.0004
+                },
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "openai/gpt-5.2".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("call succeeds");
+
+        assert_eq!(resp.reply, "ok");
+        assert_eq!(resp.generation_id.as_deref(), Some("gen-abc123"));
+        assert_eq!(resp.model.as_deref(), Some("openai/gpt-5.2"));
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_u64()), Some(12));
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(20));
+    }
+
+    #[tokio::test]
+    async fn wire_response_handles_missing_id_model_usage() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "openai/gpt-5.2".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("call succeeds");
+
+        assert_eq!(resp.reply, "ok");
+        assert!(resp.generation_id.is_none());
+        assert!(resp.model.is_none());
+        assert!(resp.usage.is_none());
     }
 }
