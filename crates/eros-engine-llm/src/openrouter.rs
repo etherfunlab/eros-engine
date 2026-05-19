@@ -201,6 +201,7 @@ impl OpenRouterClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn call_once(
         &self,
         model: &str,
@@ -242,8 +243,7 @@ impl OpenRouterClient {
         let parsed: WireResponse = resp.json().await?;
         let raw = parsed
             .choices
-            .iter()
-            .next()
+            .first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
         Ok(ChatResponse {
