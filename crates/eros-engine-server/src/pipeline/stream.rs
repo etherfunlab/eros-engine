@@ -69,6 +69,11 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
+/// Maximum number of model attempts per streaming burst. Spec §5 chose 2
+/// (= 1 primary + 1 fallback) because streaming exposes each fallback as
+/// a separate visible bubble; depth > 2 starts feeling like a bug to users.
+pub const MAX_STREAM_FALLBACK_DEPTH: usize = 2;
+
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -186,8 +191,186 @@ pub fn run_stream(
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
                 yield final_frame;
             }
+            ActionType::Reply => {
+                let req = match crate::pipeline::handlers::build_reply_request(
+                    &state, &input, &plan, user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield ProtocolFrame::Error {
+                            code: StreamErrorCode::Internal,
+                            retryable: false,
+                            message: format!("build_reply_request failed: {e}"),
+                            user_message: "服务出现问题，请稍后再试".into(),
+                        };
+                        return;
+                    }
+                };
+                let chain: Vec<String> = std::iter::once(req.model.clone())
+                    .chain(req.fallback_model.iter().cloned())
+                    .filter(|s| !s.is_empty())
+                    .take(MAX_STREAM_FALLBACK_DEPTH)
+                    .collect();
+                if chain.is_empty() {
+                    yield ProtocolFrame::Error {
+                        code: StreamErrorCode::Internal,
+                        retryable: false,
+                        message: "no models configured".into(),
+                        user_message: "服务出现问题，请稍后再试".into(),
+                    };
+                    return;
+                }
+                let mut produced: Vec<crate::pipeline::post_process::ProducedMessage> = Vec::new();
+                let mut continues_from: Option<Ulid> = None;
+                let mut yielded_any_done = false;
+
+                'fallback: for (idx, model_id) in chain.iter().enumerate() {
+                    let msg_ulid = Ulid::new();
+                    let msg_uuid: Uuid = msg_ulid.into();
+                    let mut acc = String::new();
+                    let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+                    let mut last_gen_id: Option<String> = None;
+                    let mut truncated = false;
+
+                    yield ProtocolFrame::Meta {
+                        message_id: ulid_string(msg_ulid),
+                        action_type: FrameActionType::Reply,
+                        model: model_id.clone(),
+                        continues_from: continues_from.map(ulid_string),
+                    };
+
+                    let mut per_model_req = req.clone();
+                    per_model_req.model = model_id.clone();
+                    per_model_req.fallback_model = Vec::new();
+
+                    match state.openrouter.execute_stream(per_model_req).await {
+                        Ok(mut s) => {
+                            use futures_util::StreamExt as _;
+                            while let Some(item) = s.next().await {
+                                match item {
+                                    Ok(c) => {
+                                        if let Some(content) = c.content {
+                                            acc.push_str(&content);
+                                            yield ProtocolFrame::Delta {
+                                                message_id: ulid_string(msg_ulid),
+                                                content,
+                                            };
+                                        }
+                                        if c.usage.is_some()         { last_usage = c.usage; }
+                                        if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("stream: upstream chunk err: {e}");
+                                        truncated = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !truncated && acc.is_empty() {
+                                truncated = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("stream: upstream open err: {e}");
+                            truncated = true;
+                        }
+                    }
+
+                    // Persist BEFORE yielding Done (spec §2.3 risk R7).
+                    let row = eros_engine_store::chat::AssistantInsert {
+                        id: msg_uuid,
+                        content: acc.clone(),
+                        assistant_action_type: "reply".into(),
+                        continues_from_message_id: continues_from.map(Into::into),
+                        truncated,
+                        model: Some(model_id.clone()),
+                        usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: last_gen_id.clone(),
+                    };
+                    if let Err(e) = chat_repo
+                        .insert_assistant_batch(user_msg.session_id, user_msg.user_message_id, &[row])
+                        .await
+                    {
+                        tracing::warn!("stream: assistant persist failed: {e}");
+                    }
+                    produced.push(crate::pipeline::post_process::ProducedMessage {
+                        message_id: msg_uuid,
+                        full_text: acc.clone(),
+                        action: eros_engine_core::types::ActionType::Reply,
+                    });
+                    yielded_any_done = true;
+
+                    yield ProtocolFrame::Done {
+                        message_id: ulid_string(msg_ulid),
+                        truncated,
+                        usage: last_usage,
+                        generation_id: last_gen_id,
+                    };
+
+                    if !truncated {
+                        break 'fallback;
+                    }
+                    if idx + 1 == chain.len() {
+                        yield ProtocolFrame::Error {
+                            code: StreamErrorCode::UpstreamUnavailable,
+                            retryable: true,
+                            message: "all fallback models truncated".into(),
+                            user_message: "AI 服务暂时不可用，稍后再试".into(),
+                        };
+                        return;
+                    }
+                    continues_from = Some(msg_ulid);
+                }
+
+                // Reset ghost streak (mirrors sync pipeline policy).
+                if let Err(e) = sqlx::query(
+                    "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
+                     WHERE session_id = $1 AND ghost_streak <> 0",
+                )
+                .bind(user_msg.session_id)
+                .execute(&state.pool)
+                .await
+                {
+                    tracing::warn!("stream: ghost streak reset failed: {e}");
+                }
+
+                if yielded_any_done {
+                    let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                    yield final_frame;
+                }
+
+                // Spawn post-process; do not await.
+                let state_bg = (*state).clone();
+                let plan_bg = plan.clone();
+                let event_bg = eros_engine_core::types::Event::UserMessage {
+                    content: user_msg.content.clone(),
+                    message_id: user_msg.user_message_id,
+                    prompt_traits: vec![],
+                    audit: None,
+                };
+                let user_id_bg = user_msg.user_id;
+                let instance_id_bg = user_msg.instance_id;
+                let session_id_bg = user_msg.session_id;
+                tokio::spawn(async move {
+                    crate::pipeline::post_process::run(
+                        state_bg,
+                        session_id_bg,
+                        user_id_bg,
+                        instance_id_bg,
+                        event_bg,
+                        plan_bg,
+                        produced,
+                    )
+                    .await;
+                });
+            }
+            ActionType::GiftReaction => {
+                // T12 fills this in. For now, yield Final-only so the stream terminates.
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                yield final_frame;
+            }
             _ => {
-                // Reply / GiftReaction implemented in T11/T12; Proactive returns Final only.
+                // Proactive and any future variants: Final-only.
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
                 yield final_frame;
             }
@@ -407,5 +590,71 @@ mod tests {
         // Tolerant: the test just proves the generator runs end-to-end and
         // terminates. T11/T15 add per-frame assertions for Reply/replay paths.
         assert!(frames.last().is_some(), "must emit at least one frame");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_reply_terminates_cleanly_with_mock_openrouter(pool: PgPool) {
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A", 24)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+            },
+        )
+        .collect()
+        .await;
+
+        // Tolerant assertions: PDE may pick Ghost depending on persona/seed,
+        // but if it picks Reply the stream must end without an Error frame
+        // and end with Final.
+        assert!(
+            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected, got {:?}", frames,
+        );
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
     }
 }

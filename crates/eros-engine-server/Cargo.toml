@@ -49,3 +49,6 @@ futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 ulid         = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

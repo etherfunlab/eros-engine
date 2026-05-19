@@ -325,6 +325,67 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
 
 // ─── Reply ──────────────────────────────────────────────────────────
 
+/// Build a ChatRequest for the Reply action. Shared by the sync
+/// `ReplyHandler` and the streaming `pipeline::stream::run_stream`.
+pub(super) async fn build_reply_request(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+) -> Result<ChatRequest, AppError> {
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
+
+    let query_text = match &input.event {
+        Event::UserMessage { content, .. } => content.as_str(),
+        _ => "",
+    };
+
+    let (mut profile_groups, relationship_facts) =
+        recall_memory(state, user_id, instance_id, query_text).await;
+
+    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
+    if !insight_bullets.is_empty() {
+        profile_groups.insert(0, ("基础画像".into(), insight_bullets));
+    }
+
+    let tip_personality = input
+        .persona
+        .genome
+        .tip_personality
+        .as_deref()
+        .unwrap_or("normal");
+
+    let pending_gifts: Vec<PendingGift> = vec![];
+
+    let prompt_traits: &[PromptTrait] = match &input.event {
+        Event::UserMessage { prompt_traits, .. } => prompt_traits.as_slice(),
+        _ => &[],
+    };
+
+    let system_prompt = build_prompt(
+        &input.persona,
+        &profile_groups,
+        &relationship_facts,
+        Some(&input.affinity),
+        &pending_gifts,
+        tip_personality,
+        plan.reply_style,
+        &plan.context_hints,
+        prompt_traits,
+    );
+
+    Ok(assemble_chat_request(
+        state,
+        input,
+        system_prompt,
+        history,
+        audit_from_event(&input.event),
+    ))
+}
+
 pub struct ReplyHandler<'a> {
     pub state: &'a AppState,
     pub session_id: Uuid,
@@ -339,67 +400,11 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
         input: &DecisionInput,
         plan: &ActionPlan,
     ) -> Result<Option<ChatRequest>, AppError> {
-        let chat_repo = ChatRepo {
-            pool: &self.state.pool,
-        };
-        let history = chat_repo
-            .history(self.session_id, HISTORY_WINDOW, 0)
-            .await?;
-
-        // Use the current user message as the recall query.
-        let query_text = match &input.event {
-            Event::UserMessage { content, .. } => content.as_str(),
-            _ => "",
-        };
-
-        let (mut profile_groups, relationship_facts) =
-            recall_memory(self.state, self.user_id, self.instance_id, query_text).await;
-
-        // T14: prepend structured insights as a labelled group so the LLM
-        // sees both the JSONB profile (city/MBTI/...) and the categorised
-        // pgvector recalls under the same `【你对他的了解（通用画像）】`
-        // section. "基础画像" anchors at position 0 so it always renders
-        // first regardless of which categories the dreaming-lite pass
-        // happens to have populated.
-        let insight_bullets = load_insight_bullets(&self.state.pool, self.user_id).await;
-        if !insight_bullets.is_empty() {
-            profile_groups.insert(0, ("基础画像".into(), insight_bullets));
-        }
-
-        let tip_personality = input
-            .persona
-            .genome
-            .tip_personality
-            .as_deref()
-            .unwrap_or("normal");
-
-        // Reply path never has pending gifts — those flow through GiftHandler.
-        let pending_gifts: Vec<PendingGift> = vec![];
-
-        let prompt_traits: &[PromptTrait] = match &input.event {
-            Event::UserMessage { prompt_traits, .. } => prompt_traits.as_slice(),
-            _ => &[],
-        };
-
-        let system_prompt = build_prompt(
-            &input.persona,
-            &profile_groups,
-            &relationship_facts,
-            Some(&input.affinity),
-            &pending_gifts,
-            tip_personality,
-            plan.reply_style,
-            &plan.context_hints,
-            prompt_traits,
-        );
-
-        Ok(Some(assemble_chat_request(
-            self.state,
-            input,
-            system_prompt,
-            history,
-            audit_from_event(&input.event),
-        )))
+        let req = build_reply_request(
+            self.state, input, plan, self.session_id, self.user_id, self.instance_id,
+        )
+        .await?;
+        Ok(Some(req))
     }
 }
 
