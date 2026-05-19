@@ -159,6 +159,46 @@ Anything compatible with the sqlx Postgres driver works — Supabase, Neon, RDS,
 
 If you're sharing a database with another service, the engine's tables stay in `engine.*` and never write to `public.*` — collision-free.
 
+### Supabase deployments — schema-exposure footgun
+
+If your Postgres provider is Supabase **and** you've added `engine` to the project's Exposed Schemas list (Studio → Settings → API → Exposed schemas) so a co-deployed web app can read `engine.*` through `@supabase/supabase-js`, you've also potentially exposed every `engine.*` table to the publishable `anon` key — depending on which roles Studio's Permissions panel granted SELECT/INSERT/etc to.
+
+The hazard: a holder of the publishable anon key (which ships in every browser bundle by design) can issue:
+
+```bash
+curl "https://<project>.supabase.co/rest/v1/chat_messages?select=*&limit=5" \
+  -H "apikey: <publishable-anon-key>"
+```
+
+…and read every user's chat history if `anon` was ever granted SELECT on `engine.chat_messages`.
+
+Migration `0013_supabase_lockdown.sql` (shipped with eros-engine 0.2+) closes this by:
+
+1. `REVOKE ALL` on every `engine.*` table from `anon` and `authenticated`
+2. `REVOKE USAGE ON SCHEMA engine` from `anon` and `authenticated`
+3. `ENABLE ROW LEVEL SECURITY` on every `engine.*` table (no policies — defense in depth; the `postgres` owner and `service_role` bypass RLS, which covers the engine binary and any server-side Supabase client)
+
+The migration is guarded by `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`, so non-Supabase Postgres deployments (Neon, RDS, plain self-hosted) skip the REVOKEs silently and only inherit the harmless RLS enable.
+
+**If you upgraded from a pre-0.2 release on Supabase, run `eros-engine migrate` once to apply this — it's idempotent.**
+
+To audit your project independently of this migration, run as the `postgres` role:
+
+```sql
+-- Which tables in engine.* are missing RLS?
+SELECT relname FROM pg_class
+ WHERE relnamespace = 'engine'::regnamespace
+   AND relkind = 'r' AND NOT relrowsecurity;
+
+-- Which engine.* tables expose anything to anon / authenticated?
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'engine'
+   AND grantee IN ('anon', 'authenticated');
+```
+
+Both queries should return zero rows after the migration applies.
+
 ## Operational notes
 
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.

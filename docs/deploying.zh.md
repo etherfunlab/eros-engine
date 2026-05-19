@@ -159,6 +159,46 @@ impl AuthValidator for MyValidator {
 
 如果跟另一個服務共用一個數據庫，引擎的表都在 `engine.*` 下、永不寫 `public.*`——零衝突。
 
+### Supabase 部署——schema 暴露地雷
+
+如果你的 Postgres 是 Supabase，**而且**把 `engine` 加進了項目的 Exposed Schemas 列表（Studio → Settings → API → Exposed schemas）——通常是為了讓同部署的 web 端能用 `@supabase/supabase-js` 讀 `engine.*`——那你可能同時把每張 `engine.*` 表都暴露給了可公開的 `anon` key，取決於 Studio Permissions 面板給了哪些角色什麼授權。
+
+風險：拿到 publishable anon key 的人（這個 key 按設計就會出現在每個瀏覽器 bundle 裡）只要：
+
+```bash
+curl "https://<project>.supabase.co/rest/v1/chat_messages?select=*&limit=5" \
+  -H "apikey: <publishable-anon-key>"
+```
+
+就能讀所有用戶的聊天記錄——如果 `anon` 曾經被授權對 `engine.chat_messages` 的 SELECT 的話。
+
+遷移 `0013_supabase_lockdown.sql`（eros-engine 0.2+ 起內建）通過三步堵這個洞：
+
+1. 對每張 `engine.*` 表執行 `REVOKE ALL FROM anon, authenticated`
+2. 對 schema 本身執行 `REVOKE USAGE ON SCHEMA engine FROM anon, authenticated`
+3. 對每張 `engine.*` 表執行 `ENABLE ROW LEVEL SECURITY`（無策略——縱深防禦；`postgres` 用戶和 `service_role` 都繞過 RLS，所以引擎本體和任何服務端的 Supabase client 都不受影響）
+
+遷移外面包了 `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')`，所以非 Supabase 的 Postgres 部署（Neon、RDS、自托管）會靜默跳過 REVOKE，只繼承無害的 RLS enable。
+
+**如果你是從 0.2 之前的版本升上來、又跑在 Supabase 上，跑一次 `eros-engine migrate` 應用它就行——這個遷移是冪等的。**
+
+要獨立審計你的項目（與本遷移無關），以 `postgres` 角色執行：
+
+```sql
+-- engine.* 裡哪些表沒開 RLS？
+SELECT relname FROM pg_class
+ WHERE relnamespace = 'engine'::regnamespace
+   AND relkind = 'r' AND NOT relrowsecurity;
+
+-- engine.* 裡哪些表給 anon / authenticated 開了權限？
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'engine'
+   AND grantee IN ('anon', 'authenticated');
+```
+
+應用遷移後，兩個查詢都應返回零行。
+
 ## 運維注意事項
 
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
