@@ -159,14 +159,18 @@ pub async fn run(
             // Token / cost fields are best-effort parses off the opaque
             // usage JSON; missing fields silently drop out of the log line.
             let usage_ref = llm_resp.usage.as_ref();
-            let prompt_tokens =
-                usage_ref.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+            let prompt_tokens = usage_ref
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64());
             let completion_tokens = usage_ref
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64());
-            let total_tokens =
-                usage_ref.and_then(|u| u.get("total_tokens")).and_then(|v| v.as_u64());
-            let cost = usage_ref.and_then(|u| u.get("cost")).and_then(|v| v.as_f64());
+            let total_tokens = usage_ref
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(|v| v.as_u64());
+            let cost = usage_ref
+                .and_then(|u| u.get("cost"))
+                .and_then(|v| v.as_f64());
             tracing::info!(
                 session = %session_id,
                 generation_id = ?llm_resp.generation_id,

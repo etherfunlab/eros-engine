@@ -506,9 +506,7 @@ fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppE
                 )));
             }
             let s = v.as_str().ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "audit.metadata['{k}'] must be a string value"
-                ))
+                AppError::BadRequest(format!("audit.metadata['{k}'] must be a string value"))
             })?;
             if s.chars().count() > MAX_LLM_AUDIT_METADATA_VALUE_CHARS {
                 return Err(AppError::BadRequest(format!(
@@ -1861,7 +1859,10 @@ mod tests {
             session_id: None,
             metadata: None,
         };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1871,7 +1872,10 @@ mod tests {
             session_id: Some("x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1)),
             metadata: None,
         };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1880,16 +1884,30 @@ mod tests {
         for i in 0..(MAX_LLM_AUDIT_METADATA_KEYS + 1) {
             metadata.insert(format!("k{i}"), serde_json::Value::String("v".into()));
         }
-        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: None,
+            metadata: Some(metadata),
+        };
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn validate_llm_audit_rejects_invalid_metadata_key_regex() {
         let mut metadata = serde_json::Map::new();
         metadata.insert("Bad Key!".into(), serde_json::Value::String("v".into()));
-        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: None,
+            metadata: Some(metadata),
+        };
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1899,16 +1917,33 @@ mod tests {
             "x".repeat(MAX_LLM_AUDIT_METADATA_KEY_CHARS + 1),
             serde_json::Value::String("v".into()),
         );
-        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: None,
+            metadata: Some(metadata),
+        };
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn validate_llm_audit_rejects_non_string_metadata_value() {
         let mut metadata = serde_json::Map::new();
-        metadata.insert("feature".into(), serde_json::Value::Number(serde_json::Number::from(123)));
-        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        metadata.insert(
+            "feature".into(),
+            serde_json::Value::Number(serde_json::Number::from(123)),
+        );
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: None,
+            metadata: Some(metadata),
+        };
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1918,8 +1953,15 @@ mod tests {
             "feature".into(),
             serde_json::Value::String("v".repeat(MAX_LLM_AUDIT_METADATA_VALUE_CHARS + 1)),
         );
-        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
-        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: None,
+            metadata: Some(metadata),
+        };
+        assert!(matches!(
+            validate_llm_audit(Some(dto)),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -2242,6 +2284,9 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(leak_count, 0, "audit strings must never appear in chat_messages.content");
+        assert_eq!(
+            leak_count, 0,
+            "audit strings must never appear in chat_messages.content"
+        );
     }
 }

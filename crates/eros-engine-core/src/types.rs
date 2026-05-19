@@ -180,7 +180,10 @@ mod tests {
 
     #[test]
     fn chat_response_defaults_audit_fields_to_none() {
-        let r = ChatResponse { reply: "hi".into(), ..Default::default() };
+        let r = ChatResponse {
+            reply: "hi".into(),
+            ..Default::default()
+        };
         assert!(r.usage.is_none());
         assert!(r.generation_id.is_none());
         assert!(r.model.is_none());

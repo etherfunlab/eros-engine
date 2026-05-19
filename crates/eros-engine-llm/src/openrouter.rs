@@ -400,8 +400,14 @@ mod tests {
             .expect("call succeeds despite dropped header");
 
         for req in server.received_requests().await.unwrap_or_default() {
-            assert!(req.headers.get("http-referer").is_none(), "HTTP-Referer must be dropped");
-            assert!(req.headers.get("x-title").is_none(), "X-Title must be dropped");
+            assert!(
+                req.headers.get("http-referer").is_none(),
+                "HTTP-Referer must be dropped"
+            );
+            assert!(
+                req.headers.get("x-title").is_none(),
+                "X-Title must be dropped"
+            );
         }
     }
 
@@ -432,7 +438,10 @@ mod tests {
     fn wire_request_omits_audit_fields_when_none() {
         let req = ChatRequest {
             model: "openai/gpt-5.2".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             temperature: 0.0,
             max_tokens: 16,
             ..Default::default()
@@ -448,8 +457,14 @@ mod tests {
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
-        assert!(!s.contains("\"session_id\":"), "session_id key must be absent: {s}");
-        assert!(!s.contains("\"metadata\":"), "metadata key must be absent: {s}");
+        assert!(
+            !s.contains("\"session_id\":"),
+            "session_id key must be absent: {s}"
+        );
+        assert!(
+            !s.contains("\"metadata\":"),
+            "metadata key must be absent: {s}"
+        );
     }
 
     #[test]
@@ -458,7 +473,10 @@ mod tests {
         metadata.insert("feature".into(), serde_json::Value::String("chat".into()));
         let req = ChatRequest {
             model: "openai/gpt-5.2".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             temperature: 0.0,
             max_tokens: 16,
             user: Some("u_abc".into()),
@@ -507,7 +525,10 @@ mod tests {
         let resp = client
             .execute(ChatRequest {
                 model: "openai/gpt-5.2".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -519,7 +540,10 @@ mod tests {
         assert_eq!(resp.generation_id.as_deref(), Some("gen-abc123"));
         assert_eq!(resp.model.as_deref(), Some("openai/gpt-5.2"));
         let usage = resp.usage.expect("usage present");
-        assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_u64()), Some(12));
+        assert_eq!(
+            usage.get("prompt_tokens").and_then(|v| v.as_u64()),
+            Some(12)
+        );
         assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(20));
     }
 
@@ -541,7 +565,10 @@ mod tests {
         let resp = client
             .execute(ChatRequest {
                 model: "openai/gpt-5.2".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
