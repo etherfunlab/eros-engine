@@ -20,6 +20,7 @@ use crate::auth::middleware::require_auth;
 use crate::auth::s2s::require_s2s;
 use crate::state::AppState;
 
+pub mod bff;
 pub mod companion;
 pub mod companion_stream;
 pub mod debug;
