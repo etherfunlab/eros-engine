@@ -16,6 +16,73 @@
     }
   ],
   "paths": {
+    "/bff/v1/comp/chat/{session_id}/history": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Slim chat history for the chat-screen mount. Same auth, same ownership\ncheck, same `limit ∈ [1, 50]` clamp as `/comp/.../history`. **Intentional\ndivergence:** default `limit=50` (canonical defaults to 20). Reason:\nBFF exists for cold-mount where the FE wants a full backscroll in one\nround-trip.",
+        "operationId": "bff_get_history",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 50, capped at 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffHistoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/affinity/{session_id}": {
       "get": {
         "tags": [
@@ -812,6 +879,52 @@
           }
         }
       },
+      "BffHistoryEntry": {
+        "type": "object",
+        "required": [
+          "role",
+          "content",
+          "sent_at"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "description": "\"user\" | \"assistant\" | \"gift_user\" | \"system_error\""
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BffHistoryResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "total"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "description": "Count of `messages` in this response (== `messages.len()`). NOT the\ntotal row count for the session — pagination doesn't know how many\nrows remain. Mirrors `HistoryResponse::total`.",
+            "minimum": 0
+          }
+        }
+      },
       "ChatHistoryEntry": {
         "type": "object",
         "required": [
@@ -1441,6 +1554,10 @@
     {
       "name": "companion",
       "description": "Chat sessions, messages, affinity, profile"
+    },
+    {
+      "name": "bff-companion",
+      "description": "Frontend-shaped mirror of /comp/* for first-party clients; shape may diverge from canonical without notice"
     },
     {
       "name": "debug",
