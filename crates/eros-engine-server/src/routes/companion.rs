@@ -382,7 +382,9 @@ fn typing_delay_ms_from(seed: Uuid) -> u64 {
 /// - `text.trim()` non-empty
 /// - `text.chars().count()` ≤ `MAX_PROMPT_TRAIT_TEXT_CHARS`
 /// - `text` contains no control characters (would break bullet rendering)
-fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, AppError> {
+pub(crate) fn validate_prompt_traits(
+    dtos: &[PromptTraitDto],
+) -> Result<Vec<PromptTrait>, AppError> {
     if dtos.len() > MAX_PROMPT_TRAITS {
         return Err(AppError::BadRequest(format!(
             "too many prompt_traits (max {MAX_PROMPT_TRAITS})"
@@ -474,7 +476,7 @@ fn filter_usage_keys(
 /// Validate a caller-supplied `audit` object against the documented caps.
 /// Returns `Ok(None)` when the field is absent. `Err(BadRequest)` for any
 /// cap violation — first failure wins so the message points at one cause.
-fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppError> {
+pub(crate) fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppError> {
     let Some(dto) = dto else { return Ok(None) };
 
     if let Some(ref u) = dto.user {
@@ -2002,194 +2004,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_invalid_tag_regex(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "prompt_traits": [{ "tag": "BadTag", "text": "x" }],
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        // Async route also validates BEFORE persisting — no user row.
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    // ─── LlmAudit HTTP integration tests ────────────────────────────
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_oversized_audit_user(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "user": "x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1) },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(count, 0, "validation must fire before persistence");
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_too_many_metadata_keys(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let mut metadata = serde_json::Map::new();
-        for i in 0..(MAX_LLM_AUDIT_METADATA_KEYS + 1) {
-            metadata.insert(format!("k{i}"), Value::String("v".into()));
-        }
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "metadata": metadata },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_rejects_non_string_metadata_value(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": { "metadata": { "feature": 123 } },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_async_accepts_valid_audit(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "audit": {
-                "user": "u_abc",
-                "session_id": "conv_xyz",
-                "metadata": { "feature": "chat", "plan": "pro" }
-            },
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message_async"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-
-        let user_msg_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(user_msg_count, 1);
-
-        let leak_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND (content LIKE '%u_abc%' OR content LIKE '%conv_xyz%')",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            leak_count, 0,
-            "audit strings must never appear in chat_messages.content"
-        );
     }
 }

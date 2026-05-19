@@ -1341,11 +1341,30 @@
           "client_msg_id"
         ],
         "properties": {
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
           "client_msg_id": {
             "type": "string"
           },
           "content": {
             "type": "string"
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
           }
         }
       },

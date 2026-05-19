@@ -160,6 +160,9 @@ fn drive_chat_burst(
                                 }
                                 if c.usage.is_some()         { last_usage = c.usage; }
                                 if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                                if matches!(c.finish_reason.as_deref(), Some("length")) {
+                                    truncated = true;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("stream: upstream chunk err: {e}");
@@ -235,6 +238,8 @@ pub struct PersistedUserMessage {
     pub user_id: Uuid,
     pub instance_id: Uuid,
     pub content: String,
+    pub prompt_traits: Vec<eros_engine_core::types::PromptTrait>,
+    pub audit: Option<eros_engine_core::types::LlmAudit>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -298,8 +303,8 @@ pub fn run_stream(
             event: Event::UserMessage {
                 content: user_msg.content.clone(),
                 message_id: user_msg.user_message_id,
-                prompt_traits: vec![],
-                audit: None,
+                prompt_traits: user_msg.prompt_traits.clone(),
+                audit: user_msg.audit.clone(),
             },
             affinity: affinity.clone(),
             persona,
@@ -414,8 +419,8 @@ pub fn run_stream(
                 let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,
-                    prompt_traits: vec![],
-                    audit: None,
+                    prompt_traits: user_msg.prompt_traits.clone(),
+                    audit: user_msg.audit.clone(),
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -529,6 +534,18 @@ pub fn replay_stream(
                     usage,
                     generation_id: row.generation_id.clone(),
                 };
+            }
+            // If every persisted assistant row was truncated, emit the same
+            // terminal Error that the original burst emitted so the client
+            // knows retrying is appropriate.
+            if !rows.is_empty() && rows.iter().all(|r| r.truncated) {
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::UpstreamUnavailable,
+                    retryable: true,
+                    message: "all fallback models truncated (replayed)".into(),
+                    user_message: "AI 服务暂时不可用，稍后再试".into(),
+                };
+                return;
             }
         }
         let final_frame = compute_final_frame(&state, session_id, user_id).await;
@@ -692,7 +709,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
         let chat_repo = ChatRepo { pool: &state.pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A", 24)
+            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A")
             .await
             .unwrap()
         {
@@ -708,6 +725,8 @@ mod tests {
                 user_id,
                 instance_id,
                 content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
             },
         )
         .collect()
@@ -753,7 +772,7 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A", 24)
+            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A")
             .await
             .unwrap()
         {
@@ -769,6 +788,8 @@ data: [DONE]\n\n";
                 user_id,
                 instance_id,
                 content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
             },
         )
         .collect()

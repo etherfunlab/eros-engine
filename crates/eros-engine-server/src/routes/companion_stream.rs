@@ -21,20 +21,25 @@ use eros_engine_store::persona::PersonaRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::stream::{replay_stream, run_stream, PersistedUserMessage, ProtocolFrame};
-use crate::routes::companion::enforce_nft_ownership;
+use crate::routes::companion::{
+    enforce_nft_ownership, validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
+};
 use crate::state::AppState;
 
 const MAX_CONTENT_CHARS: usize = 4096;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
-const IDEMPOTENCY_WINDOW_HOURS: i64 = 24;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
     pub client_msg_id: String,
+    #[serde(default)]
+    pub prompt_traits: Option<Vec<PromptTraitDto>>,
+    #[serde(default)]
+    pub audit: Option<LlmAuditDto>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -117,10 +122,29 @@ pub async fn send_message_stream(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(req): Json<StreamSendRequest>,
+    Json(mut req): Json<StreamSendRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
     validate_payload(&req)?;
+    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
+        .map_err(|e| {
+            AppError::StreamPre(StreamPreError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_payload",
+                message: e.to_string(),
+                user_message: "请求无效".into(),
+                original_user_message_id: None,
+            })
+        })?;
+    let audit = validate_llm_audit(req.audit.take()).map_err(|e| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: e.to_string(),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        })
+    })?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
@@ -176,12 +200,7 @@ pub async fn send_message_stream(
         })?;
 
     let outcome = chat_repo
-        .upsert_user_message_idempotent(
-            session_id,
-            &req.content,
-            &req.client_msg_id,
-            IDEMPOTENCY_WINDOW_HOURS,
-        )
+        .upsert_user_message_idempotent(session_id, &req.content, &req.client_msg_id)
         .await?;
     // Resolve the proto stream. Replay returns early with a boxed stream;
     // Inserted continues to run_stream below. Boxing erases the concrete type
@@ -196,6 +215,8 @@ pub async fn send_message_stream(
                     user_id,
                     instance_id,
                     content: req.content.clone(),
+                    prompt_traits: prompt_traits.clone(),
+                    audit: audit.clone(),
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -348,7 +369,7 @@ mod tests {
         // Pre-seed an original-request outcome.
         let chat_repo = ChatRepo { pool: &pool };
         let user_msg_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", 24)
+            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A")
             .await
             .unwrap()
         {

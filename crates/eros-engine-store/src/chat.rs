@@ -207,7 +207,7 @@ pub struct AssistantInsert {
 /// to decide between normal processing, replay, and 409.
 #[derive(Debug)]
 pub enum UpsertUserOutcome {
-    /// First time seeing `(session_id, client_msg_id)` within the window.
+    /// First time seeing `(session_id, client_msg_id)`.
     Inserted { message_id: Uuid },
     /// Original request completed. Caller should synthesise SSE frames from
     /// the persisted rows (assistant_chain may be empty for a ghost outcome).
@@ -222,32 +222,31 @@ pub enum UpsertUserOutcome {
 }
 
 impl<'a> ChatRepo<'a> {
-    /// Insert a user message keyed by `client_msg_id`, deduplicating within
-    /// the last `window_hours` hours. Application-level enforcement of the
-    /// 24 h window (vs a partial unique index with `now()`, which Postgres
-    /// rejects). Resolves the outcome under one short-lived transaction so
-    /// the dedup decision and write happen against a consistent snapshot.
+    /// Insert a user message keyed by `client_msg_id` with permanent
+    /// idempotency. The partial unique index on `(session_id, client_msg_id)`
+    /// has no time component, so deduplication is permanent: any prior row
+    /// with the same key is a replay candidate. A future janitor can GC old
+    /// rows, but the application treats any prior `(session_id, client_msg_id)`
+    /// row as authoritative. Resolves the outcome under one short-lived
+    /// transaction so the dedup decision and write happen against a consistent
+    /// snapshot.
     pub async fn upsert_user_message_idempotent(
         &self,
         session_id: Uuid,
         content: &str,
         client_msg_id: &str,
-        window_hours: i64,
     ) -> Result<UpsertUserOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Look for an existing user row with the same (session_id, client_msg_id)
-        // inside the dedup window. The partial unique index guarantees at most
-        // one match if any.
+        // Look for an existing user row with the same (session_id, client_msg_id).
+        // The partial unique index guarantees at most one match if any.
         let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
             "SELECT * FROM engine.chat_messages \
              WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
-               AND sent_at > now() - make_interval(hours => $3) \
              LIMIT 1",
         )
         .bind(session_id)
         .bind(client_msg_id)
-        .bind(window_hours)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -437,7 +436,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap();
         match outcome {
@@ -456,7 +455,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap()
         {
@@ -484,7 +483,7 @@ mod tests {
         .unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap();
         match outcome {
@@ -510,7 +509,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap()
         {
@@ -519,7 +518,7 @@ mod tests {
         };
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap()
         {
@@ -538,7 +537,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap()
         {
@@ -548,7 +547,7 @@ mod tests {
         repo.mark_user_message_ghosted(first).await.unwrap();
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", 24)
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
             .await
             .unwrap()
         {
