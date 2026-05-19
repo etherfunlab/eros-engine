@@ -27,7 +27,11 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub model: String,
-    pub fallback_model: Option<String>,
+    /// Ordered fallback chain (empty = no fallback). Singular-named
+    /// despite being a Vec because semantically the chain resolves to
+    /// ONE actually-served model per call — entries are sequentially
+    /// tried candidates, not parallel fan-out.
+    pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub max_tokens: u32,
@@ -177,7 +181,11 @@ impl OpenRouterClient {
         {
             Ok(resp) => Ok(resp),
             Err(primary_err) => {
-                if let Some(fallback) = req.fallback_model.as_deref() {
+                // Transient: Task 2 of the v0.1.3 plan rewrites this
+                // arm to walk the full `req.fallback_model` chain. For
+                // this task we preserve the v0.1.2 single-fallback
+                // behaviour by trying the FIRST entry only.
+                if let Some(fallback) = req.fallback_model.first().map(String::as_str) {
                     tracing::warn!(
                         primary = %req.model,
                         fallback = %fallback,
@@ -313,7 +321,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -343,7 +351,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
@@ -387,7 +395,7 @@ mod tests {
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
-                fallback_model: None,
+                fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: "hi".into(),
