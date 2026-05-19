@@ -194,9 +194,14 @@ Highlights:
 - `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
 - `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
 - `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
-- `POST /comp/chat/{session_id}/message` and `/message_async` accept an optional
-  `prompt_traits` field for per-request system-prompt injection — see
-  [docs/prompt-traits.md](docs/prompt-traits.md).
+- `POST /comp/chat/{session_id}/message` and `/message_async` accept two
+  optional caller-supplied fields:
+  - `prompt_traits` — per-request system-prompt injection, see
+    [docs/prompt-traits.md](docs/prompt-traits.md).
+  - `audit` — opaque OpenRouter passthrough (`user` / `session_id` /
+    `metadata`) for per-user / per-session attribution on OpenRouter
+    dashboards. Sync `/message` also echoes `usage` / `generation_id` /
+    `model` on its response. See [docs/llm-audit.md](docs/llm-audit.md).
 - `GET  /comp/affinity/{session_id}` — debug-only live affinity vector, enabled by `EXPOSE_AFFINITY_DEBUG=true`.
 
 The `AuthValidator` trait is pluggable if you use a different identity provider.
@@ -207,6 +212,8 @@ The `AuthValidator` trait is pluggable if you use a different identity provider.
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
 | `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
+| `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
+| `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
 | `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
 | `SUPABASE_URL` | no | Supabase project URL. Kept in `.env.example` for client/deploy conventions; the server does not read it today. |
 | `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |

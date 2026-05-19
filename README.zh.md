@@ -154,9 +154,14 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 - `GET  /comp/user/{user_id}/profile`——讀取目前的 `companion_insights` 和 `training_level`。
 - `POST /comp/chat/{session_id}/event/gift`——套用外部 gift event 與 affinity delta。
 - `GET  /comp/chat/{session_id}/gifts`——列出某個 session 的 gift events。
-- `POST /comp/chat/{session_id}/message` 與 `/message_async` 接受可選的
-  `prompt_traits` 欄位，用於 per-request system-prompt 注入——詳見
-  [docs/prompt-traits.md](docs/prompt-traits.md)。
+- `POST /comp/chat/{session_id}/message` 與 `/message_async` 接受兩個
+  可選的 caller-supplied 欄位：
+  - `prompt_traits` —— per-request system-prompt 注入，詳見
+    [docs/prompt-traits.md](docs/prompt-traits.md)。
+  - `audit` —— 不透明的 OpenRouter passthrough（`user` / `session_id` /
+    `metadata`），用於在 OpenRouter dashboard 上做 per-user / per-session
+    attribution。Sync `/message` 響應也會回傳 `usage` / `generation_id` /
+    `model`。詳見 [docs/llm-audit.zh.md](docs/llm-audit.zh.md)。
 - `GET  /comp/affinity/{session_id}`——debug-only 即時 affinity vector，由 `EXPOSE_AFFINITY_DEBUG=true` 開啟。
 
 如果你不用 Supabase，可以實現 `AuthValidator` trait 接自己的 identity provider。
@@ -167,6 +172,8 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 |---|---|---|
 | `DATABASE_URL` | 是 | 帶 `pgvector` 的 Postgres；表建在 `engine.*`。 |
 | `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml` 路由。 |
+| `OPENROUTER_APP_REFERER` | 否 | 設了之後每次出站 OpenRouter 調用都帶 `HTTP-Referer`。會出現在 OpenRouter 的 app 分析面板上。 |
+| `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
 | `VOYAGE_API_KEY` | 是 | Embeddings。空 key 會拒絕啟動。 |
 | `SUPABASE_URL` | 否 | Supabase project URL。保留在 `.env.example` 裡方便 client / deploy 約定；目前 server 不讀取它。 |
 | `SUPABASE_JWT_SECRET` | 是 | 默認 auth 使用的 JWT signing secret。 |

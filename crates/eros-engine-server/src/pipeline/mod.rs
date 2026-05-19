@@ -153,34 +153,7 @@ pub async fn run(
                 .await
                 .map_err(|e| AppError::Internal(format!("openrouter: {e}")))?;
 
-            // Tracing-only usage line. Covers sync, async (background
-            // tokio::spawn calls pipeline::run too), dreaming, post_process
-            // — every codepath that reaches this point in the orchestrator.
-            // Token / cost fields are best-effort parses off the opaque
-            // usage JSON; missing fields silently drop out of the log line.
-            let usage_ref = llm_resp.usage.as_ref();
-            let prompt_tokens = usage_ref
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_u64());
-            let completion_tokens = usage_ref
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_u64());
-            let total_tokens = usage_ref
-                .and_then(|u| u.get("total_tokens"))
-                .and_then(|v| v.as_u64());
-            let cost = usage_ref
-                .and_then(|u| u.get("cost"))
-                .and_then(|v| v.as_f64());
-            tracing::info!(
-                session = %session_id,
-                generation_id = ?llm_resp.generation_id,
-                model = ?llm_resp.model,
-                prompt_tokens = ?prompt_tokens,
-                completion_tokens = ?completion_tokens,
-                total_tokens = ?total_tokens,
-                cost = ?cost,
-                "openrouter: call completed"
-            );
+            log_openrouter_usage("chat_companion", Some(session_id), &llm_resp);
 
             let chat_repo = ChatRepo { pool: &state.pool };
             chat_repo
@@ -228,6 +201,43 @@ pub async fn run(
     });
 
     Ok(response)
+}
+
+/// Emit one structured `openrouter: call completed` log line per call.
+/// Token / cost fields are best-effort parses off the opaque `usage`
+/// JSON — missing fields silently drop out of the line. Called from
+/// every codepath that owns the result of `OpenRouterClient::execute`
+/// (chat, dreaming, post_process), keeping `docs/llm-audit.md`'s
+/// "background paths emit usage only as tracing fields" claim honest.
+pub(super) fn log_openrouter_usage(
+    task: &str,
+    session_id: Option<Uuid>,
+    resp: &eros_engine_llm::openrouter::ChatResponse,
+) {
+    let usage_ref = resp.usage.as_ref();
+    let prompt_tokens = usage_ref
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_u64());
+    let completion_tokens = usage_ref
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_u64());
+    let total_tokens = usage_ref
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|v| v.as_u64());
+    let cost = usage_ref
+        .and_then(|u| u.get("cost"))
+        .and_then(|v| v.as_f64());
+    tracing::info!(
+        task = task,
+        session = ?session_id,
+        generation_id = ?resp.generation_id,
+        model = ?resp.model,
+        prompt_tokens = ?prompt_tokens,
+        completion_tokens = ?completion_tokens,
+        total_tokens = ?total_tokens,
+        cost = ?cost,
+        "openrouter: call completed"
+    );
 }
 
 async fn load_session_ids(state: &AppState, session_id: Uuid) -> Result<(Uuid, Uuid), AppError> {

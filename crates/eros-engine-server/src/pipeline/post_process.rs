@@ -52,7 +52,7 @@ pub async fn run(
 
     let fut_insight = async {
         if !user_msg.is_empty() && !reply.is_empty() {
-            extract_insights(&state, user_id, &user_msg, &reply).await;
+            extract_insights(&state, session_id, user_id, &user_msg, &reply).await;
         }
     };
 
@@ -282,10 +282,17 @@ fn find_json_block(raw: &str) -> Option<&str> {
 const INSIGHT_TASK: &str = "insight_extraction";
 
 /// Top-level entry: extract facts → structured insights → InsightRepo merge.
-async fn extract_insights(state: &AppState, user_id: Uuid, user_msg: &str, assistant_msg: &str) {
+async fn extract_insights(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    user_msg: &str,
+    assistant_msg: &str,
+) {
     let facts = extract_facts(
         &state.openrouter,
         &state.model_config,
+        session_id,
         user_msg,
         assistant_msg,
     )
@@ -306,6 +313,7 @@ async fn extract_insights(state: &AppState, user_id: Uuid, user_msg: &str, assis
     let new_insights = extract_structured_insights(
         &state.openrouter,
         &state.model_config,
+        session_id,
         &facts,
         existing.as_ref(),
     )
@@ -322,6 +330,7 @@ async fn extract_insights(state: &AppState, user_id: Uuid, user_msg: &str, assis
 async fn extract_facts(
     llm: &OpenRouterClient,
     model_config: &ModelConfig,
+    session_id: Uuid,
     user_msg: &str,
     assistant_msg: &str,
 ) -> Vec<String> {
@@ -344,7 +353,10 @@ async fn extract_facts(
     };
 
     let raw = match llm.execute(req).await {
-        Ok(resp) => resp.reply.trim().to_string(),
+        Ok(resp) => {
+            super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &resp);
+            resp.reply.trim().to_string()
+        }
         Err(e) => {
             tracing::warn!("fact extraction LLM call failed: {e}");
             return vec![];
@@ -380,6 +392,7 @@ fn extract_facts_array(v: &serde_json::Value) -> Vec<String> {
 async fn extract_structured_insights(
     llm: &OpenRouterClient,
     model_config: &ModelConfig,
+    session_id: Uuid,
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
 ) -> serde_json::Value {
@@ -403,7 +416,10 @@ async fn extract_structured_insights(
     };
 
     let raw = match llm.execute(req).await {
-        Ok(r) => r.reply.trim().to_string(),
+        Ok(r) => {
+            super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &r);
+            r.reply.trim().to_string()
+        }
         Err(_) => return serde_json::Value::Object(serde_json::Map::new()),
     };
 
