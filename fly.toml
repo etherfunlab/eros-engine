@@ -32,7 +32,12 @@ primary_region = "nrt"
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  # Keep one warm machine in the primary region so the next-after-idle
+  # visitor doesn't pay the ~500ms–3s Rust binary cold-start tax. Cost is
+  # one always-started shared-cpu-1x in NRT — a few USD/mo before
+  # bandwidth and org allowances. `auto_stop_machines = "stop"` stays, so
+  # capacity above 1 still scales down to 1 (not zero).
+  min_machines_running = 1
   processes = ["app"]
 
   [http_service.concurrency]
