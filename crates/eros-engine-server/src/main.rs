@@ -165,8 +165,17 @@ async fn run_server() -> Result<()> {
 
     let openrouter_key =
         std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
+    let attribution = eros_engine_llm::openrouter::AppAttribution {
+        referer: std::env::var("OPENROUTER_APP_REFERER")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        title: std::env::var("OPENROUTER_APP_TITLE")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    };
     let openrouter = Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
         openrouter_key,
+        attribution,
     ));
 
     let voyage_key = std::env::var("VOYAGE_API_KEY").context("VOYAGE_API_KEY is required")?;

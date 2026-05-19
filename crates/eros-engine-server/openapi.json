@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "servers": [
     {
@@ -915,9 +915,23 @@
             "type": "number",
             "format": "double"
           },
+          "generation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "OpenRouter `response.id`. Omitted when not returned."
+          },
           "lead_score": {
             "type": "number",
             "format": "double"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model actually served (may differ from request when fallback hit).\nOmitted when not returned."
           },
           "reply": {
             "type": "string"
@@ -933,6 +947,9 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "usage": {
+            "description": "OpenRouter `usage` block (tokens / cost). Omitted when upstream\ndidn't return one or no LLM call was made for this turn."
           }
         }
       },
@@ -1059,6 +1076,37 @@
           "user_id": {
             "type": "string",
             "format": "uuid"
+          }
+        }
+      },
+      "LlmAuditDto": {
+        "type": "object",
+        "description": "Caller-supplied OpenRouter audit passthrough. All three fields are\noptional; engine never inspects content. See `docs/llm-audit.md`.",
+        "properties": {
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Up to 16 string-valued key/value pairs. Key regex\n`^[A-Za-z0-9_.-]{1,64}$`, value `chars ≤ 512`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Caller-defined session / conversation grouping. Distinct from the\nURL path's `session_id`. `chars ≤ 256`. Forwarded as wire\n`session_id`."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form caller identifier (recommended: hash of internal user id).\n`chars ≤ 256`. Forwarded as OpenRouter wire `user`."
           }
         }
       },
@@ -1217,6 +1265,17 @@
           "message"
         ],
         "properties": {
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto",
+                "description": "Optional OpenRouter audit passthrough. See `docs/llm-audit.md`."
+              }
+            ]
+          },
           "message": {
             "type": "string"
           },

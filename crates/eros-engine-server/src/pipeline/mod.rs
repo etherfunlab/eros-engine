@@ -24,7 +24,6 @@ use eros_engine_core::types::{
     ActionType, ChatResponse, ConversationSignals, DecisionInput, Event,
 };
 use eros_engine_core::{pde, persona::CompanionPersona};
-use eros_engine_llm::openrouter::ChatResponse as LlmChatResponse;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::persona::PersonaRepo;
@@ -73,7 +72,12 @@ pub async fn run(
         plan.reply_style,
     );
 
-    if let Event::UserMessage { prompt_traits, .. } = &event {
+    if let Event::UserMessage {
+        prompt_traits,
+        audit,
+        ..
+    } = &event
+    {
         if !prompt_traits.is_empty() {
             let tags: Vec<&str> = prompt_traits.iter().map(|t| t.tag.as_str()).collect();
             tracing::info!(
@@ -81,6 +85,20 @@ pub async fn run(
                 traits_count = prompt_traits.len(),
                 trait_tags = ?tags,
                 "engine: prompt_traits applied"
+            );
+        }
+        if let Some(a) = audit {
+            let metadata_keys: Vec<&str> = a
+                .metadata
+                .as_ref()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            tracing::info!(
+                session = %session_id,
+                audit_user_present = a.user.is_some(),
+                audit_session_present = a.session_id.is_some(),
+                audit_metadata_keys = ?metadata_keys,
+                "engine: llm audit applied"
             );
         }
     }
@@ -129,16 +147,47 @@ pub async fn run(
     // engine's public API stays decoupled from the openrouter wire shape.
     let response: Option<ChatResponse> = match chat_req {
         Some(req) => {
-            let LlmChatResponse { reply } = state
+            let llm_resp = state
                 .openrouter
                 .execute(req)
                 .await
                 .map_err(|e| AppError::Internal(format!("openrouter: {e}")))?;
+
+            // Tracing-only usage line. Covers sync, async (background
+            // tokio::spawn calls pipeline::run too), dreaming, post_process
+            // — every codepath that reaches this point in the orchestrator.
+            // Token / cost fields are best-effort parses off the opaque
+            // usage JSON; missing fields silently drop out of the log line.
+            let usage_ref = llm_resp.usage.as_ref();
+            let prompt_tokens =
+                usage_ref.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+            let completion_tokens = usage_ref
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64());
+            let total_tokens =
+                usage_ref.and_then(|u| u.get("total_tokens")).and_then(|v| v.as_u64());
+            let cost = usage_ref.and_then(|u| u.get("cost")).and_then(|v| v.as_f64());
+            tracing::info!(
+                session = %session_id,
+                generation_id = ?llm_resp.generation_id,
+                model = ?llm_resp.model,
+                prompt_tokens = ?prompt_tokens,
+                completion_tokens = ?completion_tokens,
+                total_tokens = ?total_tokens,
+                cost = ?cost,
+                "openrouter: call completed"
+            );
+
             let chat_repo = ChatRepo { pool: &state.pool };
             chat_repo
-                .append_message(session_id, "assistant", &reply)
+                .append_message(session_id, "assistant", &llm_resp.reply)
                 .await?;
-            Some(ChatResponse { reply })
+            Some(ChatResponse {
+                reply: llm_resp.reply,
+                generation_id: llm_resp.generation_id,
+                model: llm_resp.model,
+                usage: llm_resp.usage,
+            })
         }
         None => None,
     };

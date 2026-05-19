@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::Event;
+use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
@@ -60,6 +61,17 @@ use crate::state::AppState;
 const MAX_PROMPT_TRAITS: usize = 8;
 const MAX_PROMPT_TRAIT_TEXT_CHARS: usize = 2000;
 const MAX_PROMPT_TRAIT_TAG_LEN: usize = 32;
+
+/// Audit-string caps. Conservative: holds any reasonable hash without
+/// inviting raw PII in `user`. No OpenRouter doc requirement; engine-side
+/// guard.
+const MAX_LLM_AUDIT_STRING_CHARS: usize = 256;
+/// OpenRouter documented cap.
+const MAX_LLM_AUDIT_METADATA_KEYS: usize = 16;
+/// OpenRouter documented cap.
+const MAX_LLM_AUDIT_METADATA_KEY_CHARS: usize = 64;
+/// OpenRouter documented cap.
+const MAX_LLM_AUDIT_METADATA_VALUE_CHARS: usize = 512;
 
 /// NFT-ownership gate. Returns `Ok(())` immediately if `asset_id` is `None`
 /// (legacy seed-persona genome). Otherwise joins persona_ownership with
@@ -139,6 +151,9 @@ pub struct SendMessageRequest {
     /// `docs/prompt-traits.md`. Missing field → empty list.
     #[serde(default)]
     pub prompt_traits: Option<Vec<PromptTraitDto>>,
+    /// Optional OpenRouter audit passthrough. See `docs/llm-audit.md`.
+    #[serde(default)]
+    pub audit: Option<LlmAuditDto>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -149,6 +164,17 @@ pub struct CompanionReplyResponse {
     pub should_show_cta: bool,
     pub typing_delay_ms: u64,
     pub agent_training_level: f64,
+    /// OpenRouter `usage` block (tokens / cost). Omitted when upstream
+    /// didn't return one or no LLM call was made for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+    /// OpenRouter `response.id`. Omitted when not returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Model actually served (may differ from request when fallback hit).
+    /// Omitted when not returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -287,6 +313,25 @@ pub struct PromptTraitDto {
     pub text: String,
 }
 
+/// Caller-supplied OpenRouter audit passthrough. All three fields are
+/// optional; engine never inspects content. See `docs/llm-audit.md`.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct LlmAuditDto {
+    /// Free-form caller identifier (recommended: hash of internal user id).
+    /// `chars ≤ 256`. Forwarded as OpenRouter wire `user`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Caller-defined session / conversation grouping. Distinct from the
+    /// URL path's `session_id`. `chars ≤ 256`. Forwarded as wire
+    /// `session_id`.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Up to 16 string-valued key/value pairs. Key regex
+    /// `^[A-Za-z0-9_.-]{1,64}$`, value `chars ≤ 512`.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GiftEventResponse {
     pub reply: Option<String>,
@@ -418,6 +463,66 @@ fn validate_prompt_traits(dtos: &[PromptTraitDto]) -> Result<Vec<PromptTrait>, A
         });
     }
     Ok(out)
+}
+
+/// Validate a caller-supplied `audit` object against the documented caps.
+/// Returns `Ok(None)` when the field is absent. `Err(BadRequest)` for any
+/// cap violation — first failure wins so the message points at one cause.
+fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmAudit>, AppError> {
+    let Some(dto) = dto else { return Ok(None) };
+
+    if let Some(ref u) = dto.user {
+        if u.chars().count() > MAX_LLM_AUDIT_STRING_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "audit.user exceeds {MAX_LLM_AUDIT_STRING_CHARS} chars"
+            )));
+        }
+    }
+    if let Some(ref s) = dto.session_id {
+        if s.chars().count() > MAX_LLM_AUDIT_STRING_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "audit.session_id exceeds {MAX_LLM_AUDIT_STRING_CHARS} chars"
+            )));
+        }
+    }
+    if let Some(ref m) = dto.metadata {
+        if m.len() > MAX_LLM_AUDIT_METADATA_KEYS {
+            return Err(AppError::BadRequest(format!(
+                "audit.metadata exceeds {MAX_LLM_AUDIT_METADATA_KEYS} keys"
+            )));
+        }
+        for (k, v) in m.iter() {
+            if k.is_empty() || k.chars().count() > MAX_LLM_AUDIT_METADATA_KEY_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "audit.metadata key length must be 1..={MAX_LLM_AUDIT_METADATA_KEY_CHARS}"
+                )));
+            }
+            if !k
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            {
+                return Err(AppError::BadRequest(format!(
+                    "audit.metadata key '{k}' must match [A-Za-z0-9_.-]"
+                )));
+            }
+            let s = v.as_str().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "audit.metadata['{k}'] must be a string value"
+                ))
+            })?;
+            if s.chars().count() > MAX_LLM_AUDIT_METADATA_VALUE_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "audit.metadata['{k}'] exceeds {MAX_LLM_AUDIT_METADATA_VALUE_CHARS} chars"
+                )));
+            }
+        }
+    }
+
+    Ok(Some(LlmAudit {
+        user: dto.user,
+        session_id: dto.session_id,
+        metadata: dto.metadata,
+    }))
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -604,7 +709,7 @@ async fn send_message(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(req): Json<SendMessageRequest>,
+    Json(mut req): Json<SendMessageRequest>,
 ) -> Result<Json<CompanionReplyResponse>, AppError> {
     let session = require_session_for_user(&state, session_id, user_id).await?;
 
@@ -627,6 +732,7 @@ async fn send_message(
     }
 
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
+    let audit = validate_llm_audit(req.audit.take())?;
 
     // Persist the user message up-front so the engine sees it in history.
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -638,6 +744,7 @@ async fn send_message(
         content: req.message.clone(),
         message_id: user_message_id,
         prompt_traits,
+        audit,
     };
     let response = pipeline::run(&state, session_id, event).await?;
 
@@ -658,6 +765,11 @@ async fn send_message(
     let training_level = read_training_level(&state, user_id).await;
     let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
 
+    let (usage, generation_id, model) = response
+        .as_ref()
+        .map(|r| (r.usage.clone(), r.generation_id.clone(), r.model.clone()))
+        .unwrap_or((None, None, None));
+
     Ok(Json(CompanionReplyResponse {
         reply: reply_text,
         session_id,
@@ -665,6 +777,9 @@ async fn send_message(
         should_show_cta,
         typing_delay_ms: typing_delay_ms_from(user_message_id),
         agent_training_level: training_level,
+        usage,
+        generation_id,
+        model,
     }))
 }
 
@@ -688,7 +803,7 @@ async fn send_message_async(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(req): Json<SendMessageRequest>,
+    Json(mut req): Json<SendMessageRequest>,
 ) -> Result<(axum::http::StatusCode, Json<AsyncSendResponse>), AppError> {
     let session = require_session_for_user(&state, session_id, user_id).await?;
 
@@ -711,6 +826,7 @@ async fn send_message_async(
 
     // Validate BEFORE we persist the user message so a bad request leaves no row.
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
+    let audit = validate_llm_audit(req.audit.take())?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let user_message_id = chat_repo
@@ -720,11 +836,13 @@ async fn send_message_async(
     let state_bg = state.clone();
     let msg_copy = req.message.clone();
     let traits_copy = prompt_traits;
+    let audit_copy = audit;
     tokio::spawn(async move {
         let event = Event::UserMessage {
             content: msg_copy,
             message_id: user_message_id,
             prompt_traits: traits_copy,
+            audit: audit_copy,
         };
         if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
             tracing::error!("engine pipeline failed for session {session_id}: {e}");
@@ -1070,6 +1188,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
         )),
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
@@ -1706,6 +1825,103 @@ mod tests {
         }
     }
 
+    // ─── LlmAudit validator unit tests ──────────────────────────────
+
+    #[test]
+    fn validate_llm_audit_none_returns_none() {
+        let out = validate_llm_audit(None).expect("None input ok");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn validate_llm_audit_full_passes() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("feature".into(), serde_json::Value::String("chat".into()));
+        let dto = LlmAuditDto {
+            user: Some("u_abc".into()),
+            session_id: Some("conv_xyz".into()),
+            metadata: Some(metadata),
+        };
+        let out = validate_llm_audit(Some(dto)).expect("ok").expect("Some");
+        assert_eq!(out.user.as_deref(), Some("u_abc"));
+        assert_eq!(out.session_id.as_deref(), Some("conv_xyz"));
+        assert_eq!(
+            out.metadata
+                .as_ref()
+                .and_then(|m| m.get("feature"))
+                .and_then(|v| v.as_str()),
+            Some("chat")
+        );
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_oversized_user() {
+        let dto = LlmAuditDto {
+            user: Some("x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1)),
+            session_id: None,
+            metadata: None,
+        };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_oversized_session_id() {
+        let dto = LlmAuditDto {
+            user: None,
+            session_id: Some("x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1)),
+            metadata: None,
+        };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_too_many_metadata_keys() {
+        let mut metadata = serde_json::Map::new();
+        for i in 0..(MAX_LLM_AUDIT_METADATA_KEYS + 1) {
+            metadata.insert(format!("k{i}"), serde_json::Value::String("v".into()));
+        }
+        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_invalid_metadata_key_regex() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("Bad Key!".into(), serde_json::Value::String("v".into()));
+        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_oversized_metadata_key() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "x".repeat(MAX_LLM_AUDIT_METADATA_KEY_CHARS + 1),
+            serde_json::Value::String("v".into()),
+        );
+        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_non_string_metadata_value() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("feature".into(), serde_json::Value::Number(serde_json::Number::from(123)));
+        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_llm_audit_rejects_oversized_metadata_value() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "feature".into(),
+            serde_json::Value::String("v".repeat(MAX_LLM_AUDIT_METADATA_VALUE_CHARS + 1)),
+        );
+        let dto = LlmAuditDto { user: None, session_id: None, metadata: Some(metadata) };
+        assert!(matches!(validate_llm_audit(Some(dto)), Err(AppError::BadRequest(_))));
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn send_message_rejects_too_many_prompt_traits(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -1878,5 +2094,154 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ─── LlmAudit HTTP integration tests ────────────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_rejects_oversized_audit_user(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "audit": { "user": "x".repeat(MAX_LLM_AUDIT_STRING_CHARS + 1) },
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "validation must fire before persistence");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_rejects_too_many_metadata_keys(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let mut metadata = serde_json::Map::new();
+        for i in 0..(MAX_LLM_AUDIT_METADATA_KEYS + 1) {
+            metadata.insert(format!("k{i}"), Value::String("v".into()));
+        }
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "audit": { "metadata": metadata },
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_rejects_non_string_metadata_value(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "audit": { "metadata": { "feature": 123 } },
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn send_message_async_accepts_valid_audit(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vega").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let body = serde_json::to_vec(&json!({
+            "message": "hi",
+            "audit": {
+                "user": "u_abc",
+                "session_id": "conv_xyz",
+                "metadata": { "feature": "chat", "plan": "pro" }
+            },
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message_async"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _resp) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let user_msg_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_msg_count, 1);
+
+        let leak_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND (content LIKE '%u_abc%' OR content LIKE '%conv_xyz%')",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leak_count, 0, "audit strings must never appear in chat_messages.content");
     }
 }

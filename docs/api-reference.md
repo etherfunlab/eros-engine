@@ -96,11 +96,21 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   "lead_score": 4.2,
   "should_show_cta": false,
   "typing_delay_ms": 1340,
-  "agent_training_level": 0.18
+  "agent_training_level": 0.18,
+  "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": 0.0004 },
+  "generation_id": "gen-abc123",
+  "model": "openai/gpt-5.2"
 }
 ```
 
 `reply: null` when the persona ghosted this turn (see [ghost mechanics](ghost-mechanics.md)). The HTTP status is still 200.
+
+`usage` / `generation_id` / `model` are optional echoes of OpenRouter's
+response. They are omitted when upstream didn't return them or when no
+LLM call was made for this turn. The engine treats `usage` as an opaque
+JSON object — callers deserialize as needed. Only on `/message`; the
+`/message_async` route does not surface these fields (see
+[llm-audit.md](llm-audit.md)).
 
 **Optional: per-request prompt traits.** The body may include a
 `prompt_traits` array — see [prompt-traits.md](prompt-traits.md). Example:
@@ -119,7 +129,31 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 Limits: ≤ 8 entries, `tag` matches `[a-z0-9_]{1,32}`, `text` ≤ 2000 chars
 (non-blank). Violations return `400 BadRequest`.
 
-The same field is accepted by `/message_async`.
+**Optional: OpenRouter audit passthrough.** The body may include an
+`audit` object that rides directly to OpenRouter as wire-level `user` /
+`session_id` / `metadata` — see [llm-audit.md](llm-audit.md). Example:
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{
+        "message": "hi",
+        "audit": {
+          "user": "u_<hash>",
+          "session_id": "conv_xyz",
+          "metadata": { "feature": "chat", "plan": "pro" }
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message
+```
+
+Caps: `audit.user` and `audit.session_id` ≤ 256 chars; `audit.metadata`
+≤ 16 keys, key matches `[A-Za-z0-9_.-]{1,64}`, value is a string ≤ 512
+chars. Violations return `400 BadRequest`.
+
+Both `prompt_traits` and `audit` are accepted by `/message_async` as
+well — the async route does not surface `usage` / `generation_id` /
+`model` on its response, but the audit fields still ride through to
+OpenRouter.
 
 ### `POST /comp/chat/{session_id}/message_async`
 

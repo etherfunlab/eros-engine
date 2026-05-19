@@ -170,6 +170,7 @@ async fn classify_session(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        ..Default::default()
     };
     let raw = state
         .openrouter

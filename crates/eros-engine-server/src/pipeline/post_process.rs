@@ -340,6 +340,7 @@ async fn extract_facts(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        ..Default::default()
     };
 
     let raw = match llm.execute(req).await {
@@ -398,6 +399,7 @@ async fn extract_structured_insights(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        ..Default::default()
     };
 
     let raw = match llm.execute(req).await {
