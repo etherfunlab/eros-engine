@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![allow(dead_code)] // wired into routes::router in Task 5.
 //! BFF (backend-for-frontend) routes — `/bff/v1/<area>/*`.
 //!
 //! Frontend-shaped mirror of the canonical engine routes. See

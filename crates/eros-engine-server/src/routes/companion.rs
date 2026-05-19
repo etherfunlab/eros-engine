@@ -320,7 +320,7 @@ pub struct GiftEventResponse {
 
 /// Verify a session exists and is owned by `user_id`. Returns the session
 /// row on success, `404` if missing, `403` if owned by someone else.
-async fn require_session_for_user(
+pub(crate) async fn require_session_for_user(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,

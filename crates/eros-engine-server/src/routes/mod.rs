@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(debug::router(state.config.expose_affinity_debug))
+        .merge(bff::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     let s2s_routes = s2s::router().layer(from_fn_with_state(state.clone(), require_s2s));
