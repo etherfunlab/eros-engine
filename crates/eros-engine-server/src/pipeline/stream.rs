@@ -12,8 +12,13 @@ use serde::Serialize;
 use ulid::Ulid;
 
 /// Stream-level error code enum. Renders to the spec's lowercase string.
+///
+/// `RateLimited` and `Timeout` are spec-defined codes (§1.5) reserved for
+/// the per-stream rate-limit and 120s hard-timeout enforcement that the
+/// 0.2 generator does not yet implement (open §1.9 follow-up).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum StreamErrorCode {
     UpstreamUnavailable,
     RateLimited,

@@ -45,7 +45,7 @@ use eros_engine_core::types::Event;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::{ChatMessage as StoreChatMessage, ChatRepo, ChatSession};
+use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
 use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::persona::PersonaRepo;

@@ -32,8 +32,12 @@ use crate::state::AppState;
 // ─── ProducedMessage ───────────────────────────────────────────────
 
 /// One assistant message persisted during a burst (sync or streaming path).
-/// `action` mirrors the spec's `meta.action_type` discriminator.
+/// `action` mirrors the spec's `meta.action_type` discriminator. `message_id`
+/// and `action` are unused by today's per-message side-effects but are kept
+/// on the struct for the audit / lead-score hooks that a future task will
+/// thread per-message.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProducedMessage {
     pub message_id: Uuid,
     pub full_text: String,
