@@ -227,9 +227,7 @@ impl OpenRouterClient {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            LlmError::Config("openrouter: no models configured".into())
-        }))
+        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -618,13 +616,17 @@ mod tests {
         let server = MockServer::start().await;
         // Primary "p" returns 500; fallback "f1" returns 200.
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "p"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
             .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "f1"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
@@ -639,7 +641,10 @@ mod tests {
             .execute(ChatRequest {
                 model: "p".into(),
                 fallback_model: vec!["f1".into()],
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -653,19 +658,25 @@ mod tests {
     async fn execute_walks_full_fallback_chain() {
         let server = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "p"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
             .respond_with(ResponseTemplate::new(500).set_body_string("p down"))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "f1"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
             .respond_with(ResponseTemplate::new(500).set_body_string("f1 down"))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "f2"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f2"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
@@ -680,7 +691,10 @@ mod tests {
             .execute(ChatRequest {
                 model: "p".into(),
                 fallback_model: vec!["f1".into(), "f2".into()],
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -708,7 +722,10 @@ mod tests {
             .execute(ChatRequest {
                 model: "p".into(),
                 fallback_model: vec!["f1".into()],
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -735,16 +752,26 @@ mod tests {
             .execute(ChatRequest {
                 model: String::new(),
                 fallback_model: Vec::new(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
             })
             .await
             .expect_err("empty chain must Err");
-        assert!(matches!(err, LlmError::Config(_)), "expected Config error, got {err:?}");
         assert!(
-            server.received_requests().await.unwrap_or_default().is_empty(),
+            matches!(err, LlmError::Config(_)),
+            "expected Config error, got {err:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
             "no HTTP request should have been made"
         );
     }
@@ -755,7 +782,9 @@ mod tests {
         // Only "x" should be hit; primary "" must be filtered out before
         // any HTTP call is attempted.
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "x"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "x"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
@@ -770,7 +799,10 @@ mod tests {
             .execute(ChatRequest {
                 model: String::new(),
                 fallback_model: vec!["x".into()],
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()

@@ -124,7 +124,9 @@ impl ServerConfig {
             dreaming_idle_threshold,
             dreaming_claim_stale_threshold,
             openrouter_usage_hidden_keys: parse_usage_hidden_keys(
-                std::env::var("OPENROUTER_USAGE_HIDDEN_KEYS").ok().as_deref(),
+                std::env::var("OPENROUTER_USAGE_HIDDEN_KEYS")
+                    .ok()
+                    .as_deref(),
             ),
         }
     }
@@ -155,7 +157,11 @@ mod tests {
         let out = parse_usage_hidden_keys(Some("cost,,cost_details,"));
         assert!(out.contains("cost"));
         assert!(out.contains("cost_details"));
-        assert_eq!(out.len(), 2, "empty entries from extra commas must be skipped");
+        assert_eq!(
+            out.len(),
+            2,
+            "empty entries from extra commas must be skipped"
+        );
     }
 
     #[test]

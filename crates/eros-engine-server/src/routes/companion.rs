@@ -486,7 +486,9 @@ fn filter_usage_keys(
         return;
     }
     let Some(value) = usage.as_mut() else { return };
-    let Some(obj) = value.as_object_mut() else { return };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
     for key in hidden {
         obj.remove(key);
     }
@@ -2012,7 +2014,10 @@ mod tests {
         assert_eq!(out.get("prompt_tokens").and_then(|v| v.as_u64()), Some(10));
         assert_eq!(out.get("total_tokens").and_then(|v| v.as_u64()), Some(18));
         assert!(out.get("cost").is_none(), "cost must be stripped");
-        assert!(out.get("cost_details").is_none(), "cost_details must be stripped");
+        assert!(
+            out.get("cost_details").is_none(),
+            "cost_details must be stripped"
+        );
     }
 
     #[test]

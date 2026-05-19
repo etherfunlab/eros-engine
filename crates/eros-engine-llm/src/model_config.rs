@@ -306,7 +306,11 @@ description  = "reserved — Voyage hard-codes its own model"
         let insight = cfg.tasks.get("insight_extraction").unwrap();
         assert_eq!(insight.model, "x-ai/grok-4-mini");
         assert_eq!(
-            insight.fallback.clone().expect("fallback present").into_vec(),
+            insight
+                .fallback
+                .clone()
+                .expect("fallback present")
+                .into_vec(),
             vec!["deepseek/deepseek-chat-v3.2".to_string()]
         );
         assert_eq!(insight.temperature, Some(0.3));
