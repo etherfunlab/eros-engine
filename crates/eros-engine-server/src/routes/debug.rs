@@ -10,7 +10,6 @@ use axum::{
     extract::{Extension, Path, State},
     Json,
 };
-use serde::Serialize;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
@@ -18,21 +17,13 @@ use eros_engine_store::affinity::AffinityRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
+use crate::routes::dto::AffinitySnapshot;
 use crate::state::AppState;
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AffinityDebugResponse {
-    pub warmth: f64,
-    pub trust: f64,
-    pub intrigue: f64,
-    pub intimacy: f64,
-    pub patience: f64,
-    pub tension: f64,
-    pub ghost_streak: i32,
-    pub total_ghosts: i32,
-    pub relationship_label: Option<String>,
-    pub updated_at: String,
-}
+/// Back-compat alias retained for one release so external OpenAPI consumers
+/// that referenced the old type name don't break instantly. Will be removed
+/// in the next minor; new code uses `AffinitySnapshot` directly.
+pub type AffinityDebugResponse = AffinitySnapshot;
 
 /// Inspect the live affinity vector for a session. The session must be
 /// owned by the JWT user; otherwise 403.
@@ -42,7 +33,7 @@ pub struct AffinityDebugResponse {
     tag = "debug",
     params(("session_id" = Uuid, Path, description = "Chat session id")),
     responses(
-        (status = 200, body = AffinityDebugResponse),
+        (status = 200, body = AffinitySnapshot),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, description = "not your session"),
         (status = 404, description = "session has no affinity")
@@ -53,7 +44,7 @@ async fn get_affinity(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Path(session_id): Path<Uuid>,
-) -> Result<Json<AffinityDebugResponse>, AppError> {
+) -> Result<Json<AffinitySnapshot>, AppError> {
     let repo = AffinityRepo { pool: &state.pool };
     let mut a = repo
         .load(session_id)
@@ -63,31 +54,7 @@ async fn get_affinity(
         return Err(AppError::Forbidden("not your session".into()));
     }
     a.apply_time_decay();
-
-    let label = a.relationship_label.map(|l| {
-        use eros_engine_core::affinity::RelationshipLabel as L;
-        match l {
-            L::Stranger => "stranger",
-            L::Romantic => "romantic",
-            L::Friend => "friend",
-            L::Frenemy => "frenemy",
-            L::SlowBurn => "slow_burn",
-        }
-        .to_string()
-    });
-
-    Ok(Json(AffinityDebugResponse {
-        warmth: a.warmth,
-        trust: a.trust,
-        intrigue: a.intrigue,
-        intimacy: a.intimacy,
-        patience: a.patience,
-        tension: a.tension,
-        ghost_streak: a.ghost_streak,
-        total_ghosts: a.total_ghosts,
-        relationship_label: label,
-        updated_at: a.updated_at.to_rfc3339(),
-    }))
+    Ok(Json(AffinitySnapshot::from(a)))
 }
 
 /// Build the debug router. Returns an empty router when `enabled = false`

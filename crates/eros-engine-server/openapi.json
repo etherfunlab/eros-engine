@@ -108,7 +108,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AffinityDebugResponse"
+                  "$ref": "#/components/schemas/AffinitySnapshot"
                 }
               }
             }
@@ -792,8 +792,39 @@
   },
   "components": {
     "schemas": {
-      "AffinityDebugResponse": {
+      "AffinityDeltasDto": {
         "type": "object",
+        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
+        "properties": {
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "AffinitySnapshot": {
+        "type": "object",
+        "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
         "required": [
           "warmth",
           "trust",
@@ -842,36 +873,6 @@
           },
           "updated_at": {
             "type": "string"
-          },
-          "warmth": {
-            "type": "number",
-            "format": "double"
-          }
-        }
-      },
-      "AffinityDeltasDto": {
-        "type": "object",
-        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
-        "properties": {
-          "intimacy": {
-            "type": "number",
-            "format": "double"
-          },
-          "intrigue": {
-            "type": "number",
-            "format": "double"
-          },
-          "patience": {
-            "type": "number",
-            "format": "double"
-          },
-          "tension": {
-            "type": "number",
-            "format": "double"
-          },
-          "trust": {
-            "type": "number",
-            "format": "double"
           },
           "warmth": {
             "type": "number",

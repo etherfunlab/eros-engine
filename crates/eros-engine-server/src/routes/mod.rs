@@ -24,6 +24,7 @@ pub mod bff;
 pub mod companion;
 pub mod companion_stream;
 pub mod debug;
+pub mod dto;
 pub mod health;
 pub mod s2s;
 
