@@ -47,12 +47,14 @@ Plans B and C introduce a new top-level routing tree:
 ### Convention rules
 
 1. **`/bff/v1/<area>/*` mirrors the path layout of `/<area>/*`.** Same `session_id` / `instance_id` semantics in the path. The transformation lives in request/response *shape*, not URL structure.
-2. **BFF routes serve `eros-engine-web` (and any future first-party web/mobile client).** They are NOT a stable third-party API surface. We may aggregate, reshape, or drop fields without versioning beyond `v1`.
+2. **BFF routes serve `eros-engine-web` (and any future first-party web/mobile client).** They are NOT a stable third-party API surface. **Additive** changes (new optional fields, new endpoints, looser validation) ship in-place within `v1`. **Breaking** changes (removed/renamed fields, tightened validation, changed required body shape) go to `/bff/v2/...` — see rule 5.
 3. **Engine-canonical routes (`/comp/*` etc.) are NEVER modified to satisfy frontend ergonomics.** If the FE needs a different shape, add a BFF route. This keeps the OSS engine contract stable for downstream consumers.
-4. **BFF endpoints reuse the same auth (Supabase JWT) and middleware** as their engine counterparts — same `require_auth` layer attached to the merged sub-router.
-5. **`v1` is reserved for additive evolution.** Breaking BFF shape changes go to `/bff/v2/...` and the old version sticks around for one minor release before deletion.
+4. **BFF endpoints reuse the same auth (Supabase JWT) and middleware** as their engine counterparts — same `require_auth` layer attached to the merged sub-router. They also inherit the engine's `AppError` JSON taxonomy (`{ "error": code, "message": ... }`) and the bare-`401` auth-middleware response — no BFF-specific error envelope.
+5. **`v1` is reserved for additive evolution; breaking changes mean `v2`.** A `/bff/v2/...` endpoint may co-exist with its `v1` predecessor for one minor release before the `v1` form is deleted.
 6. **The `v` version in the URL is BFF-layer-wide, not per-endpoint.** All `/bff/v1/*` endpoints share the same versioning lifecycle. Avoid stamping individual endpoints with different versions.
-7. **OSS scope: BFF for `/comp/*` lives in `eros-engine` (AGPL-3.0).** The transformation is a thin shape adapter on top of an already-OSS surface — no commercial IP. Future BFF for closed-source areas (`/match/*`, etc.) will live in the future closed `eros-gateway`, mirroring its own non-OSS counterparts.
+7. **OSS scope: BFF for `/comp/*` lives in `eros-engine` (AGPL-3.0).** The transformation is a thin shape adapter on top of an already-OSS surface — no commercial IP. Future BFF for closed-source areas (`/match/*`, etc.) will live in the future closed `eros-gateway`, mirroring its own non-OSS counterparts. BFF routes in **this** OSS repo MUST NOT import from, or assume the existence of, `eros-gateway`.
+8. **BFF routes never call other BFF routes or canonical HTTP handlers.** They reach down to repos (`ChatRepo`, `AffinityRepo`, …) and shared `pub(crate)` helpers (`resolve_or_create_session`, …) directly. This keeps auth, error mapping, and OpenAPI explicit — no in-process HTTP recursion, no double-wrapping of `AppError`.
+9. **Each BFF handler gets a distinct Rust function name** (`bff_get_history`, `bff_start_chat`, …) so utoipa-axum emits a unique OpenAPI `operationId` that doesn't collide with the canonical handler of the same shape. All BFF handlers tag themselves `bff-companion` (or future `bff-<area>`), declared in `openapi.rs`.
 
 ### Why a BFF layer?
 
@@ -105,22 +107,22 @@ Each BFF handler's `#[utoipa::path]` uses the full path including the `/bff/v1/`
 
 That's the entire change.
 
-### 1.2 Note on prod deploy
+### 1.2 Note on deploy
 
-The repo `fly.toml` is the file that drives the live `erosnx.etherfun.net` deploy. This PR's one-line change ships directly via `flyctl deploy`. (The file's "Adapt to your own deployment" header is for downstream forks; it's our prod config too.)
+The repo `fly.toml` is the live config for whoever runs this image: this PR's one-line change ships directly via `flyctl deploy <your-app>`. The file's "example config — adapt to your own deployment" header still applies for downstream forks; operators of any first-party deploy keep their app name / region in their own private values file or `flyctl deploy` args, not in this OSS file.
 
 ### 1.3 Verification
 
 After `flyctl deploy`:
 
 ```
-flyctl status -a eros-engine
+flyctl status -a <your-app>
 # expected: ≥ 1 machine in `started` state when traffic is zero
 ```
 
 ### 1.4 Cost
 
-~$5/mo for one `shared-cpu-1x` (256 MB) running 24/7 in NRT at current Fly pricing.
+One `shared-cpu-1x` (currently `512 MB` per `fly.toml`) running 24/7 in NRT. At current Fly pricing this is a small recurring compute charge (single-digit USD/mo before bandwidth and org allowances); call it "a coffee a month" rather than pin a precise number that will rot.
 
 ### 1.5 Rollback
 
@@ -141,7 +143,7 @@ GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0
 Auth: Bearer <Supabase JWT>
 ```
 
-Same auth, same `(session_id, user_id)` ownership check, same `limit ∈ [1, 50] default 50`, same `offset ≥ 0` as the engine endpoint. The only difference is the response shape.
+Same auth, same `(session_id, user_id)` ownership check, same `limit ∈ [1, 50]`, same `offset ≥ 0` as the engine endpoint. **Intentional divergence: BFF defaults `limit=50` (the cap), engine defaults `limit=20`.** Reason: BFF exists for cold-mount, where the FE wants a full backscroll in one round-trip; the canonical endpoint stays conservative for OSS consumers paging through history. Plan-stage tests pin both defaults so the divergence is explicit.
 
 ### 2.3 Response DTO
 
@@ -159,6 +161,10 @@ pub struct BffHistoryEntry {
 pub struct BffHistoryResponse {
     pub session_id: Uuid,
     pub messages: Vec<BffHistoryEntry>,
+    /// Count of `messages` in this response (== `messages.len()`). NOT the
+    /// total row count for the session — pagination doesn't know how many
+    /// rows remain. Mirrors the existing `/comp/.../history` `total` field
+    /// so a FE that already keys off it doesn't have to relearn semantics.
     pub total: usize,
 }
 ```
@@ -226,7 +232,7 @@ Same `idx_chat_messages_session (session_id, sent_at DESC)` index, same DESC+rev
     ),
     security(("bearer" = []))
 )]
-async fn get_history(
+async fn bff_get_history(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
@@ -282,7 +288,7 @@ Body:
 }
 ```
 
-The request body is identical to today's `POST /comp/chat/start`. The response is the bundled FE shape.
+The request body **extends** today's `POST /comp/chat/start` body (`instance_id`, `genome_id`, `is_demo`) with one optional BFF-only field, `history_limit`. The canonical endpoint never sees `history_limit`; it is consumed and dropped at the BFF boundary. The response is the bundled FE shape.
 
 ### 3.3 Request / Response DTOs
 
@@ -318,7 +324,7 @@ No `include_history` / `include_affinity` flags — the BFF endpoint **always bu
 ### 3.4 Handler logic
 
 ```rust
-async fn start_chat(
+async fn bff_start_chat(
     State(state): State<AppState>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<BffStartRequest>,
@@ -330,21 +336,26 @@ async fn start_chat(
     let resolved = resolve_or_create_session(&state, user_id, &req).await?;
     let history_limit = req.history_limit.unwrap_or(50).clamp(1, 50);
 
-    // 2. Fire history + affinity in parallel against the same pool.
+    // 2. Fire history + affinity in parallel on the same sqlx pool. Both
+    //    arms return Result<_, AppError> directly so try_join! has nothing
+    //    to coerce.
     let history_fut = async {
-        ChatRepo { pool: &state.pool }
-            .history_slim(resolved.session_id, history_limit, 0).await
+        Ok::<_, AppError>(
+            ChatRepo { pool: &state.pool }
+                .history_slim(resolved.session_id, history_limit, 0)
+                .await?
+        )
     };
     let affinity_fut = async {
-        if !state.config.expose_affinity_debug { return Ok::<_, AppError>(None); }
+        if !state.config.expose_affinity_debug {
+            return Ok::<_, AppError>(None);
+        }
         Ok(AffinityRepo { pool: &state.pool }
-            .load(resolved.session_id).await?
+            .load(resolved.session_id)
+            .await?
             .map(|mut a| { a.apply_time_decay(); AffinitySnapshot::from(a) }))
     };
-    let (rows, affinity) = tokio::try_join!(
-        async { Ok::<_, AppError>(history_fut.await?) },
-        affinity_fut,
-    )?;
+    let (rows, affinity) = tokio::try_join!(history_fut, affinity_fut)?;
 
     let history = rows.into_iter().map(|r| BffHistoryEntry {
         role: r.role, content: r.content, sent_at: r.sent_at,
@@ -362,10 +373,13 @@ async fn start_chat(
 ```
 
 Key points:
-- `tokio::try_join!` runs both reads concurrently on the same shared pool — no extra connection cost.
-- Brand-new session ⇒ `history: []` (definitionally empty) and `affinity: None` (no row yet).
-- `affinity: None` is also returned when the debug gate is closed (§3.5).
-- The session-resolution step (instance lookup, NFT gate, session create/resume) is the **same logic** as `/comp/chat/start`. To avoid copy-paste, extract it into a pure helper that both handlers call. See §3.6.
+- `tokio::try_join!` runs both reads concurrently on the same shared sqlx pool. No new pool is opened, but the two arms each check out a pooled connection for the duration of their query — peak handler concurrency for one BFF call is two connections, not one. Bench cost is negligible since both queries are sub-ms indexed lookups.
+- Brand-new session ⇒ `history: []` (definitionally empty).
+- `affinity: None` covers **three** cases that the FE should treat as "no calibration to show":
+  1. `EXPOSE_AFFINITY_DEBUG=false` — gate closed (§3.5).
+  2. Brand-new session — `create_session_with_metadata` doesn't create an affinity row; `AffinityRepo::load_or_create` only runs inside message/gift flows.
+  3. Resumed session that has never had an affinity-producing event yet — same reason: no row exists.
+- The session-resolution step (instance lookup, NFT gate, session create/resume) is the **same logic** as `/comp/chat/start`. To avoid copy-paste, extract it into a pure helper that both handlers call. See §3.6. The handler's documented response set is `200 / 401 / 403 / 404` — `403` propagates from the NFT gate inside `resolve_or_create_session` exactly like the canonical endpoint.
 
 ### 3.5 Affinity gating (`EXPOSE_AFFINITY_DEBUG`)
 
@@ -410,7 +424,7 @@ pub(crate) async fn resolve_or_create_session(
 }
 ```
 
-Both `start_chat` (engine) and `start_chat` (BFF) call this. The canonical engine handler keeps building its own response shape; the BFF handler builds the bundled shape. Zero behaviour change to the existing endpoint.
+Both `start_chat` (canonical, in `routes/companion.rs`) and `bff_start_chat` (in `routes/bff/companion.rs`) call this. The canonical engine handler keeps building its own response shape; the BFF handler builds the bundled shape. Zero behaviour change to the existing endpoint.
 
 ### 3.7 Backwards compatibility
 
@@ -423,7 +437,9 @@ Plan C is **additive** — ships in any 0.2.x patch. No need to wait for 0.3.
 ### 3.9 Open items for plan stage
 
 - **Whether to allow `history_limit = 0`.** Recommend: no. Clamp to `[1, 50]`. A caller that doesn't want history can use a different endpoint (or pagination later). Avoids ambiguous semantics.
-- **Tracing / metrics.** Add `bff.start.bundle_emitted` counter so we can measure web adoption once the consumer PR lands.
+- **Tracing / metrics.** Add `bff.start.bundle_emitted` counter so we can measure web adoption once the consumer PR lands. On each BFF handler add a `tracing` span with `route`, `session_id`, `instance_id`, `is_new`, `history_count`, `affinity_present`, `affinity_gate_open`, and elapsed durations for the resolve / history / affinity slices — handy for spotting the next bottleneck after Plans A/B/C land.
+- **NFT-gate parity tests.** `resolve_or_create_session` must preserve the canonical handler's NFT-gate ordering (gate on explicit `instance_id` after the load+owner check; gate on `genome_id` before find-or-create). E2E coverage should hit both `/comp/chat/start` and `/bff/v1/comp/chat/start` with the same gated input and assert identical 4xx response.
+- **Concurrent-first-call idempotency.** Canonical `/comp/chat/start` is resume-or-create with no DB-level unique `(user_id, instance_id, status='active')` constraint, so two simultaneous first calls can race and create two sessions. Plan C does not change this — but the web migration concentrates more cold-mount POSTs through this code path, which makes the race observable in a way it wasn't before. Plan stage should decide whether to add the unique constraint now or treat as a follow-up; do **not** silently inherit the race.
 
 ---
 
@@ -493,26 +509,41 @@ Plan B — /bff/v1/comp/chat/{session_id}/history
          pub fn router() -> OpenApiRouter<AppState>  { /* merge of bff handlers */ }
   B3   crates/eros-engine-server/src/routes/bff/companion.rs (new):
          + BffHistoryEntry, BffHistoryResponse
-         + handler get_history
+         + handler bff_get_history  (distinct name so OpenAPI operationId
+           doesn't collide with companion::get_history)
   B4   routes/mod.rs: add bff::router() to the `comp` merged subtree
          (so it inherits require_auth)
-  B5   cargo test -p eros-engine-server  (BFF history E2E: success / 401 / 403 / 404)
-  B6   regenerate OpenAPI snapshot (utoipa picks up new path/tag automatically)
+  B4a  routes/mod.rs: add bff::router() to router_for_openapi() too —
+         CI diffs `openapi.json` against `print-openapi` output, so the
+         BFF routes must appear in the openapi-extraction router
+  B4b  openapi.rs: extend the `tags(...)` list with
+         (name = "bff-companion", description = "BFF mirror of /comp/* shaped for eros-engine-web")
+  B5   cargo test -p eros-engine-server  (BFF history E2E: success / 401 / 403 / 404,
+         plus default-limit-is-50 assertion to pin the intentional divergence
+         from canonical's default of 20)
+  B6   regenerate OpenAPI snapshot:
+         cargo run -p eros-engine-server --quiet -- print-openapi \
+           > crates/eros-engine-server/openapi.json
 
 Plan C — /bff/v1/comp/chat/start
   C1   routes/companion.rs: extract resolve_or_create_session as pub(crate) fn;
-         refactor existing start_chat to call it
+         refactor existing start_chat to call it. Preserve NFT-gate ordering
+         (gate on explicit instance_id AFTER load+owner check; gate on
+         genome_id BEFORE find-or-create — see §3.9 NFT-gate parity tests)
   C2   routes/dto.rs (new): move AffinityDebugResponse → AffinitySnapshot;
          add From<Affinity> for AffinitySnapshot;
          routes/debug.rs updates its import + re-export under old name for one release
   C3   routes/bff/companion.rs:
          + BffStartRequest, BffStartResponse
-         + handler start_chat (uses resolve_or_create_session + history_slim + AffinityRepo)
+         + handler bff_start_chat (distinct name — see B3 note;
+           uses resolve_or_create_session + history_slim + AffinityRepo)
   C4   cargo test -p eros-engine-server  (BFF start E2E:
          brand-new-session-empty-history / resumed-session-with-history /
          affinity-null-when-debug-off / affinity-present-when-debug-on /
-         shared-resolver-matches-engine-endpoint)
-  C5   regenerate OpenAPI snapshot
+         shared-resolver-matches-engine-endpoint /
+         nft-gate-rejects-explicit-instance-id-not-owned /
+         nft-gate-rejects-genome-without-nft)
+  C5   regenerate OpenAPI snapshot (same command as B6)
 ```
 
 Web migration (separately tracked in `eros-engine-web/docs/superpowers/specs/`):
