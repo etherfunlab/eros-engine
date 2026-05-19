@@ -638,6 +638,7 @@ async fn send_message(
         content: req.message.clone(),
         message_id: user_message_id,
         prompt_traits,
+        audit: None,
     };
     let response = pipeline::run(&state, session_id, event).await?;
 
@@ -725,6 +726,7 @@ async fn send_message_async(
             content: msg_copy,
             message_id: user_message_id,
             prompt_traits: traits_copy,
+            audit: None,
         };
         if let Err(e) = pipeline::run(&state_bg, session_id, event).await {
             tracing::error!("engine pipeline failed for session {session_id}: {e}");

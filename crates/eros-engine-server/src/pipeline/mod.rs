@@ -24,7 +24,6 @@ use eros_engine_core::types::{
     ActionType, ChatResponse, ConversationSignals, DecisionInput, Event,
 };
 use eros_engine_core::{pde, persona::CompanionPersona};
-use eros_engine_llm::openrouter::ChatResponse as LlmChatResponse;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::persona::PersonaRepo;
@@ -129,16 +128,21 @@ pub async fn run(
     // engine's public API stays decoupled from the openrouter wire shape.
     let response: Option<ChatResponse> = match chat_req {
         Some(req) => {
-            let LlmChatResponse { reply } = state
+            let llm_resp = state
                 .openrouter
                 .execute(req)
                 .await
                 .map_err(|e| AppError::Internal(format!("openrouter: {e}")))?;
             let chat_repo = ChatRepo { pool: &state.pool };
             chat_repo
-                .append_message(session_id, "assistant", &reply)
+                .append_message(session_id, "assistant", &llm_resp.reply)
                 .await?;
-            Some(ChatResponse { reply })
+            Some(ChatResponse {
+                reply: llm_resp.reply,
+                generation_id: None,
+                model: None,
+                usage: None,
+            })
         }
         None => None,
     };
