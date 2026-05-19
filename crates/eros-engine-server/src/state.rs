@@ -66,7 +66,13 @@ pub struct StreamSlots {
 }
 
 impl StreamSlots {
-    pub fn try_acquire(&self, user_id: Uuid, cap: u32) -> Option<StreamSlotGuard> {
+    /// Attempt to acquire a stream slot for `user_id`.
+    ///
+    /// Returns `Some(StreamSlotGuard)` if the current count is below `cap`,
+    /// or `None` if the cap is already reached. The guard is `'static` (it
+    /// holds an `Arc<StreamSlots>`) so it can be moved into SSE stream bodies
+    /// without lifetime trouble.
+    pub fn try_acquire(self: &Arc<Self>, user_id: Uuid, cap: u32) -> Option<StreamSlotGuard> {
         let mut guard = self.inner.lock().expect("StreamSlots mutex poisoned");
         let entry = guard.entry(user_id).or_insert(0);
         if *entry >= cap {
@@ -74,18 +80,22 @@ impl StreamSlots {
         }
         *entry += 1;
         Some(StreamSlotGuard {
-            slots: self,
+            slots: Arc::clone(self),
             user_id,
         })
     }
 }
 
-pub struct StreamSlotGuard<'a> {
-    slots: &'a StreamSlots,
+/// An RAII guard that decrements the per-user stream count when dropped.
+///
+/// Holds an `Arc<StreamSlots>` so it is `'static` and can be moved into
+/// long-lived futures / SSE stream bodies.
+pub struct StreamSlotGuard {
+    slots: Arc<StreamSlots>,
     user_id: Uuid,
 }
 
-impl Drop for StreamSlotGuard<'_> {
+impl Drop for StreamSlotGuard {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.slots.inner.lock() {
             if let Some(count) = guard.get_mut(&self.user_id) {
@@ -226,7 +236,7 @@ mod tests {
 
     #[test]
     fn stream_slots_acquire_until_cap_then_blocks() {
-        let slots = StreamSlots::default();
+        let slots = Arc::new(StreamSlots::default());
         let uid = Uuid::new_v4();
 
         let g1 = slots.try_acquire(uid, 2).expect("1st acquire under cap");
