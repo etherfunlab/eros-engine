@@ -434,7 +434,13 @@ pub(super) async fn build_gift_request(
         &[],
     );
 
-    Ok(assemble_chat_request(state, input, system_prompt, history, None))
+    Ok(assemble_chat_request(
+        state,
+        input,
+        system_prompt,
+        history,
+        None,
+    ))
 }
 
 pub struct ReplyHandler<'a> {
@@ -452,7 +458,12 @@ impl<'a> ActionHandler for ReplyHandler<'a> {
         plan: &ActionPlan,
     ) -> Result<Option<ChatRequest>, AppError> {
         let req = build_reply_request(
-            self.state, input, plan, self.session_id, self.user_id, self.instance_id,
+            self.state,
+            input,
+            plan,
+            self.session_id,
+            self.user_id,
+            self.instance_id,
         )
         .await?;
         Ok(Some(req))

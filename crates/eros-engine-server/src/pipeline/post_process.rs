@@ -72,7 +72,15 @@ pub async fn run(
     let fut_memory = async {
         for m in &produced {
             if !user_msg.is_empty() && !m.full_text.is_empty() {
-                write_turn(&state, session_id, user_id, instance_id, &user_msg, &m.full_text).await;
+                write_turn(
+                    &state,
+                    session_id,
+                    user_id,
+                    instance_id,
+                    &user_msg,
+                    &m.full_text,
+                )
+                .await;
             }
         }
     };

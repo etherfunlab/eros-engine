@@ -102,7 +102,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.headers().get("X-Accel-Buffering").unwrap(), "no");
         assert_eq!(
-            resp.headers().get(axum::http::header::CACHE_CONTROL).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
             "no-cache, no-transform, private"
         );
     }

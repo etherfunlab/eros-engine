@@ -45,6 +45,9 @@ mod tests {
     #[test]
     fn stream_parse_variant_renders_message() {
         let e = LlmError::StreamParse("bad delta envelope".into());
-        assert_eq!(e.to_string(), "openrouter stream parse error: bad delta envelope");
+        assert_eq!(
+            e.to_string(),
+            "openrouter stream parse error: bad delta envelope"
+        );
     }
 }

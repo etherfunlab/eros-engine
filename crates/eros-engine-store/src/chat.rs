@@ -276,7 +276,9 @@ impl<'a> ChatRepo<'a> {
                     assistant_chain: vec![],
                 }
             } else {
-                UpsertUserOutcome::DuplicateInProgress { user_message_id: row.id }
+                UpsertUserOutcome::DuplicateInProgress {
+                    user_message_id: row.id,
+                }
             });
         }
 
@@ -472,7 +474,9 @@ mod tests {
                 continues_from_message_id: None,
                 truncated: false,
                 model: Some("x-ai/grok-4-fast".into()),
-                usage: Some(serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})),
+                usage: Some(
+                    serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}),
+                ),
                 generation_id: Some("gen-1".into()),
             }],
         )
@@ -484,7 +488,11 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            UpsertUserOutcome::Replay { user_message_id, ghost, assistant_chain } => {
+            UpsertUserOutcome::Replay {
+                user_message_id,
+                ghost,
+                assistant_chain,
+            } => {
                 assert_eq!(user_message_id, first);
                 assert!(!ghost);
                 assert_eq!(assistant_chain.len(), 1);
@@ -544,7 +552,11 @@ mod tests {
             .await
             .unwrap()
         {
-            UpsertUserOutcome::Replay { ghost, assistant_chain, .. } => {
+            UpsertUserOutcome::Replay {
+                ghost,
+                assistant_chain,
+                ..
+            } => {
                 assert!(ghost);
                 assert!(assistant_chain.is_empty());
             }

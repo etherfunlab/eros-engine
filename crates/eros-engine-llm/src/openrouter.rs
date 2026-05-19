@@ -359,10 +359,7 @@ impl OpenRouterClient {
 
     /// Open a streaming chat completion against a single model. Fallback
     /// chain handling is the caller's responsibility (pipeline layer).
-    pub async fn execute_stream(
-        &self,
-        req: ChatRequest,
-    ) -> Result<DeltaStream, LlmError> {
+    pub async fn execute_stream(&self, req: ChatRequest) -> Result<DeltaStream, LlmError> {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
@@ -402,35 +399,34 @@ impl OpenRouterClient {
             return Err(LlmError::Status(status, text));
         }
 
-        let stream = resp.bytes_stream().eventsource().filter_map(|ev| async move {
-            match ev {
-                Ok(e) => {
-                    if e.data == "[DONE]" {
-                        return None;
-                    }
-                    match serde_json::from_str::<WireStreamFrame>(&e.data) {
-                        Ok(frame) => {
-                            let choice = frame
-                                .choices
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default();
-                            Some(Ok(DeltaChunk {
-                                content: choice.delta.content.filter(|s| !s.is_empty()),
-                                finish_reason: choice.finish_reason,
-                                usage: frame.usage,
-                                generation_id: frame.id,
-                                model: frame.model,
-                            }))
+        let stream = resp
+            .bytes_stream()
+            .eventsource()
+            .filter_map(|ev| async move {
+                match ev {
+                    Ok(e) => {
+                        if e.data == "[DONE]" {
+                            return None;
                         }
-                        Err(_) => Some(Err(LlmError::StreamParse(
-                            e.data.chars().take(256).collect(),
-                        ))),
+                        match serde_json::from_str::<WireStreamFrame>(&e.data) {
+                            Ok(frame) => {
+                                let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                Some(Ok(DeltaChunk {
+                                    content: choice.delta.content.filter(|s| !s.is_empty()),
+                                    finish_reason: choice.finish_reason,
+                                    usage: frame.usage,
+                                    generation_id: frame.id,
+                                    model: frame.model,
+                                }))
+                            }
+                            Err(_) => Some(Err(LlmError::StreamParse(
+                                e.data.chars().take(256).collect(),
+                            ))),
+                        }
                     }
+                    Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
                 }
-                Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
-            }
-        });
+            });
 
         Ok(DeltaStream(stream.boxed()))
     }
@@ -1003,7 +999,10 @@ data: [DONE]\n\n";
             .execute_stream(ChatRequest {
                 model: "x-ai/grok-4-fast".into(),
                 fallback_model: Vec::new(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -1017,10 +1016,18 @@ data: [DONE]\n\n";
         let mut last_model: Option<String> = None;
         while let Some(item) = stream.next().await {
             let chunk = item.expect("delta chunk parses");
-            if let Some(c) = chunk.content { contents.push(c); }
-            if chunk.usage.is_some()         { last_usage = chunk.usage; }
-            if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id; }
-            if chunk.model.is_some()         { last_model = chunk.model; }
+            if let Some(c) = chunk.content {
+                contents.push(c);
+            }
+            if chunk.usage.is_some() {
+                last_usage = chunk.usage;
+            }
+            if chunk.generation_id.is_some() {
+                last_gen_id = chunk.generation_id;
+            }
+            if chunk.model.is_some() {
+                last_model = chunk.model;
+            }
         }
         assert_eq!(contents, vec!["你".to_string(), "好".to_string()]);
         let u = last_usage.expect("usage present on terminal chunk");
@@ -1048,7 +1055,10 @@ data: [DONE]\n\n";
         let err = client
             .execute_stream(ChatRequest {
                 model: "x-ai/grok-4-fast".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -1084,7 +1094,10 @@ data: [DONE]\n\n";
         let mut stream = client
             .execute_stream(ChatRequest {
                 model: "x-ai/grok-4-fast".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()

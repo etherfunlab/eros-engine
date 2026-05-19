@@ -169,9 +169,7 @@ pub async fn send_message_stream(
             AppError::StreamPre(StreamPreError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "rate_limited",
-                message: format!(
-                    "per-user stream cap reached ({CONCURRENT_STREAMS_PER_USER})"
-                ),
+                message: format!("per-user stream cap reached ({CONCURRENT_STREAMS_PER_USER})"),
                 user_message: "请求过多，请稍后再试".into(),
                 original_user_message_id: None,
             })
@@ -210,10 +208,18 @@ pub async fn send_message_stream(
                     original_user_message_id: Some(user_message_id),
                 }));
             }
-            UpsertUserOutcome::Replay { ghost, assistant_chain, .. } => {
+            UpsertUserOutcome::Replay {
+                ghost,
+                assistant_chain,
+                ..
+            } => {
                 let state_arc = Arc::new(state.clone());
                 Box::pin(replay_stream(
-                    state_arc, session_id, user_id, ghost, assistant_chain,
+                    state_arc,
+                    session_id,
+                    user_id,
+                    ghost,
+                    assistant_chain,
                 ))
             }
         };
@@ -230,8 +236,8 @@ pub async fn send_message_stream(
             }
         },
         |frame: ProtocolFrame| {
-            let json = serde_json::to_string(&frame)
-                .expect("ProtocolFrame serialization is infallible");
+            let json =
+                serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
             Ok::<_, Infallible>(Event::default().data(json))
         },
     );
@@ -290,12 +296,18 @@ mod tests {
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
-        .bind(user_id).bind(instance_id).fetch_one(&pool).await.unwrap();
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         let state = crate::routes::companion::test_state(pool);
         let mut app = build_router(state);
         let token = mint_jwt(user_id);
-        let body = serde_json::to_vec(&json!({"content":"","client_msg_id":"01J2222222222222222222222A"})).unwrap();
+        let body =
+            serde_json::to_vec(&json!({"content":"","client_msg_id":"01J2222222222222222222222A"}))
+                .unwrap();
         let req = Request::builder()
             .method("POST")
             .uri(format!("/comp/chat/{session_id}/message/stream"))
@@ -318,13 +330,20 @@ mod tests {
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
              VALUES ('R', 'p', '{}'::jsonb, true) RETURNING id",
         )
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let instance_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
         ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        ).bind(user_id).bind(instance_id).fetch_one(&pool).await.unwrap();
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // Pre-seed an original-request outcome.
         let chat_repo = ChatRepo { pool: &pool };
@@ -358,7 +377,10 @@ mod tests {
         let state = crate::routes::companion::test_state(pool);
         let mut app = build_router(state);
         let token = mint_jwt(user_id);
-        let body = serde_json::to_vec(&json!({"content":"hi","client_msg_id":"01J3333333333333333333333A"})).unwrap();
+        let body = serde_json::to_vec(
+            &json!({"content":"hi","client_msg_id":"01J3333333333333333333333A"}),
+        )
+        .unwrap();
         let req = Request::builder()
             .method("POST")
             .uri(format!("/comp/chat/{session_id}/message/stream"))
@@ -368,13 +390,21 @@ mod tests {
             .unwrap();
         let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.starts_with("text/event-stream"));
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body_text = std::str::from_utf8(&bytes).unwrap();
         // The replayed delta carries the persisted content verbatim.
         assert!(body_text.contains("replayed reply"), "body: {body_text}");
         // And the final frame closes the stream.
-        assert!(body_text.contains("\"type\":\"final\""), "body: {body_text}");
+        assert!(
+            body_text.contains("\"type\":\"final\""),
+            "body: {body_text}"
+        );
     }
 }

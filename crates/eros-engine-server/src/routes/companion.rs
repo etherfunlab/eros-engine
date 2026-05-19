@@ -177,7 +177,6 @@ pub struct CompanionReplyResponse {
     pub model: Option<String>,
 }
 
-
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct HistoryQuery {
     pub limit: Option<i64>,
@@ -788,8 +787,6 @@ async fn send_message(
         model,
     }))
 }
-
-
 
 /// Paginated chat history (oldest-first) for the given session.
 #[utoipa::path(

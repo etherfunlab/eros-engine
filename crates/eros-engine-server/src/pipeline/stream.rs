@@ -82,8 +82,8 @@ pub const MAX_STREAM_FALLBACK_DEPTH: usize = 2;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use eros_engine_core::types::{ActionType, DecisionInput, Event};
 use eros_engine_core::pde;
+use eros_engine_core::types::{ActionType, DecisionInput, Event};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::persona::PersonaRepo;
@@ -96,6 +96,7 @@ use crate::state::AppState;
 /// burst, returns the produced messages via `produced_out` for the caller
 /// to spawn post_process with. Does NOT yield Final — the caller emits it
 /// after the burst so it reflects post-burst state.
+#[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
     session_id: Uuid,
@@ -104,7 +105,9 @@ fn drive_chat_burst(
     persist_action: &'static str, // "reply" | "gift_reaction"
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
-    produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>>,
+    produced_out: std::sync::Arc<
+        std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>,
+    >,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -440,20 +443,15 @@ pub fn run_stream(
 }
 
 /// Compute the spec's `final` frame from current session/user state.
-async fn compute_final_frame(
-    state: &AppState,
-    session_id: Uuid,
-    user_id: Uuid,
-) -> ProtocolFrame {
-    let lead_score: f64 = sqlx::query_scalar(
-        "SELECT lead_score FROM engine.chat_sessions WHERE id = $1",
-    )
-    .bind(session_id)
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(0.0);
+async fn compute_final_frame(state: &AppState, session_id: Uuid, user_id: Uuid) -> ProtocolFrame {
+    let lead_score: f64 =
+        sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
 
     let training_level: f64 = match (eros_engine_store::insight::InsightRepo { pool: &state.pool })
         .load(user_id)
@@ -556,7 +554,10 @@ mod tests {
         assert_eq!(v["type"], "meta");
         assert_eq!(v["action_type"], "reply");
         assert_eq!(v["model"], "x-ai/grok-4-fast");
-        assert!(v.get("continues_from").is_none(), "must be omitted when None");
+        assert!(
+            v.get("continues_from").is_none(),
+            "must be omitted when None"
+        );
         assert_eq!(v["message_id"].as_str().unwrap().len(), 26);
     }
 
@@ -576,7 +577,10 @@ mod tests {
     #[test]
     fn delta_frame_serializes_with_content() {
         let id = ulid_string(Ulid::new());
-        let f = ProtocolFrame::Delta { message_id: id.clone(), content: "你好".into() };
+        let f = ProtocolFrame::Delta {
+            message_id: id.clone(),
+            content: "你好".into(),
+        };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "delta");
         assert_eq!(v["message_id"], id);
@@ -646,10 +650,7 @@ mod tests {
 
     use sqlx::PgPool;
 
-    async fn seed_persona_and_session(
-        pool: &PgPool,
-        user_id: Uuid,
-    ) -> (Uuid, Uuid, Uuid) {
+    async fn seed_persona_and_session(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid, Uuid) {
         let genome_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
              VALUES ('GhostTest', 'sp', '{}'::jsonb, true) RETURNING id",
@@ -678,8 +679,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_stream_terminates_with_final_or_error(pool: PgPool) {
-        use futures_util::StreamExt;
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -719,10 +720,10 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_stream_reply_terminates_cleanly_with_mock_openrouter(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
 
         let mock = MockServer::start().await;
         let body = "\
@@ -777,8 +778,10 @@ data: [DONE]\n\n";
         // but if it picks Reply the stream must end without an Error frame
         // and end with Final.
         assert!(
-            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
-            "no error frame expected, got {:?}", frames,
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected, got {frames:?}",
         );
         assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
     }
