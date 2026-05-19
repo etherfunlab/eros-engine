@@ -3,14 +3,15 @@
 # explicitly avoids over-refusal on intimate adult dialogue.
 # DeepSeek fallback covers multilingual depth (esp. zh) and is cheap enough
 # to absorb traffic spikes.
-model = "x-ai/grok-4-fast"
-fallback = "deepseek/deepseek-chat-v3.2"
+model = "x-ai/grok-4.20"
+# fallback will be a list like ["x-ai/grok-4.1-fast", "deepseek/deepseek-v4-flash"] in a future iteration, with orders of preference. For now we only have one fallback per task.
+fallback = "x-ai/grok-4.1-fast"
 temperature = 0.85
 max_tokens = 600
 
 [tasks.insight_extraction]
-model = "x-ai/grok-4-mini"
-fallback = "deepseek/deepseek-chat-v3.2"
+model = "x-ai/grok-4.1-fast"
+fallback = "deepseek/deepseek-v4-flash"
 temperature = 0.3
 max_tokens = 400
 
@@ -18,10 +19,10 @@ max_tokens = 400
 # chat_messages, emits 0-N {content, category} candidates, and the
 # sweeper writes them to companion_memories as profile-layer rows.
 # Haiku 4.5 is the cheapest model with reliable structured-JSON output;
-# grok-4-mini fallback keeps the no-OpenAI invariant if Anthropic is down.
+# grok-4.1-fast fallback keeps the no-OpenAI invariant if Anthropic is down.
 [tasks.memory_extraction]
 model = "anthropic/claude-haiku-4.5"
-fallback = "x-ai/grok-4-mini"
+fallback = "x-ai/grok-4.1-fast"
 temperature = 0.2
 max_tokens = 800
 
@@ -29,7 +30,7 @@ max_tokens = 800
 # `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a
 # placeholder for a future optional LLM decision layer.
 [tasks.pde_decision]
-model = "x-ai/grok-4-mini"
+model = "x-ai/grok-4.1-fast"
 temperature = 0.5
 max_tokens = 200
 
