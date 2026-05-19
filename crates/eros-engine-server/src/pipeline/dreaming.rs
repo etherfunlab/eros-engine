@@ -178,6 +178,8 @@ async fn classify_session(
         .await
         .map_err(|e| format!("memory_extraction LLM call failed: {e}"))?;
 
+    super::log_openrouter_usage(MEMORY_TASK, Some(session_id), &raw);
+
     let candidates = parse_memory_candidates(&raw.reply);
 
     // 3. Embed + insert each candidate as a profile-layer row.
