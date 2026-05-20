@@ -431,6 +431,13 @@ const AFFINITY_TASK: &str = "affinity_evaluation";
 /// Tunable; small enough that any real sentence runs the eval.
 const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 
+/// Upper bound on the evaluator LLM call. The OpenRouter client has no
+/// request timeout of its own, and the affinity write (incl. the already-
+/// computed rule deltas) waits on this call — so an unbounded stall would
+/// delay or lose the turn's affinity event. On elapse we fall back to
+/// rule-only deltas (the spec §4.5 "timeout → default" path).
+const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run the haiku affinity evaluator for one Reply turn. Returns the clamped
 /// per-axis LLM deltas + the model's reason. Any failure (LLM error,
 /// non-JSON) yields all-zero deltas + empty reason so the rule deltas still
@@ -460,13 +467,20 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let raw = match state.openrouter.execute(req).await {
-        Ok(resp) => {
+    let raw = match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await
+    {
+        Ok(Ok(resp)) => {
             super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
             resp.reply
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("affinity eval LLM call failed: {e}");
+            return (AffinityDeltas::default(), String::new());
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "affinity eval timed out after {AFFINITY_EVAL_TIMEOUT:?}; using rule-only deltas"
+            );
             return (AffinityDeltas::default(), String::new());
         }
     };
