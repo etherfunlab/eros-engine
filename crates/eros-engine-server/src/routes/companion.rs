@@ -320,7 +320,7 @@ pub struct GiftEventResponse {
 
 /// Verify a session exists and is owned by `user_id`. Returns the session
 /// row on success, `404` if missing, `403` if owned by someone else.
-async fn require_session_for_user(
+pub(crate) async fn require_session_for_user(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
@@ -565,38 +565,40 @@ async fn list_personas(
     Ok(Json(ListPersonasResponse { personas }))
 }
 
-/// Start (or resume) a chat session for the JWT user.
+/// Output of `resolve_or_create_session`. Carries everything either the
+/// canonical `start_chat` or the BFF `bff_start_chat` needs to build its
+/// response. `is_new` is `true` when this call **created** the session row,
+/// `false` when an existing session was resumed.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSession {
+    pub session_id: Uuid,
+    pub instance_id: Uuid,
+    pub persona_name: String,
+    pub is_new: bool,
+}
+
+/// Shared session-resolution flow used by `POST /comp/chat/start` and
+/// `POST /bff/v1/comp/chat/start`. Encapsulates instance lookup, NFT
+/// ownership gate (with the **exact** ordering both endpoints depend on),
+/// and resume-or-create on `chat_sessions`. Caller is responsible for
+/// building its own response DTO from the returned `ResolvedSession`.
 ///
-/// Resolution rules:
-///   * `instance_id` provided → must belong to the JWT user.
-///   * else `genome_id` provided → look up (or auto-create) the user's
-///     active instance of that genome.
-///   * else: the only active genome the user already has an instance of
-///     wins; otherwise 400.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/start",
-    tag = "companion",
-    request_body = StartChatRequest,
-    responses(
-        (status = 200, body = StartChatResponse),
-        (status = 400, description = "missing genome_id and no existing instance"),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 404, description = "instance/genome not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn start_chat(
-    State(state): State<AppState>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(req): Json<StartChatRequest>,
-) -> Result<Json<StartChatResponse>, AppError> {
+/// **NFT gate ordering (load-bearing):**
+///   * Explicit `instance_id` → gate runs AFTER load + owner check, so we
+///     never gate a missing or non-owned instance.
+///   * `genome_id` only → gate runs BEFORE find-or-create on
+///     `persona_instances`, so a non-owner who hits the create-fallback
+///     does NOT leave a stray row.
+pub(crate) async fn resolve_or_create_session(
+    state: &AppState,
+    user_id: Uuid,
+    req: &StartChatRequest,
+) -> Result<ResolvedSession, AppError> {
     let persona_repo = PersonaRepo { pool: &state.pool };
     let chat_repo = ChatRepo { pool: &state.pool };
 
     let instance_id = match req.instance_id {
         Some(iid) => {
-            // Verify ownership + active status.
             let companion = persona_repo
                 .load_companion(iid)
                 .await?
@@ -606,7 +608,6 @@ async fn start_chat(
                     "instance not owned by this user".into(),
                 ));
             }
-            // NEW: NFT gate (orthogonal to owner_uid — NFT ownership is wallet-bound).
             let asset_id_opt = persona_repo
                 .get_asset_id_for_genome(companion.instance.genome_id)
                 .await?;
@@ -618,7 +619,6 @@ async fn start_chat(
                 .genome_id
                 .ok_or_else(|| AppError::BadRequest("missing genome_id (or instance_id)".into()))?;
 
-            // Validate genome exists + is active.
             let genome = persona_repo
                 .get_genome(genome_id)
                 .await?
@@ -627,13 +627,9 @@ async fn start_chat(
                 return Err(AppError::BadRequest("genome is not active".into()));
             }
 
-            // NEW: NFT gate runs BEFORE looking for an instance or creating one.
-            // A non-owner who hits the create_instance fallback would otherwise
-            // leave behind an empty persona_instances row.
             let asset_id_opt = persona_repo.get_asset_id_for_genome(genome_id).await?;
             enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
 
-            // Look for an existing active instance for this user×genome.
             let existing: Option<(Uuid,)> = sqlx::query_as(
                 "SELECT id FROM engine.persona_instances \
                  WHERE genome_id = $1 AND owner_uid = $2 AND status = 'active'",
@@ -650,13 +646,11 @@ async fn start_chat(
         }
     };
 
-    // Load persona for the response payload.
     let companion = persona_repo
         .load_companion(instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound("persona not loadable".into()))?;
 
-    // Resume the most recent session for (user, instance) or create one.
     let existing: Option<ChatSession> = sqlx::query_as::<_, ChatSession>(
         "SELECT * FROM engine.chat_sessions \
          WHERE user_id = $1 AND instance_id = $2 \
@@ -688,11 +682,45 @@ async fn start_chat(
         }
     };
 
-    Ok(Json(StartChatResponse {
+    Ok(ResolvedSession {
         session_id,
         instance_id,
         persona_name: companion.genome.name,
         is_new,
+    })
+}
+
+/// Start (or resume) a chat session for the JWT user.
+///
+/// Resolution rules:
+///   * `instance_id` provided → must belong to the JWT user.
+///   * else `genome_id` provided → look up (or auto-create) the user's
+///     active instance of that genome.
+///   * else (neither provided) → 400 Bad Request.
+#[utoipa::path(
+    post,
+    path = "/comp/chat/start",
+    tag = "companion",
+    request_body = StartChatRequest,
+    responses(
+        (status = 200, body = StartChatResponse),
+        (status = 400, description = "missing genome_id and no existing instance"),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 404, description = "instance/genome not found")
+    ),
+    security(("bearer" = []))
+)]
+async fn start_chat(
+    State(state): State<AppState>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<StartChatRequest>,
+) -> Result<Json<StartChatResponse>, AppError> {
+    let resolved = resolve_or_create_session(&state, user_id, &req).await?;
+    Ok(Json(StartChatResponse {
+        session_id: resolved.session_id,
+        instance_id: resolved.instance_id,
+        persona_name: resolved.persona_name,
+        is_new: resolved.is_new,
     }))
 }
 
@@ -1067,38 +1095,44 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
 // pipeline" — this is exactly what the gift-event test does, and it
 // matches the route's chosen implementation strategy.
 // ────────────────────────────────────────────────────────────────────
-#[cfg(test)]
-mod tests {
-    use super::*;
 
+// Test helpers shared with sibling test modules (e.g. routes::bff::companion).
+// Lives outside `mod tests` so other modules' `#[cfg(test)]` blocks can reach
+// them via `crate::routes::companion::testutil` — `mod tests` is private by convention.
+#[cfg(test)]
+pub(crate) mod testutil {
     use axum::{
         body::{to_bytes, Body},
-        http::{header, Request, StatusCode},
+        http::{Request, StatusCode},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::{json, Value};
     use sqlx::PgPool;
     use tower::Service;
+    use uuid::Uuid;
 
-    // ─── Test helpers ───────────────────────────────────────────────
+    use crate::state::AppState;
 
-    fn mint_test_jwt(uid: Uuid) -> String {
+    pub(crate) fn mint_test_jwt(uid: Uuid) -> String {
         let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
         encode(
             &Header::default(),
             &json!({ "sub": uid.to_string(), "exp": exp }),
-            &EncodingKey::from_secret(TEST_SECRET.as_ref()),
+            &EncodingKey::from_secret(super::TEST_SECRET.as_ref()),
         )
         .expect("test jwt encodes")
     }
 
-    fn build_router(state: AppState) -> Router {
+    pub(crate) fn build_router(state: AppState) -> Router {
         let (axum_router, _api) = crate::routes::router(state.clone()).split_for_parts();
         axum_router.with_state(state)
     }
 
-    async fn send_request(router: &mut Router, req: Request<Body>) -> (StatusCode, Value) {
+    pub(crate) async fn send_request(
+        router: &mut Router,
+        req: Request<Body>,
+    ) -> (StatusCode, Value) {
         let resp = router.call(req).await.expect("router call infallible");
         let status = resp.status();
         let body_bytes = to_bytes(resp.into_body(), 1024 * 1024)
@@ -1112,7 +1146,7 @@ mod tests {
         (status, json)
     }
 
-    async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
+    pub(crate) async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
              VALUES ($1, 'you are a companion', '{}'::jsonb, true) RETURNING id",
@@ -1123,7 +1157,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
+    pub(crate) async fn seed_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) \
              VALUES ($1, $2) RETURNING id",
@@ -1135,7 +1169,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_instance(pool: &PgPool, genome_id: Uuid, owner: Uuid) -> Uuid {
+    pub(crate) async fn seed_instance(pool: &PgPool, genome_id: Uuid, owner: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
              VALUES ($1, $2) RETURNING id",
@@ -1146,6 +1180,21 @@ mod tests {
         .await
         .unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::{
+        build_router, mint_test_jwt, seed_genome, seed_instance, seed_session, send_request,
+    };
+    use super::*;
+
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
 
     // ─── Test 1: public /healthz still works without bearer ─────────
 
@@ -2004,5 +2053,74 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ─── resolve_or_create_session parity tests ──────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_or_create_session_returns_resolved_for_legacy_genome(pool: PgPool) {
+        // resolve_or_create_session is the extracted core of start_chat. Brand-new
+        // user × legacy (asset-less) genome → creates a new instance + new session.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vita").await;
+        let state = test_state(pool.clone());
+
+        let req = StartChatRequest {
+            instance_id: None,
+            genome_id: Some(genome_id),
+            is_demo: None,
+        };
+        let resolved = resolve_or_create_session(&state, user_id, &req)
+            .await
+            .expect("resolve_or_create_session");
+
+        assert!(resolved.is_new);
+        assert_eq!(resolved.persona_name, "Vita");
+        // A second call with the same input should resume — not create a new session.
+        let resumed = resolve_or_create_session(&state, user_id, &req)
+            .await
+            .expect("resume");
+        assert!(!resumed.is_new);
+        assert_eq!(resumed.session_id, resolved.session_id);
+        assert_eq!(resumed.instance_id, resolved.instance_id);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_or_create_session_nft_gate_blocks_unowned_genome(pool: PgPool) {
+        // genome_id branch: NFT gate must run BEFORE we look for an instance.
+        let user_id = Uuid::new_v4();
+        let genome_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active, asset_id) \
+             VALUES ('NftPersona', 'sys', '{}'::jsonb, true, 'asset-x') RETURNING id",
+        )
+        .fetch_one(&pool).await.unwrap();
+        let state = test_state(pool.clone());
+
+        let req = StartChatRequest {
+            instance_id: None,
+            genome_id: Some(genome_id),
+            is_demo: None,
+        };
+        let err = resolve_or_create_session(&state, user_id, &req)
+            .await
+            .expect_err("should reject unowned NFT-gated genome");
+        match err {
+            AppError::Forbidden(msg) => {
+                assert!(msg.contains("nft_ownership_required"), "msg={msg}")
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+
+        // Confirm no orphan persona_instances row was created — this is what
+        // makes "gate before find-or-create" load-bearing.
+        let leftover: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.persona_instances WHERE genome_id = $1 AND owner_uid = $2",
+        )
+        .bind(genome_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leftover, 0, "NFT gate must reject before create_instance");
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! The HTTP surface is split into three independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
-//!   * Bearer JWT:    `/comp/*`  — Supabase JWT (see auth::middleware)
+//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`  — Supabase JWT (see auth::middleware)
 //!   * HMAC S2S:      `/s2s/*`   — shared-secret signature (see auth::s2s)
 //!
 //! Auth layers are applied to the per-subtree merge, NOT the top-level
@@ -20,9 +20,11 @@ use crate::auth::middleware::require_auth;
 use crate::auth::s2s::require_s2s;
 use crate::state::AppState;
 
+pub mod bff;
 pub mod companion;
 pub mod companion_stream;
 pub mod debug;
+pub mod dto;
 pub mod health;
 pub mod s2s;
 
@@ -38,6 +40,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(debug::router(state.config.expose_affinity_debug))
+        .merge(bff::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     let s2s_routes = s2s::router().layer(from_fn_with_state(state.clone(), require_s2s));
@@ -58,5 +61,6 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(debug::router(expose_affinity_debug))
+        .merge(bff::router())
         .merge(s2s::router())
 }

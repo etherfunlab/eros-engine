@@ -16,6 +16,121 @@
     }
   ],
   "paths": {
+    "/bff/v1/comp/chat/start": {
+      "post": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Cold-mount bundle: resolves (or creates) the session, then returns\nhistory + affinity in a single round-trip. Replaces three sequential\ncalls (start + history + affinity) for `eros-engine-web` cold-mount.",
+        "operationId": "bff_start_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BffStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffStartResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "missing genome_id and no existing instance"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your instance / nft gate"
+          },
+          "404": {
+            "description": "instance/genome not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/bff/v1/comp/chat/{session_id}/history": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Slim chat history for the chat-screen mount. Same auth, same ownership\ncheck, same `limit ∈ [1, 50]` clamp as `/comp/.../history`. **Intentional\ndivergence:** default `limit=50` (canonical defaults to 20). Reason:\nBFF exists for cold-mount where the FE wants a full backscroll in one\nround-trip.",
+        "operationId": "bff_get_history",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 50, capped at 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffHistoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/affinity/{session_id}": {
       "get": {
         "tags": [
@@ -41,7 +156,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AffinityDebugResponse"
+                  "$ref": "#/components/schemas/AffinitySnapshot"
                 }
               }
             }
@@ -69,7 +184,7 @@
           "companion"
         ],
         "summary": "Start (or resume) a chat session for the JWT user.",
-        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else: the only active genome the user already has an instance of\n    wins; otherwise 400.",
+        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else (neither provided) → 400 Bad Request.",
         "operationId": "start_chat",
         "requestBody": {
           "content": {
@@ -725,8 +840,39 @@
   },
   "components": {
     "schemas": {
-      "AffinityDebugResponse": {
+      "AffinityDeltasDto": {
         "type": "object",
+        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
+        "properties": {
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "AffinitySnapshot": {
+        "type": "object",
+        "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
         "required": [
           "warmth",
           "trust",
@@ -782,33 +928,126 @@
           }
         }
       },
-      "AffinityDeltasDto": {
+      "BffHistoryEntry": {
         "type": "object",
-        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
+        "required": [
+          "role",
+          "content",
+          "sent_at"
+        ],
         "properties": {
-          "intimacy": {
-            "type": "number",
-            "format": "double"
+          "content": {
+            "type": "string"
           },
-          "intrigue": {
-            "type": "number",
-            "format": "double"
+          "role": {
+            "type": "string",
+            "description": "\"user\" | \"assistant\" | \"gift_user\" | \"system_error\""
           },
-          "patience": {
-            "type": "number",
-            "format": "double"
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BffHistoryResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "total"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            }
           },
-          "tension": {
-            "type": "number",
-            "format": "double"
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           },
-          "trust": {
-            "type": "number",
-            "format": "double"
+          "total": {
+            "type": "integer",
+            "description": "Count of `messages` in this response (== `messages.len()`). NOT the\ntotal row count for the session — pagination doesn't know how many\nrows remain. Mirrors `HistoryResponse::total`.",
+            "minimum": 0
+          }
+        }
+      },
+      "BffStartRequest": {
+        "type": "object",
+        "properties": {
+          "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
           },
-          "warmth": {
-            "type": "number",
-            "format": "double"
+          "history_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "History page size for the bundled history. Default 50, capped at 50.\nBFF-only field; not present in the canonical /comp/chat/start body."
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "is_demo": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "BffStartResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "instance_id",
+          "persona_name",
+          "is_new",
+          "history"
+        ],
+        "properties": {
+          "affinity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinitySnapshot",
+                "description": "Affinity snapshot. `None` covers three cases the FE treats identically\nas \"no calibration to show\":\n  1. `EXPOSE_AFFINITY_DEBUG=false` — debug gate closed.\n  2. Brand-new session — no row created yet.\n  3. Resumed session that has never had an affinity-producing event."
+              }
+            ]
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            },
+            "description": "Most-recent N messages, oldest-first. Empty for brand-new sessions."
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_new": {
+            "type": "boolean"
+          },
+          "persona_name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -1441,6 +1680,10 @@
     {
       "name": "companion",
       "description": "Chat sessions, messages, affinity, profile"
+    },
+    {
+      "name": "bff-companion",
+      "description": "Frontend-shaped mirror of /comp/* for first-party clients; shape may diverge from canonical without notice"
     },
     {
       "name": "debug",

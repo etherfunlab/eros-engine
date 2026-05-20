@@ -58,6 +58,16 @@ pub struct ChatMessage {
     pub assistant_action_type: Option<String>,
 }
 
+/// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
+/// don't need `extracted_facts`, idempotency keys, or SSE metadata.
+/// Carries only the columns a chat-history viewer renders.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ChatMessageSlim {
+    pub role: String,
+    pub content: String,
+    pub sent_at: DateTime<Utc>,
+}
+
 pub struct ChatRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -164,6 +174,31 @@ impl<'a> ChatRepo<'a> {
         // gateway's `get_history` semantics.
         let mut rows = sqlx::query_as::<_, ChatMessage>(
             "SELECT * FROM engine.chat_messages \
+             WHERE session_id = $1 \
+             ORDER BY sent_at DESC \
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(session_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Projection-narrowed read used by BFF endpoints (and any caller that
+    /// doesn't need `extracted_facts` / idempotency / SSE metadata). Same
+    /// DESC+reverse trick as `history()` so the result is chronological.
+    /// Uses the existing `(session_id, sent_at DESC)` index — no migration.
+    pub async fn history_slim(
+        &self,
+        session_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
+        let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
+            "SELECT role, content, sent_at FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
              LIMIT $2 OFFSET $3",
@@ -397,6 +432,57 @@ mod tests {
         assert_eq!(history[0].content, "hello");
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[2].content, "how are you?");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_returns_role_content_sent_at_in_order(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        repo.append_message(s.id, "user", "alpha").await.unwrap();
+        repo.append_message(s.id, "assistant", "beta")
+            .await
+            .unwrap();
+        repo.append_message(s.id, "user", "gamma").await.unwrap();
+
+        let slim = repo.history_slim(s.id, 50, 0).await.unwrap();
+        assert_eq!(slim.len(), 3);
+        // Chronological order: oldest first (matches history()).
+        assert_eq!(slim[0].role, "user");
+        assert_eq!(slim[0].content, "alpha");
+        assert_eq!(slim[1].role, "assistant");
+        assert_eq!(slim[1].content, "beta");
+        assert_eq!(slim[2].role, "user");
+        assert_eq!(slim[2].content, "gamma");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_respects_limit_and_offset(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+        for n in 0..5 {
+            repo.append_message(s.id, "user", &format!("m{n}"))
+                .await
+                .unwrap();
+        }
+
+        // Most-recent 2, reversed to ASC — should be ["m3", "m4"].
+        let page = repo.history_slim(s.id, 2, 0).await.unwrap();
+        assert_eq!(
+            page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m4"]
+        );
+
+        // offset=2 → next-most-recent 2, reversed — should be ["m1", "m2"].
+        let page = repo.history_slim(s.id, 2, 2).await.unwrap();
+        assert_eq!(
+            page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
