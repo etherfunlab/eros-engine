@@ -89,18 +89,29 @@ The existing `predict_reply_deltas` already produces exactly the rule half — *
 ### 4.1 Placement & lifecycle
 
 - Runs inside `post_process` (`pipeline/post_process.rs`), as a sibling fire-and-forget task to the existing `extract_insights` / `write_turn` LLM work, joined via the existing `tokio::join!`.
-- Runs **only on `Reply` turns** with a non-empty user message **and** a non-empty produced assistant message. `Proactive` (no user message) → rules only. `Gift` (client-supplied deltas via `/event/gift`) and `Ghost` (all-zero) → unchanged.
+- Runs **only on `Reply` turns** with a non-empty user message **and** a non-empty produced assistant message. Other actions are unchanged:
+  - `Proactive` (no user message) → rules only, no eval.
+  - `Ghost` → all-zero, unchanged.
+  - **Gift — two distinct paths, both unchanged in v1:** (1) the `/comp/chat/{sid}/event/gift` route applies *client-supplied* deltas directly; (2) the pipeline `GiftReaction` action currently applies PDE default (zero) deltas (`pde.rs:36`). The LLM eval is **not** wired to gift turns in v1 (a follow-up could evaluate gift reactions).
 - Never blocks the chat response — it is already after the SSE stream completed.
+- **Optional cost gate:** skip the eval on trivially short user turns (e.g. `< SHORT_MSG_CHARS`), where there's nothing semantic to score — saves a haiku call on "k"/"ok"-type turns. Rules still apply. Tunable; off → eval every reply turn.
 
 ### 4.2 Wiring
 
-The evaluator needs the turn's `user_msg` + `assistant_msg` + current `Affinity` + persona. These are available in `post_process::run` (`event`, `produced`) and via repos. Restructure the affinity future so it:
+The evaluator needs the turn's `user_msg` + `assistant_msg` + current `Affinity` + persona name:
+
+- `user_msg` — from `event` (already in `post_process::run`).
+- `assistant_msg` — **`produced` is a `Vec<ProducedMessage>`** (the streaming path can emit a multi-message burst for one user turn). Join the burst into one assistant text (`produced.iter().map(|m| m.full_text).join("\n")`); run **one eval per turn**, write **one combined event**. Empty join → no eval.
+- `Affinity` — loaded in `persist_affinity` (existing).
+- **persona** — **not** currently passed to `post_process::run` (it has `instance_id`, not the persona). Load it in the affinity future via `PersonaRepo::load_companion(instance_id)` (one extra indexed query, fine in a background task) and pass the persona name to the prompt. Persona name only; the system prompt is not needed.
+
+Restructure the affinity future so it:
 
 1. computes `llm_deltas` (Reply turns only; else `AffinityDeltas::default()`),
 2. sums onto `plan.affinity_deltas` (the rule deltas already passed in),
-3. calls `persist_affinity` with the combined deltas.
+3. calls `persist_affinity` with the combined deltas **and the evaluator `reason`**.
 
-`persist_affinity` keeps its current shape (load → time_decay → `persist_with_event`). Only its input deltas change.
+`persist_affinity` keeps its overall shape (load → time_decay → `persist_with_event`). Its inputs change: the combined deltas, and the `context` JSONB now carries `{ "affinity_reason": ... }` instead of today's hardcoded `json!({})` (§6).
 
 ### 4.3 Model task
 
@@ -115,6 +126,8 @@ max_tokens = 250
 ```
 
 Resolved via the existing `ModelConfig::resolve("affinity_evaluation", None)`. `pde_decision` keeps its reserved meaning (not repurposed).
+
+**Deployment caveat (don't ship only `examples/`):** the server loads its config from `MODEL_CONFIG_PATH` (`main.rs:230`; prod = `/etc/eros-engine/model_config.toml` in the Docker image), and `resolve()` on a **missing** task does not error — it warns and silently falls back to `defaults.fallback_model` → `x-ai/grok-4-mini` (`model_config.rs:107`). So the affinity eval would silently run on the wrong model if the *deployed* config lacks the task. The new `[tasks.affinity_evaluation]` block must be added to the **deployed** config (and the Dockerfile/image source), not just `examples/`. Consider promoting the "unknown task" `warn!` to a startup assertion for tasks the code depends on.
 
 ### 4.4 Prompt (new fn in `prompt.rs`)
 
@@ -185,21 +198,34 @@ The "clear shift every ~3–5 turns" target therefore emerges from **two layers,
 
 A silent-accumulate-then-reveal model (meters dead for N turns, then one jump) is explicitly **not** adopted: it feels unresponsive between reveals, and the stage-transition layer already supplies the drama on top of continuous feedback.
 
+### 6.2 Concurrency: prevent lost updates (required by this change)
+
+Affinity persistence is a **read-modify-write** with the read (`load_or_create`, `post_process.rs:146`) **outside** the write transaction, and `post_process` is `tokio::spawn`ed and **not awaited** (`stream.rs:437`, `mod.rs:198`). Two turns whose post-process tasks overlap both read the same vector, both apply their deltas to that stale snapshot, and the second `UPDATE` wins → one turn's increment is silently lost.
+
+Today this is harmless because deltas are ~0. **This change makes it a real correctness bug**: deltas become meaningful *and* the ~1–2 s LLM eval widens the overlap window from milliseconds to seconds, so a user sending a follow-up within a couple seconds reliably triggers it — silently corrupting the core IP metric.
+
+**Requirement:** the read-modify-write must be serialized per session. Do the current-value read **inside** the `persist_with_event` transaction under a row lock (`SELECT ... FOR UPDATE` on the `companion_affinity` row), apply deltas to the freshly-locked values, then `UPDATE` + insert the event in the same tx. Exact handling of `apply_time_decay` relative to the locked read is an implementation detail for the plan (decay must be computed from the locked row, not a pre-read snapshot). This converts overlapping same-session writes into a serialized sequence — no lost increments, monotonic event ordering.
+
+(The FE's `client_msg_id`→event echo for perfect turn↔event causality remains out of scope — see the FE spec's accepted residual edge.)
+
 ---
 
 ## 7. Scope
 
 **In:**
 - `Reply`-turn six-axis movement via hybrid rules + LLM.
-- New `affinity_evaluation` model task + prompt + parse/clamp/merge.
-- Store the evaluator reason in event context.
+- New `affinity_evaluation` model task + prompt + parse/clamp/merge, added to the **deployed** config (§4.3).
+- Persona-name load in the affinity future; multi-message burst join (§4.2).
+- Store the evaluator reason in event context (§6).
+- **Row-level locking in `persist_with_event` to prevent lost updates (§6.2).**
 
 **Out (later / not now):**
 - Time-decay for `warmth`/`trust`/`intimacy` (relationship cooling on neglect). `apply_time_decay` stays as-is (intrigue/patience/tension only). Note as a follow-up.
-- Per-turn LLM eval for `Proactive` turns.
+- Per-turn LLM eval for `Proactive` and `GiftReaction` turns.
 - Two-phase UI (instant rules → delayed LLM as two events). The FE poll returns on the first new `event_id`; a single combined event is the deliberate v1 choice.
 - Any SSE/stream coupling (explicitly rejected — FE spec §8).
 - Tuning rule magnitudes (kept as-is for v1).
+- Renaming the misleading `ema_inertia` / "EMA" identifiers to "gain" — the math is documented (§1, §5) but a rename would break the deployed `EMA_INERTIA` fly secret and struct/param names; deferred.
 
 ---
 
@@ -227,7 +253,7 @@ Because both FE surfaces are fed by `persist_with_event`, writing real combined 
 
 - **core** (`affinity.rs`): existing `apply_deltas` / clamp / label tests cover the math. Add a focused test that a combined (rule + llm) delta sums then gains/clamps as expected (pure function, no LLM).
 - **post_process** (`post_process.rs`): unit-test the evaluator JSON parse + per-axis clamp + "patience ignored" + failure-returns-default, deterministically (mirrors the existing `parse_facts` / `find_json_block` tests). The live LLM call itself is not unit-tested (consistent with `extract_facts`).
-- **store** (`affinity.rs`): existing `persist_with_event` tests already assert pre/post-EMA `deltas`/`effective_deltas` and clamping — unchanged.
+- **store** (`affinity.rs`): existing `persist_with_event` tests already assert pre/post-EMA `deltas`/`effective_deltas` and clamping. **Add a concurrency test** (`sqlx::test`): two overlapping `persist_with_event` calls on the same session each apply their increment (final = sum of both, no lost update) — guards the §6.2 locking.
 - **prompt** (`prompt.rs`): snapshot/format test that `affinity_eval_prompt` includes the six current values and the turn exchange.
 - **Stage labels**: a test that a turn pushing `warmth`/`intimacy` over thresholds flips `relationship_label` (via `infer_label`, already covered) — confirms the now-live axes drive labels.
 
