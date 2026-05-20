@@ -129,9 +129,29 @@ impl<'a> AffinityRepo<'a> {
         event_type: &str,
         context: serde_json::Value,
     ) -> Result<(), sqlx::Error> {
+        // Snapshot pre-EMA axis values to derive the post-EMA effective change.
+        let before = AffinityDeltas {
+            warmth: affinity.warmth,
+            trust: affinity.trust,
+            intrigue: affinity.intrigue,
+            intimacy: affinity.intimacy,
+            patience: affinity.patience,
+            tension: affinity.tension,
+        };
+
         affinity.apply_deltas(deltas, ema_inertia);
         let label = affinity.infer_label();
         affinity.relationship_label = label;
+
+        // Post-EMA effective change = after − before (captures EMA + clamping).
+        let effective = AffinityDeltas {
+            warmth: affinity.warmth - before.warmth,
+            trust: affinity.trust - before.trust,
+            intrigue: affinity.intrigue - before.intrigue,
+            intimacy: affinity.intimacy - before.intimacy,
+            patience: affinity.patience - before.patience,
+            tension: affinity.tension - before.tension,
+        };
 
         let mut tx = self.pool.begin().await?;
 
@@ -154,13 +174,16 @@ impl<'a> AffinityRepo<'a> {
         .await?;
 
         let deltas_json = serde_json::to_value(deltas).unwrap_or_default();
+        let effective_json = serde_json::to_value(&effective).unwrap_or_default();
         sqlx::query(
-            "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, deltas, context) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, context) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(affinity.id)
         .bind(event_type)
         .bind(deltas_json)
+        .bind(effective_json)
         .bind(context)
         .execute(&mut *tx)
         .await?;
@@ -188,11 +211,14 @@ impl<'a> AffinityRepo<'a> {
         .execute(self.pool)
         .await?;
 
+        let zero = serde_json::to_value(AffinityDeltas::default()).unwrap_or_default();
         sqlx::query(
-            "INSERT INTO engine.companion_affinity_events (affinity_id, event_type, deltas, context) \
-             VALUES ($1, 'ghost', '{}'::jsonb, '{}'::jsonb)",
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, context) \
+             VALUES ($1, 'ghost', '{}'::jsonb, $2, '{}'::jsonb)",
         )
         .bind(affinity.id)
+        .bind(zero)
         .execute(self.pool)
         .await?;
 
@@ -307,5 +333,102 @@ mod tests {
         assert_eq!(reloaded.ghost_streak, 2);
         assert_eq!(reloaded.total_ghosts, 2);
         assert!(reloaded.last_ghost_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_records_post_ema_effective(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // Raw delta +0.4 warmth with EMA inertia 0.8 → effective = 0.2 * 0.4 = 0.08.
+        let deltas = AffinityDeltas {
+            warmth: 0.4,
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.8, "message", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let row: (serde_json::Value, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT deltas, effective_deltas FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Pre-EMA stored verbatim.
+        assert!((row.0["warmth"].as_f64().unwrap() - 0.4).abs() < 1e-9);
+        // Post-EMA effective = blend * raw = 0.2 * 0.4 = 0.08, NOT 0.4.
+        let eff = row.1.expect("effective_deltas present");
+        assert!(
+            (eff["warmth"].as_f64().unwrap() - 0.08).abs() < 1e-9,
+            "effective warmth should be EMA-smoothed 0.08, got {eff}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_effective_reflects_clamping(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        // trust starts at 0.2; push it past the [0,1] ceiling with no smoothing.
+        let deltas = AffinityDeltas {
+            trust: 5.0,
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let eff: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT effective_deltas FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Effective is the CLAMPED change (1.0 − 0.2 = 0.8), not the raw 5.0.
+        assert!((eff.unwrap()["trust"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn record_ghost_writes_zero_effective_deltas(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        repo.record_ghost(&mut a).await.unwrap();
+
+        let eff: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT effective_deltas FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1 AND event_type = 'ghost'",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let eff = eff.expect("ghost effective_deltas present (all-zero, not NULL)");
+        for axis in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            assert_eq!(eff[axis].as_f64().unwrap(), 0.0, "axis {axis} must be 0");
+        }
     }
 }
