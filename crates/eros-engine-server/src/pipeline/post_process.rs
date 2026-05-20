@@ -356,6 +356,24 @@ fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas
     )
 }
 
+/// Sum the rule (behavioral) and LLM (semantic) contributions per axis.
+/// `patience` is rule-owned — the evaluator always passes 0 for it — so
+/// the sum naturally keeps the rule value.
+#[allow(dead_code)] // wired in Task 6
+fn merge_deltas(
+    rule: &eros_engine_core::affinity::AffinityDeltas,
+    llm: &eros_engine_core::affinity::AffinityDeltas,
+) -> eros_engine_core::affinity::AffinityDeltas {
+    eros_engine_core::affinity::AffinityDeltas {
+        warmth: rule.warmth + llm.warmth,
+        trust: rule.trust + llm.trust,
+        intrigue: rule.intrigue + llm.intrigue,
+        intimacy: rule.intimacy + llm.intimacy,
+        patience: rule.patience + llm.patience,
+        tension: rule.tension + llm.tension,
+    }
+}
+
 const INSIGHT_TASK: &str = "insight_extraction";
 
 /// Top-level entry: extract facts → structured insights → InsightRepo merge.
@@ -637,5 +655,31 @@ mod tests {
         let (d, reason) = parse_affinity_eval(raw);
         assert!((d.warmth - 0.05).abs() < 1e-9);
         assert_eq!(reason, "fenced");
+    }
+
+    #[test]
+    fn merge_deltas_sums_per_axis_patience_from_rule_only() {
+        use eros_engine_core::affinity::AffinityDeltas;
+        let rule = AffinityDeltas {
+            intrigue: 0.02,
+            patience: 0.02,
+            ..Default::default()
+        };
+        let llm = AffinityDeltas {
+            warmth: 0.08,
+            intrigue: 0.03,
+            tension: 0.01,
+            ..Default::default()
+        };
+        let c = merge_deltas(&rule, &llm);
+        assert!((c.warmth - 0.08).abs() < 1e-9);
+        assert!((c.intrigue - 0.05).abs() < 1e-9, "0.02 rule + 0.03 llm");
+        assert!((c.tension - 0.01).abs() < 1e-9);
+        assert!(
+            (c.patience - 0.02).abs() < 1e-9,
+            "rule only (llm patience is 0)"
+        );
+        assert_eq!(c.trust, 0.0);
+        assert_eq!(c.intimacy, 0.0);
     }
 }

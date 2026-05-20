@@ -177,6 +177,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_deltas_combined_then_gains_and_clamps() {
+        // A pre-summed (rule + llm) delta on a hot axis at v1 pacing
+        // (ema_inertia 0.5 → gain 0.5): 0.3 + 0.5 * 0.15 = 0.375.
+        let mut a = fresh(); // warmth 0.3
+        a.apply_deltas(
+            &AffinityDeltas {
+                warmth: 0.15,
+                ..Default::default()
+            },
+            0.5,
+        );
+        assert!((a.warmth - 0.375).abs() < 1e-9);
+    }
+
+    #[test]
     fn time_decay_reduces_intrigue_recovers_patience_softens_tension() {
         let mut a = fresh();
         a.intrigue = 0.5;
