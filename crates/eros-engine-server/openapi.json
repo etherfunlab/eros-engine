@@ -184,7 +184,7 @@
           "companion"
         ],
         "summary": "Start (or resume) a chat session for the JWT user.",
-        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else: the only active genome the user already has an instance of\n    wins; otherwise 400.",
+        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else (neither provided) → 400 Bad Request.",
         "operationId": "start_chat",
         "requestBody": {
           "content": {
