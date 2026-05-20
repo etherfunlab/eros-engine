@@ -129,8 +129,7 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
 /// intrigue/tension) as small per-turn *changes*, not absolute values.
 /// All six current values are shown for context, but `patience` is
 /// rule-owned and is deliberately excluded from the requested output.
-/// The caller (post-process affinity evaluator) is wired in Task 6.
-#[allow(dead_code)]
+/// Called by the post-process affinity evaluator.
 pub fn affinity_eval_prompt(
     persona_name: &str,
     affinity: &Affinity,

@@ -26,6 +26,7 @@ use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+use eros_engine_store::persona::PersonaRepo;
 
 use crate::state::AppState;
 
@@ -85,14 +86,73 @@ pub async fn run(
         }
     };
 
-    let fut_affinity = persist_affinity(
-        &state,
-        session_id,
-        user_id,
-        instance_id,
-        plan.action_type,
-        plan.affinity_deltas.clone(),
-    );
+    let fut_affinity = async {
+        // Join the (possibly multi-message) assistant burst into one text;
+        // run ONE eval per turn → ONE combined event.
+        let assistant_msg = produced
+            .iter()
+            .map(|m| m.full_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Semantic eval: Reply turns only, with a non-trivial user message
+        // and a non-empty produced assistant message. Other actions
+        // (Proactive / GiftReaction / Ghost) keep rule-only deltas in v1.
+        let run_eval = plan.action_type == ActionType::Reply
+            && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
+            && !assistant_msg.trim().is_empty();
+
+        let (llm_deltas, reason) = if run_eval {
+            let persona_repo = PersonaRepo { pool: &state.pool };
+            let affinity_repo = AffinityRepo { pool: &state.pool };
+            let persona_name = match persona_repo.load_companion(instance_id).await {
+                Ok(Some(p)) => p.genome.name,
+                _ => String::new(),
+            };
+            // Snapshot the current vector for prompt context only; the
+            // authoritative value is re-read under lock in persist_with_event.
+            match affinity_repo.load(session_id).await {
+                Ok(Some(current)) if !persona_name.is_empty() => {
+                    evaluate_affinity(
+                        &state,
+                        session_id,
+                        &persona_name,
+                        &current,
+                        &user_msg,
+                        &assistant_msg,
+                    )
+                    .await
+                }
+                _ => (
+                    eros_engine_core::affinity::AffinityDeltas::default(),
+                    String::new(),
+                ),
+            }
+        } else {
+            (
+                eros_engine_core::affinity::AffinityDeltas::default(),
+                String::new(),
+            )
+        };
+
+        let combined = merge_deltas(&plan.affinity_deltas, &llm_deltas);
+        let context = if reason.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "affinity_reason": reason })
+        };
+
+        persist_affinity(
+            &state,
+            session_id,
+            user_id,
+            instance_id,
+            plan.action_type,
+            combined,
+            context,
+        )
+        .await;
+    };
 
     let should_update_lead = matches!(
         plan.action_type,
@@ -123,6 +183,7 @@ async fn persist_affinity(
     instance_id: Uuid,
     action: ActionType,
     deltas: eros_engine_core::affinity::AffinityDeltas,
+    context: serde_json::Value,
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -143,11 +204,10 @@ async fn persist_affinity(
         state.config.ema_inertia
     };
 
+    // No pre-read decay here: persist_with_event re-reads the row under a
+    // lock and applies time decay from that locked row (design spec §6.2).
     let mut affinity = match repo.load_or_create(session_id, user_id, instance_id).await {
-        Ok(mut a) => {
-            a.apply_time_decay();
-            a
-        }
+        Ok(a) => a,
         Err(e) => {
             tracing::warn!("affinity load_or_create failed: {e}");
             return;
@@ -168,13 +228,7 @@ async fn persist_affinity(
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo
-                .persist_with_event(
-                    &mut affinity,
-                    &deltas,
-                    ema_inertia,
-                    event_type,
-                    serde_json::json!({}),
-                )
+                .persist_with_event(&mut affinity, &deltas, ema_inertia, event_type, context)
                 .await
             {
                 tracing::warn!("affinity persist_with_event failed: {e}");
@@ -306,14 +360,12 @@ fn find_json_block(raw: &str) -> Option<&str> {
 /// gain. A guardrail against a misbehaving model — independent of
 /// `ema_inertia`. The two jobs (safety cap vs. pacing) are deliberately
 /// separate (see the design spec §5).
-#[allow(dead_code)] // wired in Task 6
 const LLM_AXIS_CAP: f64 = 0.15;
 
 /// Raw shape of the affinity evaluator's JSON output. `patience` is
 /// intentionally absent — it is rule-owned, so any `patience` the model
 /// emits is dropped by serde (unknown field). Missing axes default to 0.
 #[derive(Debug, Default, serde::Deserialize)]
-#[allow(dead_code)] // wired in Task 6
 struct LlmAffinityEval {
     #[serde(default)]
     warmth: f64,
@@ -333,7 +385,6 @@ struct LlmAffinityEval {
 /// Any failure (non-JSON, no object) → all-zero deltas + empty reason, so
 /// the rule deltas still persist and the affinity write never fails because
 /// the evaluator failed. `patience` is forced to 0 (rule-owned).
-#[allow(dead_code)] // wired in Task 6
 fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas, String) {
     use eros_engine_core::affinity::AffinityDeltas;
     let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
@@ -359,7 +410,6 @@ fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas
 /// Sum the rule (behavioral) and LLM (semantic) contributions per axis.
 /// `patience` is rule-owned — the evaluator always passes 0 for it — so
 /// the sum naturally keeps the rule value.
-#[allow(dead_code)] // wired in Task 6
 fn merge_deltas(
     rule: &eros_engine_core::affinity::AffinityDeltas,
     llm: &eros_engine_core::affinity::AffinityDeltas,
@@ -372,6 +422,58 @@ fn merge_deltas(
         patience: rule.patience + llm.patience,
         tension: rule.tension + llm.tension,
     }
+}
+
+const AFFINITY_TASK: &str = "affinity_evaluation";
+
+/// Skip the haiku eval on trivially short user turns (e.g. "k" / "ok") —
+/// there is nothing semantic to score and the rule deltas still apply.
+/// Tunable; small enough that any real sentence runs the eval.
+const AFFINITY_EVAL_MIN_CHARS: usize = 4;
+
+/// Run the haiku affinity evaluator for one Reply turn. Returns the clamped
+/// per-axis LLM deltas + the model's reason. Any failure (LLM error,
+/// non-JSON) yields all-zero deltas + empty reason so the rule deltas still
+/// persist and the affinity write never fails because the evaluator failed.
+async fn evaluate_affinity(
+    state: &AppState,
+    session_id: Uuid,
+    persona_name: &str,
+    affinity: &eros_engine_core::affinity::Affinity,
+    user_msg: &str,
+    assistant_msg: &str,
+) -> (eros_engine_core::affinity::AffinityDeltas, String) {
+    use eros_engine_core::affinity::AffinityDeltas;
+
+    let prompt =
+        crate::prompt::affinity_eval_prompt(persona_name, affinity, user_msg, assistant_msg);
+    let resolved = state.model_config.resolve(AFFINITY_TASK, None);
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        ..Default::default()
+    };
+
+    let raw = match state.openrouter.execute(req).await {
+        Ok(resp) => {
+            super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
+            resp.reply
+        }
+        Err(e) => {
+            tracing::warn!("affinity eval LLM call failed: {e}");
+            return (AffinityDeltas::default(), String::new());
+        }
+    };
+
+    let (deltas, reason) = parse_affinity_eval(&raw);
+    tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
+    (deltas, reason)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
