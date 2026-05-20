@@ -45,7 +45,7 @@ pub struct AffinityDeltas {
 
 impl Affinity {
     /// Apply LLM-evaluated deltas with EMA smoothing.
-    /// `ema_inertia ∈ [0, 1]` — 0 means full update, 0.8 is standard.
+    /// `ema_inertia ∈ [0, 1]` — 0 means full update; v1 default is 0.5 (gain 0.5).
     pub fn apply_deltas(&mut self, d: &AffinityDeltas, ema_inertia: f64) {
         let blend = 1.0 - ema_inertia;
         self.warmth = clamp(self.warmth + blend * d.warmth, -1.0, 1.0);

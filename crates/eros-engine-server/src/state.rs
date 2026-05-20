@@ -143,7 +143,7 @@ impl ServerConfig {
         let ema_inertia = std::env::var("EMA_INERTIA")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.8);
+            .unwrap_or(0.5);
         let dreaming_disabled = std::env::var("DREAMING_DISABLED")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
