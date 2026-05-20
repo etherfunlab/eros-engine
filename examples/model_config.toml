@@ -39,6 +39,18 @@ model = "anthropic/claude-haiku-4.5"
 temperature = 0.35
 max_tokens = 200
 
+# Per-turn six-axis affinity evaluation (post-process, semantic axes).
+# Scores how a single chat turn should move warmth/trust/intimacy plus the
+# content nudges to intrigue/tension, as small per-turn deltas. Runs only on
+# Reply turns, after the SSE stream — never blocks the chat response. Haiku
+# 4.5 is fast with reliable structured JSON; gemini-flash-lite +
+# deepseek-v4-flash keep it alive if Anthropic is down.
+[tasks.affinity_evaluation]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["google/gemini-3.1-flash-lite", "deepseek/deepseek-v4-flash"]
+temperature = 0.3
+max_tokens = 250
+
 # Reserved — not consumed by current code. `VoyageClient` reads
 # `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
 # This entry exists for future generalisation if we ever support a

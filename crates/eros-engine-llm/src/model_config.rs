@@ -475,4 +475,26 @@ fallback = ""
             r.fallback_model
         );
     }
+
+    // Regression: the committed deployed config (examples/model_config.toml,
+    // copied to /etc/eros-engine in the Docker image) must always parse and
+    // must define the affinity_evaluation task the post-process evaluator
+    // depends on — otherwise resolve() silently falls back to the wrong model.
+    #[test]
+    fn committed_example_config_parses_and_has_affinity_task() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text)
+            .expect("examples/model_config.toml must parse");
+        let r = cfg.resolve("affinity_evaluation", None);
+        assert_eq!(r.model, "anthropic/claude-haiku-4.5");
+        assert_eq!(r.max_tokens, 250);
+        assert!((r.temperature - 0.3).abs() < 1e-9);
+        assert_eq!(
+            r.fallback_model,
+            vec![
+                "google/gemini-3.1-flash-lite".to_string(),
+                "deepseek/deepseek-v4-flash".to_string(),
+            ]
+        );
+    }
 }
