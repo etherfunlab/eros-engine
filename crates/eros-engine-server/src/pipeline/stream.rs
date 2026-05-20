@@ -7,7 +7,6 @@
 //! Task 4 only ships the type layer; the `run_stream` generator lands in
 //! later tasks (T10/T11/T12).
 
-use eros_engine_llm::openrouter::UsageBlock;
 use serde::Serialize;
 use ulid::Ulid;
 
@@ -53,7 +52,11 @@ pub enum ProtocolFrame {
     Done {
         message_id: String,
         truncated: bool,
-        usage: Option<UsageBlock>,
+        /// OpenRouter usage, post-`OPENROUTER_USAGE_HIDDEN_KEYS` filtering.
+        /// A `serde_json::Value` (not `UsageBlock`) so configured keys can be
+        /// stripped before the frame reaches the client — the DB persists the
+        /// full unfiltered usage separately.
+        usage: Option<serde_json::Value>,
         generation_id: Option<String>,
     },
     Final {
@@ -88,6 +91,7 @@ use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::persona::PersonaRepo;
 
+use crate::routes::companion::filter_usage_keys;
 use crate::state::AppState;
 
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
@@ -206,10 +210,15 @@ fn drive_chat_burst(
                 });
             }
 
+            // Strip OPENROUTER_USAGE_HIDDEN_KEYS from the wire usage. The DB
+            // row above persists the full unfiltered usage; only the frame is
+            // filtered (mirrors the sync send_message path).
+            let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
             yield ProtocolFrame::Done {
                 message_id: ulid_string(msg_ulid),
                 truncated,
-                usage: last_usage,
+                usage: wire_usage,
                 generation_id: last_gen_id,
             };
 
@@ -524,10 +533,11 @@ pub fn replay_stream(
                         content: row.content.clone(),
                     };
                 }
-                let usage = row
-                    .usage
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                // Replay the persisted (full) usage, then strip
+                // OPENROUTER_USAGE_HIDDEN_KEYS for the wire — same contract as
+                // the live burst above.
+                let mut usage = row.usage.clone();
+                filter_usage_keys(&mut usage, &state.config.openrouter_usage_hidden_keys);
                 yield ProtocolFrame::Done {
                     message_id: ulid_string(msg_ulid),
                     truncated: row.truncated,
@@ -609,12 +619,11 @@ mod tests {
         let f = ProtocolFrame::Done {
             message_id: ulid_string(Ulid::new()),
             truncated: true,
-            usage: Some(UsageBlock {
-                prompt_tokens: 10,
-                completion_tokens: 4,
-                total_tokens: 14,
-                cost: None,
-            }),
+            usage: Some(serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+            })),
             generation_id: Some("gen-1".into()),
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
@@ -735,6 +744,65 @@ mod tests {
         // Tolerant: the test just proves the generator runs end-to-end and
         // terminates. T11/T15 add per-frame assertions for Reply/replay paths.
         assert!(frames.last().is_some(), "must emit at least one frame");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_done_strips_openrouter_usage_hidden_keys(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.openrouter_usage_hidden_keys =
+            std::collections::HashSet::from(["cost".to_string()]);
+        let state = std::sync::Arc::new(state);
+
+        // A persisted assistant row carrying full usage incl. `cost`.
+        let row = eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: "hello".into(),
+            extracted_facts: None,
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("x-ai/grok-4-fast".into()),
+            usage: Some(serde_json::json!({
+                "prompt_tokens": 1290,
+                "completion_tokens": 17,
+                "total_tokens": 1307,
+                "cost": 0.0015878
+            })),
+            generation_id: Some("gen-1".into()),
+            assistant_action_type: Some("reply".into()),
+        };
+
+        let frames: Vec<ProtocolFrame> =
+            replay_stream(state, session_id, user_id, false, vec![row])
+                .collect()
+                .await;
+
+        let usage = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("a Done frame")
+            .expect("usage present");
+
+        // The hidden key is gone; the rest survive.
+        assert!(
+            usage.get("cost").is_none(),
+            "cost must be stripped by OPENROUTER_USAGE_HIDDEN_KEYS; got {usage}"
+        );
+        assert_eq!(usage["prompt_tokens"], 1290);
+        assert_eq!(usage["total_tokens"], 1307);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
