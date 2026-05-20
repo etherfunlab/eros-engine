@@ -71,7 +71,9 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 
 行为：
 
-- 只作用于 sync `/comp/chat/{id}/message` 的响应。
+- sync `/comp/chat/{id}/message` 响应**和** SSE 流式 `done` 帧
+  （`/comp/chat/{id}/message/stream`）都生效。
+- 完整未过滤的 `usage` 仍会落库；只过滤面向 client 的负载。
 - **不**影响 `tracing::info!` 输出 —— 运维可见性照旧。
 - 异步路由（`/message_async`）、轮询路由、后台路径（dreaming /
   post_process）本来就不把 `usage` 返回给 client，env 设了也没区别。

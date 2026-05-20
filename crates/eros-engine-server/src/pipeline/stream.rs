@@ -874,4 +874,91 @@ data: [DONE]\n\n";
         );
         assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
     }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_done_strips_hidden_usage_keys_live(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Upstream usage carries `cost` — which OPENROUTER_USAGE_HIDDEN_KEYS hides.
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4,\"cost\":0.0015},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.openrouter_usage_hidden_keys =
+            std::collections::HashSet::from(["cost".to_string()]);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // PDE may pick Ghost (no usage) or Reply (usage present). Either way, no
+        // Done frame may leak `cost`. If Reply ran, this proves the live-burst
+        // filter; if Ghost ran, usage is None and the guard is trivially held.
+        let mut saw_filtered_usage = false;
+        for f in &frames {
+            if let ProtocolFrame::Done { usage: Some(u), .. } = f {
+                assert!(
+                    u.get("cost").is_none(),
+                    "live Done frame leaked hidden key `cost`: {u}"
+                );
+                assert_eq!(u["prompt_tokens"], 2, "non-hidden keys must survive");
+                saw_filtered_usage = true;
+            }
+        }
+        // If the reply path ran, confirm we actually exercised the filter.
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                saw_filtered_usage,
+                "a Reply burst ran but no Done frame carried usage to filter"
+            );
+        }
+    }
 }
