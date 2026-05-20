@@ -696,8 +696,7 @@ pub(crate) async fn resolve_or_create_session(
 ///   * `instance_id` provided → must belong to the JWT user.
 ///   * else `genome_id` provided → look up (or auto-create) the user's
 ///     active instance of that genome.
-///   * else: the only active genome the user already has an instance of
-///     wins; otherwise 400.
+///   * else (neither provided) → 400 Bad Request.
 #[utoipa::path(
     post,
     path = "/comp/chat/start",
