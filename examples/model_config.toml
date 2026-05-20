@@ -1,38 +1,42 @@
 [tasks.chat_companion]
 # Grok primary: most permissive among the cheap-and-fast tier; xAI's policy
-# explicitly avoids over-refusal on intimate adult dialogue.
+# explicitly avoids over-refusal on intimate adult dialogue. The fallback
+# chain stays on permissive / roleplay-tuned models so a primary outage
+# doesn't suddenly make the companion prudish.
 # `fallback` accepts either a single string (legacy) or an array of model
 # ids in preference order. The chain is tried sequentially; first success
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
 # block's fallback for this task.
 model = "x-ai/grok-4.20"
-fallback = ["x-ai/grok-4.1-fast", "deepseek/deepseek-v4-flash"]
-temperature = 0.85
-max_tokens = 600
+fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "qwen/qwen3.6-flash"]
+temperature = 0.8
+max_tokens = 1200
 
 [tasks.insight_extraction]
-model = "x-ai/grok-4.1-fast"
-fallback = ["anthropic/claude-haiku-4.5","deepseek/deepseek-v4-flash"]
-temperature = 0.3
+model = "google/gemini-3.1-flash-lite"
+fallback = ["deepseek/deepseek-v4-flash","qwen/qwen3.6-flash"]
+temperature = 0.2
 max_tokens = 400
 
 # Session-end memory extraction (dreaming-lite). Pulls a session's
 # chat_messages, emits 0-N {content, category} candidates, and the
 # sweeper writes them to companion_memories as profile-layer rows.
-# Haiku 4.5 is the cheapest model with reliable structured-JSON output;
-# grok-4.1-fast fallback keeps the no-OpenAI invariant if Anthropic is down.
+# gemini-3.1-flash-lite is cheap with reliable structured-JSON output;
+# deepseek-v4-flash + qwen3.6-flash fallback keep extraction alive if Google is down.
 [tasks.memory_extraction]
-model = "x-ai/grok-4.1-fast"
-fallback = ["anthropic/claude-haiku-4.5","deepseek/deepseek-v4-flash"]
+model = "google/gemini-3.1-flash-lite"
+fallback = ["deepseek/deepseek-v4-flash","qwen/qwen3.6-flash"]
 temperature = 0.2
 max_tokens = 800
 
 # Reserved — not consumed by current code. The PDE in
 # `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a
-# placeholder for a future optional LLM decision layer.
+# placeholder for a future optional LLM decision layer. Haiku 4.5 suits a
+# decision/classification layer (fast, strong instruction-following); the
+# structured-extraction tasks above use gemini-flash-lite instead.
 [tasks.pde_decision]
-model = "x-ai/grok-4.1-fast"
-temperature = 0.5
+model = "anthropic/claude-haiku-4.5"
+temperature = 0.35
 max_tokens = 200
 
 # Reserved — not consumed by current code. `VoyageClient` reads
