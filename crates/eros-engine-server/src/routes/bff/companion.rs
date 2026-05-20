@@ -243,11 +243,14 @@ mod tests {
         let session_id = seed_session(&pool, user_id, instance_id).await;
 
         // Seed three rows directly so we don't depend on pipeline::run.
+        // Explicit, strictly-increasing sent_at: a single multi-row INSERT
+        // shares one now() across all rows, so ORDER BY sent_at would tie and
+        // the result order would be undefined.
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, extracted_facts) \
-             VALUES ($1, 'user', 'alpha', '{\"facts\":[\"x\"]}'::jsonb),
-                    ($1, 'assistant', 'beta', NULL),
-                    ($1, 'user', 'gamma', '{\"facts\":[\"y\"]}'::jsonb)",
+            "INSERT INTO engine.chat_messages (session_id, role, content, extracted_facts, sent_at) \
+             VALUES ($1, 'user', 'alpha', '{\"facts\":[\"x\"]}'::jsonb, now() - interval '2 seconds'),
+                    ($1, 'assistant', 'beta', NULL, now() - interval '1 second'),
+                    ($1, 'user', 'gamma', '{\"facts\":[\"y\"]}'::jsonb, now())",
         )
         .bind(session_id)
         .execute(&pool)
@@ -436,9 +439,12 @@ mod tests {
         let genome_id = seed_genome(&pool, "Aria").await;
         let instance_id = seed_instance(&pool, genome_id, user_id).await;
         let session_id = seed_session(&pool, user_id, instance_id).await;
+        // Explicit, strictly-increasing sent_at so the two rows order
+        // deterministically — a single multi-row INSERT shares one now().
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'user', 'hello'), ($1, 'assistant', 'hi back')",
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'hello', now() - interval '1 second'), \
+                    ($1, 'assistant', 'hi back', now())",
         )
         .bind(session_id)
         .execute(&pool)
