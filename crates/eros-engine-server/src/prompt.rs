@@ -129,7 +129,7 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
 /// intrigue/tension) as small per-turn *changes*, not absolute values.
 /// All six current values are shown for context, but `patience` is
 /// rule-owned and is deliberately excluded from the requested output.
-// The caller (post-process affinity evaluator) is added in a later task.
+/// The caller (post-process affinity evaluator) is wired in Task 6.
 #[allow(dead_code)]
 pub fn affinity_eval_prompt(
     persona_name: &str,
@@ -660,6 +660,22 @@ mod tests {
         assert!(
             !p.contains("\"patience\""),
             "patience is rule-owned and must not be in the JSON output schema"
+        );
+        // axis-to-label binding: the labeled line must carry the correct value
+        assert!(
+            p.contains("warmth 温暖（-1~1）：当前 0.42"),
+            "warmth label must bind to warmth value"
+        );
+        assert!(
+            p.contains("patience 耐心（0~1）：当前 0.66"),
+            "patience display value must render"
+        );
+        // five-axis JSON output schema (+reason) must be present
+        assert!(
+            p.contains(
+                r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "tension": 0.0, "reason": "..."}"#
+            ),
+            "five-axis JSON output schema (+reason) must be present"
         );
     }
 
