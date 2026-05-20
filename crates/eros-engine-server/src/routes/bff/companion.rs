@@ -13,14 +13,12 @@ use serde::{Deserialize, Serialize};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::resolve_or_create_session;
 use crate::routes::companion::{require_session_for_user, HistoryQuery, StartChatRequest};
-use crate::routes::dto::AffinitySnapshot;
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
@@ -73,12 +71,6 @@ pub struct BffStartResponse {
     pub is_new: bool,
     /// Most-recent N messages, oldest-first. Empty for brand-new sessions.
     pub history: Vec<BffHistoryEntry>,
-    /// Affinity snapshot. `None` covers three cases the FE treats identically
-    /// as "no calibration to show":
-    ///   1. `EXPOSE_AFFINITY_DEBUG=false` — debug gate closed.
-    ///   2. Brand-new session — no row created yet.
-    ///   3. Resumed session that has never had an affinity-producing event.
-    pub affinity: Option<AffinitySnapshot>,
 }
 
 // ─── Handler ────────────────────────────────────────────────────────
@@ -136,9 +128,13 @@ async fn bff_get_history(
     }))
 }
 
-/// Cold-mount bundle: resolves (or creates) the session, then returns
-/// history + affinity in a single round-trip. Replaces three sequential
-/// calls (start + history + affinity) for `eros-engine-web` cold-mount.
+/// Cold-mount bundle: resolves (or creates) the session and returns its slim
+/// history in one round-trip (collapses the FE's start + history calls).
+///
+/// Affinity is intentionally NOT bundled here: the FE reads affinity on its
+/// own (full values via its DB middleware; per-turn deltas via
+/// `/bff/v1/comp/affinity/{sid}/event`). This keeps bootstrap independent of
+/// `EXPOSE_AFFINITY_DEBUG` — turning that gate off does not change this shape.
 #[utoipa::path(
     post,
     path = "/bff/v1/comp/chat/start",
@@ -162,27 +158,9 @@ async fn bff_start_chat(
     let resolved = resolve_or_create_session(&state, user_id, &canonical_req).await?;
     let history_limit = req.history_limit.unwrap_or(50).clamp(1, 50);
 
-    let history_fut = async {
-        Ok::<_, AppError>(
-            ChatRepo { pool: &state.pool }
-                .history_slim(resolved.session_id, history_limit, 0)
-                .await?,
-        )
-    };
-    let affinity_fut = async {
-        if !state.config.expose_affinity_debug {
-            return Ok::<Option<AffinitySnapshot>, AppError>(None);
-        }
-        let snapshot = AffinityRepo { pool: &state.pool }
-            .load(resolved.session_id)
-            .await?
-            .map(|mut a| {
-                a.apply_time_decay();
-                AffinitySnapshot::from(a)
-            });
-        Ok(snapshot)
-    };
-    let (rows, affinity) = tokio::try_join!(history_fut, affinity_fut)?;
+    let rows = ChatRepo { pool: &state.pool }
+        .history_slim(resolved.session_id, history_limit, 0)
+        .await?;
 
     let history = rows
         .into_iter()
@@ -199,7 +177,6 @@ async fn bff_start_chat(
         persona_name: resolved.persona_name,
         is_new: resolved.is_new,
         history,
-        affinity,
     }))
 }
 
@@ -409,7 +386,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_start_brand_new_session_returns_empty_history_no_affinity(pool: PgPool) {
+    async fn bff_start_brand_new_session_returns_empty_history(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let genome_id = seed_genome(&pool, "Aria").await;
 
@@ -429,8 +406,8 @@ mod tests {
         assert!(body["session_id"].is_string());
         assert!(body["instance_id"].is_string());
         assert!(body["history"].as_array().unwrap().is_empty());
-        // No affinity row yet for a brand-new session — spec §3.4 case 2.
-        assert!(body["affinity"].is_null());
+        // Bootstrap no longer bundles affinity — the field must be absent.
+        assert!(body.get("affinity").is_none());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -506,43 +483,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_start_affinity_null_when_debug_gate_closed(pool: PgPool) {
-        // Spec §3.4 case 1: affinity field hidden when EXPOSE_AFFINITY_DEBUG=false.
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Aria").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-        // Pre-seed an affinity row so the field would otherwise be non-null.
-        sqlx::query(
-            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, warmth) \
-             VALUES ($1, $2, $3, 0.42)",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(instance_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut state = test_state(pool);
-        state.config.expose_affinity_debug = false; // close the gate
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let (status, body) = send_request(
-            &mut app,
-            bff_start_request(&token, json!({ "genome_id": genome_id })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            body["affinity"].is_null(),
-            "affinity must be hidden when EXPOSE_AFFINITY_DEBUG=false; got {body}"
-        );
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_start_affinity_present_when_debug_gate_open(pool: PgPool) {
+    async fn bff_start_does_not_bundle_affinity_even_with_debug_open(pool: PgPool) {
+        // Bootstrap is decoupled from affinity: even with a pre-seeded affinity
+        // row AND EXPOSE_AFFINITY_DEBUG on (test default), the start response
+        // carries no `affinity` field. The FE reads affinity separately.
         let user_id = Uuid::new_v4();
         let genome_id = seed_genome(&pool, "Aria").await;
         let instance_id = seed_instance(&pool, genome_id, user_id).await;
@@ -568,12 +512,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let affinity = &body["affinity"];
         assert!(
-            affinity.is_object(),
-            "expected affinity object, got {affinity}"
+            body.get("affinity").is_none(),
+            "start must not bundle affinity; got {body}"
         );
-        assert!((affinity["warmth"].as_f64().unwrap() - 0.42).abs() < 1e-9);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
