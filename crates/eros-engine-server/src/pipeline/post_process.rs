@@ -302,6 +302,60 @@ fn find_json_block(raw: &str) -> Option<&str> {
     None
 }
 
+/// Per-axis safety cap on the LLM's raw delta, applied before the pacing
+/// gain. A guardrail against a misbehaving model — independent of
+/// `ema_inertia`. The two jobs (safety cap vs. pacing) are deliberately
+/// separate (see the design spec §5).
+#[allow(dead_code)] // wired in Task 6
+const LLM_AXIS_CAP: f64 = 0.15;
+
+/// Raw shape of the affinity evaluator's JSON output. `patience` is
+/// intentionally absent — it is rule-owned, so any `patience` the model
+/// emits is dropped by serde (unknown field). Missing axes default to 0.
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)] // wired in Task 6
+struct LlmAffinityEval {
+    #[serde(default)]
+    warmth: f64,
+    #[serde(default)]
+    trust: f64,
+    #[serde(default)]
+    intrigue: f64,
+    #[serde(default)]
+    intimacy: f64,
+    #[serde(default)]
+    tension: f64,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Parse + per-axis clamp the evaluator output into rule-mergeable deltas.
+/// Any failure (non-JSON, no object) → all-zero deltas + empty reason, so
+/// the rule deltas still persist and the affinity write never fails because
+/// the evaluator failed. `patience` is forced to 0 (rule-owned).
+#[allow(dead_code)] // wired in Task 6
+fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas, String) {
+    use eros_engine_core::affinity::AffinityDeltas;
+    let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
+        .ok()
+        .or_else(|| find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
+    let Some(e) = parsed else {
+        return (AffinityDeltas::default(), String::new());
+    };
+    let cap = |v: f64| v.clamp(-LLM_AXIS_CAP, LLM_AXIS_CAP);
+    (
+        AffinityDeltas {
+            warmth: cap(e.warmth),
+            trust: cap(e.trust),
+            intrigue: cap(e.intrigue),
+            intimacy: cap(e.intimacy),
+            tension: cap(e.tension),
+            patience: 0.0,
+        },
+        e.reason,
+    )
+}
+
 const INSIGHT_TASK: &str = "insight_extraction";
 
 /// Top-level entry: extract facts → structured insights → InsightRepo merge.
@@ -522,5 +576,66 @@ mod tests {
     #[test]
     fn find_json_block_returns_none_when_no_object() {
         assert!(find_json_block("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_affinity_eval_valid_clamps_and_keeps_reason() {
+        let raw = r#"{"warmth":0.08,"trust":0.03,"intimacy":0.06,"intrigue":0.02,"tension":-0.01,"reason":"暖"}"#;
+        let (d, reason) = parse_affinity_eval(raw);
+        assert!((d.warmth - 0.08).abs() < 1e-9);
+        assert!((d.trust - 0.03).abs() < 1e-9);
+        assert!((d.intimacy - 0.06).abs() < 1e-9);
+        assert!((d.intrigue - 0.02).abs() < 1e-9);
+        assert!((d.tension - (-0.01)).abs() < 1e-9);
+        assert_eq!(d.patience, 0.0);
+        assert_eq!(reason, "暖");
+    }
+
+    #[test]
+    fn parse_affinity_eval_clamps_out_of_range() {
+        let raw = r#"{"warmth":5.0,"trust":-2.0,"reason":"x"}"#;
+        let (d, _) = parse_affinity_eval(raw);
+        assert!((d.warmth - 0.15).abs() < 1e-9, "warmth caps at +0.15");
+        assert!(
+            (d.trust - (-0.15)).abs() < 1e-9,
+            "trust delta caps at -0.15"
+        );
+    }
+
+    #[test]
+    fn parse_affinity_eval_ignores_patience_field() {
+        let raw = r#"{"warmth":0.1,"patience":0.99,"reason":"x"}"#;
+        let (d, _) = parse_affinity_eval(raw);
+        assert_eq!(d.patience, 0.0, "patience from the model is ignored");
+        assert!((d.warmth - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_affinity_eval_garbage_returns_default() {
+        let (d, reason) = parse_affinity_eval("not json at all");
+        assert_eq!(d.warmth, 0.0);
+        assert_eq!(d.trust, 0.0);
+        assert_eq!(d.intrigue, 0.0);
+        assert_eq!(d.intimacy, 0.0);
+        assert_eq!(d.tension, 0.0);
+        assert_eq!(d.patience, 0.0);
+        assert!(reason.is_empty());
+    }
+
+    #[test]
+    fn parse_affinity_eval_missing_fields_default_zero() {
+        let raw = r#"{"warmth":0.1,"reason":"only warmth"}"#;
+        let (d, _) = parse_affinity_eval(raw);
+        assert!((d.warmth - 0.1).abs() < 1e-9);
+        assert_eq!(d.trust, 0.0);
+        assert_eq!(d.intimacy, 0.0);
+    }
+
+    #[test]
+    fn parse_affinity_eval_extracts_from_fenced_block() {
+        let raw = "```json\n{\"warmth\":0.05,\"reason\":\"fenced\"}\n```";
+        let (d, reason) = parse_affinity_eval(raw);
+        assert!((d.warmth - 0.05).abs() < 1e-9);
+        assert_eq!(reason, "fenced");
     }
 }
