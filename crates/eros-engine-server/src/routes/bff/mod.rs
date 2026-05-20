@@ -18,11 +18,14 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::state::AppState;
 
+pub mod affinity;
 pub mod companion;
 
 /// Compose all `/bff/v1/*` handlers into one router. Auth is applied
 /// at the call site in `routes::router` (the merged `comp` subtree's
 /// `require_auth` layer covers this).
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().merge(companion::router())
+    OpenApiRouter::new()
+        .merge(companion::router())
+        .merge(affinity::router())
 }
