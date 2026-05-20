@@ -73,7 +73,10 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 
 Behaviour:
 
-- Applies to the sync `/comp/chat/{id}/message` response only.
+- Applies to **both** the sync `/comp/chat/{id}/message` response and the
+  SSE streaming `done` frame (`/comp/chat/{id}/message/stream`).
+- The full unfiltered `usage` is still persisted to the DB; only the
+  client-facing payload is filtered.
 - Does **not** affect `tracing::info!` output — operator observability
   stays intact regardless of this setting.
 - Async route (`/message_async`), polling route, and background paths

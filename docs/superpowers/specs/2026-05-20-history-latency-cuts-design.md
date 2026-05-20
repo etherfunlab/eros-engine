@@ -271,6 +271,16 @@ Drop the new `routes/bff/` module and the `routes::router` merge line. Zero impa
 
 ## 3. Plan C — `POST /bff/v1/comp/chat/start`
 
+> **Amendment (2026-05-20, v0.2.1):** the `affinity` field described below was
+> **removed** from `BffStartResponse` shortly after it shipped, before any FE
+> consumer depended on it. The FE bootstrap reads affinity separately (full
+> values via its own DB middleware; per-turn deltas via
+> `GET /bff/v1/comp/affinity/{sid}/event`, see
+> `2026-05-20-affinity-event-delta-design.md`), so bundling it here coupled
+> bootstrap to `EXPOSE_AFFINITY_DEBUG` for no benefit. `bff_start_chat` now
+> returns session + slim history only; the §3.3/§3.4 affinity bits below are
+> historical. Pre-consumption removal, so no `v2` bump.
+
 ### 3.1 Problem & lever
 
 Cold-mount on `eros-engine-web` serialises three engine calls. Folding session creation + history + affinity into one BFF endpoint collapses **3 RT → 1 RT**.

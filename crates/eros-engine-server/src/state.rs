@@ -129,11 +129,12 @@ pub struct ServerConfig {
     /// re-claims the row. Should comfortably exceed the worst-case
     /// processing time (one LLM call + N voyage embeddings).
     pub dreaming_claim_stale_threshold: Duration,
-    /// Top-level keys removed from `CompanionReplyResponse.usage`
-    /// before the response leaves the engine. Empty = pass-through.
-    /// Tracing fields are unaffected — operator observability stays
-    /// intact regardless of this setting. Populated from
-    /// `OPENROUTER_USAGE_HIDDEN_KEYS` (comma-separated).
+    /// Top-level keys removed from the `usage` object before it leaves the
+    /// engine — both `CompanionReplyResponse.usage` (sync) and the SSE
+    /// streaming `done` frame. Empty = pass-through. The DB persists the full
+    /// unfiltered usage and tracing is unaffected, so operator observability
+    /// stays intact. Populated from `OPENROUTER_USAGE_HIDDEN_KEYS`
+    /// (comma-separated).
     pub openrouter_usage_hidden_keys: HashSet<String>,
 }
 

@@ -457,7 +457,7 @@ pub(crate) fn validate_prompt_traits(
 /// Only top-level keys are affected; nested sub-keys inside a retained
 /// object (e.g. `prompt_tokens.details`) are out of scope — list the
 /// parent key to suppress the whole subtree.
-fn filter_usage_keys(
+pub(crate) fn filter_usage_keys(
     usage: &mut Option<serde_json::Value>,
     hidden: &std::collections::HashSet<String>,
 ) {

@@ -225,7 +225,7 @@ for frame layout and error semantics.
 | `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
 | `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
 | `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
-| `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the sync `/message` response's `usage` object. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. Server-side tracing is unaffected. |
+| `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object — both the sync `/message` response and the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
 | `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
 | `SUPABASE_URL` | no | Supabase project URL. Kept in `.env.example` for client/deploy conventions; the server does not read it today. |
 | `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |
