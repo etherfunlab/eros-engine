@@ -17,7 +17,7 @@ primary_region = "nrt"
 [env]
   BIND_ADDR = "0.0.0.0:8080"
   EXPOSE_AFFINITY_DEBUG = "true"
-  EMA_INERTIA = "0.8"
+  EMA_INERTIA = "0.5"
   MODEL_CONFIG_PATH = "/etc/eros-engine/model_config.toml"
   RUST_LOG = "info"
 

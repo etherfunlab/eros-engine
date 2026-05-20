@@ -45,7 +45,7 @@ pub struct AffinityDeltas {
 
 impl Affinity {
     /// Apply LLM-evaluated deltas with EMA smoothing.
-    /// `ema_inertia ∈ [0, 1]` — 0 means full update, 0.8 is standard.
+    /// `ema_inertia ∈ [0, 1]` — 0 means full update; v1 default is 0.5 (gain 0.5).
     pub fn apply_deltas(&mut self, d: &AffinityDeltas, ema_inertia: f64) {
         let blend = 1.0 - ema_inertia;
         self.warmth = clamp(self.warmth + blend * d.warmth, -1.0, 1.0);
@@ -174,6 +174,21 @@ mod tests {
             0.8,
         );
         assert!((a.warmth - (before + 0.5 * 0.2)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_deltas_combined_then_gains_and_clamps() {
+        // A pre-summed (rule + llm) delta on a hot axis at v1 pacing
+        // (ema_inertia 0.5 → gain 0.5): 0.3 + 0.5 * 0.15 = 0.375.
+        let mut a = fresh(); // warmth 0.3
+        a.apply_deltas(
+            &AffinityDeltas {
+                warmth: 0.15,
+                ..Default::default()
+            },
+            0.5,
+        );
+        assert!((a.warmth - 0.375).abs() < 1e-9);
     }
 
     #[test]

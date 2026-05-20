@@ -123,6 +123,47 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
     }
 }
 
+/// Build the per-turn affinity-evaluation prompt for the post-process LLM
+/// scorer. Asks the model to rate how this single exchange should move the
+/// LLM-owned axes (warmth/trust/intimacy + content nudges to
+/// intrigue/tension) as small per-turn *changes*, not absolute values.
+/// All six current values are shown for context, but `patience` is
+/// rule-owned and is deliberately excluded from the requested output.
+/// Called by the post-process affinity evaluator.
+pub fn affinity_eval_prompt(
+    persona_name: &str,
+    affinity: &Affinity,
+    user_msg: &str,
+    assistant_msg: &str,
+) -> String {
+    format!(
+        "你在评估这一轮对话对「{persona_name}」好感度的影响。\n\
+         好感度有六个维度，当前值如下：\n\
+         - warmth 温暖（-1~1）：当前 {warmth:.2}。冷淡/敌意为负，亲切/热情为正。\n\
+         - trust 信任（0~1）：当前 {trust:.2}。自我袒露、言行一致会提升。\n\
+         - intrigue 好奇（0~1）：当前 {intrigue:.2}。话题新鲜、有内容会提升。\n\
+         - intimacy 亲密（0~1）：当前 {intimacy:.2}。情感或身体上的靠近会提升。\n\
+         - patience 耐心（0~1）：当前 {patience:.2}。由规则维护，请勿评估。\n\
+         - tension 张力（0~1）：当前 {tension:.2}。调情、暧昧或冲突会提升。\n\
+         \n\
+         本轮对话：\n\
+         用户：{user_msg}\n\
+         {persona_name}：{assistant_msg}\n\
+         \n\
+         判断这一轮应让 warmth、trust、intrigue、intimacy、tension 各变化多少\
+         （是【变化量】，不是绝对值；patience 不要输出）。\n\
+         普通寒暄接近 0；真正动情或暧昧的瞬间幅度更大，每个维度大致在 ±0.15 之间。\n\
+         严格只输出 JSON，reason 用一句中文简述：\n\
+         {{\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"tension\": 0.0, \"reason\": \"...\"}}",
+        warmth = affinity.warmth,
+        trust = affinity.trust,
+        intrigue = affinity.intrigue,
+        intimacy = affinity.intimacy,
+        patience = affinity.patience,
+        tension = affinity.tension,
+    )
+}
+
 /// Gift reaction directives keyed on persona.tip_personality.
 pub fn gift_reaction_context(gifts: &[PendingGift], tip_personality: &str) -> String {
     if gifts.is_empty() {
@@ -578,6 +619,63 @@ mod tests {
     #[test]
     fn test_gift_reaction_empty_when_no_gifts() {
         assert!(gift_reaction_context(&[], "normal").is_empty());
+    }
+
+    fn fixture_affinity() -> Affinity {
+        let now = chrono::Utc::now();
+        Affinity {
+            id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            instance_id: Uuid::nil(),
+            warmth: 0.42,
+            trust: 0.31,
+            intrigue: 0.55,
+            intimacy: 0.22,
+            patience: 0.66,
+            tension: 0.13,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn affinity_eval_prompt_includes_six_values_and_exchange() {
+        let a = fixture_affinity();
+        let p = affinity_eval_prompt("Mia", &a, "我今天好累", "抱抱你");
+        // persona + the turn exchange
+        assert!(p.contains("Mia"));
+        assert!(p.contains("我今天好累"));
+        assert!(p.contains("抱抱你"));
+        // all six current values are shown (incl. patience, for context)
+        for v in ["0.42", "0.31", "0.55", "0.22", "0.66", "0.13"] {
+            assert!(p.contains(v), "missing current value {v} in prompt");
+        }
+        // patience must NOT be a requested output key
+        assert!(
+            !p.contains("\"patience\""),
+            "patience is rule-owned and must not be in the JSON output schema"
+        );
+        // axis-to-label binding: the labeled line must carry the correct value
+        assert!(
+            p.contains("warmth 温暖（-1~1）：当前 0.42"),
+            "warmth label must bind to warmth value"
+        );
+        assert!(
+            p.contains("patience 耐心（0~1）：当前 0.66"),
+            "patience display value must render"
+        );
+        // five-axis JSON output schema (+reason) must be present
+        assert!(
+            p.contains(
+                r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "tension": 0.0, "reason": "..."}"#
+            ),
+            "five-axis JSON output schema (+reason) must be present"
+        );
     }
 
     // ─── Insight prompt tests ──────────────────────────────────────

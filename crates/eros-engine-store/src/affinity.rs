@@ -180,8 +180,13 @@ impl<'a> AffinityRepo<'a> {
         .await
     }
 
-    /// Apply EMA-smoothed deltas in core, persist updated row, log event
-    /// — all in a single transaction. Mutates `affinity` in place.
+    /// Apply EMA-smoothed deltas in core, persist updated row, log event —
+    /// all in a single transaction. The current vector is re-read **inside**
+    /// the tx under `SELECT ... FOR UPDATE`, so overlapping same-session
+    /// writes serialize instead of clobbering each other (the lost-update
+    /// bug the six-axis activation makes real — design spec §6.2). Time
+    /// decay is computed from the locked row, not a pre-read snapshot.
+    /// Mutates `affinity` in place to reflect the persisted state.
     pub async fn persist_with_event(
         &self,
         affinity: &mut Affinity,
@@ -190,31 +195,42 @@ impl<'a> AffinityRepo<'a> {
         event_type: &str,
         context: serde_json::Value,
     ) -> Result<(), sqlx::Error> {
-        // Snapshot pre-EMA axis values to derive the post-EMA effective change.
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the row and read the freshest committed values inside the tx.
+        let locked = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity WHERE id = $1 FOR UPDATE",
+        )
+        .bind(affinity.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut current = locked.into_domain();
+
+        // Decay from the locked row, then snapshot the pre-delta baseline so
+        // effective_deltas captures only the delta application, not decay.
+        current.apply_time_decay();
         let before = AffinityDeltas {
-            warmth: affinity.warmth,
-            trust: affinity.trust,
-            intrigue: affinity.intrigue,
-            intimacy: affinity.intimacy,
-            patience: affinity.patience,
-            tension: affinity.tension,
+            warmth: current.warmth,
+            trust: current.trust,
+            intrigue: current.intrigue,
+            intimacy: current.intimacy,
+            patience: current.patience,
+            tension: current.tension,
         };
 
-        affinity.apply_deltas(deltas, ema_inertia);
-        let label = affinity.infer_label();
-        affinity.relationship_label = label;
+        current.apply_deltas(deltas, ema_inertia);
+        let label = current.infer_label();
+        current.relationship_label = label;
 
         // Post-EMA effective change = after − before (captures EMA + clamping).
         let effective = AffinityDeltas {
-            warmth: affinity.warmth - before.warmth,
-            trust: affinity.trust - before.trust,
-            intrigue: affinity.intrigue - before.intrigue,
-            intimacy: affinity.intimacy - before.intimacy,
-            patience: affinity.patience - before.patience,
-            tension: affinity.tension - before.tension,
+            warmth: current.warmth - before.warmth,
+            trust: current.trust - before.trust,
+            intrigue: current.intrigue - before.intrigue,
+            intimacy: current.intimacy - before.intimacy,
+            patience: current.patience - before.patience,
+            tension: current.tension - before.tension,
         };
-
-        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "UPDATE engine.companion_affinity \
@@ -223,13 +239,13 @@ impl<'a> AffinityRepo<'a> {
                  relationship_label = $8, updated_at = now() \
              WHERE id = $1",
         )
-        .bind(affinity.id)
-        .bind(affinity.warmth)
-        .bind(affinity.trust)
-        .bind(affinity.intrigue)
-        .bind(affinity.intimacy)
-        .bind(affinity.patience)
-        .bind(affinity.tension)
+        .bind(current.id)
+        .bind(current.warmth)
+        .bind(current.trust)
+        .bind(current.intrigue)
+        .bind(current.intimacy)
+        .bind(current.patience)
+        .bind(current.tension)
         .bind(label.map(label_to_str))
         .execute(&mut *tx)
         .await?;
@@ -241,7 +257,7 @@ impl<'a> AffinityRepo<'a> {
                (affinity_id, event_type, deltas, effective_deltas, context) \
              VALUES ($1, $2, $3, $4, $5)",
         )
-        .bind(affinity.id)
+        .bind(current.id)
         .bind(event_type)
         .bind(deltas_json)
         .bind(effective_json)
@@ -250,6 +266,9 @@ impl<'a> AffinityRepo<'a> {
         .await?;
 
         tx.commit().await?;
+
+        // Reflect the persisted state back to the caller.
+        *affinity = current;
         Ok(())
     }
 
@@ -491,6 +510,104 @@ mod tests {
         ] {
             assert_eq!(eff[axis].as_f64().unwrap(), 0.0, "axis {axis} must be 0");
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_persist_with_event_does_not_lose_updates(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let base = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let start_warmth = base.warmth; // default 0.3
+
+        // Two overlapping writers, each +0.1 warmth at full gain (ema 0.0).
+        // Without row locking the second UPDATE clobbers the first and the
+        // result is 0.4 (one lost increment); with FOR UPDATE it is 0.5.
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let h1 = tokio::spawn(async move {
+            let repo = AffinityRepo { pool: &p1 };
+            let mut a = repo.load(session_id).await.unwrap().unwrap();
+            repo.persist_with_event(
+                &mut a,
+                &AffinityDeltas {
+                    warmth: 0.1,
+                    ..Default::default()
+                },
+                0.0,
+                "message",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        });
+        let h2 = tokio::spawn(async move {
+            let repo = AffinityRepo { pool: &p2 };
+            let mut a = repo.load(session_id).await.unwrap().unwrap();
+            repo.persist_with_event(
+                &mut a,
+                &AffinityDeltas {
+                    warmth: 0.1,
+                    ..Default::default()
+                },
+                0.0,
+                "message",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        });
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        assert!(
+            (reloaded.warmth - (start_warmth + 0.2)).abs() < 1e-9,
+            "both increments must land: expected {}, got {}",
+            start_warmth + 0.2,
+            reloaded.warmth
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(base.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2, "each turn writes exactly one event row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_flips_label_when_axes_cross_thresholds(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        // Defaults warmth 0.3 / intimacy 0.0 / tension 0.1 → not Romantic.
+        // Cross the Romantic thresholds (warmth>=0.7, intimacy>=0.4,
+        // tension>=0.3) at full gain — confirms the now-live axes drive labels.
+        let deltas = AffinityDeltas {
+            warmth: 0.5,   // 0.3 -> 0.8
+            intimacy: 0.5, // 0.0 -> 0.5
+            tension: 0.3,  // 0.1 -> 0.4
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}))
+            .await
+            .unwrap();
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.relationship_label,
+            Some(RelationshipLabel::Romantic)
+        );
     }
 
     async fn seed_event(
