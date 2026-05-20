@@ -16,6 +16,53 @@
     }
   ],
   "paths": {
+    "/bff/v1/comp/affinity/{session_id}/event": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Latest user-turn affinity delta (post-EMA). For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked.",
+        "operationId": "bff_get_affinity_delta",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffAffinityDeltaResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/bff/v1/comp/chat/start": {
       "post": {
         "tags": [
@@ -169,6 +216,85 @@
           },
           "404": {
             "description": "session has no affinity"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/affinity/{session_id}/event": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Paginated affinity-event log for a session — pre-EMA + post-EMA deltas.\nDebug-gated (same router as get_affinity).",
+        "operationId": "get_affinity_events",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 20, capped at 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "event_type",
+            "in": "query",
+            "description": "Filter: message|ghost|gift|proactive|time_decay",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AffinityEventsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid event_type"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
           }
         },
         "security": [
@@ -870,6 +996,69 @@
           }
         }
       },
+      "AffinityEventEntry": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "deltas",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto",
+            "description": "Pre-EMA raw delta the pipeline decided."
+          },
+          "effective_deltas": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityDeltasDto",
+                "description": "Post-EMA effective change (after − before). None for pre-0014 rows."
+              }
+            ]
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable unique id of this event (FE freshness/dedup key)."
+          },
+          "event_type": {
+            "type": "string"
+          }
+        }
+      },
+      "AffinityEventsResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "events",
+          "total"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AffinityEventEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "description": "Count returned in this page (== events.len()), NOT the grand total.",
+            "minimum": 0
+          }
+        }
+      },
       "AffinitySnapshot": {
         "type": "object",
         "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
@@ -925,6 +1114,56 @@
           "warmth": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "BffAffinityDelta": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "effective_deltas",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "effective_deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto",
+            "description": "Post-EMA effective change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable unique id of this event — the FE freshness/dedup key."
+          },
+          "event_type": {
+            "type": "string"
+          }
+        }
+      },
+      "BffAffinityDeltaResponse": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BffAffinityDelta",
+                "description": "None when no user-turn event yet (brand-new, or only time_decay), or\nwhen the latest user-turn event predates migration 0014."
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
