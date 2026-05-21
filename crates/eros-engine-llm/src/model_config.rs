@@ -31,6 +31,21 @@ impl FallbackSpec {
     }
 }
 
+/// One tier's overrides for a task. Every field is optional; an absent
+/// field inherits from the enclosing task's default block in `resolve`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TierConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub fallback: Option<FallbackSpec>,
+    /// Allow-listed prompt-trait tags. Three-state, mirroring `fallback`'s
+    /// absent≠empty rule: absent → None (no gating); `[]` → empty whitelist
+    /// (drop all); `["a","b"]` → keep only those tags.
+    #[serde(default)]
+    pub allow_traits: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultConfig {
     #[serde(default)]
@@ -58,6 +73,13 @@ pub struct TaskConfig {
     /// Embedding-only: vector dimensions.
     #[serde(default)]
     pub dimensions: Option<u32>,
+    /// Task-level (default-block) prompt-trait allow-list. Same three-state
+    /// semantics as `TierConfig::allow_traits`.
+    #[serde(default)]
+    pub allow_traits: Option<Vec<String>>,
+    /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
+    #[serde(default)]
+    pub tiers: HashMap<String, TierConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -80,6 +102,9 @@ pub struct ResolvedModel {
     pub fallback_model: Vec<String>,
     pub temperature: f64,
     pub max_tokens: u32,
+    /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
+    /// handler keeps only `prompt_traits` whose tag is in `set`.
+    pub allow_traits: Option<Vec<String>>,
 }
 
 impl ModelConfig {
@@ -101,26 +126,50 @@ impl ModelConfig {
         Ok(Arc::new(cfg))
     }
 
-    /// Resolve a task's model. Priority: persona_override > task config > defaults.
-    pub fn resolve(&self, task: &str, persona_override: Option<&str>) -> ResolvedModel {
+    /// Resolve a task's model. Priority for `model`/`fallback`/`allow_traits`:
+    /// matched tier block > task default block > `[defaults]` > compiled-in.
+    /// `temperature`/`max_tokens` are task-level only (no per-tier override).
+    pub fn resolve(&self, task: &str, tier: Option<&str>) -> ResolvedModel {
         let task_cfg = self.tasks.get(task);
         if task_cfg.is_none() {
             tracing::warn!(task, "model_config: unknown task, using defaults");
         }
 
-        let model = persona_override
-            .map(String::from)
+        // Matched tier block, if a tier was supplied and exists on this task.
+        let tier_cfg = match (task_cfg, tier) {
+            (Some(t), Some(name)) => {
+                let found = t.tiers.get(name);
+                if found.is_none() {
+                    tracing::warn!(
+                        task,
+                        tier = name,
+                        "model_config: unknown tier, using task default block"
+                    );
+                }
+                found
+            }
+            _ => None,
+        };
+
+        let model = tier_cfg
+            .and_then(|t| t.model.clone())
             .or_else(|| task_cfg.map(|t| t.model.clone()))
             .or_else(|| self.defaults.fallback_model.clone())
             .unwrap_or_else(|| FALLBACK_MODEL.to_string());
 
-        // Precedence: explicit per-task `fallback` (even when empty)
-        // wins over defaults. Only an absent per-task value inherits
-        // the singleton from `[defaults] fallback_model`.
-        let fallback_model: Vec<String> = match task_cfg.and_then(|t| t.fallback.as_ref()) {
+        // fallback: tier (even empty) > task (even empty) > defaults singleton.
+        let fallback_model: Vec<String> = match tier_cfg.and_then(|t| t.fallback.as_ref()) {
             Some(spec) => spec.clone().into_vec(),
-            None => self.defaults.fallback_model.iter().cloned().collect(),
+            None => match task_cfg.and_then(|t| t.fallback.as_ref()) {
+                Some(spec) => spec.clone().into_vec(),
+                None => self.defaults.fallback_model.iter().cloned().collect(),
+            },
         };
+
+        // allow_traits: tier (even empty) > task > None.
+        let allow_traits = tier_cfg
+            .and_then(|t| t.allow_traits.clone())
+            .or_else(|| task_cfg.and_then(|t| t.allow_traits.clone()));
 
         let temperature = task_cfg
             .and_then(|t| t.temperature)
@@ -137,6 +186,7 @@ impl ModelConfig {
             fallback_model,
             temperature,
             max_tokens,
+            allow_traits,
         }
     }
 }
@@ -156,6 +206,25 @@ model = "deepseek/deepseek-v3.2"
 temperature = 0.85
 max_tokens = 200
 description = "AI companion chat"
+"#;
+
+    const TIERED: &str = r#"
+[tasks.chat_companion]
+model        = "default-model"
+fallback     = ["default-fb"]
+allow_traits = ["allow_politics"]
+temperature  = 0.8
+max_tokens   = 1200
+
+[tasks.chat_companion.tiers.free]
+model        = "free-model"
+fallback     = ["free-fb"]
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.gold]
+model        = "gold-model"
+fallback     = ["gold-fb-1", "gold-fb-2"]
+allow_traits = ["allow_nsfw", "allow_politics"]
 "#;
 
     #[test]
@@ -193,15 +262,6 @@ max_tokens = 600
     }
 
     #[test]
-    fn test_resolve_persona_override_wins() {
-        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
-        let r = cfg.resolve("chat_companion", Some("x-ai/grok-4-fast"));
-        assert_eq!(r.model, "x-ai/grok-4-fast");
-        // temp comes from task config, not override
-        assert_eq!(r.temperature, 0.85);
-    }
-
-    #[test]
     fn test_resolve_unknown_task_uses_defaults() {
         let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
         let r = cfg.resolve("nonexistent_task", None);
@@ -216,12 +276,90 @@ max_tokens = 600
     }
 
     #[test]
-    fn test_resolve_override_with_unknown_task_uses_defaults_for_params() {
-        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
-        let r = cfg.resolve("nonexistent_task", Some("x-ai/grok-4-fast"));
-        assert_eq!(r.model, "x-ai/grok-4-fast"); // override wins
-        assert_eq!(r.temperature, 0.5); // defaults
-        assert_eq!(r.max_tokens, 200); // defaults
+    fn resolve_tier_match_uses_tier_block() {
+        let cfg = ModelConfig::from_toml_str(TIERED).unwrap();
+        let r = cfg.resolve("chat_companion", Some("gold"));
+        assert_eq!(r.model, "gold-model");
+        assert_eq!(
+            r.fallback_model,
+            vec!["gold-fb-1".to_string(), "gold-fb-2".to_string()]
+        );
+        assert_eq!(
+            r.allow_traits,
+            Some(vec!["allow_nsfw".to_string(), "allow_politics".to_string()])
+        );
+        assert_eq!(r.temperature, 0.8);
+        assert_eq!(r.max_tokens, 1200);
+    }
+
+    #[test]
+    fn resolve_unknown_tier_falls_back_to_default_block() {
+        let cfg = ModelConfig::from_toml_str(TIERED).unwrap();
+        let r = cfg.resolve("chat_companion", Some("platinum"));
+        assert_eq!(r.model, "default-model");
+        assert_eq!(r.fallback_model, vec!["default-fb".to_string()]);
+        assert_eq!(r.allow_traits, Some(vec!["allow_politics".to_string()]));
+    }
+
+    #[test]
+    fn resolve_no_tier_uses_default_block() {
+        let cfg = ModelConfig::from_toml_str(TIERED).unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.model, "default-model");
+        assert_eq!(r.allow_traits, Some(vec!["allow_politics".to_string()]));
+    }
+
+    #[test]
+    fn resolve_tier_inherits_unspecified_fields_from_default_block() {
+        let toml = r#"
+[tasks.chat_companion]
+model        = "default-model"
+fallback     = ["default-fb"]
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.free]
+model = "free-model"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", Some("free"));
+        assert_eq!(r.model, "free-model");
+        assert_eq!(r.fallback_model, vec!["default-fb".to_string()]);
+        assert_eq!(r.allow_traits, Some(vec!["allow_politics".to_string()]));
+    }
+
+    #[test]
+    fn resolve_allow_traits_three_state() {
+        let absent = r#"
+[tasks.chat_companion]
+model = "m"
+"#;
+        let r = ModelConfig::from_toml_str(absent)
+            .unwrap()
+            .resolve("chat_companion", None);
+        assert_eq!(r.allow_traits, None);
+
+        let empty = r#"
+[tasks.chat_companion]
+model = "m"
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.locked]
+allow_traits = []
+"#;
+        let r = ModelConfig::from_toml_str(empty)
+            .unwrap()
+            .resolve("chat_companion", Some("locked"));
+        assert_eq!(r.allow_traits, Some(vec![]));
+
+        let list = r#"
+[tasks.chat_companion]
+model = "m"
+allow_traits = ["a", "b"]
+"#;
+        let r = ModelConfig::from_toml_str(list)
+            .unwrap()
+            .resolve("chat_companion", None);
+        assert_eq!(r.allow_traits, Some(vec!["a".to_string(), "b".to_string()]));
     }
 
     // ─── Public schema compat fixture ─────────────────────────────────
@@ -337,10 +475,10 @@ description  = "reserved — Voyage hard-codes its own model"
         assert_eq!(r.temperature, 0.85);
         assert_eq!(r.max_tokens, 600);
 
-        // Persona override only touches `model`; temperature / max_tokens
-        // stay on the task config.
-        let r = cfg.resolve("chat_companion", Some("anthropic/claude-sonnet-4"));
-        assert_eq!(r.model, "anthropic/claude-sonnet-4");
+        // A tier name that isn't configured falls back to the task default
+        // block; temperature / max_tokens are always task-level.
+        let r = cfg.resolve("chat_companion", Some("nonexistent_tier"));
+        assert_eq!(r.model, "x-ai/grok-4-fast");
         assert_eq!(r.temperature, 0.85);
         assert_eq!(r.max_tokens, 600);
     }
