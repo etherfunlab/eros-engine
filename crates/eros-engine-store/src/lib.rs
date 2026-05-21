@@ -3,6 +3,7 @@
 
 pub mod affinity;
 pub mod chat;
+pub mod human_insight;
 pub mod insight;
 pub mod memory;
 pub mod ownership;
