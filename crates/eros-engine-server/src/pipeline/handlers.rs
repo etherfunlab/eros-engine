@@ -9,9 +9,9 @@
 //!   inline `sqlx::query_as` against `chat_messages`.
 //! - `ChatRequest` is built around the OSS `eros_engine_llm::openrouter::ChatRequest`
 //!   shape (`model` / `fallback_model` / `messages` / `temperature` / `max_tokens`),
-//!   resolved via `state.model_config` at handler time. The gateway's
-//!   `task: String` + `persona_override: Option<String>` indirection lives at
-//!   the resolver call instead of being passed downstream.
+//!   resolved via `state.model_config` at handler time. The resolver takes
+//!   `task: &str` + the request's `tier: Option<&str>` and returns the
+//!   per-tier model / fallback / allow_traits.
 //! - `GiftHandler` carries `deltas: AffinityDeltas` directly — there is
 //!   no shop item / gift-record lookup since the OSS engine has no
 //!   credit ledger.
