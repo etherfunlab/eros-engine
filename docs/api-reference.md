@@ -126,6 +126,23 @@ Once the first SSE byte has been written, terminal failures arrive as an
 in-band `error` frame and the stream closes; the HTTP response has already
 committed `200 OK`.
 
+**Optional: tier selection.** The body may include a `tier` string —
+type `String`, regex `^[a-z0-9_]{1,32}$` (returns `400` if malformed).
+Selects the per-tier model and `allow_traits` from `model_config.toml`
+(`[tasks.chat_companion.tiers.<tier>]`). An unknown or absent tier falls
+back to the task default block (a warn is logged). Example:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "tier": "gold"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **Optional: per-request prompt traits.** The body may include a
 `prompt_traits` array — see [prompt-traits.md](prompt-traits.md). Example:
 

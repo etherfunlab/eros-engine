@@ -2,7 +2,7 @@
 
 [English](model-config.md) · [中文](model-config.zh.md)
 
-LLM model selection for the engine lives in a TOML file loaded at server start. Per-task model + parameters, with persona-level overrides on top.
+LLM model selection for the engine lives in a TOML file loaded at server start. Per-task model + parameters, with optional per-tier overrides on top.
 
 ## Where it lives
 
@@ -25,21 +25,29 @@ model        = "<provider>/<model-id>"      # required
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
+allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
 dimensions   = 512                          # optional, embedding-only field
+
+[tasks.<name>.tiers.<tier>]
+model        = "<provider>/<model-id>"      # optional, overrides task-level model for this tier
+fallback     = "<provider>/<model-id>"      # optional, overrides task-level fallback for this tier
+allow_traits = ["tag_a"]                    # optional, overrides task-level allow_traits for this tier
 ```
 
 Field details:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `defaults.fallback_model` | `String` | no | Hard fallback if neither task config nor persona override provides a model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
+| `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
-| `tasks.<name>.model` | `String` | yes | Primary model for the task. |
+| `tasks.<name>.model` | `String` | yes | Primary model for the task (task default block). |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
-| `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. |
-| `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. |
+| `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
+| `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
+| `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
+| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 | `tasks.<name>.dimensions` | `u32` | no | Embedding-only. Ignored by chat / insight tasks. |
 
@@ -61,16 +69,32 @@ Anything else is either reserved for a future feature (`pde_decision`) or vestig
 
 ## Resolution rules
 
+For `model` and `fallback`:
+
 ```
-persona_override > task_config > defaults > compiled-in fallback
+matched tier block > task default block > [defaults] > compiled-in fallback
+```
+
+For `allow_traits`:
+
+```
+matched tier block > task default block
+```
+
+For `temperature` and `max_tokens`:
+
+```
+task default block > [defaults] > compiled-in fallback
 ```
 
 Where each step contributes:
 
-- **`persona_override`** — set per persona in `genome.art_metadata.model`. Wins for the `model` field only; temperature / max_tokens still come from the task config.
-- **`task_config`** — `[tasks.<name>]` block.
-- **`defaults`** — `[defaults]` block.
+- **Matched tier block** — `[tasks.<name>.tiers.<tier>]`, where `<tier>` comes from the `tier` field of the chat request (regex `^[a-z0-9_]{1,32}$`). If the requested tier is absent or unknown (no matching sub-table), the task default block is used and a `tracing::warn!` is emitted.
+- **Task default block** — `[tasks.<name>]`.
+- **`[defaults]`** — top-level defaults block.
 - **Compiled-in fallback** — `x-ai/grok-4-mini`, temperature `0.5`, max_tokens `200`. Hard-coded in `model_config.rs`.
+
+`temperature` and `max_tokens` are task-level only — per-tier sub-tables do not override them.
 
 If `resolve()` is called with an unknown task name, it falls back through `defaults → compiled-in` and emits a `tracing::warn!` ("model_config: unknown task, using defaults").
 
@@ -82,14 +106,18 @@ For the duration of `0.x`, the OSS engine commits to:
 2. **No renamed fields.** `fallback` will not become `fallback_model`. `model` will not become `primary_model`. Etc.
 3. **No newly required fields.** Anything added is optional with a sensible default.
 4. **No removed task names from this list:** `chat_companion`, `insight_extraction`. Reserved task names (`pde_decision`, `embedding`) may shift if a real implementation lands and supersedes their current placeholder semantics; that change will be called out in the changelog.
-5. **Resolution precedence is fixed.** `persona_override > task_config > defaults > compiled-in fallback`.
+5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only.
 
 What may still change without notice:
 
 - Compiled-in fallback values (currently `x-ai/grok-4-mini` / `0.5` / `200`). These are fail-safes, not contract.
 - Internal struct shapes inside `eros-engine-llm` if `#[non_exhaustive]` is added.
 - The `description` field's handling — it's documentation today, may become structured metadata later.
-- Newly added optional fields and new task names.
+- Newly added optional fields (`allow_traits`, `tiers`) and new task names.
+
+### Changelog note
+
+- **`persona_override` (`art_metadata.model`) is no longer read by the engine as of this version.** Use `[tasks.<name>.tiers.<tier>]` for per-tier model selection instead. The `model` field may still exist in a persona's JSONB `art_metadata` but is silently ignored.
 
 ## What this config does NOT control
 
@@ -98,24 +126,48 @@ What may still change without notice:
 - **OpenRouter API key** — read directly from `OPENROUTER_API_KEY`, not the config file.
 - **Per-call streaming / response format flags** — fixed in `OpenRouterClient`.
 
-## Worked example: persona override
+## Worked example: tier-based resolution
 
 ```toml
 [tasks.chat_companion]
-model = "x-ai/grok-4-fast"
-fallback = "deepseek/deepseek-chat-v3.2"
-temperature = 0.85
-max_tokens = 600
+model        = "x-ai/grok-4.20"
+fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "qwen/qwen3.6-flash"]
+temperature  = 0.8
+max_tokens   = 1200
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.free]
+model        = "qwen/qwen3.6-flash"
+fallback     = ["deepseek/deepseek-v4-flash"]
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.gold]
+model        = "x-ai/grok-4.20"
+fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
+allow_traits = ["allow_nsfw", "allow_politics"]
 ```
 
-Persona genome `art_metadata.model = "anthropic/claude-sonnet-4"` for a particular character. When that persona is in the chat session, `resolve("chat_companion", Some("anthropic/claude-sonnet-4"))` returns:
+When a request arrives with `"tier": "gold"`, `resolve("chat_companion", "gold")` returns:
 
 | Field | Value | Source |
 |---|---|---|
-| `model` | `anthropic/claude-sonnet-4` | persona override |
-| `fallback_model` | `deepseek/deepseek-chat-v3.2` | task config (override only touches `model`) |
-| `temperature` | `0.85` | task config |
-| `max_tokens` | `600` | task config |
+| `model` | `x-ai/grok-4.20` | `tiers.gold` |
+| `fallback` | `["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]` | `tiers.gold` |
+| `allow_traits` | `["allow_nsfw", "allow_politics"]` | `tiers.gold` |
+| `temperature` | `0.8` | task default block (no tier override) |
+| `max_tokens` | `1200` | task default block (no tier override) |
+
+When a request arrives with `"tier": "free"`:
+
+| Field | Value | Source |
+|---|---|---|
+| `model` | `qwen/qwen3.6-flash` | `tiers.free` |
+| `fallback` | `["deepseek/deepseek-v4-flash"]` | `tiers.free` |
+| `allow_traits` | `["allow_politics"]` | `tiers.free` |
+| `temperature` | `0.8` | task default block |
+| `max_tokens` | `1200` | task default block |
+
+When no `tier` is sent (or an unknown tier is sent), all fields resolve from the task default block.
 
 ## Compatibility test fixture
 

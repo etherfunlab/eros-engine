@@ -30,10 +30,34 @@ the legacy output.
 - **No persistence.** Traits are not written to any DB table.
   Each request re-supplies them.
 - **No content interpretation.** The engine treats `text` as opaque.
-  Sanitisation, allow-listing, and user-consent gating are the caller's
-  responsibility.
+  Sanitisation and user-consent gating are the caller's responsibility.
 - **No semantic categories.** `tag` is a logging key — the engine does
   not interpret `"nsfw_boost"` differently from `"politics_open"`.
+- **Engine-side allow-listing (defense-in-depth only).** The engine now
+  drops trait tags that are not in the resolved tier's `allow_traits` list —
+  those tags are silently excluded from injection and the reply is still
+  generated normally. Caller-side blocking is still recommended as the
+  primary guard; engine-side filtering is defense-in-depth.
+
+## Tier gating
+
+Tags outside the request tier's `allow_traits` are not injected into the
+system prompt. Specifically:
+
+- Dropped tags are logged (tag name only, never the `text` body).
+- The reply is generated normally even if all traits are dropped.
+- Configure allow-lists per tier in `model_config.toml`:
+  ```toml
+  [tasks.chat_companion.tiers.gold]
+  allow_traits = ["allow_nsfw", "allow_politics"]
+  ```
+- **Three-state semantics:**
+  - `allow_traits` absent — no gating; all traits are injected.
+  - `allow_traits = []` — drop all traits.
+  - `allow_traits = ["a", "b"]` — whitelist; only listed tags are injected.
+- The `tier` field on the request selects the tier block (see
+  [api-reference.md](api-reference.md#post-compchatsession_idmessagestream)).
+  Unknown or absent tier → task default block's `allow_traits`.
 
 ## Limits
 
@@ -55,9 +79,10 @@ logged.
 ## Threat model
 
 A compromised client can attempt prompt-injection through `text`. The
-engine is a transport, not a guard — protecting persona internals is
-the caller's responsibility. Use deployer-side allow-listing of `tag`
-values if you need to lock down which traits a client may send.
+engine now performs server-side tag filtering via `allow_traits` (see
+"Tier gating" above), but protecting persona internals is ultimately the
+caller's responsibility. Use deployer-side allow-listing of `tag`
+values as the primary guard; the engine-side filtering is defense-in-depth.
 
 ## Why not persist?
 
