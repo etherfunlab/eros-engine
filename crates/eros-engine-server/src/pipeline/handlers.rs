@@ -49,6 +49,9 @@ const HISTORY_WINDOW: i64 = 20;
 
 #[async_trait]
 pub trait ActionHandler: Send + Sync {
+    // Dispatched only by the retained-but-unreached sync `pipeline::run`
+    // (the sync `/message` handler was removed); see pipeline/mod.rs note.
+    #[allow(dead_code)]
     async fn handle(
         &self,
         input: &DecisionInput,
