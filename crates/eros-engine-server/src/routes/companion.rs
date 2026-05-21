@@ -25,7 +25,7 @@
 //!   directly via `AffinityRepo::persist_with_event`. We deliberately
 //!   bypass `pipeline::run` for the gift route so the HTTP+DB side-effects
 //!   can be tested without a live LLM (the full gift→reply flow remains
-//!   reachable through the regular `send_message` path with whatever
+//!   reachable through the streaming `/message/stream` path with whatever
 //!   client-driven semantics the host app prefers).
 //! - `lead_score` / CTA-gating fields are computed from the same store
 //!   primitives used by post-process; no inline `companion_insights`
@@ -41,7 +41,6 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
-use eros_engine_core::types::Event;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
@@ -52,7 +51,6 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
-use crate::pipeline;
 use crate::state::AppState;
 
 /// Per-request prompt-injection limits. Conservative defaults; deployers
@@ -142,39 +140,6 @@ pub struct StartChatResponse {
     pub instance_id: Uuid,
     pub persona_name: String,
     pub is_new: bool,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SendMessageRequest {
-    pub message: String,
-    /// Optional caller-supplied prompt-injection fragments. See
-    /// `docs/prompt-traits.md`. Missing field → empty list.
-    #[serde(default)]
-    pub prompt_traits: Option<Vec<PromptTraitDto>>,
-    /// Optional OpenRouter audit passthrough. See `docs/llm-audit.md`.
-    #[serde(default)]
-    pub audit: Option<LlmAuditDto>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct CompanionReplyResponse {
-    pub reply: String,
-    pub session_id: Uuid,
-    pub lead_score: f64,
-    pub should_show_cta: bool,
-    pub typing_delay_ms: u64,
-    pub agent_training_level: f64,
-    /// OpenRouter `usage` block (tokens / cost). Omitted when upstream
-    /// didn't return one or no LLM call was made for this turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<serde_json::Value>,
-    /// OpenRouter `response.id`. Omitted when not returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation_id: Option<String>,
-    /// Model actually served (may differ from request when fallback hit).
-    /// Omitted when not returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -336,18 +301,6 @@ pub(crate) async fn require_session_for_user(
     Ok(session)
 }
 
-/// Compute the on-the-fly `agent_training_level` for `user_id` from
-/// the engine.companion_insights row (returns 0.0 when no row exists).
-async fn read_training_level(state: &AppState, user_id: Uuid) -> f64 {
-    let repo = InsightRepo { pool: &state.pool };
-    repo.load(user_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|row| compute_training_level(&row.insights))
-        .unwrap_or(0.0)
-}
-
 fn label_to_string(label: Option<eros_engine_core::affinity::RelationshipLabel>) -> Option<String> {
     use eros_engine_core::affinity::RelationshipLabel as L;
     label.map(|l| {
@@ -360,17 +313,6 @@ fn label_to_string(label: Option<eros_engine_core::affinity::RelationshipLabel>)
         }
         .to_string()
     })
-}
-
-/// Pseudo-random typing delay in `[800, 2500)` ms. Avoids pulling in
-/// the `rand` crate just for this UI nicety — uses the message UUID's
-/// low bits as the entropy source.
-fn typing_delay_ms_from(seed: Uuid) -> u64 {
-    let bytes = seed.as_bytes();
-    let n = u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]);
-    800 + (n % 1700)
 }
 
 /// Validate a caller-supplied list of `PromptTraitDto` and convert to the
@@ -445,8 +387,8 @@ pub(crate) fn validate_prompt_traits(
 }
 
 /// Deployer-controlled suppression of wholesale cost fields from the
-/// sync `/message` response. Operator tracing is unaffected — this
-/// only touches the value before it leaves the HTTP layer.
+/// streaming `/message/stream` response usage block. Operator tracing is
+/// unaffected — this only touches the value before it leaves the HTTP layer.
 ///
 /// Remove the configured top-level keys from a `usage` JSON object in
 /// place. No-op when `hidden` is empty, when `usage` is `None`, or
@@ -724,100 +666,6 @@ async fn start_chat(
     }))
 }
 
-/// Send a user message and synchronously return the AI reply.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/{session_id}/message",
-    tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
-    request_body = SendMessageRequest,
-    responses(
-        (status = 200, body = CompanionReplyResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn send_message(
-    State(state): State<AppState>,
-    Path(session_id): Path<Uuid>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(mut req): Json<SendMessageRequest>,
-) -> Result<Json<CompanionReplyResponse>, AppError> {
-    let session = require_session_for_user(&state, session_id, user_id).await?;
-
-    if req.message.trim().is_empty() {
-        return Err(AppError::BadRequest("message must not be empty".into()));
-    }
-
-    // Per-message NFT ownership recheck — a previous owner cannot keep
-    // messaging through an existing session after sale or wallet unlink.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    if let Some(instance_id) = session.instance_id {
-        let companion = persona_repo
-            .load_companion(instance_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-        let asset_id_opt = persona_repo
-            .get_asset_id_for_genome(companion.instance.genome_id)
-            .await?;
-        enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
-    }
-
-    let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))?;
-    let audit = validate_llm_audit(req.audit.take())?;
-
-    // Persist the user message up-front so the engine sees it in history.
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let user_message_id = chat_repo
-        .append_message(session_id, "user", &req.message)
-        .await?;
-
-    let event = Event::UserMessage {
-        content: req.message.clone(),
-        message_id: user_message_id,
-        prompt_traits,
-        audit,
-    };
-    let response = pipeline::run(&state, session_id, event).await?;
-
-    let reply_text = response
-        .as_ref()
-        .map(|r| r.reply.clone())
-        .unwrap_or_default();
-
-    let lead_score: f64 =
-        sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
-
-    let training_level = read_training_level(&state, user_id).await;
-    let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
-
-    let (mut usage, generation_id, model) = response
-        .as_ref()
-        .map(|r| (r.usage.clone(), r.generation_id.clone(), r.model.clone()))
-        .unwrap_or((None, None, None));
-    filter_usage_keys(&mut usage, &state.config.openrouter_usage_hidden_keys);
-
-    Ok(Json(CompanionReplyResponse {
-        reply: reply_text,
-        session_id,
-        lead_score,
-        should_show_cta,
-        typing_delay_ms: typing_delay_ms_from(user_message_id),
-        agent_training_level: training_level,
-        usage,
-        generation_id,
-        model,
-    }))
-}
-
 /// Paginated chat history (oldest-first) for the given session.
 #[utoipa::path(
     get,
@@ -1025,7 +873,6 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list_personas))
         .routes(routes!(start_chat))
-        .routes(routes!(send_message))
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
@@ -1193,7 +1040,7 @@ mod tests {
         body::Body,
         http::{header, Request, StatusCode},
     };
-    use serde_json::{json, Value};
+    use serde_json::json;
     use sqlx::PgPool;
 
     // ─── Test 1: public /healthz still works without bearer ─────────
@@ -1575,11 +1422,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Sending a message should now 403.
-        let body = serde_json::to_vec(&serde_json::json!({ "message": "hi" })).unwrap();
+        // Sending a message should now 403. The per-message NFT recheck
+        // lives on the streaming endpoint (the sync endpoint is gone); the
+        // ownership failure is returned before any SSE body is produced, so
+        // we can assert on the pre-stream status directly.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": "hi",
+            "client_msg_id": "01J4444444444444444444444A",
+        }))
+        .unwrap();
         let req = Request::builder()
             .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message"))
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
@@ -1918,141 +1772,62 @@ mod tests {
         assert_eq!(usage, Some(serde_json::Value::String("opaque".into())));
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_rejects_too_many_prompt_traits(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
+    // ─── Message-payload validation (formerly exercised via the sync
+    //     /message endpoint; now direct validator calls) ───────────────
+    //
+    // These cover the prompt-trait limits the sync endpoint used to gate.
+    // The sync handler is gone (replaced by /message/stream, which calls
+    // the same `validate_prompt_traits`), so they assert on the validator
+    // directly — no DB / HTTP plumbing required. The exact over/under-cap
+    // inputs match the original endpoint tests.
 
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let traits: Vec<Value> = (0..9)
-            .map(|i| json!({ "tag": format!("t{i}"), "text": "x" }))
+    #[test]
+    fn send_message_rejects_too_many_prompt_traits() {
+        // 9 traits > MAX_PROMPT_TRAITS (8) → BadRequest.
+        let dtos: Vec<PromptTraitDto> = (0..9)
+            .map(|i| PromptTraitDto {
+                tag: format!("t{i}"),
+                text: "x".into(),
+            })
             .collect();
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "prompt_traits": traits,
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        // No user message persisted on a 400.
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(count, 0);
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_rejects_oversized_trait_text(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "prompt_traits": [{ "tag": "ok", "text": "a".repeat(2001) }],
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    #[test]
+    fn send_message_rejects_oversized_trait_text() {
+        // 2001 chars > MAX_PROMPT_TRAIT_TEXT_CHARS (2000) → BadRequest.
+        let dtos = vec![PromptTraitDto {
+            tag: "ok".into(),
+            text: "a".repeat(2001),
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_rejects_invalid_tag_regex(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "message": "hi",
-            "prompt_traits": [{ "tag": "NSFW Boost", "text": "x" }],
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    #[test]
+    fn send_message_rejects_invalid_tag_regex() {
+        // Whitespace + uppercase in tag violates [a-z0-9_]+ → BadRequest.
+        let dtos = vec![PromptTraitDto {
+            tag: "NSFW Boost".into(),
+            text: "x".into(),
+        }];
+        assert!(matches!(
+            validate_prompt_traits(&dtos),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn send_message_accepts_missing_prompt_traits_field(pool: PgPool) {
-        // A body without `prompt_traits` deserialises fine and reaches the
-        // pipeline. We only assert that the validator did not reject the
-        // request — the downstream LLM call may or may not succeed against
-        // the stubbed OpenRouter key in test state.
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Vega").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({ "message": "hi" })).unwrap();
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_ne!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "missing prompt_traits must NOT be rejected"
-        );
-        // The user message row should have been appended either way.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 1);
+    #[test]
+    fn send_message_accepts_missing_prompt_traits_field() {
+        // A missing `prompt_traits` field deserialises to None, which the
+        // handler converts to an empty slice — the validator must accept it.
+        let out = validate_prompt_traits(&[]).expect("empty/missing must be accepted");
+        assert!(out.is_empty());
     }
 
     // ─── resolve_or_create_session parity tests ──────────────────────

@@ -1,9 +1,9 @@
 # LLM audit passthrough
 
-eros-engine exposes an opaque OpenRouter passthrough on the chat
-message endpoints. Three caller-supplied fields ride to
+eros-engine exposes an opaque OpenRouter passthrough on the streaming
+chat endpoint. Three caller-supplied fields ride to
 `openrouter.ai/api/v1/chat/completions` unchanged, three OpenRouter wire
-echoes come back on the sync response, and two deployer-set env vars
+echoes come back on the SSE `done` frame, and two deployer-set env vars
 add app-attribution headers to every outbound call.
 
 The engine never inspects content. PII scrubbing, hashing, and
@@ -11,13 +11,13 @@ metadata semantics are the caller's responsibility.
 
 ## Inbound: the `audit` request field
 
-Both `POST /comp/chat/{session_id}/message` and
-`POST /comp/chat/{session_id}/message_async` accept an optional `audit`
-object:
+`POST /comp/chat/{session_id}/message/stream` accepts an optional `audit`
+object alongside the required `content` / `client_msg_id`:
 
 ```jsonc
 {
-  "message": "...",
+  "content": "...",
+  "client_msg_id": "01J3333333333333333333333A",
   "audit": {
     "user": "u_<hash-of-internal-id>",     // optional
     "session_id": "conv_xyz",               // optional, ≠ URL session UUID
@@ -39,16 +39,16 @@ Caps enforced at the engine before forwarding:
 | `audit.metadata` key   | regex `^[A-Za-z0-9_.-]{1,64}$`                   |
 | `audit.metadata` value | JSON string, `chars ≤ 512`                       |
 
-Violations return `400 BadRequest`, and no user message row is persisted.
+Violations return `400 BadRequest` as a pre-stream error, and no user
+message row is persisted.
 
 **Privacy:** do not put raw email / wallet address / real name in
 `user` — send a hash. OpenRouter retains request metadata (token
 counts, latency) but not prompts / responses by default.
 
-## Outbound: the `usage` echo on the sync response
+## Outbound: the `usage` echo on the SSE `done` frame
 
-`POST /comp/chat/{session_id}/message` adds three optional fields to
-its 200 body:
+The streaming endpoint's `done` frame carries three optional fields:
 
 | Field           | Type      | Meaning                                                                                       |
 |-----------------|-----------|-----------------------------------------------------------------------------------------------|
@@ -56,9 +56,9 @@ its 200 body:
 | `generation_id` | `string?` | OpenRouter `response.id`. Query `/api/v1/generation` with it for full request metadata later. |
 | `model`         | `string?` | Model OpenRouter actually served. When `fallback_model` was hit, this is the fallback.        |
 
-The async route (`/message_async`) and the polling route
-(`/pending/{message_id}`) do **not** carry these fields. Use the sync
-route if you need per-turn audit data.
+These fields appear on the `done` frame (the per-turn terminal frame
+before `final`). Background paths (dreaming / post_process) do **not**
+surface them to clients.
 
 ### Hiding fields from the response
 
@@ -73,15 +73,14 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 
 Behaviour:
 
-- Applies to **both** the sync `/comp/chat/{id}/message` response and the
-  SSE streaming `done` frame (`/comp/chat/{id}/message/stream`).
+- Applies to the SSE streaming `done` frame
+  (`/comp/chat/{id}/message/stream`).
 - The full unfiltered `usage` is still persisted to the DB; only the
   client-facing payload is filtered.
 - Does **not** affect `tracing::info!` output — operator observability
   stays intact regardless of this setting.
-- Async route (`/message_async`), polling route, and background paths
-  (dreaming / post_process) already don't return `usage` to clients,
-  so the env var has no effect on them.
+- Background paths (dreaming / post_process) already don't return
+  `usage` to clients, so the env var has no effect on them.
 - Only top-level keys are stripped; to suppress a whole subtree, list
   its parent key (`cost_details` removes the entire object, not just
   its members).

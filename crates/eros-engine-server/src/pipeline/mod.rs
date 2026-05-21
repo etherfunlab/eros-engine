@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// The synchronous orchestrator `run` (and its private helpers
+// `load_session_ids` / `load_affinity_with_decay` / `clear_ghost_streak`)
+// is the non-streaming companion entry point. The only HTTP caller — the
+// sync `POST /comp/chat/{session_id}/message` handler — was removed in
+// favour of the SSE streaming endpoint (which drives `stream::run_stream`).
+// `run` is retained as the canonical host-app-driven path (see the
+// companion routes module doc) but is currently unreached from the binary,
+// so allow dead_code module-wide rather than delete the orchestrator.
+#![allow(dead_code)]
 //! Pipeline orchestrator — pre-process → PDE → handler dispatch → chat
 //! exec → save assistant message → spawn post-process.
 //!
