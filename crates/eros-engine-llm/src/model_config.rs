@@ -407,6 +407,12 @@ fallback     = "deepseek/deepseek-chat-v3.2"
 temperature  = 0.85
 max_tokens   = 600
 description  = "AI companion chat"
+allow_traits = ["allow_politics"]
+
+[tasks.chat_companion.tiers.gold]
+model        = "x-ai/grok-4.20"
+fallback     = ["a", "b"]
+allow_traits = ["allow_nsfw", "allow_politics"]
 
 [tasks.insight_extraction]
 model        = "x-ai/grok-4-mini"
@@ -462,6 +468,21 @@ description  = "reserved — Voyage hard-codes its own model"
         assert_eq!(chat.temperature, Some(0.85));
         assert_eq!(chat.max_tokens, Some(600));
         assert_eq!(chat.description, "AI companion chat");
+        // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
+        assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));
+        let gold = chat.tiers.get("gold").expect("gold tier present");
+        assert_eq!(gold.model.as_deref(), Some("x-ai/grok-4.20"));
+        assert_eq!(
+            gold.fallback
+                .clone()
+                .expect("tier fallback present")
+                .into_vec(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            gold.allow_traits,
+            Some(vec!["allow_nsfw".to_string(), "allow_politics".to_string()])
+        );
 
         // insight_extraction — same shape.
         let insight = cfg.tasks.get("insight_extraction").unwrap();
@@ -504,6 +525,15 @@ description  = "reserved — Voyage hard-codes its own model"
         assert_eq!(r.model, "x-ai/grok-4-fast");
         assert_eq!(r.temperature, 0.85);
         assert_eq!(r.max_tokens, 600);
+
+        // A configured tier resolves to its own block.
+        let r = cfg.resolve("chat_companion", Some("gold"));
+        assert_eq!(r.model, "x-ai/grok-4.20");
+        assert_eq!(r.fallback_model, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            r.allow_traits,
+            Some(vec!["allow_nsfw".to_string(), "allow_politics".to_string()])
+        );
     }
 
     #[test]
