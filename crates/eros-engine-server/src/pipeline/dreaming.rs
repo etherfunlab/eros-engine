@@ -34,6 +34,13 @@ use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use crate::state::AppState;
 
 const MEMORY_TASK: &str = "memory_extraction";
+/// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
+/// calls. Dreaming runs in the background sweeper with no live request, so
+/// per-user attribution is meaningless; this buckets all dreaming spend
+/// under one id. All-ones (not the `0…1` nil-plus-one, which is already used
+/// in our database). Not a real auth UUID (v4) and not a hashed client id,
+/// so it cannot collide with a real user.
+const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111";
 const PICK_BATCH: i64 = 10;
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +177,7 @@ async fn classify_session(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        user: Some(SYSTEM_AUDIT_USER.into()),
         ..Default::default()
     };
     let raw = state
@@ -374,5 +382,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(block).unwrap();
         assert_eq!(v["a"], "b}c");
         assert_eq!(v["d"], 1);
+    }
+
+    #[test]
+    fn system_audit_user_is_all_ones_sentinel() {
+        assert_eq!(SYSTEM_AUDIT_USER, "11111111-1111-1111-1111-111111111111");
     }
 }
