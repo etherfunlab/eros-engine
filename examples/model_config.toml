@@ -8,9 +8,22 @@
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
 # block's fallback for this task.
 model = "x-ai/grok-4.20"
-fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "qwen/qwen3.6-flash"]
+fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "minimax/minimax-m2-her"]
 temperature = 0.8
 max_tokens = 1200
+# Default-block trait allow-list: used when no tier is sent or the tier is
+# unknown. Tier sub-tables below override model/fallback/allow_traits per tier.
+allow_traits = ["nsfw_boost","politics_open"]
+
+[tasks.chat_companion.tiers.free]
+model        = "minimax/minimax-m2-her"
+fallback     = ["qwen/qwen3.6-flash","z-ai/glm-4.5-air"]
+allow_traits = ["politics_open"]
+
+[tasks.chat_companion.tiers.beta]
+model        = "x-ai/grok-4.20"
+fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
+allow_traits = ["nsfw_boost", "politics_open"]
 
 [tasks.insight_extraction]
 model = "google/gemini-3.1-flash-lite"

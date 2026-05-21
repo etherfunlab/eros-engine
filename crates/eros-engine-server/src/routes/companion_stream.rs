@@ -27,6 +27,7 @@ use crate::routes::companion::{
 use crate::state::AppState;
 
 const MAX_CONTENT_CHARS: usize = 4096;
+const MAX_TIER_LEN: usize = 32;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -40,6 +41,8 @@ pub struct StreamSendRequest {
     pub prompt_traits: Option<Vec<PromptTraitDto>>,
     #[serde(default)]
     pub audit: Option<LlmAuditDto>,
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -96,6 +99,21 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
             user_message: "请求无效".into(),
             original_user_message_id: None,
         }));
+    }
+    if let Some(tier) = req.tier.as_deref() {
+        let ok = (1..=MAX_TIER_LEN).contains(&tier.len())
+            && tier
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
+        if !ok {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_payload",
+                message: format!("tier must match [a-z0-9_]{{1,{MAX_TIER_LEN}}}"),
+                user_message: "请求无效".into(),
+                original_user_message_id: None,
+            }));
+        }
     }
     Ok(())
 }
@@ -217,6 +235,7 @@ pub async fn send_message_stream(
                     content: req.content.clone(),
                     prompt_traits: prompt_traits.clone(),
                     audit: audit.clone(),
+                    tier: req.tier.clone(),
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -285,6 +304,32 @@ mod tests {
     use sqlx::PgPool;
     use tower::Service;
 
+    fn req_with_tier(tier: Option<&str>) -> StreamSendRequest {
+        StreamSendRequest {
+            content: "hi".into(),
+            client_msg_id: "01J5555555555555555555555A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: tier.map(String::from),
+        }
+    }
+
+    #[test]
+    fn validate_payload_accepts_wellformed_and_absent_tier() {
+        assert!(validate_payload(&req_with_tier(Some("gold"))).is_ok());
+        assert!(validate_payload(&req_with_tier(Some("free_2"))).is_ok());
+        assert!(validate_payload(&req_with_tier(None)).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_rejects_malformed_tier() {
+        // uppercase, punctuation, and over-length are all rejected.
+        assert!(validate_payload(&req_with_tier(Some("Gold"))).is_err());
+        assert!(validate_payload(&req_with_tier(Some("gold!"))).is_err());
+        assert!(validate_payload(&req_with_tier(Some(""))).is_err());
+        assert!(validate_payload(&req_with_tier(Some(&"x".repeat(MAX_TIER_LEN + 1)))).is_err());
+    }
+
     fn mint_jwt(uid: Uuid) -> String {
         let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
         encode(
@@ -341,6 +386,52 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], "unprocessable");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_400_when_tier_malformed(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
+             VALUES ('S', 'p', '{}'::jsonb, true) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::routes::companion::test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content":"hi",
+            "client_msg_id":"01J4444444444444444444444A",
+            "tier":"Gold!"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "invalid_payload");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

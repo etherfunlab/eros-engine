@@ -9,9 +9,9 @@
 //!   inline `sqlx::query_as` against `chat_messages`.
 //! - `ChatRequest` is built around the OSS `eros_engine_llm::openrouter::ChatRequest`
 //!   shape (`model` / `fallback_model` / `messages` / `temperature` / `max_tokens`),
-//!   resolved via `state.model_config` at handler time. The gateway's
-//!   `task: String` + `persona_override: Option<String>` indirection lives at
-//!   the resolver call instead of being passed downstream.
+//!   resolved via `state.model_config` at handler time. The resolver takes
+//!   `task: &str` + the request's `tier: Option<&str>` and returns the
+//!   per-tier model / fallback / allow_traits.
 //! - `GiftHandler` carries `deltas: AffinityDeltas` directly — there is
 //!   no shop item / gift-record lookup since the OSS engine has no
 //!   credit ledger.
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
+use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::insight::InsightRepo;
@@ -59,15 +60,29 @@ pub trait ActionHandler: Send + Sync {
     ) -> Result<Option<ChatRequest>, AppError>;
 }
 
-/// Read the persona model override out of `art_metadata.model`, if any.
-fn persona_model_override(input: &DecisionInput) -> Option<String> {
-    input
-        .persona
-        .genome
-        .art_metadata
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+/// Partition caller traits by a tier's resolved allow-list.
+/// - `allow == None` → no gating: all kept, none dropped.
+/// - `allow == Some(set)` → keep only traits whose `tag` ∈ `set`; the rest
+///   are dropped and their tags returned for logging (text is never logged).
+fn filter_traits(
+    traits: &[PromptTrait],
+    allow: Option<&[String]>,
+) -> (Vec<PromptTrait>, Vec<String>) {
+    match allow {
+        None => (traits.to_vec(), Vec::new()),
+        Some(set) => {
+            let mut kept = Vec::new();
+            let mut dropped = Vec::new();
+            for t in traits {
+                if set.iter().any(|a| a == &t.tag) {
+                    kept.push(t.clone());
+                } else {
+                    dropped.push(t.tag.clone());
+                }
+            }
+            (kept, dropped)
+        }
+    }
 }
 
 /// Extract the caller-supplied OpenRouter audit passthrough off the
@@ -81,12 +96,11 @@ pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> 
     }
 }
 
-/// Materialise a ChatRequest from a system prompt + chronological history.
-/// `audit` carries the caller's OpenRouter passthrough fields when the
-/// driving event was a `UserMessage`; gift / proactive paths pass `None`.
+/// Materialise a ChatRequest from a pre-resolved model + system prompt +
+/// chronological history. `audit` carries the caller's OpenRouter passthrough
+/// when the driving event was a `UserMessage`; gift / proactive pass `None`.
 fn assemble_chat_request(
-    state: &AppState,
-    input: &DecisionInput,
+    resolved: ResolvedModel,
     system_prompt: String,
     history: Vec<eros_engine_store::chat::ChatMessage>,
     audit: Option<&LlmAudit>,
@@ -97,20 +111,14 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        // ChatRepo::history returns ascending chronological order already.
         match msg.role.as_str() {
             "user" | "assistant" => messages.push(ChatMessage {
                 role: msg.role,
                 content: msg.content,
             }),
-            // skip tip_user, gift_user, system_error, etc.
             _ => continue,
         }
     }
-
-    let resolved = state
-        .model_config
-        .resolve(CHAT_TASK, persona_model_override(input).as_deref());
 
     let (audit_user, audit_session, audit_metadata) = audit
         .map(|a| (a.user.clone(), a.session_id.clone(), a.metadata.clone()))
@@ -363,10 +371,26 @@ pub(super) async fn build_reply_request(
 
     let pending_gifts: Vec<PendingGift> = vec![];
 
-    let prompt_traits: &[PromptTrait] = match &input.event {
+    let tier = match &input.event {
+        Event::UserMessage { tier, .. } => tier.as_deref(),
+        _ => None,
+    };
+    let resolved = state.model_config.resolve(CHAT_TASK, tier);
+
+    let requested_traits: &[PromptTrait] = match &input.event {
         Event::UserMessage { prompt_traits, .. } => prompt_traits.as_slice(),
         _ => &[],
     };
+    let (kept_traits, dropped_tags) =
+        filter_traits(requested_traits, resolved.allow_traits.as_deref());
+    if !dropped_tags.is_empty() {
+        tracing::info!(
+            tier = tier.unwrap_or("<none>"),
+            kept = kept_traits.len(),
+            dropped_tags = ?dropped_tags,
+            "prompt_traits: dropped tags not allowed for tier"
+        );
+    }
 
     let system_prompt = build_prompt(
         &input.persona,
@@ -377,12 +401,11 @@ pub(super) async fn build_reply_request(
         tip_personality,
         plan.reply_style,
         &plan.context_hints,
-        prompt_traits,
+        &kept_traits,
     );
 
     Ok(assemble_chat_request(
-        state,
-        input,
+        resolved,
         system_prompt,
         history,
         audit_from_event(&input.event),
@@ -425,6 +448,8 @@ pub(super) async fn build_gift_request(
         .as_deref()
         .unwrap_or("normal");
 
+    let resolved = state.model_config.resolve(CHAT_TASK, None);
+
     let system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -438,8 +463,7 @@ pub(super) async fn build_gift_request(
     );
 
     Ok(assemble_chat_request(
-        state,
-        input,
+        resolved,
         system_prompt,
         history,
         None,
@@ -992,6 +1016,7 @@ mod tests {
             message_id: Uuid::new_v4(),
             prompt_traits: vec![],
             audit: Some(audit.clone()),
+            tier: None,
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));
@@ -1001,5 +1026,50 @@ mod tests {
     fn extract_audit_from_non_user_message_is_none() {
         let ev = Event::ProactiveTrigger;
         assert!(audit_from_event(&ev).is_none());
+    }
+
+    fn pt(tag: &str) -> PromptTrait {
+        PromptTrait {
+            tag: tag.into(),
+            text: "x".into(),
+        }
+    }
+
+    #[test]
+    fn filter_traits_none_keeps_all() {
+        let traits = vec![pt("allow_nsfw"), pt("allow_politics")];
+        let (kept, dropped) = filter_traits(&traits, None);
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn filter_traits_whitelist_drops_outside() {
+        let traits = vec![pt("allow_politics"), pt("allow_nsfw")];
+        let allow = vec!["allow_politics".to_string()];
+        let (kept, dropped) = filter_traits(&traits, Some(&allow));
+        assert_eq!(
+            kept.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["allow_politics"]
+        );
+        assert_eq!(dropped, vec!["allow_nsfw".to_string()]);
+    }
+
+    #[test]
+    fn filter_traits_empty_whitelist_drops_all() {
+        let traits = vec![pt("allow_politics"), pt("allow_nsfw")];
+        let allow: Vec<String> = vec![];
+        let (kept, dropped) = filter_traits(&traits, Some(&allow));
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 2);
+    }
+
+    #[test]
+    fn filter_traits_whitelist_keeps_all_when_all_allowed() {
+        let traits = vec![pt("allow_politics"), pt("allow_nsfw")];
+        let allow = vec!["allow_nsfw".to_string(), "allow_politics".to_string()];
+        let (kept, dropped) = filter_traits(&traits, Some(&allow));
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
     }
 }

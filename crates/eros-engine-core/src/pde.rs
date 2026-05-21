@@ -208,6 +208,7 @@ mod tests {
             message_id: Uuid::new_v4(),
             prompt_traits: Vec::new(),
             audit: None,
+            tier: None,
         }
     }
 

@@ -733,6 +733,7 @@ mod tests {
                 session_id: Some("s_xyz".into()),
                 metadata: Some(metadata),
             }),
+            tier: None,
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -745,6 +746,7 @@ mod tests {
             message_id: Uuid::new_v4(),
             prompt_traits: Vec::new(),
             audit: None,
+            tier: None,
         };
         assert_eq!(client_id_from_event(&event), None);
     }

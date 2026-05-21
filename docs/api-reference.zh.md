@@ -121,6 +121,23 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
 此时 HTTP 响应已提交 `200 OK`。
 
+**可选：tier 选择。** 请求体可附加 `tier` 字符串 ——
+类型 `String`，正则 `^[a-z0-9_]{1,32}$`（格式错返回 `400`）。
+从 `model_config.toml` 中选择对应 tier 的模型和 `allow_traits`
+（`[tasks.chat_companion.tiers.<tier>]`）。tier 未知或缺省时
+回退到任务默认块（会记录一条 warn 日志）。示例：
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "tier": "gold"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
 详见 [prompt-traits.zh.md](prompt-traits.zh.md)。示例：
 
