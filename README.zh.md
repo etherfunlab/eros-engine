@@ -152,9 +152,12 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 - `GET  /comp/user/{user_id}/profile`——讀取目前的 `companion_insights` 和 `training_level`。
 - `POST /comp/chat/{session_id}/event/gift`——套用外部 gift event 與 affinity delta。
 - `GET  /comp/chat/{session_id}/gifts`——列出某個 session 的 gift events。
-- `/message/stream` 接受兩個可選的 caller-supplied 欄位：
-  - `prompt_traits` —— per-request system-prompt 注入，詳見
-    [docs/prompt-traits.md](docs/prompt-traits.md)。
+- `/message/stream` 接受幾個可選的 caller-supplied 欄位：
+  - `tier` —— 從 `model_config.toml` 選出該 tier 的 chat model 和
+    `prompt_traits` allow-list；未知或缺省會 fallback 到 task 默認 block。
+    詳見 [docs/model-config.zh.md](docs/model-config.zh.md)。
+  - `prompt_traits` —— per-request system-prompt 注入，會被解析出的 tier
+    allow-list gating，詳見 [docs/prompt-traits.md](docs/prompt-traits.md)。
   - `audit` —— 不透明的 OpenRouter passthrough（`user` / `session_id` /
     `metadata`），用於在 OpenRouter dashboard 上做 per-user / per-session
     attribution。詳見 [docs/llm-audit.zh.md](docs/llm-audit.zh.md)。

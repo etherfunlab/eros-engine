@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
