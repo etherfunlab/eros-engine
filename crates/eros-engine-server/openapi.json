@@ -1691,6 +1691,12 @@
             "items": {
               "$ref": "#/components/schemas/PromptTraitDto"
             }
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
