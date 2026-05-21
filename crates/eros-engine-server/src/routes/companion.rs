@@ -704,7 +704,10 @@ async fn get_history(
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,
-            extracted_facts: m.extracted_facts,
+            // Vestigial: the engine.chat_messages.extracted_facts column was
+            // dropped in migration 0017. The field stays on this canonical
+            // DTO (always null) to preserve the documented OSS API contract.
+            extracted_facts: None,
         })
         .collect();
     let total = entries.len();

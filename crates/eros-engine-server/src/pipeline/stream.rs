@@ -768,7 +768,6 @@ mod tests {
             session_id,
             role: "assistant".into(),
             content: "hello".into(),
-            extracted_facts: None,
             sent_at: chrono::Utc::now(),
             client_msg_id: None,
             ghost_decision: false,

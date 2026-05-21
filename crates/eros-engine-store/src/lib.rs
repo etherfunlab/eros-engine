@@ -126,4 +126,32 @@ mod migration_tests {
         .expect("query relrowsecurity for human_insights");
         assert!(enabled, "RLS must be enabled on engine.human_insights");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sqlx_migrations_has_rls_enabled(pool: PgPool) {
+        let enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+             WHERE oid = 'public._sqlx_migrations'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity for _sqlx_migrations");
+        assert!(enabled, "RLS must be enabled on public._sqlx_migrations");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_messages_has_no_extracted_facts_column(pool: PgPool) {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'chat_messages' \
+               AND column_name = 'extracted_facts')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query for extracted_facts column");
+        assert!(
+            !exists,
+            "extracted_facts column must be dropped (migration 0017)"
+        );
+    }
 }

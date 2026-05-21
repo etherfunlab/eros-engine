@@ -34,7 +34,6 @@ pub struct ChatMessage {
     pub session_id: Uuid,
     pub role: String,
     pub content: String,
-    pub extracted_facts: Option<serde_json::Value>,
     pub sent_at: DateTime<Utc>,
 
     // Streaming + idempotency metadata (added in migration 0012).

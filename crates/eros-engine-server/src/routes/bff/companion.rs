@@ -224,10 +224,10 @@ mod tests {
         // shares one now() across all rows, so ORDER BY sent_at would tie and
         // the result order would be undefined.
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content, extracted_facts, sent_at) \
-             VALUES ($1, 'user', 'alpha', '{\"facts\":[\"x\"]}'::jsonb, now() - interval '2 seconds'),
-                    ($1, 'assistant', 'beta', NULL, now() - interval '1 second'),
-                    ($1, 'user', 'gamma', '{\"facts\":[\"y\"]}'::jsonb, now())",
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'alpha', now() - interval '2 seconds'),
+                    ($1, 'assistant', 'beta', now() - interval '1 second'),
+                    ($1, 'user', 'gamma', now())",
         )
         .bind(session_id)
         .execute(&pool)
