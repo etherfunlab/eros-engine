@@ -328,6 +328,29 @@ model = "free-model"
     }
 
     #[test]
+    fn resolve_tier_empty_fallback_suppresses_task_fallback() {
+        // A tier `fallback = []` must suppress the task default block's
+        // fallback (mirrors the task-vs-defaults suppression rule), not
+        // inherit it.
+        let toml = r#"
+[tasks.chat_companion]
+model    = "default-model"
+fallback = ["default-fb"]
+
+[tasks.chat_companion.tiers.bare]
+fallback = []
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", Some("bare"));
+        assert_eq!(r.model, "default-model"); // inherited (tier sets no model)
+        assert!(
+            r.fallback_model.is_empty(),
+            "tier `fallback = []` must suppress task fallback; got {:?}",
+            r.fallback_model
+        );
+    }
+
+    #[test]
     fn resolve_allow_traits_three_state() {
         let absent = r#"
 [tasks.chat_companion]
