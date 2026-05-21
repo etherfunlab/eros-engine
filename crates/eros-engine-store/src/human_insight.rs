@@ -45,15 +45,20 @@ fn str_array(v: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 /// Parse `matching_preferences.age_range` ([min, max]) into two i32s. Any
-/// shape other than a 2-element all-integer array yields `(None, None)`.
+/// shape other than a 2-element array of in-range integers yields `(None,
+/// None)` — including values outside i32 range, which degrade to NULL rather
+/// than wrapping silently.
 fn parse_age_range(prefs: Option<&serde_json::Value>) -> (Option<i32>, Option<i32>) {
     prefs
         .and_then(|p| p.get("age_range"))
         .and_then(|a| a.as_array())
         .and_then(|arr| {
             if arr.len() == 2 {
-                match (arr[0].as_i64(), arr[1].as_i64()) {
-                    (Some(lo), Some(hi)) => Some((Some(lo as i32), Some(hi as i32))),
+                match (
+                    arr[0].as_i64().and_then(|n| i32::try_from(n).ok()),
+                    arr[1].as_i64().and_then(|n| i32::try_from(n).ok()),
+                ) {
+                    (Some(lo), Some(hi)) => Some((Some(lo), Some(hi))),
                     _ => None,
                 }
             } else {
@@ -218,6 +223,7 @@ mod tests {
             serde_json::json!([18]),
             serde_json::json!([18, 30, 40]),
             serde_json::json!(["a", "b"]),
+            serde_json::json!([i64::MAX, 30]),
         ] {
             let v = serde_json::json!({ "matching_preferences": { "age_range": bad } });
             let c = project_columns(&v);
