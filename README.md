@@ -126,7 +126,7 @@ eros-engine-llm   = "0.1"   # only if you want the OpenRouter + Voyage clients
 Multi-arch (`linux/amd64`, `linux/arm64`) images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag:
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.2.0
+docker pull ghcr.io/etherfunlab/eros-engine:0.3.0
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -135,7 +135,7 @@ Minimal run (you bring Postgres + your own `.env`):
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.2.0 serve
+  ghcr.io/etherfunlab/eros-engine:0.3.0 serve
 ```
 
 The Dockerfile under `docker/` and `fly.toml` in the repo root are the same artifacts used by this image and by the Fly.io example deployment.
@@ -186,14 +186,13 @@ Highlights:
 
 - `GET  /comp/personas` — list active persona genomes.
 - `POST /comp/chat/start` — open a chat session against a persona.
-- `POST /comp/chat/{session_id}/message/stream` — streaming chat turn (SSE, recommended).
-- `POST /comp/chat/{session_id}/message` — synchronous chat turn (deprecated in 0.2, removed in 0.3).
+- `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events (SSE) streaming. (The old blocking synchronous `/message` endpoint was removed in 0.3 — SSE is now the only chat path.)
 - `GET  /comp/chat/{session_id}/history` — paginated chat history.
 - `GET  /comp/chat/{user_id}/sessions` — list a user's sessions.
 - `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
 - `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
 - `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
-- `/message/stream` and `/message` accept two optional caller-supplied fields:
+- `/message/stream` accepts two optional caller-supplied fields:
   - `prompt_traits` — per-request system-prompt injection, see
     [docs/prompt-traits.md](docs/prompt-traits.md).
   - `audit` — opaque OpenRouter passthrough (`user` / `session_id` /
@@ -204,6 +203,8 @@ Highlights:
 The `AuthValidator` trait is pluggable if you use a different identity provider.
 
 ### Streaming chat
+
+Chat is streaming-only: replies arrive token-by-token over SSE so clients can render as the model generates, instead of blocking on a full synchronous response. (The legacy blocking `/message` endpoint was removed in 0.3.)
 
 ```bash
 curl -N -X POST \
@@ -225,7 +226,7 @@ for frame layout and error semantics.
 | `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
 | `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
 | `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
-| `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object — both the sync `/message` response and the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
+| `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
 | `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
 | `SUPABASE_URL` | no | Supabase project URL. Kept in `.env.example` for client/deploy conventions; the server does not read it today. |
 | `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |
