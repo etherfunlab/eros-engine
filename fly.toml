@@ -37,7 +37,7 @@ primary_region = "nrt"
   # one always-started shared-cpu-1x in NRT — a few USD/mo before
   # bandwidth and org allowances. `auto_stop_machines = "stop"` stays, so
   # capacity above 1 still scales down to 1 (not zero).
-  min_machines_running = 1
+  min_machines_running = 2
   processes = ["app"]
 
   [http_service.concurrency]
