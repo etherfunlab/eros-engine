@@ -48,6 +48,14 @@ pub struct ProducedMessage {
 
 // ─── Top-level dispatcher ──────────────────────────────────────────
 
+/// The OpenRouter `user` (client id) to attribute this turn's post-process
+/// LLM calls to. Forwards ONLY the caller's `audit.user` — never session_id
+/// or metadata (audit decision: client id only). Reuses the extractor in
+/// `handlers` so there's a single definition of "audit off an Event".
+fn client_id_from_event(event: &Event) -> Option<String> {
+    super::handlers::audit_from_event(event).and_then(|a| a.user.clone())
+}
+
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
 pub async fn run(
     state: AppState,
@@ -62,11 +70,20 @@ pub async fn run(
         Event::UserMessage { content, .. } => content.clone(),
         _ => String::new(),
     };
+    let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
         for m in &produced {
             if !user_msg.is_empty() && !m.full_text.is_empty() {
-                extract_insights(&state, session_id, user_id, &user_msg, &m.full_text).await;
+                extract_insights(
+                    &state,
+                    session_id,
+                    user_id,
+                    &user_msg,
+                    &m.full_text,
+                    client_id.as_deref(),
+                )
+                .await;
             }
         }
     };
@@ -121,6 +138,7 @@ pub async fn run(
                         &current,
                         &user_msg,
                         &assistant_msg,
+                        client_id.as_deref(),
                     )
                     .await
                 }
@@ -450,6 +468,7 @@ async fn evaluate_affinity(
     affinity: &eros_engine_core::affinity::Affinity,
     user_msg: &str,
     assistant_msg: &str,
+    audit_user: Option<&str>,
 ) -> (eros_engine_core::affinity::AffinityDeltas, String) {
     use eros_engine_core::affinity::AffinityDeltas;
 
@@ -465,6 +484,7 @@ async fn evaluate_affinity(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        user: audit_user.map(String::from),
         ..Default::default()
     };
 
@@ -500,6 +520,7 @@ async fn extract_insights(
     user_id: Uuid,
     user_msg: &str,
     assistant_msg: &str,
+    audit_user: Option<&str>,
 ) {
     let facts = extract_facts(
         &state.openrouter,
@@ -507,6 +528,7 @@ async fn extract_insights(
         session_id,
         user_msg,
         assistant_msg,
+        audit_user,
     )
     .await;
     if facts.is_empty() {
@@ -528,6 +550,7 @@ async fn extract_insights(
         session_id,
         &facts,
         existing.as_ref(),
+        audit_user,
     )
     .await;
     if new_insights.as_object().is_none_or(|o| o.is_empty()) {
@@ -557,6 +580,7 @@ async fn extract_facts(
     session_id: Uuid,
     user_msg: &str,
     assistant_msg: &str,
+    audit_user: Option<&str>,
 ) -> Vec<String> {
     if user_msg.trim().is_empty() {
         return vec![];
@@ -573,6 +597,7 @@ async fn extract_facts(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        user: audit_user.map(String::from),
         ..Default::default()
     };
 
@@ -619,6 +644,7 @@ async fn extract_structured_insights(
     session_id: Uuid,
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
+    audit_user: Option<&str>,
 ) -> serde_json::Value {
     if facts.is_empty() {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -636,6 +662,7 @@ async fn extract_structured_insights(
         }],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        user: audit_user.map(String::from),
         ..Default::default()
     };
 
@@ -690,6 +717,46 @@ async fn refresh_lead_score(state: &AppState, session_id: Uuid, user_id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn client_id_from_event_forwards_user_only() {
+        use eros_engine_core::types::LlmAudit;
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("feature".into(), serde_json::Value::String("chat".into()));
+        let event = Event::UserMessage {
+            content: "hi".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: Some(LlmAudit {
+                user: Some("u_abc".into()),
+                session_id: Some("s_xyz".into()),
+                metadata: Some(metadata),
+            }),
+        };
+        // Only `user` is taken; session_id/metadata are ignored by design.
+        assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
+    }
+
+    #[test]
+    fn client_id_from_event_none_when_no_audit() {
+        let event = Event::UserMessage {
+            content: "hi".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+        };
+        assert_eq!(client_id_from_event(&event), None);
+    }
+
+    #[test]
+    fn client_id_from_event_none_for_non_user_message() {
+        let event = Event::Gift {
+            gift_id: Uuid::new_v4(),
+            amount: 100,
+        };
+        assert_eq!(client_id_from_event(&event), None);
+    }
 
     #[test]
     fn parse_facts_empty_array() {

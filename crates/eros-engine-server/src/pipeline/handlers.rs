@@ -71,7 +71,7 @@ fn persona_model_override(input: &DecisionInput) -> Option<String> {
 /// `Event` driving this turn. Returns `None` for non-`UserMessage` events
 /// (gift / proactive paths cannot supply audit today — out of scope for
 /// the v1 audit feature).
-fn audit_from_event(event: &Event) -> Option<&LlmAudit> {
+pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> {
     match event {
         Event::UserMessage { audit, .. } => audit.as_ref(),
         _ => None,
