@@ -7,15 +7,15 @@ persona system prompt.
 
 ```jsonc
 {
-  "message": "...",
+  "content": "...",
+  "client_msg_id": "01J3333333333333333333333A",
   "prompt_traits": [
     { "tag": "ascii_identifier", "text": "verbatim text to inject" }
   ]
 }
 ```
 
-Accepted on `POST /comp/chat/{session_id}/message` and
-`POST /comp/chat/{session_id}/message_async`.
+Accepted on `POST /comp/chat/{session_id}/message/stream`.
 
 ## What the engine does
 

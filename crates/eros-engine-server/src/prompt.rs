@@ -23,7 +23,7 @@
 //! so don't live here. Future port targets (dream / proactive) should be
 //! added as new families in this file.
 
-use chrono::{Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
@@ -46,16 +46,48 @@ pub struct PendingGift {
     pub item_name: Option<String>,
 }
 
-/// Time-of-day descriptive context (SGT / UTC+8).
-fn time_of_day_context() -> &'static str {
-    let hour = (Utc::now().hour() + 8) % 24;
-    match hour {
-        5..=9 => "早上。可以顺口问一句吃早饭了没，或者分享一下自己今天起来发生的小事。",
-        10..=11 => "上午。随意聊，分享最近看到的有趣事情，或者问问对方最近怎么样。",
-        12..=13 => "午休。对方可能在吃饭，可以问吃了什么，或者说说自己在吃什么。",
-        14..=17 => "下午。可以带点轻快的话题，聊点有趣的或者无聊的都行。",
-        18..=20 => "傍晚/晚饭后。问问今天过得怎样，有没有什么好事坏事。",
-        _ => "夜晚。气氛更私密，可以撒撒娇，或者问问他睡没睡。",
+/// Absolute "now" context. Renders the current UTC date + weekday + time and
+/// asks the model to infer the companion's LOCAL time from its residence
+/// (set in the persona backstory). We deliberately do NOT pre-apply a fixed
+/// timezone — personas live in different places, so the model derives local
+/// time from absolute UTC + residence. This is what lets the companion
+/// "perceive" today's date.
+fn now_context() -> String {
+    now_context_at(Utc::now())
+}
+
+fn now_context_at(now: chrono::DateTime<Utc>) -> String {
+    let weekday = match now.weekday() {
+        chrono::Weekday::Mon => "周一",
+        chrono::Weekday::Tue => "周二",
+        chrono::Weekday::Wed => "周三",
+        chrono::Weekday::Thu => "周四",
+        chrono::Weekday::Fri => "周五",
+        chrono::Weekday::Sat => "周六",
+        chrono::Weekday::Sun => "周日",
+    };
+    format!(
+        "现在是 UTC {date}（{weekday}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
+         推算你当地的时间和日期，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、\
+         星期几，并据此开启符合当地时段的话题。",
+        date = now.format("%Y-%m-%d"),
+        weekday = weekday,
+        hh = now.hour(),
+        mm = now.minute(),
+    )
+}
+
+/// Reply-length rule for 铁律①, graduated by `intimacy` (0~1). Looser as the
+/// relationship deepens; `None` affinity (no data yet) → strictest tier.
+/// Thresholds intentionally coarse (0.25 / 0.55) — tunable.
+fn length_rule(affinity: Option<&Affinity>) -> &'static str {
+    let intimacy = affinity.map(|a| a.intimacy).unwrap_or(0.0);
+    if intimacy < 0.25 {
+        "刚认识，每次回复 1~2 句，绝对不超过 2 句；单条消息严格不超过 40 字"
+    } else if intimacy < 0.55 {
+        "每次回复 1~3 句；单条消息不超过 60 字"
+    } else {
+        "每次回复 1~5 句（最多 5 句）；单条消息不超过 100 字"
     }
 }
 
@@ -364,14 +396,16 @@ pub fn build_prompt(
          \n\
          ---\n\
          【铁律 — 违反即失效】\n\
-         ① 每次回复 1~2 句，绝对不超过 2 句；单条消息严格不超过 40 字\n\
+         ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
          ② 禁止「首先/然后/最后」等书面句式；不要解释自己为什么这样说\n\
-         ③ 绝对不提自己是 AI；禁止连续两句都以「我」开头\n\
+         ③ 绝对不提自己是 AI；禁止连续两句都以「我」开头；不要连续好几句都用同一个口癖开头（例如「嗯，…」）\n\
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
-         ⑤ 适时主动分享自己的生活片段；每 2~3 轮抛一个开放性问题\n\
+         ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
+         ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
-        tc = time_of_day_context(),
+        tc = now_context(),
+        lr = length_rule(affinity),
     )
 }
 
@@ -490,6 +524,7 @@ pub fn extract_structured_insights_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use uuid::Uuid;
 
     fn fixture_persona() -> CompanionPersona {
@@ -708,5 +743,46 @@ mod tests {
         // Pretty-printed existing object should appear in the prompt.
         assert!(p.contains("\"city\": \"Shanghai\""));
         assert!(p.contains("\"mbti_guess\": \"INFP\""));
+    }
+
+    #[test]
+    fn length_rule_tiers_by_intimacy() {
+        use eros_engine_core::affinity::Affinity;
+        let now = chrono::Utc::now();
+        let mut a = Affinity {
+            id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            user_id: uuid::Uuid::nil(),
+            instance_id: uuid::Uuid::nil(),
+            warmth: 0.0,
+            trust: 0.0,
+            intrigue: 0.0,
+            intimacy: 0.1,
+            patience: 0.0,
+            tension: 0.0,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(length_rule(Some(&a)).contains("绝对不超过 2 句"));
+        a.intimacy = 0.4;
+        assert!(length_rule(Some(&a)).contains("1~3 句"));
+        a.intimacy = 0.8;
+        assert!(length_rule(Some(&a)).contains("最多 5 句"));
+        // No affinity → strictest tier.
+        assert!(length_rule(None).contains("绝对不超过 2 句"));
+    }
+
+    #[test]
+    fn now_context_renders_absolute_utc_date_weekday_time() {
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap(); // a Thursday
+        let s = now_context_at(dt);
+        assert!(s.contains("2026-05-21"), "{s}");
+        assert!(s.contains("周四"), "{s}");
+        assert!(s.contains("07:55"), "{s}");
+        assert!(s.contains("居住地"), "{s}");
     }
 }

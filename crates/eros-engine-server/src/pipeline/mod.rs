@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// NOTE: the synchronous orchestrator `run` (+ its sync-only helpers and the
+// `ActionHandler` dispatch it drives) is currently unreached from the binary:
+// its only HTTP caller, the sync `POST /comp/chat/{session_id}/message`
+// handler, was removed in favour of the SSE streaming endpoint
+// (`stream::run_stream`). It's retained for now as the canonical
+// host-app-driven path pending a separate decision to delete it. The dead
+// items carry targeted `#[allow(dead_code)]` so the rest of the `pipeline`
+// module keeps its normal dead-code warnings (no module-wide suppression).
 //! Pipeline orchestrator — pre-process → PDE → handler dispatch → chat
 //! exec → save assistant message → spawn post-process.
 //!
@@ -34,6 +42,9 @@ use crate::state::AppState;
 use handlers::{ActionHandler, GhostHandler, GiftHandler, ProactiveHandler, ReplyHandler};
 
 /// Primary entry point for the companion engine.
+// Unreached from the binary since the sync `/message` handler was removed; see
+// the module note above. Retained pending a separate decision to delete it.
+#[allow(dead_code)]
 pub async fn run(
     state: &AppState,
     session_id: Uuid,
@@ -248,6 +259,7 @@ pub(super) fn log_openrouter_usage(
     );
 }
 
+#[allow(dead_code)] // only used by the retained-but-unreached sync `run`
 async fn load_session_ids(state: &AppState, session_id: Uuid) -> Result<(Uuid, Uuid), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     let session = chat_repo
@@ -260,6 +272,7 @@ async fn load_session_ids(state: &AppState, session_id: Uuid) -> Result<(Uuid, U
     Ok((session.user_id, instance_id))
 }
 
+#[allow(dead_code)] // only used by the retained-but-unreached sync `run`
 async fn load_affinity_with_decay(
     state: &AppState,
     session_id: Uuid,
@@ -315,6 +328,7 @@ pub async fn compute_signals_for_session(
 /// Reset `ghost_streak` to 0 for the affinity row tied to this session.
 /// Idempotent: the WHERE clause skips the UPDATE when streak is already 0
 /// so the unconditional call from `pipeline::run` doesn't spam writes.
+#[allow(dead_code)] // only used by the retained-but-unreached sync `run`
 async fn clear_ghost_streak(state: &AppState, session_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE engine.companion_affinity \

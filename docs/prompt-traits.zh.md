@@ -7,15 +7,15 @@ prompt 里塞入自定义段落。
 
 ```jsonc
 {
-  "message": "...",
+  "content": "...",
+  "client_msg_id": "01J3333333333333333333333A",
   "prompt_traits": [
     { "tag": "ascii_identifier", "text": "要注入的文字" }
   ]
 }
 ```
 
-接受于 `POST /comp/chat/{session_id}/message` 和
-`POST /comp/chat/{session_id}/message_async`。
+接受于 `POST /comp/chat/{session_id}/message/stream`。
 
 ## 引擎会做什么
 

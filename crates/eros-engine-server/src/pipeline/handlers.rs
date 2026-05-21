@@ -49,6 +49,9 @@ const HISTORY_WINDOW: i64 = 20;
 
 #[async_trait]
 pub trait ActionHandler: Send + Sync {
+    // Dispatched only by the retained-but-unreached sync `pipeline::run`
+    // (the sync `/message` handler was removed); see pipeline/mod.rs note.
+    #[allow(dead_code)]
     async fn handle(
         &self,
         input: &DecisionInput,
@@ -71,7 +74,7 @@ fn persona_model_override(input: &DecisionInput) -> Option<String> {
 /// `Event` driving this turn. Returns `None` for non-`UserMessage` events
 /// (gift / proactive paths cannot supply audit today — out of scope for
 /// the v1 audit feature).
-fn audit_from_event(event: &Event) -> Option<&LlmAudit> {
+pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> {
     match event {
         Event::UserMessage { audit, .. } => audit.as_ref(),
         _ => None,

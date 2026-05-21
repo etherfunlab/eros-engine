@@ -476,63 +476,6 @@
         ]
       }
     },
-    "/comp/chat/{session_id}/message": {
-      "post": {
-        "tags": [
-          "companion"
-        ],
-        "summary": "Send a user message and synchronously return the AI reply.",
-        "operationId": "send_message",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SendMessageRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CompanionReplyResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "not your session"
-          },
-          "404": {
-            "description": "session not found"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
     "/comp/chat/{session_id}/message/stream": {
       "post": {
         "tags": [
@@ -1304,59 +1247,6 @@
           }
         }
       },
-      "CompanionReplyResponse": {
-        "type": "object",
-        "required": [
-          "reply",
-          "session_id",
-          "lead_score",
-          "should_show_cta",
-          "typing_delay_ms",
-          "agent_training_level"
-        ],
-        "properties": {
-          "agent_training_level": {
-            "type": "number",
-            "format": "double"
-          },
-          "generation_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "OpenRouter `response.id`. Omitted when not returned."
-          },
-          "lead_score": {
-            "type": "number",
-            "format": "double"
-          },
-          "model": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Model actually served (may differ from request when fallback hit).\nOmitted when not returned."
-          },
-          "reply": {
-            "type": "string"
-          },
-          "session_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "should_show_cta": {
-            "type": "boolean"
-          },
-          "typing_delay_ms": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "usage": {
-            "description": "OpenRouter `usage` block (tokens / cost). Omitted when upstream\ndidn't return one or no LLM call was made for this turn."
-          }
-        }
-      },
       "GiftEventBody": {
         "type": "object",
         "description": "Body for `POST /comp/chat/{session_id}/event/gift`.\n\nReplaces the gateway's `tip` + `gift` endpoints. The OSS engine has\nno credit ledger, so the caller supplies the affinity deltas\ndirectly. `label` is the human-readable description (e.g. `\"rose\"`)\nand is also used as the `chat_messages.content` for the gift turn.",
@@ -1639,38 +1529,6 @@
           "text": {
             "type": "string",
             "description": "Verbatim text inserted under `【附加指引】` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
-          }
-        }
-      },
-      "SendMessageRequest": {
-        "type": "object",
-        "required": [
-          "message"
-        ],
-        "properties": {
-          "audit": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LlmAuditDto",
-                "description": "Optional OpenRouter audit passthrough. See `docs/llm-audit.md`."
-              }
-            ]
-          },
-          "message": {
-            "type": "string"
-          },
-          "prompt_traits": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "$ref": "#/components/schemas/PromptTraitDto"
-            },
-            "description": "Optional caller-supplied prompt-injection fragments. See\n`docs/prompt-traits.md`. Missing field → empty list."
           }
         }
       },

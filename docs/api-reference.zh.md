@@ -121,75 +121,47 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
 此时 HTTP 响应已提交 `200 OK`。
 
-### `POST /comp/chat/{session_id}/message`
-
-> **0.2 弃用。** 新接入请改用 `/message/stream`。同步端点在 0.2.x 期间
-> 保留兼容，在 0.3.0 中正式移除。
-
-同步對話一輪。阻塞到 LLM 響應為止。
-
-```bash
-curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"message":"嗨，今天讀甚麼書？"}' \
-  http://localhost:8080/comp/chat/<session_id>/message
-```
-
-```json
-{
-  "reply": "Bishop。三月份我總是回到的同一本。",
-  "lead_score": 4.2,
-  "should_show_cta": false,
-  "typing_delay_ms": 1340,
-  "agent_training_level": 0.18,
-  "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": 0.0004 },
-  "generation_id": "gen-abc123",
-  "model": "openai/gpt-5.2"
-}
-```
-
-`reply: null` 意味著人格在這一輪 ghost 了你（看 [Ghost 機制](ghost-mechanics.zh.md)）。HTTP 狀態仍是 200。
-
-`usage` / `generation_id` / `model` 是 OpenRouter 响应的可选回显。
-上游未返回或本轮没有 LLM 调用时省略。引擎把 `usage` 当作不透明 JSON
-对象，调用方按需反序列化。详见 [llm-audit.zh.md](llm-audit.zh.md)。
-
 **可选：单轮 prompt traits。** 请求体可附加 `prompt_traits` 数组 ——
 详见 [prompt-traits.zh.md](prompt-traits.zh.md)。示例：
 
 ```bash
-curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
   -d '{
-        "message": "hi",
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
         "prompt_traits": [
           {"tag": "nsfw_boost", "text": "<your injection text>"}
         ]
       }' \
-  http://localhost:8080/comp/chat/<session_id>/message
+  http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
 限制：最多 8 条，`tag` 满足 `[a-z0-9_]{1,32}`，`text` ≤ 2000 字符
-（trim 后非空）。违反返回 `400 BadRequest`。
+（trim 后非空）。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
 **可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，
 原样作为 wire 级别的 `user` / `session_id` / `metadata` 发送给
 OpenRouter —— 详见 [llm-audit.zh.md](llm-audit.zh.md)。示例：
 
 ```bash
-curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
   -d '{
-        "message": "hi",
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
         "audit": {
           "user": "u_<hash>",
           "session_id": "conv_xyz",
           "metadata": { "feature": "chat", "plan": "pro" }
         }
       }' \
-  http://localhost:8080/comp/chat/<session_id>/message
+  http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
 限制：`audit.user` 与 `audit.session_id` ≤ 256 字符；`audit.metadata`
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
-且 ≤ 512 字符。违反返回 `400 BadRequest`。
+且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
