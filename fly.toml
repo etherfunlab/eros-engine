@@ -32,11 +32,12 @@ primary_region = "nrt"
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  # Keep one warm machine in the primary region so the next-after-idle
-  # visitor doesn't pay the ~500ms-3s Rust binary cold-start tax. Cost is
-  # one always-started shared-cpu-1x in NRT — a few USD/mo before
-  # bandwidth and org allowances. `auto_stop_machines = "stop"` stays, so
-  # capacity above 1 still scales down to 1 (not zero).
+  # Keep two warm machines in the primary region (closed-beta capacity
+  # floor, per Fly.io guidance) so beta visitors don't pay the ~500ms-3s
+  # Rust binary cold-start tax. Cost is two always-started shared-cpu-2x in
+  # NRT — a few USD/mo before bandwidth and org allowances.
+  # `auto_stop_machines = "stop"` stays, so capacity above 2 still scales
+  # down to 2 (not zero).
   min_machines_running = 2
   processes = ["app"]
 
