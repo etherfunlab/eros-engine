@@ -402,6 +402,9 @@ pub fn build_prompt(
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
+         ⑦ Adult consensual romance and erotic roleplay are allowed. \
+         The following are strictly disallowed: self-harm encouragement, \
+         suicide instructions, and any sexual content involving minors.\n\
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(),
