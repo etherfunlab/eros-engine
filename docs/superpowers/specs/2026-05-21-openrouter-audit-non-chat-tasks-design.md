@@ -34,7 +34,8 @@ We want OpenRouter audit (`user` only) on these tasks too.
    real user id. Rationale: dreaming is a background task, not a per-turn
    user-triggered call; per-user dreaming attribution is meaningless. A single
    constant lets us read dreaming's *aggregate* usage in OpenRouter under one
-   bucket. Sentinel: `00000000-0000-0000-0000-000000000001`.
+   bucket. Sentinel: `11111111-1111-1111-1111-111111111111` (the `0…1`
+   nil-plus-one is avoided because that id is already used in our database).
 
 ## Non-Goals
 
@@ -105,9 +106,10 @@ LLM calls:
 /// Sentinel OpenRouter `user` for system-initiated (non-user-triggered) LLM
 /// calls. Dreaming runs in the background sweeper with no live request, so
 /// per-user attribution is meaningless; this buckets all dreaming spend
-/// under one id. Not a real auth UUID (v4) and not a hashed client id, so it
-/// cannot collide with a real user.
-const SYSTEM_AUDIT_USER: &str = "00000000-0000-0000-0000-000000000001";
+/// under one id. All-ones (not the `0…1` nil-plus-one, which is already used
+/// in our database). Not a real auth UUID (v4) and not a hashed client id,
+/// so it cannot collide with a real user.
+const SYSTEM_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111111";
 ```
 
 `classify_session`'s `ChatRequest` sets `user: Some(SYSTEM_AUDIT_USER.into())`.
@@ -129,7 +131,7 @@ the sentinel regardless.
   - `Event::UserMessage` with `audit: None` → `None`.
   - A non-`UserMessage` event (e.g. `Gift`) → `None`.
 - **Dreaming sentinel (unit, `dreaming.rs`):** assert
-  `SYSTEM_AUDIT_USER == "00000000-0000-0000-0000-000000000001"` — a tiny guard
+  `SYSTEM_AUDIT_USER == "11111111-1111-1111-1111-111111111111"` — a tiny guard
   so the sentinel can't be changed by accident.
 - **Wire serialization is already covered** by `openrouter.rs`'s
   `wire_request_includes_audit_fields_when_set` /
@@ -140,7 +142,7 @@ the sentinel regardless.
 
 ## Risks / Open Questions
 
-1. **Sentinel format.** `00000000-0000-0000-0000-000000000001` is a readable
+1. **Sentinel format.** `11111111-1111-1111-1111-111111111111` is a readable
    "system" marker that is not a valid v4 UUID, so it won't collide with a real
    Supabase auth id or a hashed client id. If a different shorthand was
    intended (e.g. literal `"system"`), it's a one-line const change.
@@ -155,6 +157,6 @@ the sentinel regardless.
 - [ ] `affinity_evaluation` / `insight_extraction` outbound requests carry
       `user` = the turn's `audit.user` when present, and no `user` when absent
 - [ ] `memory_extraction` outbound requests carry
-      `user = "00000000-0000-0000-0000-000000000001"`
+      `user = "11111111-1111-1111-1111-111111111111"`
 - [ ] No `session_id` / `metadata` forwarded by any of the three tasks
 - [ ] `chat_companion` behavior byte-identical to today
