@@ -540,7 +540,10 @@ async fn extract_insights(
             // matching table. No extra read — merge returned the merged row.
             // Failure only warns; it must not break the chat turn.
             let human_repo = HumanInsightRepo { pool: &state.pool };
-            if let Err(e) = human_repo.project_from_insights(user_id, &row.insights).await {
+            if let Err(e) = human_repo
+                .project_from_insights(user_id, &row.insights)
+                .await
+            {
                 tracing::warn!("human_insights projection failed: {e}");
             }
         }

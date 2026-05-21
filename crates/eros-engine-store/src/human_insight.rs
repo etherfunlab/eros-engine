@@ -36,7 +36,11 @@ fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
 fn str_array(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -76,7 +80,9 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
         preferred_gender: prefs.and_then(|p| str_field(p, "preferred_gender")),
         age_min,
         age_max,
-        deal_breakers: prefs.map(|p| str_array(p, "deal_breakers")).unwrap_or_default(),
+        deal_breakers: prefs
+            .map(|p| str_array(p, "deal_breakers"))
+            .unwrap_or_default(),
     }
 }
 
@@ -280,20 +286,22 @@ mod tests {
         let repo = HumanInsightRepo { pool: &pool };
         let want = Uuid::new_v4();
         let other = Uuid::new_v4();
-        repo.project_from_insights(want, &serde_json::json!({ "interests": ["coffee", "hiking"] }))
-            .await
-            .unwrap();
+        repo.project_from_insights(
+            want,
+            &serde_json::json!({ "interests": ["coffee", "hiking"] }),
+        )
+        .await
+        .unwrap();
         repo.project_from_insights(other, &serde_json::json!({ "interests": ["gaming"] }))
             .await
             .unwrap();
 
-        let hits: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT user_id FROM engine.human_insights WHERE interests && $1",
-        )
-        .bind(vec!["coffee".to_string()])
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let hits: Vec<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM engine.human_insights WHERE interests && $1")
+                .bind(vec!["coffee".to_string()])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(hits, vec![want]);
     }
 
