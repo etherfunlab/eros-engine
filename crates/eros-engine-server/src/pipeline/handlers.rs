@@ -992,6 +992,7 @@ mod tests {
             message_id: Uuid::new_v4(),
             prompt_traits: vec![],
             audit: Some(audit.clone()),
+            tier: None,
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));

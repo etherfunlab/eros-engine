@@ -249,6 +249,7 @@ pub struct PersistedUserMessage {
     pub content: String,
     pub prompt_traits: Vec<eros_engine_core::types::PromptTrait>,
     pub audit: Option<eros_engine_core::types::LlmAudit>,
+    pub tier: Option<String>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -314,6 +315,7 @@ pub fn run_stream(
                 message_id: user_msg.user_message_id,
                 prompt_traits: user_msg.prompt_traits.clone(),
                 audit: user_msg.audit.clone(),
+                tier: user_msg.tier.clone(),
             },
             affinity: affinity.clone(),
             persona,
@@ -430,6 +432,7 @@ pub fn run_stream(
                     message_id: user_msg.user_message_id,
                     prompt_traits: user_msg.prompt_traits.clone(),
                     audit: user_msg.audit.clone(),
+                    tier: user_msg.tier.clone(),
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -736,6 +739,7 @@ mod tests {
                 content: "hi".into(),
                 prompt_traits: vec![],
                 audit: None,
+                tier: None,
             },
         )
         .collect()
@@ -858,6 +862,7 @@ data: [DONE]\n\n";
                 content: "hi".into(),
                 prompt_traits: vec![],
                 audit: None,
+                tier: None,
             },
         )
         .collect()
@@ -931,6 +936,7 @@ data: [DONE]\n\n";
                 content: "hi".into(),
                 prompt_traits: vec![],
                 audit: None,
+                tier: None,
             },
         )
         .collect()

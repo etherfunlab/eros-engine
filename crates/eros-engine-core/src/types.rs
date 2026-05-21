@@ -49,6 +49,11 @@ pub enum Event {
         /// inspected.
         #[serde(default)]
         audit: Option<LlmAudit>,
+        /// Optional caller-supplied tier (downstream-defined, e.g. "free" /
+        /// "gold"). `None` for clients that don't send it. Routed opaquely to
+        /// `model_config.resolve` to pick the per-tier model + allow_traits.
+        #[serde(default)]
+        tier: Option<String>,
     },
     Gift {
         gift_id: Uuid,
@@ -173,6 +178,18 @@ mod tests {
         match ev {
             Event::UserMessage { audit, .. } => {
                 assert!(audit.is_none(), "missing audit field must default to None");
+            }
+            _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
+    fn event_user_message_defaults_tier_to_none() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
+        match ev {
+            Event::UserMessage { tier, .. } => {
+                assert!(tier.is_none(), "missing tier must default to None")
             }
             _ => panic!("expected UserMessage"),
         }
