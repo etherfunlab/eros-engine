@@ -16,7 +16,7 @@ primary_region = "nrt"
 
 [env]
   BIND_ADDR = "0.0.0.0:8080"
-  EXPOSE_AFFINITY_DEBUG = "true"
+  EXPOSE_AFFINITY_DEBUG = "false"
   EMA_INERTIA = "0.5"
   MODEL_CONFIG_PATH = "/etc/eros-engine/model_config.toml"
   RUST_LOG = "info"
@@ -33,7 +33,7 @@ primary_region = "nrt"
   auto_stop_machines = "stop"
   auto_start_machines = true
   # Keep one warm machine in the primary region so the next-after-idle
-  # visitor doesn't pay the ~500ms–3s Rust binary cold-start tax. Cost is
+  # visitor doesn't pay the ~500ms-3s Rust binary cold-start tax. Cost is
   # one always-started shared-cpu-1x in NRT — a few USD/mo before
   # bandwidth and org allowances. `auto_stop_machines = "stop"` stays, so
   # capacity above 1 still scales down to 1 (not zero).
@@ -53,7 +53,5 @@ primary_region = "nrt"
   path = "/healthz"
 
 [[vm]]
-  size = "shared-cpu-1x"
+  size = "shared-cpu-2x"
   memory = "512mb"
-  cpu_kind = "shared"
-  cpus = 1
