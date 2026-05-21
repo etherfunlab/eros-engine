@@ -1063,4 +1063,13 @@ mod tests {
         assert!(kept.is_empty());
         assert_eq!(dropped.len(), 2);
     }
+
+    #[test]
+    fn filter_traits_whitelist_keeps_all_when_all_allowed() {
+        let traits = vec![pt("allow_politics"), pt("allow_nsfw")];
+        let allow = vec!["allow_nsfw".to_string(), "allow_politics".to_string()];
+        let (kept, dropped) = filter_traits(&traits, Some(&allow));
+        assert_eq!(kept.len(), 2);
+        assert!(dropped.is_empty());
+    }
 }
