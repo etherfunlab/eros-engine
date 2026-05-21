@@ -113,7 +113,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 - 代码内置兜底值(目前 `x-ai/grok-4-mini` / `0.5` / `200`)—— 这是 fail-safe,不是 contract。
 - `eros-engine-llm` 内部 struct 形状(可能加 `#[non_exhaustive]`)。
 - `description` 字段的处理 —— 现在是纯文档,以后可能变成结构化 metadata。
-- 新加的可选字段(`allow_traits`、`tiers`)和新的 task 名。
+- *未来*新增的可选字段和新的 task 名（本文已记录的字段——含 `allow_traits`、`tiers`——受承诺 1–3 保护）。
 
 ### Changelog 说明
 

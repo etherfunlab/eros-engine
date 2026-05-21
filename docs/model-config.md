@@ -113,7 +113,7 @@ What may still change without notice:
 - Compiled-in fallback values (currently `x-ai/grok-4-mini` / `0.5` / `200`). These are fail-safes, not contract.
 - Internal struct shapes inside `eros-engine-llm` if `#[non_exhaustive]` is added.
 - The `description` field's handling — it's documentation today, may become structured metadata later.
-- Newly added optional fields (`allow_traits`, `tiers`) and new task names.
+- *Future* new optional fields and new task names beyond those documented here. (The fields documented above — including `allow_traits` and `tiers` — are covered by commitments 1–3.)
 
 ### Changelog note
 
