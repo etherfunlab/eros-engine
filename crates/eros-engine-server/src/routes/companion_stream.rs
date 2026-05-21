@@ -304,6 +304,32 @@ mod tests {
     use sqlx::PgPool;
     use tower::Service;
 
+    fn req_with_tier(tier: Option<&str>) -> StreamSendRequest {
+        StreamSendRequest {
+            content: "hi".into(),
+            client_msg_id: "01J5555555555555555555555A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: tier.map(String::from),
+        }
+    }
+
+    #[test]
+    fn validate_payload_accepts_wellformed_and_absent_tier() {
+        assert!(validate_payload(&req_with_tier(Some("gold"))).is_ok());
+        assert!(validate_payload(&req_with_tier(Some("free_2"))).is_ok());
+        assert!(validate_payload(&req_with_tier(None)).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_rejects_malformed_tier() {
+        // uppercase, punctuation, and over-length are all rejected.
+        assert!(validate_payload(&req_with_tier(Some("Gold"))).is_err());
+        assert!(validate_payload(&req_with_tier(Some("gold!"))).is_err());
+        assert!(validate_payload(&req_with_tier(Some(""))).is_err());
+        assert!(validate_payload(&req_with_tier(Some(&"x".repeat(MAX_TIER_LEN + 1)))).is_err());
+    }
+
     fn mint_jwt(uid: Uuid) -> String {
         let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
         encode(
