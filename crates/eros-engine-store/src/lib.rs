@@ -3,6 +3,7 @@
 
 pub mod affinity;
 pub mod chat;
+pub mod human_insight;
 pub mod insight;
 pub mod memory;
 pub mod ownership;
@@ -112,5 +113,17 @@ mod migration_tests {
         .execute(&pool)
         .await;
         assert!(dup_res.is_err(), "duplicate asset_id must be rejected");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn human_insights_has_rls_enabled(pool: PgPool) {
+        let enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+             WHERE oid = 'engine.human_insights'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity for human_insights");
+        assert!(enabled, "RLS must be enabled on engine.human_insights");
     }
 }

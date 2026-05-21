@@ -43,6 +43,10 @@ async fn main() -> Result<()> {
     //                                     (Fly.io release_command)
     //   eros-engine seed-personas <dir>   load every *.toml in <dir> as a
     //                                     persona genome (idempotent on name)
+    //   eros-engine backfill-human-insights  project every companion_insights
+    //                                     row into engine.human_insights
+    //                                     (idempotent UPSERT; manual, never
+    //                                     in release_command)
     //   eros-engine print-openapi         dump the OpenAPI spec to stdout and
     //                                     exit (no DB, no env). Used by the
     //                                     CI drift check.
@@ -55,11 +59,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "/etc/eros-engine/personas".to_string());
             run_seed_personas(&dir).await
         }
+        Some("backfill-human-insights") => run_backfill_human_insights().await,
         Some("print-openapi") => run_print_openapi(),
         Some("serve") | None => run_server().await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>|print-openapi]");
+            eprintln!("usage: eros-engine [serve|migrate|seed-personas <dir>|backfill-human-insights|print-openapi]");
             std::process::exit(2);
         }
     }
@@ -137,6 +142,38 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
         }
     }
     tracing::info!(inserted, skipped, "seed-personas complete");
+    Ok(())
+}
+
+/// Project every existing `companion_insights` row into `engine.human_insights`.
+/// Idempotent (UPSERT), so re-running is safe. Manual maintenance command —
+/// deliberately NOT wired into the Fly release_command.
+async fn run_backfill_human_insights() -> Result<()> {
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let pool = eros_engine_store::pool::build(&database_url)
+        .await
+        .context("failed to connect to DATABASE_URL")?;
+    let human_repo = eros_engine_store::human_insight::HumanInsightRepo { pool: &pool };
+
+    let rows: Vec<(uuid::Uuid, serde_json::Value)> =
+        sqlx::query_as("SELECT user_id, insights FROM engine.companion_insights")
+            .fetch_all(&pool)
+            .await
+            .context("load companion_insights for backfill")?;
+
+    let total = rows.len();
+    let mut ok = 0u32;
+    let mut failed = 0u32;
+    for (user_id, insights) in rows {
+        match human_repo.project_from_insights(user_id, &insights).await {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                tracing::warn!(%user_id, "backfill projection failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+    tracing::info!(total, ok, failed, "backfill-human-insights complete");
     Ok(())
 }
 

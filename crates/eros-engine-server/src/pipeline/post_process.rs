@@ -24,6 +24,7 @@ use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_llm::voyage::VoyageClient;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use eros_engine_store::persona::PersonaRepo;
@@ -533,8 +534,20 @@ async fn extract_insights(
         return;
     }
 
-    if let Err(e) = insights_repo.merge(user_id, new_insights).await {
-        tracing::warn!("companion_insights merge failed: {e}");
+    match insights_repo.merge(user_id, new_insights).await {
+        Ok(row) => {
+            // Write-through: project the just-merged JSONB into the flat
+            // matching table. No extra read — merge returned the merged row.
+            // Failure only warns; it must not break the chat turn.
+            let human_repo = HumanInsightRepo { pool: &state.pool };
+            if let Err(e) = human_repo
+                .project_from_insights(user_id, &row.insights)
+                .await
+            {
+                tracing::warn!("human_insights projection failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("companion_insights merge failed: {e}"),
     }
 }
 
