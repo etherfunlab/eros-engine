@@ -8,7 +8,7 @@ This page is a hand-written summary of the endpoints worth knowing. The Scalar U
 
 ## Authentication
 
-Every `/comp/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The JWT must be HS256-signed against `SUPABASE_JWT_SECRET`. The `sub` claim must be a UUID; that becomes the user_id for the request.
+Every `/comp/*` and `/bff/v1/*` endpoint requires `Authorization: Bearer <Supabase JWT>`. The JWT must be HS256-signed against `SUPABASE_JWT_SECRET`. The `sub` claim must be a UUID; that becomes the user_id for the request.
 
 `/healthz` and `/docs` are public.
 
@@ -269,6 +269,94 @@ Live 6-dim vector + ghost stats + relationship label. Gated by `EXPOSE_AFFINITY_
 
 Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). Turn it on if your frontend wants to render a live radar of the vector.
 
+## BFF (`/bff/v1/*`)
+
+A frontend-shaped mirror of selected `/comp/*` routes for first-party
+clients. Same Supabase JWT auth and the same per-user ownership checks as
+the canonical routes — only the **response shape** differs (slimmer DTOs,
+bundled payloads). Canonical `/comp/*` routes are never reshaped to fit a
+frontend; a BFF route is added alongside instead. Three routes exist today.
+
+### `POST /bff/v1/comp/chat/start`
+
+Cold-mount bundle: resolves (or creates) the session **and** returns its
+recent history in one round-trip, collapsing the frontend's separate
+`start` + `history` calls. For the same user + input it resolves to the
+exact same session as the canonical `POST /comp/chat/start`.
+
+The body is the canonical start body plus one BFF-only field:
+
+- `genome_id` / `instance_id` — identify the persona (same as canonical).
+- `is_demo` — optional, same as canonical.
+- `history_limit` — optional bundled-history page size; default 50, capped at 50.
+
+```json
+{
+  "session_id": "5f7e…",
+  "instance_id": "…",
+  "persona_name": "Aria",
+  "is_new": false,
+  "history": [
+    { "role": "user",      "content": "hello",   "sent_at": "…" },
+    { "role": "assistant", "content": "hi back", "sent_at": "…" }
+  ]
+}
+```
+
+Affinity is intentionally **not** bundled here — the frontend reads it
+separately (see the affinity event route below), which keeps bootstrap
+independent of `EXPOSE_AFFINITY_DEBUG`.
+
+### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
+
+Slim history projection for the chat screen: `role` / `content` /
+`sent_at` only (no `extracted_facts`). Same auth, ownership check, and
+`limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
+divergence:** the default `limit` is 50 (the canonical route defaults to 20),
+because the BFF exists for a cold mount that wants a full backscroll in one
+round-trip.
+
+```json
+{
+  "session_id": "…",
+  "messages": [
+    { "role": "user",      "content": "alpha", "sent_at": "…" },
+    { "role": "assistant", "content": "beta",  "sent_at": "…" }
+  ],
+  "total": 2
+}
+```
+
+`total` is the count of `messages` in **this** response (`== messages.len()`),
+not the grand total of rows in the session.
+
+### `GET /bff/v1/comp/affinity/{session_id}/event`
+
+Latest user-turn affinity delta (post-EMA), for per-turn frontend
+observation. Unlike the canonical `/comp/affinity/{session_id}` debug
+route, this is **not** gated by `EXPOSE_AFFINITY_DEBUG` (the frontend owns
+this surface) — but it is still JWT + ownership checked.
+
+```json
+{
+  "session_id": "…",
+  "event": {
+    "event_id": "…",
+    "event_type": "message",
+    "effective_deltas": {
+      "warmth": 0.03, "trust": 0.01, "intrigue": 0.0,
+      "intimacy": 0.0, "patience": 0.0, "tension": -0.01
+    },
+    "created_at": "…"
+  }
+}
+```
+
+`event` is `null` when there is no user-turn event yet (brand-new session,
+or only time-decay), or when the latest event predates affinity migration
+`0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
+reports all-zero `effective_deltas`.
+
 ## Error responses
 
 All errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`:
@@ -351,6 +439,8 @@ calls always sign with the current secret only.
 ## Source
 
 - `crates/eros-engine-server/src/routes/companion.rs` — handler implementations
+- `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
+- `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/debug.rs` — affinity debug route
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/routes/s2s.rs` — `/s2s/*` handlers
