@@ -1104,12 +1104,8 @@ data: [DONE]\n\n";
             .expect("stream opens");
         while stream.next().await.is_some() {}
 
-        let reqs = server
-            .received_requests()
-            .await
-            .expect("requests recorded");
-        let body: serde_json::Value =
-            serde_json::from_slice(&reqs[0].body).expect("body is json");
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("body is json");
         let obj = body.as_object().expect("body is a json object");
         assert_eq!(obj.get("stream"), Some(&serde_json::Value::Bool(true)));
         assert!(
