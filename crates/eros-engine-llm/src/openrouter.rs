@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
+use crate::model_config::ReasoningConfig;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -45,9 +46,9 @@ pub struct ChatRequest {
     /// (≤16 keys, key ≤64 chars, value ≤512 chars) are enforced at the
     /// HTTP boundary, not here.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Reasoning toggle forwarded to OpenRouter. `None` → omit the param;
-    /// `Some(b)` → send `reasoning:{enabled:b}`.
-    pub reasoning: Option<bool>,
+    /// Reasoning config forwarded to OpenRouter. `None` → omit the param;
+    /// `Some(cfg)` → send the `reasoning` object verbatim.
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -67,11 +68,6 @@ fn is_false(b: &bool) -> bool {
 }
 
 #[derive(Debug, Serialize)]
-struct WireReasoning {
-    enabled: bool,
-}
-
-#[derive(Debug, Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
@@ -86,7 +82,7 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<WireReasoning>,
+    reasoning: Option<&'a ReasoningConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +278,7 @@ impl OpenRouterClient {
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
-                    req.reasoning,
+                    req.reasoning.as_ref(),
                 )
                 .await
             {
@@ -331,7 +327,7 @@ impl OpenRouterClient {
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
-        req_reasoning: Option<bool>,
+        req_reasoning: Option<&ReasoningConfig>,
     ) -> Result<ChatResponse, LlmError> {
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
@@ -346,7 +342,7 @@ impl OpenRouterClient {
             user: req_user,
             session_id: req_session_id,
             metadata: req_metadata,
-            reasoning: req_reasoning.map(|enabled| WireReasoning { enabled }),
+            reasoning: req_reasoning,
         };
 
         let resp = self
@@ -405,7 +401,7 @@ impl OpenRouterClient {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
-            reasoning: req.reasoning.map(|enabled| WireReasoning { enabled }),
+            reasoning: req.reasoning.as_ref(),
         };
 
         let resp = self
@@ -1169,7 +1165,11 @@ data: [DONE]\n\n";
             role: "user".into(),
             content: "hi".into(),
         }];
-        // Some(false) -> nested {enabled:false}
+        // Some(cfg) -> nested object; absent inner fields are omitted.
+        let cfg = ReasoningConfig {
+            enabled: Some(false),
+            exclude: None,
+        };
         let wire = WireRequest {
             model: "m",
             messages: &messages,
@@ -1179,12 +1179,12 @@ data: [DONE]\n\n";
             user: None,
             session_id: None,
             metadata: None,
-            reasoning: Some(WireReasoning { enabled: false }),
+            reasoning: Some(&cfg),
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(
             s.contains("\"reasoning\":{\"enabled\":false}"),
-            "reasoning must serialize as a nested enabled flag: {s}"
+            "reasoning must serialize as a nested object: {s}"
         );
 
         // None -> key omitted entirely

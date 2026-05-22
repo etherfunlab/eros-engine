@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! TOML-driven model orchestration config.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,6 +29,20 @@ impl FallbackSpec {
             FallbackSpec::Multiple(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
         }
     }
+}
+
+/// Mirror of OpenRouter's `reasoning` request object. Parsed from TOML and
+/// forwarded to the wire unchanged, so operators control reasoning in the
+/// same shape OpenRouter documents. Every field optional; absent fields are
+/// omitted from the wire. Common uses: `{ enabled = false }` to disable
+/// reasoning entirely, or `{ exclude = true }` to keep reasoning but drop it
+/// from the response. (Extend with `effort`/`max_tokens` here if ever needed.)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
 }
 
 /// One tier's overrides for a task. Every field is optional; an absent
@@ -77,12 +91,12 @@ pub struct TaskConfig {
     /// semantics as `TierConfig::allow_traits`.
     #[serde(default)]
     pub allow_traits: Option<Vec<String>>,
-    /// Task-level reasoning toggle. Tri-state: absent → omit the OpenRouter
-    /// `reasoning` param (model default); `false` → send `{enabled:false}`
-    /// (disable); `true` → `{enabled:true}`. Task-level only — tiers inherit,
-    /// like `temperature`/`max_tokens`.
+    /// Task-level reasoning config (OpenRouter `reasoning` object). Absent →
+    /// omit the param (model default); present → forwarded to the wire (e.g.
+    /// `reasoning = { enabled = false }` to disable). Task-level only — tiers
+    /// inherit, like `temperature`/`max_tokens`.
     #[serde(default)]
-    pub reasoning: Option<bool>,
+    pub reasoning: Option<ReasoningConfig>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -111,9 +125,9 @@ pub struct ResolvedModel {
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
     pub allow_traits: Option<Vec<String>>,
-    /// Resolved reasoning toggle (see `TaskConfig::reasoning`). `None` → omit
-    /// the wire param; `Some(b)` → send `reasoning:{enabled:b}`.
-    pub reasoning: Option<bool>,
+    /// Resolved reasoning config (see `TaskConfig::reasoning`). `None` → omit
+    /// the wire param; `Some(cfg)` → forwarded as the `reasoning` object.
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 impl ModelConfig {
@@ -192,7 +206,7 @@ impl ModelConfig {
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
-        let reasoning = task_cfg.and_then(|t| t.reasoning);
+        let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
 
         ResolvedModel {
             model,
@@ -686,18 +700,25 @@ fallback = ""
         let toml = r#"
 [tasks.chat_companion]
 model = "m"
-reasoning = false
+reasoning = { enabled = false }
 
 [tasks.chat_companion.tiers.free]
 model = "free-m"
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let expected = ReasoningConfig {
+            enabled: Some(false),
+            exclude: None,
+        };
         // Task-level value applies with no tier...
-        assert_eq!(cfg.resolve("chat_companion", None).reasoning, Some(false));
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(expected.clone())
+        );
         // ...and a tier that doesn't override it inherits the task value.
         assert_eq!(
             cfg.resolve("chat_companion", Some("free")).reasoning,
-            Some(false)
+            Some(expected)
         );
     }
 
@@ -712,14 +733,20 @@ model = "m"
     }
 
     #[test]
-    fn resolve_reasoning_true_is_some_true() {
+    fn resolve_reasoning_parses_exclude_field() {
         let toml = r#"
 [tasks.chat_companion]
 model = "m"
-reasoning = true
+reasoning = { exclude = true }
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        assert_eq!(cfg.resolve("chat_companion", None).reasoning, Some(true));
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(ReasoningConfig {
+                enabled: None,
+                exclude: Some(true),
+            })
+        );
     }
 
     // Regression: the committed deployed config (examples/model_config.toml,
