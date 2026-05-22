@@ -137,7 +137,8 @@ impl ModelConfig {
 
     /// Resolve a task's model. Priority for `model`/`fallback`/`allow_traits`:
     /// matched tier block > task default block > `[defaults]` > compiled-in.
-    /// `temperature`/`max_tokens` are task-level only (no per-tier override).
+    /// `temperature`/`max_tokens`/`reasoning` are task-level only (no per-tier
+    /// override).
     pub fn resolve(&self, task: &str, tier: Option<&str>) -> ResolvedModel {
         let task_cfg = self.tasks.get(task);
         if task_cfg.is_none() {
