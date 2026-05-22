@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.3.0"
+    "version": "0.3.1"
   },
   "servers": [
     {
@@ -1114,13 +1114,26 @@
       "BffHistoryEntry": {
         "type": "object",
         "required": [
+          "id",
           "role",
           "content",
           "sent_at"
         ],
         "properties": {
+          "client_msg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client-supplied message id forwarded during streaming (the\n`client_msg_id` the FE sent on send). NULL for rows that never carried\none, e.g. assistant turns. Lets the FE reconcile an optimistic local\nmessage with its persisted row."
+          },
           "content": {
             "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable message id — the `engine.chat_messages` row primary key (UUID)."
           },
           "role": {
             "type": "string",

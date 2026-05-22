@@ -7,10 +7,18 @@
 # ids in preference order. The chain is tried sequentially; first success
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
 # block's fallback for this task.
+# Recommendation: keep `fallback` to at most 2 entries. The streaming chat
+# burst caps attempts at MAX_STREAM_FALLBACK_DEPTH (3 = primary + 2 fallbacks);
+# anything past the third entry is never tried on the chat path.
 model = "x-ai/grok-4.20"
-fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "z-ai/glm-4.7-flash"]
+fallback = ["thedrummer/cydonia-24b-v4.1", "minimax/minimax-m2-her"]
 temperature = 0.8
 max_tokens = 1500
+# Companion replies only render `content`; the reasoning channel is ignored,
+# so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
+# object — set `{ exclude = true }` instead if you want it generated but hidden.
+# Inherited by every tier below.
+reasoning = { enabled = false }
 # Default-block trait allow-list: used when no tier is sent or the tier is
 # unknown. Tier sub-tables below override model/fallback/allow_traits per tier.
 allow_traits = ["nsfw_boost","politics_open"]

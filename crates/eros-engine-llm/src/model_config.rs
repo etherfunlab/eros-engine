@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! TOML-driven model orchestration config.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,6 +29,20 @@ impl FallbackSpec {
             FallbackSpec::Multiple(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
         }
     }
+}
+
+/// Mirror of OpenRouter's `reasoning` request object. Parsed from TOML and
+/// forwarded to the wire unchanged, so operators control reasoning in the
+/// same shape OpenRouter documents. Every field optional; absent fields are
+/// omitted from the wire. Common uses: `{ enabled = false }` to disable
+/// reasoning entirely, or `{ exclude = true }` to keep reasoning but drop it
+/// from the response. (Extend with `effort`/`max_tokens` here if ever needed.)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
 }
 
 /// One tier's overrides for a task. Every field is optional; an absent
@@ -77,6 +91,12 @@ pub struct TaskConfig {
     /// semantics as `TierConfig::allow_traits`.
     #[serde(default)]
     pub allow_traits: Option<Vec<String>>,
+    /// Task-level reasoning config (OpenRouter `reasoning` object). Absent →
+    /// omit the param (model default); present → forwarded to the wire (e.g.
+    /// `reasoning = { enabled = false }` to disable). Task-level only — tiers
+    /// inherit, like `temperature`/`max_tokens`.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -105,6 +125,9 @@ pub struct ResolvedModel {
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
     pub allow_traits: Option<Vec<String>>,
+    /// Resolved reasoning config (see `TaskConfig::reasoning`). `None` → omit
+    /// the wire param; `Some(cfg)` → forwarded as the `reasoning` object.
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 impl ModelConfig {
@@ -128,7 +151,8 @@ impl ModelConfig {
 
     /// Resolve a task's model. Priority for `model`/`fallback`/`allow_traits`:
     /// matched tier block > task default block > `[defaults]` > compiled-in.
-    /// `temperature`/`max_tokens` are task-level only (no per-tier override).
+    /// `temperature`/`max_tokens`/`reasoning` are task-level only (no per-tier
+    /// override).
     pub fn resolve(&self, task: &str, tier: Option<&str>) -> ResolvedModel {
         let task_cfg = self.tasks.get(task);
         if task_cfg.is_none() {
@@ -181,12 +205,16 @@ impl ModelConfig {
             .or(self.defaults.fallback_max_tokens)
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
+        // Task-level only (tiers inherit), mirroring temperature/max_tokens.
+        let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
+
         ResolvedModel {
             model,
             fallback_model,
             temperature,
             max_tokens,
             allow_traits,
+            reasoning,
         }
     }
 }
@@ -667,6 +695,60 @@ fallback = ""
         );
     }
 
+    #[test]
+    fn resolve_reads_task_level_reasoning_and_tiers_inherit() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+reasoning = { enabled = false }
+
+[tasks.chat_companion.tiers.free]
+model = "free-m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let expected = ReasoningConfig {
+            enabled: Some(false),
+            exclude: None,
+        };
+        // Task-level value applies with no tier...
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(expected.clone())
+        );
+        // ...and a tier that doesn't override it inherits the task value.
+        assert_eq!(
+            cfg.resolve("chat_companion", Some("free")).reasoning,
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_absent_is_none() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("chat_companion", None).reasoning, None);
+    }
+
+    #[test]
+    fn resolve_reasoning_parses_exclude_field() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+reasoning = { exclude = true }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(ReasoningConfig {
+                enabled: None,
+                exclude: Some(true),
+            })
+        );
+    }
+
     // Regression: the committed deployed config (examples/model_config.toml,
     // copied to /etc/eros-engine in the Docker image) must always parse and
     // must define the affinity_evaluation task the post-process evaluator
@@ -677,7 +759,7 @@ fallback = ""
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
-        assert_eq!(r.max_tokens, 250);
+        assert_eq!(r.max_tokens, 400);
         assert!((r.temperature - 0.3).abs() < 1e-9);
         assert_eq!(
             r.fallback_model,
@@ -686,5 +768,27 @@ fallback = ""
                 "deepseek/deepseek-v4-flash".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn committed_example_chat_companion_disables_reasoning() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let disabled = ReasoningConfig {
+            enabled: Some(false),
+            exclude: None,
+        };
+        // Disabled for the default block...
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(disabled.clone())
+        );
+        // ...and inherited by the free tier (no per-tier override).
+        assert_eq!(
+            cfg.resolve("chat_companion", Some("free")).reasoning,
+            Some(disabled)
+        );
+        // Untouched tasks stay at model default.
+        assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
     }
 }
