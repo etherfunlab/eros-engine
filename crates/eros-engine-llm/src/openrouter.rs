@@ -45,6 +45,9 @@ pub struct ChatRequest {
     /// (≤16 keys, key ≤64 chars, value ≤512 chars) are enforced at the
     /// HTTP boundary, not here.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Reasoning toggle forwarded to OpenRouter. `None` → omit the param;
+    /// `Some(b)` → send `reasoning:{enabled:b}`.
+    pub reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -64,6 +67,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+struct WireReasoning {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
@@ -77,6 +85,8 @@ struct WireRequest<'a> {
     session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<WireReasoning>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +282,7 @@ impl OpenRouterClient {
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
+                    req.reasoning,
                 )
                 .await
             {
@@ -320,6 +331,7 @@ impl OpenRouterClient {
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+        req_reasoning: Option<bool>,
     ) -> Result<ChatResponse, LlmError> {
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
@@ -334,6 +346,7 @@ impl OpenRouterClient {
             user: req_user,
             session_id: req_session_id,
             metadata: req_metadata,
+            reasoning: req_reasoning.map(|enabled| WireReasoning { enabled }),
         };
 
         let resp = self
@@ -392,6 +405,7 @@ impl OpenRouterClient {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
+            reasoning: req.reasoning.map(|enabled| WireReasoning { enabled }),
         };
 
         let resp = self
@@ -642,6 +656,7 @@ mod tests {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
+            reasoning: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
@@ -681,6 +696,7 @@ mod tests {
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
+            reasoning: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(s.contains("\"user\":\"u_abc\""), "{s}");
@@ -1144,6 +1160,49 @@ data: [DONE]\n\n";
         assert!(
             matches!(err, LlmError::Status(s, _) if s.as_u16() == 429),
             "expected Status(429), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wire_request_serializes_reasoning_enabled_flag() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        // Some(false) -> nested {enabled:false}
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: Some(WireReasoning { enabled: false }),
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(
+            s.contains("\"reasoning\":{\"enabled\":false}"),
+            "reasoning must serialize as a nested enabled flag: {s}"
+        );
+
+        // None -> key omitted entirely
+        let wire_none = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+        };
+        let s_none = serde_json::to_string(&wire_none).unwrap();
+        assert!(
+            !s_none.contains("\"reasoning\""),
+            "absent reasoning must be omitted: {s_none}"
         );
     }
 
