@@ -59,12 +59,18 @@ pub struct ChatResponse {
     pub usage: Option<serde_json::Value>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     temperature: f32,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +330,7 @@ impl OpenRouterClient {
             messages,
             temperature,
             max_tokens,
+            stream: false,
             user: req_user,
             session_id: req_session_id,
             metadata: req_metadata,
@@ -372,17 +379,20 @@ impl OpenRouterClient {
             ));
         }
 
-        let wire = serde_json::json!({
-            "model": req.model,
-            "messages": req.messages,
-            "temperature": req.temperature,
-            "max_tokens": req.max_tokens,
-            "stream": true,
-            // Forward audit fields when set.
-            "user": req.user,
-            "session_id": req.session_id,
-            "metadata": req.metadata,
-        });
+        // Mirror the sync `call_once` wire: a hand-rolled `json!` here once
+        // serialised unset audit fields as `user: null`, which OpenRouter
+        // rejects (400 "expected string, received null"). Sharing WireRequest
+        // keeps the skip-None behaviour and stops the two paths from drifting.
+        let wire = WireRequest {
+            model: &req.model,
+            messages: &req.messages,
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            stream: true,
+            user: req.user.as_deref(),
+            session_id: req.session_id.as_deref(),
+            metadata: req.metadata.as_ref(),
+        };
 
         let resp = self
             .http
@@ -628,6 +638,7 @@ mod tests {
             messages: &req.messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            stream: false,
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
@@ -666,6 +677,7 @@ mod tests {
             messages: &req.messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            stream: false,
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
@@ -1036,6 +1048,70 @@ data: [DONE]\n\n";
         assert_eq!(u.total_tokens, 5);
         assert_eq!(last_gen_id.as_deref(), Some("gen-xyz"));
         assert_eq!(last_model.as_deref(), Some("x-ai/grok-4-fast"));
+    }
+
+    #[tokio::test]
+    async fn execute_stream_omits_null_audit_fields() {
+        use futures_util::StreamExt;
+
+        // Regression: the streaming wire used to be built with the `json!`
+        // macro, which serialised unset audit fields as `user: null`.
+        // OpenRouter rejects that with 400 "user: Invalid input: expected
+        // string, received null", so absent fields MUST be omitted — same
+        // skip-None behaviour as the sync `call_once` path.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "minimax/minimax-m2".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                // user / session_id / metadata default to None.
+                ..Default::default()
+            })
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("body is json");
+        let obj = body.as_object().expect("body is a json object");
+        assert_eq!(obj.get("stream"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            !obj.contains_key("user"),
+            "user key must be absent (not null): {body}"
+        );
+        assert!(
+            !obj.contains_key("session_id"),
+            "session_id key must be absent: {body}"
+        );
+        assert!(
+            !obj.contains_key("metadata"),
+            "metadata key must be absent: {body}"
+        );
     }
 
     #[tokio::test]
