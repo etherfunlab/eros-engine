@@ -677,7 +677,7 @@ fallback = ""
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
-        assert_eq!(r.max_tokens, 250);
+        assert_eq!(r.max_tokens, 400);
         assert!((r.temperature - 0.3).abs() < 1e-9);
         assert_eq!(
             r.fallback_model,
