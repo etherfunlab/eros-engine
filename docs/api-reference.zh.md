@@ -291,8 +291,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   "persona_name": "Aria",
   "is_new": false,
   "history": [
-    { "role": "user",      "content": "hello",   "sent_at": "…" },
-    { "role": "assistant", "content": "hi back", "sent_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…" }
   ]
 }
 ```
@@ -302,8 +302,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
-給聊天屏用的精簡歷史投影：只有 `role` / `content` / `sent_at`
-（不含 `extracted_facts`）。鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
+給聊天屏用的精簡歷史投影：`id` / `client_msg_id` / `role` / `content` /
+`sent_at`（不含 `extracted_facts`）。`id` 是 `chat_messages` 行的主鍵（UUID）；
+`client_msg_id` 是前端串流時帶上的 id（沒帶的行為 `null`，例如 assistant 回合）。
+鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
 （canonical 默認 20），因為 BFF 是為「冷啟動一次拉一整屏 backscroll」設計的。
 
@@ -311,8 +313,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 {
   "session_id": "…",
   "messages": [
-    { "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "role": "assistant", "content": "beta",  "sent_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" }
   ],
   "total": 2
 }

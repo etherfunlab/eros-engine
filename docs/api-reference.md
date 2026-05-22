@@ -297,8 +297,8 @@ The body is the canonical start body plus one BFF-only field:
   "persona_name": "Aria",
   "is_new": false,
   "history": [
-    { "role": "user",      "content": "hello",   "sent_at": "…" },
-    { "role": "assistant", "content": "hi back", "sent_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…" }
   ]
 }
 ```
@@ -309,8 +309,11 @@ independent of `EXPOSE_AFFINITY_DEBUG`.
 
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
-Slim history projection for the chat screen: `role` / `content` /
-`sent_at` only (no `extracted_facts`). Same auth, ownership check, and
+Slim history projection for the chat screen: `id` / `client_msg_id` /
+`role` / `content` / `sent_at` (no `extracted_facts`). `id` is the
+`chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
+sent during streaming (`null` for rows that never carried one, e.g.
+assistant turns). Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -320,8 +323,8 @@ round-trip.
 {
   "session_id": "…",
   "messages": [
-    { "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "role": "assistant", "content": "beta",  "sent_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" }
   ],
   "total": 2
 }

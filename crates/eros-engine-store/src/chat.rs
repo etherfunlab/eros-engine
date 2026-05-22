@@ -62,9 +62,13 @@ pub struct ChatMessage {
 /// Carries only the columns a chat-history viewer renders.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ChatMessageSlim {
+    pub id: Uuid,
     pub role: String,
     pub content: String,
     pub sent_at: DateTime<Utc>,
+    /// Client-supplied message id forwarded during streaming (idempotency
+    /// key). NULL for rows that never carried one (e.g. assistant turns).
+    pub client_msg_id: Option<String>,
 }
 
 pub struct ChatRepo<'a> {
@@ -197,7 +201,7 @@ impl<'a> ChatRepo<'a> {
         offset: i64,
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
-            "SELECT role, content, sent_at FROM engine.chat_messages \
+            "SELECT id, role, content, sent_at, client_msg_id FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
              LIMIT $2 OFFSET $3",

@@ -25,6 +25,13 @@ use crate::state::AppState;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BffHistoryEntry {
+    /// Stable message id — the `engine.chat_messages` row primary key (UUID).
+    pub id: Uuid,
+    /// Client-supplied message id forwarded during streaming (the
+    /// `client_msg_id` the FE sent on send). NULL for rows that never carried
+    /// one, e.g. assistant turns. Lets the FE reconcile an optimistic local
+    /// message with its persisted row.
+    pub client_msg_id: Option<String>,
     /// "user" | "assistant" | "gift_user" | "system_error"
     pub role: String,
     pub content: String,
@@ -114,6 +121,8 @@ async fn bff_get_history(
     let messages: Vec<BffHistoryEntry> = rows
         .into_iter()
         .map(|r| BffHistoryEntry {
+            id: r.id,
+            client_msg_id: r.client_msg_id,
             role: r.role,
             content: r.content,
             sent_at: r.sent_at,
@@ -165,6 +174,8 @@ async fn bff_start_chat(
     let history = rows
         .into_iter()
         .map(|r| BffHistoryEntry {
+            id: r.id,
+            client_msg_id: r.client_msg_id,
             role: r.role,
             content: r.content,
             sent_at: r.sent_at,
@@ -260,6 +271,62 @@ mod tests {
         // `total` reflects page count, not grand total.
         assert_eq!(body["total"], 3);
         assert_eq!(body["session_id"], json!(session_id.to_string()));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_entries_carry_row_id_and_client_msg_id(pool: PgPool) {
+        // The slim history must expose the engine's chat_messages primary key
+        // (`id`, a UUID) plus the stream-time `client_msg_id` (nullable), so the
+        // FE can reconcile persisted rows against both the DB key and its own
+        // optimistic message ids.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let id_with = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, sent_at) \
+             VALUES ($1, 'user', 'alpha', 'c_alpha', now() - interval '1 second') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let id_without = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'assistant', 'beta', now()) RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        // Oldest-first: the user row carrying a client_msg_id.
+        assert_eq!(
+            messages[0]["id"].as_str(),
+            Some(id_with.to_string().as_str()),
+            "id must be the raw chat_messages UUID; got {body}"
+        );
+        assert_eq!(messages[0]["client_msg_id"].as_str(), Some("c_alpha"));
+        // Assistant row had no client_msg_id → serialized as null.
+        assert_eq!(
+            messages[1]["id"].as_str(),
+            Some(id_without.to_string().as_str())
+        );
+        assert!(
+            messages[1]["client_msg_id"].is_null(),
+            "absent client_msg_id must be null; got {body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
