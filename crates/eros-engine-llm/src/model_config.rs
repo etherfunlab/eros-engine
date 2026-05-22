@@ -769,4 +769,26 @@ reasoning = { exclude = true }
             ]
         );
     }
+
+    #[test]
+    fn committed_example_chat_companion_disables_reasoning() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let disabled = ReasoningConfig {
+            enabled: Some(false),
+            exclude: None,
+        };
+        // Disabled for the default block...
+        assert_eq!(
+            cfg.resolve("chat_companion", None).reasoning,
+            Some(disabled.clone())
+        );
+        // ...and inherited by the free tier (no per-tier override).
+        assert_eq!(
+            cfg.resolve("chat_companion", Some("free")).reasoning,
+            Some(disabled)
+        );
+        // Untouched tasks stay at model default.
+        assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
+    }
 }
