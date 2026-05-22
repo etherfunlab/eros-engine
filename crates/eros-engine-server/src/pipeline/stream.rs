@@ -77,10 +77,11 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
-/// Maximum number of model attempts per streaming burst. Spec §5 chose 2
-/// (= 1 primary + 1 fallback) because streaming exposes each fallback as
-/// a separate visible bubble; depth > 2 starts feeling like a bug to users.
-pub const MAX_STREAM_FALLBACK_DEPTH: usize = 2;
+/// Maximum number of model attempts per streaming burst (= 1 primary + up to
+/// 2 fallbacks). Each attempt surfaces as a separate visible bubble; the
+/// frontend masks attempts beyond the first behind a "thinking" affordance, so
+/// a depth of 3 buys extra resilience without looking like a bug to users.
+pub const MAX_STREAM_FALLBACK_DEPTH: usize = 3;
 
 use std::sync::Arc;
 use uuid::Uuid;
