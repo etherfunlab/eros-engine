@@ -77,6 +77,12 @@ pub struct TaskConfig {
     /// semantics as `TierConfig::allow_traits`.
     #[serde(default)]
     pub allow_traits: Option<Vec<String>>,
+    /// Task-level reasoning toggle. Tri-state: absent → omit the OpenRouter
+    /// `reasoning` param (model default); `false` → send `{enabled:false}`
+    /// (disable); `true` → `{enabled:true}`. Task-level only — tiers inherit,
+    /// like `temperature`/`max_tokens`.
+    #[serde(default)]
+    pub reasoning: Option<bool>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -105,6 +111,9 @@ pub struct ResolvedModel {
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
     pub allow_traits: Option<Vec<String>>,
+    /// Resolved reasoning toggle (see `TaskConfig::reasoning`). `None` → omit
+    /// the wire param; `Some(b)` → send `reasoning:{enabled:b}`.
+    pub reasoning: Option<bool>,
 }
 
 impl ModelConfig {
@@ -181,12 +190,16 @@ impl ModelConfig {
             .or(self.defaults.fallback_max_tokens)
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
+        // Task-level only (tiers inherit), mirroring temperature/max_tokens.
+        let reasoning = task_cfg.and_then(|t| t.reasoning);
+
         ResolvedModel {
             model,
             fallback_model,
             temperature,
             max_tokens,
             allow_traits,
+            reasoning,
         }
     }
 }
@@ -665,6 +678,47 @@ fallback = ""
             "explicit empty string must suppress defaults; got {:?}",
             r.fallback_model
         );
+    }
+
+    #[test]
+    fn resolve_reads_task_level_reasoning_and_tiers_inherit() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+reasoning = false
+
+[tasks.chat_companion.tiers.free]
+model = "free-m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Task-level value applies with no tier...
+        assert_eq!(cfg.resolve("chat_companion", None).reasoning, Some(false));
+        // ...and a tier that doesn't override it inherits the task value.
+        assert_eq!(
+            cfg.resolve("chat_companion", Some("free")).reasoning,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_absent_is_none() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("chat_companion", None).reasoning, None);
+    }
+
+    #[test]
+    fn resolve_reasoning_true_is_some_true() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+reasoning = true
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("chat_companion", None).reasoning, Some(true));
     }
 
     // Regression: the committed deployed config (examples/model_config.toml,
