@@ -8,16 +8,16 @@
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
 # block's fallback for this task.
 model = "x-ai/grok-4.20"
-fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "minimax/minimax-m2-her"]
+fallback = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3", "z-ai/glm-4.7-flash"]
 temperature = 0.8
-max_tokens = 1200
+max_tokens = 1500
 # Default-block trait allow-list: used when no tier is sent or the tier is
 # unknown. Tier sub-tables below override model/fallback/allow_traits per tier.
 allow_traits = ["nsfw_boost","politics_open"]
 
 [tasks.chat_companion.tiers.free]
 model        = "minimax/minimax-m2-her"
-fallback     = ["qwen/qwen3.6-flash","z-ai/glm-4.5-air"]
+fallback     = ["z-ai/glm-4.5-air", "z-ai/glm-4.7-flash"]
 allow_traits = ["politics_open"]
 
 [tasks.chat_companion.tiers.beta]
@@ -27,7 +27,7 @@ allow_traits = ["nsfw_boost", "politics_open"]
 
 [tasks.insight_extraction]
 model = "google/gemini-3.1-flash-lite"
-fallback = ["deepseek/deepseek-v4-flash","qwen/qwen3.6-flash"]
+fallback = ["deepseek/deepseek-v4-flash","anthropic/claude-haiku-4.5"]
 temperature = 0.2
 max_tokens = 400
 
@@ -35,10 +35,10 @@ max_tokens = 400
 # chat_messages, emits 0-N {content, category} candidates, and the
 # sweeper writes them to companion_memories as profile-layer rows.
 # gemini-3.1-flash-lite is cheap with reliable structured-JSON output;
-# deepseek-v4-flash + qwen3.6-flash fallback keep extraction alive if Google is down.
+# deepseek-v4-flash + claude-haiku-4.5 fallback keep extraction alive if Google is down.
 [tasks.memory_extraction]
 model = "google/gemini-3.1-flash-lite"
-fallback = ["deepseek/deepseek-v4-flash","qwen/qwen3.6-flash"]
+fallback = ["deepseek/deepseek-v4-flash","anthropic/claude-haiku-4.5"]
 temperature = 0.2
 max_tokens = 800
 
@@ -49,8 +49,8 @@ max_tokens = 800
 # structured-extraction tasks above use gemini-flash-lite instead.
 [tasks.pde_decision]
 model = "anthropic/claude-haiku-4.5"
-temperature = 0.35
-max_tokens = 200
+temperature = 0.3
+max_tokens = 300
 
 # Per-turn six-axis affinity evaluation (post-process, semantic axes).
 # Scores how a single chat turn should move warmth/trust/intimacy plus the
@@ -62,7 +62,7 @@ max_tokens = 200
 model = "anthropic/claude-haiku-4.5"
 fallback = ["google/gemini-3.1-flash-lite", "deepseek/deepseek-v4-flash"]
 temperature = 0.3
-max_tokens = 250
+max_tokens = 400
 
 # Reserved — not consumed by current code. `VoyageClient` reads
 # `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
