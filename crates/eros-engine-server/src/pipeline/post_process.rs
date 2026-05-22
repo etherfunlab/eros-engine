@@ -485,6 +485,7 @@ async fn evaluate_affinity(
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
         ..Default::default()
     };
 
@@ -598,6 +599,7 @@ async fn extract_facts(
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
         ..Default::default()
     };
 
@@ -663,6 +665,7 @@ async fn extract_structured_insights(
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
         ..Default::default()
     };
 

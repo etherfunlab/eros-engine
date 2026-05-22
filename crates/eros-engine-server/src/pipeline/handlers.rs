@@ -133,6 +133,7 @@ fn assemble_chat_request(
         user: audit_user,
         session_id: audit_session,
         metadata: audit_metadata,
+        reasoning: resolved.reasoning,
     }
 }
 
