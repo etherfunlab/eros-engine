@@ -45,7 +45,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres
+        # Pin to 0.8.x: it matches the workspace's `sqlx = "0.8"` and builds on
+        # the repo's pinned rustc (rust-toolchain.toml = 1.88). Unpinned would
+        # grab sqlx-cli 0.9+, which requires rustc 1.94 and fails to install.
+        run: cargo install sqlx-cli --no-default-features --features postgres --version ^0.8
       - name: Run migrations
         run: sqlx migrate run --source crates/eros-engine-store/migrations
       - run: cargo test --workspace --all-features
