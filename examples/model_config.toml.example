@@ -6,10 +6,10 @@
 # If the selected primary also appears in `fallback`, it is auto-skipped.
 
 [tasks.chat_companion]
-# Grok primary: most permissive among the cheap-and-fast tier; xAI's policy
-# explicitly avoids over-refusal on intimate adult dialogue. The first
-# fallback (Cydonia) is roleplay-tuned so a primary outage doesn't suddenly
-# make the companion prudish; glm-4.7-flash is a fast, reliable last resort.
+# Example chat primary. deepseek-v4-flash is a cheap, fast, permissive
+# default — swap in whatever suits your product. The first fallback (Cydonia)
+# is roleplay-tuned so a primary outage doesn't make the companion prudish;
+# glm-4.7-flash is a fast, reliable last resort.
 # `fallback` accepts either a single string (legacy) or an array of model
 # ids in preference order. The chain is tried sequentially; first success
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
@@ -17,7 +17,7 @@
 # Recommendation: keep `fallback` to at most 2 entries. The streaming chat
 # burst caps attempts at MAX_STREAM_FALLBACK_DEPTH (3 = primary + 2 fallbacks);
 # anything past the third entry is never tried on the chat path.
-model = "x-ai/grok-4.20"
+model = "deepseek/deepseek-v4-flash"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8
 max_tokens = 1600
@@ -26,21 +26,25 @@ max_tokens = 1600
 # object — set `{ exclude = true }` instead if you want it generated but hidden.
 # Inherited by every tier below.
 reasoning = { enabled = false }
-# Default-block trait allow-list: used when no tier is sent or the tier is
-# unknown. Tier sub-tables below override model/fallback/allow_traits per tier.
-allow_traits = ["nsfw_boost","politics_open"]
+# Optional prompt-trait allow-list (three-state). Commented out here means no
+# gating. See docs/prompt-traits.md.
+#allow_traits = ["nsfw_boost","politics_open"]
 
-[tasks.chat_companion.tiers.free]
-# Fast GLM models. minimax-m2-her was the primary here but its latency was
-# unacceptable, so the free tier now leads with glm-4.5-air.
-model        = "z-ai/glm-4.5-air"
-fallback     = ["thedrummer/cydonia-24b-v4.1","z-ai/glm-4.7-flash"]
-allow_traits = ["politics_open"]
+# Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
+# your product sends per request. The OSS template enables none — with no tier
+# (or an unknown one) the task default block above is used. Uncomment and adapt
+# these as a starting point, or define your own. A tier may override
+# model / fallback / allow_traits; `model` here also accepts the array
+# (round-robin) and table (weighted) forms shown at the top of this file.
+#[tasks.chat_companion.tiers.free]
+#model        = "z-ai/glm-4.5-air"
+#fallback     = ["thedrummer/cydonia-24b-v4.1","z-ai/glm-4.7-flash"]
+#allow_traits = ["politics_open"]
 
-[tasks.chat_companion.tiers.beta]
-model        = "x-ai/grok-4.20"
-fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
-allow_traits = ["nsfw_boost", "politics_open"]
+#[tasks.chat_companion.tiers.plus]
+#model        = "x-ai/grok-4.20"
+#fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
+#allow_traits = ["nsfw_boost", "politics_open"]
 
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
