@@ -136,14 +136,14 @@ impl ModelConfig {
     }
 
     /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml` to match the
+    /// or fall back to `examples/model_config.toml.example` to match the
     /// `eros-engine-server` boot default. The server binary itself reads
     /// the file inline via `from_toml_str` rather than calling this; this
     /// method is provided for embedders who want the same behaviour in
     /// one call.
     pub fn load() -> Result<Arc<Self>, LlmError> {
         let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
+            .unwrap_or_else(|_| "examples/model_config.toml.example".to_string());
         let text = std::fs::read_to_string(&path)?;
         let cfg = Self::from_toml_str(&text)?;
         Ok(Arc::new(cfg))
