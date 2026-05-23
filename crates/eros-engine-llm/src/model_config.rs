@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! TOML-driven model orchestration config.
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error::LlmError;
@@ -27,6 +29,93 @@ impl FallbackSpec {
             FallbackSpec::Single(s) if s.is_empty() => Vec::new(),
             FallbackSpec::Single(s) => vec![s],
             FallbackSpec::Multiple(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
+        }
+    }
+}
+
+/// A task/tier's primary `model`. Accepts three TOML shapes:
+/// `"id"` (fixed), `["a","b"]` (round-robin), or `{ "a" = 0.8, "b" = 0.2 }`
+/// (weighted random, any positive weights, normalized by sum).
+#[derive(Debug, Clone)]
+pub enum ModelSpec {
+    Fixed(String),
+    RoundRobin {
+        models: Vec<String>,
+        cursor: Arc<AtomicUsize>,
+    },
+    Weighted(Vec<(String, f64)>),
+}
+
+impl<'de> Deserialize<'de> for ModelSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Untagged intermediate: TOML string vs array vs inline table are
+        // unambiguous to serde (same pattern as `FallbackSpec`).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Fixed(String),
+            RoundRobin(Vec<String>),
+            Weighted(HashMap<String, f64>),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Fixed(s) => ModelSpec::Fixed(s),
+            Raw::RoundRobin(models) => ModelSpec::RoundRobin {
+                models: models.into_iter().filter(|s| !s.is_empty()).collect(),
+                cursor: Arc::new(AtomicUsize::new(0)),
+            },
+            // Drop non-positive weights at parse time; normalization is by sum
+            // at selection, so raw weights need no further processing here.
+            Raw::Weighted(map) => {
+                ModelSpec::Weighted(map.into_iter().filter(|(_, w)| *w > 0.0).collect())
+            }
+        })
+    }
+}
+
+impl ModelSpec {
+    /// Pick one concrete model id. `None` means the spec is empty (empty array,
+    /// empty/all-non-positive table, or empty fixed string) — the caller should
+    /// fall through to the next precedence level.
+    fn select(&self) -> Option<String> {
+        match self {
+            ModelSpec::Fixed(s) if !s.is_empty() => Some(s.clone()),
+            ModelSpec::RoundRobin { models, cursor } if !models.is_empty() => {
+                let i = cursor.fetch_add(1, Ordering::Relaxed) % models.len();
+                Some(models[i].clone())
+            }
+            ModelSpec::Weighted(entries) if !entries.is_empty() => {
+                let sum: f64 = entries.iter().map(|(_, w)| w).sum();
+                let position = rand::thread_rng().gen_range(0.0..sum);
+                Some(pick_weighted(entries, position).to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Pure cumulative-weight walk: given `position` in `[0, sum)`, return the id
+/// whose cumulative band contains it. Split out so the random draw stays in
+/// `select()` and the band logic is unit-testable. Caller guarantees non-empty.
+fn pick_weighted(entries: &[(String, f64)], position: f64) -> &str {
+    let mut acc = 0.0;
+    for (model, w) in entries {
+        acc += w;
+        if position < acc {
+            return model;
+        }
+    }
+    &entries.last().expect("pick_weighted called on empty entries").0
+}
+
+#[cfg(test)]
+impl ModelSpec {
+    fn as_fixed(&self) -> Option<&str> {
+        match self {
+            ModelSpec::Fixed(s) => Some(s.as_str()),
+            _ => None,
         }
     }
 }
@@ -222,6 +311,19 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_weighted_boundaries_and_normalization() {
+        let raw = vec![("a".to_string(), 8.0), ("b".to_string(), 2.0)];
+        assert_eq!(pick_weighted(&raw, 0.0), "a");
+        assert_eq!(pick_weighted(&raw, 7.999), "a");
+        assert_eq!(pick_weighted(&raw, 8.0), "b");
+        assert_eq!(pick_weighted(&raw, 9.999), "b");
+
+        let norm = vec![("a".to_string(), 0.8), ("b".to_string(), 0.2)];
+        assert_eq!(pick_weighted(&norm, 0.79), "a");
+        assert_eq!(pick_weighted(&norm, 0.80), "b");
+    }
 
     const SAMPLE: &str = r#"
 [defaults]
