@@ -139,7 +139,7 @@ pub struct ReasoningConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TierConfig {
     #[serde(default)]
-    pub model: Option<String>,
+    pub model: Option<ModelSpec>,
     #[serde(default)]
     pub fallback: Option<FallbackSpec>,
     /// Allow-listed prompt-trait tags. Three-state, mirroring `fallback`'s
@@ -161,7 +161,7 @@ pub struct DefaultConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
-    pub model: String,
+    pub model: ModelSpec,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -264,9 +264,19 @@ impl ModelConfig {
             _ => None,
         };
 
-        let model = tier_cfg
-            .and_then(|t| t.model.clone())
-            .or_else(|| task_cfg.map(|t| t.model.clone()))
+        // Primary model: pick the winning spec by precedence
+        // (tier > task default > defaults.fallback_model > compiled-in), then
+        // select() a concrete id from it. An empty spec (e.g. `model = []`)
+        // yields None and falls through, warning as it goes.
+        let select_with_warn = |spec: Option<&ModelSpec>, level: &str| -> Option<String> {
+            let picked = spec.and_then(ModelSpec::select);
+            if spec.is_some() && picked.is_none() {
+                tracing::warn!(task, level, "model_config: empty model spec, falling through");
+            }
+            picked
+        };
+        let model = select_with_warn(tier_cfg.and_then(|t| t.model.as_ref()), "tier")
+            .or_else(|| select_with_warn(task_cfg.map(|t| &t.model), "task"))
             .or_else(|| self.defaults.fallback_model.clone())
             .unwrap_or_else(|| FALLBACK_MODEL.to_string());
 
@@ -325,6 +335,22 @@ mod tests {
         assert_eq!(pick_weighted(&norm, 0.80), "b");
     }
 
+    #[test]
+    fn model_spec_parses_three_forms() {
+        let toml = r#"
+[tasks.fixed]
+model = "a"
+[tasks.rr]
+model = ["a", "b"]
+[tasks.weighted]
+model = { "a" = 0.8, "b" = 0.2 }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(matches!(cfg.tasks["fixed"].model, ModelSpec::Fixed(_)));
+        assert!(matches!(cfg.tasks["rr"].model, ModelSpec::RoundRobin { .. }));
+        assert!(matches!(cfg.tasks["weighted"].model, ModelSpec::Weighted(_)));
+    }
+
     const SAMPLE: &str = r#"
 [defaults]
 fallback_model = "x-ai/grok-4-mini"
@@ -370,7 +396,7 @@ max_tokens = 600
             .tasks
             .get("chat_companion")
             .expect("chat_companion task present");
-        assert_eq!(task.model, "deepseek/chat");
+        assert_eq!(task.model.as_fixed(), Some("deepseek/chat"));
     }
 
     #[test]
@@ -590,7 +616,7 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // chat_companion — every field round-trips.
         let chat = cfg.tasks.get("chat_companion").unwrap();
-        assert_eq!(chat.model, "x-ai/grok-4-fast");
+        assert_eq!(chat.model.as_fixed(), Some("x-ai/grok-4-fast"));
         assert_eq!(
             chat.fallback.clone().expect("fallback present").into_vec(),
             vec!["deepseek/deepseek-chat-v3.2".to_string()]
@@ -601,7 +627,7 @@ description  = "reserved — Voyage hard-codes its own model"
         // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
         assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));
         let gold = chat.tiers.get("gold").expect("gold tier present");
-        assert_eq!(gold.model.as_deref(), Some("x-ai/grok-4.20"));
+        assert_eq!(gold.model.as_ref().and_then(ModelSpec::as_fixed), Some("x-ai/grok-4.20"));
         assert_eq!(
             gold.fallback
                 .clone()
@@ -616,7 +642,7 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // insight_extraction — same shape.
         let insight = cfg.tasks.get("insight_extraction").unwrap();
-        assert_eq!(insight.model, "x-ai/grok-4-mini");
+        assert_eq!(insight.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert_eq!(
             insight
                 .fallback
@@ -630,13 +656,13 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // pde_decision — reserved, partial fields.
         let pde = cfg.tasks.get("pde_decision").unwrap();
-        assert_eq!(pde.model, "x-ai/grok-4-mini");
+        assert_eq!(pde.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
-        assert_eq!(emb.model, "voyage-3-lite");
+        assert_eq!(emb.model.as_fixed(), Some("voyage-3-lite"));
         assert_eq!(emb.dimensions, Some(512));
 
         // Resolution behaviour on the live tasks.
