@@ -539,78 +539,56 @@ pub(crate) async fn resolve_or_create_session(
     let persona_repo = PersonaRepo { pool: &state.pool };
     let chat_repo = ChatRepo { pool: &state.pool };
 
-    let instance_id = match req.instance_id {
+    let (instance_id, persona_name) = match req.instance_id {
         Some(iid) => {
-            let companion = persona_repo
-                .load_companion(iid)
+            // Explicit instance: one JOIN read gives owner + genome name +
+            // asset_id (replaces the former double load_companion + asset read).
+            let gate = persona_repo
+                .load_instance_gate(iid)
                 .await?
                 .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-            if companion.instance.owner_uid != user_id {
+            if gate.owner_uid != user_id {
                 return Err(AppError::Forbidden(
                     "instance not owned by this user".into(),
                 ));
             }
-            let asset_id_opt = persona_repo
-                .get_asset_id_for_genome(companion.instance.genome_id)
-                .await?;
-            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
-            iid
+            enforce_nft_ownership(&state.pool, user_id, gate.asset_id.as_deref()).await?;
+            (iid, gate.genome_name)
         }
         None => {
             let genome_id = req
                 .genome_id
                 .ok_or_else(|| AppError::BadRequest("missing genome_id (or instance_id)".into()))?;
 
-            let genome = persona_repo
-                .get_genome(genome_id)
-                .await?
-                .ok_or_else(|| AppError::NotFound("genome not found".into()))?;
-            if !genome.is_active {
+            // Two independent reads in one latency wave: `genome_id` comes from
+            // the request, so the instance lookup does not depend on the gate read.
+            let (gate, existing_instance) = tokio::try_join!(
+                persona_repo.get_genome_gate(genome_id),
+                persona_repo.find_active_instance(genome_id, user_id),
+            )?;
+
+            let gate = gate.ok_or_else(|| AppError::NotFound("genome not found".into()))?;
+            if !gate.is_active {
                 return Err(AppError::BadRequest("genome is not active".into()));
             }
 
-            let asset_id_opt = persona_repo.get_asset_id_for_genome(genome_id).await?;
-            enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
+            // NFT gate runs BEFORE any instance write (load-bearing: a non-owner
+            // who hits the create/reactivate fallback must not leave or revive a row).
+            enforce_nft_ownership(&state.pool, user_id, gate.asset_id.as_deref()).await?;
 
-            let existing: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM engine.persona_instances \
-                 WHERE genome_id = $1 AND owner_uid = $2 AND status = 'active'",
-            )
-            .bind(genome_id)
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-
-            match existing {
-                Some((iid,)) => iid,
-                None => persona_repo.create_instance(genome_id, user_id).await?,
-            }
+            let iid = match existing_instance {
+                Some(iid) => iid,
+                // Upsert: create new, or reactivate an archived row (#37).
+                None => persona_repo.ensure_active_instance(genome_id, user_id).await?,
+            };
+            (iid, gate.name)
         }
     };
 
-    let companion = persona_repo
-        .load_companion(instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("persona not loadable".into()))?;
-
-    let existing: Option<ChatSession> = sqlx::query_as::<_, ChatSession>(
-        "SELECT * FROM engine.chat_sessions \
-         WHERE user_id = $1 AND instance_id = $2 \
-         ORDER BY last_active_at DESC LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(instance_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let (session_id, is_new) = match existing {
-        Some(s) => {
-            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
-                .bind(s.id)
-                .execute(&state.pool)
-                .await?;
-            (s.id, false)
-        }
+    // Resume the latest session (bumping last_active_at in one statement), or
+    // create a fresh one. Only `id` is consumed downstream.
+    let (session_id, is_new) = match chat_repo.resume_latest_session(user_id, instance_id).await? {
+        Some(s) => (s.id, false),
         None => {
             let metadata = if req.is_demo.unwrap_or(false) {
                 serde_json::json!({ "is_demo": true })
@@ -627,7 +605,7 @@ pub(crate) async fn resolve_or_create_session(
     Ok(ResolvedSession {
         session_id,
         instance_id,
-        persona_name: companion.genome.name,
+        persona_name,
         is_new,
     })
 }
@@ -1900,5 +1878,63 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(leftover, 0, "NFT gate must reject before create_instance");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_reactivates_archived_instance_genome_path(pool: PgPool) {
+        // #37: a user with an ARCHIVED instance for the genome must be able
+        // to start a chat again. The create-fallback reactivates instead of
+        // 500-ing on UNIQUE(genome_id, owner_uid).
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vita").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(instance_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = test_state(pool.clone());
+
+        let req = StartChatRequest {
+            instance_id: None,
+            genome_id: Some(genome_id),
+            is_demo: None,
+        };
+        let resolved = resolve_or_create_session(&state, user_id, &req)
+            .await
+            .expect("must reactivate, not 500");
+
+        // UNIQUE(genome_id, owner_uid) ⇒ the same row is reactivated.
+        assert_eq!(resolved.instance_id, instance_id);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.persona_instances WHERE id = $1")
+                .bind(instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "active");
+        assert!(resolved.is_new, "no prior session existed");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_instance_path_403_for_non_owner(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        let state = test_state(pool.clone());
+
+        let req = StartChatRequest {
+            instance_id: Some(instance_id),
+            genome_id: None,
+            is_demo: None,
+        };
+        let err = resolve_or_create_session(&state, intruder, &req)
+            .await
+            .expect_err("non-owner must be forbidden");
+        match err {
+            AppError::Forbidden(msg) => assert!(msg.contains("not owned"), "msg={msg}"),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
     }
 }
