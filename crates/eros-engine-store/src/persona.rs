@@ -28,6 +28,19 @@ pub struct GenomeGate {
     pub asset_id: Option<String>,
 }
 
+/// Gate-fields view for the explicit-`instance_id` chat-start path: owner
+/// (403 check), genome name (response), asset_id (NFT gate), in one JOIN.
+/// Filters `status='active'` like `load_companion`, so an archived instance
+/// yields `None`. Folds the former `load_companion` + `get_asset_id_for_genome`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InstanceGate {
+    pub instance_id: Uuid,
+    pub genome_id: Uuid,
+    pub owner_uid: Uuid,
+    pub genome_name: String,
+    pub asset_id: Option<String>,
+}
+
 impl From<GenomeRow> for PersonaGenome {
     fn from(r: GenomeRow) -> Self {
         Self {
@@ -169,6 +182,27 @@ impl<'a> PersonaRepo<'a> {
                 status: r.status,
             },
         }))
+    }
+
+    /// One-JOIN gate read for the explicit-`instance_id` path. See [`InstanceGate`].
+    pub async fn load_instance_gate(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<InstanceGate>, sqlx::Error> {
+        sqlx::query_as::<_, InstanceGate>(
+            "SELECT \
+                pi.id        AS instance_id, \
+                pi.genome_id AS genome_id, \
+                pi.owner_uid AS owner_uid, \
+                pg.name      AS genome_name, \
+                pg.asset_id  AS asset_id \
+             FROM engine.persona_instances pi \
+             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             WHERE pi.id = $1 AND pi.status = 'active'",
+        )
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await
     }
 
     /// Upsert a persona genome by `name`. New row → INSERT, returns
@@ -448,6 +482,40 @@ mod tests {
 
         let companion = repo.load_companion(instance_id).await.unwrap();
         assert!(companion.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_instance_gate_returns_fields_and_filters_active(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let genome_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes \
+                (name, system_prompt, art_metadata, is_active, asset_id) \
+             VALUES ('Nova', 'p', '{}'::jsonb, true, 'asset-1') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let iid = repo.create_instance(genome_id, owner).await.unwrap();
+
+        let gate = repo
+            .load_instance_gate(iid)
+            .await
+            .unwrap()
+            .expect("active instance gate");
+        assert_eq!(gate.instance_id, iid);
+        assert_eq!(gate.genome_id, genome_id);
+        assert_eq!(gate.owner_uid, owner);
+        assert_eq!(gate.genome_name, "Nova");
+        assert_eq!(gate.asset_id.as_deref(), Some("asset-1"));
+
+        // archived → None (mirrors load_companion's active filter)
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(iid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.load_instance_gate(iid).await.unwrap().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
