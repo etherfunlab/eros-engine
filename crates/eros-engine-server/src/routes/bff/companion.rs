@@ -165,22 +165,25 @@ async fn bff_start_chat(
 ) -> Result<Json<BffStartResponse>, AppError> {
     let canonical_req = StartChatRequest::from(&req);
     let resolved = resolve_or_create_session(&state, user_id, &canonical_req).await?;
-    let history_limit = req.history_limit.unwrap_or(50).clamp(1, 50);
 
-    let rows = ChatRepo { pool: &state.pool }
-        .history_slim(resolved.session_id, history_limit, 0)
-        .await?;
-
-    let history = rows
-        .into_iter()
-        .map(|r| BffHistoryEntry {
-            id: r.id,
-            client_msg_id: r.client_msg_id,
-            role: r.role,
-            content: r.content,
-            sent_at: r.sent_at,
-        })
-        .collect();
+    // Brand-new sessions have no messages — skip the history round-trip.
+    let history = if resolved.is_new {
+        Vec::new()
+    } else {
+        let history_limit = req.history_limit.unwrap_or(50).clamp(1, 50);
+        let rows = ChatRepo { pool: &state.pool }
+            .history_slim(resolved.session_id, history_limit, 0)
+            .await?;
+        rows.into_iter()
+            .map(|r| BffHistoryEntry {
+                id: r.id,
+                client_msg_id: r.client_msg_id,
+                role: r.role,
+                content: r.content,
+                sent_at: r.sent_at,
+            })
+            .collect()
+    };
 
     Ok(Json(BffStartResponse {
         session_id: resolved.session_id,
