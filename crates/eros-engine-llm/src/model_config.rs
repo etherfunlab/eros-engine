@@ -284,13 +284,15 @@ impl ModelConfig {
             .unwrap_or_else(|| FALLBACK_MODEL.to_string());
 
         // fallback: tier (even empty) > task (even empty) > defaults singleton.
-        let fallback_model: Vec<String> = match tier_cfg.and_then(|t| t.fallback.as_ref()) {
+        let mut fallback_model: Vec<String> = match tier_cfg.and_then(|t| t.fallback.as_ref()) {
             Some(spec) => spec.clone().into_vec(),
             None => match task_cfg.and_then(|t| t.fallback.as_ref()) {
                 Some(spec) => spec.clone().into_vec(),
                 None => self.defaults.fallback_model.iter().cloned().collect(),
             },
         };
+        // A just-failed primary in its own fallback chain is a wasted retry.
+        fallback_model.retain(|m| m != &model);
 
         // allow_traits: tier (even empty) > task > None.
         let allow_traits = tier_cfg
@@ -425,10 +427,13 @@ max_tokens = 600
         let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
         let r = cfg.resolve("nonexistent_task", None);
         assert_eq!(r.model, "x-ai/grok-4-mini");
-        assert_eq!(
-            r.fallback_model,
-            vec!["x-ai/grok-4-mini".to_string()],
-            "unknown task must inherit defaults.fallback_model as a singleton"
+        // defaults.fallback_model is the same id as the selected primary, so
+        // after primary-dedup it is removed from the chain (retrying the same
+        // model that just failed is wasteful).
+        assert!(
+            r.fallback_model.is_empty(),
+            "primary dedup must remove the defaults fallback when it equals the primary; got {:?}",
+            r.fallback_model
         );
         assert_eq!(r.temperature, 0.5);
         assert_eq!(r.max_tokens, 200);
@@ -921,6 +926,37 @@ reasoning = { exclude = true }
         );
         // Untouched tasks stay at model default.
         assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
+    }
+
+    #[test]
+    fn fallback_drops_selected_primary() {
+        let toml = r#"
+[tasks.t]
+model = "a"
+fallback = ["a", "c"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("t", None);
+        assert_eq!(r.model, "a");
+        assert_eq!(r.fallback_model, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn fallback_dedup_is_dynamic_under_round_robin() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+fallback = ["a", "c"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // turn 1 selects "a" -> "a" dropped from fallback
+        let r1 = cfg.resolve("t", None);
+        assert_eq!(r1.model, "a");
+        assert_eq!(r1.fallback_model, vec!["c".to_string()]);
+        // turn 2 selects "b" -> "a" stays
+        let r2 = cfg.resolve("t", None);
+        assert_eq!(r2.model, "b");
+        assert_eq!(r2.fallback_model, vec!["a".to_string(), "c".to_string()]);
     }
 
     #[test]
