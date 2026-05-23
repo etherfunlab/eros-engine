@@ -431,7 +431,11 @@ mod tests {
         assert_eq!(g2.asset_id.as_deref(), Some("asset-xyz"));
 
         // missing → None
-        assert!(repo.get_genome_gate(Uuid::new_v4()).await.unwrap().is_none());
+        assert!(repo
+            .get_genome_gate(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -539,7 +543,10 @@ mod tests {
 
         // second call reactivates the same row (no unique violation)
         let again = repo.ensure_active_instance(genome_id, owner).await.unwrap();
-        assert_eq!(again, iid, "must reactivate existing row, not create a new one");
+        assert_eq!(
+            again, iid,
+            "must reactivate existing row, not create a new one"
+        );
 
         let status: String =
             sqlx::query_scalar("SELECT status FROM engine.persona_instances WHERE id = $1")

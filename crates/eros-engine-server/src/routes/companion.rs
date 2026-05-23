@@ -579,7 +579,11 @@ pub(crate) async fn resolve_or_create_session(
             let iid = match existing_instance {
                 Some(iid) => iid,
                 // Upsert: create new, or reactivate an archived row (#37).
-                None => persona_repo.ensure_active_instance(genome_id, user_id).await?,
+                None => {
+                    persona_repo
+                        .ensure_active_instance(genome_id, user_id)
+                        .await?
+                }
             };
             (iid, gate.name)
         }
@@ -587,7 +591,10 @@ pub(crate) async fn resolve_or_create_session(
 
     // Resume the latest session (bumping last_active_at in one statement), or
     // create a fresh one. Only `id` is consumed downstream.
-    let (session_id, is_new) = match chat_repo.resume_latest_session(user_id, instance_id).await? {
+    let (session_id, is_new) = match chat_repo
+        .resume_latest_session(user_id, instance_id)
+        .await?
+    {
         Some(s) => (s.id, false),
         None => {
             let metadata = if req.is_demo.unwrap_or(false) {
