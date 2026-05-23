@@ -1914,6 +1914,7 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "active");
         assert!(resolved.is_new, "no prior session existed");
+        assert_eq!(resolved.persona_name, "Vita");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1936,5 +1937,30 @@ mod tests {
             AppError::Forbidden(msg) => assert!(msg.contains("not owned"), "msg={msg}"),
             other => panic!("expected Forbidden, got {other:?}"),
         }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_instance_path_404_for_archived_instance(pool: PgPool) {
+        // load_instance_gate filters status='active', so an explicit
+        // instance_id pointing at an archived instance resolves to 404.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Mira").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(instance_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = test_state(pool.clone());
+
+        let req = StartChatRequest {
+            instance_id: Some(instance_id),
+            genome_id: None,
+            is_demo: None,
+        };
+        let err = resolve_or_create_session(&state, user_id, &req)
+            .await
+            .expect_err("archived instance must 404");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }
