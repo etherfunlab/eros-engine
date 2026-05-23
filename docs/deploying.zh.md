@@ -7,7 +7,7 @@
 1. **Docker compose 自托管**——單機 VPS，自帶 Postgres+pgvector。
 2. **作為庫嵌入**——`core + llm + store` 進你自己的服務，不要 HTTP 層。
 
-## 三種方式都需要的前置
+## 兩種方式都需要的前置
 
 - Postgres 16+，裝了 `pgvector` extension（≥ 0.7）。
 - 一個 OpenRouter 賬號（`OPENROUTER_API_KEY`）。

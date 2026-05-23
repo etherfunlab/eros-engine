@@ -67,9 +67,13 @@ impl<'de> Deserialize<'de> for ModelSpec {
                 cursor: Arc::new(AtomicUsize::new(0)),
             },
             // Drop non-positive weights at parse time; normalization is by sum
-            // at selection, so raw weights need no further processing here.
+            // at selection. Sort by id so the cumulative-band order is
+            // deterministic across restarts (HashMap iteration order is not).
             Raw::Weighted(map) => {
-                ModelSpec::Weighted(map.into_iter().filter(|(_, w)| *w > 0.0).collect())
+                let mut entries: Vec<(String, f64)> =
+                    map.into_iter().filter(|(_, w)| *w > 0.0).collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                ModelSpec::Weighted(entries)
             }
         })
     }
