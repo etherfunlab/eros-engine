@@ -755,8 +755,8 @@ reasoning = { exclude = true }
     // depends on — otherwise resolve() silently falls back to the wrong model.
     #[test]
     fn committed_example_config_parses_and_has_affinity_task() {
-        let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let text = include_str!("../../../examples/model_config.toml.example");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml.example must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
         assert_eq!(r.max_tokens, 400);
@@ -764,16 +764,16 @@ reasoning = { exclude = true }
         assert_eq!(
             r.fallback_model,
             vec![
-                "google/gemini-3.1-flash-lite".to_string(),
                 "deepseek/deepseek-v4-flash".to_string(),
+                "google/gemini-3.1-flash-lite".to_string(),
             ]
         );
     }
 
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
-        let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let text = include_str!("../../../examples/model_config.toml.example");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml.example must parse");
         let disabled = ReasoningConfig {
             enabled: Some(false),
             exclude: None,
