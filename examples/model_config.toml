@@ -13,7 +13,7 @@
 model = "x-ai/grok-4.20"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8
-max_tokens = 1500
+max_tokens = 1600
 # Companion replies only render `content`; the reasoning channel is ignored,
 # so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
 # object — set `{ exclude = true }` instead if you want it generated but hidden.
@@ -58,19 +58,21 @@ max_tokens = 800
 # decision/classification layer (fast, strong instruction-following); the
 # structured-extraction tasks above use gemini-flash-lite instead.
 [tasks.pde_decision]
-model = "anthropic/claude-haiku-4.5"
+model = "google/gemini-3.1-flash-lite"
+#fallback = ["deepseek/deepseek-v4-flash", "anthropic/claude-haiku-4.5"]
 temperature = 0.3
-max_tokens = 300
+max_tokens = 400
 
 # Per-turn six-axis affinity evaluation (post-process, semantic axes).
 # Scores how a single chat turn should move warmth/trust/intimacy plus the
 # content nudges to intrigue/tension, as small per-turn deltas. Runs only on
-# Reply turns, after the SSE stream — never blocks the chat response. Haiku
-# 4.5 is fast with reliable structured JSON; gemini-flash-lite +
-# deepseek-v4-flash keep it alive if Anthropic is down.
+# Reply turns, after the SSE stream — never blocks the chat response.
+# gemini-3.1-flash-lite leads here: cheaper, more NSFW-tolerant, and unifies
+# the model chain with the extraction tasks above. deepseek-v4-flash +
+# claude-haiku-4.5 fallback keep it alive if Google is down.
 [tasks.affinity_evaluation]
-model = "anthropic/claude-haiku-4.5"
-fallback = ["google/gemini-3.1-flash-lite", "deepseek/deepseek-v4-flash"]
+model = "google/gemini-3.1-flash-lite"
+fallback = ["deepseek/deepseek-v4-flash", "anthropic/claude-haiku-4.5"]
 temperature = 0.3
 max_tokens = 400
 
