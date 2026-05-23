@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! TOML-driven model orchestration config.
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error::LlmError;
@@ -31,6 +33,106 @@ impl FallbackSpec {
     }
 }
 
+/// A task/tier's primary `model`. Accepts three TOML shapes:
+/// `"id"` (fixed), `["a","b"]` (round-robin), or `{ "a" = 0.8, "b" = 0.2 }`
+/// (weighted random, any positive weights, normalized by sum).
+#[derive(Debug, Clone)]
+pub enum ModelSpec {
+    Fixed(String),
+    RoundRobin {
+        models: Vec<String>,
+        cursor: Arc<AtomicUsize>,
+    },
+    Weighted(Vec<(String, f64)>),
+}
+
+impl<'de> Deserialize<'de> for ModelSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Untagged intermediate: TOML string vs array vs inline table are
+        // unambiguous to serde (same pattern as `FallbackSpec`).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Fixed(String),
+            RoundRobin(Vec<String>),
+            Weighted(HashMap<String, f64>),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Fixed(s) => ModelSpec::Fixed(s),
+            Raw::RoundRobin(models) => ModelSpec::RoundRobin {
+                models: models.into_iter().filter(|s| !s.is_empty()).collect(),
+                cursor: Arc::new(AtomicUsize::new(0)),
+            },
+            // Drop non-finite and non-positive weights at parse time. `inf` is
+            // a valid TOML float and passes `> 0.0`, but would make the sum
+            // non-finite and panic `gen_range(0.0..sum)` at selection; require
+            // finite so a bad config falls through instead of crashing.
+            // Normalization is by sum at selection. Sort by id so the
+            // cumulative-band order is deterministic across restarts
+            // (HashMap iteration order is not).
+            Raw::Weighted(map) => {
+                let mut entries: Vec<(String, f64)> = map
+                    .into_iter()
+                    .filter(|(_, w)| w.is_finite() && *w > 0.0)
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                ModelSpec::Weighted(entries)
+            }
+        })
+    }
+}
+
+impl ModelSpec {
+    /// Pick one concrete model id. `None` means the spec is empty (empty array,
+    /// empty/all-non-positive table, or empty fixed string) — the caller should
+    /// fall through to the next precedence level.
+    fn select(&self) -> Option<String> {
+        match self {
+            ModelSpec::Fixed(s) if !s.is_empty() => Some(s.clone()),
+            ModelSpec::RoundRobin { models, cursor } if !models.is_empty() => {
+                let i = cursor.fetch_add(1, Ordering::Relaxed) % models.len();
+                Some(models[i].clone())
+            }
+            ModelSpec::Weighted(entries) if !entries.is_empty() => {
+                let sum: f64 = entries.iter().map(|(_, w)| w).sum();
+                let position = rand::thread_rng().gen_range(0.0..sum);
+                Some(pick_weighted(entries, position).to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Pure cumulative-weight walk: given `position` in `[0, sum)`, return the id
+/// whose cumulative band contains it. Split out so the random draw stays in
+/// `select()` and the band logic is unit-testable. Caller guarantees non-empty.
+fn pick_weighted(entries: &[(String, f64)], position: f64) -> &str {
+    let mut acc = 0.0;
+    for (model, w) in entries {
+        acc += w;
+        if position < acc {
+            return model;
+        }
+    }
+    // Reachable when position >= acc: gen_range uses Iterator::sum() while the
+    // loop accumulates with sequential +=, and the two can round differently,
+    // so the last entry absorbs the rounding remainder.
+    &entries.last().expect("caller ensures non-empty").0
+}
+
+#[cfg(test)]
+impl ModelSpec {
+    fn as_fixed(&self) -> Option<&str> {
+        match self {
+            ModelSpec::Fixed(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Mirror of OpenRouter's `reasoning` request object. Parsed from TOML and
 /// forwarded to the wire unchanged, so operators control reasoning in the
 /// same shape OpenRouter documents. Every field optional; absent fields are
@@ -50,7 +152,7 @@ pub struct ReasoningConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TierConfig {
     #[serde(default)]
-    pub model: Option<String>,
+    pub model: Option<ModelSpec>,
     #[serde(default)]
     pub fallback: Option<FallbackSpec>,
     /// Allow-listed prompt-trait tags. Three-state, mirroring `fallback`'s
@@ -72,7 +174,7 @@ pub struct DefaultConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
-    pub model: String,
+    pub model: ModelSpec,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -136,14 +238,14 @@ impl ModelConfig {
     }
 
     /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml` to match the
+    /// or fall back to `examples/model_config.toml.example` to match the
     /// `eros-engine-server` boot default. The server binary itself reads
     /// the file inline via `from_toml_str` rather than calling this; this
     /// method is provided for embedders who want the same behaviour in
     /// one call.
     pub fn load() -> Result<Arc<Self>, LlmError> {
         let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
+            .unwrap_or_else(|_| "examples/model_config.toml.example".to_string());
         let text = std::fs::read_to_string(&path)?;
         let cfg = Self::from_toml_str(&text)?;
         Ok(Arc::new(cfg))
@@ -175,20 +277,36 @@ impl ModelConfig {
             _ => None,
         };
 
-        let model = tier_cfg
-            .and_then(|t| t.model.clone())
-            .or_else(|| task_cfg.map(|t| t.model.clone()))
+        // Primary model: pick the winning spec by precedence
+        // (tier > task default > defaults.fallback_model > compiled-in), then
+        // select() a concrete id from it. An empty spec (e.g. `model = []`)
+        // yields None and falls through, warning as it goes.
+        let select_with_warn = |spec: Option<&ModelSpec>, level: &str| -> Option<String> {
+            let picked = spec.and_then(ModelSpec::select);
+            if spec.is_some() && picked.is_none() {
+                tracing::warn!(
+                    task,
+                    level,
+                    "model_config: empty model spec, falling through"
+                );
+            }
+            picked
+        };
+        let model = select_with_warn(tier_cfg.and_then(|t| t.model.as_ref()), "tier")
+            .or_else(|| select_with_warn(task_cfg.map(|t| &t.model), "task"))
             .or_else(|| self.defaults.fallback_model.clone())
             .unwrap_or_else(|| FALLBACK_MODEL.to_string());
 
         // fallback: tier (even empty) > task (even empty) > defaults singleton.
-        let fallback_model: Vec<String> = match tier_cfg.and_then(|t| t.fallback.as_ref()) {
+        let mut fallback_model: Vec<String> = match tier_cfg.and_then(|t| t.fallback.as_ref()) {
             Some(spec) => spec.clone().into_vec(),
             None => match task_cfg.and_then(|t| t.fallback.as_ref()) {
                 Some(spec) => spec.clone().into_vec(),
                 None => self.defaults.fallback_model.iter().cloned().collect(),
             },
         };
+        // A just-failed primary in its own fallback chain is a wasted retry.
+        fallback_model.retain(|m| m != &model);
 
         // allow_traits: tier (even empty) > task > None.
         let allow_traits = tier_cfg
@@ -222,6 +340,68 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_weighted_boundaries_and_normalization() {
+        let raw = vec![("a".to_string(), 8.0), ("b".to_string(), 2.0)];
+        assert_eq!(pick_weighted(&raw, 0.0), "a");
+        assert_eq!(pick_weighted(&raw, 7.999), "a");
+        assert_eq!(pick_weighted(&raw, 8.0), "b");
+        assert_eq!(pick_weighted(&raw, 9.999), "b");
+
+        let norm = vec![("a".to_string(), 0.8), ("b".to_string(), 0.2)];
+        assert_eq!(pick_weighted(&norm, 0.79), "a");
+        assert_eq!(pick_weighted(&norm, 0.80), "b");
+    }
+
+    #[test]
+    fn model_spec_parses_three_forms() {
+        let toml = r#"
+[tasks.fixed]
+model = "a"
+[tasks.rr]
+model = ["a", "b"]
+[tasks.weighted]
+model = { "a" = 0.8, "b" = 0.2 }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(matches!(cfg.tasks["fixed"].model, ModelSpec::Fixed(_)));
+        assert!(matches!(
+            cfg.tasks["rr"].model,
+            ModelSpec::RoundRobin { .. }
+        ));
+        assert!(matches!(
+            cfg.tasks["weighted"].model,
+            ModelSpec::Weighted(_)
+        ));
+    }
+
+    #[test]
+    fn weighted_drops_non_finite_weights() {
+        // `inf` is a valid TOML float and passes `> 0.0`, but must be dropped:
+        // an infinite sum would panic `gen_range(0.0..sum)` in select(). The
+        // sole entry is filtered, leaving an empty spec that falls through.
+        let toml = r#"
+[defaults]
+fallback_model = "fb"
+[tasks.t]
+model = { "a" = inf }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Resolve many times: a surviving inf weight would panic, not just
+        // return the wrong model.
+        for _ in 0..50 {
+            assert_eq!(cfg.resolve("t", None).model, "fb");
+        }
+
+        // A finite sibling still wins when inf is dropped.
+        let toml = r#"
+[tasks.t]
+model = { "a" = inf, "b" = 1.0 }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "b");
+    }
 
     const SAMPLE: &str = r#"
 [defaults]
@@ -268,7 +448,7 @@ max_tokens = 600
             .tasks
             .get("chat_companion")
             .expect("chat_companion task present");
-        assert_eq!(task.model, "deepseek/chat");
+        assert_eq!(task.model.as_fixed(), Some("deepseek/chat"));
     }
 
     #[test]
@@ -294,10 +474,13 @@ max_tokens = 600
         let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
         let r = cfg.resolve("nonexistent_task", None);
         assert_eq!(r.model, "x-ai/grok-4-mini");
-        assert_eq!(
-            r.fallback_model,
-            vec!["x-ai/grok-4-mini".to_string()],
-            "unknown task must inherit defaults.fallback_model as a singleton"
+        // defaults.fallback_model is the same id as the selected primary, so
+        // after primary-dedup it is removed from the chain (retrying the same
+        // model that just failed is wasteful).
+        assert!(
+            r.fallback_model.is_empty(),
+            "primary dedup must remove the defaults fallback when it equals the primary; got {:?}",
+            r.fallback_model
         );
         assert_eq!(r.temperature, 0.5);
         assert_eq!(r.max_tokens, 200);
@@ -488,7 +671,7 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // chat_companion — every field round-trips.
         let chat = cfg.tasks.get("chat_companion").unwrap();
-        assert_eq!(chat.model, "x-ai/grok-4-fast");
+        assert_eq!(chat.model.as_fixed(), Some("x-ai/grok-4-fast"));
         assert_eq!(
             chat.fallback.clone().expect("fallback present").into_vec(),
             vec!["deepseek/deepseek-chat-v3.2".to_string()]
@@ -499,7 +682,10 @@ description  = "reserved — Voyage hard-codes its own model"
         // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
         assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));
         let gold = chat.tiers.get("gold").expect("gold tier present");
-        assert_eq!(gold.model.as_deref(), Some("x-ai/grok-4.20"));
+        assert_eq!(
+            gold.model.as_ref().and_then(ModelSpec::as_fixed),
+            Some("x-ai/grok-4.20")
+        );
         assert_eq!(
             gold.fallback
                 .clone()
@@ -514,7 +700,7 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // insight_extraction — same shape.
         let insight = cfg.tasks.get("insight_extraction").unwrap();
-        assert_eq!(insight.model, "x-ai/grok-4-mini");
+        assert_eq!(insight.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert_eq!(
             insight
                 .fallback
@@ -528,13 +714,13 @@ description  = "reserved — Voyage hard-codes its own model"
 
         // pde_decision — reserved, partial fields.
         let pde = cfg.tasks.get("pde_decision").unwrap();
-        assert_eq!(pde.model, "x-ai/grok-4-mini");
+        assert_eq!(pde.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
-        assert_eq!(emb.model, "voyage-3-lite");
+        assert_eq!(emb.model.as_fixed(), Some("voyage-3-lite"));
         assert_eq!(emb.dimensions, Some(512));
 
         // Resolution behaviour on the live tasks.
@@ -755,8 +941,9 @@ reasoning = { exclude = true }
     // depends on — otherwise resolve() silently falls back to the wrong model.
     #[test]
     fn committed_example_config_parses_and_has_affinity_task() {
-        let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let text = include_str!("../../../examples/model_config.toml.example");
+        let cfg = ModelConfig::from_toml_str(text)
+            .expect("examples/model_config.toml.example must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
         assert_eq!(r.max_tokens, 400);
@@ -764,16 +951,17 @@ reasoning = { exclude = true }
         assert_eq!(
             r.fallback_model,
             vec![
-                "google/gemini-3.1-flash-lite".to_string(),
                 "deepseek/deepseek-v4-flash".to_string(),
+                "google/gemini-3.1-flash-lite".to_string(),
             ]
         );
     }
 
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
-        let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let text = include_str!("../../../examples/model_config.toml.example");
+        let cfg = ModelConfig::from_toml_str(text)
+            .expect("examples/model_config.toml.example must parse");
         let disabled = ReasoningConfig {
             enabled: Some(false),
             exclude: None,
@@ -790,5 +978,88 @@ reasoning = { exclude = true }
         );
         // Untouched tasks stay at model default.
         assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
+    }
+
+    #[test]
+    fn fallback_drops_selected_primary() {
+        let toml = r#"
+[tasks.t]
+model = "a"
+fallback = ["a", "c"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("t", None);
+        assert_eq!(r.model, "a");
+        assert_eq!(r.fallback_model, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn fallback_dedup_is_dynamic_under_round_robin() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+fallback = ["a", "c"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // turn 1 selects "a" -> "a" dropped from fallback
+        let r1 = cfg.resolve("t", None);
+        assert_eq!(r1.model, "a");
+        assert_eq!(r1.fallback_model, vec!["c".to_string()]);
+        // turn 2 selects "b" -> "a" stays
+        let r2 = cfg.resolve("t", None);
+        assert_eq!(r2.model, "b");
+        assert_eq!(r2.fallback_model, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn round_robin_alternates() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+    }
+
+    #[test]
+    fn round_robin_task_and_tier_counters_independent() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+
+[tasks.t.tiers.free]
+model = ["c", "d"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", Some("free")).model, "c");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+        assert_eq!(cfg.resolve("t", Some("free")).model, "d");
+    }
+
+    #[test]
+    fn single_entry_array_behaves_like_fixed() {
+        let toml = r#"
+[tasks.t]
+model = ["only"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "only");
+        assert_eq!(cfg.resolve("t", None).model, "only");
+    }
+
+    #[test]
+    fn empty_model_array_falls_through_to_defaults() {
+        let toml = r#"
+[defaults]
+fallback_model = "fb"
+[tasks.t]
+model = []
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "fb");
     }
 }

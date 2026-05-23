@@ -138,7 +138,7 @@ docker run --rm -p 8080:8080 --env-file .env \
   ghcr.io/etherfunlab/eros-engine:0.3.1 serve
 ```
 
-The Dockerfile under `docker/` and `fly.toml` in the repo root are the same artifacts used by this image and by the Fly.io example deployment.
+The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host.
 
 ## Documentation
 
@@ -147,7 +147,7 @@ The Dockerfile under `docker/` and `fly.toml` in the repo root are the same arti
 - [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
 - [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
 - [Model config](docs/model-config.md) — `model_config.toml` schema, task names, resolution rules, 0.x stability commitments.
-- [Deploying](docs/deploying.md) — Fly.io, Docker, bring-your-own Postgres / IdP.
+- [Deploying](docs/deploying.md) — Docker, bring-your-own Postgres / IdP.
 - [API reference](docs/api-reference.md) — every `/comp/*` endpoint.
 
 ## Quickstart
@@ -226,7 +226,7 @@ for frame layout and error semantics.
 | Env var | Required | Notes |
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
-| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
+| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml.example` unless overridden. |
 | `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
 | `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
@@ -236,7 +236,7 @@ for frame layout and error semantics.
 | `BIND_ADDR` | no | Defaults to `0.0.0.0:8080`. |
 | `EXPOSE_AFFINITY_DEBUG` | no | Set `true` to enable `/comp/affinity/{session_id}`. |
 | `EMA_INERTIA` | no | Defaults to `0.8`. |
-| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
+| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml.example`. |
 | `RUST_LOG` | no | Defaults to `info`. |
 | `MARKETPLACE_SVC_URL` | no | Base URL of eros-marketplace-svc. When set, the engine pulls /since cursors every 5 min as a self-heal recovery path. Requires `MARKETPLACE_SVC_S2S_SECRET`. |
 | `MARKETPLACE_SVC_S2S_SECRET` | no | HMAC secret shared with eros-marketplace-svc. Gates the `/s2s/*` routes the svc pushes into. Without it, `/s2s/*` always 401s. |

@@ -107,7 +107,7 @@ Workspace 拆成四個 crate：
 - [Ghost 機制](docs/ghost-mechanics.zh.md)——score formula、保護規則、示例。
 - [記憶層](docs/memory-layers.zh.md)——profile vs relationship memory、Voyage、pgvector retrieval。
 - [模型配置](docs/model-config.zh.md)——`model_config.toml` schema、任務名、解析優先級、0.x 穩定性承諾。
-- [部署](docs/deploying.zh.md)——Fly.io、Docker、自帶 Postgres / IdP。
+- [部署](docs/deploying.zh.md)——Docker、自帶 Postgres / IdP。
 - [API 參考](docs/api-reference.zh.md)——每個 `/comp/*` endpoint。
 
 ## 快速開始
@@ -170,7 +170,7 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 | 環境變量 | 必要 | 說明 |
 |---|---|---|
 | `DATABASE_URL` | 是 | 帶 `pgvector` 的 Postgres；表建在 `engine.*`。 |
-| `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml` 路由。 |
+| `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml.example` 路由。 |
 | `OPENROUTER_APP_REFERER` | 否 | 設了之後每次出站 OpenRouter 調用都帶 `HTTP-Referer`。會出現在 OpenRouter 的 app 分析面板上。 |
 | `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | 否 | 逗号分隔的顶层 key 列表，从 `usage` 对象里剔除 —— 在 SSE 流式 `done` 帧上生效。常用于把批发 `cost` / `cost_details` 隐藏起来不外泄给下游客户。完整 usage 仍会落库并写入服务器端 tracing。 |
@@ -180,7 +180,7 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 | `BIND_ADDR` | 否 | 默認 `0.0.0.0:8080`。 |
 | `EXPOSE_AFFINITY_DEBUG` | 否 | 設為 `true` 會開啟 `/comp/affinity/{session_id}`。 |
 | `EMA_INERTIA` | 否 | 默認 `0.8`。 |
-| `MODEL_CONFIG_PATH` | 否 | 默認 `examples/model_config.toml`。 |
+| `MODEL_CONFIG_PATH` | 否 | 默認 `examples/model_config.toml.example`。 |
 | `RUST_LOG` | 否 | 默認 `info`。 |
 
 ## 刻意不包含的東西

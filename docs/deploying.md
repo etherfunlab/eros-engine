@@ -2,11 +2,10 @@
 
 [English](deploying.md) · [中文](deploying.zh.md)
 
-Three supported paths, in order of effort:
+Two supported paths, in order of effort:
 
-1. **Fly.io** — what the included `fly.toml` is wired up for. ~10 minutes if you've used Fly before.
-2. **Docker compose self-host** — single-host VPS, brings its own Postgres+pgvector.
-3. **Embed as a library** — `core + llm + store` into your own service, no HTTP layer.
+1. **Docker compose self-host** — single-host VPS, brings its own Postgres+pgvector.
+2. **Embed as a library** — `core + llm + store` into your own service, no HTTP layer.
 
 ## Prerequisites in all cases
 
@@ -15,43 +14,7 @@ Three supported paths, in order of effort:
 - A Voyage AI account (`VOYAGE_API_KEY`).
 - Either a Supabase project (for default JWT auth) or your own JWT issuer (implement `AuthValidator`).
 
-## Path 1: Fly.io
-
-The `fly.toml` in the repo root is a ready-to-use production config. App name `eros-engine`, region `nrt`, `shared-cpu-1x` 512MB, scale-to-zero. Custom domain via Fly certs. Rename the app and pick a region that suits you before deploying.
-
-```bash
-# 1. App
-flyctl apps create eros-engine --org personal
-
-# 2. Secrets (paste your real values)
-flyctl secrets set --app eros-engine \
-  DATABASE_URL='postgres://…@…supabase.co:5432/postgres' \
-  OPENROUTER_API_KEY='sk-or-…' \
-  VOYAGE_API_KEY='pa-…' \
-  SUPABASE_URL='https://…supabase.co' \
-  SUPABASE_JWT_SECRET='…' \
-  SUPABASE_SERVICE_ROLE_KEY='eyJ…'
-
-# Or import from a .env file:
-#   grep -E '^(DATABASE_URL|OPENROUTER_API_KEY|VOYAGE_API_KEY|SUPABASE_URL|SUPABASE_JWT_SECRET|SUPABASE_SERVICE_ROLE_KEY)=' .env \
-#     | flyctl secrets import -a eros-engine
-
-# 3. First deploy (Fly's remote builder; ~5–10 min on a clean cache)
-flyctl deploy --remote-only -a eros-engine
-
-# 4. Custom domain
-flyctl certs create your-domain.example.com -a eros-engine
-# Add the A + AAAA records that flyctl prints, at your DNS provider.
-flyctl certs check your-domain.example.com -a eros-engine
-
-# 5. (Optional) Seed personas
-flyctl ssh console -a eros-engine \
-  -C "/usr/local/bin/eros-engine seed-personas /etc/eros-engine/personas"
-```
-
-The `release_command = "migrate"` in `fly.toml` runs sqlx migrations automatically before each deploy swaps traffic — you don't run migrations by hand.
-
-### Subcommands
+## Subcommands
 
 The binary has three modes (dispatched by `argv[1]`):
 
@@ -63,7 +26,7 @@ The binary has three modes (dispatched by `argv[1]`):
 
 `seed-personas` is idempotent — re-runs update existing rows in place (matched by `name`), preserving UUIDs and FK references in `persona_instances`.
 
-## Path 2: Docker compose self-host
+## Path 1: Docker compose self-host
 
 For a single-VPS deployment that runs Postgres+pgvector inside the same compose stack:
 
@@ -100,7 +63,7 @@ Run with `docker compose -f docker/docker-compose.yml up`. The first boot will r
 
 Place a real Caddy / Traefik / Cloudflare in front for HTTPS termination.
 
-## Path 3: Embed as a library
+## Path 2: Embed as a library
 
 If you don't need the HTTP layer — say you're building a different product on top of the affinity + memory pipeline — skip `eros-engine-server` entirely:
 
@@ -228,7 +191,6 @@ after one sync cycle (5 minutes).
 
 ## Source
 
-- `fly.toml` — ready-to-use Fly.io production config
 - `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime)
 - `docker/docker-compose.yml` — self-host stack
 - `crates/eros-engine-server/src/main.rs` — the three subcommands
