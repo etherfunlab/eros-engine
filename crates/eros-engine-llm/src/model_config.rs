@@ -922,4 +922,56 @@ reasoning = { exclude = true }
         // Untouched tasks stay at model default.
         assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
     }
+
+    #[test]
+    fn round_robin_alternates() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+    }
+
+    #[test]
+    fn round_robin_task_and_tier_counters_independent() {
+        let toml = r#"
+[tasks.t]
+model = ["a", "b"]
+
+[tasks.t.tiers.free]
+model = ["c", "d"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "a");
+        assert_eq!(cfg.resolve("t", Some("free")).model, "c");
+        assert_eq!(cfg.resolve("t", None).model, "b");
+        assert_eq!(cfg.resolve("t", Some("free")).model, "d");
+    }
+
+    #[test]
+    fn single_entry_array_behaves_like_fixed() {
+        let toml = r#"
+[tasks.t]
+model = ["only"]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "only");
+        assert_eq!(cfg.resolve("t", None).model, "only");
+    }
+
+    #[test]
+    fn empty_model_array_falls_through_to_defaults() {
+        let toml = r#"
+[defaults]
+fallback_model = "fb"
+[tasks.t]
+model = []
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "fb");
+    }
 }
