@@ -107,7 +107,10 @@ fn pick_weighted(entries: &[(String, f64)], position: f64) -> &str {
             return model;
         }
     }
-    &entries.last().expect("pick_weighted called on empty entries").0
+    // Reachable when position >= acc: gen_range uses Iterator::sum() while the
+    // loop accumulates with sequential +=, and the two can round differently,
+    // so the last entry absorbs the rounding remainder.
+    &entries.last().expect("caller ensures non-empty").0
 }
 
 #[cfg(test)]
