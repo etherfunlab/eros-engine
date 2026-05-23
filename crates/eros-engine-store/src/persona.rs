@@ -242,6 +242,24 @@ impl<'a> PersonaRepo<'a> {
         .await
     }
 
+    /// The id of the user's *active* instance for `genome_id`, if any.
+    /// Lifted from the inline lookup in `resolve_or_create_session` so it
+    /// can run inside `tokio::try_join!`.
+    pub async fn find_active_instance(
+        &self,
+        genome_id: Uuid,
+        owner_uid: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM engine.persona_instances \
+             WHERE genome_id = $1 AND owner_uid = $2 AND status = 'active'",
+        )
+        .bind(genome_id)
+        .bind(owner_uid)
+        .fetch_optional(self.pool)
+        .await
+    }
+
     /// Returns the `asset_id` for an NFT-backed genome, or `None` for legacy
     /// seed-persona rows where the column is NULL. Used by the chat-start
     /// and per-message gates to decide whether to invoke the NFT ownership
@@ -357,6 +375,39 @@ mod tests {
 
         // missing → None
         assert!(repo.get_genome_gate(Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_active_instance_skips_archived_and_missing(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
+
+        // none yet
+        assert!(repo
+            .find_active_instance(genome_id, owner)
+            .await
+            .unwrap()
+            .is_none());
+
+        // active → found
+        let iid = repo.create_instance(genome_id, owner).await.unwrap();
+        assert_eq!(
+            repo.find_active_instance(genome_id, owner).await.unwrap(),
+            Some(iid)
+        );
+
+        // archived → skipped
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(iid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo
+            .find_active_instance(genome_id, owner)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
