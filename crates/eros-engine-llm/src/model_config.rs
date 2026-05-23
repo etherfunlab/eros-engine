@@ -278,7 +278,11 @@ impl ModelConfig {
         let select_with_warn = |spec: Option<&ModelSpec>, level: &str| -> Option<String> {
             let picked = spec.and_then(ModelSpec::select);
             if spec.is_some() && picked.is_none() {
-                tracing::warn!(task, level, "model_config: empty model spec, falling through");
+                tracing::warn!(
+                    task,
+                    level,
+                    "model_config: empty model spec, falling through"
+                );
             }
             picked
         };
@@ -356,8 +360,14 @@ model = { "a" = 0.8, "b" = 0.2 }
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         assert!(matches!(cfg.tasks["fixed"].model, ModelSpec::Fixed(_)));
-        assert!(matches!(cfg.tasks["rr"].model, ModelSpec::RoundRobin { .. }));
-        assert!(matches!(cfg.tasks["weighted"].model, ModelSpec::Weighted(_)));
+        assert!(matches!(
+            cfg.tasks["rr"].model,
+            ModelSpec::RoundRobin { .. }
+        ));
+        assert!(matches!(
+            cfg.tasks["weighted"].model,
+            ModelSpec::Weighted(_)
+        ));
     }
 
     const SAMPLE: &str = r#"
@@ -639,7 +649,10 @@ description  = "reserved — Voyage hard-codes its own model"
         // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
         assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));
         let gold = chat.tiers.get("gold").expect("gold tier present");
-        assert_eq!(gold.model.as_ref().and_then(ModelSpec::as_fixed), Some("x-ai/grok-4.20"));
+        assert_eq!(
+            gold.model.as_ref().and_then(ModelSpec::as_fixed),
+            Some("x-ai/grok-4.20")
+        );
         assert_eq!(
             gold.fallback
                 .clone()
@@ -896,7 +909,8 @@ reasoning = { exclude = true }
     #[test]
     fn committed_example_config_parses_and_has_affinity_task() {
         let text = include_str!("../../../examples/model_config.toml.example");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml.example must parse");
+        let cfg = ModelConfig::from_toml_str(text)
+            .expect("examples/model_config.toml.example must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
         assert_eq!(r.max_tokens, 400);
@@ -913,7 +927,8 @@ reasoning = { exclude = true }
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
         let text = include_str!("../../../examples/model_config.toml.example");
-        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml.example must parse");
+        let cfg = ModelConfig::from_toml_str(text)
+            .expect("examples/model_config.toml.example must parse");
         let disabled = ReasoningConfig {
             enabled: Some(false),
             exclude: None,
