@@ -140,6 +140,32 @@ impl<'a> ChatRepo<'a> {
         self.create_session(user_id, instance_id).await
     }
 
+    /// Resume the most-recent session for `(user_id, instance_id)`, bumping
+    /// `last_active_at` in the same statement. Returns `None` when none
+    /// exists (caller then creates). Folds the former SELECT-latest +
+    /// separate UPDATE into one round-trip. Callers consume only `id`
+    /// (immutable), so returning the post-bump row is immaterial.
+    pub async fn resume_latest_session(
+        &self,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) -> Result<Option<ChatSession>, sqlx::Error> {
+        sqlx::query_as::<_, ChatSession>(
+            "UPDATE engine.chat_sessions SET last_active_at = now() \
+             WHERE id = ( \
+                 SELECT id FROM engine.chat_sessions \
+                 WHERE user_id = $1 AND instance_id = $2 \
+                 ORDER BY last_active_at DESC \
+                 LIMIT 1 \
+             ) \
+             RETURNING *",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
     /// Append a message to a session and bump `last_active_at`.
     pub async fn append_message(
         &self,
@@ -650,5 +676,57 @@ mod tests {
             }
             other => panic!("expected Replay, got {other:?}"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn resume_latest_session_returns_latest_and_bumps(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+
+        // no session yet → None
+        assert!(repo
+            .resume_latest_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // two sessions with explicit last_active_at so "latest" is deterministic
+        let _older = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at) \
+             VALUES ($1, $2, now() - interval '1 hour') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let newer = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at) \
+             VALUES ($1, $2, now() - interval '1 minute') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(newer)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let resumed = repo
+            .resume_latest_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .expect("resume the most-recent session");
+        assert_eq!(resumed.id, newer, "must resume the most-recent session");
+        assert!(
+            resumed.last_active_at >= before,
+            "last_active_at must be bumped"
+        );
     }
 }
