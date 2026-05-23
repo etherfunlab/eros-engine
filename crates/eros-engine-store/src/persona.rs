@@ -17,6 +17,17 @@ struct GenomeRow {
     is_active: bool,
 }
 
+/// Narrow gate-fields view of a genome for the chat-start path: the three
+/// fields `resolve_or_create_session` needs — `name` (response),
+/// `is_active` (400 check), `asset_id` (NFT gate) — in one row. Folds the
+/// former `get_genome` + `get_asset_id_for_genome` reads.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GenomeGate {
+    pub name: String,
+    pub is_active: bool,
+    pub asset_id: Option<String>,
+}
+
 impl From<GenomeRow> for PersonaGenome {
     fn from(r: GenomeRow) -> Self {
         Self {
@@ -81,6 +92,20 @@ impl<'a> PersonaRepo<'a> {
         .fetch_optional(self.pool)
         .await?;
         Ok(row.map(PersonaGenome::from))
+    }
+
+    /// One-row gate read for the genome chat-start path. See [`GenomeGate`].
+    pub async fn get_genome_gate(
+        &self,
+        genome_id: Uuid,
+    ) -> Result<Option<GenomeGate>, sqlx::Error> {
+        sqlx::query_as::<_, GenomeGate>(
+            "SELECT name, is_active, asset_id \
+             FROM engine.persona_genomes WHERE id = $1",
+        )
+        .bind(genome_id)
+        .fetch_optional(self.pool)
+        .await
     }
 
     /// Joined genome+instance view used by the chat pipeline.
@@ -303,6 +328,35 @@ mod tests {
         assert_eq!(companion.genome.name, "Echo");
         assert_eq!(companion.instance.owner_uid, owner);
         assert_eq!(companion.instance.status, "active");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_genome_gate_returns_name_active_and_asset_id(pool: PgPool) {
+        let repo = PersonaRepo { pool: &pool };
+
+        // legacy genome → asset_id NULL
+        let legacy = insert_genome(&pool, "Legacy", true, serde_json::json!({})).await;
+        let g = repo.get_genome_gate(legacy).await.unwrap().unwrap();
+        assert_eq!(g.name, "Legacy");
+        assert!(g.is_active);
+        assert_eq!(g.asset_id, None);
+
+        // NFT genome, inactive → asset_id Some, is_active false
+        let nft = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes \
+                (name, system_prompt, art_metadata, is_active, asset_id) \
+             VALUES ('Nft', 'p', '{}'::jsonb, false, 'asset-xyz') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let g2 = repo.get_genome_gate(nft).await.unwrap().unwrap();
+        assert_eq!(g2.name, "Nft");
+        assert!(!g2.is_active);
+        assert_eq!(g2.asset_id.as_deref(), Some("asset-xyz"));
+
+        // missing → None
+        assert!(repo.get_genome_gate(Uuid::new_v4()).await.unwrap().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
