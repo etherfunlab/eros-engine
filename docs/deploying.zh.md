@@ -2,11 +2,10 @@
 
 [English](deploying.md) · [中文](deploying.zh.md)
 
-三條支持的路徑，按工作量排：
+兩條支持的路徑，按工作量排：
 
-1. **Fly.io**——倉庫裏的 `fly.toml` 直接配好了。如果之前用過 Fly，大約 10 分鐘搞定。
-2. **Docker compose 自托管**——單機 VPS，自帶 Postgres+pgvector。
-3. **作為庫嵌入**——`core + llm + store` 進你自己的服務，不要 HTTP 層。
+1. **Docker compose 自托管**——單機 VPS，自帶 Postgres+pgvector。
+2. **作為庫嵌入**——`core + llm + store` 進你自己的服務，不要 HTTP 層。
 
 ## 三種方式都需要的前置
 
@@ -15,43 +14,7 @@
 - 一個 Voyage AI 賬號（`VOYAGE_API_KEY`）。
 - 要麼 Supabase 項目（默認 JWT auth 用），要麼你自己的 JWT 簽發者（實現 `AuthValidator`）。
 
-## 路徑 1：Fly.io
-
-倉庫根目錄的 `fly.toml` 是一份可以直接用的生產配置。app 名 `eros-engine`、region `nrt`、`shared-cpu-1x` 512MB、scale-to-zero。自定義域名走 Fly certs。部署前把 app 名換成自己的、region 挑一個合適的。
-
-```bash
-# 1. 建 app
-flyctl apps create eros-engine --org personal
-
-# 2. 寫入密鑰（換成你的真實值）
-flyctl secrets set --app eros-engine \
-  DATABASE_URL='postgres://…@…supabase.co:5432/postgres' \
-  OPENROUTER_API_KEY='sk-or-…' \
-  VOYAGE_API_KEY='pa-…' \
-  SUPABASE_URL='https://…supabase.co' \
-  SUPABASE_JWT_SECRET='…' \
-  SUPABASE_SERVICE_ROLE_KEY='eyJ…'
-
-# 或者從 .env 文件導入：
-#   grep -E '^(DATABASE_URL|OPENROUTER_API_KEY|VOYAGE_API_KEY|SUPABASE_URL|SUPABASE_JWT_SECRET|SUPABASE_SERVICE_ROLE_KEY)=' .env \
-#     | flyctl secrets import -a eros-engine
-
-# 3. 首次部署（Fly 的遠端構建器；空緩存約 5-10 分鐘）
-flyctl deploy --remote-only -a eros-engine
-
-# 4. 自定義域名
-flyctl certs create your-domain.example.com -a eros-engine
-# 把 flyctl 打印的 A + AAAA 記錄加到你的 DNS 提供商。
-flyctl certs check your-domain.example.com -a eros-engine
-
-# 5. （可選）Seed 人格
-flyctl ssh console -a eros-engine \
-  -C "/usr/local/bin/eros-engine seed-personas /etc/eros-engine/personas"
-```
-
-`fly.toml` 裡的 `release_command = "migrate"` 會在每次 deploy 切流量之前自動跑 sqlx migrations——你不需要手動跑遷移。
-
-### 子命令
+## 子命令
 
 二進制文件有三種模式（按 `argv[1]` 分派）：
 
@@ -63,7 +26,7 @@ flyctl ssh console -a eros-engine \
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
 
-## 路徑 2：Docker compose 自托管
+## 路徑 1：Docker compose 自托管
 
 單機 VPS 部署，把 Postgres+pgvector 跟引擎一起放進同一個 compose stack：
 
@@ -100,7 +63,7 @@ volumes:
 
 前面放個真正的 Caddy / Traefik / Cloudflare 做 HTTPS 終止。
 
-## 路徑 3：作為庫嵌入
+## 路徑 2：作為庫嵌入
 
 如果你不需要 HTTP 層——比如你在這個基礎上搞另一個產品——直接跳過 `eros-engine-server`：
 
@@ -209,7 +172,6 @@ SELECT grantee, table_name, privilege_type
 
 ## 源碼
 
-- `fly.toml`——可直接套用的 Fly.io 生產配置
 - `docker/Dockerfile`——多階段構建（Rust 1.88 構建器 → debian:bookworm-slim 運行時）
 - `docker/docker-compose.yml`——自托管 stack
 - `crates/eros-engine-server/src/main.rs`——三個子命令
