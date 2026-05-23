@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 toml = "0.8"
+rand = "0.8"
 eventsource-stream = { workspace = true }
 futures-util       = { workspace = true }
 tokio-stream       = { workspace = true }
