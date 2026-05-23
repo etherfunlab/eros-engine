@@ -6,9 +6,9 @@ LLM model selection for the engine lives in a TOML file loaded at server start. 
 
 ## Where it lives
 
-- Default path: `examples/model_config.toml` (relative to the working directory)
+- Default path: `examples/model_config.toml.example` (relative to the working directory). The committed file is a sanitized template; copy it (or point `MODEL_CONFIG_PATH` at your own) for real deployments.
 - Override: `MODEL_CONFIG_PATH` environment variable
-- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path.
+- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path (`examples/model_config.toml.example`).
 - Held as `Arc<ModelConfig>` in `AppState`; shared across all chat / post-process turns
 - The server also calls `dotenvy::dotenv()` at startup, so `cp .env.example .env` works for the quickstart without an explicit `source .env`
 
@@ -21,7 +21,7 @@ fallback_temperature = 0.5
 fallback_max_tokens  = 200
 
 [tasks.<name>]
-model        = "<provider>/<model-id>"      # required
+model        = "<provider>/<model-id>"      # required; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
@@ -42,7 +42,7 @@ Field details:
 | `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
-| `tasks.<name>.model` | `String` | yes | Primary model for the task (task default block). |
+| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | yes | Primary model. String = fixed; array = round-robin; table = weighted random. See "Primary model selection". |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
 | `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
@@ -98,6 +98,27 @@ Where each step contributes:
 
 If `resolve()` is called with an unknown task name, it falls back through `defaults → compiled-in` and emits a `tracing::warn!` ("model_config: unknown task, using defaults").
 
+## Primary model selection
+
+`model` (task-level and per-tier) accepts three shapes:
+
+```toml
+model = "x-ai/grok-4.20"                              # fixed
+model = ["x-ai/grok-4.20", "z-ai/glm-4.7-flash"]     # round-robin (deterministic)
+model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted random
+```
+
+- **Round-robin** alternates deterministically across calls (per-process counter; resets on restart; each replica counts independently).
+- **Weighted** draws randomly; weights are any positive numbers, normalized by their sum (`{a = 8, b = 2}` == `{a = 0.8, b = 0.2}`). Non-positive weights are dropped.
+- `["a","b"]` and `{a = 1, b = 1}` produce the same long-run distribution but differ in mechanism (deterministic vs. random).
+- A single-entry array/table behaves like a fixed string. An empty array/table falls through to the next precedence level.
+
+**TOML gotcha:** inline-table keys allow only `A-Za-z0-9_-`, but model ids contain `/` and `.`, so weighted keys **must be quoted**: `{ "x-ai/grok-4.20" = 0.8 }`. The array form needs no quoting.
+
+### Fallback dedup
+
+After the primary is selected, any occurrence of that exact id is removed from the resolved `fallback` chain — retrying a model that just failed is wasted. With round-robin/weighted primaries this is dynamic: only the id chosen for that call is dropped.
+
 ## Stability commitments (OSS 0.x)
 
 For the duration of `0.x`, the OSS engine commits to:
@@ -107,6 +128,7 @@ For the duration of `0.x`, the OSS engine commits to:
 3. **No newly required fields.** Anything added is optional with a sensible default.
 4. **No removed task names from this list:** `chat_companion`, `insight_extraction`. Reserved task names (`pde_decision`, `embedding`) may shift if a real implementation lands and supersedes their current placeholder semantics; that change will be called out in the changelog.
 5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only.
+6. **`model` accepts a string, array (round-robin), or table (weighted).** A plain string remains valid forever; the array/table forms are an additive widening.
 
 What may still change without notice:
 

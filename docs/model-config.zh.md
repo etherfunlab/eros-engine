@@ -6,9 +6,9 @@
 
 ## 文件位置
 
-- 默认路径: `examples/model_config.toml`(相对于工作目录)
+- 默认路径: `examples/model_config.toml.example`(相对于工作目录)。已提交的文件是脱敏模板；实际部署时复制一份（或用 `MODEL_CONFIG_PATH` 指向自己的文件）。
 - 覆盖: `MODEL_CONFIG_PATH` 环境变量
-- 服务启动时由 `eros-engine-server/src/main.rs` 一次性载入(直接读 `MODEL_CONFIG_PATH` + `ModelConfig::from_toml_str`)。`crates/eros-engine-llm/src/model_config.rs` 里的 `ModelConfig::load()` 是给 library embedder 用的便利方法,默认路径一致
+- 服务启动时由 `eros-engine-server/src/main.rs` 一次性载入(直接读 `MODEL_CONFIG_PATH` + `ModelConfig::from_toml_str`)。`crates/eros-engine-llm/src/model_config.rs` 里的 `ModelConfig::load()` 是给 library embedder 用的便利方法,默认路径同为 `examples/model_config.toml.example`
 - 以 `Arc<ModelConfig>` 形式挂在 `AppState` 上,所有 chat / post-process 轮共享
 - Server 启动时还会调一次 `dotenvy::dotenv()`,所以快速开始里 `cp .env.example .env` 之后可以直接 `cargo run`,不需要手动 `source .env`
 
@@ -21,7 +21,7 @@ fallback_temperature = 0.5
 fallback_max_tokens  = 200
 
 [tasks.<name>]
-model        = "<provider>/<model-id>"      # 必填
+model        = "<provider>/<model-id>"      # 必填；也接受数组（轮转）或表（加权）—— 见「主模型选择」
 fallback     = "<provider>/<model-id>"      # 可选,主模型挂掉时的备选
 temperature  = 0.85                         # 可选,缺省走 defaults.fallback_temperature
 max_tokens   = 600                          # 可选,缺省走 defaults.fallback_max_tokens
@@ -42,7 +42,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 | `defaults.fallback_model` | `String` | 否 | 任务没给 model 时的兜底。还是缺,走代码内置的 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 同样优先级链;代码内置默认 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 同样;代码内置默认 `200`。 |
-| `tasks.<name>.model` | `String` | 是 | 任务的主模型（任务默认块）。 |
+| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。String = 固定；数组 = 轮转（round-robin）；表 = 加权随机。见「主模型选择」。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主模型调用挂掉时,`OpenRouterClient` 用的备选。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 任务级 sampling temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 任务级 token 上限。无 per-tier 覆盖。 |
@@ -98,6 +98,27 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 
 如果 `resolve()` 被传了一个未知 task 名,会落到 `defaults → 内置兜底`,同时 `tracing::warn!` 一条 "model_config: unknown task, using defaults"。
 
+## 主模型选择
+
+`model`（任务级和 per-tier）接受三种写法：
+
+```toml
+model = "x-ai/grok-4.20"                              # 固定
+model = ["x-ai/grok-4.20", "z-ai/glm-4.7-flash"]     # 轮转（round-robin，确定性交替）
+model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # 加权随机
+```
+
+- **轮转（Round-robin）**：每次调用确定性地轮流选取（进程级计数器；重启清零；每个副本独立计数）。
+- **加权（Weighted）**：随机抽取；权重为任意正数，按总和归一化（`{a = 8, b = 2}` 等价于 `{a = 0.8, b = 0.2}`）。非正权重直接丢弃。
+- `["a","b"]` 与 `{a = 1, b = 1}` 的长期分布相同，但机制不同（确定性 vs. 随机）。
+- 单元素数组/表的行为等同于固定字符串。空数组/表会透传到下一级优先级。
+
+**TOML 坑：** 内联表的裸键只允许 `A-Za-z0-9_-`，但 model id 含有 `/` 和 `.`，因此加权写法的键**必须加引号**：`{ "x-ai/grok-4.20" = 0.8 }`。数组写法无此限制。
+
+### fallback 去重
+
+主模型选定后，已选出的那个 id 会从解析后的 `fallback` 链中自动移除 —— 刚失败的模型重试毫无意义。轮转/加权主模型下，这是动态的：每次调用只去掉本次选中的那个 id。
+
 ## 稳定性承诺 (OSS 0.x)
 
 整个 `0.x` 期间,OSS 引擎承诺:
@@ -107,6 +128,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 3. **不加新的必填字段。** 后续加的字段一律可选,带合理默认。
 4. **以下任务名不会被删除:** `chat_companion`,`insight_extraction`。Reserved 名 (`pde_decision`,`embedding`) 在真实现落地后可能有 semantic 变化,但会在 changelog 里明确写。
 5. **解析优先级顺序固定。** `model`/`fallback`/`allow_traits` 走 `匹配 tier > 任务默认块 > [defaults] > 内置兜底`;`temperature`/`max_tokens` 只在任务级设置。
+6. **`model` 接受字符串、数组（轮转）或表（加权）。** 纯字符串写法永久有效；数组/表形式是向后兼容的扩展。
 
 可能不通知就改的:
 

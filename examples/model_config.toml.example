@@ -1,3 +1,10 @@
+# `model` accepts three forms (task-level and per-tier):
+#   model = "id"                       # fixed
+#   model = ["id_a", "id_b"]           # round-robin (deterministic alternation)
+#   model = { "id_a" = 0.8, "id_b" = 0.2 }  # weighted random (normalized by sum)
+# Weighted-table keys must be quoted (model ids contain "/" and ".").
+# If the selected primary also appears in `fallback`, it is auto-skipped.
+
 [tasks.chat_companion]
 # Grok primary: most permissive among the cheap-and-fast tier; xAI's policy
 # explicitly avoids over-refusal on intimate adult dialogue. The first
