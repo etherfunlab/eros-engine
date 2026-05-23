@@ -66,12 +66,18 @@ impl<'de> Deserialize<'de> for ModelSpec {
                 models: models.into_iter().filter(|s| !s.is_empty()).collect(),
                 cursor: Arc::new(AtomicUsize::new(0)),
             },
-            // Drop non-positive weights at parse time; normalization is by sum
-            // at selection. Sort by id so the cumulative-band order is
-            // deterministic across restarts (HashMap iteration order is not).
+            // Drop non-finite and non-positive weights at parse time. `inf` is
+            // a valid TOML float and passes `> 0.0`, but would make the sum
+            // non-finite and panic `gen_range(0.0..sum)` at selection; require
+            // finite so a bad config falls through instead of crashing.
+            // Normalization is by sum at selection. Sort by id so the
+            // cumulative-band order is deterministic across restarts
+            // (HashMap iteration order is not).
             Raw::Weighted(map) => {
-                let mut entries: Vec<(String, f64)> =
-                    map.into_iter().filter(|(_, w)| *w > 0.0).collect();
+                let mut entries: Vec<(String, f64)> = map
+                    .into_iter()
+                    .filter(|(_, w)| w.is_finite() && *w > 0.0)
+                    .collect();
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 ModelSpec::Weighted(entries)
             }
@@ -368,6 +374,33 @@ model = { "a" = 0.8, "b" = 0.2 }
             cfg.tasks["weighted"].model,
             ModelSpec::Weighted(_)
         ));
+    }
+
+    #[test]
+    fn weighted_drops_non_finite_weights() {
+        // `inf` is a valid TOML float and passes `> 0.0`, but must be dropped:
+        // an infinite sum would panic `gen_range(0.0..sum)` in select(). The
+        // sole entry is filtered, leaving an empty spec that falls through.
+        let toml = r#"
+[defaults]
+fallback_model = "fb"
+[tasks.t]
+model = { "a" = inf }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Resolve many times: a surviving inf weight would panic, not just
+        // return the wrong model.
+        for _ in 0..50 {
+            assert_eq!(cfg.resolve("t", None).model, "fb");
+        }
+
+        // A finite sibling still wins when inf is dropped.
+        let toml = r#"
+[tasks.t]
+model = { "a" = inf, "b" = 1.0 }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolve("t", None).model, "b");
     }
 
     const SAMPLE: &str = r#"
