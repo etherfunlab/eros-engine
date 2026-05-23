@@ -260,6 +260,29 @@ impl<'a> PersonaRepo<'a> {
         .await
     }
 
+    /// Ensure an *active* instance exists for `(genome_id, owner_uid)` and
+    /// return its id. Creates a new row, or reactivates the existing
+    /// (possibly archived) one. `persona_instances` is
+    /// `UNIQUE(genome_id, owner_uid)`, so a plain INSERT 500s on an archived
+    /// row (issue #37); the `ON CONFLICT DO UPDATE` flips it back to active.
+    /// Caller MUST run the NFT-ownership gate before this write.
+    pub async fn ensure_active_instance(
+        &self,
+        genome_id: Uuid,
+        owner_uid: Uuid,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1, $2) \
+             ON CONFLICT (genome_id, owner_uid) DO UPDATE SET status = 'active' \
+             RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner_uid)
+        .fetch_one(self.pool)
+        .await
+    }
+
     /// Returns the `asset_id` for an NFT-backed genome, or `None` for legacy
     /// seed-persona rows where the column is NULL. Used by the chat-start
     /// and per-message gates to decide whether to invoke the NFT ownership
@@ -425,6 +448,49 @@ mod tests {
 
         let companion = repo.load_companion(instance_id).await.unwrap();
         assert!(companion.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ensure_active_instance_creates_then_reactivates(pool: PgPool) {
+        // #37: a plain INSERT would 500 on the unconditional
+        // UNIQUE(genome_id, owner_uid) when an archived row exists. The
+        // upsert must reactivate the SAME row instead.
+        let repo = PersonaRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
+
+        // first call creates
+        let iid = repo.ensure_active_instance(genome_id, owner).await.unwrap();
+
+        // archive it
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(iid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // second call reactivates the same row (no unique violation)
+        let again = repo.ensure_active_instance(genome_id, owner).await.unwrap();
+        assert_eq!(again, iid, "must reactivate existing row, not create a new one");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.persona_instances WHERE id = $1")
+                .bind(iid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "active");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.persona_instances \
+             WHERE genome_id = $1 AND owner_uid = $2",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "exactly one instance per (genome, owner)");
     }
 }
 
