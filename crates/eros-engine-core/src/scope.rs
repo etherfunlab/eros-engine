@@ -157,8 +157,8 @@ impl AffinityScope {
             self.patience,
             self.tension,
         ]
-        .iter()
-        .filter(|b| **b)
+        .into_iter()
+        .filter(|b| *b)
         .count()
     }
 

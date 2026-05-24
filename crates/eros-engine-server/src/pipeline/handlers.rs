@@ -461,13 +461,23 @@ pub(super) async fn build_reply_request(
         _ => (MemoryScope::default(), AffinityScope::default()),
     };
     let (mem_mode, x_on, y_on) = memory_scope.resolve();
-    tracing::info!(
-        memory_scope = ?memory_scope,
-        affinity_axes = affinity_scope.active_count(),
-        x_on,
-        y_on,
-        "chat scopes resolved"
-    );
+    // Routine turns use the defaults — keep those at debug. Surface only
+    // caller-overridden scopes at info, where they're actually notable.
+    if memory_scope != MemoryScope::default() || affinity_scope != AffinityScope::default() {
+        tracing::info!(
+            memory_scope = ?memory_scope,
+            affinity_axes_active = affinity_scope.active_count(),
+            x_on,
+            y_on,
+            "chat scopes resolved (non-default)"
+        );
+    } else {
+        tracing::debug!(
+            memory_scope = ?memory_scope,
+            affinity_axes_active = affinity_scope.active_count(),
+            "chat scopes resolved (defaults)"
+        );
+    }
 
     let (mut profile_groups, relationship_facts) =
         recall_memory(state, user_id, instance_id, query_text, x_on, y_on).await;
