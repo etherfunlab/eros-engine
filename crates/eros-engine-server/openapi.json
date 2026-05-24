@@ -1003,6 +1003,29 @@
           }
         }
       },
+      "AffinityScopeDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AffinityScopeName"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "AffinityScopeName": {
+        "type": "string",
+        "enum": [
+          "full",
+          "bond_and_chemistry",
+          "bond",
+          "chemistry",
+          "none"
+        ]
+      },
       "AffinitySnapshot": {
         "type": "object",
         "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
@@ -1680,6 +1703,16 @@
           "client_msg_id"
         ],
         "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
           "audit": {
             "oneOf": [
               {
@@ -1695,6 +1728,12 @@
           },
           "content": {
             "type": "string"
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "prompt_traits": {
             "type": [

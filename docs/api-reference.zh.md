@@ -157,6 +157,47 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 限制：最多 8 条，`tag` 满足 `[a-z0-9_]{1,32}`，`text` ≤ 2000 字符
 （trim 后非空）。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
+**可选：记忆注入范围。** 请求体可附加 `memory_scope` 字符串，控制哪些
+记忆层会被注入到 prompt 中。接受值：
+
+| 值 | 注入内容 |
+|-------|----------|
+| `full` | 完整用户画像（含亲密字段）+ 关系记忆 |
+| `neutral_and_relationship` | 中性画像（仅城市/职业/MBTI）+ 关系记忆 **（默认）** |
+| `relationship_only` | 仅关系记忆；不含画像 |
+| `neutral_only` | 仅中性画像；不含关系记忆 |
+| `insights_only` | 仅完整用户画像（含亲密字段）；不含关系记忆 |
+| `none` | 不注入任何记忆 |
+
+> **重要（#40 缓解措施）：** 默认的 `neutral_and_relationship` 有意比
+> #40 之前的行为更窄（旧行为注入全部内容）。**省略 `memory_scope` 并不
+> 等同于旧行为**——会应用收窄后的默认值。如需完整注入，请显式指定 `full`。
+
+**可选：好感度注入范围。** 请求体可附加 `affinity_scope` 值，控制六个
+好感度轴中哪些会被注入到 prompt 中。接受值：
+
+- 具名预设：`"bond"` **（默认）** — warmth + intimacy + tension；
+  `"chemistry"` — trust + intrigue + patience；`"bond_and_chemistry"` / `"full"` — 全部六轴；`"none"` — 不注入好感度。
+- 轴数组：`["warmth", "trust", "intrigue", "intimacy", "patience", "tension"]` 的任意子集。
+
+> **重要（#40 缓解措施）：** 默认的 `bond`（3 轴）有意比 #40 之前的行为
+> 更窄（旧行为注入全部六轴）。**省略 `affinity_scope` 并不等同于旧行为**。
+> 如需全轴注入，请显式指定 `"bond_and_chemistry"` 或 `"full"`。
+
+同时使用两个字段的示例：
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "memory_scope": "full",
+        "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **可选：OpenRouter audit 透传。** 请求体可附加 `audit` 对象，
 原样作为 wire 级别的 `user` / `session_id` / `metadata` 发送给
 OpenRouter —— 详见 [llm-audit.zh.md](llm-audit.zh.md)。示例：

@@ -147,6 +147,21 @@ impl AffinityScope {
             || self.tension)
     }
 
+    /// Number of axes that are active (0..=6). Used for observability tracing.
+    pub fn active_count(self) -> usize {
+        [
+            self.warmth,
+            self.trust,
+            self.intrigue,
+            self.intimacy,
+            self.patience,
+            self.tension,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count()
+    }
+
     /// Composite length score per the #40 spec. `None` when no axis is in scope
     /// (caller falls back to the strictest tier, matching `affinity = None`).
     pub fn length_score(self, a: &Affinity) -> Option<f64> {
@@ -272,6 +287,15 @@ mod tests {
         assert!(!s.intrigue && !s.intimacy && !s.patience && !s.tension);
         assert!(AffinityScope::from_axes(&[]).is_empty());
         assert!(AffinityScope::none().is_empty());
+    }
+
+    #[test]
+    fn affinity_scope_active_count() {
+        assert_eq!(AffinityScope::none().active_count(), 0);
+        assert_eq!(AffinityScope::bond().active_count(), 3);
+        assert_eq!(AffinityScope::full().active_count(), 6);
+        let one = AffinityScope::from_axes(&[AffinityAxis::Warmth]);
+        assert_eq!(one.active_count(), 1);
     }
 
     #[test]

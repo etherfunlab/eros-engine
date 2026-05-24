@@ -461,6 +461,13 @@ pub(super) async fn build_reply_request(
         _ => (MemoryScope::default(), AffinityScope::default()),
     };
     let (mem_mode, x_on, y_on) = memory_scope.resolve();
+    tracing::info!(
+        memory_scope = ?memory_scope,
+        affinity_axes = affinity_scope.active_count(),
+        x_on,
+        y_on,
+        "chat scopes resolved"
+    );
 
     let (mut profile_groups, relationship_facts) =
         recall_memory(state, user_id, instance_id, query_text, x_on, y_on).await;
