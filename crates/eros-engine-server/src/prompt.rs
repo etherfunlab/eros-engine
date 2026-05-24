@@ -637,10 +637,20 @@ mod tests {
     #[test]
     fn build_prompt_with_empty_traits_omits_section() {
         let p = build_prompt(
-            &fixture_persona(), &[], &[], None, &[], "normal",
-            ReplyStyle::Neutral, &[], &[],
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
-        assert!(!p.contains("【附加指引】"), "empty traits must not render section");
+        assert!(
+            !p.contains("【附加指引】"),
+            "empty traits must not render section"
+        );
         // 擅长话题 now flows straight into 本轮风格 (the first volatile block).
         assert!(
             p.contains("【擅长话题】t1\n\n【本轮风格】"),
@@ -682,10 +692,20 @@ mod tests {
 
     #[test]
     fn build_prompt_stable_block_order() {
-        let traits = vec![PromptTrait { tag: "x".into(), text: "trait body".into() }];
+        let traits = vec![PromptTrait {
+            tag: "x".into(),
+            text: "trait body".into(),
+        }];
         let p = build_prompt(
-            &fixture_persona(), &[], &[], None, &[], "normal",
-            ReplyStyle::Neutral, &[], &traits,
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &traits,
         );
         let topics = p.find("【擅长话题】").expect("topics");
         let traits_i = p.find("【附加指引】").expect("traits");
@@ -699,14 +719,29 @@ mod tests {
     #[test]
     fn build_prompt_full_order_and_cache_break() {
         let s = build_prompt(
-            &fixture_persona(), &[], &[], None, &[], "normal",
-            ReplyStyle::Neutral, &[], &[],
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
-            "你是 ", "【背景故事】", "【说话风格】", "【口癖/习惯】", "【擅长话题】",
-            "【本轮风格】", "【你对他的了解（通用画像）】", "【你们之间的事",
-            "【今日情境】", "【铁律", "【输出】",
+            "你是 ",
+            "【背景故事】",
+            "【说话风格】",
+            "【口癖/习惯】",
+            "【擅长话题】",
+            "【本轮风格】",
+            "【你对他的了解（通用画像）】",
+            "【你们之间的事",
+            "【今日情境】",
+            "【铁律",
+            "【输出】",
         ];
         let mut last = 0usize;
         for h in order {
@@ -715,8 +750,15 @@ mod tests {
             last = cur;
         }
         let topics = pos("【擅长话题】");
-        for vol in ["【本轮风格】", "【你对他的了解（通用画像）】", "【今日情境】"] {
-            assert!(pos(vol) > topics, "{vol} must sit after the stable persona block");
+        for vol in [
+            "【本轮风格】",
+            "【你对他的了解（通用画像）】",
+            "【今日情境】",
+        ] {
+            assert!(
+                pos(vol) > topics,
+                "{vol} must sit after the stable persona block"
+            );
         }
     }
 
@@ -725,7 +767,15 @@ mod tests {
         let mut p = fixture_persona();
         p.genome.system_prompt = "AUTHORED HEAD".into();
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         assert!(
             s.starts_with("AUTHORED HEAD\n\n你是 "),
@@ -738,9 +788,20 @@ mod tests {
         let mut p = fixture_persona();
         p.genome.system_prompt = "   ".into();
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
-        assert!(s.starts_with("你是 "), "empty head → starts with identity: {s}");
+        assert!(
+            s.starts_with("你是 "),
+            "empty head → starts with identity: {s}"
+        );
     }
 
     #[test]
@@ -748,7 +809,15 @@ mod tests {
         let mut p = fixture_persona();
         set_meta(&mut p, "gender", serde_json::json!("male"));
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -759,17 +828,39 @@ mod tests {
         let mut p = fixture_persona();
         set_meta(&mut p, "gender", serde_json::json!("non-binary"));
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
-        assert!(s.contains("你是 Aria，non-binary，24 岁"), "verbatim render: {s}");
-        assert!(!s.contains("⑧"), "non-binary must not get the binary anatomy rule: {s}");
+        assert!(
+            s.contains("你是 Aria，non-binary，24 岁"),
+            "verbatim render: {s}"
+        );
+        assert!(
+            !s.contains("⑧"),
+            "non-binary must not get the binary anatomy rule: {s}"
+        );
     }
 
     #[test]
     fn build_prompt_omits_gender_when_absent() {
         let p = fixture_persona(); // fixture art_metadata has no gender key
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -780,11 +871,22 @@ mod tests {
         let mut p = fixture_persona();
         set_meta(&mut p, "gender", serde_json::json!("   "));
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
-        assert!(!s.contains("，，"), "blank gender must not double-comma: {s}");
+        assert!(
+            !s.contains("，，"),
+            "blank gender must not double-comma: {s}"
+        );
         assert!(!s.contains("⑧"), "{s}");
     }
 
@@ -793,7 +895,15 @@ mod tests {
         let mut p = fixture_persona();
         set_meta(&mut p, "timezone", serde_json::json!("Asia/Tokyo"));
         let s = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -805,7 +915,15 @@ mod tests {
     fn build_prompt_stable_prefix_identical_across_volatile_changes() {
         let p = fixture_persona();
         let a = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -832,13 +950,35 @@ mod tests {
     #[test]
     fn build_prompt_traits_change_only_breaks_after_topics() {
         let p = fixture_persona();
-        let t1 = vec![PromptTrait { tag: "a".into(), text: "alpha".into() }];
-        let t2 = vec![PromptTrait { tag: "b".into(), text: "beta".into() }];
+        let t1 = vec![PromptTrait {
+            tag: "a".into(),
+            text: "alpha".into(),
+        }];
+        let t2 = vec![PromptTrait {
+            tag: "b".into(),
+            text: "beta".into(),
+        }];
         let a = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &t1,
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &t1,
         );
         let b = build_prompt(
-            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &t2,
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &t2,
         );
         let cut = a.find("【附加指引】").expect("traits header present");
         assert_eq!(
@@ -1004,11 +1144,17 @@ mod tests {
         let s = now_context_at(dt, Some("Asia/Tokyo"));
         assert!(s.contains("Asia/Tokyo"), "renders the persona zone id: {s}");
         assert!(s.contains("2026-05-22"), "local date should roll over: {s}");
-        assert!(s.contains("周五"), "local weekday should be Friday, not UTC Thursday: {s}");
+        assert!(
+            s.contains("周五"),
+            "local weekday should be Friday, not UTC Thursday: {s}"
+        );
         assert!(s.contains("05:00"), "{s}");
         assert!(s.contains("清晨"), "05:00 local → 清晨: {s}");
         assert!(s.contains("唯一的时间基准"), "{s}");
-        assert!(s.contains("今天/今晚/明天/昨天/刚才/现在"), "relative-date binding: {s}");
+        assert!(
+            s.contains("今天/今晚/明天/昨天/刚才/现在"),
+            "relative-date binding: {s}"
+        );
     }
 
     #[test]
@@ -1016,7 +1162,10 @@ mod tests {
         // Unparseable tz → SGT default (not UTC): 07:55 UTC → 15:55 SGT.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap();
         let s = now_context_at(dt, Some("Not/AZone"));
-        assert!(s.contains("Asia/Singapore"), "garbage tz falls back to SGT: {s}");
+        assert!(
+            s.contains("Asia/Singapore"),
+            "garbage tz falls back to SGT: {s}"
+        );
         assert!(s.contains("15:55"), "{s}");
         assert!(!s.contains("UTC"), "{s}");
     }
