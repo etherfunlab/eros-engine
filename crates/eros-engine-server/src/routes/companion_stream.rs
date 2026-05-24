@@ -55,6 +55,8 @@ pub enum AffinityScopeDto {
 impl AffinityScopeDto {
     fn resolve(&self) -> AffinityScope {
         match self {
+            // bond (warmth+intimacy+tension) ∪ chemistry (trust+intrigue+patience)
+            // covers all six axes — identical to Full.
             AffinityScopeDto::Named(AffinityScopeName::Full)
             | AffinityScopeDto::Named(AffinityScopeName::BondAndChemistry) => AffinityScope::full(),
             AffinityScopeDto::Named(AffinityScopeName::Bond) => AffinityScope::bond(),
@@ -365,6 +367,14 @@ mod tests {
     fn affinity_scope_dto_resolves_named_and_array() {
         let named: AffinityScopeDto = serde_json::from_str("\"chemistry\"").unwrap();
         assert_eq!(named.resolve(), AffinityScope::chemistry());
+        let bond: AffinityScopeDto = serde_json::from_str("\"bond\"").unwrap();
+        assert_eq!(bond.resolve(), AffinityScope::bond());
+        let full: AffinityScopeDto = serde_json::from_str("\"full\"").unwrap();
+        assert_eq!(full.resolve(), AffinityScope::full());
+        let bac: AffinityScopeDto = serde_json::from_str("\"bond_and_chemistry\"").unwrap();
+        assert_eq!(bac.resolve(), AffinityScope::full());
+        let none: AffinityScopeDto = serde_json::from_str("\"none\"").unwrap();
+        assert!(none.resolve().is_empty());
         let arr: AffinityScopeDto = serde_json::from_str("[\"warmth\",\"trust\"]").unwrap();
         assert_eq!(
             arr.resolve(),
