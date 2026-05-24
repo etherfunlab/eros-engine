@@ -68,39 +68,31 @@ fn period_cn(hour: u32) -> &'static str {
     }
 }
 
-/// Absolute "now" context. With a parseable IANA `timezone` we render the
-/// persona's LOCAL date/weekday/time/period directly (the model does no
-/// arithmetic — this is the fix for the time-hallucination bug). Without one we
-/// fall back to UTC + infer-from-residence, hardened against fabricating times.
+/// Absolute "now" context. Renders the persona's LOCAL date/weekday/time/period
+/// directly so the model does no arithmetic — this is the fix for the
+/// time-hallucination bug. The zone is the persona's own IANA `timezone` when
+/// set & valid; otherwise we default to SGT (UTC+8), since most users sit in
+/// UTC+8 — an unset persona then shares their wall clock rather than guessing.
 fn now_context(timezone: Option<&str>) -> String {
     now_context_at(Utc::now(), timezone)
 }
 
 fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String {
-    match timezone.and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok()) {
-        Some(tz) => {
-            let local = now.with_timezone(&tz);
-            format!(
-                "现在你当地时间是 {date}（{wd}）{hh:02}:{mm:02}，{period}。\
-                 这是你唯一的时间基准，不要编造其它日期或时间。",
-                date = local.format("%Y-%m-%d"),
-                wd = weekday_cn(local.weekday()),
-                hh = local.hour(),
-                mm = local.minute(),
-                period = period_cn(local.hour()),
-            )
-        }
-        None => format!(
-            "现在是 UTC {date}（{wd}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
-             推算你当地的时间和日期，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、\
-             星期几。严格以上述 UTC 时间为唯一基准，不得编造其它日期或时间；无法换算时区时\
-             只说大致时段，不要编造具体钟点。",
-            date = now.format("%Y-%m-%d"),
-            wd = weekday_cn(now.weekday()),
-            hh = now.hour(),
-            mm = now.minute(),
-        ),
-    }
+    let tz = timezone
+        .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Asia::Singapore);
+    let local = now.with_timezone(&tz);
+    format!(
+        "现在你当地时间（{tz}）是 {date}（{wd}）{hh:02}:{mm:02}，{period}。\
+         这是你唯一的时间基准；用户提到「今天/今晚/明天/昨天/刚才/现在」时一律以此为准，\
+         不要编造其它日期或时间。",
+        tz = tz.name(),
+        date = local.format("%Y-%m-%d"),
+        wd = weekday_cn(local.weekday()),
+        hh = local.hour(),
+        mm = local.minute(),
+        period = period_cn(local.hour()),
+    )
 }
 
 /// Reply-length rule for 铁律①, graduated by `intimacy` (0~1). Looser as the
@@ -444,8 +436,9 @@ pub fn build_prompt(
     let gender_rule = if is_binary_gender(persona) {
         let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
-            "\n⑧ 你是{g}，严格遵守自己的性别，绝不说出与自身性别矛盾的身体或身份描述；\
-             除非在与用户的角色扮演中双方明确约定你暂时扮演其他性别"
+            "\n⑧ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+             也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
+             或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
         )
     } else {
         String::new()
@@ -805,6 +798,57 @@ mod tests {
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
 
+    // ─── Cache-prefix boundary invariants ──────────────────────────────
+    // Same-user multi-turn: the stable block (everything before 【本轮风格】) is
+    // byte-identical no matter how the per-turn-volatile inputs change.
+    #[test]
+    fn build_prompt_stable_prefix_identical_across_volatile_changes() {
+        let p = fixture_persona();
+        let a = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
+        let b = build_prompt(
+            &p,
+            &groups,
+            &["聊到深夜".to_string()],
+            Some(&fixture_affinity()),
+            &[],
+            "normal",
+            ReplyStyle::Warm,
+            &["想他".to_string()],
+            &[],
+        );
+        let cut = a.find("【本轮风格】").expect("turn-style header present");
+        assert_eq!(
+            &a[..cut],
+            &b[..cut],
+            "everything before 【本轮风格】 must be byte-identical across turns"
+        );
+    }
+
+    // Cross-config: different trait sets share the persona block up to 【擅长话题】
+    // (the divergence is at 【附加指引】), but the full prompts differ.
+    #[test]
+    fn build_prompt_traits_change_only_breaks_after_topics() {
+        let p = fixture_persona();
+        let t1 = vec![PromptTrait { tag: "a".into(), text: "alpha".into() }];
+        let t2 = vec![PromptTrait { tag: "b".into(), text: "beta".into() }];
+        let a = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &t1,
+        );
+        let b = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &t2,
+        );
+        let cut = a.find("【附加指引】").expect("traits header present");
+        assert_eq!(
+            &a[..cut],
+            &b[..cut],
+            "persona block up to 【擅长话题】 is shared across trait configs"
+        );
+        assert_ne!(a, b, "different trait sets must produce different prompts");
+    }
+
     #[test]
     fn test_style_directive_for_all_styles() {
         assert!(!style_directive(ReplyStyle::Warm).is_empty());
@@ -940,14 +984,17 @@ mod tests {
     }
 
     #[test]
-    fn now_context_fallback_renders_utc_and_hardened_wording() {
+    fn now_context_defaults_to_sgt_when_timezone_absent() {
+        // No persona tz → default SGT (UTC+8): 07:55 UTC → 15:55 same day, Thursday.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap(); // a Thursday
         let s = now_context_at(dt, None);
+        assert!(s.contains("Asia/Singapore"), "default zone is SGT: {s}");
         assert!(s.contains("2026-05-21"), "{s}");
         assert!(s.contains("周四"), "{s}");
-        assert!(s.contains("07:55"), "{s}");
-        assert!(s.contains("居住地"), "{s}");
-        assert!(s.contains("不得编造"), "hardened anti-fabrication wording: {s}");
+        assert!(s.contains("15:55"), "07:55 UTC +8 = 15:55: {s}");
+        assert!(s.contains("白天"), "{s}");
+        assert!(s.contains("唯一的时间基准"), "{s}");
+        assert!(!s.contains("UTC"), "no UTC-inference path anymore: {s}");
     }
 
     #[test]
@@ -955,17 +1002,22 @@ mod tests {
         // 2026-05-21 20:00 UTC is Thursday; Asia/Tokyo (UTC+9) → 2026-05-22 05:00, Friday.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 20, 0, 0).unwrap();
         let s = now_context_at(dt, Some("Asia/Tokyo"));
+        assert!(s.contains("Asia/Tokyo"), "renders the persona zone id: {s}");
         assert!(s.contains("2026-05-22"), "local date should roll over: {s}");
         assert!(s.contains("周五"), "local weekday should be Friday, not UTC Thursday: {s}");
         assert!(s.contains("05:00"), "{s}");
         assert!(s.contains("清晨"), "05:00 local → 清晨: {s}");
         assert!(s.contains("唯一的时间基准"), "{s}");
+        assert!(s.contains("今天/今晚/明天/昨天/刚才/现在"), "relative-date binding: {s}");
     }
 
     #[test]
-    fn now_context_with_garbage_timezone_falls_back() {
+    fn now_context_with_garbage_timezone_defaults_to_sgt() {
+        // Unparseable tz → SGT default (not UTC): 07:55 UTC → 15:55 SGT.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap();
         let s = now_context_at(dt, Some("Not/AZone"));
-        assert!(s.contains("UTC"), "unparseable tz falls back to UTC: {s}");
+        assert!(s.contains("Asia/Singapore"), "garbage tz falls back to SGT: {s}");
+        assert!(s.contains("15:55"), "{s}");
+        assert!(!s.contains("UTC"), "{s}");
     }
 }
