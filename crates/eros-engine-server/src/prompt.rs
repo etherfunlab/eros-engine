@@ -23,7 +23,7 @@
 //! so don't live here. Future port targets (dream / proactive) should be
 //! added as new families in this file.
 
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
@@ -46,35 +46,61 @@ pub struct PendingGift {
     pub item_name: Option<String>,
 }
 
-/// Absolute "now" context. Renders the current UTC date + weekday + time and
-/// asks the model to infer the companion's LOCAL time from its residence
-/// (set in the persona backstory). We deliberately do NOT pre-apply a fixed
-/// timezone — personas live in different places, so the model derives local
-/// time from absolute UTC + residence. This is what lets the companion
-/// "perceive" today's date.
-fn now_context() -> String {
-    now_context_at(Utc::now())
+fn weekday_cn(wd: Weekday) -> &'static str {
+    match wd {
+        Weekday::Mon => "周一",
+        Weekday::Tue => "周二",
+        Weekday::Wed => "周三",
+        Weekday::Thu => "周四",
+        Weekday::Fri => "周五",
+        Weekday::Sat => "周六",
+        Weekday::Sun => "周日",
+    }
 }
 
-fn now_context_at(now: chrono::DateTime<Utc>) -> String {
-    let weekday = match now.weekday() {
-        chrono::Weekday::Mon => "周一",
-        chrono::Weekday::Tue => "周二",
-        chrono::Weekday::Wed => "周三",
-        chrono::Weekday::Thu => "周四",
-        chrono::Weekday::Fri => "周五",
-        chrono::Weekday::Sat => "周六",
-        chrono::Weekday::Sun => "周日",
-    };
-    format!(
-        "现在是 UTC {date}（{weekday}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
-         推算你当地的时间和日期，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、\
-         星期几，并据此开启符合当地时段的话题。",
-        date = now.format("%Y-%m-%d"),
-        weekday = weekday,
-        hh = now.hour(),
-        mm = now.minute(),
-    )
+/// Coarse day-part bucket from a local hour (0-23).
+fn period_cn(hour: u32) -> &'static str {
+    match hour {
+        5..=7 => "清晨",
+        8..=17 => "白天",
+        18..=22 => "傍晚",
+        _ => "深夜",
+    }
+}
+
+/// Absolute "now" context. With a parseable IANA `timezone` we render the
+/// persona's LOCAL date/weekday/time/period directly (the model does no
+/// arithmetic — this is the fix for the time-hallucination bug). Without one we
+/// fall back to UTC + infer-from-residence, hardened against fabricating times.
+fn now_context(timezone: Option<&str>) -> String {
+    now_context_at(Utc::now(), timezone)
+}
+
+fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String {
+    match timezone.and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok()) {
+        Some(tz) => {
+            let local = now.with_timezone(&tz);
+            format!(
+                "现在你当地时间是 {date}（{wd}）{hh:02}:{mm:02}，{period}。\
+                 这是你唯一的时间基准，不要编造其它日期或时间。",
+                date = local.format("%Y-%m-%d"),
+                wd = weekday_cn(local.weekday()),
+                hh = local.hour(),
+                mm = local.minute(),
+                period = period_cn(local.hour()),
+            )
+        }
+        None => format!(
+            "现在是 UTC {date}（{wd}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
+             推算你当地的时间和日期，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、\
+             星期几。严格以上述 UTC 时间为唯一基准，不得编造其它日期或时间；无法换算时区时\
+             只说大致时段，不要编造具体钟点。",
+            date = now.format("%Y-%m-%d"),
+            wd = weekday_cn(now.weekday()),
+            hh = now.hour(),
+            mm = now.minute(),
+        ),
+    }
 }
 
 /// Reply-length rule for 铁律①, graduated by `intimacy` (0~1). Looser as the
@@ -405,7 +431,7 @@ pub fn build_prompt(
          ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
-        tc = now_context(),
+        tc = now_context(meta_str(persona, "timezone")),
         lr = length_rule(affinity),
     )
 }
@@ -778,12 +804,32 @@ mod tests {
     }
 
     #[test]
-    fn now_context_renders_absolute_utc_date_weekday_time() {
+    fn now_context_fallback_renders_utc_and_hardened_wording() {
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap(); // a Thursday
-        let s = now_context_at(dt);
+        let s = now_context_at(dt, None);
         assert!(s.contains("2026-05-21"), "{s}");
         assert!(s.contains("周四"), "{s}");
         assert!(s.contains("07:55"), "{s}");
         assert!(s.contains("居住地"), "{s}");
+        assert!(s.contains("不得编造"), "hardened anti-fabrication wording: {s}");
+    }
+
+    #[test]
+    fn now_context_with_timezone_uses_local_date_weekday_time() {
+        // 2026-05-21 20:00 UTC is Thursday; Asia/Tokyo (UTC+9) → 2026-05-22 05:00, Friday.
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 20, 0, 0).unwrap();
+        let s = now_context_at(dt, Some("Asia/Tokyo"));
+        assert!(s.contains("2026-05-22"), "local date should roll over: {s}");
+        assert!(s.contains("周五"), "local weekday should be Friday, not UTC Thursday: {s}");
+        assert!(s.contains("05:00"), "{s}");
+        assert!(s.contains("清晨"), "05:00 local → 清晨: {s}");
+        assert!(s.contains("唯一的时间基准"), "{s}");
+    }
+
+    #[test]
+    fn now_context_with_garbage_timezone_falls_back() {
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap();
+        let s = now_context_at(dt, Some("Not/AZone"));
+        assert!(s.contains("UTC"), "unparseable tz falls back to UTC: {s}");
     }
 }
