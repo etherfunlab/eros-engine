@@ -45,7 +45,7 @@ output.** That is intentional — the new defaults are the #40 mitigation:
 
 | Flag | Omitted-default | vs. today |
 |------|-----------------|-----------|
-| `memory_scope` | `neutral_and_relationship` | drops intimate insights + global memory layer from the default prompt |
+| `memory_scope` | `neutral_and_relationship` | drops the intimate insight *fields* (W→W') from the default prompt; global memory recall (X) stays ON — use `relationship_only` to also stop global cross-persona bleed |
 | `affinity_scope` | `bond` | injects 3 axes (warmth/intimacy/tension) instead of all 6 |
 
 Byte-for-byte parity with today is reachable explicitly: `memory_scope:"full"`
