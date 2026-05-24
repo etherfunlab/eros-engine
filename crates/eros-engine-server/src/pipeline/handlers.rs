@@ -235,6 +235,8 @@ async fn recall_memory_with_embedding(
         };
         (vec![], rel)
     } else {
+        // Unreachable via MemoryScope::resolve() (x_on ⇒ y_on); defensive for
+        // any direct caller that passes both layers off.
         (vec![], vec![])
     };
 
@@ -245,6 +247,8 @@ async fn recall_memory_with_embedding(
     tracing::debug!(
         user_id = %user_id,
         instance_id = %instance_id,
+        x_on,
+        y_on,
         profile_groups = profile_groups.len(),
         profile_total_chars,
         relationship_hits = relationship.len(),
@@ -1180,7 +1184,11 @@ mod tests {
             true,
         )
         .await;
-        assert!(!prof3.is_empty() && !rel3.is_empty());
+        assert!(
+            !prof3.is_empty(),
+            "profile groups should be present when X on"
+        );
+        assert!(!rel3.is_empty(), "relationship should be present when Y on");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
