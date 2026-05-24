@@ -128,6 +128,16 @@ impl AffinityScope {
         }
         s
     }
+    pub fn contains(self, axis: AffinityAxis) -> bool {
+        match axis {
+            AffinityAxis::Warmth => self.warmth,
+            AffinityAxis::Trust => self.trust,
+            AffinityAxis::Intrigue => self.intrigue,
+            AffinityAxis::Intimacy => self.intimacy,
+            AffinityAxis::Patience => self.patience,
+            AffinityAxis::Tension => self.tension,
+        }
+    }
     pub fn is_empty(self) -> bool {
         !(self.warmth
             || self.trust
@@ -155,13 +165,7 @@ impl AffinityScope {
 }
 
 fn clamp01(x: f64) -> f64 {
-    if x < 0.0 {
-        0.0
-    } else if x > 1.0 {
-        1.0
-    } else {
-        x
-    }
+    x.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -170,7 +174,14 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    fn affinity(warmth: f64, trust: f64, intrigue: f64, intimacy: f64, patience: f64, tension: f64) -> Affinity {
+    fn affinity(
+        warmth: f64,
+        trust: f64,
+        intrigue: f64,
+        intimacy: f64,
+        patience: f64,
+        tension: f64,
+    ) -> Affinity {
         let now = Utc::now();
         Affinity {
             id: Uuid::new_v4(),
@@ -196,7 +207,10 @@ mod tests {
     fn memory_scope_resolution_table() {
         use InsightMode::*;
         assert_eq!(MemoryScope::Full.resolve(), (Full, true, true));
-        assert_eq!(MemoryScope::NeutralAndRelationship.resolve(), (Neutral, true, true));
+        assert_eq!(
+            MemoryScope::NeutralAndRelationship.resolve(),
+            (Neutral, true, true)
+        );
         assert_eq!(MemoryScope::RelationshipOnly.resolve(), (Off, false, true));
         assert_eq!(MemoryScope::NeutralOnly.resolve(), (Neutral, false, false));
         assert_eq!(MemoryScope::InsightsOnly.resolve(), (Full, false, false));
@@ -212,7 +226,25 @@ mod tests {
     fn memory_scope_serde_snake_case() {
         let s: MemoryScope = serde_json::from_str("\"relationship_only\"").unwrap();
         assert_eq!(s, MemoryScope::RelationshipOnly);
+        // multi-word default variant round-trips
+        let n: MemoryScope = serde_json::from_str("\"neutral_and_relationship\"").unwrap();
+        assert_eq!(n, MemoryScope::NeutralAndRelationship);
+        assert_eq!(
+            serde_json::to_string(&MemoryScope::NeutralAndRelationship).unwrap(),
+            "\"neutral_and_relationship\""
+        );
         assert!(serde_json::from_str::<MemoryScope>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn affinity_scope_contains_matches_fields() {
+        let s = AffinityScope::bond();
+        assert!(s.contains(AffinityAxis::Warmth));
+        assert!(s.contains(AffinityAxis::Intimacy));
+        assert!(s.contains(AffinityAxis::Tension));
+        assert!(!s.contains(AffinityAxis::Trust));
+        assert!(!s.contains(AffinityAxis::Intrigue));
+        assert!(!s.contains(AffinityAxis::Patience));
     }
 
     #[test]
