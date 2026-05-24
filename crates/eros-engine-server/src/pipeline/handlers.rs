@@ -342,10 +342,13 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
 /// `InsightMode::Full` reproduces the legacy output byte-for-byte. `Neutral`
 /// drops the intimate fields (love_values / emotional_needs / interests).
 /// Matching-only columns (preferred_gender / age / deal_breakers) are never
-/// rendered.
+/// rendered. `Off` → empty (defensive; loaders gate it before calling).
 // wired into the recall path in Task 5
 #[allow(dead_code)]
 fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
+    if matches!(mode, InsightMode::Off) {
+        return vec![];
+    }
     let mut out = Vec::new();
     let push_str = |out: &mut Vec<String>, val: &Option<String>, label: &str| {
         if let Some(s) = val {
@@ -1121,9 +1124,37 @@ mod tests {
                 "性格特质：温柔"
             ]
         );
-        assert!(bullets
-            .iter()
-            .all(|b| !b.contains("female") && !b.contains("抽烟")));
+        // matching-only columns (preferred_gender / age / deal_breakers) are
+        // never rendered in any mode — proven by the exact vec above.
+    }
+
+    #[test]
+    fn human_insights_full_matches_companion_insights_renderer() {
+        // The byte-identical parity contract: Full mode over a human_insights row
+        // must equal insights_to_bullets over the equivalent companion_insights JSON.
+        let row = sample_human_row();
+        let equivalent = serde_json::json!({
+            "city": "上海",
+            "occupation": "设计师",
+            "mbti_guess": "INFP",
+            "love_values": "慢热",
+            "interests": ["登山", "摄影"],
+            "emotional_needs": "被理解",
+            "life_rhythm": "夜猫子",
+            "personality_traits": ["温柔"],
+            // matching-only fields exist in JSON too but neither renderer emits them
+            "matching_preferences": { "preferred_gender": "female", "age_range": [25, 35] }
+        });
+        assert_eq!(
+            human_insights_to_bullets(&row, InsightMode::Full),
+            insights_to_bullets(&equivalent)
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_human_insight_bullets_returns_empty_for_unknown_user(pool: PgPool) {
+        let bullets = load_human_insight_bullets(&pool, Uuid::new_v4(), InsightMode::Full).await;
+        assert!(bullets.is_empty());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
