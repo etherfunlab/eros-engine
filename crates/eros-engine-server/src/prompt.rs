@@ -300,13 +300,16 @@ fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<Str
 }
 
 /// Display label for the persona's gender. `male`/`female` → Chinese; any other
-/// non-empty value (e.g. "non-binary") is rendered verbatim; absent → None.
+/// non-empty value (e.g. "non-binary") is rendered verbatim; absent or
+/// blank → None (so a `""` value can't produce a double-comma identity line).
 fn gender_label(persona: &CompanionPersona) -> Option<String> {
-    meta_str(persona, "gender").map(|g| match g {
-        "male" => "男性".to_string(),
-        "female" => "女性".to_string(),
-        other => other.to_string(),
-    })
+    meta_str(persona, "gender")
+        .filter(|g| !g.trim().is_empty())
+        .map(|g| match g {
+            "male" => "男性".to_string(),
+            "female" => "女性".to_string(),
+            other => other.to_string(),
+        })
 }
 
 /// Whether gender is a binary value that warrants the 铁律 anatomy clause.
@@ -439,7 +442,7 @@ pub fn build_prompt(
     // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     let gender_rule = if is_binary_gender(persona) {
-        let g = gender_label(persona).unwrap_or_default();
+        let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
             "\n⑧ 你是{g}，严格遵守自己的性别，绝不说出与自身性别矛盾的身体或身份描述；\
              除非在与用户的角色扮演中双方明确约定你暂时扮演其他性别"
@@ -777,6 +780,19 @@ mod tests {
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
+    }
+
+    #[test]
+    fn build_prompt_treats_blank_gender_as_absent() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("   "));
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        // blank gender must not produce a double comma or a ⑧ rule
+        assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
+        assert!(!s.contains("，，"), "blank gender must not double-comma: {s}");
+        assert!(!s.contains("⑧"), "{s}");
     }
 
     #[test]
