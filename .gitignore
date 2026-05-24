@@ -17,7 +17,3 @@ docs/superpowers/plans/
 
 # Supabase CLI scratch state (created by `supabase link`).
 **/supabase/.temp/
-
-examples/model_config.toml
-fly.toml
-docker/Dockerfile.fly
