@@ -209,6 +209,8 @@ mod tests {
             prompt_traits: Vec::new(),
             audit: None,
             tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
         }
     }
 

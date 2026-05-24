@@ -1018,6 +1018,8 @@ mod tests {
             prompt_traits: vec![],
             audit: Some(audit.clone()),
             tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));

@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::affinity::{Affinity, AffinityDeltas};
 use crate::persona::CompanionPersona;
+use crate::scope::{AffinityScope, MemoryScope};
 
 /// A caller-supplied system-prompt fragment. The engine treats `text` as
 /// opaque — it is inserted verbatim under the `【附加指引】` section of
@@ -54,6 +55,14 @@ pub enum Event {
         /// `model_config.resolve` to pick the per-tier model + allow_traits.
         #[serde(default)]
         tier: Option<String>,
+        /// Optional caller-supplied memory injection scope (#40). Defaults to
+        /// `neutral_and_relationship` when absent.
+        #[serde(default)]
+        memory_scope: MemoryScope,
+        /// Optional caller-supplied affinity-axis injection scope (#40).
+        /// Defaults to `bond` when absent.
+        #[serde(default)]
+        affinity_scope: AffinityScope,
     },
     Gift {
         gift_id: Uuid,
@@ -190,6 +199,26 @@ mod tests {
         match ev {
             Event::UserMessage { tier, .. } => {
                 assert!(tier.is_none(), "missing tier must default to None")
+            }
+            _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
+    fn user_message_defaults_scopes_when_absent() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).unwrap();
+        match ev {
+            Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } => {
+                assert_eq!(
+                    memory_scope,
+                    crate::scope::MemoryScope::NeutralAndRelationship
+                );
+                assert_eq!(affinity_scope, crate::scope::AffinityScope::bond());
             }
             _ => panic!("expected UserMessage"),
         }
