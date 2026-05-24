@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
-use eros_engine_core::scope::InsightMode;
+use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
@@ -142,17 +142,19 @@ fn assemble_chat_request(
 // ─── Memory recall + insight injection helpers ────────────────────
 
 /// Embed `query_text` once, then delegate to `recall_memory_with_embedding`.
-/// Empty query → returns (empty, empty) without hitting Voyage. Voyage
-/// failure also degrades silently to (empty, empty) — recall failure must
-/// never block a chat reply (the persona just looks slightly less "with
-/// it" for that turn).
+/// Returns (empty, empty) without hitting Voyage when both layers are off or
+/// the query is blank. Voyage failure also degrades silently to (empty, empty)
+/// — recall failure must never block a chat reply (the persona just looks
+/// slightly less "with it" for that turn).
 async fn recall_memory(
     state: &AppState,
     user_id: Uuid,
     instance_id: Uuid,
     query_text: &str,
+    x_on: bool,
+    y_on: bool,
 ) -> (Vec<(String, Vec<String>)>, Vec<String>) {
-    if query_text.trim().is_empty() {
+    if (!x_on && !y_on) || query_text.trim().is_empty() {
         return (vec![], vec![]);
     }
     let embedding = match state.voyage.embed_query(query_text).await {
@@ -162,53 +164,78 @@ async fn recall_memory(
             return (vec![], vec![]);
         }
     };
-    // Observation hook for recall-quality investigation (RUST_LOG=...=debug).
-    // Cheap fields only: scalars + lengths, no content / no PII.
     tracing::debug!(
         user_id = %user_id,
         query_len = query_text.chars().count(),
         embedding_dim = embedding.len(),
+        x_on,
+        y_on,
         "recall_memory: embedded query, dispatching pgvector search"
     );
-    recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding).await
+    recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding, x_on, y_on).await
 }
 
-/// Pure-DB inner half of memory recall. Takes a pre-computed embedding,
-/// fans out to profile (categorised + raw fallback) + relationship layers
-/// in parallel via `tokio::join!`, and returns:
+/// Pure-DB inner half of memory recall. Takes a pre-computed embedding and
+/// layer-enable flags, then returns:
 /// - profile_groups: `Vec<(label, bullets)>` — categorised rows grouped by
 ///   `category` if any exist; otherwise a single `("近况", raw_rows)` group
 ///   so users with no classified sessions yet still get profile context.
+///   Empty when `x_on` is false.
 /// - relationship: flat `Vec<String>` — relationship rows are full turn
-///   dumps and not categorised by the dreaming-lite pass.
+///   dumps and not categorised by the dreaming-lite pass. Empty when `y_on`
+///   is false.
+///
+/// Hot path (`x_on` ⇒ `y_on`): the three profile + relationship searches run
+/// in parallel via `tokio::join!`. Relationship-only (`!x_on && y_on`): only
+/// the relationship search runs. Both off: no DB round-trip.
 async fn recall_memory_with_embedding(
     pool: &PgPool,
     user_id: Uuid,
     instance_id: Uuid,
     embedding: &[f32],
+    x_on: bool,
+    y_on: bool,
 ) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     let repo = MemoryRepo { pool };
-    let (grouped_res, raw_res, rel_res) = tokio::join!(
-        repo.search_profile_grouped(user_id, embedding, K_PER_CATEGORY),
-        repo.search(user_id, None, embedding, PROFILE_RECALL_K),
-        repo.search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K),
-    );
-    let grouped_rows = grouped_res.unwrap_or_else(|e| {
-        tracing::warn!("profile-layer grouped search failed: {e}");
-        vec![]
-    });
-    let raw_rows = raw_res.unwrap_or_else(|e| {
-        tracing::warn!("profile-layer raw search failed: {e}");
-        vec![]
-    });
-    let profile_groups = build_profile_groups(grouped_rows, raw_rows);
 
-    let relationship: Vec<String> = match rel_res {
-        Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
-        Err(e) => {
-            tracing::warn!("relationship-layer memory search failed: {e}");
+    let (profile_groups, relationship): (Vec<(String, Vec<String>)>, Vec<String>) = if x_on {
+        // X on ⇒ Y on: original three-way parallel recall (hot path).
+        let (grouped_res, raw_res, rel_res) = tokio::join!(
+            repo.search_profile_grouped(user_id, embedding, K_PER_CATEGORY),
+            repo.search(user_id, None, embedding, PROFILE_RECALL_K),
+            repo.search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K),
+        );
+        let grouped_rows = grouped_res.unwrap_or_else(|e| {
+            tracing::warn!("profile-layer grouped search failed: {e}");
             vec![]
-        }
+        });
+        let raw_rows = raw_res.unwrap_or_else(|e| {
+            tracing::warn!("profile-layer raw search failed: {e}");
+            vec![]
+        });
+        let rel = match rel_res {
+            Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
+            Err(e) => {
+                tracing::warn!("relationship-layer memory search failed: {e}");
+                vec![]
+            }
+        };
+        (build_profile_groups(grouped_rows, raw_rows), rel)
+    } else if y_on {
+        // relationship_only: skip both profile-layer searches.
+        let rel = match repo
+            .search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K)
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
+            Err(e) => {
+                tracing::warn!("relationship-layer memory search failed: {e}");
+                vec![]
+            }
+        };
+        (vec![], rel)
+    } else {
+        (vec![], vec![])
     };
 
     let profile_total_chars: usize = profile_groups
@@ -343,8 +370,6 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
 /// drops the intimate fields (love_values / emotional_needs / interests).
 /// Matching-only columns (preferred_gender / age / deal_breakers) are never
 /// rendered. `Off` → empty (defensive; loaders gate it before calling).
-// wired into the recall path in Task 5
-#[allow(dead_code)]
 fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
     if matches!(mode, InsightMode::Off) {
         return vec![];
@@ -384,8 +409,6 @@ fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<S
 }
 
 /// Load + render 基础画像 from the flat `human_insights` mirror. `Off` → empty.
-// wired into the recall path in Task 5
-#[allow(dead_code)]
 async fn load_human_insight_bullets(
     pool: &PgPool,
     user_id: Uuid,
@@ -425,10 +448,20 @@ pub(super) async fn build_reply_request(
         _ => "",
     };
 
-    let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text).await;
+    let (memory_scope, affinity_scope) = match &input.event {
+        Event::UserMessage {
+            memory_scope,
+            affinity_scope,
+            ..
+        } => (*memory_scope, *affinity_scope),
+        _ => (MemoryScope::default(), AffinityScope::default()),
+    };
+    let (mem_mode, x_on, y_on) = memory_scope.resolve();
 
-    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
+    let (mut profile_groups, relationship_facts) =
+        recall_memory(state, user_id, instance_id, query_text, x_on, y_on).await;
+
+    let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
     if !insight_bullets.is_empty() {
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
@@ -462,11 +495,6 @@ pub(super) async fn build_reply_request(
             "prompt_traits: dropped tags not allowed for tier"
         );
     }
-
-    let affinity_scope = match &input.event {
-        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
-        _ => eros_engine_core::scope::AffinityScope::default(),
-    };
 
     let system_prompt = build_prompt(
         &input.persona,
@@ -511,7 +539,7 @@ pub(super) async fn build_gift_request(
         .unwrap_or("");
 
     let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text).await;
+        recall_memory(state, user_id, instance_id, query_text, true, true).await;
 
     let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
     if !insight_bullets.is_empty() {
@@ -809,8 +837,15 @@ mod tests {
     async fn recall_memory_with_embedding_empty_db_returns_empty(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let instance_id = Uuid::new_v4();
-        let (profile, relationship) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(7)).await;
+        let (profile, relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(7),
+            true,
+            true,
+        )
+        .await;
         assert!(profile.is_empty());
         assert!(relationship.is_empty());
     }
@@ -849,8 +884,15 @@ mod tests {
         .await
         .unwrap();
 
-        let (profile_groups, relationship) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(11)).await;
+        let (profile_groups, relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(11),
+            true,
+            true,
+        )
+        .await;
         assert_eq!(
             profile_groups,
             vec![("近况".to_string(), vec!["profile fact".to_string()])]
@@ -902,8 +944,15 @@ mod tests {
         .await
         .unwrap();
 
-        let (profile_groups, _relationship) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(7)).await;
+        let (profile_groups, _relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(7),
+            true,
+            true,
+        )
+        .await;
 
         // Categorised rows surfaced; raw row dropped because grouped path won.
         let labels: Vec<&str> = profile_groups.iter().map(|(l, _)| l.as_str()).collect();
@@ -957,8 +1006,15 @@ mod tests {
             .unwrap();
         }
 
-        let (profile_groups, relationship) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(100)).await;
+        let (profile_groups, relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(100),
+            true,
+            true,
+        )
+        .await;
 
         // No categorised rows exist → raw fallback fires under "近况"
         // with PROFILE_RECALL_K entries from the cosine top-K.
@@ -1028,8 +1084,15 @@ mod tests {
         // Query embedding hits the profile target seed exactly. All rows
         // here are uncategorised, so the raw fallback fires under "近况"
         // and its first item is the cosine-nearest one.
-        let (profile_groups, _relationship) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(42)).await;
+        let (profile_groups, _relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(42),
+            true,
+            true,
+        )
+        .await;
         assert_eq!(profile_groups.len(), 1);
         assert_eq!(profile_groups[0].0, "近况");
         assert_eq!(
@@ -1038,12 +1101,86 @@ mod tests {
         );
 
         // Query at the relationship target seed.
-        let (_profile2, relationship2) =
-            recall_memory_with_embedding(&pool, user_id, instance_id, &unit_embedding(99)).await;
+        let (_profile2, relationship2) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(99),
+            true,
+            true,
+        )
+        .await;
         assert_eq!(
             relationship2.first().map(String::as_str),
             Some("relationship target"),
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_gating_skips_layers_per_flags(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "profile fact",
+            &unit_embedding(11),
+            None,
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "relationship fact",
+            &unit_embedding(11),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // relationship_only: x off, y on → profile groups empty, relationship present
+        let (prof, rel) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(11),
+            false,
+            true,
+        )
+        .await;
+        assert!(prof.is_empty(), "profile groups must be empty when X off");
+        assert_eq!(rel, vec!["relationship fact".to_string()]);
+
+        // both off → nothing
+        let (prof2, rel2) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(11),
+            false,
+            false,
+        )
+        .await;
+        assert!(prof2.is_empty() && rel2.is_empty());
+
+        // both on → both layers (sanity that the hot path still works)
+        let (prof3, rel3) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(11),
+            true,
+            true,
+        )
+        .await;
+        assert!(!prof3.is_empty() && !rel3.is_empty());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
