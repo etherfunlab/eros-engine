@@ -22,10 +22,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::AffinityDeltas;
+use eros_engine_core::scope::InsightMode;
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
 use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::MemoryRepo;
 
@@ -333,6 +335,71 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
     push_arr(&mut out, "personality_traits", "性格特质");
 
     out
+}
+
+/// Render a `human_insights` row as 基础画像 bullets. Mirrors
+/// `insights_to_bullets`' labels / order / trim / empty-skip exactly so that
+/// `InsightMode::Full` reproduces the legacy output byte-for-byte. `Neutral`
+/// drops the intimate fields (love_values / emotional_needs / interests).
+/// Matching-only columns (preferred_gender / age / deal_breakers) are never
+/// rendered.
+// wired into the recall path in Task 5
+#[allow(dead_code)]
+fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
+    let mut out = Vec::new();
+    let push_str = |out: &mut Vec<String>, val: &Option<String>, label: &str| {
+        if let Some(s) = val {
+            let s = s.trim();
+            if !s.is_empty() {
+                out.push(format!("{label}：{s}"));
+            }
+        }
+    };
+    let push_arr = |out: &mut Vec<String>, val: &[String], label: &str| {
+        let parts: Vec<&str> = val
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            out.push(format!("{label}：{}", parts.join("、")));
+        }
+    };
+    let intimate = matches!(mode, InsightMode::Full);
+
+    push_str(&mut out, &row.city, "城市");
+    push_str(&mut out, &row.occupation, "职业");
+    push_str(&mut out, &row.mbti_guess, "MBTI");
+    if intimate {
+        push_str(&mut out, &row.love_values, "感情观");
+        push_arr(&mut out, &row.interests, "兴趣");
+        push_str(&mut out, &row.emotional_needs, "情感需求");
+    }
+    push_str(&mut out, &row.life_rhythm, "作息");
+    push_arr(&mut out, &row.personality_traits, "性格特质");
+    out
+}
+
+/// Load + render 基础画像 from the flat `human_insights` mirror. `Off` → empty.
+// wired into the recall path in Task 5
+#[allow(dead_code)]
+async fn load_human_insight_bullets(
+    pool: &PgPool,
+    user_id: Uuid,
+    mode: InsightMode,
+) -> Vec<String> {
+    if matches!(mode, InsightMode::Off) {
+        return vec![];
+    }
+    let repo = HumanInsightRepo { pool };
+    match repo.load(user_id).await {
+        Ok(Some(row)) => human_insights_to_bullets(&row, mode),
+        Ok(None) => vec![],
+        Err(e) => {
+            tracing::warn!("human_insights load failed: {e}");
+            vec![]
+        }
+    }
 }
 
 // ─── Reply ──────────────────────────────────────────────────────────
@@ -701,6 +768,7 @@ mod tests {
     // either need a live Voyage key or a trait-mock indirection that
     // doesn't justify its weight for a single thin function.
 
+    use eros_engine_store::human_insight::HumanInsightRepo;
     use eros_engine_store::insight::InsightRepo;
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
@@ -999,6 +1067,89 @@ mod tests {
                 "兴趣：登山、精酿".to_string(),
             ]
         );
+    }
+
+    // ─── human_insights_to_bullets ──────────────────────────────────────
+
+    fn sample_human_row() -> HumanInsightsRow {
+        HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: Some("上海".into()),
+            occupation: Some("设计师".into()),
+            mbti_guess: Some("INFP".into()),
+            love_values: Some("慢热".into()),
+            emotional_needs: Some("被理解".into()),
+            life_rhythm: Some("夜猫子".into()),
+            interests: vec!["登山".into(), "摄影".into()],
+            personality_traits: vec!["温柔".into()],
+            preferred_gender: Some("female".into()),
+            age_min: Some(25),
+            age_max: Some(35),
+            deal_breakers: vec!["抽烟".into()],
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn human_insights_full_renders_all_eight_fields_in_order() {
+        let bullets = human_insights_to_bullets(&sample_human_row(), InsightMode::Full);
+        assert_eq!(
+            bullets,
+            vec![
+                "城市：上海",
+                "职业：设计师",
+                "MBTI：INFP",
+                "感情观：慢热",
+                "兴趣：登山、摄影",
+                "情感需求：被理解",
+                "作息：夜猫子",
+                "性格特质：温柔",
+            ]
+        );
+    }
+
+    #[test]
+    fn human_insights_neutral_drops_intimate_fields() {
+        let bullets = human_insights_to_bullets(&sample_human_row(), InsightMode::Neutral);
+        assert_eq!(
+            bullets,
+            vec![
+                "城市：上海",
+                "职业：设计师",
+                "MBTI：INFP",
+                "作息：夜猫子",
+                "性格特质：温柔"
+            ]
+        );
+        assert!(bullets
+            .iter()
+            .all(|b| !b.contains("female") && !b.contains("抽烟")));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn load_human_insight_bullets_neutral_vs_full(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let insights = serde_json::json!({
+            "city": "北京", "occupation": "工程师",
+            "love_values": "认真", "interests": ["爬山"], "emotional_needs": "陪伴"
+        });
+        HumanInsightRepo { pool: &pool }
+            .project_from_insights(user_id, &insights)
+            .await
+            .unwrap();
+
+        let full = load_human_insight_bullets(&pool, user_id, InsightMode::Full).await;
+        assert!(full.iter().any(|b| b == "感情观：认真"));
+        assert!(full.iter().any(|b| b == "兴趣：爬山"));
+
+        let neutral = load_human_insight_bullets(&pool, user_id, InsightMode::Neutral).await;
+        assert!(neutral.iter().any(|b| b == "城市：北京"));
+        assert!(neutral
+            .iter()
+            .all(|b| !b.contains("认真") && !b.contains("爬山") && !b.contains("陪伴")));
+
+        let off = load_human_insight_bullets(&pool, user_id, InsightMode::Off).await;
+        assert!(off.is_empty());
     }
 
     // ─── audit_from_event ───────────────────────────────────────────────
