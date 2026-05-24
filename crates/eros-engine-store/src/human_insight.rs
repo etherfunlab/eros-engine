@@ -317,6 +317,10 @@ mod tests {
         assert!(repo.load(Uuid::new_v4()).await.unwrap().is_none());
     }
 
+    /// The canonical backfill SQL, embedded from the migration file so the test
+    /// always exercises the real statement (no drift between test and migration).
+    const BACKFILL_SQL: &str = include_str!("../migrations/0018_backfill_human_insights.sql");
+
     #[sqlx::test(migrations = "./migrations")]
     async fn backfill_sql_projects_companion_insights(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -334,30 +338,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Run the backfill statement (same body as 0018_backfill_human_insights.sql).
-        sqlx::query(
-            "INSERT INTO engine.human_insights ( \
-                user_id, city, occupation, mbti_guess, love_values, emotional_needs, \
-                life_rhythm, interests, personality_traits, preferred_gender, \
-                age_min, age_max, deal_breakers, updated_at) \
-             SELECT ci.user_id, ci.insights->>'city', ci.insights->>'occupation', \
-                ci.insights->>'mbti_guess', ci.insights->>'love_values', \
-                ci.insights->>'emotional_needs', ci.insights->>'life_rhythm', \
-                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'interests')), '{}'), \
-                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'personality_traits')), '{}'), \
-                ci.insights->'matching_preferences'->>'preferred_gender', \
-                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->0) = 'number' \
-                     THEN (ci.insights->'matching_preferences'->'age_range'->>0)::int END, \
-                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->1) = 'number' \
-                     THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int END, \
-                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'matching_preferences'->'deal_breakers')), '{}'), \
-                now() \
-             FROM engine.companion_insights ci \
-             ON CONFLICT (user_id) DO NOTHING",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Re-run the canonical migration (idempotent) now that a row exists.
+        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
 
         let row = HumanInsightRepo { pool: &pool }
             .load(user_id)
@@ -374,31 +356,26 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn backfill_sql_tolerates_malformed_age_range(pool: PgPool) {
+    async fn backfill_sql_tolerates_malformed_fields(pool: PgPool) {
         let user_id = Uuid::new_v4();
+        // Non-array scalars where arrays are expected (would crash
+        // jsonb_array_elements_text without the jsonb_typeof guards), plus a
+        // non-array age_range — all degrade to NULL / empty, no abort.
         sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
             .bind(user_id)
             .bind(serde_json::json!({
                 "city": "深圳",
-                "matching_preferences": { "age_range": "not-an-array" }
+                "interests": "游泳、读书",
+                "personality_traits": "开朗",
+                "matching_preferences": { "age_range": "not-an-array", "deal_breakers": "抽烟" }
             }))
             .execute(&pool)
             .await
             .unwrap();
-        // Same backfill statement — must NOT error on the malformed age_range.
-        sqlx::query(
-            "INSERT INTO engine.human_insights (user_id, city, age_min, age_max, updated_at) \
-             SELECT ci.user_id, ci.insights->>'city', \
-                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->0) = 'number' \
-                     THEN (ci.insights->'matching_preferences'->'age_range'->>0)::int END, \
-                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->1) = 'number' \
-                     THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int END, \
-                now() \
-             FROM engine.companion_insights ci ON CONFLICT (user_id) DO NOTHING",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+
+        // The canonical migration must NOT error on these malformed fields.
+        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
+
         let row = HumanInsightRepo { pool: &pool }
             .load(user_id)
             .await
@@ -407,5 +384,8 @@ mod tests {
         assert_eq!(row.city.as_deref(), Some("深圳"));
         assert_eq!(row.age_min, None);
         assert_eq!(row.age_max, None);
+        assert!(row.interests.is_empty());
+        assert!(row.personality_traits.is_empty());
+        assert!(row.deal_breakers.is_empty());
     }
 }

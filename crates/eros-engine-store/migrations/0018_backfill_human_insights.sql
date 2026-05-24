@@ -17,11 +17,13 @@ SELECT
     ci.insights->>'emotional_needs',
     ci.insights->>'life_rhythm',
     COALESCE(
-        ARRAY(SELECT jsonb_array_elements_text(ci.insights->'interests')),
+        CASE WHEN jsonb_typeof(ci.insights->'interests') = 'array'
+             THEN ARRAY(SELECT jsonb_array_elements_text(ci.insights->'interests')) END,
         '{}'
     ),
     COALESCE(
-        ARRAY(SELECT jsonb_array_elements_text(ci.insights->'personality_traits')),
+        CASE WHEN jsonb_typeof(ci.insights->'personality_traits') = 'array'
+             THEN ARRAY(SELECT jsonb_array_elements_text(ci.insights->'personality_traits')) END,
         '{}'
     ),
     ci.insights->'matching_preferences'->>'preferred_gender',
@@ -34,7 +36,8 @@ SELECT
         THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int
     END,
     COALESCE(
-        ARRAY(SELECT jsonb_array_elements_text(ci.insights->'matching_preferences'->'deal_breakers')),
+        CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'deal_breakers') = 'array'
+             THEN ARRAY(SELECT jsonb_array_elements_text(ci.insights->'matching_preferences'->'deal_breakers')) END,
         '{}'
     ),
     now()
