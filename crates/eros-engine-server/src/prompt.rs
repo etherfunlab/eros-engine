@@ -299,6 +299,21 @@ fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<Str
         })
 }
 
+/// Display label for the persona's gender. `male`/`female` → Chinese; any other
+/// non-empty value (e.g. "non-binary") is rendered verbatim; absent → None.
+fn gender_label(persona: &CompanionPersona) -> Option<String> {
+    meta_str(persona, "gender").map(|g| match g {
+        "male" => "男性".to_string(),
+        "female" => "女性".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// Whether gender is a binary value that warrants the 铁律 anatomy clause.
+fn is_binary_gender(persona: &CompanionPersona) -> bool {
+    matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
+}
+
 /// Build the full companion system prompt (plain-text reply schema).
 ///
 /// `profile_groups` is a list of `(label, bullets)` pairs that get rendered
@@ -329,6 +344,28 @@ pub fn build_prompt(
         meta_string_array_joined(persona, "quirks").unwrap_or_else(|| "无特定口癖".into());
     let topics_str =
         meta_string_array_joined(persona, "topics").unwrap_or_else(|| "日常生活、感情观".into());
+    let timezone = meta_str(persona, "timezone");
+
+    // Authored prose head — the most stable per-genome block, used as the
+    // leading cache prefix. Deliberately redundant with the structured sections
+    // below (reinforcement). Omitted with no separator when empty.
+    let head = {
+        let sp = persona.genome.system_prompt.trim();
+        if sp.is_empty() {
+            String::new()
+        } else {
+            format!("{sp}\n\n")
+        }
+    };
+
+    let identity = match gender_label(persona) {
+        Some(g) => format!("你是 {name}，{g}，{age} 岁，{mbti} 性格。"),
+        None => format!("你是 {name}，{age} 岁，{mbti} 性格。"),
+    };
+    let tz_clause = match timezone {
+        Some(tz) if !tz.trim().is_empty() => format!("你所在时区：{}。", tz.trim()),
+        _ => String::new(),
+    };
 
     let traits_section = if prompt_traits.is_empty() {
         String::new()
@@ -399,8 +436,20 @@ pub fn build_prompt(
         )
     };
 
+    // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
+    // binary genders, with a role-play exception. Skipped for non-binary/absent.
+    let gender_rule = if is_binary_gender(persona) {
+        let g = gender_label(persona).unwrap_or_default();
+        format!(
+            "\n⑧ 你是{g}，严格遵守自己的性别，绝不说出与自身性别矛盾的身体或身份描述；\
+             除非在与用户的角色扮演中双方明确约定你暂时扮演其他性别"
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "你是 {name}，{age} 岁，{mbti} 性格。\n\
+        "{head}{identity}{tz_clause}\n\
          \n\
          【背景故事】\n{backstory}\n\
          \n\
@@ -408,17 +457,14 @@ pub fn build_prompt(
          【口癖/习惯】{quirks_str}\n\
          【擅长话题】{topics_str}{traits_section}\n\
          \n\
-         【今日情境】\n{tc}\n\
+         【本轮风格】{style_text}\n\
          \n\
          【你对他的了解（通用画像）】\n{profile_str}\n\
          \n\
          【你们之间的事（只有你和他知道）】\n{rel_str}\
-         {attitude}\
-         {state}\
-         {gift}\
-         {hints_section}\n\
+         {attitude}{state}{hints_section}{gift}\n\
          \n\
-         【本轮风格】{style_text}\n\
+         【今日情境】\n{tc}\n\
          \n\
          ---\n\
          【铁律 — 违反即失效】\n\
@@ -428,10 +474,10 @@ pub fn build_prompt(
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
-         ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
+         ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
-        tc = now_context(meta_str(persona, "timezone")),
+        tc = now_context(timezone),
         lr = length_rule(affinity),
     )
 }
@@ -554,6 +600,14 @@ mod tests {
     use chrono::TimeZone;
     use uuid::Uuid;
 
+    fn set_meta(p: &mut CompanionPersona, key: &str, val: serde_json::Value) {
+        p.genome
+            .art_metadata
+            .as_object_mut()
+            .expect("fixture art_metadata is an object")
+            .insert(key.to_string(), val);
+    }
+
     fn fixture_persona() -> CompanionPersona {
         use eros_engine_core::persona::{PersonaGenome, PersonaInstance};
         let uid = Uuid::nil();
@@ -585,29 +639,16 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_with_empty_traits_omits_section_and_preserves_layout() {
+    fn build_prompt_with_empty_traits_omits_section() {
         let p = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            &[],
-            "normal",
-            ReplyStyle::Neutral,
-            &[],
-            &[],
+            &fixture_persona(), &[], &[], None, &[], "normal",
+            ReplyStyle::Neutral, &[], &[],
         );
+        assert!(!p.contains("【附加指引】"), "empty traits must not render section");
+        // 擅长话题 now flows straight into 本轮风格 (the first volatile block).
         assert!(
-            !p.contains("【附加指引】"),
-            "empty traits must not render section"
-        );
-        // Byte-level invariant proving "byte-for-byte identical to legacy"
-        // for the empty-traits case: topics → time-context joins with the
-        // pre-existing `\n\n` separator, no leftover whitespace from the
-        // new `{traits_section}` placeholder.
-        assert!(
-            p.contains("【擅长话题】t1\n\n【今日情境】"),
-            "topics → time-context separator must be exactly '\\n\\n'"
+            p.contains("【擅长话题】t1\n\n【本轮风格】"),
+            "topics → 本轮风格 separator must be exactly '\\n\\n': {p}"
         );
     }
 
@@ -644,29 +685,108 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_section_sits_between_topics_and_time_context() {
-        let traits = vec![PromptTrait {
-            tag: "x".into(),
-            text: "trait body".into(),
-        }];
+    fn build_prompt_stable_block_order() {
+        let traits = vec![PromptTrait { tag: "x".into(), text: "trait body".into() }];
         let p = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            &[],
-            "normal",
-            ReplyStyle::Neutral,
-            &[],
-            &traits,
+            &fixture_persona(), &[], &[], None, &[], "normal",
+            ReplyStyle::Neutral, &[], &traits,
         );
-        let topics_idx = p.find("【擅长话题】").expect("topics header");
-        let traits_idx = p.find("【附加指引】").expect("traits header");
-        let time_idx = p.find("【今日情境】").expect("time-context header");
+        let topics = p.find("【擅长话题】").expect("topics");
+        let traits_i = p.find("【附加指引】").expect("traits");
+        let turn_style = p.find("【本轮风格】").expect("turn style");
         assert!(
-            topics_idx < traits_idx && traits_idx < time_idx,
-            "order: 擅长话题 → 附加指引 → 今日情境"
+            topics < traits_i && traits_i < turn_style,
+            "order: 擅长话题 → 附加指引 → 本轮风格"
         );
+    }
+
+    #[test]
+    fn build_prompt_full_order_and_cache_break() {
+        let s = build_prompt(
+            &fixture_persona(), &[], &[], None, &[], "normal",
+            ReplyStyle::Neutral, &[], &[],
+        );
+        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
+        let order = [
+            "你是 ", "【背景故事】", "【说话风格】", "【口癖/习惯】", "【擅长话题】",
+            "【本轮风格】", "【你对他的了解（通用画像）】", "【你们之间的事",
+            "【今日情境】", "【铁律", "【输出】",
+        ];
+        let mut last = 0usize;
+        for h in order {
+            let cur = pos(h);
+            assert!(cur >= last, "header {h} out of order in:\n{s}");
+            last = cur;
+        }
+        let topics = pos("【擅长话题】");
+        for vol in ["【本轮风格】", "【你对他的了解（通用画像）】", "【今日情境】"] {
+            assert!(pos(vol) > topics, "{vol} must sit after the stable persona block");
+        }
+    }
+
+    #[test]
+    fn build_prompt_renders_system_prompt_head_when_present() {
+        let mut p = fixture_persona();
+        p.genome.system_prompt = "AUTHORED HEAD".into();
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(
+            s.starts_with("AUTHORED HEAD\n\n你是 "),
+            "prose head + '\\n\\n' separator before identity: {s}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_head_when_system_prompt_empty() {
+        let mut p = fixture_persona();
+        p.genome.system_prompt = "   ".into();
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(s.starts_with("你是 "), "empty head → starts with identity: {s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_binary_gender_and_iron_rule() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("male"));
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
+        assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_nonbinary_gender_without_iron_rule() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("non-binary"));
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(s.contains("你是 Aria，non-binary，24 岁"), "verbatim render: {s}");
+        assert!(!s.contains("⑧"), "non-binary must not get the binary anatomy rule: {s}");
+    }
+
+    #[test]
+    fn build_prompt_omits_gender_when_absent() {
+        let p = fixture_persona(); // fixture art_metadata has no gender key
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
+        assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_timezone_clause_when_present() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "timezone", serde_json::json!("Asia/Tokyo"));
+        let s = build_prompt(
+            &p, &[], &[], None, &[], "normal", ReplyStyle::Neutral, &[], &[],
+        );
+        assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
 
     #[test]
