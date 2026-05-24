@@ -316,4 +316,96 @@ mod tests {
         let repo = HumanInsightRepo { pool: &pool };
         assert!(repo.load(Uuid::new_v4()).await.unwrap().is_none());
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_sql_projects_companion_insights(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        // Seed a companion_insights row directly (simulating a legacy user with
+        // no human_insights mirror yet).
+        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(serde_json::json!({
+                "city": "广州",
+                "interests": ["游泳", "读书"],
+                "personality_traits": ["开朗"],
+                "matching_preferences": { "age_range": [22, 30], "preferred_gender": "female", "deal_breakers": ["抽烟"] }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Run the backfill statement (same body as 0018_backfill_human_insights.sql).
+        sqlx::query(
+            "INSERT INTO engine.human_insights ( \
+                user_id, city, occupation, mbti_guess, love_values, emotional_needs, \
+                life_rhythm, interests, personality_traits, preferred_gender, \
+                age_min, age_max, deal_breakers, updated_at) \
+             SELECT ci.user_id, ci.insights->>'city', ci.insights->>'occupation', \
+                ci.insights->>'mbti_guess', ci.insights->>'love_values', \
+                ci.insights->>'emotional_needs', ci.insights->>'life_rhythm', \
+                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'interests')), '{}'), \
+                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'personality_traits')), '{}'), \
+                ci.insights->'matching_preferences'->>'preferred_gender', \
+                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->0) = 'number' \
+                     THEN (ci.insights->'matching_preferences'->'age_range'->>0)::int END, \
+                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->1) = 'number' \
+                     THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int END, \
+                COALESCE(ARRAY(SELECT jsonb_array_elements_text(ci.insights->'matching_preferences'->'deal_breakers')), '{}'), \
+                now() \
+             FROM engine.companion_insights ci \
+             ON CONFLICT (user_id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = HumanInsightRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.city.as_deref(), Some("广州"));
+        assert_eq!(row.interests, vec!["游泳".to_string(), "读书".to_string()]);
+        assert_eq!(row.personality_traits, vec!["开朗".to_string()]);
+        assert_eq!(row.age_min, Some(22));
+        assert_eq!(row.age_max, Some(30));
+        assert_eq!(row.preferred_gender.as_deref(), Some("female"));
+        assert_eq!(row.deal_breakers, vec!["抽烟".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_sql_tolerates_malformed_age_range(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(serde_json::json!({
+                "city": "深圳",
+                "matching_preferences": { "age_range": "not-an-array" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Same backfill statement — must NOT error on the malformed age_range.
+        sqlx::query(
+            "INSERT INTO engine.human_insights (user_id, city, age_min, age_max, updated_at) \
+             SELECT ci.user_id, ci.insights->>'city', \
+                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->0) = 'number' \
+                     THEN (ci.insights->'matching_preferences'->'age_range'->>0)::int END, \
+                CASE WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->1) = 'number' \
+                     THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int END, \
+                now() \
+             FROM engine.companion_insights ci ON CONFLICT (user_id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = HumanInsightRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.city.as_deref(), Some("深圳"));
+        assert_eq!(row.age_min, None);
+        assert_eq!(row.age_max, None);
+    }
 }
