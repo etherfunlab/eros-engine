@@ -162,6 +162,52 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 Limits: ≤ 8 entries, `tag` matches `[a-z0-9_]{1,32}`, `text` ≤ 2000 chars
 (non-blank). Violations return `400 BadRequest` as a pre-stream error.
 
+**Optional: memory injection scope.** The body may include a `memory_scope`
+string to control which memory layers are injected into the prompt. Accepted
+values:
+
+| Value | Injected |
+|-------|----------|
+| `full` | Full user profile (including intimate fields) + relationship memory |
+| `neutral_and_relationship` | Neutral profile (city/occupation/MBTI only) + relationship memory **(default)** |
+| `relationship_only` | Relationship memory only; no profile |
+| `neutral_only` | Neutral profile only; no relationship memory |
+| `insights_only` | Full user profile only (intimate fields included); no relationship memory |
+| `none` | No memory injection |
+
+> **Important (#40 mitigation):** The default `neutral_and_relationship` is
+> intentionally narrower than the pre-#40 behavior (which injected everything).
+> Omitting `memory_scope` is **not** equivalent to the old behavior — it
+> applies the narrowed default. Use `full` explicitly if you need the
+> full-injection behavior.
+
+**Optional: affinity injection scope.** The body may include an
+`affinity_scope` value to control which of the six affinity axes are injected
+into the prompt. Accepted values:
+
+- Named presets: `"bond"` **(default)** — warmth + intimacy + tension;
+  `"chemistry"` — trust + intrigue + patience; `"bond_and_chemistry"` / `"full"` — all six axes; `"none"` — no affinity injection.
+- Axis array: any subset of `["warmth", "trust", "intrigue", "intimacy", "patience", "tension"]`.
+
+> **Important (#40 mitigation):** The default `bond` (3 axes) is intentionally
+> narrower than the pre-#40 behavior (which injected all six axes). Omitting
+> `affinity_scope` is **not** equivalent to the old behavior. Use
+> `"bond_and_chemistry"` or `"full"` explicitly if you need all axes.
+
+Example using both fields:
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "hi",
+        "client_msg_id": "01J3333333333333333333333A",
+        "memory_scope": "full",
+        "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 **Optional: OpenRouter audit passthrough.** The body may include an
 `audit` object that rides directly to OpenRouter as wire-level `user` /
 `session_id` / `metadata` — see [llm-audit.md](llm-audit.md). Example:

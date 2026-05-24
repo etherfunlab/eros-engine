@@ -15,6 +15,7 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::scope::{AffinityAxis, AffinityScope, MemoryScope};
 use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -34,6 +35,39 @@ const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityScopeName {
+    Full,
+    BondAndChemistry,
+    Bond,
+    Chemistry,
+    None,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum AffinityScopeDto {
+    Named(AffinityScopeName),
+    #[schema(value_type = Vec<String>)]
+    Axes(Vec<AffinityAxis>),
+}
+
+impl AffinityScopeDto {
+    fn resolve(&self) -> AffinityScope {
+        match self {
+            // bond (warmth+intimacy+tension) ∪ chemistry (trust+intrigue+patience)
+            // covers all six axes — identical to Full.
+            AffinityScopeDto::Named(AffinityScopeName::Full)
+            | AffinityScopeDto::Named(AffinityScopeName::BondAndChemistry) => AffinityScope::full(),
+            AffinityScopeDto::Named(AffinityScopeName::Bond) => AffinityScope::bond(),
+            AffinityScopeDto::Named(AffinityScopeName::Chemistry) => AffinityScope::chemistry(),
+            AffinityScopeDto::Named(AffinityScopeName::None) => AffinityScope::none(),
+            AffinityScopeDto::Axes(axes) => AffinityScope::from_axes(axes),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
     pub client_msg_id: String,
@@ -43,6 +77,11 @@ pub struct StreamSendRequest {
     pub audit: Option<LlmAuditDto>,
     #[serde(default)]
     pub tier: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub memory_scope: Option<MemoryScope>,
+    #[serde(default)]
+    pub affinity_scope: Option<AffinityScopeDto>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -227,6 +266,12 @@ pub async fn send_message_stream(
         match outcome {
             UpsertUserOutcome::Inserted { message_id } => {
                 let state_arc = Arc::new(state.clone());
+                let memory_scope = req.memory_scope.unwrap_or_default();
+                let affinity_scope = req
+                    .affinity_scope
+                    .as_ref()
+                    .map(AffinityScopeDto::resolve)
+                    .unwrap_or_default();
                 let user_msg = PersistedUserMessage {
                     user_message_id: message_id,
                     session_id,
@@ -236,6 +281,8 @@ pub async fn send_message_stream(
                     prompt_traits: prompt_traits.clone(),
                     audit: audit.clone(),
                     tier: req.tier.clone(),
+                    memory_scope,
+                    affinity_scope,
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -311,7 +358,31 @@ mod tests {
             prompt_traits: None,
             audit: None,
             tier: tier.map(String::from),
+            memory_scope: None,
+            affinity_scope: None,
         }
+    }
+
+    #[test]
+    fn affinity_scope_dto_resolves_named_and_array() {
+        let named: AffinityScopeDto = serde_json::from_str("\"chemistry\"").unwrap();
+        assert_eq!(named.resolve(), AffinityScope::chemistry());
+        let bond: AffinityScopeDto = serde_json::from_str("\"bond\"").unwrap();
+        assert_eq!(bond.resolve(), AffinityScope::bond());
+        let full: AffinityScopeDto = serde_json::from_str("\"full\"").unwrap();
+        assert_eq!(full.resolve(), AffinityScope::full());
+        let bac: AffinityScopeDto = serde_json::from_str("\"bond_and_chemistry\"").unwrap();
+        assert_eq!(bac.resolve(), AffinityScope::full());
+        let none: AffinityScopeDto = serde_json::from_str("\"none\"").unwrap();
+        assert!(none.resolve().is_empty());
+        let arr: AffinityScopeDto = serde_json::from_str("[\"warmth\",\"trust\"]").unwrap();
+        assert_eq!(
+            arr.resolve(),
+            AffinityScope::from_axes(&[AffinityAxis::Warmth, AffinityAxis::Trust])
+        );
+        let empty: AffinityScopeDto = serde_json::from_str("[]").unwrap();
+        assert!(empty.resolve().is_empty());
+        assert!(serde_json::from_str::<AffinityScopeDto>("\"bogus\"").is_err());
     }
 
     #[test]

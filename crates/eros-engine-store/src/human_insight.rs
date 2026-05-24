@@ -316,4 +316,76 @@ mod tests {
         let repo = HumanInsightRepo { pool: &pool };
         assert!(repo.load(Uuid::new_v4()).await.unwrap().is_none());
     }
+
+    /// The canonical backfill SQL, embedded from the migration file so the test
+    /// always exercises the real statement (no drift between test and migration).
+    const BACKFILL_SQL: &str = include_str!("../migrations/0018_backfill_human_insights.sql");
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_sql_projects_companion_insights(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        // Seed a companion_insights row directly (simulating a legacy user with
+        // no human_insights mirror yet).
+        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(serde_json::json!({
+                "city": "广州",
+                "interests": ["游泳", "读书"],
+                "personality_traits": ["开朗"],
+                "matching_preferences": { "age_range": [22, 30], "preferred_gender": "female", "deal_breakers": ["抽烟"] }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Re-run the canonical migration (idempotent) now that a row exists.
+        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
+
+        let row = HumanInsightRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.city.as_deref(), Some("广州"));
+        assert_eq!(row.interests, vec!["游泳".to_string(), "读书".to_string()]);
+        assert_eq!(row.personality_traits, vec!["开朗".to_string()]);
+        assert_eq!(row.age_min, Some(22));
+        assert_eq!(row.age_max, Some(30));
+        assert_eq!(row.preferred_gender.as_deref(), Some("female"));
+        assert_eq!(row.deal_breakers, vec!["抽烟".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_sql_tolerates_malformed_fields(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        // Non-array scalars where arrays are expected (would crash
+        // jsonb_array_elements_text without the jsonb_typeof guards), plus a
+        // non-array age_range — all degrade to NULL / empty, no abort.
+        sqlx::query("INSERT INTO engine.companion_insights (user_id, insights) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(serde_json::json!({
+                "city": "深圳",
+                "interests": "游泳、读书",
+                "personality_traits": "开朗",
+                "matching_preferences": { "age_range": "not-an-array", "deal_breakers": "抽烟" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The canonical migration must NOT error on these malformed fields.
+        sqlx::query(BACKFILL_SQL).execute(&pool).await.unwrap();
+
+        let row = HumanInsightRepo { pool: &pool }
+            .load(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.city.as_deref(), Some("深圳"));
+        assert_eq!(row.age_min, None);
+        assert_eq!(row.age_max, None);
+        assert!(row.interests.is_empty());
+        assert!(row.personality_traits.is_empty());
+        assert!(row.deal_breakers.is_empty());
+    }
 }

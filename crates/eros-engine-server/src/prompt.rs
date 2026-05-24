@@ -27,6 +27,7 @@ use chrono::{Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
+use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::ReplyStyle;
 
@@ -95,14 +96,15 @@ fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String 
     )
 }
 
-/// Reply-length rule for 铁律①, graduated by `intimacy` (0~1). Looser as the
-/// relationship deepens; `None` affinity (no data yet) → strictest tier.
-/// Thresholds intentionally coarse (0.25 / 0.55) — tunable.
-fn length_rule(affinity: Option<&Affinity>) -> &'static str {
-    let intimacy = affinity.map(|a| a.intimacy).unwrap_or(0.0);
-    if intimacy < 0.25 {
+/// Reply-length rule for 铁律①, graduated by the affinity-scope composite
+/// score (0~1). No in-scope axis (or no affinity yet) → strictest tier.
+/// Thresholds (0.25 / 0.55) carry over from the single-intimacy era; the
+/// composite averages land on similar tier boundaries in practice — tunable.
+fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static str {
+    let score = affinity.and_then(|a| scope.length_score(a)).unwrap_or(0.0);
+    if score < 0.25 {
         "刚认识，每次回复 1~2 句，绝对不超过 2 句；单条消息严格不超过 40 字"
-    } else if intimacy < 0.55 {
+    } else if score < 0.55 {
         "每次回复 1~3 句；单条消息不超过 60 字"
     } else {
         "每次回复 1~5 句（最多 5 句）；单条消息不超过 100 字"
@@ -110,42 +112,50 @@ fn length_rule(affinity: Option<&Affinity>) -> &'static str {
 }
 
 /// Attitude directives derived from the affinity state.
-pub fn affinity_to_attitude_prompt(a: &Affinity) -> String {
+pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String {
     let mut directives: Vec<&str> = Vec::new();
 
-    if a.warmth > 0.6 {
-        directives.push("语气温暖，可以用一些亲昵的称呼");
-    } else if a.warmth > 0.3 {
-        directives.push("语气友善自然");
-    } else if a.warmth > 0.0 {
-        directives.push("语气平淡，保持礼貌但不热络");
-    } else {
-        directives.push("语气冷淡，回复简短，不主动延伸话题");
+    if scope.warmth {
+        if a.warmth > 0.6 {
+            directives.push("语气温暖，可以用一些亲昵的称呼");
+        } else if a.warmth > 0.3 {
+            directives.push("语气友善自然");
+        } else if a.warmth > 0.0 {
+            directives.push("语气平淡，保持礼貌但不热络");
+        } else {
+            directives.push("语气冷淡，回复简短，不主动延伸话题");
+        }
     }
 
-    if a.trust > 0.6 {
-        directives.push("可以分享更私密的想法和小秘密");
-    } else if a.trust < 0.3 {
-        directives.push("保持一定距离感，不轻易透露内心想法");
+    if scope.trust {
+        if a.trust > 0.6 {
+            directives.push("可以分享更私密的想法和小秘密");
+        } else if a.trust < 0.3 {
+            directives.push("保持一定距离感，不轻易透露内心想法");
+        }
     }
 
-    if a.intrigue > 0.7 {
-        directives.push("你对他很好奇，主动问问题，想了解更多");
-    } else if a.intrigue < 0.3 {
-        directives.push("你对他兴趣不大，不会主动找话题");
+    if scope.intrigue {
+        if a.intrigue > 0.7 {
+            directives.push("你对他很好奇，主动问问题，想了解更多");
+        } else if a.intrigue < 0.3 {
+            directives.push("你对他兴趣不大，不会主动找话题");
+        }
     }
 
-    if a.intimacy > 0.5 {
+    if scope.intimacy && a.intimacy > 0.5 {
         directives.push("可以引用之前聊过的事情，有默契感，用你们之间的梗");
     }
 
-    if a.patience < 0.3 {
-        directives.push("你有点不耐烦了，回复可以更敷衍、更短");
-    } else if a.patience > 0.7 {
-        directives.push("你很有耐心，愿意陪他聊");
+    if scope.patience {
+        if a.patience < 0.3 {
+            directives.push("你有点不耐烦了，回复可以更敷衍、更短");
+        } else if a.patience > 0.7 {
+            directives.push("你很有耐心，愿意陪他聊");
+        }
     }
 
-    if a.tension > 0.5 {
+    if scope.tension && a.tension > 0.5 {
         directives.push("带点小傲娇，不要太好说话，适度推拉");
     }
 
@@ -327,6 +337,7 @@ pub fn build_prompt(
     style: ReplyStyle,
     hints: &[String],
     prompt_traits: &[PromptTrait],
+    affinity_scope: AffinityScope,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -404,15 +415,37 @@ pub fn build_prompt(
     };
 
     let attitude = affinity
-        .map(affinity_to_attitude_prompt)
+        .map(|a| affinity_to_attitude_prompt(a, affinity_scope))
         .unwrap_or_default();
     let state = affinity
         .map(|a| {
-            format!(
-                "\n【你对他的内心感受】（绝对不要在回复中提及这些数值，这是隐藏参数）\n\
-             warmth={:.2}, trust={:.2}, intrigue={:.2}, intimacy={:.2}, patience={:.2}, tension={:.2}",
-                a.warmth, a.trust, a.intrigue, a.intimacy, a.patience, a.tension
-            )
+            let mut parts: Vec<String> = Vec::new();
+            if affinity_scope.warmth {
+                parts.push(format!("warmth={:.2}", a.warmth));
+            }
+            if affinity_scope.trust {
+                parts.push(format!("trust={:.2}", a.trust));
+            }
+            if affinity_scope.intrigue {
+                parts.push(format!("intrigue={:.2}", a.intrigue));
+            }
+            if affinity_scope.intimacy {
+                parts.push(format!("intimacy={:.2}", a.intimacy));
+            }
+            if affinity_scope.patience {
+                parts.push(format!("patience={:.2}", a.patience));
+            }
+            if affinity_scope.tension {
+                parts.push(format!("tension={:.2}", a.tension));
+            }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n【你对他的内心感受】（绝对不要在回复中提及这些数值，这是隐藏参数）\n{}",
+                    parts.join(", ")
+                )
+            }
         })
         .unwrap_or_default();
     let gift = gift_reaction_context(pending_gifts, tip_personality);
@@ -474,7 +507,7 @@ pub fn build_prompt(
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
-        lr = length_rule(affinity),
+        lr = length_rule(affinity, affinity_scope),
     )
 }
 
@@ -646,6 +679,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(
             !p.contains("【附加指引】"),
@@ -680,6 +714,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &traits,
+            AffinityScope::full(),
         );
         assert!(p.contains("【附加指引】"), "section header present");
         assert!(p.contains("- be more daring"));
@@ -706,6 +741,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &traits,
+            AffinityScope::full(),
         );
         let topics = p.find("【擅长话题】").expect("topics");
         let traits_i = p.find("【附加指引】").expect("traits");
@@ -728,6 +764,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -776,6 +813,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(
             s.starts_with("AUTHORED HEAD\n\n你是 "),
@@ -797,6 +835,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(
             s.starts_with("你是 "),
@@ -818,6 +857,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -837,6 +877,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -861,6 +902,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -880,6 +922,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -904,6 +947,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -924,6 +968,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &[],
+            AffinityScope::full(),
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -936,6 +981,7 @@ mod tests {
             ReplyStyle::Warm,
             &["想他".to_string()],
             &[],
+            AffinityScope::full(),
         );
         let cut = a.find("【本轮风格】").expect("turn-style header present");
         assert_eq!(
@@ -968,6 +1014,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &t1,
+            AffinityScope::full(),
         );
         let b = build_prompt(
             &p,
@@ -979,6 +1026,7 @@ mod tests {
             ReplyStyle::Neutral,
             &[],
             &t2,
+            AffinityScope::full(),
         );
         let cut = a.find("【附加指引】").expect("traits header present");
         assert_eq!(
@@ -1092,35 +1140,86 @@ mod tests {
         assert!(p.contains("\"mbti_guess\": \"INFP\""));
     }
 
-    #[test]
-    fn length_rule_tiers_by_intimacy() {
-        use eros_engine_core::affinity::Affinity;
+    fn make_affinity(
+        warmth: f64,
+        trust: f64,
+        intrigue: f64,
+        intimacy: f64,
+        patience: f64,
+        tension: f64,
+    ) -> eros_engine_core::affinity::Affinity {
         let now = chrono::Utc::now();
-        let mut a = Affinity {
-            id: uuid::Uuid::nil(),
-            session_id: uuid::Uuid::nil(),
-            user_id: uuid::Uuid::nil(),
-            instance_id: uuid::Uuid::nil(),
-            warmth: 0.0,
-            trust: 0.0,
-            intrigue: 0.0,
-            intimacy: 0.1,
-            patience: 0.0,
-            tension: 0.0,
+        eros_engine_core::affinity::Affinity {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            instance_id: uuid::Uuid::new_v4(),
+            warmth,
+            trust,
+            intrigue,
+            intimacy,
+            patience,
+            tension,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
             relationship_label: None,
             created_at: now,
             updated_at: now,
-        };
-        assert!(length_rule(Some(&a)).contains("绝对不超过 2 句"));
-        a.intimacy = 0.4;
-        assert!(length_rule(Some(&a)).contains("1~3 句"));
-        a.intimacy = 0.8;
-        assert!(length_rule(Some(&a)).contains("最多 5 句"));
-        // No affinity → strictest tier.
-        assert!(length_rule(None).contains("绝对不超过 2 句"));
+        }
+    }
+
+    #[test]
+    fn length_rule_uses_scope_composite() {
+        // warmth=0 → warm01=0.5; intimacy=0.5; tension=0.5 → bond=0.5
+        // trust=0.9; intrigue=0.9; patience=0.9 → chemistry=0.9
+        let a = make_affinity(0.0, 0.9, 0.9, 0.5, 0.9, 0.5);
+        assert!(length_rule(Some(&a), AffinityScope::bond()).contains("1~3 句"));
+        assert!(length_rule(Some(&a), AffinityScope::chemistry()).contains("最多 5 句"));
+        assert!(length_rule(Some(&a), AffinityScope::none()).contains("绝对不超过 2 句"));
+        assert!(length_rule(None, AffinityScope::full()).contains("绝对不超过 2 句"));
+    }
+
+    #[test]
+    fn bond_scope_injects_only_bond_axes() {
+        let a = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            Some(&a),
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::bond(),
+        );
+        assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
+        assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
+        // attitude directives are gated by the same axis set: bond-axis directives
+        // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
+        assert!(p.contains("语气温暖"));
+        assert!(!p.contains("私密") && !p.contains("好奇") && !p.contains("有耐心"));
+    }
+
+    #[test]
+    fn none_scope_omits_affinity_blocks() {
+        let a = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            Some(&a),
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::none(),
+        );
+        assert!(!p.contains("【你对他的内心感受】"));
+        assert!(!p.contains("【你此刻的心情】"));
     }
 
     #[test]
