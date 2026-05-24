@@ -98,7 +98,8 @@ fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String 
 
 /// Reply-length rule for 铁律①, graduated by the affinity-scope composite
 /// score (0~1). No in-scope axis (or no affinity yet) → strictest tier.
-/// Thresholds intentionally coarse (0.25 / 0.55) — tunable.
+/// Thresholds (0.25 / 0.55) carry over from the single-intimacy era; the
+/// composite averages land on similar tier boundaries in practice — tunable.
 fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static str {
     let score = affinity.and_then(|a| scope.length_score(a)).unwrap_or(0.0);
     if score < 0.25 {
@@ -1196,6 +1197,10 @@ mod tests {
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
+        // attitude directives are gated by the same axis set: bond-axis directives
+        // present, chemistry-axis directives (trust/intrigue/patience) suppressed.
+        assert!(p.contains("语气温暖"));
+        assert!(!p.contains("私密") && !p.contains("好奇") && !p.contains("有耐心"));
     }
 
     #[test]
