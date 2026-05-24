@@ -150,9 +150,12 @@ falling back to the current `你是 {name}，{age} 岁，{mbti} 性格。` when 
 when gender normalizes to a **binary** value (`male`/`female`). Skipped for
 non-binary / verbatim / absent (they carry no fixed binary-anatomy constraint):
 
-> ⑧ 你是{gender_label}，严格遵守自己的性别，绝不说出与自身性别矛盾的身体或身份描述；除非在与用户的角色扮演中双方明确约定你暂时扮演其他性别。
+> ⑧ 你是{gender_label}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别
 
-The role-play exception keeps consensual gender-swap fiction allowed.
+The role-play exception keeps consensual gender-swap fiction allowed. (The
+clause was spelled out further during PR review — body/称谓/self-identity,
+rejecting wrong-gender address, and resisting address/prior-turn/gift/context/
+flirting pressure — but the conditional-on-binary-gender behavior is unchanged.)
 
 ### 2.4 `timezone` field + server-side local-time precompute
 
@@ -160,39 +163,42 @@ Add an optional `timezone` field to `art_metadata` (IANA name, e.g.
 `"Asia/Tokyo"`; may be empty). Dependency: add **`chrono-tz`** (workspace dep +
 `eros-engine-server`).
 
-`now_context` gains the persona timezone:
+`now_context` resolves a single zone — the persona's own `timezone` when set &
+valid, otherwise **SGT (`Asia/Singapore`, UTC+8) as the default** — and always
+renders concrete local time. There is **no UTC-inference fallback**: the model
+never does timezone arithmetic, which is what closes the time-hallucination bug.
+The SGT default is a product decision — most users sit in UTC+8, so a persona
+with no declared zone shares the user's wall clock rather than guessing.
 
 ```rust
 fn now_context(timezone: Option<&str>) -> String { now_context_at(Utc::now(), timezone) }
 
 fn now_context_at(now: DateTime<Utc>, timezone: Option<&str>) -> String {
-    match timezone.and_then(|s| s.parse::<chrono_tz::Tz>().ok()) {
-        Some(tz) => {
-            let local = now.with_timezone(&tz);
-            // weekday / date / HH:MM / period all computed in LOCAL time
-            // period buckets (coarse): 05–08 清晨, 08–18 白天, 18–23 傍晚, 23–05 深夜
-            format!(
-                "现在你当地时间是 {date}（{weekday}）{hh:02}:{mm:02}，{period}。\
-                 这是你唯一的时间基准，不要编造其它日期或时间。",
-                …
-            )
-        }
-        None => {
-            // fallback: current UTC + infer-from-residence, with hardened wording
-            "现在是 UTC {date}（{weekday}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
-             推算当地时间，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、星期几。\
-             严格以上述 UTC 时间为唯一基准，不得编造其它日期或时间；无法换算时区时只说\
-             大致时段，不要编造具体钟点。"
-        }
-    }
+    let tz = timezone
+        .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Asia::Singapore);
+    let local = now.with_timezone(&tz);
+    // weekday / date / HH:MM / period all computed in LOCAL time
+    // period buckets (coarse): 05–07 清晨, 08–17 白天, 18–22 傍晚, else 深夜
+    format!(
+        "现在你当地时间（{tz}）是 {date}（{weekday}）{hh:02}:{mm:02}，{period}。\
+         这是你唯一的时间基准；用户提到「今天/今晚/明天/昨天/刚才/现在」时一律以此为准，\
+         不要编造其它日期或时间。",
+        tz = tz.name(), …
+    )
 }
 ```
 
-Note the fallback path also fixes a latent correctness bug: today the weekday is
-derived from **UTC**, not local time; the `chrono-tz` path computes weekday from
-the converted local datetime. The `timezone` declaration in the stable block
-(2.1 item 2) is kept for persona self-awareness + reinforcement even though
-`今日情境` now states the concrete local time.
+The block also renders the resolved zone id (`{tz.name()}`) and binds relative
+date words (今天/今晚/明天/…) to this time, so the model can't drift to another
+zone. This also fixes a latent correctness bug: weekday/date are now computed in
+**local** time (the previous code derived weekday from **UTC**). The `timezone`
+declaration in the stable block (2.1 item 2) is kept for persona self-awareness
++ reinforcement even though `今日情境` now states the concrete local time.
+
+> **Note (review amendment):** §2.4 originally specified a UTC + infer-from-
+> residence fallback for the no-timezone case. During PR review that was replaced
+> with the SGT default above (simpler, and fully removes model-side arithmetic).
 
 ### 2.5 `build_prompt` signature / call sites
 
@@ -217,11 +223,16 @@ Unit tests in `prompt.rs` (the three order/byte assertions at `:562`, `:589`,
   the no-head case.
 - **gender:** `male`→`男性` and `female`→`女性` in the identity line + 铁律 ⑧
   present; `non-binary` rendered verbatim + **no** ⑧; absent → identity line
-  has no gender clause + no ⑧.
+  has no gender clause + no ⑧; blank/whitespace → treated as absent (no
+  double-comma, no ⑧).
 - **timezone:** a fixed UTC instant + `Asia/Tokyo` renders the expected local
-  date/weekday/HH:MM/period and the "唯一的时间基准" anti-fabrication line;
-  absent/garbage → UTC fallback with hardened wording (and weekday-from-local
-  on the tz path vs weekday-from-UTC on the fallback).
+  date/weekday/HH:MM/period, the resolved zone id, and the "唯一的时间基准"
+  anti-fabrication + relative-date binding; absent/garbage → **SGT default**
+  (`Asia/Singapore`, UTC+8), never UTC. Weekday/date are computed in local time.
+- **cache-prefix boundaries:** stable block (everything before `【本轮风格】`)
+  is byte-identical across volatile-input changes (style/profile/affinity/hints);
+  different trait configs share the persona block up to `【附加指引】` but
+  produce different full prompts.
 - **traits:** unchanged rendering, now asserted between `擅长话题` and `本轮风格`;
   empty traits omit the section with no stray whitespace.
 
