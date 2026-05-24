@@ -5,4 +5,5 @@ pub mod affinity;
 pub mod ghost;
 pub mod pde;
 pub mod persona;
+pub mod scope;
 pub mod types;
