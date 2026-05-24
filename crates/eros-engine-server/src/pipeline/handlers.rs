@@ -463,6 +463,11 @@ pub(super) async fn build_reply_request(
         );
     }
 
+    let affinity_scope = match &input.event {
+        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
+        _ => eros_engine_core::scope::AffinityScope::default(),
+    };
+
     let system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -473,6 +478,7 @@ pub(super) async fn build_reply_request(
         plan.reply_style,
         &plan.context_hints,
         &kept_traits,
+        affinity_scope,
     );
 
     Ok(assemble_chat_request(
@@ -531,6 +537,7 @@ pub(super) async fn build_gift_request(
         plan.reply_style,
         &plan.context_hints,
         &[],
+        eros_engine_core::scope::AffinityScope::full(),
     );
 
     Ok(assemble_chat_request(
