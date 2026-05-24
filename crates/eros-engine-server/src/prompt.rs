@@ -23,7 +23,7 @@
 //! so don't live here. Future port targets (dream / proactive) should be
 //! added as new families in this file.
 
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc, Weekday};
 
 use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
@@ -46,34 +46,52 @@ pub struct PendingGift {
     pub item_name: Option<String>,
 }
 
-/// Absolute "now" context. Renders the current UTC date + weekday + time and
-/// asks the model to infer the companion's LOCAL time from its residence
-/// (set in the persona backstory). We deliberately do NOT pre-apply a fixed
-/// timezone — personas live in different places, so the model derives local
-/// time from absolute UTC + residence. This is what lets the companion
-/// "perceive" today's date.
-fn now_context() -> String {
-    now_context_at(Utc::now())
+fn weekday_cn(wd: Weekday) -> &'static str {
+    match wd {
+        Weekday::Mon => "周一",
+        Weekday::Tue => "周二",
+        Weekday::Wed => "周三",
+        Weekday::Thu => "周四",
+        Weekday::Fri => "周五",
+        Weekday::Sat => "周六",
+        Weekday::Sun => "周日",
+    }
 }
 
-fn now_context_at(now: chrono::DateTime<Utc>) -> String {
-    let weekday = match now.weekday() {
-        chrono::Weekday::Mon => "周一",
-        chrono::Weekday::Tue => "周二",
-        chrono::Weekday::Wed => "周三",
-        chrono::Weekday::Thu => "周四",
-        chrono::Weekday::Fri => "周五",
-        chrono::Weekday::Sat => "周六",
-        chrono::Weekday::Sun => "周日",
-    };
+/// Coarse day-part bucket from a local hour (0-23).
+fn period_cn(hour: u32) -> &'static str {
+    match hour {
+        5..=7 => "清晨",
+        8..=17 => "白天",
+        18..=22 => "傍晚",
+        _ => "深夜",
+    }
+}
+
+/// Absolute "now" context. Renders the persona's LOCAL date/weekday/time/period
+/// directly so the model does no arithmetic — this is the fix for the
+/// time-hallucination bug. The zone is the persona's own IANA `timezone` when
+/// set & valid; otherwise we default to SGT (UTC+8), since most users sit in
+/// UTC+8 — an unset persona then shares their wall clock rather than guessing.
+fn now_context(timezone: Option<&str>) -> String {
+    now_context_at(Utc::now(), timezone)
+}
+
+fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String {
+    let tz = timezone
+        .and_then(|s| s.trim().parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Asia::Singapore);
+    let local = now.with_timezone(&tz);
     format!(
-        "现在是 UTC {date}（{weekday}）{hh:02}:{mm:02}。根据你的居住地（见背景故事）\
-         推算你当地的时间和日期，自然地感知现在大概是清晨/白天/傍晚/深夜、今天几号、\
-         星期几，并据此开启符合当地时段的话题。",
-        date = now.format("%Y-%m-%d"),
-        weekday = weekday,
-        hh = now.hour(),
-        mm = now.minute(),
+        "现在你当地时间（{tz}）是 {date}（{wd}）{hh:02}:{mm:02}，{period}。\
+         这是你唯一的时间基准；用户提到「今天/今晚/明天/昨天/刚才/现在」时一律以此为准，\
+         不要编造其它日期或时间。",
+        tz = tz.name(),
+        date = local.format("%Y-%m-%d"),
+        wd = weekday_cn(local.weekday()),
+        hh = local.hour(),
+        mm = local.minute(),
+        period = period_cn(local.hour()),
     )
 }
 
@@ -273,6 +291,24 @@ fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<Str
         })
 }
 
+/// Display label for the persona's gender. `male`/`female` → Chinese; any other
+/// non-empty value (e.g. "non-binary") is rendered verbatim; absent or
+/// blank → None (so a `""` value can't produce a double-comma identity line).
+fn gender_label(persona: &CompanionPersona) -> Option<String> {
+    meta_str(persona, "gender")
+        .filter(|g| !g.trim().is_empty())
+        .map(|g| match g {
+            "male" => "男性".to_string(),
+            "female" => "女性".to_string(),
+            other => other.to_string(),
+        })
+}
+
+/// Whether gender is a binary value that warrants the 铁律 anatomy clause.
+fn is_binary_gender(persona: &CompanionPersona) -> bool {
+    matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
+}
+
 /// Build the full companion system prompt (plain-text reply schema).
 ///
 /// `profile_groups` is a list of `(label, bullets)` pairs that get rendered
@@ -303,6 +339,28 @@ pub fn build_prompt(
         meta_string_array_joined(persona, "quirks").unwrap_or_else(|| "无特定口癖".into());
     let topics_str =
         meta_string_array_joined(persona, "topics").unwrap_or_else(|| "日常生活、感情观".into());
+    let timezone = meta_str(persona, "timezone");
+
+    // Authored prose head — the most stable per-genome block, used as the
+    // leading cache prefix. Deliberately redundant with the structured sections
+    // below (reinforcement). Omitted with no separator when empty.
+    let head = {
+        let sp = persona.genome.system_prompt.trim();
+        if sp.is_empty() {
+            String::new()
+        } else {
+            format!("{sp}\n\n")
+        }
+    };
+
+    let identity = match gender_label(persona) {
+        Some(g) => format!("你是 {name}，{g}，{age} 岁，{mbti} 性格。"),
+        None => format!("你是 {name}，{age} 岁，{mbti} 性格。"),
+    };
+    let tz_clause = match timezone {
+        Some(tz) if !tz.trim().is_empty() => format!("你所在时区：{}。", tz.trim()),
+        _ => String::new(),
+    };
 
     let traits_section = if prompt_traits.is_empty() {
         String::new()
@@ -373,8 +431,21 @@ pub fn build_prompt(
         )
     };
 
+    // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
+    // binary genders, with a role-play exception. Skipped for non-binary/absent.
+    let gender_rule = if is_binary_gender(persona) {
+        let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
+        format!(
+            "\n⑧ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+             也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
+             或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "你是 {name}，{age} 岁，{mbti} 性格。\n\
+        "{head}{identity}{tz_clause}\n\
          \n\
          【背景故事】\n{backstory}\n\
          \n\
@@ -382,17 +453,14 @@ pub fn build_prompt(
          【口癖/习惯】{quirks_str}\n\
          【擅长话题】{topics_str}{traits_section}\n\
          \n\
-         【今日情境】\n{tc}\n\
+         【本轮风格】{style_text}\n\
          \n\
          【你对他的了解（通用画像）】\n{profile_str}\n\
          \n\
          【你们之间的事（只有你和他知道）】\n{rel_str}\
-         {attitude}\
-         {state}\
-         {gift}\
-         {hints_section}\n\
+         {attitude}{state}{hints_section}{gift}\n\
          \n\
-         【本轮风格】{style_text}\n\
+         【今日情境】\n{tc}\n\
          \n\
          ---\n\
          【铁律 — 违反即失效】\n\
@@ -402,10 +470,10 @@ pub fn build_prompt(
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
-         ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
+         ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
          【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
-        tc = now_context(),
+        tc = now_context(timezone),
         lr = length_rule(affinity),
     )
 }
@@ -528,6 +596,14 @@ mod tests {
     use chrono::TimeZone;
     use uuid::Uuid;
 
+    fn set_meta(p: &mut CompanionPersona, key: &str, val: serde_json::Value) {
+        p.genome
+            .art_metadata
+            .as_object_mut()
+            .expect("fixture art_metadata is an object")
+            .insert(key.to_string(), val);
+    }
+
     fn fixture_persona() -> CompanionPersona {
         use eros_engine_core::persona::{PersonaGenome, PersonaInstance};
         let uid = Uuid::nil();
@@ -559,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_with_empty_traits_omits_section_and_preserves_layout() {
+    fn build_prompt_with_empty_traits_omits_section() {
         let p = build_prompt(
             &fixture_persona(),
             &[],
@@ -575,13 +651,10 @@ mod tests {
             !p.contains("【附加指引】"),
             "empty traits must not render section"
         );
-        // Byte-level invariant proving "byte-for-byte identical to legacy"
-        // for the empty-traits case: topics → time-context joins with the
-        // pre-existing `\n\n` separator, no leftover whitespace from the
-        // new `{traits_section}` placeholder.
+        // 擅长话题 now flows straight into 本轮风格 (the first volatile block).
         assert!(
-            p.contains("【擅长话题】t1\n\n【今日情境】"),
-            "topics → time-context separator must be exactly '\\n\\n'"
+            p.contains("【擅长话题】t1\n\n【本轮风格】"),
+            "topics → 本轮风格 separator must be exactly '\\n\\n': {p}"
         );
     }
 
@@ -618,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_section_sits_between_topics_and_time_context() {
+    fn build_prompt_stable_block_order() {
         let traits = vec![PromptTrait {
             tag: "x".into(),
             text: "trait body".into(),
@@ -634,13 +707,286 @@ mod tests {
             &[],
             &traits,
         );
-        let topics_idx = p.find("【擅长话题】").expect("topics header");
-        let traits_idx = p.find("【附加指引】").expect("traits header");
-        let time_idx = p.find("【今日情境】").expect("time-context header");
+        let topics = p.find("【擅长话题】").expect("topics");
+        let traits_i = p.find("【附加指引】").expect("traits");
+        let turn_style = p.find("【本轮风格】").expect("turn style");
         assert!(
-            topics_idx < traits_idx && traits_idx < time_idx,
-            "order: 擅长话题 → 附加指引 → 今日情境"
+            topics < traits_i && traits_i < turn_style,
+            "order: 擅长话题 → 附加指引 → 本轮风格"
         );
+    }
+
+    #[test]
+    fn build_prompt_full_order_and_cache_break() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
+        let order = [
+            "你是 ",
+            "【背景故事】",
+            "【说话风格】",
+            "【口癖/习惯】",
+            "【擅长话题】",
+            "【本轮风格】",
+            "【你对他的了解（通用画像）】",
+            "【你们之间的事",
+            "【今日情境】",
+            "【铁律",
+            "【输出】",
+        ];
+        let mut last = 0usize;
+        for h in order {
+            let cur = pos(h);
+            assert!(cur >= last, "header {h} out of order in:\n{s}");
+            last = cur;
+        }
+        let topics = pos("【擅长话题】");
+        for vol in [
+            "【本轮风格】",
+            "【你对他的了解（通用画像）】",
+            "【今日情境】",
+        ] {
+            assert!(
+                pos(vol) > topics,
+                "{vol} must sit after the stable persona block"
+            );
+        }
+    }
+
+    #[test]
+    fn build_prompt_renders_system_prompt_head_when_present() {
+        let mut p = fixture_persona();
+        p.genome.system_prompt = "AUTHORED HEAD".into();
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(
+            s.starts_with("AUTHORED HEAD\n\n你是 "),
+            "prose head + '\\n\\n' separator before identity: {s}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_head_when_system_prompt_empty() {
+        let mut p = fixture_persona();
+        p.genome.system_prompt = "   ".into();
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(
+            s.starts_with("你是 "),
+            "empty head → starts with identity: {s}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_binary_gender_and_iron_rule() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("male"));
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
+        assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_nonbinary_gender_without_iron_rule() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("non-binary"));
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(
+            s.contains("你是 Aria，non-binary，24 岁"),
+            "verbatim render: {s}"
+        );
+        assert!(
+            !s.contains("⑧"),
+            "non-binary must not get the binary anatomy rule: {s}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_gender_when_absent() {
+        let p = fixture_persona(); // fixture art_metadata has no gender key
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
+        assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
+    }
+
+    #[test]
+    fn build_prompt_treats_blank_gender_as_absent() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "gender", serde_json::json!("   "));
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        // blank gender must not produce a double comma or a ⑧ rule
+        assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
+        assert!(
+            !s.contains("，，"),
+            "blank gender must not double-comma: {s}"
+        );
+        assert!(!s.contains("⑧"), "{s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_timezone_clause_when_present() {
+        let mut p = fixture_persona();
+        set_meta(&mut p, "timezone", serde_json::json!("Asia/Tokyo"));
+        let s = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
+    }
+
+    // ─── Cache-prefix boundary invariants ──────────────────────────────
+    // Same-user multi-turn: the stable block (everything before 【本轮风格】) is
+    // byte-identical no matter how the per-turn-volatile inputs change.
+    #[test]
+    fn build_prompt_stable_prefix_identical_across_volatile_changes() {
+        let p = fixture_persona();
+        let a = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+        );
+        let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
+        let b = build_prompt(
+            &p,
+            &groups,
+            &["聊到深夜".to_string()],
+            Some(&fixture_affinity()),
+            &[],
+            "normal",
+            ReplyStyle::Warm,
+            &["想他".to_string()],
+            &[],
+        );
+        let cut = a.find("【本轮风格】").expect("turn-style header present");
+        assert_eq!(
+            &a[..cut],
+            &b[..cut],
+            "everything before 【本轮风格】 must be byte-identical across turns"
+        );
+    }
+
+    // Cross-config: different trait sets share the persona block up to 【擅长话题】
+    // (the divergence is at 【附加指引】), but the full prompts differ.
+    #[test]
+    fn build_prompt_traits_change_only_breaks_after_topics() {
+        let p = fixture_persona();
+        let t1 = vec![PromptTrait {
+            tag: "a".into(),
+            text: "alpha".into(),
+        }];
+        let t2 = vec![PromptTrait {
+            tag: "b".into(),
+            text: "beta".into(),
+        }];
+        let a = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &t1,
+        );
+        let b = build_prompt(
+            &p,
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &t2,
+        );
+        let cut = a.find("【附加指引】").expect("traits header present");
+        assert_eq!(
+            &a[..cut],
+            &b[..cut],
+            "persona block up to 【擅长话题】 is shared across trait configs"
+        );
+        assert_ne!(a, b, "different trait sets must produce different prompts");
     }
 
     #[test]
@@ -778,12 +1124,49 @@ mod tests {
     }
 
     #[test]
-    fn now_context_renders_absolute_utc_date_weekday_time() {
+    fn now_context_defaults_to_sgt_when_timezone_absent() {
+        // No persona tz → default SGT (UTC+8): 07:55 UTC → 15:55 same day, Thursday.
         let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap(); // a Thursday
-        let s = now_context_at(dt);
+        let s = now_context_at(dt, None);
+        assert!(s.contains("Asia/Singapore"), "default zone is SGT: {s}");
         assert!(s.contains("2026-05-21"), "{s}");
         assert!(s.contains("周四"), "{s}");
-        assert!(s.contains("07:55"), "{s}");
-        assert!(s.contains("居住地"), "{s}");
+        assert!(s.contains("15:55"), "07:55 UTC +8 = 15:55: {s}");
+        assert!(s.contains("白天"), "{s}");
+        assert!(s.contains("唯一的时间基准"), "{s}");
+        assert!(!s.contains("UTC"), "no UTC-inference path anymore: {s}");
+    }
+
+    #[test]
+    fn now_context_with_timezone_uses_local_date_weekday_time() {
+        // 2026-05-21 20:00 UTC is Thursday; Asia/Tokyo (UTC+9) → 2026-05-22 05:00, Friday.
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 20, 0, 0).unwrap();
+        let s = now_context_at(dt, Some("Asia/Tokyo"));
+        assert!(s.contains("Asia/Tokyo"), "renders the persona zone id: {s}");
+        assert!(s.contains("2026-05-22"), "local date should roll over: {s}");
+        assert!(
+            s.contains("周五"),
+            "local weekday should be Friday, not UTC Thursday: {s}"
+        );
+        assert!(s.contains("05:00"), "{s}");
+        assert!(s.contains("清晨"), "05:00 local → 清晨: {s}");
+        assert!(s.contains("唯一的时间基准"), "{s}");
+        assert!(
+            s.contains("今天/今晚/明天/昨天/刚才/现在"),
+            "relative-date binding: {s}"
+        );
+    }
+
+    #[test]
+    fn now_context_with_garbage_timezone_defaults_to_sgt() {
+        // Unparseable tz → SGT default (not UTC): 07:55 UTC → 15:55 SGT.
+        let dt = Utc.with_ymd_and_hms(2026, 5, 21, 7, 55, 0).unwrap();
+        let s = now_context_at(dt, Some("Not/AZone"));
+        assert!(
+            s.contains("Asia/Singapore"),
+            "garbage tz falls back to SGT: {s}"
+        );
+        assert!(s.contains("15:55"), "{s}");
+        assert!(!s.contains("UTC"), "{s}");
     }
 }
