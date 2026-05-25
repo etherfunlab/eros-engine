@@ -37,18 +37,25 @@ Embedding 使用 Voyage `voyage-3-lite`，512 維向量。檢索走 pgvector IVF
 
 ### 六維好感度
 
-每個 chat session 都有一條關係向量：
+每個 chat session 都有一條六維關係向量。六個維度（向量的各軸）如下：
 
 | 維度 | 範圍 | 控制 |
 |---|---:|---|
 | `warmth` | -1.0 到 1.0 | 語氣與稱呼，從疏離到親近。 |
 | `trust` | 0.0 到 1.0 | 話題深度，以及 persona 是否願意透露自己。 |
-| `intrigue` | 0.0 到 1.0 | 好奇心與追問傾向。 |
 | `intimacy` | 0.0 到 1.0 | 暱稱、內部梗、對過往細節的呼應。 |
+| `intrigue` | 0.0 到 1.0 | 好奇心與追問傾向。 |
 | `patience` | 0.0 到 1.0 | 對低 effort 或重複消息的容忍度。 |
 | `tension` | 0.0 到 1.0 | 推拉、摩擦、玩鬧式抵抗。 |
 
-更新使用指數移動平均（EMA），避免 persona 在情緒狀態間突然跳變。`intrigue`、`patience`、`tension` 也會隨真實時間自然衰退或恢復。
+兩個**复合指标**把這條向量壓成便於 prompt 塑形的摘要——各是一組互斥三維的平均（`warmth` 先線性縮放到 0–1）：
+
+- **bond**（朋友感，關係有多近）= mean(`warmth`、`intimacy`、`tension`)
+- **chemistry**（来电感，張力有多強）= mean(`trust`、`intrigue`、`patience`)
+
+更新使用指數移動平均（EMA），避免 persona 在情緒狀態間突然跳變。`intrigue`、`patience`、`tension` 也會隨真實時間自然衰退或恢復。平滑强度由 `EMA_INERTIA`（默认 `0.8`）控制：每轮只施加 `1 − inertia` 比例的评估增量，所以值越高、关系升温（与降温）越慢——相当于一个难度旋钮；设为 `0` 则每次增量全额生效。
+
+每個 request 可帶 `affinity_scope` flag，決定哪一個复合指标參與 prompt 注入：`bond`（默認）、`chemistry`、`bond_and_chemistry`（≡ `full`，全部六維）、`none`，或像 `["warmth", "trust"]` 這樣的顯式維度子集。它只 gate prompt 注入——六個維度始終照常持久化與更新。
 
 `stranger`、`slow_burn`、`friend`、`frenemy`、`romantic` 這些關係標籤由閾值規則從向量中推導出來。它們是內部狀態，不是展示給用戶看的 badge。
 
@@ -170,7 +177,7 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 | 環境變量 | 必要 | 說明 |
 |---|---|---|
 | `DATABASE_URL` | 是 | 帶 `pgvector` 的 Postgres；表建在 `engine.*`。 |
-| `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml.example` 路由。 |
+| `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml` 路由。 |
 | `OPENROUTER_APP_REFERER` | 否 | 設了之後每次出站 OpenRouter 調用都帶 `HTTP-Referer`。會出現在 OpenRouter 的 app 分析面板上。 |
 | `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | 否 | 逗号分隔的顶层 key 列表，从 `usage` 对象里剔除 —— 在 SSE 流式 `done` 帧上生效。常用于把批发 `cost` / `cost_details` 隐藏起来不外泄给下游客户。完整 usage 仍会落库并写入服务器端 tracing。 |
@@ -179,8 +186,8 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 | `SUPABASE_JWT_SECRET` | 是 | 默認 auth 使用的 JWT signing secret。 |
 | `BIND_ADDR` | 否 | 默認 `0.0.0.0:8080`。 |
 | `EXPOSE_AFFINITY_DEBUG` | 否 | 設為 `true` 會開啟 `/comp/affinity/{session_id}`。 |
-| `EMA_INERTIA` | 否 | 默認 `0.8`。 |
-| `MODEL_CONFIG_PATH` | 否 | 默認 `examples/model_config.toml.example`。 |
+| `EMA_INERTIA` | 否 | affinity 更新的 EMA 平滑系数，范围 `[0, 1]`，默认 `0.8`。每轮只施加 `1 − inertia` 比例的增量，值越高则关系向量每轮移动越小（升温/降温都更慢）——相当于关系难度旋钮；`0` 表示每次增量全额生效。 |
+| `MODEL_CONFIG_PATH` | 否 | 默認 `examples/model_config.toml`。 |
 | `RUST_LOG` | 否 | 默認 `info`。 |
 
 ## 刻意不包含的東西
