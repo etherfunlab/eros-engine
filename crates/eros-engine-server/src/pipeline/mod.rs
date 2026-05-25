@@ -90,4 +90,3 @@ pub async fn compute_signals_for_session(
         hours_since_last_ghost,
     })
 }
-

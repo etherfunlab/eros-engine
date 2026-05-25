@@ -1112,10 +1112,15 @@ data: [DONE]\n\n";
             )
             .unwrap(),
         );
-        let f1: Vec<ProtocolFrame> =
-            replay_stream(std::sync::Arc::new(s1), session_id, user_id, false, vec![row.clone()])
-                .collect()
-                .await;
+        let f1: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s1),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
         assert_eq!(meta_model(&f1), None);
 
         // pinned string -> that name
@@ -1126,10 +1131,15 @@ data: [DONE]\n\n";
             )
             .unwrap(),
         );
-        let f2: Vec<ProtocolFrame> =
-            replay_stream(std::sync::Arc::new(s2), session_id, user_id, false, vec![row.clone()])
-                .collect()
-                .await;
+        let f2: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s2),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
         assert_eq!(meta_model(&f2), Some("Aria".to_string()));
 
         // map hit -> mapped name
@@ -1140,10 +1150,15 @@ data: [DONE]\n\n";
             )
             .unwrap(),
         );
-        let f3: Vec<ProtocolFrame> =
-            replay_stream(std::sync::Arc::new(s3), session_id, user_id, false, vec![row.clone()])
-                .collect()
-                .await;
+        let f3: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s3),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
         assert_eq!(meta_model(&f3), Some("Nova".to_string()));
     }
 }

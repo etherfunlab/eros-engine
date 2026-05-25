@@ -991,8 +991,7 @@ reasoning = { exclude = true }
     #[test]
     fn committed_example_config_parses_and_has_affinity_task() {
         let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text)
-            .expect("examples/model_config.toml must parse");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
         assert_eq!(r.max_tokens, 400);
@@ -1009,8 +1008,7 @@ reasoning = { exclude = true }
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
         let text = include_str!("../../../examples/model_config.toml");
-        let cfg = ModelConfig::from_toml_str(text)
-            .expect("examples/model_config.toml must parse");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let disabled = ReasoningConfig {
             enabled: Some(false),
             exclude: None,
