@@ -419,7 +419,7 @@ pub(super) async fn build_reply_request(
     session_id: Uuid,
     user_id: Uuid,
     instance_id: Uuid,
-) -> Result<ChatRequest, AppError> {
+) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
 
@@ -506,11 +506,15 @@ pub(super) async fn build_reply_request(
         affinity_scope,
     );
 
-    Ok(assemble_chat_request(
-        resolved,
-        system_prompt,
-        history,
-        audit_from_event(&input.event),
+    let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
+    Ok((
+        assemble_chat_request(
+            resolved,
+            system_prompt,
+            history,
+            audit_from_event(&input.event),
+        ),
+        injected_tags,
     ))
 }
 
@@ -524,7 +528,7 @@ pub(super) async fn build_gift_request(
     user_id: Uuid,
     instance_id: Uuid,
     pending: &[PendingGift],
-) -> Result<ChatRequest, AppError> {
+) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
 
@@ -565,11 +569,9 @@ pub(super) async fn build_gift_request(
         eros_engine_core::scope::AffinityScope::full(),
     );
 
-    Ok(assemble_chat_request(
-        resolved,
-        system_prompt,
-        history,
-        None,
+    Ok((
+        assemble_chat_request(resolved, system_prompt, history, None),
+        Vec::new(),
     ))
 }
 
