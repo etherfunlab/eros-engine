@@ -38,7 +38,12 @@ against the reply.
   `temperature` / `max_tokens` / `filter_prompt` / `trigger` / `timing`
   (default block + per-tier overrides),
 - a combinable per-turn `trigger`,
-- two extract-timing modes (`after_extract` default, `before_extract`).
+- two extract-timing modes (`after_extract` default, `before_extract`),
+- two new `final`-frame status fields: `filtered` (bool) and `prompt_injected`
+  (array of injected trait tags, `null` when none). **`prompt_injected` is
+  independent of the filter** — it surfaces the existing prompt-trait injection
+  feature (an oversight from its original design) and is bundled here for
+  convenience. (See §2.8.)
 
 **Non-goals / explicit boundaries:**
 - **Not enabled by default.** Absent config ⇒ no filtering, byte-identical to
@@ -258,6 +263,47 @@ this path) are unaffected. The new fields live on the generic
 `TaskConfig`/`TierConfig`; setting them on other task blocks parses but is inert
 (consistent with the rest of the config — no `deny_unknown_fields`).
 
+### 2.8 `final`-frame status fields (`filtered`, `prompt_injected`)
+
+`ProtocolFrame::Final` gains two **always-present** fields:
+
+```rust
+Final {
+    lead_score: f64,
+    should_show_cta: bool,
+    agent_training_level: f64,
+    filtered: bool,                        // client received filtered output this turn
+    prompt_injected: Option<Vec<String>>,  // injected trait tags; null when none
+}
+```
+
+- **`prompt_injected`** = JSON array of the trait tags **actually injected** into
+  the system prompt — i.e. `kept_traits` *after* tier `allow_traits` gating in
+  `build_reply_request` / `build_gift_request`, mapped to their `tag`. `null`
+  when nothing was injected. **No `skip_serializing_if`** → always present
+  (array or `null`). Independent of the filter feature; reflects only trait
+  injection. (Example: `"prompt_injected": ["nsfw_boost"]`.)
+- **`filtered`** = `true` only when the client actually received filtered output
+  (filtered mode + per-attempt `models` pass + filter LLM success). `false` for
+  live mode, a `models`-miss, fail-open, ghost, and replay.
+
+**Plumbing:**
+- `build_reply_request` / `build_gift_request` additionally return the injected
+  tags (today they return only the `ChatRequest`), so `run_stream` can carry
+  them into the Final frame.
+- `drive_chat_burst` reports whether it filtered via the shared burst result
+  (extend `produced_out` into a small `BurstOutcome { produced, filtered }`, or
+  add a parallel flag); `run_stream` reads it after the burst.
+- `compute_final_frame` takes `filtered` + `prompt_injected` params. The
+  Reply/GiftReaction branch passes the burst's `filtered` and the request's
+  injected tags; Ghost / Proactive / other branches pass `false` / `None`.
+- `replay_stream`: `filtered = false`, `prompt_injected = null` — neither is
+  persisted, so replay cannot reconstruct them (consistent with `lead_score` /
+  `agent_training_level` already being recomputed-from-current on replay).
+
+Additive change to the `final` frame contract in
+`docs/superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md` §1.5.
+
 ---
 
 ## 3. Testing
@@ -286,6 +332,12 @@ this path) are unaffected. The new fields live on the generic
     attempt in filtered mode is not persisted/emitted.
 - **Committed example config:** parses; with `output_filter` unset, resolve ⇒
   `None` (off by default).
+- **Final frame fields:** `filtered` true on filtered-success; false on
+  fail-open / live mode / `models`-miss / ghost. `prompt_injected` = array of
+  injected tags; reflects **kept** (post-gating) tags, not requested; `null`
+  when none or all dropped by tier gating. Replay Final ⇒ `filtered=false`,
+  `prompt_injected=null`. `null` serializes as `null` (field always present).
+  Update existing `final_frame_*` constructor tests for the new fields.
 
 ---
 
@@ -299,5 +351,9 @@ this path) are unaffected. The new fields live on the generic
   the trigger semantics, the fail-open behavior, and the persistence/replay
   consequence (only filtered text is stored; after- vs before-extract).
 - Additive TOML schema; default behavior unchanged (off unless configured).
+- Update `docs/superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md`
+  §1.5: the `final` frame now carries `filtered` (bool) and `prompt_injected`
+  (array | null). Note `prompt_injected` reflects the pre-existing trait
+  injection and is unrelated to the filter.
 - Dev-track feature: lands on `feat/chat-output-filter` → PR into `dev` →
   ships in a `0.4.21-dev` cut before promotion to stable `0.4.21`.
