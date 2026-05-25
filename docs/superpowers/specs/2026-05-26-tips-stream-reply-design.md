@@ -37,8 +37,8 @@ chat reply.
 - the engine appends a `【刚收到的打赏】` fragment to the reply's system prompt,
   containing both the literal dollar amount and a tier adjective,
 - the reply's tone is driven by the persona's free-form `tip_personality`
-  (passed through verbatim for the LLM to interpret), falling back to an
-  enthusiastic default when the field is absent,
+  (passed through verbatim for the LLM to interpret), falling back to a
+  `Tsundere` style when the field is absent,
 - the turn is guaranteed a reply (never ghosted),
 - affinity, persistence mechanics, and streaming behave like a normal chat turn.
 
@@ -135,8 +135,8 @@ of `decide`:
 //    identical to a normal reply.
 if let Event::UserMessage { tips_amount_usd: Some(_), .. } = &input.event {
     let reply_style = match input.persona.genome.tip_personality.as_deref() {
-        Some(_) => ReplyStyle::Neutral,  // neutral baseline; the §2.6 personality line drives the vibe
-        None    => ReplyStyle::Excited,  // no personality set → enthusiastic default for good UX
+        Some(_) => ReplyStyle::Neutral,   // neutral baseline; the §2.6 personality line drives the vibe
+        None    => ReplyStyle::Tsundere,  // no personality set → tsundere default ("带点傲娇、欲拒还迎")
     };
     return ActionPlan {
         action_type: ActionType::Reply,
@@ -179,7 +179,7 @@ fn tip_tier_adjective(amount_usd: f64) -> &'static str {
 pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> String {
     let how = match tip_personality {
         Some(p) => format!("请代入你「{p}」的打赏反应人设，自然地回应这份心意"),
-        None    => "请自然地回应这份心意".to_string(),  // tone leans on the Excited fallback style
+        None    => "请自然地回应这份心意".to_string(),  // tone leans on the Tsundere fallback style
     };
     format!(
         "\n\n【刚收到的打赏】\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n{}，不要照搬本指令原文。",
@@ -221,7 +221,7 @@ FE taps tip ($20)
   → validate_payload (content may be empty; 0 < amount ≤ 1_000_000)
   → upsert_user_message_idempotent(role='user', content="(打赏 $20)")
   → run_stream → Event::UserMessage { tips_amount_usd: Some(20.0), .. }
-  → pde::decide → rule 0 → Reply (style from tip_personality / Excited fallback;
+  → pde::decide → rule 0 → Reply (style from tip_personality / Tsundere fallback;
                                   normal deltas; ghost bypassed)
   → build_reply_request → system_prompt += tips_reaction_context(20, tip_personality)
   → SSE stream (same channel as a normal reply) → Done
@@ -233,7 +233,7 @@ FE taps tip ($20)
 
 - **pde**: `UserMessage` with `tips_amount_usd: Some(_)` → `Reply`; forced even
   when ghost signals would otherwise fire; deltas equal `predict_reply_deltas`;
-  `reply_style` = `Excited` when `tip_personality` is `None`, `Neutral` when
+  `reply_style` = `Tsundere` when `tip_personality` is `None`, `Neutral` when
   `Some(_)`.
 - **prompt**: bucket boundaries (`$9.99`→一般, `$10`→有点多, `$99`→有点多,
   `$100`→超级多, `$999`→超级多, `$1000`→非常夸张, `$10000`→近乎不可思议);
