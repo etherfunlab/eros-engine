@@ -181,6 +181,43 @@ pub struct ReasoningConfig {
     pub exclude: Option<bool>,
 }
 
+/// Per-turn filter trigger. Every field optional; the AND of all *specified*
+/// predicates decides whether a turn is filtered. None specified ⇒ filter every
+/// turn. `random` is the probability the turn passes the random gate.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OutputFilterTrigger {
+    #[serde(default)]
+    pub random: Option<f64>,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+    #[serde(default)]
+    pub traits: Option<TraitPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TraitPredicate {
+    #[serde(default)]
+    pub any: Vec<String>,
+    #[serde(default)]
+    pub when: TraitWhen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TraitWhen {
+    #[default]
+    Present,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterTiming {
+    #[default]
+    AfterExtract,
+    BeforeExtract,
+}
+
 /// One tier's overrides for a task. Every field is optional; an absent
 /// field inherits from the enclosing task's default block in `resolve`.
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +231,16 @@ pub struct TierConfig {
     /// (drop all); `["a","b"]` → keep only those tags.
     #[serde(default)]
     pub allow_traits: Option<Vec<String>>,
+    #[serde(default)]
+    pub output_filter: Option<bool>,
+    #[serde(default)]
+    pub filter_prompt: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<OutputFilterTrigger>,
+    #[serde(default)]
+    pub timing: Option<FilterTiming>,
+    #[serde(default)]
+    pub retry_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -238,6 +285,16 @@ pub struct TaskConfig {
     /// `model` field is omitted from chat `meta` frames). See `DisplayOverride`.
     #[serde(default)]
     pub model_name_display_override: Option<DisplayOverride>,
+    #[serde(default)]
+    pub output_filter: Option<bool>,
+    #[serde(default)]
+    pub filter_prompt: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<OutputFilterTrigger>,
+    #[serde(default)]
+    pub timing: Option<FilterTiming>,
+    #[serde(default)]
+    pub retry_depth: Option<u32>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -1223,5 +1280,60 @@ model = "m"
         );
         // A task without the field stays None (omit).
         assert_eq!(cfg.display_override("insight_extraction"), None);
+    }
+
+    #[test]
+    fn output_filter_config_parses() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = false
+[tasks.chat_companion.tiers.gold]
+model = "g"
+output_filter = true
+
+[tasks.chat_output_filter]
+model = "fast/model"
+filter_prompt = "Rewrite: {x}"
+temperature = 0.3
+max_tokens = 400
+retry_depth = 2
+trigger = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw"], when = "present" } }
+timing = "after_extract"
+[tasks.chat_output_filter.tiers.gold]
+filter_prompt = "tier prompt"
+trigger = { random = 1.0 }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let cc = &cfg.tasks["chat_companion"];
+        assert_eq!(cc.output_filter, Some(false));
+        assert_eq!(cc.tiers["gold"].output_filter, Some(true));
+
+        let f = &cfg.tasks["chat_output_filter"];
+        assert_eq!(f.filter_prompt.as_deref(), Some("Rewrite: {x}"));
+        assert_eq!(f.retry_depth, Some(2));
+        assert_eq!(f.timing, Some(FilterTiming::AfterExtract));
+        let trig = f.trigger.clone().unwrap();
+        assert_eq!(trig.random, Some(0.3));
+        assert_eq!(trig.models.as_deref(), Some(&["x/y".to_string()][..]));
+        let tp = trig.traits.unwrap();
+        assert_eq!(tp.any, vec!["nsfw".to_string()]);
+        assert_eq!(tp.when, TraitWhen::Present);
+        // per-tier override parses; tier trigger replaces default wholesale
+        assert_eq!(f.tiers["gold"].trigger.clone().unwrap().random, Some(1.0));
+        assert_eq!(f.tiers["gold"].filter_prompt.as_deref(), Some("tier prompt"));
+    }
+
+    #[test]
+    fn trait_when_defaults_to_present() {
+        let toml = r#"
+[tasks.chat_output_filter]
+model = "m"
+filter_prompt = "p"
+trigger = { traits = { any = ["a"] } }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let tp = cfg.tasks["chat_output_filter"].trigger.clone().unwrap().traits.unwrap();
+        assert_eq!(tp.when, TraitWhen::Present);
     }
 }
