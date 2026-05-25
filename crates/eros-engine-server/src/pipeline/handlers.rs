@@ -1,27 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Action handlers — one per ActionType. Each assembles a ChatRequest
-//! (or None if no LLM call is needed) based on the PDE's ActionPlan.
+//! Chat request builders — assemble an `eros_engine_llm::openrouter::ChatRequest`
+//! for the streaming pipeline based on the PDE's `ActionPlan`.
 //!
-//! Ported from `eros-gateway/src/engine/handlers/{reply,ghost,gift,proactive}.rs`
-//! with these OSS-specific changes:
-//!
-//! - All handlers go through `eros_engine_store::chat::ChatRepo` rather than
-//!   inline `sqlx::query_as` against `chat_messages`.
-//! - `ChatRequest` is built around the OSS `eros_engine_llm::openrouter::ChatRequest`
-//!   shape (`model` / `fallback_model` / `messages` / `temperature` / `max_tokens`),
-//!   resolved via `state.model_config` at handler time. The resolver takes
-//!   `task: &str` + the request's `tier: Option<&str>` and returns the
-//!   per-tier model / fallback / allow_traits.
-//! - `GiftHandler` carries `deltas: AffinityDeltas` directly — there is
-//!   no shop item / gift-record lookup since the OSS engine has no
-//!   credit ledger.
+//! OSS specifics: all DB I/O goes through `eros_engine_store` repos, and the
+//! model / fallback / allow_traits are resolved via `state.model_config`
+//! (task + per-request tier).
 
-use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::ResolvedModel;
@@ -49,18 +37,6 @@ const CHAT_TASK: &str = "chat_companion";
 
 /// Maximum number of recent messages pulled into the prompt.
 const HISTORY_WINDOW: i64 = 20;
-
-#[async_trait]
-pub trait ActionHandler: Send + Sync {
-    // Dispatched only by the retained-but-unreached sync `pipeline::run`
-    // (the sync `/message` handler was removed); see pipeline/mod.rs note.
-    #[allow(dead_code)]
-    async fn handle(
-        &self,
-        input: &DecisionInput,
-        plan: &ActionPlan,
-    ) -> Result<Option<ChatRequest>, AppError>;
-}
 
 /// Partition caller traits by a tier's resolved allow-list.
 /// - `allow == None` → no gating: all kept, none dropped.
@@ -595,124 +571,6 @@ pub(super) async fn build_gift_request(
         history,
         None,
     ))
-}
-
-pub struct ReplyHandler<'a> {
-    pub state: &'a AppState,
-    pub session_id: Uuid,
-    pub user_id: Uuid,
-    pub instance_id: Uuid,
-}
-
-#[async_trait]
-impl<'a> ActionHandler for ReplyHandler<'a> {
-    async fn handle(
-        &self,
-        input: &DecisionInput,
-        plan: &ActionPlan,
-    ) -> Result<Option<ChatRequest>, AppError> {
-        let req = build_reply_request(
-            self.state,
-            input,
-            plan,
-            self.session_id,
-            self.user_id,
-            self.instance_id,
-        )
-        .await?;
-        Ok(Some(req))
-    }
-}
-
-// ─── Ghost ──────────────────────────────────────────────────────────
-
-/// Ghost handler is intentionally a no-op at the chat-request layer:
-/// the affinity row update happens in `pipeline::post_process`. The
-/// `state` / `session_id` fields are kept for future tracing hooks and
-/// for symmetry with the other handlers.
-#[allow(dead_code)]
-pub struct GhostHandler<'a> {
-    pub state: &'a AppState,
-    pub session_id: Uuid,
-}
-
-#[async_trait]
-impl<'a> ActionHandler for GhostHandler<'a> {
-    async fn handle(
-        &self,
-        _input: &DecisionInput,
-        _plan: &ActionPlan,
-    ) -> Result<Option<ChatRequest>, AppError> {
-        tracing::info!("Ghost decision: session={}", self.session_id);
-        // Affinity mutation and DB write happen in pipeline::post_process,
-        // which sees ActionType::Ghost and calls AffinityRepo::record_ghost.
-        Ok(None)
-    }
-}
-
-// ─── Gift ───────────────────────────────────────────────────────────
-
-/// Gift reaction handler.
-///
-/// Replaces the gateway's shop-item / gift-record lookup. The OSS engine
-/// has no credit ledger — the gift event endpoint (T11) injects the
-/// affinity deltas and an optional pending-gift list directly.
-pub struct GiftHandler<'a> {
-    pub state: &'a AppState,
-    pub session_id: Uuid,
-    pub user_id: Uuid,
-    pub instance_id: Uuid,
-    /// Caller-supplied deltas — passed through to the post-process step
-    /// via the ActionPlan / event channel; not consumed inside `handle()`.
-    #[allow(dead_code)]
-    pub deltas: AffinityDeltas,
-    /// Caller-supplied pending gifts (possibly empty) for prompt context.
-    pub pending: Vec<PendingGift>,
-}
-
-#[async_trait]
-impl<'a> ActionHandler for GiftHandler<'a> {
-    async fn handle(
-        &self,
-        input: &DecisionInput,
-        plan: &ActionPlan,
-    ) -> Result<Option<ChatRequest>, AppError> {
-        let req = build_gift_request(
-            self.state,
-            input,
-            plan,
-            self.session_id,
-            self.user_id,
-            self.instance_id,
-            &self.pending,
-        )
-        .await?;
-        Ok(Some(req))
-    }
-}
-
-// ─── Proactive ──────────────────────────────────────────────────────
-
-/// Proactive handler is a stub today — Phase 6 in the gateway / a
-/// later OSS milestone produces an outbound message here. Fields kept
-/// for the eventual implementation.
-#[allow(dead_code)]
-pub struct ProactiveHandler<'a> {
-    pub state: &'a AppState,
-    pub session_id: Uuid,
-}
-
-#[async_trait]
-impl<'a> ActionHandler for ProactiveHandler<'a> {
-    async fn handle(
-        &self,
-        _input: &DecisionInput,
-        _plan: &ActionPlan,
-    ) -> Result<Option<ChatRequest>, AppError> {
-        // Stub — Phase 6 in the gateway / a later OSS milestone will
-        // produce an outbound message here.
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
