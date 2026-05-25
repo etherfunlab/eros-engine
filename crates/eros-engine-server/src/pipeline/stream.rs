@@ -111,6 +111,7 @@ fn drive_chat_burst(
     persist_action: &'static str, // "reply" | "gift_reaction"
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
+    display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     produced_out: std::sync::Arc<
         std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>,
     >,
@@ -143,7 +144,7 @@ fn drive_chat_burst(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
-                model: Some(model_id.clone()),
+                model: display_override.as_ref().and_then(|d| d.display(model_id)),
                 continues_from: continues_from.map(ulid_string),
             };
 
@@ -389,6 +390,7 @@ pub fn run_stream(
 
                 let produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let display_override = state.model_config.display_override("chat_companion");
                 let burst = drive_chat_burst(
                     state.clone(),
                     user_msg.session_id,
@@ -397,6 +399,7 @@ pub fn run_stream(
                     persist_action,
                     plan_action,
                     req,
+                    display_override,
                     produced_out.clone(),
                 );
                 {
@@ -991,6 +994,79 @@ data: [DONE]\n\n";
                 saw_filtered_usage,
                 "a Reply burst ran but no Done frame carried usage to filter"
             );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_burst_meta_omits_model_when_override_false(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        for f in &frames {
+            if let ProtocolFrame::Meta { model, .. } = f {
+                assert_eq!(*model, None, "override=false must omit meta.model");
+            }
         }
     }
 }
