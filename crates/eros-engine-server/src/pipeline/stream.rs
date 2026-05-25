@@ -474,6 +474,7 @@ pub struct PersistedUserMessage {
     pub tier: Option<String>,
     pub memory_scope: eros_engine_core::scope::MemoryScope,
     pub affinity_scope: eros_engine_core::scope::AffinityScope,
+    pub tips_amount_usd: Option<f64>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -542,7 +543,7 @@ pub fn run_stream(
                 tier: user_msg.tier.clone(),
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
-                tips_amount_usd: None,
+                tips_amount_usd: user_msg.tips_amount_usd,
             },
             affinity: affinity.clone(),
             persona,
@@ -694,7 +695,7 @@ pub fn run_stream(
                     tier: user_msg.tier.clone(),
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
-                    tips_amount_usd: None,
+                    tips_amount_usd: user_msg.tips_amount_usd,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -1058,6 +1059,7 @@ mod tests {
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1182,6 +1184,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1258,6 +1261,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1350,6 +1354,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1538,6 +1543,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1654,6 +1660,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1767,6 +1774,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1873,6 +1881,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
