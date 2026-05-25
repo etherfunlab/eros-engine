@@ -64,6 +64,13 @@ pub enum ProtocolFrame {
         lead_score: f64,
         should_show_cta: bool,
         agent_training_level: f64,
+        filtered: bool,
+        // null when no trait injected; always present (no skip_serializing_if).
+        prompt_injected: Option<Vec<String>>,
+        // echo of the request tier; null when none. always present.
+        tier: Option<String>,
+        retries_chat: u32,
+        retries_filter: u32,
     },
     Error {
         code: StreamErrorCode,
@@ -353,7 +360,7 @@ pub fn run_stream(
                     usage: None,
                     generation_id: None,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
             ActionType::Reply | ActionType::GiftReaction => {
@@ -430,7 +437,7 @@ pub fn run_stream(
                     tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
 
                 // Spawn post-process; do not await.
@@ -463,7 +470,7 @@ pub fn run_stream(
             }
             _ => {
                 // Proactive and any future variants: Final-only.
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
         }
@@ -471,7 +478,17 @@ pub fn run_stream(
 }
 
 /// Compute the spec's `final` frame from current session/user state.
-async fn compute_final_frame(state: &AppState, session_id: Uuid, user_id: Uuid) -> ProtocolFrame {
+#[allow(clippy::too_many_arguments)]
+async fn compute_final_frame(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    filtered: bool,
+    prompt_injected: Option<Vec<String>>,
+    tier: Option<String>,
+    retries_chat: u32,
+    retries_filter: u32,
+) -> ProtocolFrame {
     let lead_score: f64 =
         sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
             .bind(session_id)
@@ -497,6 +514,11 @@ async fn compute_final_frame(state: &AppState, session_id: Uuid, user_id: Uuid) 
         lead_score: normalised_lead,
         should_show_cta,
         agent_training_level: training_level,
+        filtered,
+        prompt_injected,
+        tier,
+        retries_chat,
+        retries_filter,
     }
 }
 
@@ -575,7 +597,7 @@ pub fn replay_stream(
                 return;
             }
         }
-        let final_frame = compute_final_frame(&state, session_id, user_id).await;
+        let final_frame = compute_final_frame(&state, session_id, user_id, false, None, None, 0, 0).await;
         yield final_frame;
     }
 }
@@ -664,16 +686,34 @@ mod tests {
     }
 
     #[test]
-    fn final_frame_carries_three_floats() {
+    fn final_frame_carries_filter_and_status_fields() {
         let f = ProtocolFrame::Final {
             lead_score: 0.71,
             should_show_cta: false,
             agent_training_level: 0.42,
+            filtered: true,
+            prompt_injected: Some(vec!["nsfw_boost".into()]),
+            tier: Some("gold".into()),
+            retries_chat: 1,
+            retries_filter: 0,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "final");
-        assert!((v["lead_score"].as_f64().unwrap() - 0.71).abs() < 1e-9);
-        assert_eq!(v["should_show_cta"], false);
+        assert_eq!(v["filtered"], true);
+        assert_eq!(v["prompt_injected"][0], "nsfw_boost");
+        assert_eq!(v["tier"], "gold");
+        assert_eq!(v["retries_chat"], 1);
+        assert_eq!(v["retries_filter"], 0);
+
+        let f2 = ProtocolFrame::Final {
+            lead_score: 0.0, should_show_cta: false, agent_training_level: 0.0,
+            filtered: false, prompt_injected: None, tier: None,
+            retries_chat: 0, retries_filter: 0,
+        };
+        let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
+        assert!(v2["prompt_injected"].is_null());
+        assert!(v2["tier"].is_null());
+        assert_eq!(v2["filtered"], false);
     }
 
     #[test]
