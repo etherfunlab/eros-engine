@@ -513,6 +513,7 @@ pub fn replay_stream(
     rows: Vec<eros_engine_store::chat::ChatMessage>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
+        let display_override = state.model_config.display_override("chat_companion");
         if ghost {
             let msg_id = Ulid::new();
             yield ProtocolFrame::Meta {
@@ -538,7 +539,9 @@ pub fn replay_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
-                    model: row.model.clone(),
+                    model: display_override
+                        .as_ref()
+                        .and_then(|d| d.display(row.model.as_deref().unwrap_or_default())),
                     continues_from: prev_ulid.map(ulid_string),
                 };
                 if !row.content.is_empty() {
@@ -1068,5 +1071,79 @@ data: [DONE]\n\n";
                 assert_eq!(*model, None, "override=false must omit meta.model");
             }
         }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_applies_display_override(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let row = eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: "hello".into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("deepseek/x".into()),
+            usage: None,
+            generation_id: None,
+            assistant_action_type: Some("reply".into()),
+        };
+
+        let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {
+            frames.iter().find_map(|f| match f {
+                ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+                _ => None,
+            })?
+        };
+
+        // false -> omit
+        let mut s1 = crate::routes::companion::test_state(pool.clone());
+        s1.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = false\n",
+            )
+            .unwrap(),
+        );
+        let f1: Vec<ProtocolFrame> =
+            replay_stream(std::sync::Arc::new(s1), session_id, user_id, false, vec![row.clone()])
+                .collect()
+                .await;
+        assert_eq!(meta_model(&f1), None);
+
+        // pinned string -> that name
+        let mut s2 = crate::routes::companion::test_state(pool.clone());
+        s2.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = \"Aria\"\n",
+            )
+            .unwrap(),
+        );
+        let f2: Vec<ProtocolFrame> =
+            replay_stream(std::sync::Arc::new(s2), session_id, user_id, false, vec![row.clone()])
+                .collect()
+                .await;
+        assert_eq!(meta_model(&f2), Some("Aria".to_string()));
+
+        // map hit -> mapped name
+        let mut s3 = crate::routes::companion::test_state(pool.clone());
+        s3.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = { \"deepseek/x\" = \"Nova\", default = \"Companion\" }\n",
+            )
+            .unwrap(),
+        );
+        let f3: Vec<ProtocolFrame> =
+            replay_stream(std::sync::Arc::new(s3), session_id, user_id, false, vec![row.clone()])
+                .collect()
+                .await;
+        assert_eq!(meta_model(&f3), Some("Nova".to_string()));
     }
 }
