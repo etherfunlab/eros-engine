@@ -50,6 +50,7 @@ futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 ulid         = { workspace = true }
+rand = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"
