@@ -2,7 +2,7 @@
 
 **Status**: design, pending implementation plan
 **Target release**: 0.x patch (additive schema; **changes the default SSE wire behavior** — see §1)
-**Audience**: anyone implementing the engine-side `model_name_display_override` knob for `tasks.*`
+**Audience**: anyone implementing the engine-side `model_name_display_override` knob for `tasks.chat_companion`
 
 ---
 
@@ -32,9 +32,8 @@ Only the **streaming SSE path** (`crates/eros-engine-server/src/pipeline/stream.
 
 Not client-facing (left untouched):
 - `pipeline/mod.rs` sync `run` builds `ChatResponse.model` (~L177) but is
-  **unrouted dead code**; the gift route returns `reply: None`. We apply the
-  override there too (trivial, keeps the contract honest if re-wired) but it
-  has no live effect today.
+  **unrouted dead code**; the gift route returns `reply: None`. Out of scope —
+  not wired to the override (§1 non-goals).
 - Background tasks (affinity / memory / dreaming) build requests with the
   resolved model and never expose it to a client.
 
@@ -42,9 +41,16 @@ Not client-facing (left untouched):
 
 ## 1. Goal / Non-goals
 
-**Goal:** a TOML-driven, **task-level** `model_name_display_override` that
-controls the `model` value sent to clients in chat `meta` frames. Four forms:
-`boolean | string | array | dict`.
+**Goal:** a TOML-driven `model_name_display_override` on
+`[tasks.chat_companion]` that controls the `model` value sent to clients in
+chat `meta` frames. Four forms: `boolean | string | array | dict`. It is a
+top-level (default-block) field; tiers inherit it.
+
+**Scope: `chat_companion` only.** It is the only task that streams a `model`
+to a client, so the override is documented, exampled, and honored there alone.
+The field still lives on `TaskConfig` (the resolver is generic), so setting it
+on another task block parses without error but is **inert** — no task other
+than `chat_companion` ever reaches a `display_model()` call.
 
 **Default behavior change (approved):** the compiled-in / field-absent default
 is **`false` → omit the `model` field**. This flips today's "always show the
@@ -53,12 +59,16 @@ shipped `examples/model_config.toml.example` sets
 `model_name_display_override = true` on `chat_companion`.
 
 **Non-goals:**
+- Honoring the override on non-chat tasks (insight/affinity/memory/dreaming) —
+  they never stream a `model` to a client; the field is inert there.
 - Per-tier override (task-level only; tiers inherit, exactly like
   `reasoning`/`temperature`/`max_tokens`).
 - Changing the model sent to OpenRouter (`per_model_req.model`), the persisted
   `AssistantInsert.model`, or any usage logging — all keep the **real** id.
 - Persisting the display name (so the DB stays the source of truth for the
-  real model; see the replay note in §2.5).
+  real model; see the replay note in §2.6).
+- Wiring the override into the dead sync `pipeline::run` path (§0) — it is
+  unrouted; out of scope until/unless that path is revived.
 
 ---
 
@@ -170,9 +180,8 @@ In `stream.rs`:
   builds via `resolve(CHAT_TASK, None)` too), so one resolve covers all rows.
 - **Ghost** (both live and replay): `model: None`.
 
-In `pipeline/mod.rs` (currently dead sync path): apply
-`resolved.display_model(llm_resp.model.as_deref().unwrap_or(&resolved.model))`
-when building `ChatResponse.model`, for contract consistency.
+The dead sync `pipeline/mod.rs` path (`ChatResponse.model`, ~L177) is left
+unchanged — it is unrouted (§0) and out of scope.
 
 ### 2.6 Replay consistency (explicit consequence)
 
@@ -183,12 +192,14 @@ Because the display name is intentionally **not** persisted, the `array` form
 after a reload. `bool` / `string` / `dict` are deterministic across live and
 replay. This is acceptable for a cosmetic field.
 
-### 2.7 "All task types"
+### 2.7 Scope — `chat_companion` only
 
-The field is valid on every task block (it lives on `TaskConfig`) and is
-carried on every `ResolvedModel`, but it only has an **observable effect** for
-`chat_companion`, the only task that streams a model to a client. On
-background tasks it is inert.
+The field lives on `TaskConfig` and is carried on `ResolvedModel` (the resolver
+is generic), but `display_model()` is only ever called from the chat streaming
+path. No other task reaches an apply site, so the override is honored for
+`chat_companion` alone. Setting it on another task block parses without error
+and is silently inert — consistent with the absence of `deny_unknown_fields`
+elsewhere in the config.
 
 ---
 
