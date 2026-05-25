@@ -493,7 +493,7 @@ pub(super) async fn build_reply_request(
         );
     }
 
-    let system_prompt = build_prompt(
+    let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
         &relationship_facts,
@@ -505,6 +505,15 @@ pub(super) async fn build_reply_request(
         &kept_traits,
         affinity_scope,
     );
+
+    if let Event::UserMessage {
+        tips_amount_usd: Some(amount),
+        ..
+    } = &input.event
+    {
+        let tp = input.persona.genome.tip_personality.as_deref();
+        system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
+    }
 
     let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
     Ok((
