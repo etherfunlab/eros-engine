@@ -39,10 +39,13 @@ against the reply.
   (default block + per-tier overrides),
 - a combinable per-turn `trigger`,
 - two extract-timing modes (`after_extract` default, `before_extract`),
-- two new `final`-frame status fields: `filtered` (bool) and `prompt_injected`
-  (array of injected trait tags, `null` when none). **`prompt_injected` is
-  independent of the filter** — it surfaces the existing prompt-trait injection
-  feature (an oversight from its original design) and is bundled here for
+- a `retry_depth` on `[tasks.chat_output_filter]` capping the filter's fallback
+  chain, **default 1** (primary + first fallback only),
+- five new `final`-frame status fields: `filtered` (bool), `prompt_injected`
+  (array | null), `tier` (echo, string | null), `retries_chat` (u32),
+  `retries_filter` (u32). **`prompt_injected` and `tier` are independent of the
+  filter** — they surface the existing prompt-trait injection and the request
+  tier (both oversights from earlier designs) and are bundled here for
   convenience. (See §2.8.)
 
 **Non-goals / explicit boundaries:**
@@ -73,7 +76,8 @@ output_filter = true                  # per-tier override; beats the task defaul
 
 [tasks.chat_output_filter]            # whole table absent ⇒ filter never runs (#6)
 model        = "anthropic/claude-haiku-4.5"     # fast model recommended
-fallback     = ["deepseek/deepseek-v4-flash"]   # optional, like other tasks
+fallback     = ["deepseek/deepseek-v4-flash", "x/y"]  # optional, like other tasks
+retry_depth  = 1                       # fallbacks to try on filter failure; default 1
 temperature  = 0.3
 max_tokens   = 400
 filter_prompt = """
@@ -101,6 +105,8 @@ filter-specific fields:
   - `filter_prompt: Option<String>`
   - `trigger: Option<OutputFilterTrigger>`
   - `timing: Option<FilterTiming>`
+  - `retry_depth: Option<u32>` (chat_output_filter uses it; **default 1** when
+    unset — the filter tries the primary + at most the first `fallback` entry)
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -133,14 +139,21 @@ the existing `resolve()` machinery for model/fallback/temp/max_tokens):
 ```rust
 pub struct ResolvedOutputFilter {
     pub model: String,
-    pub fallback_model: Vec<String>,
+    pub fallback_model: Vec<String>,   // already truncated to retry_depth entries
     pub temperature: f64,
     pub max_tokens: u32,
     pub filter_prompt: String,
     pub trigger: OutputFilterTrigger,
     pub timing: FilterTiming,
+    pub retry_depth: u32,              // tier → default → 1
 }
 ```
+
+`retry_depth` resolves tier → default block → **1**. The filter's effective
+chain is `[model] + fallback_model[..retry_depth]` — so `retry_depth = 1`
+(default) ⇒ primary + first fallback only; `0` ⇒ primary only. The resolver
+truncates `fallback_model` to `retry_depth` entries so callers can pass the
+chain straight through.
 
 Decision procedure, per request + resolved `tier`:
 
@@ -221,14 +234,18 @@ logical bubble; every attempt is buffered (no live `Delta`s):
    predicate (`trigger.should_filter(model_id, traits, random_pass)`, with the
    turn-level parts already known true):
    - **Filter this attempt** (`should_filter` true) ⇒ call the filter LLM via
-     `execute_stream` on `ResolvedOutputFilter`'s model+fallback, messages
-     `[system: filter_prompt, user: acc]`, forwarding **its** deltas as the
-     bubble's `Delta`s, accumulating `filtered`. Log usage as task
-     `"chat_output_filter"`.
+     non-streaming `execute()` on `ResolvedOutputFilter`'s model + (depth-capped)
+     `fallback_model`, messages `[system: filter_prompt, user: acc]`. `execute()`
+     walks the chain itself; `ChatResponse.model` reports the model served, so
+     `retries_filter` = its index in the chain (`0` = primary). Emit the filtered
+     text as the bubble's `Delta` (one frame; replies are short — §0). Log usage
+     as task `"chat_output_filter"`.
      - **Success** ⇒ persist `content = filtered`; `produced.full_text =`
-       `after_extract ? acc (original) : filtered`.
-     - **Failure / timeout** ⇒ **fail-open**: emit `acc` as the bubble's
-       `Delta`s, persist `content = acc`, `produced.full_text = acc`.
+       `after_extract ? acc (original) : filtered`; set `filtered = true`,
+       `retries_filter`.
+     - **Failure / timeout** ⇒ **fail-open**: emit `acc` as the bubble's `Delta`,
+       persist `content = acc`, `produced.full_text = acc`; `filtered = false`,
+       `retries_filter = 0`.
    - **Don't filter this attempt** (only the `models` predicate failed for this
      fallback model) ⇒ emit `acc` (original) as the bubble's `Delta`s, persist
      `content = acc`, `produced.full_text = acc`.
@@ -238,6 +255,10 @@ logical bubble; every attempt is buffered (no live `Delta`s):
 
 `Meta`/`Done` framing is emitted once around the single bubble; `continues_from`
 is unused in filtered mode.
+
+In **both** modes the burst records `retries_chat` = the 0-based index of the
+successful (non-truncated) chat attempt onto the `BurstOutcome` (`0` = primary).
+`retries_filter` is set only on the filtered path (`0` otherwise).
 
 ### 2.6 Persistence, replay & extract (explicit consequences)
 
@@ -265,7 +286,7 @@ this path) are unaffected. The new fields live on the generic
 
 ### 2.8 `final`-frame status fields (`filtered`, `prompt_injected`)
 
-`ProtocolFrame::Final` gains two **always-present** fields:
+`ProtocolFrame::Final` gains five **always-present** fields:
 
 ```rust
 Final {
@@ -274,6 +295,9 @@ Final {
     agent_training_level: f64,
     filtered: bool,                        // client received filtered output this turn
     prompt_injected: Option<Vec<String>>,  // injected trait tags; null when none
+    tier: Option<String>,                  // echo of the request tier; null when none
+    retries_chat: u32,                     // fallback retries used for the chat reply
+    retries_filter: u32,                   // fallback retries used for the filter call
 }
 ```
 
@@ -286,20 +310,33 @@ Final {
 - **`filtered`** = `true` only when the client actually received filtered output
   (filtered mode + per-attempt `models` pass + filter LLM success). `false` for
   live mode, a `models`-miss, fail-open, ghost, and replay.
+- **`tier`** = the request's `tier` echoed back (`Option<String>`, `null` when
+  the request sent none). Independent of the filter — lets the frontend confirm
+  the backend actually received the tier it sent (it was never echoed before;
+  added here for convenience).
+- **`retries_chat`** = how many fallbacks the chat reply used: `0` = primary
+  succeeded, `1` = first fallback succeeded, etc. (= the successful attempt's
+  0-based index in the chain).
+- **`retries_filter`** = same for the filter call (`0` when primary filter model
+  served, `1` when its first fallback served, …). `0` whenever no filter ran.
 
 **Plumbing:**
 - `build_reply_request` / `build_gift_request` additionally return the injected
   tags (today they return only the `ChatRequest`), so `run_stream` can carry
   them into the Final frame.
-- `drive_chat_burst` reports whether it filtered via the shared burst result
-  (extend `produced_out` into a small `BurstOutcome { produced, filtered }`, or
-  add a parallel flag); `run_stream` reads it after the burst.
-- `compute_final_frame` takes `filtered` + `prompt_injected` params. The
-  Reply/GiftReaction branch passes the burst's `filtered` and the request's
-  injected tags; Ghost / Proactive / other branches pass `false` / `None`.
-- `replay_stream`: `filtered = false`, `prompt_injected = null` — neither is
-  persisted, so replay cannot reconstruct them (consistent with `lead_score` /
-  `agent_training_level` already being recomputed-from-current on replay).
+- `drive_chat_burst` reports `filtered`, `retries_chat`, `retries_filter` via the
+  shared burst result (`BurstOutcome { produced, filtered, retries_chat,
+  retries_filter }`). `retries_chat` = successful attempt index; `retries_filter`
+  = position of `ChatResponse.model` (model actually served) in the depth-capped
+  filter chain (§2.5).
+- `compute_final_frame` takes `filtered` / `prompt_injected` / `tier` /
+  `retries_chat` / `retries_filter`. The Reply/GiftReaction branch passes the
+  burst values + the request's injected tags + `user_msg.tier`; Ghost / Proactive
+  pass `false` / `None` / `user_msg.tier` / `0` / `0` (tier is still echoed).
+- `replay_stream`: `filtered=false`, `prompt_injected=null`, `tier=null`,
+  `retries_*=0` — none are persisted, so replay cannot reconstruct them
+  (consistent with `lead_score` / `agent_training_level` already being
+  recomputed-from-current on replay).
 
 Additive change to the `final` frame contract in
 `docs/superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md` §1.5.
@@ -314,7 +351,9 @@ Additive change to the `final` frame contract in
 - **Resolve/gating:** `output_filter` precedence tier>task>false (#7/#3);
   `true` + no table ⇒ `None` (#6); `true` + table but blank `filter_prompt` ⇒
   `None`; tier missing in `chat_output_filter` ⇒ default block used (#5);
-  `timing` default `after_extract`.
+  `timing` default `after_extract`; `retry_depth` default `1` and
+  `fallback_model` truncated to it (e.g. `fallback=["a","b","c"]` + default ⇒
+  resolved chain `[model,"a"]`).
 - **`should_filter` (pure):** empty trigger ⇒ true; each predicate alone;
   AND combination; `traits` present/absent + empty `any`; `models` membership;
   `random_pass` true/false gates.
@@ -335,9 +374,13 @@ Additive change to the `final` frame contract in
 - **Final frame fields:** `filtered` true on filtered-success; false on
   fail-open / live mode / `models`-miss / ghost. `prompt_injected` = array of
   injected tags; reflects **kept** (post-gating) tags, not requested; `null`
-  when none or all dropped by tier gating. Replay Final ⇒ `filtered=false`,
-  `prompt_injected=null`. `null` serializes as `null` (field always present).
-  Update existing `final_frame_*` constructor tests for the new fields.
+  when none or all dropped by tier gating. `tier` echoes the request tier
+  (string | null), present on Reply/Ghost/Gift/Proactive, `null` on replay.
+  `retries_chat` = successful chat-attempt index (0 = primary); `retries_filter`
+  = served-filter-model index (0 when no filter / primary served). Replay Final
+  ⇒ `filtered=false`, `prompt_injected=null`, `tier=null`, `retries_*=0`. `null`
+  fields serialize as `null` (always present). Update existing `final_frame_*`
+  constructor tests for the new fields.
 
 ---
 
@@ -352,8 +395,9 @@ Additive change to the `final` frame contract in
   consequence (only filtered text is stored; after- vs before-extract).
 - Additive TOML schema; default behavior unchanged (off unless configured).
 - Update `docs/superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md`
-  §1.5: the `final` frame now carries `filtered` (bool) and `prompt_injected`
-  (array | null). Note `prompt_injected` reflects the pre-existing trait
-  injection and is unrelated to the filter.
+  §1.5: the `final` frame now carries `filtered` (bool), `prompt_injected`
+  (array | null), `tier` (string | null), `retries_chat` (u32), `retries_filter`
+  (u32). Note `prompt_injected` + `tier` reflect pre-existing features
+  (trait injection / request tier) and are unrelated to the filter.
 - Dev-track feature: lands on `feat/chat-output-filter` → PR into `dev` →
   ships in a `0.4.21-dev` cut before promotion to stable `0.4.21`.
