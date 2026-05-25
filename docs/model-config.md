@@ -69,18 +69,127 @@ tier inherits it. Setting it on other tasks parses but has no effect.
 Because the display name is never persisted, the **array** form re-randomizes on
 history replay; `bool`/`string`/`map` are deterministic.
 
+### `output_filter` — second-pass reply rewrite (chat task only)
+
+Passes the completed chat reply through a second LLM before the client sees it. The
+filter is **off by default** and has no effect unless explicitly enabled.
+
+#### Turning the filter on
+
+`output_filter` is a boolean flag on `[tasks.chat_companion]`. It acts as a
+task-level default, which any tier sub-table may override:
+
+```toml
+[tasks.chat_companion]
+output_filter = true              # task-level default; applies when no matching tier block exists
+
+[tasks.chat_companion.tiers.gold]
+output_filter = true              # per-tier override; takes precedence over the task default
+```
+
+Resolution follows the same precedence as every other `chat_companion` field:
+
+```
+matched tier block > task default block
+```
+
+The compiled-in default when neither sets `output_filter` is `false`.
+
+#### Gating rules
+
+The filter runs for a given turn only when **all** of the following hold:
+
+1. `output_filter` resolves to `true` for the active tier (per the precedence above).
+2. `[tasks.chat_output_filter]` is present in the config.
+3. The resolved `filter_prompt` for the active tier is non-blank.
+4. Any `trigger` predicates that are present all pass (see below).
+
+If any condition is unmet the filter is **inert** — the original reply is delivered unchanged.
+
+#### `[tasks.chat_output_filter]` fields
+
+```toml
+[tasks.chat_output_filter]
+model        = "anthropic/claude-haiku-4.5"   # fast model recommended
+fallback     = ["deepseek/deepseek-v4-flash", "x/y"]
+retry_depth  = 1     # fallbacks to try on filter failure (default 1 = primary + first fallback)
+temperature  = 0.3
+max_tokens   = 400
+filter_prompt = """
+Rewrite the assistant reply below per <your policy>. Output only the rewrite.
+"""
+# trigger: AND of the predicates you specify; omit all ⇒ filter every turn.
+trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"], when = "present" } }
+timing       = "after_extract"   # or "before_extract"
+
+[tasks.chat_output_filter.tiers.gold]
+filter_prompt = "..."            # any field is optional; falls back to the default block
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `model` | `String` \| `Array` \| `Table` | — | Primary filter model. Accepts the same three shapes as `chat_companion.model`. |
+| `fallback` | `String` \| `Array<String>` | — | Fallback chain for the filter call. |
+| `retry_depth` | `u32` | `1` | Number of `fallback` entries the filter may try before giving up. `0` = primary only; `1` = primary + first fallback (default). |
+| `temperature` | `f64` | `defaults.fallback_temperature` | Sampling temperature for the filter model. |
+| `max_tokens` | `u32` | `defaults.fallback_max_tokens` | Token cap for the filter response. |
+| `filter_prompt` | `String` | — | **Required for the filter to be active.** System/instruction prompt sent to the filter model. Blank or absent → filter is inert. |
+| `trigger` | inline table | absent (every turn) | AND-gate on when to apply the filter. Omit the whole key to filter every qualifying turn. |
+| `timing` | `"after_extract"` \| `"before_extract"` | `"after_extract"` | Controls whether extract (memory/insight/affinity) reads the original or the filtered text (see below). |
+
+Per-tier sub-tables (`[tasks.chat_output_filter.tiers.<tier>]`) may override any
+field. A tier that omits a field falls back to the default `[tasks.chat_output_filter]` block — the same precedence as every other task.
+
+#### `trigger` predicates
+
+`trigger` is an optional inline table. Every predicate you include must pass; predicates you omit are treated as passing. Omit `trigger` entirely to filter every qualifying turn.
+
+| Predicate | Type | Semantics |
+|---|---|---|
+| `random` | `f64` in `(0.0, 1.0]` | Probability that this turn passes. `random = 0.3` → ~30 % of turns are filtered. |
+| `models` | `Array<String>` | Turn passes only if the producing model id is in the list. |
+| `traits` | `{ any = [...], when = "present" \| "absent" }` | Turn passes only if at least one tag in `any` is present (`when = "present"`) or absent (`when = "absent"`) in the active prompt-trait set. |
+
+#### `timing` and extract behavior
+
+| `timing` | Extract input | Notes |
+|---|---|---|
+| `"after_extract"` *(default)* | Original (pre-filter) text | Memory/insight/affinity see the unmodified reply; only the rewritten text is delivered to the client and persisted in `chat_messages`. |
+| `"before_extract"` | Filtered text | Extract also reads the rewritten text. Use this when the filter normalizes content that the extract pipeline should reflect. |
+
+**Fail-open:** if the filter LLM call times out or returns an error the engine delivers the **original** reply unchanged (the filter never blocks the chat response).
+
+#### What is stored / shown
+
+Only the **filtered** text is written to `chat_messages` and shown to the client. The original text is used internally for extract when `timing = "after_extract"` (default) and is then discarded. History replay therefore shows the filtered version.
+
+#### SSE `final`-frame fields
+
+The `final` event emitted at the end of a chat SSE stream includes several new
+fields. These are independent of whether the filter ran — all are always present
+when the frame is emitted.
+
+| Field | Type | Notes |
+|---|---|---|
+| `filtered` | `bool` | `true` if the output filter ran and rewrote the reply for this turn; `false` otherwise. |
+| `retries_chat` | `u32` | Number of fallback retries consumed by the chat model call (0 = primary succeeded). |
+| `retries_filter` | `u32` | Number of fallback retries consumed by the filter model call (0 = primary succeeded or filter did not run). |
+| `prompt_injected` | `Array<String>` \| `null` | Trait tags that were injected into the prompt this turn, or `null` if none. Independent of the filter. |
+| `tier` | `String` \| `null` | Echo of the `tier` field from the request, or `null` if none was sent. Independent of the filter. |
+
 ## Task names
 
 | Name | Consumed by | Status |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers::ReplyHandler` and `GiftHandler` (chat completions) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
+| `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | reserved — current PDE is rule-based and does not call an LLM | reserved |
 | `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
-- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`
+- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
 
 Anything else is either reserved for a future feature (`pde_decision`) or vestigial (`embedding` — Voyage doesn't go through this path).
@@ -162,6 +271,12 @@ What may still change without notice:
   0.x. When unset the chat `meta.model` field is **omitted** — a change from the
   earlier "always present" behavior. The shipped example sets `= true` to keep
   showing the real id.
+- `output_filter` (optional bool, `[tasks.chat_companion]` and per-tier): added in
+  0.x. Default `false`. Enables the second-pass reply rewrite via `[tasks.chat_output_filter]`.
+- `[tasks.chat_output_filter]` (new task): added in 0.x. Absent by default (filter
+  is inert). See "output_filter — second-pass reply rewrite" above.
+- SSE `final`-frame fields `filtered`, `retries_chat`, `retries_filter`,
+  `prompt_injected`, `tier`: added in 0.x.
 
 ## What this config does NOT control
 

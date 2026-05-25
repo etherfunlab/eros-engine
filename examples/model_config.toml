@@ -58,6 +58,32 @@ model_name_display_override = true
 #fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
 #allow_traits = ["nsfw_boost", "politics_open"]
 
+# ── Optional output filter (OFF by default) ──────────────────────────────
+# Rewrites the chat reply through a second LLM before the client sees it.
+# Enable per-tier (or globally) with `output_filter` on [tasks.chat_companion]:
+#   [tasks.chat_companion]
+#   output_filter = true                 # global default (default: false)
+#   [tasks.chat_companion.tiers.gold]
+#   output_filter = true                 # per-tier; overrides the global default
+#
+# The filter only runs if BOTH output_filter is true AND this table exists with
+# a non-blank filter_prompt; otherwise it is inert. Only the FILTERED text is
+# shown/stored; extract (memory/insight/affinity) reads the original by default.
+#[tasks.chat_output_filter]
+#model        = "anthropic/claude-haiku-4.5"   # fast model recommended
+#fallback     = ["deepseek/deepseek-v4-flash", "x/y"]
+#retry_depth  = 1     # fallbacks to try on filter failure; default 1 (primary + first fallback)
+#temperature  = 0.3
+#max_tokens   = 400
+#filter_prompt = """
+#Rewrite the assistant reply below per <your policy>. Output only the rewrite.
+#"""
+# trigger: AND of the predicates you specify; omit all ⇒ filter every turn.
+#trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"], when = "present" } }
+#timing       = "after_extract"   # or "before_extract"
+#[tasks.chat_output_filter.tiers.gold]
+#filter_prompt = "..."            # any field optional; falls back to the default block
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
