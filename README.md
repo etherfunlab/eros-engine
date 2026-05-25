@@ -130,7 +130,7 @@ eros-engine-llm   = "0.4"   # only if you want the OpenRouter + Voyage clients
 
 ## Run as a Docker image
 
-Multi-arch (`linux/amd64`, `linux/arm64`) images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag:
+`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag (need arm64? build it yourself from `docker/Dockerfile`):
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:0.4.1
