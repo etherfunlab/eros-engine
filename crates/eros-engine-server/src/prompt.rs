@@ -267,6 +267,49 @@ pub fn gift_reaction_context(gifts: &[PendingGift], tip_personality: &str) -> St
     )
 }
 
+/// Format a USD amount for display: whole numbers drop decimals (`$20`),
+/// fractional amounts keep two (`$5.50`). Used by the tip prompt fragment and
+/// the persisted tip marker content.
+pub(crate) fn fmt_amount(amount_usd: f64) -> String {
+    if amount_usd.fract() == 0.0 {
+        format!("{}", amount_usd as i64)
+    } else {
+        format!("{:.2}", (amount_usd * 100.0).round() / 100.0)
+    }
+}
+
+/// Coarse magnitude adjective for a tip, log10-bucketed. Covers any positive
+/// amount; the frontend's 5 preset buttons each land squarely in one bucket.
+fn tip_tier_adjective(amount_usd: f64) -> &'static str {
+    if amount_usd < 10.0 {
+        "一般"
+    } else if amount_usd < 100.0 {
+        "有点多"
+    } else if amount_usd < 1000.0 {
+        "超级多"
+    } else if amount_usd < 10000.0 {
+        "非常夸张"
+    } else {
+        "近乎不可思议"
+    }
+}
+
+/// Prompt fragment appended to a tip turn's system prompt. Carries the literal
+/// dollar amount, the tier adjective, and — when set — the persona's free-form
+/// `tip_personality` passed through verbatim for the LLM to interpret.
+pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> String {
+    let how = match tip_personality {
+        Some(p) => format!("请代入你「{p}」的打赏反应人设，自然地回应这份心意"),
+        None => "请自然地回应这份心意".to_string(),
+    };
+    format!(
+        "\n\n【刚收到的打赏】\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n{}，不要照搬本指令原文。",
+        fmt_amount(amount_usd),
+        tip_tier_adjective(amount_usd),
+        how,
+    )
+}
+
 /// Pluck a string field out of `art_metadata`.
 fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&'a str> {
     persona
@@ -1049,6 +1092,51 @@ mod tests {
     #[test]
     fn test_gift_reaction_empty_when_no_gifts() {
         assert!(gift_reaction_context(&[], "normal").is_empty());
+    }
+
+    #[test]
+    fn fmt_amount_integer_has_no_decimals() {
+        assert_eq!(fmt_amount(20.0), "20");
+        assert_eq!(fmt_amount(2.0), "2");
+        assert_eq!(fmt_amount(20000.0), "20000");
+    }
+
+    #[test]
+    fn fmt_amount_fractional_has_two_decimals() {
+        assert_eq!(fmt_amount(5.5), "5.50");
+        assert_eq!(fmt_amount(5.555), "5.56");
+    }
+
+    #[test]
+    fn tip_tier_adjective_buckets_by_magnitude() {
+        assert_eq!(tip_tier_adjective(2.0), "一般");
+        assert_eq!(tip_tier_adjective(9.99), "一般");
+        assert_eq!(tip_tier_adjective(10.0), "有点多");
+        assert_eq!(tip_tier_adjective(99.0), "有点多");
+        assert_eq!(tip_tier_adjective(100.0), "超级多");
+        assert_eq!(tip_tier_adjective(999.0), "超级多");
+        assert_eq!(tip_tier_adjective(1000.0), "非常夸张");
+        assert_eq!(tip_tier_adjective(9999.0), "非常夸张");
+        assert_eq!(tip_tier_adjective(10000.0), "近乎不可思议");
+        assert_eq!(tip_tier_adjective(20000.0), "近乎不可思议");
+    }
+
+    #[test]
+    fn tips_reaction_context_with_personality_includes_name_amount_adjective() {
+        let s = tips_reaction_context(20.0, Some("傲娇"));
+        assert!(s.contains("【刚收到的打赏】"));
+        assert!(s.contains("$20"));
+        assert!(s.contains("有点多"));
+        assert!(s.contains("傲娇"));
+    }
+
+    #[test]
+    fn tips_reaction_context_without_personality_omits_persona_clause() {
+        let s = tips_reaction_context(20.0, None);
+        assert!(s.contains("【刚收到的打赏】"));
+        assert!(s.contains("$20"));
+        assert!(s.contains("有点多"));
+        assert!(!s.contains("人设"));
     }
 
     fn fixture_affinity() -> Affinity {
