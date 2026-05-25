@@ -511,6 +511,8 @@ pub(super) async fn build_reply_request(
         ..
     } = &input.event
     {
+        // Raw Option (not the "normal"-defaulted local above): tips_reaction_context
+        // renders Some vs None as different prose, so the distinction must survive.
         let tp = input.persona.genome.tip_personality.as_deref();
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }

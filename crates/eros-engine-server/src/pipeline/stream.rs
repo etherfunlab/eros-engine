@@ -1884,7 +1884,7 @@ data: [DONE]\n\n";
         );
         let sent = String::from_utf8_lossy(&reqs[0].body);
         assert!(
-            sent.contains("【刚收到的打赏】") && sent.contains("$20"),
+            sent.contains("【刚收到的打赏】") && sent.contains("$20 美元的红包"),
             "system prompt must contain the tip block, got: {sent}",
         );
     }
