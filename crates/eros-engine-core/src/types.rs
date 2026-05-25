@@ -63,6 +63,11 @@ pub enum Event {
         /// Defaults to `bond` when absent.
         #[serde(default)]
         affinity_scope: AffinityScope,
+        /// Optional caller-supplied tip amount in USD. When `Some`, this turn
+        /// is a tip: the PDE forces a reply (never ghost) and the reply prompt
+        /// gets a tip fragment. `None` for normal messages.
+        #[serde(default)]
+        tips_amount_usd: Option<f64>,
     },
     Gift {
         gift_id: Uuid,
@@ -219,6 +224,23 @@ mod tests {
                     crate::scope::MemoryScope::NeutralAndRelationship
                 );
                 assert_eq!(affinity_scope, crate::scope::AffinityScope::bond());
+            }
+            _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
+    fn event_user_message_defaults_tips_amount_to_none() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
+        match ev {
+            Event::UserMessage {
+                tips_amount_usd, ..
+            } => {
+                assert!(
+                    tips_amount_usd.is_none(),
+                    "missing field must default to None"
+                );
             }
             _ => panic!("expected UserMessage"),
         }
