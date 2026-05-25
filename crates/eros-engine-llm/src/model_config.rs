@@ -941,7 +941,7 @@ reasoning = { exclude = true }
     // depends on — otherwise resolve() silently falls back to the wrong model.
     #[test]
     fn committed_example_config_parses_and_has_affinity_task() {
-        let text = include_str!("../../../examples/model_config.toml.example");
+        let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text)
             .expect("examples/model_config.toml.example must parse");
         let r = cfg.resolve("affinity_evaluation", None);
@@ -959,7 +959,7 @@ reasoning = { exclude = true }
 
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
-        let text = include_str!("../../../examples/model_config.toml.example");
+        let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text)
             .expect("examples/model_config.toml.example must parse");
         let disabled = ReasoningConfig {
