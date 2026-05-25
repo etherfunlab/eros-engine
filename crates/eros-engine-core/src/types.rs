@@ -230,6 +230,23 @@ mod tests {
     }
 
     #[test]
+    fn event_user_message_defaults_tips_amount_to_none() {
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).expect("legacy body deserialises");
+        match ev {
+            Event::UserMessage {
+                tips_amount_usd, ..
+            } => {
+                assert!(
+                    tips_amount_usd.is_none(),
+                    "missing field must default to None"
+                );
+            }
+            _ => panic!("expected UserMessage"),
+        }
+    }
+
+    #[test]
     fn chat_response_defaults_audit_fields_to_none() {
         let r = ChatResponse {
             reply: "hi".into(),

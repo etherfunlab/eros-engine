@@ -35,7 +35,11 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
     // 0. Tip on a user message — always reply, never ghost. Tone is driven by
     //    tip_personality (injected into the prompt downstream); the ReplyStyle
     //    here is only a baseline / fallback. Affinity deltas stay normal.
-    if let Event::UserMessage { tips_amount_usd: Some(_), .. } = &input.event {
+    if let Event::UserMessage {
+        tips_amount_usd: Some(_),
+        ..
+    } = &input.event
+    {
         let reply_style = match input.persona.genome.tip_personality.as_deref() {
             Some(_) => ReplyStyle::Neutral,
             None => ReplyStyle::Tsundere,
@@ -281,7 +285,11 @@ mod tests {
             signals: base_signals(),
         };
         let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::Reply, "a tip must never be ghosted");
+        assert_eq!(
+            plan.action_type,
+            ActionType::Reply,
+            "a tip must never be ghosted"
+        );
     }
 
     #[test]
