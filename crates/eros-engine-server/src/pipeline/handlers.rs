@@ -410,8 +410,8 @@ async fn load_human_insight_bullets(
 
 // ─── Reply ──────────────────────────────────────────────────────────
 
-/// Build a ChatRequest for the Reply action. Shared by the sync
-/// `ReplyHandler` and the streaming `pipeline::stream::run_stream`.
+/// Build a ChatRequest for the Reply action. Called by the streaming
+/// pipeline (`pipeline::stream::run_stream`).
 pub(super) async fn build_reply_request(
     state: &AppState,
     input: &DecisionInput,
@@ -514,8 +514,8 @@ pub(super) async fn build_reply_request(
     ))
 }
 
-/// Build a ChatRequest for the GiftReaction action. Shared by the sync
-/// `GiftHandler` and the streaming `pipeline::stream::run_stream`.
+/// Build a ChatRequest for the GiftReaction action. Called by the streaming
+/// pipeline (`pipeline::stream::run_stream`).
 pub(super) async fn build_gift_request(
     state: &AppState,
     input: &DecisionInput,

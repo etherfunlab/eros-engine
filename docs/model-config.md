@@ -6,9 +6,9 @@ LLM model selection for the engine lives in a TOML file loaded at server start. 
 
 ## Where it lives
 
-- Default path: `examples/model_config.toml.example` (relative to the working directory). The committed file is a sanitized template; copy it (or point `MODEL_CONFIG_PATH` at your own) for real deployments.
+- Default path: `examples/model_config.toml` (relative to the working directory). The committed file is a sanitized template; copy it (or point `MODEL_CONFIG_PATH` at your own) for real deployments.
 - Override: `MODEL_CONFIG_PATH` environment variable
-- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path (`examples/model_config.toml.example`).
+- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path (`examples/model_config.toml`).
 - Held as `Arc<ModelConfig>` in `AppState`; shared across all chat / post-process turns
 - The server also calls `dotenvy::dotenv()` at startup, so `cp .env.example .env` works for the quickstart without an explicit `source .env`
 
