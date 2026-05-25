@@ -30,10 +30,10 @@ Only the **streaming SSE path** (`crates/eros-engine-server/src/pipeline/stream.
 | Replay Meta | `replay_stream`, ~L537 | DB `row.model` |
 | Ghost Meta (live + replay) | ~L345 / ~L517 | none — no model involved |
 
-Not client-facing (left untouched):
+Not client-facing:
 - `pipeline/mod.rs` sync `run` builds `ChatResponse.model` (~L177) but is
-  **unrouted dead code**; the gift route returns `reply: None`. Out of scope —
-  not wired to the override (§1 non-goals).
+  **unrouted dead code** (the gift route returns `reply: None`). It is
+  **removed** in this task as bundled cleanup — see §2.8.
 - Background tasks (affinity / memory / dreaming) build requests with the
   resolved model and never expose it to a client.
 
@@ -67,8 +67,9 @@ shipped `examples/model_config.toml.example` sets
   `AssistantInsert.model`, or any usage logging — all keep the **real** id.
 - Persisting the display name (so the DB stays the source of truth for the
   real model; see the replay note in §2.6).
-- Wiring the override into the dead sync `pipeline::run` path (§0) — it is
-  unrouted; out of scope until/unless that path is revived.
+- Reviving the sync `pipeline::run` path or supporting a non-streaming chat
+  response — instead it is removed as bundled cleanup (§2.8).
+- Removing core's public `ChatResponse` type — see §2.8.
 
 ---
 
@@ -180,8 +181,9 @@ In `stream.rs`:
   builds via `resolve(CHAT_TASK, None)` too), so one resolve covers all rows.
 - **Ghost** (both live and replay): `model: None`.
 
-The dead sync `pipeline/mod.rs` path (`ChatResponse.model`, ~L177) is left
-unchanged — it is unrouted (§0) and out of scope.
+There is no sync apply site: the dead `pipeline/mod.rs` chat path is removed in
+this task (§2.8), so the SSE Meta frames are the only place the override is
+applied.
 
 ### 2.6 Replay consistency (explicit consequence)
 
@@ -200,6 +202,36 @@ path. No other task reaches an apply site, so the override is honored for
 `chat_companion` alone. Setting it on another task block parses without error
 and is silently inert — consistent with the absence of `deny_unknown_fields`
 elsewhere in the config.
+
+### 2.8 Bundled cleanup — remove the dead sync orchestrator
+
+`pipeline::run` and the `ActionHandler` dispatch it drives have been unreached
+since the sync `POST /comp/chat/{id}/message` handler was replaced by the SSE
+endpoint (`stream::run_stream`). Remove them in this task rather than leave a
+dead apply-site for the override to reason about. **Do the removal first**, then
+build the feature on the slimmed-down stream path.
+
+**Remove (server crate only):**
+- `pipeline/mod.rs`: `run`, `load_session_ids`, `load_affinity_with_decay`,
+  `clear_ghost_streak` (all `#[allow(dead_code)]`, sync-only); the
+  `handlers::{ActionHandler, …}` import; the module-level note about the sync
+  orchestrator; and any imports left unused after the removal.
+- `pipeline/handlers.rs`: the `ActionHandler` trait and all four structs +
+  impls (`ReplyHandler`, `GhostHandler`, `GiftHandler`, `ProactiveHandler`);
+  the `async_trait` and `AffinityDeltas` imports; trim the module doc comment
+  that references them.
+
+**Keep (shared with the live SSE path — do NOT remove):**
+- `build_reply_request`, `build_gift_request`, `assemble_chat_request`,
+  `audit_from_event`, and every recall / insight / trait helper.
+- `compute_signals_for_session` and `log_openrouter_usage` in `mod.rs` (used by
+  `stream` / `post_process` / `dreaming`).
+- `pipeline/sync.rs` — an unrelated marketplace self-heal job, still spawned in
+  `main.rs`.
+
+**Out of scope:** core's public `ChatResponse` type (`eros-engine-core`) stays —
+it's library surface for embedders. Drop the `async_trait` crate dependency only
+if it turns out unused workspace-wide after the import is gone.
 
 ---
 
@@ -222,6 +254,9 @@ elsewhere in the config.
 - **Committed example config:** `resolve("chat_companion", …).display_model(id)`
   returns the real id (because the example sets `= true`); an untouched task
   with no override → `None`.
+- **Dead-path removal (§2.8):** the crate builds with no new dead-code warnings,
+  `cargo clippy` is clean, and the existing `pipeline` / `handlers` test suites
+  still pass (none of them exercise `run` or the removed handlers).
 
 ---
 
@@ -238,3 +273,5 @@ elsewhere in the config.
 - Additive TOML schema; **default wire behavior changes** (model omitted when
   unset) — the shipped example opts back into showing the real id so OSS users
   see no behavior change out of the box.
+- Bundled cleanup (§2.8): remove the dead sync `pipeline::run` orchestrator and
+  the `ActionHandler` trait/handlers as the first commit on the branch.
