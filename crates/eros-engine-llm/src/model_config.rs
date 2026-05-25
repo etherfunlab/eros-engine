@@ -133,6 +133,40 @@ impl ModelSpec {
     }
 }
 
+/// Client-facing model-name display override (chat `meta.model`). Four TOML
+/// shapes, unambiguous to serde: `false`/`true` (bool), `"name"` (string),
+/// `["a","b"]` (array → random per emit), or `{ "id" = "name", default =
+/// "name" }` (map keyed by the real id; reserved `default` key). Affects ONLY
+/// what the client sees — never the OpenRouter call or the persisted row.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum DisplayOverride {
+    Bool(bool),
+    Fixed(String),
+    Random(Vec<String>),
+    Map(HashMap<String, String>),
+}
+
+impl DisplayOverride {
+    /// Map the real model id to the value shown to the client. `None` means
+    /// "omit the `model` field". `false`, an empty string, an empty array, and
+    /// a map miss with no `default` all yield `None`.
+    pub fn display(&self, actual_model: &str) -> Option<String> {
+        match self {
+            DisplayOverride::Bool(false) => None,
+            DisplayOverride::Bool(true) => Some(actual_model.to_string()),
+            DisplayOverride::Fixed(s) if s.is_empty() => None,
+            DisplayOverride::Fixed(s) => Some(s.clone()),
+            DisplayOverride::Random(v) if v.is_empty() => None,
+            DisplayOverride::Random(v) => {
+                let i = rand::thread_rng().gen_range(0..v.len());
+                Some(v[i].clone())
+            }
+            DisplayOverride::Map(m) => m.get(actual_model).or_else(|| m.get("default")).cloned(),
+        }
+    }
+}
+
 /// Mirror of OpenRouter's `reasoning` request object. Parsed from TOML and
 /// forwarded to the wire unchanged, so operators control reasoning in the
 /// same shape OpenRouter documents. Every field optional; absent fields are
@@ -199,6 +233,11 @@ pub struct TaskConfig {
     /// inherit, like `temperature`/`max_tokens`.
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    /// Client-facing display override for `meta.model` (chat task only).
+    /// Task-level; tiers inherit. Absent → `None` (treated as `false` → the
+    /// `model` field is omitted from chat `meta` frames). See `DisplayOverride`.
+    #[serde(default)]
+    pub model_name_display_override: Option<DisplayOverride>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -334,6 +373,16 @@ impl ModelConfig {
             allow_traits,
             reasoning,
         }
+    }
+
+    /// Task-level display override, read WITHOUT running model selection — so
+    /// the replay path can read it without advancing round-robin / weighted
+    /// cursors. Tier-independent (the field is task-level; tiers inherit it).
+    /// `None` when the task is unknown or sets no override.
+    pub fn display_override(&self, task: &str) -> Option<DisplayOverride> {
+        self.tasks
+            .get(task)
+            .and_then(|t| t.model_name_display_override.clone())
     }
 }
 
@@ -1061,5 +1110,102 @@ model = []
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.resolve("t", None).model, "fb");
+    }
+
+    #[test]
+    fn display_override_parses_all_four_forms() {
+        let toml = r#"
+[tasks.b_false]
+model = "m"
+model_name_display_override = false
+[tasks.b_true]
+model = "m"
+model_name_display_override = true
+[tasks.s]
+model = "m"
+model_name_display_override = "Aria"
+[tasks.arr]
+model = "m"
+model_name_display_override = ["Aria", "Nova"]
+[tasks.map]
+model = "m"
+model_name_display_override = { "deepseek/x" = "Aria", default = "Companion" }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.tasks["b_false"].model_name_display_override,
+            Some(DisplayOverride::Bool(false))
+        );
+        assert_eq!(
+            cfg.tasks["b_true"].model_name_display_override,
+            Some(DisplayOverride::Bool(true))
+        );
+        assert_eq!(
+            cfg.tasks["s"].model_name_display_override,
+            Some(DisplayOverride::Fixed("Aria".into()))
+        );
+        assert_eq!(
+            cfg.tasks["arr"].model_name_display_override,
+            Some(DisplayOverride::Random(vec!["Aria".into(), "Nova".into()]))
+        );
+        let map = match &cfg.tasks["map"].model_name_display_override {
+            Some(DisplayOverride::Map(m)) => m.clone(),
+            other => panic!("expected Map, got {other:?}"),
+        };
+        assert_eq!(map.get("deepseek/x").map(String::as_str), Some("Aria"));
+        assert_eq!(map.get("default").map(String::as_str), Some("Companion"));
+    }
+
+    #[test]
+    fn display_method_truth_table() {
+        assert_eq!(DisplayOverride::Bool(false).display("m"), None);
+        assert_eq!(
+            DisplayOverride::Bool(true).display("m"),
+            Some("m".to_string())
+        );
+        assert_eq!(
+            DisplayOverride::Fixed("Aria".into()).display("m"),
+            Some("Aria".to_string())
+        );
+        assert_eq!(DisplayOverride::Fixed(String::new()).display("m"), None);
+        assert_eq!(DisplayOverride::Random(vec![]).display("m"), None);
+        assert_eq!(
+            DisplayOverride::Random(vec!["only".into()]).display("m"),
+            Some("only".to_string())
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("m1".to_string(), "n1".to_string());
+        map.insert("default".to_string(), "nd".to_string());
+        let ov = DisplayOverride::Map(map);
+        assert_eq!(ov.display("m1"), Some("n1".to_string()));
+        assert_eq!(ov.display("zzz"), Some("nd".to_string()));
+
+        let mut map2 = std::collections::HashMap::new();
+        map2.insert("m1".to_string(), "n1".to_string());
+        let ov2 = DisplayOverride::Map(map2);
+        assert_eq!(ov2.display("zzz"), None);
+    }
+
+    #[test]
+    fn display_override_accessor_is_tier_independent_and_absent_is_none() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+model_name_display_override = "Aria"
+
+[tasks.chat_companion.tiers.gold]
+model = "g"
+
+[tasks.other]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.display_override("chat_companion"),
+            Some(DisplayOverride::Fixed("Aria".into()))
+        );
+        assert_eq!(cfg.display_override("other"), None);
+        assert_eq!(cfg.display_override("nonexistent"), None);
     }
 }
