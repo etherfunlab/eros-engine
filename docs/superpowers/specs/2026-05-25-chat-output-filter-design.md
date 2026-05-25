@@ -88,9 +88,10 @@ trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"]
 timing       = "after_extract"        # or "before_extract"; default after_extract (#2)
 
 [tasks.chat_output_filter.tiers.gold]
-model         = "..."                 # each of model/fallback/temperature/max_tokens/
-filter_prompt = "..."                 #   filter_prompt/trigger/timing is optional and
-trigger       = { random = 1.0 }      #   falls back to the default block when omitted (#5)
+model         = "..."                 # per-tier overridable: model/fallback/retry_depth/
+filter_prompt = "..."                 #   filter_prompt/trigger/timing (fall back to default
+trigger       = { random = 1.0 }      #   block when omitted, #5). temperature/max_tokens are
+                                      #   task-level only (no per-tier override).
 ```
 
 ### 2.2 Config types (`model_config.rs`)
@@ -192,8 +193,10 @@ impl OutputFilterTrigger {
   Absent ⇒ no random gate.
 - `models`: `model_id` ∈ `models` — checked **per attempt** (the model about to
   be called is known before any token is requested).
-- `traits`: `Present` ⇒ at least one of `any` is in the turn's `prompt_traits`;
-  `Absent` ⇒ none of `any` present. Empty `any` ⇒ predicate passes.
+- `traits`: `Present` ⇒ at least one of `any` is in the turn's **injected** trait
+  tags (the `kept_traits` after tier `allow_traits` gating — the same set as
+  `prompt_injected`, NOT the raw requested tags, so a trait the tier dropped does
+  not count); `Absent` ⇒ none present. Empty `any` ⇒ predicate passes.
 
 Split the predicates by when they're knowable:
 - **Turn-level** (`random`, `traits`): constant for the whole turn, known before
@@ -207,8 +210,9 @@ token reaches the client on an attempt that will be filtered.
 ### 2.5 Runtime flow (`drive_chat_burst`)
 
 `run_stream` resolves `Option<ResolvedOutputFilter>` once (mirroring how it
-already fetches `display_override`) and threads it + the turn's `prompt_traits`
-into `drive_chat_burst`. Draw `random_pass` once.
+already fetches `display_override`) and threads it + the turn's **injected** trait
+tags (the `kept_traits` from `build_*_request`, post `allow_traits` gating) into
+`drive_chat_burst`. Draw `random_pass` once.
 
 The burst picks **one of two modes** up front:
 

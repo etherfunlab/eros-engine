@@ -601,6 +601,10 @@ pub fn run_stream(
                         return;
                     }
                 };
+                // The filter trigger's `traits` predicate AND `prompt_injected`
+                // both use the KEPT tags (post tier `allow_traits` gating), so a
+                // tier that drops a requested trait can't trigger filtering on it.
+                let trait_tags: Vec<String> = injected_tags.clone();
                 let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
                 let (frame_action, persist_action, plan_action) = if is_gift {
                     (FrameActionType::GiftReaction, "gift_reaction", ActionType::GiftReaction)
@@ -619,8 +623,6 @@ pub fn run_stream(
                     .and_then(|f| f.trigger.random)
                     .map(|p| rand::thread_rng().gen::<f64>() < p)
                     .unwrap_or(true);
-                let trait_tags: Vec<String> =
-                    user_msg.prompt_traits.iter().map(|t| t.tag.clone()).collect();
 
                 let outcome = std::sync::Arc::new(std::sync::Mutex::new(
                     crate::pipeline::stream::BurstOutcome::default(),

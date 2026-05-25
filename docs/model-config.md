@@ -131,14 +131,17 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 | `model` | `String` \| `Array` \| `Table` | — | Primary filter model. Accepts the same three shapes as `chat_companion.model`. |
 | `fallback` | `String` \| `Array<String>` | — | Fallback chain for the filter call. |
 | `retry_depth` | `u32` | `1` | Number of `fallback` entries the filter may try before giving up. `0` = primary only; `1` = primary + first fallback (default). |
-| `temperature` | `f64` | `defaults.fallback_temperature` | Sampling temperature for the filter model. |
-| `max_tokens` | `u32` | `defaults.fallback_max_tokens` | Token cap for the filter response. |
+| `temperature` | `f64` | `defaults.fallback_temperature` | Sampling temperature for the filter model. **Task-level only — no per-tier override** (same as every other task). |
+| `max_tokens` | `u32` | `defaults.fallback_max_tokens` | Token cap for the filter response. **Task-level only — no per-tier override.** |
 | `filter_prompt` | `String` | — | **Required for the filter to be active.** System/instruction prompt sent to the filter model. Blank or absent → filter is inert. |
 | `trigger` | inline table | absent (every turn) | AND-gate on when to apply the filter. Omit the whole key to filter every qualifying turn. |
 | `timing` | `"after_extract"` \| `"before_extract"` | `"after_extract"` | Controls whether extract (memory/insight/affinity) reads the original or the filtered text (see below). |
 
-Per-tier sub-tables (`[tasks.chat_output_filter.tiers.<tier>]`) may override any
-field. A tier that omits a field falls back to the default `[tasks.chat_output_filter]` block — the same precedence as every other task.
+Per-tier sub-tables (`[tasks.chat_output_filter.tiers.<tier>]`) may override
+`model`, `fallback`, `retry_depth`, `filter_prompt`, `trigger`, and `timing`; a
+tier that omits one falls back to the default `[tasks.chat_output_filter]` block.
+**`temperature` and `max_tokens` are task-level only** (per-tier sub-tables do not
+override them — the same rule as every other task).
 
 #### `trigger` predicates
 
@@ -148,7 +151,7 @@ field. A tier that omits a field falls back to the default `[tasks.chat_output_f
 |---|---|---|
 | `random` | `f64` in `(0.0, 1.0]` | Probability that this turn passes. `random = 0.3` → ~30 % of turns are filtered. |
 | `models` | `Array<String>` | Turn passes only if the producing model id is in the list. |
-| `traits` | `{ any = [...], when = "present" \| "absent" }` | Turn passes only if at least one tag in `any` is present (`when = "present"`) or absent (`when = "absent"`) in the active prompt-trait set. |
+| `traits` | `{ any = [...], when = "present" \| "absent" }` | Turn passes only if at least one tag in `any` is present (`when = "present"`) or absent (`when = "absent"`) among the tags **actually injected** into the prompt — i.e. after tier `allow_traits` gating, the same set reported in the `final` frame's `prompt_injected`. A trait the tier dropped does not count as present. |
 
 #### `timing` and extract behavior
 

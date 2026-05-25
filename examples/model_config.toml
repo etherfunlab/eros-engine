@@ -79,10 +79,14 @@ model_name_display_override = true
 #Rewrite the assistant reply below per <your policy>. Output only the rewrite.
 #"""
 # trigger: AND of the predicates you specify; omit all ⇒ filter every turn.
+# `traits` matches the tags ACTUALLY injected (after tier allow_traits gating),
+# i.e. the same set reported in the final frame's prompt_injected.
 #trigger      = { random = 0.3, models = ["x/y"], traits = { any = ["nsfw_boost"], when = "present" } }
 #timing       = "after_extract"   # or "before_extract"
 #[tasks.chat_output_filter.tiers.gold]
-#filter_prompt = "..."            # any field optional; falls back to the default block
+# per-tier may override model/fallback/retry_depth/filter_prompt/trigger/timing
+# (NOT temperature/max_tokens — those are task-level only, like every other task)
+#filter_prompt = "..."
 
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
