@@ -36,16 +36,20 @@ chat reply.
 - the turn is allowed to carry no user text (a tip is a button tap),
 - the engine appends a `【刚收到的打赏】` fragment to the reply's system prompt,
   containing both the literal dollar amount and a tier adjective,
+- the reply's tone is driven by the persona's free-form `tip_personality`
+  (passed through verbatim for the LLM to interpret), falling back to an
+  enthusiastic default when the field is absent,
 - the turn is guaranteed a reply (never ghosted),
-- everything else (affinity, persistence mechanics, streaming) behaves exactly
-  like a normal chat turn.
+- affinity, persistence mechanics, and streaming behave like a normal chat turn.
 
 **Non-goals / explicit boundaries:**
 - **No affinity special-casing.** The normal `predict_reply_deltas`
   (`pde.rs:97`) micro-tweak still runs. We do **not** apply gift-specific
   deltas and do **not** write a `gift` row to `companion_affinity_events`.
-- **No `Event::Gift` / `GiftReaction` / `PendingGift` / `tip_personality`.**
-  The dormant gift-value reaction line is untouched.
+- **No `Event::Gift` / `GiftReaction` / `PendingGift` / `gift_reaction_context`
+  / `pick_gift_style`.** The dormant gift-value reaction line is untouched. We
+  *do* read `tip_personality` (§2.5/§2.6), but inject it as a free-form string
+  rather than through that enum-mapping machinery.
 - **No new endpoint.** The change rides on the existing stream endpoint.
 - **No new chat role / no store migration.** The tip turn persists as a normal
   `role='user'` row so the existing replay/idempotency machinery is unchanged.
@@ -117,7 +121,7 @@ Add `tips_amount_usd: Option<f64>` to:
 that use `..` need no change; the few **construction** sites in tests
 (`handlers.rs:1226`, `post_process.rs:730`/`:749`) get `tips_amount_usd: None`.
 
-### 2.5 PDE guard — tip always replies, never ghosts
+### 2.5 PDE guard — tip always replies, never ghosts; tone from `tip_personality`
 
 `pde::decide` checks ghost at step 2 (`pde.rs:46`), before the reply default at
 step 5 (`pde.rs:85`). A tip routed as a normal `UserMessage` could therefore be
@@ -125,13 +129,18 @@ ghosted — taking money and going silent. Add a deterministic rule at the **top
 of `decide`:
 
 ```rust
-// 0. Tip on a user message — always reply, never ghost. reply_style and
-//    affinity deltas are identical to a normal reply; the only effect is
-//    bypassing the ghost branch below.
+// 0. Tip on a user message — always reply, never ghost. Tone is driven by the
+//    persona's free-form tip_personality (injected as text in §2.6); the
+//    ReplyStyle enum is only a baseline / fallback. Affinity deltas stay
+//    identical to a normal reply.
 if let Event::UserMessage { tips_amount_usd: Some(_), .. } = &input.event {
+    let reply_style = match input.persona.genome.tip_personality.as_deref() {
+        Some(_) => ReplyStyle::Neutral,  // neutral baseline; the §2.6 personality line drives the vibe
+        None    => ReplyStyle::Excited,  // no personality set → enthusiastic default for good UX
+    };
     return ActionPlan {
         action_type: ActionType::Reply,
-        reply_style: ReplyStyle::Neutral,
+        reply_style,
         affinity_deltas: predict_reply_deltas(input),
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
@@ -139,13 +148,22 @@ if let Event::UserMessage { tips_amount_usd: Some(_), .. } = &input.event {
 }
 ```
 
-This keeps "treat like a normal chat" (same style, same predictive deltas)
-while guaranteeing a reply.
+This guarantees a reply, keeps the normal predictive affinity deltas, and routes
+tone through `tip_personality`. We deliberately bypass the gift line's
+`pick_gift_style` enum mapping — `tip_personality` reaches the LLM verbatim, so
+arbitrary values (`"傲娇"`, `"gold_digger"`, anything) are interpreted by the
+model rather than coerced into one of the five fixed styles.
 
-### 2.6 Prompt fragment + bucketing
+### 2.6 Prompt fragment + bucketing + tip_personality
 
-New helper in `prompt.rs`, sibling to (but independent of)
-`gift_reaction_context`:
+`tip_personality` is a free-form `Option<String>` on the **genome** — a
+dedicated column `engine.persona_genomes.tip_personality`, *separate* from the
+`art_metadata` JSONB blob (`core/persona.rs:11`). Already unrestricted at the
+type level; only the dormant `pick_gift_style` treats it as an enum, which we
+bypass here.
+
+New helpers in `prompt.rs`, sibling to (but independent of)
+`gift_reaction_context` / `pick_gift_style`:
 
 ```rust
 fn tip_tier_adjective(amount_usd: f64) -> &'static str {
@@ -158,11 +176,16 @@ fn tip_tier_adjective(amount_usd: f64) -> &'static str {
     }
 }
 
-pub fn tips_reaction_context(amount_usd: f64) -> String {
+pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> String {
+    let how = match tip_personality {
+        Some(p) => format!("请代入你「{p}」的打赏反应人设，自然地回应这份心意"),
+        None    => "请自然地回应这份心意".to_string(),  // tone leans on the Excited fallback style
+    };
     format!(
-        "\n\n【刚收到的打赏】\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n请在回复中自然地回应这份心意，不要照搬本指令原文。",
+        "\n\n【刚收到的打赏】\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n{}，不要照搬本指令原文。",
         fmt_amount(amount_usd),
         tip_tier_adjective(amount_usd),
+        how,
     )
 }
 ```
@@ -183,8 +206,10 @@ lands squarely in its bucket):
 | 5 | `≥ 10000` | $20000 | 近乎不可思议 |
 
 Wiring: in `build_reply_request` (`handlers.rs:415`), read `tips_amount_usd`
-from `input.event`; after `build_prompt(...)` returns `system_prompt`
-(`handlers.rs:496`), if `Some(amount)`, append `tips_reaction_context(amount)`.
+from `input.event` and `tip_personality` from
+`input.persona.genome.tip_personality` (already read at `handlers.rs:466`);
+after `build_prompt(...)` returns `system_prompt` (`handlers.rs:496`), if
+`Some(amount)`, append `tips_reaction_context(amount, tip_personality)`.
 `build_prompt`'s signature is **not** changed — the tip logic stays isolated to
 the reply builder.
 
@@ -196,8 +221,9 @@ FE taps tip ($20)
   → validate_payload (content may be empty; 0 < amount ≤ 1_000_000)
   → upsert_user_message_idempotent(role='user', content="(打赏 $20)")
   → run_stream → Event::UserMessage { tips_amount_usd: Some(20.0), .. }
-  → pde::decide → rule 0 → Reply (normal deltas, ghost bypassed)
-  → build_reply_request → system_prompt += tips_reaction_context(20)
+  → pde::decide → rule 0 → Reply (style from tip_personality / Excited fallback;
+                                  normal deltas; ghost bypassed)
+  → build_reply_request → system_prompt += tips_reaction_context(20, tip_personality)
   → SSE stream (same channel as a normal reply) → Done
 ```
 
@@ -206,11 +232,14 @@ FE taps tip ($20)
 ## 3. Testing
 
 - **pde**: `UserMessage` with `tips_amount_usd: Some(_)` → `Reply`; forced even
-  when ghost signals would otherwise fire; deltas equal `predict_reply_deltas`.
+  when ghost signals would otherwise fire; deltas equal `predict_reply_deltas`;
+  `reply_style` = `Excited` when `tip_personality` is `None`, `Neutral` when
+  `Some(_)`.
 - **prompt**: bucket boundaries (`$9.99`→一般, `$10`→有点多, `$99`→有点多,
   `$100`→超级多, `$999`→超级多, `$1000`→非常夸张, `$10000`→近乎不可思议);
   `fmt_amount` integer vs fractional (`$20`, `$5.50`); fragment contains both the
-  amount and the adjective.
+  amount and the adjective; `tip_personality: Some("傲娇")` puts the literal
+  `傲娇` in the fragment, `None` omits the persona clause.
 - **validate_payload**: tip present allows empty content; `amount ≤ 0`,
   non-finite, `> 1_000_000` each rejected; content + tip both absent → 422.
 - **stream integration** (mock OpenRouter): a tip request streams to `Done`, and
@@ -225,4 +254,9 @@ FE taps tip ($20)
 - Affinity movement / `companion_affinity_events` recording for tips — out of
   scope; if wanted later, the existing `event/gift` route or a new rule can own
   it.
-- `Event::Gift` / `GiftReaction` / `tip_personality` reaction line — untouched.
+- `Event::Gift` / `GiftReaction` / `gift_reaction_context` / `pick_gift_style`
+  reaction line — untouched. (This spec uses `tip_personality` via its own
+  free-form injection, not that machinery.)
+- This is an intentional first live test of `tip_personality` — reversing the
+  earlier "don't use tip_personality" stance. If the free-form approach proves
+  out, the dormant gift line's enum mapping becomes a candidate for removal.
