@@ -377,7 +377,7 @@ pub fn run_stream(
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     ).await
                 };
-                let req = match req_res {
+                let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
                         yield ProtocolFrame::Error {
@@ -389,6 +389,7 @@ pub fn run_stream(
                         return;
                     }
                 };
+                let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
                 let (frame_action, persist_action, plan_action) = if is_gift {
                     (FrameActionType::GiftReaction, "gift_reaction", ActionType::GiftReaction)
                 } else {
@@ -437,7 +438,7 @@ pub fn run_stream(
                     tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, prompt_injected.clone(), user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
 
                 // Spawn post-process; do not await.
