@@ -39,7 +39,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /eros-engine /usr/local/bin/eros-engine
-COPY examples/model_config.toml.example /etc/eros-engine/model_config.toml
+COPY examples/model_config.toml /etc/eros-engine/model_config.toml
 COPY examples/personas /etc/eros-engine/personas
 
 # sqlx::migrate!() embeds migration files at compile time, but the

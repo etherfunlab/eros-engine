@@ -26,6 +26,18 @@ max_tokens = 1600
 # object — set `{ exclude = true }` instead if you want it generated but hidden.
 # Inherited by every tier below.
 reasoning = { enabled = false }
+# Controls the `model` value sent to clients in chat `meta` frames. Affects ONLY
+# the client display — never the OpenRouter call or the persisted row. Omit this
+# line and the field defaults to `false` (the model name is NOT sent). Four forms:
+#   model_name_display_override = false               # omit model from meta
+#   model_name_display_override = true                # send the real model id (this line)
+#   model_name_display_override = "Aria"              # always show "Aria"
+#   model_name_display_override = ["Aria", "Nova"]    # random per bubble
+#   model_name_display_override = { "deepseek/deepseek-v4-flash" = "Aria", default = "Companion" }
+# Map keys must be quoted (ids contain "/" and "."); the bareword `default` key
+# is the fallback when the real id isn't listed (no default ⇒ omit). Task-level;
+# every tier inherits it.
+model_name_display_override = true
 # Optional prompt-trait allow-list (three-state). Commented out here means no
 # gating. See docs/prompt-traits.md.
 #allow_traits = ["nsfw_boost","politics_open"]

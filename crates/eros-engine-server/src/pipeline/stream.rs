@@ -41,7 +41,8 @@ pub enum ProtocolFrame {
     Meta {
         message_id: String,
         action_type: FrameActionType,
-        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         continues_from: Option<String>,
     },
@@ -110,6 +111,7 @@ fn drive_chat_burst(
     persist_action: &'static str, // "reply" | "gift_reaction"
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
+    display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     produced_out: std::sync::Arc<
         std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>,
     >,
@@ -142,7 +144,7 @@ fn drive_chat_burst(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
-                model: model_id.clone(),
+                model: display_override.as_ref().and_then(|d| d.display(model_id)),
                 continues_from: continues_from.map(ulid_string),
             };
 
@@ -342,7 +344,7 @@ pub fn run_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_id),
                     action_type: FrameActionType::Ghost,
-                    model: String::new(),
+                    model: None,
                     continues_from: None,
                 };
                 yield ProtocolFrame::Done {
@@ -388,6 +390,7 @@ pub fn run_stream(
 
                 let produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let display_override = state.model_config.display_override("chat_companion");
                 let burst = drive_chat_burst(
                     state.clone(),
                     user_msg.session_id,
@@ -396,6 +399,7 @@ pub fn run_stream(
                     persist_action,
                     plan_action,
                     req,
+                    display_override,
                     produced_out.clone(),
                 );
                 {
@@ -509,12 +513,13 @@ pub fn replay_stream(
     rows: Vec<eros_engine_store::chat::ChatMessage>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
+        let display_override = state.model_config.display_override("chat_companion");
         if ghost {
             let msg_id = Ulid::new();
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_id),
                 action_type: FrameActionType::Ghost,
-                model: String::new(),
+                model: None,
                 continues_from: None,
             };
             yield ProtocolFrame::Done {
@@ -534,7 +539,9 @@ pub fn replay_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
-                    model: row.model.clone().unwrap_or_default(),
+                    model: display_override
+                        .as_ref()
+                        .and_then(|d| d.display(row.model.as_deref().unwrap_or_default())),
                     continues_from: prev_ulid.map(ulid_string),
                 };
                 if !row.content.is_empty() {
@@ -583,7 +590,7 @@ mod tests {
         let f = ProtocolFrame::Meta {
             message_id: ulid_string(id),
             action_type: FrameActionType::Reply,
-            model: "x-ai/grok-4-fast".into(),
+            model: Some("x-ai/grok-4-fast".into()),
             continues_from: None,
         };
         let s = serde_json::to_string(&f).unwrap();
@@ -604,11 +611,24 @@ mod tests {
         let f = ProtocolFrame::Meta {
             message_id: ulid_string(Ulid::new()),
             action_type: FrameActionType::Reply,
-            model: "x-ai/grok-4-fast".into(),
+            model: Some("x-ai/grok-4-fast".into()),
             continues_from: Some(prev.clone()),
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["continues_from"], prev);
+    }
+
+    #[test]
+    fn meta_frame_omits_model_when_none() {
+        let f = ProtocolFrame::Meta {
+            message_id: ulid_string(Ulid::new()),
+            action_type: FrameActionType::Ghost,
+            model: None,
+            continues_from: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "meta");
+        assert!(v.get("model").is_none(), "model must be omitted when None");
     }
 
     #[test]
@@ -978,5 +998,167 @@ data: [DONE]\n\n";
                 "a Reply burst ran but no Done frame carried usage to filter"
             );
         }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_burst_meta_omits_model_when_override_false(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        for f in &frames {
+            if let ProtocolFrame::Meta { model, .. } = f {
+                assert_eq!(*model, None, "override=false must omit meta.model");
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_applies_display_override(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let row = eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: "hello".into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("deepseek/x".into()),
+            usage: None,
+            generation_id: None,
+            assistant_action_type: Some("reply".into()),
+        };
+
+        let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {
+            frames.iter().find_map(|f| match f {
+                ProtocolFrame::Meta { model, .. } => Some(model.clone()),
+                _ => None,
+            })?
+        };
+
+        // false -> omit
+        let mut s1 = crate::routes::companion::test_state(pool.clone());
+        s1.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = false\n",
+            )
+            .unwrap(),
+        );
+        let f1: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s1),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
+        assert_eq!(meta_model(&f1), None);
+
+        // pinned string -> that name
+        let mut s2 = crate::routes::companion::test_state(pool.clone());
+        s2.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = \"Aria\"\n",
+            )
+            .unwrap(),
+        );
+        let f2: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s2),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
+        assert_eq!(meta_model(&f2), Some("Aria".to_string()));
+
+        // map hit -> mapped name
+        let mut s3 = crate::routes::companion::test_state(pool.clone());
+        s3.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\nmodel_name_display_override = { \"deepseek/x\" = \"Nova\", default = \"Companion\" }\n",
+            )
+            .unwrap(),
+        );
+        let f3: Vec<ProtocolFrame> = replay_stream(
+            std::sync::Arc::new(s3),
+            session_id,
+            user_id,
+            false,
+            vec![row.clone()],
+        )
+        .collect()
+        .await;
+        assert_eq!(meta_model(&f3), Some("Nova".to_string()));
     }
 }

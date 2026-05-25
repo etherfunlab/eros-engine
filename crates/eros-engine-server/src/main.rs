@@ -261,11 +261,11 @@ async fn run_server() -> Result<()> {
     }
     let auth: Arc<dyn AuthValidator> = Arc::new(validator);
 
-    // model_config: env override > examples/model_config.toml.example dev default.
+    // model_config: env override > examples/model_config.toml dev default.
     // The committed example is sanitized; the real config is opted into via
     // MODEL_CONFIG_PATH (the docker/Dockerfile.fly image bakes it in for prod).
-    let model_config_path = std::env::var("MODEL_CONFIG_PATH")
-        .unwrap_or_else(|_| "examples/model_config.toml.example".into());
+    let model_config_path =
+        std::env::var("MODEL_CONFIG_PATH").unwrap_or_else(|_| "examples/model_config.toml".into());
     let model_config_text = std::fs::read_to_string(&model_config_path)
         .with_context(|| format!("model_config read failed: {model_config_path}"))?;
     let model_config = Arc::new(

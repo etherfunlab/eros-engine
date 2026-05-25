@@ -41,18 +41,25 @@ Embeddings use Voyage `voyage-3-lite` with 512-dimensional vectors. Retrieval ru
 
 ### Six-dimensional affinity
 
-Each chat session has a relationship vector:
+Each chat session carries a six-dimensional relationship vector. The six axes — the dimensions of the vector — are:
 
 | Axis | Range | Controls |
 |---|---:|---|
 | `warmth` | -1.0 to 1.0 | Tone and address, from distant to affectionate. |
 | `trust` | 0.0 to 1.0 | Topic depth and willingness to disclose. |
-| `intrigue` | 0.0 to 1.0 | Curiosity and follow-up behavior. |
 | `intimacy` | 0.0 to 1.0 | Nicknames, inside jokes, and callbacks. |
+| `intrigue` | 0.0 to 1.0 | Curiosity and follow-up behavior. |
 | `patience` | 0.0 to 1.0 | Tolerance for low-effort or repeated messages. |
 | `tension` | 0.0 to 1.0 | Push-pull, friction, and playful resistance. |
 
-Updates are smoothed with exponential moving average (EMA), so the persona does not jump between emotional states. `intrigue`, `patience`, and `tension` also decay or recover with real time.
+Two **composite scores** summarize this vector for prompt-shaping — each is the mean of a disjoint triplet of axes (`warmth` is rescaled to 0–1 first):
+
+- **bond** (朋友感, how close it feels) = mean(`warmth`, `intimacy`, `tension`)
+- **chemistry** (来电感, how charged it feels) = mean(`trust`, `intrigue`, `patience`)
+
+Updates are smoothed with exponential moving average (EMA), so the persona does not jump between emotional states. `intrigue`, `patience`, and `tension` also decay or recover with real time. The smoothing strength is set by `EMA_INERTIA` (default `0.8`): each turn applies only `1 − inertia` of the evaluated delta, so a higher value makes the relationship build (and cool) more slowly — in effect a difficulty dial — while `0` applies every delta in full.
+
+A per-request `affinity_scope` flag selects which composite shapes the prompt: `bond` (default), `chemistry`, `bond_and_chemistry` (≡ `full`, all six axes), `none`, or an explicit axis subset like `["warmth", "trust"]`. It gates prompt injection only — all six axes are always persisted and updated regardless.
 
 Relationship labels such as `stranger`, `slow_burn`, `friend`, `frenemy`, and `romantic` emerge from threshold rules. They are internal state, not user-facing badges.
 
@@ -226,7 +233,7 @@ for frame layout and error semantics.
 | Env var | Required | Notes |
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
-| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml.example` unless overridden. |
+| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
 | `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
 | `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
@@ -235,8 +242,8 @@ for frame layout and error semantics.
 | `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |
 | `BIND_ADDR` | no | Defaults to `0.0.0.0:8080`. |
 | `EXPOSE_AFFINITY_DEBUG` | no | Set `true` to enable `/comp/affinity/{session_id}`. |
-| `EMA_INERTIA` | no | Defaults to `0.8`. |
-| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml.example`. |
+| `EMA_INERTIA` | no | EMA smoothing for affinity updates, in `[0, 1]`; defaults to `0.8`. Each turn applies `1 − inertia` of the evaluated delta, so a higher value moves the affinity vector less per turn (slower to build or lose) — a relationship-difficulty dial; `0` applies every delta in full. |
+| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
 | `RUST_LOG` | no | Defaults to `info`. |
 | `MARKETPLACE_SVC_URL` | no | Base URL of eros-marketplace-svc. When set, the engine pulls /since cursors every 5 min as a self-heal recovery path. Requires `MARKETPLACE_SVC_S2S_SECRET`. |
 | `MARKETPLACE_SVC_S2S_SECRET` | no | HMAC secret shared with eros-marketplace-svc. Gates the `/s2s/*` routes the svc pushes into. Without it, `/s2s/*` always 401s. |
