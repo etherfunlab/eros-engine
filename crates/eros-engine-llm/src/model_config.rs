@@ -183,7 +183,8 @@ pub struct ReasoningConfig {
 
 /// Per-turn filter trigger. Every field optional; the AND of all *specified*
 /// predicates decides whether a turn is filtered. None specified ⇒ filter every
-/// turn. `random` is the probability the turn passes the random gate.
+/// turn. `random` is the probability (0.0–1.0) that a turn passes the random
+/// gate (1.0 ≈ always, 0.0 = never); combined via AND with the other predicates.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OutputFilterTrigger {
     #[serde(default)]
@@ -194,7 +195,10 @@ pub struct OutputFilterTrigger {
     pub traits: Option<TraitPredicate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// Trait-match predicate: the predicate passes when at least one tag in `any`
+/// is present among the turn's prompt traits (`when = present`) or absent
+/// (`when = absent`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TraitPredicate {
     #[serde(default)]
     pub any: Vec<String>,
@@ -210,6 +214,10 @@ pub enum TraitWhen {
     Absent,
 }
 
+/// When the output filter runs relative to the post-process extraction pipeline
+/// (insight/memory/affinity). `AfterExtract` (default): extraction reads the
+/// original reply, only the client output is filtered. `BeforeExtract`:
+/// extraction reads the filtered text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterTiming {
@@ -287,12 +295,17 @@ pub struct TaskConfig {
     pub model_name_display_override: Option<DisplayOverride>,
     #[serde(default)]
     pub output_filter: Option<bool>,
+    /// System instruction sent to the filter LLM; the assistant reply to
+    /// rewrite is passed as a SEPARATE user message — this is NOT a template
+    /// with placeholder substitution.
     #[serde(default)]
     pub filter_prompt: Option<String>,
     #[serde(default)]
     pub trigger: Option<OutputFilterTrigger>,
     #[serde(default)]
     pub timing: Option<FilterTiming>,
+    /// Number of fallback models the filter may try on failure; the runtime
+    /// defaults this to 1 (primary + first fallback) when unset.
     #[serde(default)]
     pub retry_depth: Option<u32>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
