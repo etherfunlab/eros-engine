@@ -29,6 +29,7 @@ use crate::state::AppState;
 
 const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
+const MAX_TIP_USD: f64 = 1_000_000.0;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
@@ -82,6 +83,8 @@ pub struct StreamSendRequest {
     pub memory_scope: Option<MemoryScope>,
     #[serde(default)]
     pub affinity_scope: Option<AffinityScopeDto>,
+    #[serde(default)]
+    pub tips_amount_usd: Option<f64>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -96,7 +99,8 @@ pub struct StreamPreErrorBody {
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    if req.content.is_empty() {
+    // Content may be empty only when a tip is attached (a tip is a button tap).
+    if req.content.is_empty() && req.tips_amount_usd.is_none() {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -104,6 +108,17 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
             user_message: "请输入一条消息".into(),
             original_user_message_id: None,
         }));
+    }
+    if let Some(amount) = req.tips_amount_usd {
+        if !amount.is_finite() || amount <= 0.0 || amount > MAX_TIP_USD {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: format!("tips_amount_usd must be a finite value in (0, {MAX_TIP_USD}]"),
+                user_message: "打赏金额无效".into(),
+                original_user_message_id: None,
+            }));
+        }
     }
     if req.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(AppError::StreamPre(StreamPreError {
@@ -256,8 +271,16 @@ pub async fn send_message_stream(
             })
         })?;
 
+    let persisted_content = if req.content.is_empty() {
+        match req.tips_amount_usd {
+            Some(amount) => format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
+            None => req.content.clone(), // unreachable post-validation
+        }
+    } else {
+        req.content.clone()
+    };
     let outcome = chat_repo
-        .upsert_user_message_idempotent(session_id, &req.content, &req.client_msg_id)
+        .upsert_user_message_idempotent(session_id, &persisted_content, &req.client_msg_id)
         .await?;
     // Resolve the proto stream. Replay returns early with a boxed stream;
     // Inserted continues to run_stream below. Boxing erases the concrete type
@@ -277,12 +300,13 @@ pub async fn send_message_stream(
                     session_id,
                     user_id,
                     instance_id,
-                    content: req.content.clone(),
+                    content: persisted_content.clone(),
                     prompt_traits: prompt_traits.clone(),
                     audit: audit.clone(),
                     tier: req.tier.clone(),
                     memory_scope,
                     affinity_scope,
+                    tips_amount_usd: req.tips_amount_usd,
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -360,7 +384,47 @@ mod tests {
             tier: tier.map(String::from),
             memory_scope: None,
             affinity_scope: None,
+            tips_amount_usd: None,
         }
+    }
+
+    fn req_tip(amount: Option<f64>, content: &str) -> StreamSendRequest {
+        StreamSendRequest {
+            content: content.into(),
+            client_msg_id: "01J5555555555555555555555A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: None,
+            memory_scope: None,
+            affinity_scope: None,
+            tips_amount_usd: amount,
+        }
+    }
+
+    #[test]
+    fn validate_payload_tip_allows_empty_content() {
+        assert!(validate_payload(&req_tip(Some(20.0), "")).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_rejects_empty_content_without_tip() {
+        assert!(validate_payload(&req_tip(None, "")).is_err());
+    }
+
+    #[test]
+    fn validate_payload_rejects_bad_tip_amounts() {
+        assert!(validate_payload(&req_tip(Some(0.0), "")).is_err());
+        assert!(validate_payload(&req_tip(Some(-5.0), "")).is_err());
+        assert!(validate_payload(&req_tip(Some(2_000_000.0), "")).is_err());
+        assert!(validate_payload(&req_tip(Some(f64::NAN), "")).is_err());
+        assert!(validate_payload(&req_tip(Some(f64::INFINITY), "")).is_err());
+    }
+
+    #[test]
+    fn validate_payload_accepts_wellformed_tip() {
+        assert!(validate_payload(&req_tip(Some(2.0), "")).is_ok());
+        assert!(validate_payload(&req_tip(Some(20000.0), "")).is_ok());
+        assert!(validate_payload(&req_tip(Some(1_000_000.0), "")).is_ok());
     }
 
     #[test]

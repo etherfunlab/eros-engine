@@ -10,9 +10,9 @@ name = "eros-engine"
 path = "src/main.rs"
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.4.20" }
-eros-engine-llm  = { path = "../eros-engine-llm", version = "0.4.20" }
-eros-engine-store = { path = "../eros-engine-store", version = "0.4.20" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.4.21" }
+eros-engine-llm  = { path = "../eros-engine-llm", version = "0.4.21" }
+eros-engine-store = { path = "../eros-engine-store", version = "0.4.21" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -50,6 +50,7 @@ futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 ulid         = { workspace = true }
+rand = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"

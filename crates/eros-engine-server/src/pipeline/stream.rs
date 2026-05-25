@@ -7,6 +7,7 @@
 //! Task 4 only ships the type layer; the `run_stream` generator lands in
 //! later tasks (T10/T11/T12).
 
+use rand::Rng;
 use serde::Serialize;
 use ulid::Ulid;
 
@@ -64,6 +65,13 @@ pub enum ProtocolFrame {
         lead_score: f64,
         should_show_cta: bool,
         agent_training_level: f64,
+        filtered: bool,
+        // null when no trait injected; always present (no skip_serializing_if).
+        prompt_injected: Option<Vec<String>>,
+        // echo of the request tier; null when none. always present.
+        tier: Option<String>,
+        retries_chat: u32,
+        retries_filter: u32,
     },
     Error {
         code: StreamErrorCode,
@@ -96,12 +104,30 @@ use eros_engine_store::persona::PersonaRepo;
 use crate::routes::companion::filter_usage_keys;
 use crate::state::AppState;
 
+/// Result of a single streaming burst, shared back to `run_stream` via a
+/// mutex. Replaces the old `produced_out: Vec<ProducedMessage>` channel so
+/// the caller can also learn whether the turn was filtered and which model
+/// attempt (chat / filter) actually served.
+#[derive(Default)]
+pub struct BurstOutcome {
+    pub produced: Vec<crate::pipeline::post_process::ProducedMessage>,
+    pub filtered: bool,
+    pub retries_chat: u32,   // successful chat-attempt index (0 = primary)
+    pub retries_filter: u32, // served filter-model index (0 when none/primary)
+}
+
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
 /// per attempt, persists each logical message before its Done, and yields
 /// a final Error{UpstreamUnavailable} if the chain exhausts. On a clean
-/// burst, returns the produced messages via `produced_out` for the caller
-/// to spawn post_process with. Does NOT yield Final — the caller emits it
-/// after the burst so it reflects post-burst state.
+/// burst, returns the produced messages (plus filter/attempt status) via
+/// `outcome` for the caller to spawn post_process with. Does NOT yield
+/// Final — the caller emits it after the burst so it reflects post-burst
+/// state.
+///
+/// Two modes: when the resolved output filter's turn-level predicates pass
+/// (live=false), the burst buffers each attempt, runs the filter LLM, and
+/// only emits the filtered text (never the original). Otherwise it streams
+/// live per-chunk exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn drive_chat_burst(
     state: Arc<AppState>,
@@ -112,9 +138,10 @@ fn drive_chat_burst(
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
-    produced_out: std::sync::Arc<
-        std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>,
-    >,
+    filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
+    trait_tags: Vec<String>, // requested prompt-trait tags (the turn's)
+    random_pass: bool,       // drawn once per turn by run_stream
+    outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -132,7 +159,131 @@ fn drive_chat_burst(
             };
             return;
         }
-        let mut continues_from: Option<Ulid> = None;
+
+        let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
+        let filtered_mode = filter
+            .as_ref()
+            .map(|f| f.trigger.turn_level_pass(random_pass, &tag_refs))
+            .unwrap_or(false);
+
+        if !filtered_mode {
+            // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
+            let mut continues_from: Option<Ulid> = None;
+            for (idx, model_id) in chain.iter().enumerate() {
+                let msg_ulid = Ulid::new();
+                let msg_uuid: Uuid = msg_ulid.into();
+                let mut acc = String::new();
+                let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+                let mut last_gen_id: Option<String> = None;
+                let mut truncated = false;
+
+                yield ProtocolFrame::Meta {
+                    message_id: ulid_string(msg_ulid),
+                    action_type: frame_action,
+                    model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                    continues_from: continues_from.map(ulid_string),
+                };
+
+                let mut per_model_req = req.clone();
+                per_model_req.model = model_id.clone();
+                per_model_req.fallback_model = Vec::new();
+
+                match state.openrouter.execute_stream(per_model_req).await {
+                    Ok(mut s) => {
+                        use futures_util::StreamExt as _;
+                        while let Some(item) = s.next().await {
+                            match item {
+                                Ok(c) => {
+                                    if let Some(content) = c.content {
+                                        acc.push_str(&content);
+                                        yield ProtocolFrame::Delta {
+                                            message_id: ulid_string(msg_ulid),
+                                            content,
+                                        };
+                                    }
+                                    if c.usage.is_some()         { last_usage = c.usage; }
+                                    if c.generation_id.is_some() { last_gen_id = c.generation_id; }
+                                    if matches!(c.finish_reason.as_deref(), Some("length")) {
+                                        truncated = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("stream: upstream chunk err: {e}");
+                                    truncated = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !truncated && acc.is_empty() {
+                            truncated = true;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("stream: upstream open err: {e}");
+                        truncated = true;
+                    }
+                }
+
+                // Persist BEFORE yielding Done (spec §2.3 risk R7).
+                let row = eros_engine_store::chat::AssistantInsert {
+                    id: msg_uuid,
+                    content: acc.clone(),
+                    assistant_action_type: persist_action.into(),
+                    continues_from_message_id: continues_from.map(Into::into),
+                    truncated,
+                    model: Some(model_id.clone()),
+                    usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                    generation_id: last_gen_id.clone(),
+                };
+                if let Err(e) = chat_repo
+                    .insert_assistant_batch(session_id, user_message_id, &[row])
+                    .await
+                {
+                    tracing::warn!("stream: assistant persist failed: {e}");
+                }
+                outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
+                    message_id: msg_uuid,
+                    full_text: acc.clone(),
+                    action: plan_action,
+                });
+
+                // Strip OPENROUTER_USAGE_HIDDEN_KEYS from the wire usage. The DB
+                // row above persists the full unfiltered usage; only the frame is
+                // filtered (mirrors the sync send_message path).
+                let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
+                yield ProtocolFrame::Done {
+                    message_id: ulid_string(msg_ulid),
+                    truncated,
+                    usage: wire_usage,
+                    generation_id: last_gen_id,
+                };
+
+                if !truncated {
+                    outcome.lock().unwrap().retries_chat = idx as u32;
+                    return;
+                }
+                if idx + 1 == chain.len() {
+                    yield ProtocolFrame::Error {
+                        code: StreamErrorCode::UpstreamUnavailable,
+                        retryable: true,
+                        message: "all fallback models truncated".into(),
+                        user_message: "AI 服务暂时不可用，稍后再试".into(),
+                    };
+                    return;
+                }
+                continues_from = Some(msg_ulid);
+            }
+            return;
+        }
+
+        // ===== FILTERED MODE =====
+        // The turn's trait/random predicates pass: buffer each attempt, run the
+        // filter LLM, and emit ONLY the filtered text (the original reply must
+        // never reach the client). Per-attempt the model predicate decides
+        // whether that specific served model is actually filtered; on filter
+        // error we fail open and emit the original.
+        let f = filter.expect("filtered_mode ⇒ filter present");
         for (idx, model_id) in chain.iter().enumerate() {
             let msg_ulid = Ulid::new();
             let msg_uuid: Uuid = msg_ulid.into();
@@ -141,103 +292,171 @@ fn drive_chat_burst(
             let mut last_gen_id: Option<String> = None;
             let mut truncated = false;
 
-            yield ProtocolFrame::Meta {
-                message_id: ulid_string(msg_ulid),
-                action_type: frame_action,
-                model: display_override.as_ref().and_then(|d| d.display(model_id)),
-                continues_from: continues_from.map(ulid_string),
-            };
-
             let mut per_model_req = req.clone();
             per_model_req.model = model_id.clone();
             per_model_req.fallback_model = Vec::new();
-
             match state.openrouter.execute_stream(per_model_req).await {
                 Ok(mut s) => {
                     use futures_util::StreamExt as _;
                     while let Some(item) = s.next().await {
                         match item {
                             Ok(c) => {
-                                if let Some(content) = c.content {
-                                    acc.push_str(&content);
-                                    yield ProtocolFrame::Delta {
-                                        message_id: ulid_string(msg_ulid),
-                                        content,
-                                    };
-                                }
-                                if c.usage.is_some()         { last_usage = c.usage; }
+                                if let Some(content) = c.content { acc.push_str(&content); }
+                                if c.usage.is_some() { last_usage = c.usage; }
                                 if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                if matches!(c.finish_reason.as_deref(), Some("length")) {
-                                    truncated = true;
-                                }
+                                if matches!(c.finish_reason.as_deref(), Some("length")) { truncated = true; }
                             }
-                            Err(e) => {
-                                tracing::warn!("stream: upstream chunk err: {e}");
-                                truncated = true;
-                                break;
-                            }
+                            Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
                         }
                     }
-                    if !truncated && acc.is_empty() {
-                        truncated = true;
-                    }
+                    if !truncated && acc.is_empty() { truncated = true; }
                 }
-                Err(e) => {
-                    tracing::warn!("stream: upstream open err: {e}");
-                    truncated = true;
-                }
+                Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
             }
 
-            // Persist BEFORE yielding Done (spec §2.3 risk R7).
+            if truncated {
+                if idx + 1 == chain.len() {
+                    yield ProtocolFrame::Error {
+                        code: StreamErrorCode::UpstreamUnavailable,
+                        retryable: true,
+                        message: "all fallback models truncated".into(),
+                        user_message: "AI 服务暂时不可用，稍后再试".into(),
+                    };
+                }
+                continue;
+            }
+
+            outcome.lock().unwrap().retries_chat = idx as u32;
+            let do_filter = f.trigger.should_filter(model_id, &tag_refs, random_pass);
+            yield ProtocolFrame::Meta {
+                message_id: ulid_string(msg_ulid),
+                action_type: frame_action,
+                model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                continues_from: None,
+            };
+
+            let visible: String = if do_filter {
+                match run_output_filter(&state, &f, &acc).await {
+                    Some((filtered_text, retries_filter)) => {
+                        let mut o = outcome.lock().unwrap();
+                        o.filtered = true;
+                        o.retries_filter = retries_filter;
+                        filtered_text
+                    }
+                    None => acc.clone(),
+                }
+            } else {
+                acc.clone()
+            };
+
+            if !visible.is_empty() {
+                yield ProtocolFrame::Delta {
+                    message_id: ulid_string(msg_ulid),
+                    content: visible.clone(),
+                };
+            }
+
             let row = eros_engine_store::chat::AssistantInsert {
                 id: msg_uuid,
-                content: acc.clone(),
+                content: visible.clone(),
                 assistant_action_type: persist_action.into(),
-                continues_from_message_id: continues_from.map(Into::into),
-                truncated,
+                continues_from_message_id: None,
+                truncated: false,
                 model: Some(model_id.clone()),
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
             };
-            if let Err(e) = chat_repo
-                .insert_assistant_batch(session_id, user_message_id, &[row])
-                .await
-            {
-                tracing::warn!("stream: assistant persist failed: {e}");
+            if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
+                tracing::warn!("stream(filtered): persist failed: {e}");
             }
-            if let Ok(mut p) = produced_out.lock() {
-                p.push(crate::pipeline::post_process::ProducedMessage {
-                    message_id: msg_uuid,
-                    full_text: acc.clone(),
-                    action: plan_action,
-                });
-            }
+            let extracted = extract_text(f.timing, &acc, &visible);
+            outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
+                message_id: msg_uuid,
+                full_text: extracted,
+                action: plan_action,
+            });
 
-            // Strip OPENROUTER_USAGE_HIDDEN_KEYS from the wire usage. The DB
-            // row above persists the full unfiltered usage; only the frame is
-            // filtered (mirrors the sync send_message path).
             let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
             yield ProtocolFrame::Done {
                 message_id: ulid_string(msg_ulid),
-                truncated,
+                truncated: false,
                 usage: wire_usage,
                 generation_id: last_gen_id,
             };
+            return;
+        }
+    }
+}
 
-            if !truncated {
-                return;
+/// Pick the text post_process extracts from: original (after) vs visible (before).
+fn extract_text(
+    timing: eros_engine_llm::model_config::FilterTiming,
+    original: &str,
+    visible: &str,
+) -> String {
+    match timing {
+        eros_engine_llm::model_config::FilterTiming::AfterExtract => original.to_string(),
+        eros_engine_llm::model_config::FilterTiming::BeforeExtract => visible.to_string(),
+    }
+}
+
+/// Run the output-filter LLM over `original`. `execute()` walks the (already
+/// depth-capped) chain; `ChatResponse.model` reports the model served. Returns
+/// `(filtered_text, retries_filter)` where retries_filter = served model's index
+/// in `[f.model] + f.fallback_model` (0 = primary). `None` on error/timeout/empty.
+async fn run_output_filter(
+    state: &AppState,
+    f: &eros_engine_llm::model_config::ResolvedOutputFilter,
+    original: &str,
+) -> Option<(String, u32)> {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let req = ChatRequest {
+        model: f.model.clone(),
+        fallback_model: f.fallback_model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: f.filter_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: original.to_string(),
+            },
+        ],
+        temperature: f.temperature as f32,
+        max_tokens: f.max_tokens,
+        ..Default::default()
+    };
+    const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+        Ok(Ok(resp)) => {
+            super::log_openrouter_usage("chat_output_filter", None, &resp);
+            let out = resp.reply.trim().to_string();
+            if out.is_empty() {
+                return None;
             }
-            if idx + 1 == chain.len() {
-                yield ProtocolFrame::Error {
-                    code: StreamErrorCode::UpstreamUnavailable,
-                    retryable: true,
-                    message: "all fallback models truncated".into(),
-                    user_message: "AI 服务暂时不可用，稍后再试".into(),
-                };
-                return;
-            }
-            continues_from = Some(msg_ulid);
+            let chain = std::iter::once(f.model.as_str())
+                .chain(f.fallback_model.iter().map(String::as_str));
+            let retries_filter = resp
+                .model
+                .as_deref()
+                .and_then(|served| {
+                    chain
+                        .enumerate()
+                        .find(|(_, m)| *m == served)
+                        .map(|(i, _)| i as u32)
+                })
+                .unwrap_or(0);
+            Some((out, retries_filter))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("output filter LLM failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("output filter timed out");
+            None
         }
     }
 }
@@ -255,6 +474,7 @@ pub struct PersistedUserMessage {
     pub tier: Option<String>,
     pub memory_scope: eros_engine_core::scope::MemoryScope,
     pub affinity_scope: eros_engine_core::scope::AffinityScope,
+    pub tips_amount_usd: Option<f64>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -323,6 +543,7 @@ pub fn run_stream(
                 tier: user_msg.tier.clone(),
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
+                tips_amount_usd: user_msg.tips_amount_usd,
             },
             affinity: affinity.clone(),
             persona,
@@ -353,7 +574,7 @@ pub fn run_stream(
                     usage: None,
                     generation_id: None,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
             ActionType::Reply | ActionType::GiftReaction => {
@@ -370,7 +591,7 @@ pub fn run_stream(
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                     ).await
                 };
-                let req = match req_res {
+                let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
                         yield ProtocolFrame::Error {
@@ -382,15 +603,32 @@ pub fn run_stream(
                         return;
                     }
                 };
+                // The filter trigger's `traits` predicate AND `prompt_injected`
+                // both use the KEPT tags (post tier `allow_traits` gating), so a
+                // tier that drops a requested trait can't trigger filtering on it.
+                let trait_tags: Vec<String> = injected_tags.clone();
+                let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
                 let (frame_action, persist_action, plan_action) = if is_gift {
                     (FrameActionType::GiftReaction, "gift_reaction", ActionType::GiftReaction)
                 } else {
                     (FrameActionType::Reply, "reply", ActionType::Reply)
                 };
 
-                let produced_out: std::sync::Arc<std::sync::Mutex<Vec<crate::pipeline::post_process::ProducedMessage>>> =
-                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let display_override = state.model_config.display_override("chat_companion");
+
+                // Resolve the output filter for this tier and draw the per-turn
+                // random gate ONCE (so live/filter share the same coin flip).
+                let tier = user_msg.tier.as_deref();
+                let filter = state.model_config.resolve_output_filter(tier);
+                let random_pass = filter
+                    .as_ref()
+                    .and_then(|f| f.trigger.random)
+                    .map(|p| rand::thread_rng().gen::<f64>() < p)
+                    .unwrap_or(true);
+
+                let outcome = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::pipeline::stream::BurstOutcome::default(),
+                ));
                 let burst = drive_chat_burst(
                     state.clone(),
                     user_msg.session_id,
@@ -400,7 +638,10 @@ pub fn run_stream(
                     plan_action,
                     req,
                     display_override,
-                    produced_out.clone(),
+                    filter,
+                    trait_tags,
+                    random_pass,
+                    outcome.clone(),
                 );
                 {
                     use futures_util::StreamExt as _;
@@ -413,10 +654,10 @@ pub fn run_stream(
                         yield frame;
                     }
                 }
-                let produced: Vec<crate::pipeline::post_process::ProducedMessage> = produced_out
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+                let (produced, did_filter, retries_chat, retries_filter) = {
+                    let g = outcome.lock().unwrap();
+                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter)
+                };
 
                 // Reset ghost streak (mirrors sync pipeline policy).
                 if let Err(e) = sqlx::query(
@@ -430,7 +671,17 @@ pub fn run_stream(
                     tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(
+                    &state,
+                    user_msg.session_id,
+                    user_msg.user_id,
+                    did_filter,
+                    prompt_injected.clone(),
+                    user_msg.tier.clone(),
+                    retries_chat,
+                    retries_filter,
+                )
+                .await;
                 yield final_frame;
 
                 // Spawn post-process; do not await.
@@ -444,6 +695,7 @@ pub fn run_stream(
                     tier: user_msg.tier.clone(),
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
+                    tips_amount_usd: user_msg.tips_amount_usd,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -463,7 +715,7 @@ pub fn run_stream(
             }
             _ => {
                 // Proactive and any future variants: Final-only.
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id).await;
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
         }
@@ -471,7 +723,17 @@ pub fn run_stream(
 }
 
 /// Compute the spec's `final` frame from current session/user state.
-async fn compute_final_frame(state: &AppState, session_id: Uuid, user_id: Uuid) -> ProtocolFrame {
+#[allow(clippy::too_many_arguments)]
+async fn compute_final_frame(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    filtered: bool,
+    prompt_injected: Option<Vec<String>>,
+    tier: Option<String>,
+    retries_chat: u32,
+    retries_filter: u32,
+) -> ProtocolFrame {
     let lead_score: f64 =
         sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
             .bind(session_id)
@@ -497,6 +759,11 @@ async fn compute_final_frame(state: &AppState, session_id: Uuid, user_id: Uuid) 
         lead_score: normalised_lead,
         should_show_cta,
         agent_training_level: training_level,
+        filtered,
+        prompt_injected,
+        tier,
+        retries_chat,
+        retries_filter,
     }
 }
 
@@ -575,7 +842,7 @@ pub fn replay_stream(
                 return;
             }
         }
-        let final_frame = compute_final_frame(&state, session_id, user_id).await;
+        let final_frame = compute_final_frame(&state, session_id, user_id, false, None, None, 0, 0).await;
         yield final_frame;
     }
 }
@@ -664,16 +931,39 @@ mod tests {
     }
 
     #[test]
-    fn final_frame_carries_three_floats() {
+    fn final_frame_carries_filter_and_status_fields() {
         let f = ProtocolFrame::Final {
             lead_score: 0.71,
             should_show_cta: false,
             agent_training_level: 0.42,
+            filtered: true,
+            prompt_injected: Some(vec!["nsfw_boost".into()]),
+            tier: Some("gold".into()),
+            retries_chat: 1,
+            retries_filter: 0,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "final");
-        assert!((v["lead_score"].as_f64().unwrap() - 0.71).abs() < 1e-9);
-        assert_eq!(v["should_show_cta"], false);
+        assert_eq!(v["filtered"], true);
+        assert_eq!(v["prompt_injected"][0], "nsfw_boost");
+        assert_eq!(v["tier"], "gold");
+        assert_eq!(v["retries_chat"], 1);
+        assert_eq!(v["retries_filter"], 0);
+
+        let f2 = ProtocolFrame::Final {
+            lead_score: 0.0,
+            should_show_cta: false,
+            agent_training_level: 0.0,
+            filtered: false,
+            prompt_injected: None,
+            tier: None,
+            retries_chat: 0,
+            retries_filter: 0,
+        };
+        let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
+        assert!(v2["prompt_injected"].is_null());
+        assert!(v2["tier"].is_null());
+        assert_eq!(v2["filtered"], false);
     }
 
     #[test]
@@ -769,6 +1059,7 @@ mod tests {
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -893,6 +1184,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -969,6 +1261,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1061,6 +1354,7 @@ data: [DONE]\n\n";
                 tier: None,
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
+                tips_amount_usd: None,
             },
         )
         .collect()
@@ -1160,5 +1454,558 @@ data: [DONE]\n\n";
         .collect()
         .await;
         assert_eq!(meta_model(&f3), Some("Nova".to_string()));
+    }
+
+    #[test]
+    fn extract_text_picks_by_timing() {
+        use eros_engine_llm::model_config::FilterTiming::*;
+        assert_eq!(extract_text(AfterExtract, "orig", "filt"), "orig");
+        assert_eq!(extract_text(BeforeExtract, "orig", "filt"), "filt");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_turn_emits_filtered_and_persists_filtered(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        // The output filter uses the NON-streaming `execute()` path, so its mock
+        // must return a JSON completion object (choices[].message.content), not
+        // SSE. `model:"fast/m"` makes retries_filter resolve to the primary (0).
+        let filt_body = serde_json::json!({
+            "id": "gf", "model": "fast/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "FILT"}}],
+        });
+        // Route the two calls by the MODEL ID present in the request body so the two
+        // mocks are MUTUALLY EXCLUSIVE (mount order / precedence cannot matter):
+        //   chat call body contains "deepseek/x"; filter call body contains "fast/m".
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999A",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("FILT"),
+                "client must see filtered text, got {deltas:?}"
+            );
+            assert!(
+                !deltas.contains("ORIG"),
+                "original must never reach client, got {deltas:?}"
+            );
+            let (filtered, rc, rf) = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final {
+                        filtered,
+                        retries_chat,
+                        retries_filter,
+                        ..
+                    } => Some((*filtered, *retries_chat, *retries_filter)),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(filtered, "final.filtered must be true");
+            assert_eq!(rc, 0, "primary chat model served");
+            assert_eq!(rf, 0, "primary filter model served");
+            let row = sqlx::query_scalar::<_, String>(
+                "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
+                .bind(session_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(row, "FILT");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_turn_fail_open_emits_original(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        // Filter model returns 500 → fail open to the original reply.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999B",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("ORIG"),
+                "fail-open must emit original, got {deltas:?}"
+            );
+            assert!(
+                !deltas.contains("FILT"),
+                "no filtered text on fail-open, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!filtered, "final.filtered must be false on fail-open");
+            let row = sqlx::query_scalar::<_, String>(
+                "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
+                .bind(session_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(row, "ORIG");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_mode_when_random_zero(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        // random=0.0 ⇒ turn never passes the gate ⇒ LIVE mode; the filter model
+        // must never be contacted.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\ntrigger = { random = 0.0 }\n",
+            ).unwrap());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999C",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("ORIG"),
+                "live mode must emit original, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!filtered, "final.filtered must be false in live mode");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_tip_injects_reward_block_in_prompt(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"谢谢\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(session_id, "(打赏 $20)", "01J5555555555555555555555A")
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "(打赏 $20)".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: Some(20.0),
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected, got {frames:?}",
+        );
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
+
+        // A tip is never ghosted ⇒ exactly one LLM call, whose system prompt
+        // carries the tip block.
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            !reqs.is_empty(),
+            "tip must trigger an LLM call (never ghosted)"
+        );
+        let sent = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            sent.contains("【刚收到的打赏】") && sent.contains("$20 美元的红包"),
+            "system prompt must contain the tip block, got: {sent}",
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_mode_models_miss_emits_original(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        // Turn-level predicates pass (no random/traits gate) ⇒ FILTERED mode, but
+        // the per-attempt models predicate fails (primary chat is "deepseek/x",
+        // not "other/model") ⇒ no filter call, emit the original.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\ntrigger = { models = [\"other/model\"] }\n",
+            ).unwrap());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999D",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert_eq!(
+                deltas, "ORIG",
+                "models-miss must emit only the original, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                !filtered,
+                "final.filtered must be false when models predicate misses"
+            );
+            let meta_count = frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Meta { .. }))
+                .count();
+            let done_count = frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count();
+            assert_eq!(meta_count, 1, "exactly one Meta frame");
+            assert_eq!(done_count, 1, "exactly one Done frame");
+        }
     }
 }

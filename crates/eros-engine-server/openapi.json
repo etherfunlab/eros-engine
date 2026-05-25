@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.4.20"
+    "version": "0.4.21"
   },
   "servers": [
     {
@@ -1749,6 +1749,13 @@
               "string",
               "null"
             ]
+          },
+          "tips_amount_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
           }
         }
       },
