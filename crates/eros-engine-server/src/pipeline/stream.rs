@@ -41,7 +41,8 @@ pub enum ProtocolFrame {
     Meta {
         message_id: String,
         action_type: FrameActionType,
-        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         continues_from: Option<String>,
     },
@@ -142,7 +143,7 @@ fn drive_chat_burst(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
-                model: model_id.clone(),
+                model: Some(model_id.clone()),
                 continues_from: continues_from.map(ulid_string),
             };
 
@@ -342,7 +343,7 @@ pub fn run_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_id),
                     action_type: FrameActionType::Ghost,
-                    model: String::new(),
+                    model: None,
                     continues_from: None,
                 };
                 yield ProtocolFrame::Done {
@@ -514,7 +515,7 @@ pub fn replay_stream(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_id),
                 action_type: FrameActionType::Ghost,
-                model: String::new(),
+                model: None,
                 continues_from: None,
             };
             yield ProtocolFrame::Done {
@@ -534,7 +535,7 @@ pub fn replay_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
-                    model: row.model.clone().unwrap_or_default(),
+                    model: row.model.clone(),
                     continues_from: prev_ulid.map(ulid_string),
                 };
                 if !row.content.is_empty() {
@@ -583,7 +584,7 @@ mod tests {
         let f = ProtocolFrame::Meta {
             message_id: ulid_string(id),
             action_type: FrameActionType::Reply,
-            model: "x-ai/grok-4-fast".into(),
+            model: Some("x-ai/grok-4-fast".into()),
             continues_from: None,
         };
         let s = serde_json::to_string(&f).unwrap();
@@ -604,11 +605,24 @@ mod tests {
         let f = ProtocolFrame::Meta {
             message_id: ulid_string(Ulid::new()),
             action_type: FrameActionType::Reply,
-            model: "x-ai/grok-4-fast".into(),
+            model: Some("x-ai/grok-4-fast".into()),
             continues_from: Some(prev.clone()),
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["continues_from"], prev);
+    }
+
+    #[test]
+    fn meta_frame_omits_model_when_none() {
+        let f = ProtocolFrame::Meta {
+            message_id: ulid_string(Ulid::new()),
+            action_type: FrameActionType::Ghost,
+            model: None,
+            continues_from: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "meta");
+        assert!(v.get("model").is_none(), "model must be omitted when None");
     }
 
     #[test]
