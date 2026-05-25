@@ -238,14 +238,14 @@ impl ModelConfig {
     }
 
     /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml.example` to match the
+    /// or fall back to `examples/model_config.toml` to match the
     /// `eros-engine-server` boot default. The server binary itself reads
     /// the file inline via `from_toml_str` rather than calling this; this
     /// method is provided for embedders who want the same behaviour in
     /// one call.
     pub fn load() -> Result<Arc<Self>, LlmError> {
         let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml.example".to_string());
+            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
         let text = std::fs::read_to_string(&path)?;
         let cfg = Self::from_toml_str(&text)?;
         Ok(Arc::new(cfg))
@@ -943,7 +943,7 @@ reasoning = { exclude = true }
     fn committed_example_config_parses_and_has_affinity_task() {
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text)
-            .expect("examples/model_config.toml.example must parse");
+            .expect("examples/model_config.toml must parse");
         let r = cfg.resolve("affinity_evaluation", None);
         assert_eq!(r.model, "anthropic/claude-haiku-4.5");
         assert_eq!(r.max_tokens, 400);
@@ -961,7 +961,7 @@ reasoning = { exclude = true }
     fn committed_example_chat_companion_disables_reasoning() {
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text)
-            .expect("examples/model_config.toml.example must parse");
+            .expect("examples/model_config.toml must parse");
         let disabled = ReasoningConfig {
             enabled: Some(false),
             exclude: None,
