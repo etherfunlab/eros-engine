@@ -415,8 +415,14 @@ async fn run_output_filter(
         model: f.model.clone(),
         fallback_model: f.fallback_model.clone(),
         messages: vec![
-            ChatMessage { role: "system".into(), content: f.filter_prompt.clone() },
-            ChatMessage { role: "user".into(), content: original.to_string() },
+            ChatMessage {
+                role: "system".into(),
+                content: f.filter_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: original.to_string(),
+            },
         ],
         temperature: f.temperature as f32,
         max_tokens: f.max_tokens,
@@ -435,7 +441,12 @@ async fn run_output_filter(
             let retries_filter = resp
                 .model
                 .as_deref()
-                .and_then(|served| chain.enumerate().find(|(_, m)| *m == served).map(|(i, _)| i as u32))
+                .and_then(|served| {
+                    chain
+                        .enumerate()
+                        .find(|(_, m)| *m == served)
+                        .map(|(i, _)| i as u32)
+                })
                 .unwrap_or(0);
             Some((out, retries_filter))
         }
@@ -935,9 +946,14 @@ mod tests {
         assert_eq!(v["retries_filter"], 0);
 
         let f2 = ProtocolFrame::Final {
-            lead_score: 0.0, should_show_cta: false, agent_training_level: 0.0,
-            filtered: false, prompt_injected: None, tier: None,
-            retries_chat: 0, retries_filter: 0,
+            lead_score: 0.0,
+            should_show_cta: false,
+            agent_training_level: 0.0,
+            filtered: false,
+            prompt_injected: None,
+            tier: None,
+            retries_chat: 0,
+            retries_filter: 0,
         };
         let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
         assert!(v2["prompt_injected"].is_null());
@@ -1461,13 +1477,17 @@ data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
             .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(chat_body, "text/event-stream"))
-            .mount(&mock).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -1476,32 +1496,80 @@ data: [DONE]\n\n";
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
                  [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
-            ).unwrap());
+            )
+            .unwrap(),
+        );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(), Default::default(),
-                format!("{}/api/v1/chat/completions", mock.uri())));
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
 
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hello there friend", "01J9999999999999999999999A")
-            .await.unwrap() { UpsertUserOutcome::Inserted { message_id } => message_id, _ => unreachable!() };
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999A",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
 
-        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), PersistedUserMessage {
-            user_message_id: umid, session_id, user_id, instance_id,
-            content: "hello there friend".into(), prompt_traits: vec![], audit: None, tier: None,
-            memory_scope: Default::default(), affinity_scope: Default::default(),
-        }).collect().await;
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
 
-        let deltas: String = frames.iter().filter_map(|f| match f {
-            ProtocolFrame::Delta { content, .. } => Some(content.clone()), _ => None,
-        }).collect();
-        if frames.iter().any(|f| matches!(f, ProtocolFrame::Delta { .. })) {
-            assert!(deltas.contains("FILT"), "client must see filtered text, got {deltas:?}");
-            assert!(!deltas.contains("ORIG"), "original must never reach client, got {deltas:?}");
-            let (filtered, rc, rf) = frames.iter().find_map(|f| match f {
-                ProtocolFrame::Final { filtered, retries_chat, retries_filter, .. }
-                    => Some((*filtered, *retries_chat, *retries_filter)), _ => None }).unwrap();
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("FILT"),
+                "client must see filtered text, got {deltas:?}"
+            );
+            assert!(
+                !deltas.contains("ORIG"),
+                "original must never reach client, got {deltas:?}"
+            );
+            let (filtered, rc, rf) = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final {
+                        filtered,
+                        retries_chat,
+                        retries_filter,
+                        ..
+                    } => Some((*filtered, *retries_chat, *retries_filter)),
+                    _ => None,
+                })
+                .unwrap();
             assert!(filtered, "final.filtered must be true");
             assert_eq!(rc, 0, "primary chat model served");
             assert_eq!(rf, 0, "primary filter model served");
@@ -1525,13 +1593,17 @@ data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
             .respond_with(ResponseTemplate::new(500))
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(chat_body, "text/event-stream"))
-            .mount(&mock).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -1540,31 +1612,75 @@ data: [DONE]\n\n";
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
                  [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
-            ).unwrap());
+            )
+            .unwrap(),
+        );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(), Default::default(),
-                format!("{}/api/v1/chat/completions", mock.uri())));
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
 
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hello there friend", "01J9999999999999999999999B")
-            .await.unwrap() { UpsertUserOutcome::Inserted { message_id } => message_id, _ => unreachable!() };
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999B",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
 
-        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), PersistedUserMessage {
-            user_message_id: umid, session_id, user_id, instance_id,
-            content: "hello there friend".into(), prompt_traits: vec![], audit: None, tier: None,
-            memory_scope: Default::default(), affinity_scope: Default::default(),
-        }).collect().await;
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
 
-        let deltas: String = frames.iter().filter_map(|f| match f {
-            ProtocolFrame::Delta { content, .. } => Some(content.clone()), _ => None,
-        }).collect();
-        if frames.iter().any(|f| matches!(f, ProtocolFrame::Delta { .. })) {
-            assert!(deltas.contains("ORIG"), "fail-open must emit original, got {deltas:?}");
-            assert!(!deltas.contains("FILT"), "no filtered text on fail-open, got {deltas:?}");
-            let filtered = frames.iter().find_map(|f| match f {
-                ProtocolFrame::Final { filtered, .. } => Some(*filtered), _ => None }).unwrap();
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("ORIG"),
+                "fail-open must emit original, got {deltas:?}"
+            );
+            assert!(
+                !deltas.contains("FILT"),
+                "no filtered text on fail-open, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
             assert!(!filtered, "final.filtered must be false on fail-open");
             let row = sqlx::query_scalar::<_, String>(
                 "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
@@ -1586,17 +1702,23 @@ data: [DONE]\n\n";
         // must never be contacted.
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw("data: [DONE]\n\n", "text/event-stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
             .expect(0)
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(chat_body, "text/event-stream"))
-            .mount(&mock).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -1608,27 +1730,66 @@ data: [DONE]\n\n";
             ).unwrap());
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(), Default::default(),
-                format!("{}/api/v1/chat/completions", mock.uri())));
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
 
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hello there friend", "01J9999999999999999999999C")
-            .await.unwrap() { UpsertUserOutcome::Inserted { message_id } => message_id, _ => unreachable!() };
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999C",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
 
-        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), PersistedUserMessage {
-            user_message_id: umid, session_id, user_id, instance_id,
-            content: "hello there friend".into(), prompt_traits: vec![], audit: None, tier: None,
-            memory_scope: Default::default(), affinity_scope: Default::default(),
-        }).collect().await;
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
 
-        let deltas: String = frames.iter().filter_map(|f| match f {
-            ProtocolFrame::Delta { content, .. } => Some(content.clone()), _ => None,
-        }).collect();
-        if frames.iter().any(|f| matches!(f, ProtocolFrame::Delta { .. })) {
-            assert!(deltas.contains("ORIG"), "live mode must emit original, got {deltas:?}");
-            let filtered = frames.iter().find_map(|f| match f {
-                ProtocolFrame::Final { filtered, .. } => Some(*filtered), _ => None }).unwrap();
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert!(
+                deltas.contains("ORIG"),
+                "live mode must emit original, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
             assert!(!filtered, "final.filtered must be false in live mode");
         }
     }
@@ -1647,17 +1808,23 @@ data: [DONE]\n\n";
         // not "other/model") ⇒ no filter call, emit the original.
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("fast/m"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw("data: [DONE]\n\n", "text/event-stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
             .expect(0)
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(chat_body, "text/event-stream"))
-            .mount(&mock).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
 
         let user_id = Uuid::new_v4();
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
@@ -1669,30 +1836,78 @@ data: [DONE]\n\n";
             ).unwrap());
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(), Default::default(),
-                format!("{}/api/v1/chat/completions", mock.uri())));
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
 
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hello there friend", "01J9999999999999999999999D")
-            .await.unwrap() { UpsertUserOutcome::Inserted { message_id } => message_id, _ => unreachable!() };
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J9999999999999999999999D",
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
 
-        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), PersistedUserMessage {
-            user_message_id: umid, session_id, user_id, instance_id,
-            content: "hello there friend".into(), prompt_traits: vec![], audit: None, tier: None,
-            memory_scope: Default::default(), affinity_scope: Default::default(),
-        }).collect().await;
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+            },
+        )
+        .collect()
+        .await;
 
-        let deltas: String = frames.iter().filter_map(|f| match f {
-            ProtocolFrame::Delta { content, .. } => Some(content.clone()), _ => None,
-        }).collect();
-        if frames.iter().any(|f| matches!(f, ProtocolFrame::Delta { .. })) {
-            assert_eq!(deltas, "ORIG", "models-miss must emit only the original, got {deltas:?}");
-            let filtered = frames.iter().find_map(|f| match f {
-                ProtocolFrame::Final { filtered, .. } => Some(*filtered), _ => None }).unwrap();
-            assert!(!filtered, "final.filtered must be false when models predicate misses");
-            let meta_count = frames.iter().filter(|f| matches!(f, ProtocolFrame::Meta { .. })).count();
-            let done_count = frames.iter().filter(|f| matches!(f, ProtocolFrame::Done { .. })).count();
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            assert_eq!(
+                deltas, "ORIG",
+                "models-miss must emit only the original, got {deltas:?}"
+            );
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                !filtered,
+                "final.filtered must be false when models predicate misses"
+            );
+            let meta_count = frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Meta { .. }))
+                .count();
+            let done_count = frames
+                .iter()
+                .filter(|f| matches!(f, ProtocolFrame::Done { .. }))
+                .count();
             assert_eq!(meta_count, 1, "exactly one Meta frame");
             assert_eq!(done_count, 1, "exactly one Done frame");
         }

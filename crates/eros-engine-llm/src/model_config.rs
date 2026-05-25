@@ -381,7 +381,7 @@ pub struct ResolvedModel {
 #[derive(Debug, Clone)]
 pub struct ResolvedOutputFilter {
     pub model: String,
-    pub fallback_model: Vec<String>,   // already truncated to retry_depth
+    pub fallback_model: Vec<String>, // already truncated to retry_depth
     pub temperature: f64,
     pub max_tokens: u32,
     pub filter_prompt: String,
@@ -539,7 +539,11 @@ impl ModelConfig {
         let trigger = tier_cfg
             .and_then(|t| t.trigger.clone())
             .or_else(|| task_cfg.trigger.clone())
-            .unwrap_or(OutputFilterTrigger { random: None, models: None, traits: None });
+            .unwrap_or(OutputFilterTrigger {
+                random: None,
+                models: None,
+                traits: None,
+            });
         let timing = tier_cfg
             .and_then(|t| t.timing)
             .or(task_cfg.timing)
@@ -1445,7 +1449,10 @@ trigger = { random = 1.0 }
         assert_eq!(tp.when, TraitWhen::Present);
         // per-tier override parses; tier trigger replaces default wholesale
         assert_eq!(f.tiers["gold"].trigger.clone().unwrap().random, Some(1.0));
-        assert_eq!(f.tiers["gold"].filter_prompt.as_deref(), Some("tier prompt"));
+        assert_eq!(
+            f.tiers["gold"].filter_prompt.as_deref(),
+            Some("tier prompt")
+        );
     }
 
     #[test]
@@ -1457,50 +1464,79 @@ filter_prompt = "p"
 trigger = { traits = { any = ["a"] } }
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        let tp = cfg.tasks["chat_output_filter"].trigger.clone().unwrap().traits.unwrap();
+        let tp = cfg.tasks["chat_output_filter"]
+            .trigger
+            .clone()
+            .unwrap()
+            .traits
+            .unwrap();
         assert_eq!(tp.when, TraitWhen::Present);
     }
 
     #[test]
     fn should_filter_predicate_combinations() {
         use super::*;
-        let none = OutputFilterTrigger { random: None, models: None, traits: None };
+        let none = OutputFilterTrigger {
+            random: None,
+            models: None,
+            traits: None,
+        };
         // empty trigger ⇒ always filter
         assert!(none.should_filter("any/model", &[], true));
         assert!(none.should_filter("any/model", &[], false));
 
         // random only
-        let r = OutputFilterTrigger { random: Some(0.5), models: None, traits: None };
+        let r = OutputFilterTrigger {
+            random: Some(0.5),
+            models: None,
+            traits: None,
+        };
         assert!(r.should_filter("m", &[], true));
         assert!(!r.should_filter("m", &[], false));
 
         // models only
-        let m = OutputFilterTrigger { random: None, models: Some(vec!["x/y".into()]), traits: None };
+        let m = OutputFilterTrigger {
+            random: None,
+            models: Some(vec!["x/y".into()]),
+            traits: None,
+        };
         assert!(m.should_filter("x/y", &[], true));
         assert!(!m.should_filter("a/b", &[], true));
 
         // traits present / absent
         let tp = OutputFilterTrigger {
-            random: None, models: None,
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+            random: None,
+            models: None,
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            }),
         };
         assert!(tp.should_filter("m", &["nsfw"], true));
         assert!(!tp.should_filter("m", &["sfw"], true));
         let ta = OutputFilterTrigger {
-            random: None, models: None,
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Absent }),
+            random: None,
+            models: None,
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Absent,
+            }),
         };
         assert!(ta.should_filter("m", &["sfw"], true));
         assert!(!ta.should_filter("m", &["nsfw"], true));
 
         // AND of all three
         let all = OutputFilterTrigger {
-            random: Some(0.9), models: Some(vec!["x/y".into()]),
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+            random: Some(0.9),
+            models: Some(vec!["x/y".into()]),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            }),
         };
         assert!(all.should_filter("x/y", &["nsfw"], true));
         assert!(!all.should_filter("x/y", &["nsfw"], false)); // random fails
-        assert!(!all.should_filter("a/b", &["nsfw"], true));  // model fails
+        assert!(!all.should_filter("a/b", &["nsfw"], true)); // model fails
 
         // turn_level_pass ignores models
         assert!(all.turn_level_pass(true, &["nsfw"]));
@@ -1512,9 +1548,9 @@ trigger = { traits = { any = ["a"] } }
     fn resolve_output_filter_gating() {
         use super::*;
         // #6: enabled but no [tasks.chat_output_filter] ⇒ None
-        let t = ModelConfig::from_toml_str(
-            "[tasks.chat_companion]\nmodel=\"m\"\noutput_filter=true\n",
-        ).unwrap();
+        let t =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\noutput_filter=true\n")
+                .unwrap();
         assert!(t.output_filter_enabled("chat_companion", None));
         assert!(t.resolve_output_filter(None).is_none());
 
@@ -1524,7 +1560,8 @@ trigger = { traits = { any = ["a"] } }
         assert!(off.resolve_output_filter(None).is_none());
 
         // enabled + table + prompt ⇒ Some, resolves fields
-        let on = ModelConfig::from_toml_str(r#"
+        let on = ModelConfig::from_toml_str(
+            r#"
 [tasks.chat_companion]
 model = "m"
 output_filter = true
@@ -1535,7 +1572,9 @@ filter_prompt = "P"
 temperature = 0.4
 max_tokens = 222
 timing = "before_extract"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let r = on.resolve_output_filter(None).expect("some");
         assert_eq!(r.model, "fast/m");
         assert_eq!(r.filter_prompt, "P");
@@ -1546,7 +1585,8 @@ timing = "before_extract"
         assert_eq!(r.fallback_model, vec!["a".to_string()]);
 
         // explicit retry_depth = 0 ⇒ no fallback (primary only)
-        let d0 = ModelConfig::from_toml_str(r#"
+        let d0 = ModelConfig::from_toml_str(
+            r#"
 [tasks.chat_companion]
 model = "m"
 output_filter = true
@@ -1555,23 +1595,31 @@ model = "fast/m"
 fallback = ["a", "b"]
 filter_prompt = "P"
 retry_depth = 0
-"#).unwrap().resolve_output_filter(None).expect("some");
+"#,
+        )
+        .unwrap()
+        .resolve_output_filter(None)
+        .expect("some");
         assert_eq!(d0.retry_depth, 0);
         assert!(d0.fallback_model.is_empty());
 
         // blank filter_prompt ⇒ None even though enabled + table present
-        let blank = ModelConfig::from_toml_str(r#"
+        let blank = ModelConfig::from_toml_str(
+            r#"
 [tasks.chat_companion]
 model = "m"
 output_filter = true
 [tasks.chat_output_filter]
 model = "fast/m"
 filter_prompt = "   "
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert!(blank.resolve_output_filter(None).is_none());
 
         // tier output_filter overrides task default (#3); tier filter_prompt falls back to default (#5)
-        let tiered = ModelConfig::from_toml_str(r#"
+        let tiered = ModelConfig::from_toml_str(
+            r#"
 [tasks.chat_companion]
 model = "m"
 output_filter = false
@@ -1582,12 +1630,14 @@ model = "fast/m"
 filter_prompt = "DEFAULT"
 [tasks.chat_output_filter.tiers.gold]
 model = "gold/m"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert!(!tiered.output_filter_enabled("chat_companion", Some("free")));
         assert!(tiered.output_filter_enabled("chat_companion", Some("gold")));
         let rg = tiered.resolve_output_filter(Some("gold")).expect("some");
-        assert_eq!(rg.model, "gold/m");           // tier model
-        assert_eq!(rg.filter_prompt, "DEFAULT");  // fell back to default block (#5)
+        assert_eq!(rg.model, "gold/m"); // tier model
+        assert_eq!(rg.filter_prompt, "DEFAULT"); // fell back to default block (#5)
         assert_eq!(rg.timing, FilterTiming::AfterExtract); // default timing
     }
 }

@@ -570,12 +570,7 @@ pub(super) async fn build_gift_request(
     );
 
     Ok((
-        assemble_chat_request(
-            resolved,
-            system_prompt,
-            history,
-            None,
-        ),
+        assemble_chat_request(resolved, system_prompt, history, None),
         Vec::new(),
     ))
 }
