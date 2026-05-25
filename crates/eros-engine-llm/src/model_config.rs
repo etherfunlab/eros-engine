@@ -373,6 +373,23 @@ pub struct ResolvedModel {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Resolved output-filter parameters for a chat request.
+///
+/// `fallback_model` is already truncated to `retry_depth` entries —
+/// the runtime tries the primary, then each entry in order, and stops after
+/// `retry_depth` total attempts beyond the primary.
+#[derive(Debug, Clone)]
+pub struct ResolvedOutputFilter {
+    pub model: String,
+    pub fallback_model: Vec<String>,   // already truncated to retry_depth
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub filter_prompt: String,
+    pub trigger: OutputFilterTrigger,
+    pub timing: FilterTiming,
+    pub retry_depth: u32,
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
@@ -485,6 +502,68 @@ impl ModelConfig {
         self.tasks
             .get(task)
             .and_then(|t| t.model_name_display_override.clone())
+    }
+
+    /// Resolve `output_filter` for `task`: tier override → task default → false.
+    pub fn output_filter_enabled(&self, task: &str, tier: Option<&str>) -> bool {
+        let task_cfg = self.tasks.get(task);
+        let tier_cfg = match (task_cfg, tier) {
+            (Some(t), Some(name)) => t.tiers.get(name),
+            _ => None,
+        };
+        tier_cfg
+            .and_then(|t| t.output_filter)
+            .or_else(|| task_cfg.and_then(|t| t.output_filter))
+            .unwrap_or(false)
+    }
+
+    /// Resolve the output filter for a chat request. `None` (filter disabled) when:
+    /// chat_companion `output_filter` is false (tier→task→false), OR the
+    /// `chat_output_filter` task is absent, OR its resolved `filter_prompt` is blank.
+    pub fn resolve_output_filter(&self, tier: Option<&str>) -> Option<ResolvedOutputFilter> {
+        const FILTER_TASK: &str = "chat_output_filter";
+        if !self.output_filter_enabled("chat_companion", tier) {
+            return None;
+        }
+        let task_cfg = self.tasks.get(FILTER_TASK)?; // #6: table absent ⇒ None
+        let tier_cfg = tier.and_then(|name| task_cfg.tiers.get(name));
+
+        // filter_prompt / trigger / timing: tier → default block.
+        let filter_prompt = tier_cfg
+            .and_then(|t| t.filter_prompt.clone())
+            .or_else(|| task_cfg.filter_prompt.clone())
+            .unwrap_or_default();
+        if filter_prompt.trim().is_empty() {
+            return None; // no usable instruction ⇒ inert
+        }
+        let trigger = tier_cfg
+            .and_then(|t| t.trigger.clone())
+            .or_else(|| task_cfg.trigger.clone())
+            .unwrap_or(OutputFilterTrigger { random: None, models: None, traits: None });
+        let timing = tier_cfg
+            .and_then(|t| t.timing)
+            .or(task_cfg.timing)
+            .unwrap_or_default();
+        let retry_depth = tier_cfg
+            .and_then(|t| t.retry_depth)
+            .or(task_cfg.retry_depth)
+            .unwrap_or(1); // default 1: primary + first fallback only
+
+        // model / fallback / temperature / max_tokens via the existing resolver
+        // (tier → default block → [defaults] → compiled-in).
+        let m = self.resolve(FILTER_TASK, tier);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize); // cap to retry_depth entries
+        Some(ResolvedOutputFilter {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            filter_prompt,
+            trigger,
+            timing,
+            retry_depth,
+        })
     }
 }
 
@@ -1427,5 +1506,88 @@ trigger = { traits = { any = ["a"] } }
         assert!(all.turn_level_pass(true, &["nsfw"]));
         assert!(!all.turn_level_pass(false, &["nsfw"]));
         assert!(!all.turn_level_pass(true, &["sfw"]));
+    }
+
+    #[test]
+    fn resolve_output_filter_gating() {
+        use super::*;
+        // #6: enabled but no [tasks.chat_output_filter] ⇒ None
+        let t = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"m\"\noutput_filter=true\n",
+        ).unwrap();
+        assert!(t.output_filter_enabled("chat_companion", None));
+        assert!(t.resolve_output_filter(None).is_none());
+
+        // off by default (#7)
+        let off = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\n").unwrap();
+        assert!(!off.output_filter_enabled("chat_companion", None));
+        assert!(off.resolve_output_filter(None).is_none());
+
+        // enabled + table + prompt ⇒ Some, resolves fields
+        let on = ModelConfig::from_toml_str(r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = true
+[tasks.chat_output_filter]
+model = "fast/m"
+fallback = ["a", "b", "c"]
+filter_prompt = "P"
+temperature = 0.4
+max_tokens = 222
+timing = "before_extract"
+"#).unwrap();
+        let r = on.resolve_output_filter(None).expect("some");
+        assert_eq!(r.model, "fast/m");
+        assert_eq!(r.filter_prompt, "P");
+        assert_eq!(r.max_tokens, 222);
+        assert_eq!(r.timing, FilterTiming::BeforeExtract);
+        // retry_depth defaults to 1 ⇒ fallback truncated to the first entry
+        assert_eq!(r.retry_depth, 1);
+        assert_eq!(r.fallback_model, vec!["a".to_string()]);
+
+        // explicit retry_depth = 0 ⇒ no fallback (primary only)
+        let d0 = ModelConfig::from_toml_str(r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = true
+[tasks.chat_output_filter]
+model = "fast/m"
+fallback = ["a", "b"]
+filter_prompt = "P"
+retry_depth = 0
+"#).unwrap().resolve_output_filter(None).expect("some");
+        assert_eq!(d0.retry_depth, 0);
+        assert!(d0.fallback_model.is_empty());
+
+        // blank filter_prompt ⇒ None even though enabled + table present
+        let blank = ModelConfig::from_toml_str(r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = true
+[tasks.chat_output_filter]
+model = "fast/m"
+filter_prompt = "   "
+"#).unwrap();
+        assert!(blank.resolve_output_filter(None).is_none());
+
+        // tier output_filter overrides task default (#3); tier filter_prompt falls back to default (#5)
+        let tiered = ModelConfig::from_toml_str(r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = false
+[tasks.chat_companion.tiers.gold]
+output_filter = true
+[tasks.chat_output_filter]
+model = "fast/m"
+filter_prompt = "DEFAULT"
+[tasks.chat_output_filter.tiers.gold]
+model = "gold/m"
+"#).unwrap();
+        assert!(!tiered.output_filter_enabled("chat_companion", Some("free")));
+        assert!(tiered.output_filter_enabled("chat_companion", Some("gold")));
+        let rg = tiered.resolve_output_filter(Some("gold")).expect("some");
+        assert_eq!(rg.model, "gold/m");           // tier model
+        assert_eq!(rg.filter_prompt, "DEFAULT");  // fell back to default block (#5)
+        assert_eq!(rg.timing, FilterTiming::AfterExtract); // default timing
     }
 }
