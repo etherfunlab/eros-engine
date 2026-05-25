@@ -110,6 +110,11 @@ Every frame's JSON has a required `"type"` discriminator.
 }
 ```
 
+> **Update (2026-05-25):** `meta.model` is now optional — omitted when
+> `tasks.chat_companion.model_name_display_override` resolves to "hide"
+> (`false`/absent, or a map miss with no `default`). See
+> `2026-05-25-model-name-display-override-design.md`.
+
 #### `delta` — token chunk
 
 ```jsonc

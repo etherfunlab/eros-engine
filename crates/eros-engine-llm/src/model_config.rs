@@ -1208,4 +1208,22 @@ model = "m"
         assert_eq!(cfg.display_override("other"), None);
         assert_eq!(cfg.display_override("nonexistent"), None);
     }
+
+    #[test]
+    fn committed_example_chat_companion_shows_real_model() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("example must parse");
+        // The shipped example opts into showing the real id (today's behavior).
+        assert_eq!(
+            cfg.display_override("chat_companion"),
+            Some(DisplayOverride::Bool(true))
+        );
+        assert_eq!(
+            cfg.display_override("chat_companion")
+                .and_then(|d| d.display("deepseek/deepseek-v4-flash")),
+            Some("deepseek/deepseek-v4-flash".to_string())
+        );
+        // A task without the field stays None (omit).
+        assert_eq!(cfg.display_override("insight_extraction"), None);
+    }
 }

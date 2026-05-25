@@ -51,6 +51,24 @@ Field details:
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 | `tasks.<name>.dimensions` | `u32` | no | Embedding-only. Ignored by chat / insight tasks. |
 
+### `model_name_display_override` (chat task only)
+
+Controls the `model` value sent to clients in chat SSE `meta` frames. Affects
+**only** the client display — never the OpenRouter request, the persisted
+assistant row, or usage logging. Task-level on `[tasks.chat_companion]`; every
+tier inherits it. Setting it on other tasks parses but has no effect.
+
+| Form | Example | Behavior |
+|---|---|---|
+| `false` *(default when absent)* | `false` | `model` is **omitted** from the frame |
+| `true` | `true` | the real model id is sent (pre-0.x behavior) |
+| string | `"Aria"` | always sends `"Aria"` |
+| array | `["Aria","Nova"]` | random pick per bubble (re-randomizes on replay) |
+| map | `{ "deepseek/x" = "Aria", default = "Companion" }` | maps the real id to a name; `default` when unlisted; omit if no `default` |
+
+Because the display name is never persisted, the **array** form re-randomizes on
+history replay; `bool`/`string`/`map` are deterministic.
+
 ## Task names
 
 | Name | Consumed by | Status |
@@ -140,6 +158,10 @@ What may still change without notice:
 ### Changelog note
 
 - **`persona_override` (`art_metadata.model`) is no longer read by the engine as of this version.** Use `[tasks.<name>.tiers.<tier>]` for per-tier model selection instead. The `model` field may still exist in a persona's JSONB `art_metadata` but is silently ignored.
+- `model_name_display_override` (optional, `[tasks.chat_companion]`): added in
+  0.x. When unset the chat `meta.model` field is **omitted** — a change from the
+  earlier "always present" behavior. The shipped example sets `= true` to keep
+  showing the real id.
 
 ## What this config does NOT control
 
