@@ -63,6 +63,11 @@ pub enum Event {
         /// Defaults to `bond` when absent.
         #[serde(default)]
         affinity_scope: AffinityScope,
+        /// Optional caller-supplied tip amount in USD. When `Some`, this turn
+        /// is a tip: the PDE forces a reply (never ghost) and the reply prompt
+        /// gets a tip fragment. `None` for normal messages.
+        #[serde(default)]
+        tips_amount_usd: Option<f64>,
     },
     Gift {
         gift_id: Uuid,

@@ -32,6 +32,23 @@ const GHOST_DELTA_TENSION: f64 = 0.05;
 ///
 /// Phase 2: rules only. Phase 6 adds the LLM fallback path.
 pub fn decide(input: &DecisionInput) -> ActionPlan {
+    // 0. Tip on a user message — always reply, never ghost. Tone is driven by
+    //    tip_personality (injected into the prompt downstream); the ReplyStyle
+    //    here is only a baseline / fallback. Affinity deltas stay normal.
+    if let Event::UserMessage { tips_amount_usd: Some(_), .. } = &input.event {
+        let reply_style = match input.persona.genome.tip_personality.as_deref() {
+            Some(_) => ReplyStyle::Neutral,
+            None => ReplyStyle::Tsundere,
+        };
+        return ActionPlan {
+            action_type: ActionType::Reply,
+            reply_style,
+            affinity_deltas: predict_reply_deltas(input),
+            energy_cost: ENERGY_COST_REPLY,
+            context_hints: vec![],
+        };
+    }
+
     // 1. Gift event — deterministic
     if matches!(input.event, Event::Gift { .. }) {
         return ActionPlan {
@@ -211,6 +228,20 @@ mod tests {
             tier: None,
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
+            tips_amount_usd: None,
+        }
+    }
+
+    fn tip_msg(amount: f64) -> Event {
+        Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: Some(amount),
         }
     }
 
@@ -234,6 +265,49 @@ mod tests {
         let plan = decide(&input);
         assert_eq!(plan.action_type, ActionType::GiftReaction);
         assert_eq!(plan.reply_style, ReplyStyle::Excited);
+    }
+
+    #[test]
+    fn test_tip_forces_reply_even_when_ghost_signals_present() {
+        // Same affinity that drives test_ghost_threshold_triggers_ghost_action.
+        let mut affinity = base_affinity();
+        affinity.intrigue = 0.05;
+        affinity.patience = 0.05;
+        affinity.tension = 0.5;
+        let input = DecisionInput {
+            event: tip_msg(20.0),
+            affinity,
+            persona: persona_with_tip(None),
+            signals: base_signals(),
+        };
+        let plan = decide(&input);
+        assert_eq!(plan.action_type, ActionType::Reply, "a tip must never be ghosted");
+    }
+
+    #[test]
+    fn test_tip_reply_style_neutral_when_personality_present() {
+        let input = DecisionInput {
+            event: tip_msg(20.0),
+            affinity: base_affinity(),
+            persona: persona_with_tip(Some("傲娇")),
+            signals: base_signals(),
+        };
+        let plan = decide(&input);
+        assert_eq!(plan.action_type, ActionType::Reply);
+        assert_eq!(plan.reply_style, ReplyStyle::Neutral);
+    }
+
+    #[test]
+    fn test_tip_reply_style_tsundere_when_personality_absent() {
+        let input = DecisionInput {
+            event: tip_msg(20.0),
+            affinity: base_affinity(),
+            persona: persona_with_tip(None),
+            signals: base_signals(),
+        };
+        let plan = decide(&input);
+        assert_eq!(plan.action_type, ActionType::Reply);
+        assert_eq!(plan.reply_style, ReplyStyle::Tsundere);
     }
 
     #[test]

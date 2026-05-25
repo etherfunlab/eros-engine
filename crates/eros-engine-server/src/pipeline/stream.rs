@@ -542,6 +542,7 @@ pub fn run_stream(
                 tier: user_msg.tier.clone(),
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
+                tips_amount_usd: None,
             },
             affinity: affinity.clone(),
             persona,
@@ -693,6 +694,7 @@ pub fn run_stream(
                     tier: user_msg.tier.clone(),
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
+                    tips_amount_usd: None,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
