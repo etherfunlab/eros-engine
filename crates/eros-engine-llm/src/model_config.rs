@@ -195,6 +195,38 @@ pub struct OutputFilterTrigger {
     pub traits: Option<TraitPredicate>,
 }
 
+impl OutputFilterTrigger {
+    /// Turn-constant predicates (random + traits). When either is specified and
+    /// fails, no attempt can be filtered this turn.
+    pub fn turn_level_pass(&self, random_pass: bool, trait_tags: &[&str]) -> bool {
+        self.random.is_none_or(|_| random_pass) && self.traits_pass(trait_tags)
+    }
+
+    /// Full per-attempt decision: turn-level predicates AND the model predicate.
+    pub fn should_filter(&self, model_id: &str, trait_tags: &[&str], random_pass: bool) -> bool {
+        self.turn_level_pass(random_pass, trait_tags) && self.models_pass(model_id)
+    }
+
+    fn models_pass(&self, model_id: &str) -> bool {
+        self.models
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|m| m == model_id))
+    }
+
+    fn traits_pass(&self, tags: &[&str]) -> bool {
+        match &self.traits {
+            None => true,
+            Some(tp) => {
+                let any_present = tp.any.iter().any(|a| tags.iter().any(|t| t == a));
+                match tp.when {
+                    TraitWhen::Present => any_present,
+                    TraitWhen::Absent => !any_present,
+                }
+            }
+        }
+    }
+}
+
 /// Trait-match predicate: the predicate passes when at least one tag in `any`
 /// is present among the turn's prompt traits (`when = present`) or absent
 /// (`when = absent`).
@@ -1348,5 +1380,52 @@ trigger = { traits = { any = ["a"] } }
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let tp = cfg.tasks["chat_output_filter"].trigger.clone().unwrap().traits.unwrap();
         assert_eq!(tp.when, TraitWhen::Present);
+    }
+
+    #[test]
+    fn should_filter_predicate_combinations() {
+        use super::*;
+        let none = OutputFilterTrigger { random: None, models: None, traits: None };
+        // empty trigger ⇒ always filter
+        assert!(none.should_filter("any/model", &[], true));
+        assert!(none.should_filter("any/model", &[], false));
+
+        // random only
+        let r = OutputFilterTrigger { random: Some(0.5), models: None, traits: None };
+        assert!(r.should_filter("m", &[], true));
+        assert!(!r.should_filter("m", &[], false));
+
+        // models only
+        let m = OutputFilterTrigger { random: None, models: Some(vec!["x/y".into()]), traits: None };
+        assert!(m.should_filter("x/y", &[], true));
+        assert!(!m.should_filter("a/b", &[], true));
+
+        // traits present / absent
+        let tp = OutputFilterTrigger {
+            random: None, models: None,
+            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+        };
+        assert!(tp.should_filter("m", &["nsfw"], true));
+        assert!(!tp.should_filter("m", &["sfw"], true));
+        let ta = OutputFilterTrigger {
+            random: None, models: None,
+            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Absent }),
+        };
+        assert!(ta.should_filter("m", &["sfw"], true));
+        assert!(!ta.should_filter("m", &["nsfw"], true));
+
+        // AND of all three
+        let all = OutputFilterTrigger {
+            random: Some(0.9), models: Some(vec!["x/y".into()]),
+            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+        };
+        assert!(all.should_filter("x/y", &["nsfw"], true));
+        assert!(!all.should_filter("x/y", &["nsfw"], false)); // random fails
+        assert!(!all.should_filter("a/b", &["nsfw"], true));  // model fails
+
+        // turn_level_pass ignores models
+        assert!(all.turn_level_pass(true, &["nsfw"]));
+        assert!(!all.turn_level_pass(false, &["nsfw"]));
+        assert!(!all.turn_level_pass(true, &["sfw"]));
     }
 }
