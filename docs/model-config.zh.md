@@ -6,7 +6,7 @@
 
 ## 文件位置
 
-- 默认路径: `examples/model_config.toml`(相对于工作目录)。已提交的文件是脱敏模板；实际部署时复制一份（或用 `MODEL_CONFIG_PATH` 指向自己的文件）。
+- 默认路径: `examples/model_config.toml`(相对于工作目录)。examples 内的是示意模版，请依自身业务需求修改（或用 `MODEL_CONFIG_PATH` 指向自己的文件）。
 - 覆盖: `MODEL_CONFIG_PATH` 环境变量
 - 服务启动时由 `eros-engine-server/src/main.rs` 一次性载入(直接读 `MODEL_CONFIG_PATH` + `ModelConfig::from_toml_str`)。`crates/eros-engine-llm/src/model_config.rs` 里的 `ModelConfig::load()` 是给 library embedder 用的便利方法,默认路径同为 `examples/model_config.toml`
 - 以 `Arc<ModelConfig>` 形式挂在 `AppState` 上,所有 chat / post-process 轮共享
