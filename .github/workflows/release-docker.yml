@@ -26,8 +26,15 @@ jobs:
           else
             ref="${{ github.ref_name }}"
           fi
+          version="${ref#v}"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Dev cuts (e.g. v0.4.21-dev) move :latest-dev and never touch :latest;
+          # stable cuts move :latest.
+          case "$version" in
+            *-dev*) echo "moving=latest-dev" >> "$GITHUB_OUTPUT" ;;
+            *)      echo "moving=latest" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - uses: actions/checkout@v4
         with:
@@ -51,7 +58,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/etherfunlab/eros-engine:${{ steps.ref.outputs.version }}
-            ghcr.io/etherfunlab/eros-engine:latest
+            ghcr.io/etherfunlab/eros-engine:${{ steps.ref.outputs.moving }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
