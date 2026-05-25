@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.21-dev"
+version = "0.4.21"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/etherfunlab/eros-engine"
