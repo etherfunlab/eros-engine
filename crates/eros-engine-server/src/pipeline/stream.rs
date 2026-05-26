@@ -134,8 +134,10 @@ fn drive_chat_burst(
     req: eros_engine_llm::openrouter::ChatRequest,
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
-    trait_tags: Vec<String>,  // requested prompt-trait tags (the turn's)
-    tier: Option<String>,     // user's tier at message time; None omitted from metadata
+    trait_tags: Vec<String>, // requested prompt-trait tags (the turn's)
+    tier: Option<String>,    // user's tier at message time; None omitted from metadata
+    memory_scope: eros_engine_core::scope::MemoryScope, // post-resolve scope for assistant metadata
+    affinity_scope: eros_engine_core::scope::AffinityScope, // post-resolve scope for assistant metadata
     random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
@@ -163,13 +165,25 @@ fn drive_chat_burst(
             .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
 
-        // Build the assistant row metadata bag: always includes prompt_traits;
-        // includes tier only when the request carried one (omit key entirely
-        // when None). When the filter chain failed entirely (fail-open), also
-        // writes the per-attempt audit log so ops can identify these rows.
+        // Build the assistant row metadata bag: always includes prompt_traits +
+        // resolved memory_scope / affinity_scope (the POST-resolve values
+        // actually used to serve this turn — pair with the user row's
+        // memory_scope_raw / affinity_scope_raw to surface allow-list / shape
+        // mismatches with a single metadata->>'...' diff); includes tier only
+        // when the request carried one (omit key entirely when None). When the
+        // filter chain failed entirely (fail-open), also writes the per-attempt
+        // audit log so ops can identify these rows.
         let build_metadata = |filter_failure: Option<&FilterFailOpen>| -> Option<serde_json::Value> {
             let mut m = serde_json::Map::new();
             m.insert("prompt_traits".into(), serde_json::json!(&trait_tags));
+            m.insert(
+                "memory_scope".into(),
+                serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+            );
+            m.insert(
+                "affinity_scope".into(),
+                serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+            );
             if let Some(t) = tier.as_deref() {
                 m.insert("tier".into(), serde_json::json!(t));
             }
@@ -294,6 +308,8 @@ fn drive_chat_burst(
                         plan_action,
                         &trait_tags,
                         &tier,
+                        memory_scope,
+                        affinity_scope,
                         fallback_retries,
                         // Live mode persisted the final truncated bubble; link
                         // the pseudo-ghost to it so clients + replay can stitch
@@ -383,6 +399,8 @@ fn drive_chat_burst(
                         plan_action,
                         &trait_tags,
                         &tier,
+                        memory_scope,
+                        affinity_scope,
                         fallback_retries,
                         // Filtered mode never persists intermediate truncated
                         // attempts, so there is no prior bubble to continue from.
@@ -776,6 +794,8 @@ async fn build_stream_failure_pseudo_ghost(
     plan_action: ActionType,
     trait_tags: &[String],
     tier: &Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
     fallback_retries: u32,
     continues_from_ulid: Option<Ulid>,
 ) -> Option<(
@@ -798,13 +818,24 @@ async fn build_stream_failure_pseudo_ghost(
     let msg_ulid = Ulid::new();
     let msg_uuid: Uuid = msg_ulid.into();
 
-    // Build metadata bag: fallback_reason + prompt_traits + optional tier.
+    // Build metadata bag: fallback_reason + prompt_traits + resolved
+    // memory_scope / affinity_scope (mirrors build_metadata's contract so the
+    // pseudo-ghost row carries the same post-resolve scope snapshot as a
+    // normal assistant row) + optional tier.
     let mut meta_map = serde_json::Map::new();
     meta_map.insert(
         "fallback_reason".into(),
         serde_json::json!("stream_failure"),
     );
     meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert(
+        "memory_scope".into(),
+        serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+    );
+    meta_map.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+    );
     meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
     if let Some(t) = tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
@@ -1042,6 +1073,8 @@ pub fn run_stream(
                     filter,
                     trait_tags,
                     user_msg.tier.clone(),
+                    user_msg.memory_scope,
+                    user_msg.affinity_scope,
                     random_draw,
                     outcome.clone(),
                 );
@@ -2856,6 +2889,255 @@ data: [DONE]\n\n";
                 .count();
             assert_eq!(meta_count, 1, "exactly one Meta frame");
             assert_eq!(done_count, 1, "exactly one Done frame");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn assistant_row_writes_memory_and_affinity_scope_keys(pool: PgPool) {
+        // Success-path sanity: the assistant row's metadata must carry the
+        // POST-resolve memory_scope (snake_case enum string) + affinity_scope
+        // (6-bool record) on every turn — paired with the user row's
+        // *_raw counterparts so ops can diff for shape mismatches.
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JSCOPEKEYS1111111111111A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Only assert when PDE chose Reply (not Ghost) — same gate as siblings.
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                metadata["memory_scope"],
+                serde_json::json!("neutral_and_relationship"),
+                "default MemoryScope should serialize as snake_case, got {metadata}",
+            );
+            assert!(
+                metadata["affinity_scope"].is_object(),
+                "AffinityScope serializes as a 6-boolean record, got {metadata}",
+            );
+            // Default AffinityScope is `bond` = {warmth, intimacy, tension}=true;
+            // trust, intrigue, patience=false.
+            assert_eq!(
+                metadata["affinity_scope"]["warmth"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["intimacy"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["tension"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["trust"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["intrigue"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["patience"],
+                serde_json::json!(false)
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pseudo_ghost_assistant_row_carries_scope_metadata(pool: PgPool) {
+        // Chain-exhaustion path: primary returns an empty SSE stream ⇒
+        // `acc.is_empty()` flips `truncated = true`. With no fallback model
+        // configured the chain = [primary], so `idx + 1 == chain.len()` ⇒
+        // build_stream_failure_pseudo_ghost fires. The pseudo-ghost row's
+        // metadata must carry memory_scope + affinity_scope alongside the
+        // existing fallback_reason = "stream_failure" audit signal.
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Empty SSE stream ⇒ acc stays empty ⇒ truncated path.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Default ModelConfig has empty fallback_model ⇒ chain = [primary],
+        // so a single truncated attempt exhausts the chain. The compiled-in
+        // FALLBACK_MODEL is used as primary; it's only ever passed through
+        // to the mocked openrouter, never actually served.
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JPSEUDOGHOSTSCOPE1111111",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Only assert when PDE chose Reply (not Ghost). Inside that gate the
+        // pseudo-ghost must have run (chain = [primary], primary truncated).
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            // The pseudo-ghost row is the LATEST assistant row (and the only
+            // one in live mode where the truncated attempt also persists a
+            // bubble — we want the most recent, which is the pseudo-ghost).
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' \
+                   AND metadata->>'fallback_reason' = 'stream_failure' \
+                 ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                metadata["fallback_reason"],
+                serde_json::json!("stream_failure"),
+                "this test must exercise the pseudo-ghost path, got {metadata}",
+            );
+            assert!(
+                metadata.get("memory_scope").is_some(),
+                "pseudo-ghost row must carry memory_scope, got {metadata}",
+            );
+            assert!(
+                metadata.get("affinity_scope").is_some(),
+                "pseudo-ghost row must carry affinity_scope, got {metadata}",
+            );
+            assert_eq!(
+                metadata["memory_scope"],
+                serde_json::json!("neutral_and_relationship"),
+                "default MemoryScope should serialize as snake_case, got {metadata}",
+            );
+            // Spot-check the affinity_scope shape (full 6-bool assertions are
+            // already covered in the success-path test above).
+            assert!(
+                metadata["affinity_scope"].is_object(),
+                "AffinityScope serializes as a 6-boolean record, got {metadata}",
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["warmth"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["trust"],
+                serde_json::json!(false)
+            );
         }
     }
 }
