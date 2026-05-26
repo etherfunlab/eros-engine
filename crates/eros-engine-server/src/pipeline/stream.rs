@@ -519,6 +519,11 @@ struct RunFilterOutcome {
 /// Refusal phrases checked in the leading [`REFUSAL_HEAD_SCAN_CHARS`] chars
 /// of the filter output.  When any prefix matches, the call is treated as a
 /// model refusal regardless of HTTP status.
+///
+/// **Matching is ASCII-case-insensitive** — the input head is lowercased before
+/// `contains` runs, so models that emit `"as an ai ..."` or `"I'M SORRY"` are
+/// caught.  All English patterns are stored lowercase; Chinese patterns are
+/// unaffected by lowercasing (CJK code points have no case).
 const REFUSAL_PATTERNS_HEAD: &[&str] = &[
     // Chinese refusals — observed in production from gpt-4.1-nano
     "抱歉，我无法",
@@ -529,27 +534,30 @@ const REFUSAL_PATTERNS_HEAD: &[&str] = &[
     "对不起，无法",
     "很抱歉，我无法",
     "很抱歉，我不能",
-    // English refusals — standard OpenAI/Anthropic apology shapes
-    "I'm sorry, but I can't",
-    "I'm sorry, but I cannot",
-    "I cannot rewrite",
-    "I can't rewrite",
-    "I cannot help",
-    "I can't help",
-    "I won't be able to",
-    "I'm not able to",
-    "I am not able to",
-    "As an AI",
-    "I apologize, but",
-    "Sorry, I can't",
-    "Sorry, I cannot",
-    "Unfortunately, I can't",
-    "Unfortunately, I cannot",
+    // English refusals — standard OpenAI/Anthropic apology shapes (lowercase)
+    "i'm sorry, but i can't",
+    "i'm sorry, but i cannot",
+    "i cannot rewrite",
+    "i can't rewrite",
+    "i cannot help",
+    "i can't help",
+    "i won't be able to",
+    "i'm not able to",
+    "i am not able to",
+    "as an ai",
+    "i apologize, but",
+    "sorry, i can't",
+    "sorry, i cannot",
+    "unfortunately, i can't",
+    "unfortunately, i cannot",
 ];
 
 /// Refusal verbs used in the short-response branch: if the total response is
 /// shorter than [`MIN_FILTERED_OUTPUT_CHARS`] and contains any of these
 /// anywhere in the text, it is treated as a refusal rather than just too-short.
+///
+/// English entries are stored lowercase; the input is lowercased before
+/// matching (see [`filter_output_invalidity`]).
 const REFUSAL_SHORT_VERBS: &[&str] = &[
     "无法", "不能", "拒绝", "won't", "cannot", "can't", "unable", "refuse",
 ];
@@ -580,15 +588,24 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
         return Some("content_filter");
     }
     let total_chars = text.chars().count();
-    let head: String = text.chars().take(REFUSAL_HEAD_SCAN_CHARS).collect();
+    // ASCII-case-insensitive matching: lowercase the head (and the short-text
+    // body below) once so models that emit `"as an ai ..."` or `"I'M SORRY"`
+    // are caught.  `to_lowercase` is Unicode-aware; CJK code points are
+    // unchanged, so the Chinese patterns still match exactly.
+    let head_lower: String = text
+        .chars()
+        .take(REFUSAL_HEAD_SCAN_CHARS)
+        .flat_map(char::to_lowercase)
+        .collect();
     for pat in REFUSAL_PATTERNS_HEAD {
-        if head.contains(pat) {
+        if head_lower.contains(pat) {
             return Some("refusal_pattern");
         }
     }
     if total_chars < MIN_FILTERED_OUTPUT_CHARS {
+        let text_lower = text.to_lowercase();
         for verb in REFUSAL_SHORT_VERBS {
-            if text.contains(verb) {
+            if text_lower.contains(verb) {
                 return Some("refusal_pattern");
             }
         }
@@ -1872,6 +1889,31 @@ data: [DONE]\n\n";
             filter_output_invalidity(text, Some("stop")),
             None,
             "long clean rewrite with stop finish_reason must pass the gate"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_lowercase_english_refusal() {
+        // Codex regression guard: a model that emits the apology shape with
+        // lowercase `i` / `ai` (or all-caps `I'M SORRY`) must still be caught,
+        // because the gate runs case-insensitively after lowercasing the head.
+        let lower = "i'm sorry, but i can't help with rewriting that content. it's outside what i can produce safely.";
+        assert_eq!(
+            filter_output_invalidity(lower, None),
+            Some("refusal_pattern"),
+            "lowercase apology must hit the head pattern via case-insensitive match"
+        );
+        let mixed = "As an ai language model, I am not able to rewrite the text in the way you have requested.";
+        assert_eq!(
+            filter_output_invalidity(mixed, None),
+            Some("refusal_pattern"),
+            "mixed-case 'As an ai' must still match the lowercase pattern"
+        );
+        let upper = "I'M SORRY, BUT I CAN'T REWRITE THIS PASSAGE IN THE FORM YOU'VE REQUESTED — IT VIOLATES POLICY.";
+        assert_eq!(
+            filter_output_invalidity(upper, None),
+            Some("refusal_pattern"),
+            "uppercase apology must match via lowercased head"
         );
     }
 
