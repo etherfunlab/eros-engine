@@ -260,6 +260,69 @@ impl<'a> ChatRepo<'a> {
         .fetch_all(self.pool)
         .await
     }
+
+    /// Returns up to `limit` (user_or_gift_user_content, assistant_content)
+    /// pairs from this session whose rows have `truncated = false`, ordered
+    /// chronologically. Pairs are formed by walking the most-recent rows
+    /// chronologically: a `user` or `gift_user` row immediately followed by an
+    /// `assistant` row produces one pair; orphan rows are dropped.
+    ///
+    /// Used by the chat pipeline to inject the `[recent_conversation]` short-
+    /// term memory block into the system prompt. Uses the existing
+    /// `idx_chat_messages_session(session_id, sent_at DESC)` index — no
+    /// migration needed.
+    pub async fn recent_turn_pairs(
+        &self,
+        session_id: Uuid,
+        cutoff: DateTime<Utc>,
+        limit: u8,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        // Pull enough rows for `limit` complete pairs. 2× is the minimum; we
+        // fetch a small extra to absorb any role-interleaving slop without a
+        // round trip. limit <= 10 in practice (a single turn's short-term
+        // memory budget), so this stays cheap.
+        let fetch_n: i64 = (limit as i64) * 2 + 2;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 \
+               AND sent_at < $2 \
+               AND truncated = FALSE \
+               AND role IN ('user', 'gift_user', 'assistant') \
+             ORDER BY sent_at DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(cutoff)
+        .bind(fetch_n)
+        .fetch_all(self.pool)
+        .await?;
+
+        // Reverse to chronological order, then pair (user|gift_user) → assistant.
+        let mut chrono = rows;
+        chrono.reverse();
+
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < chrono.len() {
+            let (role_a, content_a) = &chrono[i];
+            let (role_b, content_b) = &chrono[i + 1];
+            if (role_a == "user" || role_a == "gift_user") && role_b == "assistant" {
+                pairs.push((content_a.clone(), content_b.clone()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Keep only the last `limit` pairs.
+        let want = limit as usize;
+        if pairs.len() > want {
+            let drop = pairs.len() - want;
+            pairs.drain(..drop);
+        }
+        Ok(pairs)
+    }
 }
 
 /// Audit metadata for a filtered-success assistant row. Threaded through
@@ -1242,5 +1305,317 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(m, Some(metadata));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_empty_session_returns_empty(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_single_pair_returned(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000010001A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi back".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("test-model".into()),
+            usage: None,
+            generation_id: None,
+            filter_audit: None,
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert_eq!(pairs, vec![("hi".to_string(), "hi back".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_skips_truncated_assistant(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let u1 = match repo
+            .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000020001A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        repo.insert_assistant_batch(
+            s.id,
+            u1,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "a1".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: true,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let u2 = match repo
+            .upsert_user_message_idempotent(s.id, "u2", "01J0000000000000000020003A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        repo.insert_assistant_batch(
+            s.id,
+            u2,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "a2".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        // Truncated assistant excluded by WHERE; u1 then has no following assistant
+        // and is dropped as an orphan.
+        assert_eq!(pairs, vec![("u2".to_string(), "a2".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_returns_latest_three_when_more_exist(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        // Insert 5 complete pairs.
+        for n in 0..5u8 {
+            // ULIDs must be unique and monotonic. Use n in the suffix:
+            let u_ulid = format!("01J000000000000000003{n}001A");
+            let user_id = match repo
+                .upsert_user_message_idempotent(s.id, &format!("u{n}"), &u_ulid, "user", None)
+                .await
+                .unwrap()
+            {
+                UpsertUserOutcome::Inserted { message_id } => message_id,
+                other => panic!("expected Inserted, got {other:?}"),
+            };
+            repo.insert_assistant_batch(
+                s.id,
+                user_id,
+                &[AssistantInsert {
+                    id: Uuid::new_v4(),
+                    content: format!("a{n}"),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    model: Some("m".into()),
+                    usage: None,
+                    generation_id: None,
+                    filter_audit: None,
+                    metadata: None,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("u2".to_string(), "a2".to_string()),
+                ("u3".to_string(), "a3".to_string()),
+                ("u4".to_string(), "a4".to_string()),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_cutoff_excludes_current_turn(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let u1 = match repo
+            .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000040001A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        repo.insert_assistant_batch(
+            s.id,
+            u1,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "a1".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Second user row inserted AFTER the cutoff timestamp we'll use.
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "current",
+                "01J0000000000000000040003A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_drops_orphan_user_at_end(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let u1 = match repo
+            .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000050001A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        repo.insert_assistant_batch(
+            s.id,
+            u1,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "a1".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let _ = repo
+            .upsert_user_message_idempotent(s.id, "u2", "01J0000000000000000050003A", "user", None)
+            .await
+            .unwrap();
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_turn_pairs_includes_gift_user_pair(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let meta = serde_json::json!({"tips_amount_usd": 20.0});
+        let u1 = match repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "(打赏 $20)",
+                "01J0000000000000000060001A",
+                "gift_user",
+                Some(&meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        repo.insert_assistant_batch(
+            s.id,
+            u1,
+            &[AssistantInsert {
+                id: Uuid::new_v4(),
+                content: "thanks!".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
+        assert_eq!(
+            pairs,
+            vec![("(打赏 $20)".to_string(), "thanks!".to_string())]
+        );
     }
 }
