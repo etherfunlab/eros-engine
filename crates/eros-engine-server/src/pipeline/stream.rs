@@ -235,6 +235,7 @@ fn drive_chat_burst(
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
                     filter_audit: None,
+                    metadata: Some(serde_json::json!({ "prompt_traits": &trait_tags })),
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -378,6 +379,7 @@ fn drive_chat_burst(
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
                 filter_audit,
+                metadata: Some(serde_json::json!({ "prompt_traits": &trait_tags })),
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");

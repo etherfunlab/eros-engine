@@ -287,6 +287,12 @@ pub struct AssistantInsert {
     pub usage: Option<serde_json::Value>,
     pub generation_id: Option<String>,
     pub filter_audit: Option<FilterAudit>,
+    /// Open marker bag for assistant rows. Today carries `{"prompt_traits": [...]}`
+    /// — the kept (post-tier-gated) prompt-trait tags injected this turn,
+    /// mirroring the final frame's `prompt_injected`. Always written when
+    /// trait info is known (potentially `{"prompt_traits": []}`). NULL on
+    /// legacy rows from before this column existed.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Outcome of `upsert_user_message_idempotent`. The application uses this
@@ -438,9 +444,9 @@ impl<'a> ChatRepo<'a> {
                     continues_from_message_id, truncated, model, usage, generation_id, \
                     assistant_action_type, \
                     pre_filter_content, filter_model, filter_triggers, \
-                    f_client_msg_id, f_generation_id) \
+                    f_client_msg_id, f_generation_id, metadata) \
                  VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, \
-                         $11, $12, $13, $14, $15)",
+                         $11, $12, $13, $14, $15, $16)",
             )
             .bind(row.id)
             .bind(session_id)
@@ -457,6 +463,7 @@ impl<'a> ChatRepo<'a> {
             .bind(filter_triggers)
             .bind(f_client_msg_id)
             .bind(f_generation_id)
+            .bind(&row.metadata)
             .execute(&mut *tx)
             .await?;
         }
@@ -652,6 +659,7 @@ mod tests {
                 ),
                 generation_id: Some("gen-1".into()),
                 filter_audit: None,
+                metadata: None,
             }],
         )
         .await
@@ -949,6 +957,7 @@ mod tests {
                 f_client_msg_id: "f_01J0000000000000000000001Z".into(),
                 f_generation_id: Some("gen_filter_abc".into()),
             }),
+            metadata: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -1003,6 +1012,7 @@ mod tests {
             usage: None,
             generation_id: Some("gen_chat_xyz".into()),
             filter_audit: None,
+            metadata: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -1084,6 +1094,7 @@ mod tests {
                 f_client_msg_id: "f_01J0000000000000000000003Z".into(),
                 f_generation_id: None,
             }),
+            metadata: None,
         };
         repo.insert_assistant_batch(s.id, user_msg_id, &[row])
             .await
@@ -1102,5 +1113,88 @@ mod tests {
             f_gen.is_none(),
             "f_generation_id should be NULL when None inside Some(FilterAudit)"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_persists_metadata_with_prompt_traits(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000004A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let metadata = serde_json::json!({ "prompt_traits": ["nsfw_boost", "tsundere"] });
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: Some(metadata.clone()),
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(m, Some(metadata));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_metadata_default_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000005A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(m.is_none());
     }
 }

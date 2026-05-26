@@ -202,6 +202,23 @@ field; omitted otherwise via `skip_serializing_if`.
 `"gift_user"` for tip rows where they previously saw `"user"`. This is the
 behaviour change clients act on.
 
+### 3.5 `prompt_traits` on assistant rows' `metadata`
+
+In addition to the user-side tip case, `engine.chat_messages.metadata` is also written
+on **every** assistant row persisted by `drive_chat_burst` — both live mode and
+filtered mode, regardless of whether the filter fired. Shape:
+
+```json
+{ "prompt_traits": ["nsfw_boost", "tsundere"] }
+```
+
+The array is the **kept** trait tags actually injected into the system prompt this
+turn — the same set as the final frame's `prompt_injected`. Empty array when no
+traits were injected (distinct from legacy rows with NULL metadata).
+
+**Not** exposed via BFF history — audit-only. A future admin/debug endpoint can read
+it if needed.
+
 ---
 
 ## 4. Gap B — filter audit columns
