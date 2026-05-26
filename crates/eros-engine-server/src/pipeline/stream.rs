@@ -1016,12 +1016,14 @@ pub fn run_stream(
                     crate::pipeline::handlers::build_gift_request(
                         &state, &input, &plan,
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id,
                         &[],
                     ).await
                 } else {
                     crate::pipeline::handlers::build_reply_request(
                         &state, &input, &plan,
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id,
                     ).await
                 };
                 let (req, injected_tags) = match req_res {
