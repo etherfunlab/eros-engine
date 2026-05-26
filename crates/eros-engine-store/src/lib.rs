@@ -3,6 +3,7 @@
 
 pub mod affinity;
 pub mod chat;
+pub mod error_handling;
 pub mod human_insight;
 pub mod insight;
 pub mod memory;
@@ -153,5 +154,61 @@ mod migration_tests {
             !exists,
             "extracted_facts column must be dropped (migration 0017)"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0020_seeds_ten_fallback_phrases(pool: PgPool) {
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM engine.error_handling_config \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let arr = payload.as_array().expect("payload is an array");
+        assert_eq!(arr.len(), 10, "seed must carry exactly 10 phrases");
+        for item in arr {
+            assert!(item.is_string(), "each phrase must be a string: {item}");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pick_chat_stream_fallback_phrase_returns_seeded_phrase(pool: PgPool) {
+        use crate::error_handling::ErrorHandlingRepo;
+        let repo = ErrorHandlingRepo { pool: &pool };
+        let phrase = repo.pick_chat_stream_fallback_phrase().await.unwrap();
+        let phrase = phrase.expect("seeded phrase should be available");
+        let seeded = [
+            "huh?",
+            "hm?",
+            "...",
+            "oh?",
+            "mhm",
+            "ok",
+            "👀",
+            "😅",
+            "say again?",
+            "wait what?",
+        ];
+        assert!(
+            seeded.contains(&phrase.as_str()),
+            "picked {phrase:?} not in seed"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pick_chat_stream_fallback_phrase_returns_none_when_kind_missing(pool: PgPool) {
+        use crate::error_handling::ErrorHandlingRepo;
+        let repo = ErrorHandlingRepo { pool: &pool };
+        // Clear the seeded row to simulate a fresh DB without the kind.
+        sqlx::query(
+            "DELETE FROM engine.error_handling_config \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let phrase = repo.pick_chat_stream_fallback_phrase().await.unwrap();
+        assert!(phrase.is_none(), "expected None when config row absent");
     }
 }
