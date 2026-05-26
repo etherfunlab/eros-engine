@@ -279,7 +279,10 @@ fn drive_chat_burst(
                     return;
                 }
                 if idx + 1 == chain.len() {
-                    outcome.lock().unwrap().retries_chat = chain.len() as u32;
+                    // retries_chat = fallback count consumed (NOT total attempts),
+                    // matching its 0-based semantics elsewhere (0 = primary served).
+                    let fallback_retries = (chain.len() as u32).saturating_sub(1);
+                    outcome.lock().unwrap().retries_chat = fallback_retries;
                     match build_stream_failure_pseudo_ghost(
                         &state.pool,
                         session_id,
@@ -288,7 +291,11 @@ fn drive_chat_burst(
                         persist_action,
                         &trait_tags,
                         &tier,
-                        chain.len() as u32,
+                        fallback_retries,
+                        // Live mode persisted the final truncated bubble; link
+                        // the pseudo-ghost to it so clients + replay can stitch
+                        // them as one logical conversation turn.
+                        Some(msg_ulid),
                     )
                     .await
                     {
@@ -350,7 +357,8 @@ fn drive_chat_burst(
 
             if truncated {
                 if idx + 1 == chain.len() {
-                    outcome.lock().unwrap().retries_chat = chain.len() as u32;
+                    let fallback_retries = (chain.len() as u32).saturating_sub(1);
+                    outcome.lock().unwrap().retries_chat = fallback_retries;
                     match build_stream_failure_pseudo_ghost(
                         &state.pool,
                         session_id,
@@ -359,7 +367,10 @@ fn drive_chat_burst(
                         persist_action,
                         &trait_tags,
                         &tier,
-                        chain.len() as u32,
+                        fallback_retries,
+                        // Filtered mode never persists intermediate truncated
+                        // attempts, so there is no prior bubble to continue from.
+                        None,
                     )
                     .await
                     {
@@ -571,7 +582,8 @@ async fn build_stream_failure_pseudo_ghost(
     persist_action: &str,
     trait_tags: &[String],
     tier: &Option<String>,
-    retries_chat_total: u32,
+    fallback_retries: u32,
+    continues_from_ulid: Option<Ulid>,
 ) -> Option<Vec<ProtocolFrame>> {
     let repo = ErrorHandlingRepo { pool };
     let phrase = match repo.pick_chat_stream_fallback_phrase().await {
@@ -596,7 +608,7 @@ async fn build_stream_failure_pseudo_ghost(
         serde_json::json!("stream_failure"),
     );
     meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
-    meta_map.insert("retries_chat".into(), serde_json::json!(retries_chat_total));
+    meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
     if let Some(t) = tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
     }
@@ -607,7 +619,7 @@ async fn build_stream_failure_pseudo_ghost(
         id: msg_uuid,
         content: phrase.clone(),
         assistant_action_type: persist_action.into(),
-        continues_from_message_id: None,
+        continues_from_message_id: continues_from_ulid.map(Uuid::from),
         truncated: false,
         // No model served this row — live emits Meta with model: None, and
         // replay_stream applies display_override to Some(...) values, so a
@@ -633,7 +645,7 @@ async fn build_stream_failure_pseudo_ghost(
             message_id: ulid_string(msg_ulid),
             action_type: frame_action,
             model: None,
-            continues_from: None,
+            continues_from: continues_from_ulid.map(ulid_string),
         },
         ProtocolFrame::Delta {
             message_id: ulid_string(msg_ulid),
