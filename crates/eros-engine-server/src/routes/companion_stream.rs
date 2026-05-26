@@ -271,16 +271,27 @@ pub async fn send_message_stream(
             })
         })?;
 
-    let persisted_content = if req.content.is_empty() {
-        match req.tips_amount_usd {
-            Some(amount) => format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
-            None => req.content.clone(), // unreachable post-validation
-        }
-    } else {
-        req.content.clone()
+    let (persisted_content, persisted_role, persisted_metadata) = match req.tips_amount_usd {
+        Some(amount) if req.content.is_empty() => (
+            format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
+            "gift_user",
+            Some(serde_json::json!({ "tips_amount_usd": amount })),
+        ),
+        Some(amount) => (
+            req.content.clone(),
+            "gift_user",
+            Some(serde_json::json!({ "tips_amount_usd": amount })),
+        ),
+        None => (req.content.clone(), "user", None),
     };
     let outcome = chat_repo
-        .upsert_user_message_idempotent(session_id, &persisted_content, &req.client_msg_id)
+        .upsert_user_message_idempotent(
+            session_id,
+            &persisted_content,
+            &req.client_msg_id,
+            persisted_role,
+            persisted_metadata.as_ref(),
+        )
         .await?;
     // Resolve the proto stream. Replay returns early with a boxed stream;
     // Inserted continues to run_stream below. Boxing erases the concrete type
@@ -595,7 +606,7 @@ mod tests {
         // Pre-seed an original-request outcome.
         let chat_repo = ChatRepo { pool: &pool };
         let user_msg_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A")
+            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", "user", None)
             .await
             .unwrap()
         {
