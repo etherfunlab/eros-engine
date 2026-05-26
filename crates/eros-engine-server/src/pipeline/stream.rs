@@ -140,7 +140,7 @@ fn drive_chat_burst(
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
     trait_tags: Vec<String>, // requested prompt-trait tags (the turn's)
-    random_pass: bool,       // drawn once per turn by run_stream
+    random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
@@ -163,7 +163,7 @@ fn drive_chat_burst(
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
         let filtered_mode = filter
             .as_ref()
-            .map(|f| f.trigger.turn_level_pass(random_pass, &tag_refs))
+            .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
 
         if !filtered_mode {
@@ -328,7 +328,7 @@ fn drive_chat_burst(
             }
 
             outcome.lock().unwrap().retries_chat = idx as u32;
-            let do_filter = f.trigger.should_filter(model_id, &tag_refs, random_pass);
+            let hits = f.trigger.should_filter(model_id, &tag_refs, random_draw);
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
@@ -336,18 +336,29 @@ fn drive_chat_burst(
                 continues_from: None,
             };
 
-            let visible: String = if do_filter {
-                match run_output_filter(&state, &f, &acc).await {
-                    Some((filtered_text, retries_filter)) => {
+            let (visible, filter_audit): (
+                String,
+                Option<eros_engine_store::chat::FilterAudit>,
+            ) = match hits {
+                Some(h) => match run_output_filter(&state, &f, &acc).await {
+                    Some(out) => {
                         let mut o = outcome.lock().unwrap();
                         o.filtered = true;
-                        o.retries_filter = retries_filter;
-                        filtered_text
+                        o.retries_filter = out.retries_filter;
+                        drop(o);
+                        let audit = eros_engine_store::chat::FilterAudit {
+                            pre_filter_content: acc.clone(),
+                            filter_model: out.filter_model,
+                            filter_triggers: serde_json::to_value(&h)
+                                .unwrap_or(serde_json::Value::Null),
+                            f_client_msg_id: out.f_client_msg_id,
+                            f_generation_id: out.f_generation_id,
+                        };
+                        (out.filtered_text, Some(audit))
                     }
-                    None => acc.clone(),
-                }
-            } else {
-                acc.clone()
+                    None => (acc.clone(), None), // fail-open
+                },
+                None => (acc.clone(), None), // models-miss or trigger off
             };
 
             if !visible.is_empty() {
@@ -366,7 +377,7 @@ fn drive_chat_burst(
                 model: Some(model_id.clone()),
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
-                filter_audit: None,
+                filter_audit,
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -403,16 +414,30 @@ fn extract_text(
     }
 }
 
+/// Result of a filter LLM call. `f_client_msg_id` is the engine-generated
+/// idempotency / trace ULID for the call (prefix `f_`), reused across the
+/// filter's internal fallback retries. `filter_model` is the model actually
+/// served (from `ChatResponse.model`), falling back to the requested primary
+/// model if the response omits it. `f_generation_id` mirrors the optional
+/// nature of `ChatResponse.generation_id` so SQL NULL propagates cleanly.
+struct RunFilterOutcome {
+    filtered_text: String,
+    retries_filter: u32,
+    filter_model: String,
+    f_client_msg_id: String,
+    f_generation_id: Option<String>,
+}
+
 /// Run the output-filter LLM over `original`. `execute()` walks the (already
 /// depth-capped) chain; `ChatResponse.model` reports the model served. Returns
-/// `(filtered_text, retries_filter)` where retries_filter = served model's index
-/// in `[f.model] + f.fallback_model` (0 = primary). `None` on error/timeout/empty.
+/// `RunFilterOutcome` on success. `None` on error/timeout/empty.
 async fn run_output_filter(
     state: &AppState,
     f: &eros_engine_llm::model_config::ResolvedOutputFilter,
     original: &str,
-) -> Option<(String, u32)> {
+) -> Option<RunFilterOutcome> {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let f_client_msg_id = format!("f_{}", Ulid::new());
     let req = ChatRequest {
         model: f.model.clone(),
         fallback_model: f.fallback_model.clone(),
@@ -438,19 +463,29 @@ async fn run_output_filter(
             if out.is_empty() {
                 return None;
             }
+            let served = resp.model.clone();
             let chain = std::iter::once(f.model.as_str())
                 .chain(f.fallback_model.iter().map(String::as_str));
-            let retries_filter = resp
-                .model
+            let retries_filter = served
                 .as_deref()
-                .and_then(|served| {
+                .and_then(|s| {
                     chain
                         .enumerate()
-                        .find(|(_, m)| *m == served)
+                        .find(|(_, m)| *m == s)
                         .map(|(i, _)| i as u32)
                 })
                 .unwrap_or(0);
-            Some((out, retries_filter))
+            // Falling back to f.model when the response omits the served model is
+            // safe: that is the model we requested, and OpenRouter only omits it
+            // on error paths (which we have already excluded via .reply.is_empty()).
+            let filter_model = served.unwrap_or_else(|| f.model.clone());
+            Some(RunFilterOutcome {
+                filtered_text: out,
+                retries_filter,
+                filter_model,
+                f_client_msg_id,
+                f_generation_id: resp.generation_id,
+            })
         }
         Ok(Err(e)) => {
             tracing::warn!("output filter LLM failed: {e}");
@@ -622,11 +657,10 @@ pub fn run_stream(
                 // random gate ONCE (so live/filter share the same coin flip).
                 let tier = user_msg.tier.as_deref();
                 let filter = state.model_config.resolve_output_filter(tier);
-                let random_pass = filter
+                let random_draw: Option<f64> = filter
                     .as_ref()
                     .and_then(|f| f.trigger.random)
-                    .map(|p| rand::thread_rng().gen::<f64>() < p)
-                    .unwrap_or(true);
+                    .map(|_| rand::thread_rng().gen::<f64>());
 
                 let outcome = std::sync::Arc::new(std::sync::Mutex::new(
                     crate::pipeline::stream::BurstOutcome::default(),
@@ -642,7 +676,7 @@ pub fn run_stream(
                     display_override,
                     filter,
                     trait_tags,
-                    random_pass,
+                    random_draw,
                     outcome.clone(),
                 );
                 {
