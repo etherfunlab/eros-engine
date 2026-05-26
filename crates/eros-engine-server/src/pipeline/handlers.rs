@@ -542,10 +542,7 @@ pub(super) async fn build_reply_request(
 ///
 /// Non-fatal: a DB hiccup degrades to an empty Vec with a warn-level log so
 /// short-term memory is omitted but prompt assembly still succeeds.
-async fn fetch_recent_turn_pairs(
-    pool: &PgPool,
-    session_id: Uuid,
-) -> Vec<(String, String)> {
+async fn fetch_recent_turn_pairs(pool: &PgPool, session_id: Uuid) -> Vec<(String, String)> {
     ChatRepo { pool }
         .recent_turn_pairs(session_id, chrono::Utc::now(), 3)
         .await
@@ -1346,19 +1343,16 @@ mod tests {
         let chat_repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = Uuid::new_v4();
-        let session = chat_repo.create_session(user_id, instance_id).await.unwrap();
+        let session = chat_repo
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap();
 
         // Insert 2 prior complete (user, assistant) pairs.
         for n in 0..2u8 {
             let u_ulid = format!("01J000000000000000008{n}001A");
             let uid = match chat_repo
-                .upsert_user_message_idempotent(
-                    session.id,
-                    &format!("u{n}"),
-                    &u_ulid,
-                    "user",
-                    None,
-                )
+                .upsert_user_message_idempotent(session.id, &format!("u{n}"), &u_ulid, "user", None)
                 .await
                 .unwrap()
             {
