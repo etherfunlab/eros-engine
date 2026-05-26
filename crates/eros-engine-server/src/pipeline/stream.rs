@@ -345,12 +345,12 @@ fn drive_chat_burst(
                         let mut o = outcome.lock().unwrap();
                         o.filtered = true;
                         o.retries_filter = out.retries_filter;
-                        drop(o);
+                        drop(o); // release MutexGuard before the yield below — must not cross suspension point
                         let audit = eros_engine_store::chat::FilterAudit {
                             pre_filter_content: acc.clone(),
                             filter_model: out.filter_model,
                             filter_triggers: serde_json::to_value(&h)
-                                .unwrap_or(serde_json::Value::Null),
+                                .expect("TriggerHits Serialize is infallible"),
                             f_client_msg_id: out.f_client_msg_id,
                             f_generation_id: out.f_generation_id,
                         };
