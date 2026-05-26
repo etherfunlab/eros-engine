@@ -20,8 +20,8 @@ Accepted on `POST /comp/chat/{session_id}/message/stream`.
 ## What the engine does
 
 For each turn, the validated `text` of every trait is rendered as a
-bullet under a `【附加指引】` section inside the persona system prompt,
-positioned between `【擅长话题】` and `【今日情境】`. Empty list →
+bullet under a `[additional_guidance]` section inside the persona system
+prompt, positioned between `[topics]` and `[turn_style]`. Empty list →
 the section is omitted and the prompt is byte-for-byte identical to
 the legacy output.
 

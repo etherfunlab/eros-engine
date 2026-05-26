@@ -728,10 +728,10 @@ mod tests {
             !p.contains("[additional_guidance]"),
             "empty traits must not render section"
         );
-        // 擅长话题 now flows straight into 本轮风格 (the first volatile block).
+        // [topics] now flows straight into [turn_style] (the first volatile block).
         assert!(
             p.contains("[topics]t1\n\n[turn_style]"),
-            "topics → 本轮风格 separator must be exactly '\\n\\n': {p}"
+            "topics → turn_style separator must be exactly '\\n\\n': {p}"
         );
     }
 
@@ -791,7 +791,7 @@ mod tests {
         let turn_style = p.find("[turn_style]").expect("turn style");
         assert!(
             topics < traits_i && traits_i < turn_style,
-            "order: 擅长话题 → 附加指引 → 本轮风格"
+            "order: [topics] → [additional_guidance] → [turn_style]"
         );
     }
 
