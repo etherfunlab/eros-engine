@@ -110,8 +110,8 @@ If any condition is unmet the filter is **inert** — the original reply is deli
 
 ```toml
 [tasks.chat_output_filter]
-model        = "anthropic/claude-haiku-4.5"   # fast model recommended
-fallback     = ["deepseek/deepseek-v4-flash", "x/y"]
+model        = "openai/gpt-5.4-nano"
+fallback     = ["google/gemini-3.1-flash", "zhipuai/zlm-4.7-flash"]
 retry_depth  = 1     # fallbacks to try on filter failure (default 1 = primary + first fallback)
 temperature  = 0.3
 max_tokens   = 400
@@ -125,6 +125,14 @@ timing       = "after_extract"   # or "before_extract"
 [tasks.chat_output_filter.tiers.gold]
 filter_prompt = "..."            # any field is optional; falls back to the default block
 ```
+
+**Recommended models for `chat_output_filter`:**
+
+- **Primary**: `openai/gpt-5.4-nano` — fast, stable filtered output.
+- **DO NOT** use `openai/gpt-4.1-nano` as the filter model — empirically returns `"对不起，无法满足你的要求"`-style refusals with HTTP 200, which the engine cannot distinguish from a successful filtered rewrite, so the fail-open path never triggers and the user sees the refusal text.
+- **Recommended fallback**: `google/gemini-3.1-flash` — high success rate; when it does fail it surfaces a proper error response (non-200), letting the engine's fail-open path kick in and emit the original reply.
+- **Cost-saving fallback**: `zhipuai/zlm-4.7-flash` — cheaper, similar fail-mode profile to gemini-3.1-flash.
+- **DO NOT** use `anthropic/claude-haiku-4.5` for the filter — its input tolerance for NSFW (great for extraction) does NOT extend to output; the safety alignment on the output side is strict enough that the filter LLM often refuses to produce rewritten text at all.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
