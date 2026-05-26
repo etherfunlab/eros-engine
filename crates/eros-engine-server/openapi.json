@@ -1572,7 +1572,7 @@
           },
           "text": {
             "type": "string",
-            "description": "Verbatim text inserted under `【附加指引】` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
+            "description": "Verbatim text inserted under `[additional_guidance]` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
           }
         }
       },

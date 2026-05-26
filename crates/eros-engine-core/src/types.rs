@@ -9,7 +9,7 @@ use crate::persona::CompanionPersona;
 use crate::scope::{AffinityScope, MemoryScope};
 
 /// A caller-supplied system-prompt fragment. The engine treats `text` as
-/// opaque — it is inserted verbatim under the `【附加指引】` section of
+/// opaque — it is inserted verbatim under the `[additional_guidance]` section of
 /// the persona system prompt. `tag` is for logging/observability only and
 /// is constrained to `[a-z0-9_]{1,32}` by the HTTP layer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -35,7 +35,7 @@ const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityScopeName {
     Full,
@@ -45,7 +45,7 @@ pub enum AffinityScopeName {
     None,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum AffinityScopeDto {
     Named(AffinityScopeName),
@@ -279,6 +279,33 @@ pub async fn send_message_stream(
     }
     if let Some(t) = req.tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
+    // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
+    // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
+    // An operator diffing the two can spot allow-list misconfiguration or
+    // frontend/backend shape drift.
+    if let Some(ms) = req.memory_scope.as_ref() {
+        meta_map.insert(
+            "memory_scope_raw".into(),
+            serde_json::to_value(ms).expect("MemoryScope serializes"),
+        );
+    }
+    if let Some(asd) = req.affinity_scope.as_ref() {
+        meta_map.insert(
+            "affinity_scope_raw".into(),
+            serde_json::to_value(asd).expect("AffinityScopeDto serializes"),
+        );
+    }
+    if let Some(pt) = req.prompt_traits.as_ref() {
+        // PromptTraitDto does not derive Serialize (lives in companion.rs).
+        // Hand-build the JSON shape — `{tag, text}` per element — so an empty
+        // input vec round-trips as `[]` (not omitted).
+        let arr: Vec<serde_json::Value> = pt
+            .iter()
+            .map(|t| serde_json::json!({"tag": t.tag, "text": t.text}))
+            .collect();
+        meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
     }
     let persisted_metadata: Option<serde_json::Value> = if meta_map.is_empty() {
         None
@@ -681,6 +708,87 @@ mod tests {
         assert!(
             body_text.contains("\"type\":\"final\""),
             "body: {body_text}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_row_writes_scope_raw_keys_when_request_carries_them(pool: sqlx::PgPool) {
+        use eros_engine_core::scope::MemoryScope;
+        use eros_engine_store::chat::ChatRepo;
+        // Build raw metadata bag mirroring what the route handler would build
+        // for a request with all three new fields populated.
+        let mut meta_map = serde_json::Map::new();
+        let ms = MemoryScope::NeutralOnly;
+        let asd_value: serde_json::Value = serde_json::json!("chemistry");
+        let pt_value: serde_json::Value = serde_json::json!([
+            {"tag": "nsfw_boost", "text": "be daring"}
+        ]);
+        meta_map.insert("memory_scope_raw".into(), serde_json::to_value(ms).unwrap());
+        meta_map.insert("affinity_scope_raw".into(), asd_value);
+        meta_map.insert("prompt_traits_raw".into(), pt_value);
+        let persisted = serde_json::Value::Object(meta_map);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let session = chat_repo
+            .create_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        chat_repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "hi",
+                "01J0000000000000000070001A",
+                "user",
+                Some(&persisted),
+            )
+            .await
+            .unwrap();
+
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored["memory_scope_raw"],
+            serde_json::json!("neutral_only")
+        );
+        assert_eq!(stored["affinity_scope_raw"], serde_json::json!("chemistry"));
+        assert_eq!(stored["prompt_traits_raw"][0]["tag"], "nsfw_boost");
+        assert_eq!(stored["prompt_traits_raw"][0]["text"], "be daring");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_row_omits_scope_raw_keys_when_request_fields_are_none(pool: sqlx::PgPool) {
+        use eros_engine_store::chat::ChatRepo;
+        let chat_repo = ChatRepo { pool: &pool };
+        let session = chat_repo
+            .create_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        // None of the three optional fields present, no tip, no tier → meta_map
+        // empty → metadata = None.
+        chat_repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "hi",
+                "01J0000000000000000070002A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stored: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            stored.is_none(),
+            "metadata must be NULL when no fields present"
         );
     }
 }
