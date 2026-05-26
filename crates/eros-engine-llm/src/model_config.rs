@@ -432,6 +432,12 @@ pub struct ResolvedModel {
     /// Resolved reasoning config (see `TaskConfig::reasoning`). `None` → omit
     /// the wire param; `Some(cfg)` → forwarded as the `reasoning` object.
     pub reasoning: Option<ReasoningConfig>,
+    /// Number of fallback models the chat burst may try after the primary.
+    /// `fallback_model` is already truncated to this length by `resolve()`.
+    /// Task-level → tier override precedence, default 2 (primary + 2 fallbacks
+    /// = 3-entry chain, matching the prior `MAX_STREAM_FALLBACK_DEPTH = 3`
+    /// hard-cap).
+    pub retry_depth: u32,
 }
 
 /// Resolved output-filter parameters for a chat request.
@@ -449,6 +455,10 @@ pub struct ResolvedOutputFilter {
     pub trigger: OutputFilterTrigger,
     pub timing: FilterTiming,
     pub retry_depth: u32,
+    /// Reasoning config forwarded from `[tasks.chat_output_filter]`. Task-level
+    /// only (no per-tier override), consistent with `chat_companion`'s own
+    /// `reasoning` field shape.
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 impl ModelConfig {
@@ -545,6 +555,14 @@ impl ModelConfig {
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
         let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
 
+        // retry_depth: tier > task > default 2. Truncate fallback_model to
+        // retry_depth entries so the caller never needs to cap the chain.
+        let retry_depth = tier_cfg
+            .and_then(|t| t.retry_depth)
+            .or_else(|| task_cfg.and_then(|t| t.retry_depth))
+            .unwrap_or(2);
+        fallback_model.truncate(retry_depth as usize);
+
         ResolvedModel {
             model,
             fallback_model,
@@ -552,6 +570,7 @@ impl ModelConfig {
             max_tokens,
             allow_traits,
             reasoning,
+            retry_depth,
         }
     }
 
@@ -614,11 +633,17 @@ impl ModelConfig {
             .or(task_cfg.retry_depth)
             .unwrap_or(1); // default 1: primary + first fallback only
 
+        // reasoning: task-level only (no per-tier override), consistent with
+        // chat_companion's own reasoning field.
+        let reasoning = task_cfg.reasoning.clone();
+
         // model / fallback / temperature / max_tokens via the existing resolver
-        // (tier → default block → [defaults] → compiled-in).
+        // (tier → default block → [defaults] → compiled-in). Note: resolve()
+        // now truncates fallback_model to its own retry_depth; we re-truncate
+        // to chat_output_filter's retry_depth (which may differ).
         let m = self.resolve(FILTER_TASK, tier);
         let mut fallback_model = m.fallback_model;
-        fallback_model.truncate(retry_depth as usize); // cap to retry_depth entries
+        fallback_model.truncate(retry_depth as usize); // cap to filter's retry_depth entries
         Some(ResolvedOutputFilter {
             model: m.model,
             fallback_model,
@@ -628,6 +653,7 @@ impl ModelConfig {
             trigger,
             timing,
             retry_depth,
+            reasoning,
         })
     }
 }
@@ -1699,6 +1725,101 @@ trigger = { traits = { any = ["a"] } }
         };
         let v = serde_json::to_value(&hits).unwrap();
         assert_eq!(v, serde_json::json!({}));
+    }
+
+    // ─── Item 1: reasoning threaded through resolve_output_filter ─────────
+
+    #[test]
+    fn resolve_output_filter_threads_reasoning() {
+        let cfg: ModelConfig = toml::from_str(
+            r#"
+[tasks.chat_companion]
+output_filter = true
+model = "x/y"
+
+[tasks.chat_output_filter]
+model = "filter/m"
+filter_prompt = "rewrite"
+reasoning = { enabled = false }
+"#,
+        )
+        .unwrap();
+        let resolved = cfg.resolve_output_filter(None).expect("filter resolved");
+        assert!(resolved.reasoning.is_some());
+    }
+
+    #[test]
+    fn resolve_output_filter_reasoning_absent_is_none() {
+        let cfg: ModelConfig = toml::from_str(
+            r#"
+[tasks.chat_companion]
+output_filter = true
+model = "x/y"
+
+[tasks.chat_output_filter]
+model = "filter/m"
+filter_prompt = "rewrite"
+"#,
+        )
+        .unwrap();
+        let resolved = cfg.resolve_output_filter(None).expect("filter resolved");
+        assert!(resolved.reasoning.is_none());
+    }
+
+    // ─── Item 2: chat_companion retry_depth ───────────────────────────────
+
+    #[test]
+    fn resolve_chat_companion_retry_depth_defaults_to_2() {
+        let cfg: ModelConfig = toml::from_str(
+            r#"
+[tasks.chat_companion]
+model = "x/y"
+fallback = ["a/b", "c/d", "e/f", "g/h"]
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.retry_depth, 2);
+        // fallback truncated to retry_depth entries
+        assert_eq!(r.fallback_model, vec!["a/b".to_string(), "c/d".to_string()]);
+    }
+
+    #[test]
+    fn resolve_chat_companion_retry_depth_overridable() {
+        let cfg: ModelConfig = toml::from_str(
+            r#"
+[tasks.chat_companion]
+model = "x/y"
+fallback = ["a/b", "c/d", "e/f"]
+retry_depth = 3
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.retry_depth, 3);
+        assert_eq!(
+            r.fallback_model,
+            vec!["a/b".to_string(), "c/d".to_string(), "e/f".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_chat_companion_retry_depth_tier_overrides_task() {
+        let cfg: ModelConfig = toml::from_str(
+            r#"
+[tasks.chat_companion]
+model = "x/y"
+fallback = ["a/b", "c/d", "e/f"]
+retry_depth = 2
+
+[tasks.chat_companion.tiers.gold]
+retry_depth = 1
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve("chat_companion", Some("gold"));
+        assert_eq!(r.retry_depth, 1);
+        assert_eq!(r.fallback_model, vec!["a/b".to_string()]);
     }
 
     #[test]
