@@ -1654,6 +1654,25 @@ trigger = { traits = { any = ["a"] } }
     }
 
     #[test]
+    fn should_filter_returns_none_when_random_configured_but_no_draw() {
+        // Defensive: if the caller wires random=Some(p) but forgets to thread
+        // a per-turn random_draw, treat as "no fire" rather than silently
+        // assume pass. Guards against a Task 7-era wiring mistake.
+        let r = OutputFilterTrigger { random: Some(0.5), models: None, traits: None };
+        assert!(r.should_filter("m", &[], None).is_none());
+        assert!(r.turn_level_pass(None, &[]) == false);
+    }
+
+    #[test]
+    fn trigger_hits_empty_serializes_to_empty_object() {
+        // Spec §4.2: when an always-fire trigger (no configured predicates)
+        // is recorded, filter_triggers JSONB must be `{}` — not `{"random":null, ...}`.
+        let hits = TriggerHits { random: None, models: None, traits: None };
+        let v = serde_json::to_value(&hits).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
     fn resolve_output_filter_gating() {
         use super::*;
         // #6: enabled but no [tasks.chat_output_filter] ⇒ None
