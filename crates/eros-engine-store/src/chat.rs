@@ -299,14 +299,18 @@ impl<'a> ChatRepo<'a> {
         session_id: Uuid,
         content: &str,
         client_msg_id: &str,
+        role: &str,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<UpsertUserOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Look for an existing user row with the same (session_id, client_msg_id).
-        // The partial unique index guarantees at most one match if any.
+        // Widened role filter: tip path writes 'gift_user', and idempotency is
+        // keyed on (session_id, client_msg_id) regardless of which user-side
+        // role was originally persisted.
         let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
             "SELECT * FROM engine.chat_messages \
-             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
+             WHERE session_id = $1 AND client_msg_id = $2 \
+               AND role IN ('user', 'gift_user') \
              LIMIT 1",
         )
         .bind(session_id)
@@ -345,14 +349,16 @@ impl<'a> ChatRepo<'a> {
             });
         }
 
-        // First time: insert + bump last_active_at.
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
-             VALUES ($1, 'user', $2, $3) RETURNING id",
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(session_id)
+        .bind(role)
         .bind(content)
         .bind(client_msg_id)
+        .bind(metadata)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
@@ -551,7 +557,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap();
         match outcome {
@@ -570,7 +576,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap()
         {
@@ -598,7 +604,7 @@ mod tests {
         .unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap();
         match outcome {
@@ -624,7 +630,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap()
         {
@@ -633,7 +639,7 @@ mod tests {
         };
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap()
         {
@@ -652,7 +658,7 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap()
         {
@@ -662,7 +668,7 @@ mod tests {
         repo.mark_user_message_ghosted(first).await.unwrap();
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap()
         {
@@ -728,6 +734,102 @@ mod tests {
             resumed.last_active_at >= before,
             "last_active_at must be bumped"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_writes_role_user_and_no_metadata(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "hi",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::Inserted { .. } => {}
+            other => panic!("expected Inserted, got {:?}", other),
+        }
+        let (role, metadata): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "user");
+        assert!(metadata.is_none(), "metadata should be NULL on plain user rows");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_writes_gift_user_role_and_tip_metadata(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let meta = serde_json::json!({ "tips_amount_usd": 20.0 });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "(打赏 $20)",
+            "01J0000000000000000000000B",
+            "gift_user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+        let (role, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "gift_user");
+        assert_eq!(metadata["tips_amount_usd"].as_f64(), Some(20.0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_replay_finds_gift_user_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let meta = serde_json::json!({ "tips_amount_usd": 5.0 });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "(打赏 $5)",
+            "01J0000000000000000000000C",
+            "gift_user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+        // Second call with the same client_msg_id is a replay candidate even
+        // though the original wrote role='gift_user'. The widened role filter
+        // in the dedup lookup is what we're exercising.
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "(打赏 $5)",
+                "01J0000000000000000000000C",
+                "gift_user",
+                Some(&meta),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::DuplicateInProgress { .. } => {}
+            other => panic!("expected DuplicateInProgress, got {:?}", other),
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
