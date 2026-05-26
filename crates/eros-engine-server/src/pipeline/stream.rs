@@ -86,12 +86,6 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
-/// Maximum number of model attempts per streaming burst (= 1 primary + up to
-/// 2 fallbacks). Each attempt surfaces as a separate visible bubble; the
-/// frontend masks attempts beyond the first behind a "thinking" affordance, so
-/// a depth of 3 buys extra resilience without looking like a bug to users.
-pub const MAX_STREAM_FALLBACK_DEPTH: usize = 3;
-
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -146,10 +140,11 @@ fn drive_chat_burst(
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
+        // The fallback_model is already truncated to retry_depth entries by
+        // resolve() — no cap needed here; the chain is just [primary] + fallbacks.
         let chain: Vec<String> = std::iter::once(req.model.clone())
             .chain(req.fallback_model.iter().cloned())
             .filter(|s| !s.is_empty())
-            .take(MAX_STREAM_FALLBACK_DEPTH)
             .collect();
         if chain.is_empty() {
             yield ProtocolFrame::Error {
@@ -467,6 +462,7 @@ async fn run_output_filter(
         ],
         temperature: f.temperature as f32,
         max_tokens: f.max_tokens,
+        reasoning: f.reasoning.clone(),
         ..Default::default()
     };
     const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
