@@ -609,7 +609,12 @@ async fn build_stream_failure_pseudo_ghost(
         assistant_action_type: persist_action.into(),
         continues_from_message_id: None,
         truncated: false,
-        model: Some("__fallback_phrase__".into()),
+        // No model served this row — live emits Meta with model: None, and
+        // replay_stream applies display_override to Some(...) values, so a
+        // sentinel like "__fallback_phrase__" would surface differently on
+        // replay than on the original stream and break idempotency.
+        // metadata.fallback_reason carries the audit signal instead.
+        model: None,
         usage: None,
         generation_id: None,
         filter_audit: None,
