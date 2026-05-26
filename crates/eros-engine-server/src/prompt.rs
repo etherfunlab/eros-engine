@@ -521,8 +521,12 @@ pub fn build_prompt(
         String::new()
     };
 
+    // Empty path emits "\n" (one extra newline) so the gap between [now] and
+    // --- stays at two newlines = one blank line, byte-identical to the
+    // pre-this-PR layout. Non-empty path's trailing "\n\n" continues to add
+    // the same blank line after the block.
     let recent_section = if recent_turns.is_empty() {
-        String::new()
+        "\n".to_string()
     } else {
         let pairs: Vec<String> = recent_turns
             .iter()
