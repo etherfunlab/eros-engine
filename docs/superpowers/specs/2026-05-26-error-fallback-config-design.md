@@ -25,6 +25,15 @@ indistinguishable from a model deciding to be coy.
 with the first use case being "chat-stream pseudo-ghost on chain exhaustion."
 Phrases are operator-configurable via plain SQL `UPDATE`.
 
+**Inherited non-goal (replay Final-frame fidelity):** consistent with
+`2026-05-25-chat-output-filter-design.md` §2.8, idempotent replay of a
+pseudo-ghost turn does NOT reproduce the same `Final` frame as the live stream
+— `retries_chat`, `tier`, and `prompt_injected` are recomputed-from-current
+on replay rather than read off the persisted row's metadata. This matches the
+behavior of every other completed turn. The pseudo-ghost row DOES persist
+these values in `metadata` (audit-only), but a future PR would need to extend
+`replay_stream` to read them back if wire-identical Final replay is wanted.
+
 **Non-goal (important):** do NOT silently swallow infra failures. If the config
 lookup itself fails (DB down, table missing, empty array), the engine still
 emits the original `Error{UpstreamUnavailable}` frame. Hiding infra failures
