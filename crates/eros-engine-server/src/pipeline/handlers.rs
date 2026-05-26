@@ -566,6 +566,7 @@ async fn fetch_recent_turn_pairs(
 
 /// Build a ChatRequest for the GiftReaction action. Called by the streaming
 /// pipeline (`pipeline::stream::run_stream`).
+#[allow(clippy::too_many_arguments)] // mirrors build_reply_request + pending gifts
 pub(super) async fn build_gift_request(
     state: &AppState,
     input: &DecisionInput,
