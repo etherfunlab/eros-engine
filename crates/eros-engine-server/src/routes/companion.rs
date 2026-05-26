@@ -250,7 +250,7 @@ impl From<&AffinityDeltasDto> for AffinityDeltas {
 pub struct PromptTraitDto {
     /// ASCII identifier, regex `^[a-z0-9_]{1,32}$`. Used for logging.
     pub tag: String,
-    /// Verbatim text inserted under `【附加指引】` in the system prompt.
+    /// Verbatim text inserted under `[additional_guidance]` in the system prompt.
     /// 1 ≤ chars ≤ 2000 after trim.
     pub text: String,
 }

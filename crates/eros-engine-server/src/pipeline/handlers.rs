@@ -284,7 +284,7 @@ fn build_profile_groups(
 
 /// Load `companion_insights` for the user and render the structured fields
 /// as Chinese-language bullets that fit naturally into the
-/// `【你对他的了解（通用画像）】` prompt section. Takes `&PgPool` directly
+/// `[user_profile]` prompt section. Takes `&PgPool` directly
 /// (not `&AppState`) so it's reachable from sqlx integration tests without
 /// constructing the full state.
 async fn load_insight_bullets(pool: &PgPool, user_id: Uuid) -> Vec<String> {
