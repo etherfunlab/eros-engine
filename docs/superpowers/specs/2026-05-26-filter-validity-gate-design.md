@@ -96,6 +96,51 @@ across all model attempts within a single logical filter call.  `retries_filter`
 reflects the index of the model that passed the validity gate — 0 for the
 primary, 1 for the first fallback, etc.
 
+### §3.5 Fail-open audit (`chat_messages.metadata`)
+
+When the whole filter chain fails validity (or every model errors / times out),
+the engine still fails open — emits + persists the original reply — but now also
+writes a fail-open audit into `chat_messages.metadata` so ops can identify these
+rows without ambiguity:
+
+```json
+{
+  "prompt_traits": ["..."],
+  "tier": "...",
+  "filter_outcome": "fail_open",
+  "f_client_msg_id": "f_01J...",
+  "filter_attempts": [
+    {"model": "openai/gpt-5.4-nano", "reason": "refusal_pattern"},
+    {"model": "google/gemini-3.1-flash-lite", "reason": "content_filter"}
+  ]
+}
+```
+
+Reason vocabulary:
+- `"refusal_pattern"`, `"too_short"`, `"content_filter"` — from
+  `filter_output_invalidity`
+- `"empty"` — model returned an empty `reply` field (checked before the
+  validity gate; distinguishes "model returned literally nothing" from
+  "model returned a short but non-empty response")
+- `"error"` — HTTP error / non-2xx response from the OpenRouter call
+- `"timeout"` — exceeded the 15s per-model filter timeout
+
+`run_output_filter` now returns `Result<RunFilterOutcome, FilterFailOpen>`
+instead of `Option<RunFilterOutcome>`. The `FilterFailOpen` value carries the
+`f_client_msg_id` (generated once before the loop) and the `Vec<FilterAttemptFailure>`
+audit log. The caller writes these into metadata only when `Err(fail)` is
+received — i.e., when filter was triggered AND every model in the chain failed.
+
+Rows where the filter trigger NEVER fired (trigger predicate returned `None`,
+or no filter is configured) are unchanged: `filter_outcome` / `filter_attempts`
+are absent. The audit is specifically for "we tried to filter and failed,"
+not "we chose not to filter." Ops query:
+
+```sql
+SELECT * FROM engine.chat_messages
+WHERE metadata->>'filter_outcome' = 'fail_open';
+```
+
 ---
 
 ## §4 `finish_reason` Plumbing
