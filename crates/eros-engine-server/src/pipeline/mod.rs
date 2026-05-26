@@ -59,7 +59,11 @@ pub async fn compute_signals_for_session(
     affinity: &Affinity,
 ) -> Result<ConversationSignals, AppError> {
     let message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        "SELECT COUNT(*) FROM engine.chat_messages \
+         WHERE session_id = $1 AND (\
+             role = 'user' \
+             OR (role = 'gift_user' AND metadata ? 'tips_amount_usd')\
+         )",
     )
     .bind(session_id)
     .fetch_one(pool)
@@ -67,7 +71,11 @@ pub async fn compute_signals_for_session(
     .unwrap_or(0);
 
     let last_time: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT MAX(sent_at) FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        "SELECT MAX(sent_at) FROM engine.chat_messages \
+         WHERE session_id = $1 AND (\
+             role = 'user' \
+             OR (role = 'gift_user' AND metadata ? 'tips_amount_usd')\
+         )",
     )
     .bind(session_id)
     .fetch_optional(pool)
@@ -89,4 +97,118 @@ pub async fn compute_signals_for_session(
         ghost_streak: affinity.ghost_streak,
         hours_since_last_ghost,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    fn fixture_affinity(session_id: Uuid, user_id: Uuid, instance_id: Uuid) -> Affinity {
+        let now = chrono::Utc::now();
+        Affinity {
+            id: Uuid::new_v4(),
+            session_id,
+            user_id,
+            instance_id,
+            warmth: 0.3,
+            trust: 0.2,
+            intrigue: 0.5,
+            intimacy: 0.0,
+            patience: 0.5,
+            tension: 0.1,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Seed a minimal persona_genome → persona_instance → chat_session chain so
+    /// the chat_messages FK is satisfied. Returns (genome_id, instance_id, session_id).
+    async fn seed_session(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid, Uuid) {
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
+             VALUES ('SignalsTest', 'sp', '{}'::jsonb, true) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (genome_id, instance_id, session_id)
+    }
+
+    /// Tip `gift_user` rows (with `tips_amount_usd` in metadata) must be
+    /// counted exactly like `user` turns; legacy in-app-gift `gift_user` rows
+    /// (no tip metadata, written by routes/companion.rs:827) must NOT count.
+    /// Regression guard for codex P2 v2 finding on PR #52.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_count_includes_tip_gift_user_but_excludes_legacy_gifts(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+                 ($1, 'user', 'hi', NULL), \
+                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb), \
+                 ($1, 'gift_user', 'in-app gift label', NULL)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aff = fixture_affinity(session_id, user_id, instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            signals.message_count, 2,
+            "user + tip gift_user count (2); legacy gift_user row does not"
+        );
+    }
+
+    /// Pure `user` rows still count normally (baseline regression).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_count_user_only_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, _instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'hello'), ($1, 'user', 'world')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aff = fixture_affinity(session_id, user_id, _instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff)
+            .await
+            .unwrap();
+
+        assert_eq!(signals.message_count, 2, "two user rows must yield count 2");
+    }
 }

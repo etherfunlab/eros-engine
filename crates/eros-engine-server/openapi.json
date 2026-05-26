@@ -1165,6 +1165,14 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "tips_amount_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Structured tip amount for `role='gift_user'` rows. Omitted from\nresponse when None (`skip_serializing_if`). Lets clients render tips\nat the right point in the timeline without parsing the `(打赏 $X)`\ncontent marker. Spec:\ndocs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4."
           }
         }
       },

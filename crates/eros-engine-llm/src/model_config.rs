@@ -195,16 +195,77 @@ pub struct OutputFilterTrigger {
     pub traits: Option<TraitPredicate>,
 }
 
+/// Detail of which predicates a turn matched. Each field present ⇒ that
+/// predicate was configured **and** passed. Serialises to JSONB for
+/// `chat_messages.filter_triggers`; absent fields skip serialization so the
+/// stored shape matches the spec (only fired predicates appear).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TriggerHits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub random: Option<RandomHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traits: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RandomHit {
+    pub p: f64,
+    pub draw: f64,
+}
+
 impl OutputFilterTrigger {
     /// Turn-constant predicates (random + traits). When either is specified and
-    /// fails, no attempt can be filtered this turn.
-    pub fn turn_level_pass(&self, random_pass: bool, trait_tags: &[&str]) -> bool {
-        self.random.is_none_or(|_| random_pass) && self.traits_pass(trait_tags)
+    /// fails, no attempt can be filtered this turn. Used by the burst's
+    /// live-vs-buffer branch before any attempt runs.
+    pub fn turn_level_pass(&self, random_draw: Option<f64>, trait_tags: &[&str]) -> bool {
+        let random_ok = match (self.random, random_draw) {
+            (Some(p), Some(d)) => d < p,
+            (Some(_), None) => false, // misuse: a random predicate with no draw is a fail
+            (None, _) => true,
+        };
+        random_ok && self.traits_pass(trait_tags)
     }
 
-    /// Full per-attempt decision: turn-level predicates AND the model predicate.
-    pub fn should_filter(&self, model_id: &str, trait_tags: &[&str], random_pass: bool) -> bool {
-        self.turn_level_pass(random_pass, trait_tags) && self.models_pass(model_id)
+    /// Per-attempt decision. Returns `Some(hits)` when the trigger fires for
+    /// this attempt, with hit detail; `None` otherwise. Hits serialise to
+    /// `chat_messages.filter_triggers` JSONB on write.
+    pub fn should_filter(
+        &self,
+        model_id: &str,
+        trait_tags: &[&str],
+        random_draw: Option<f64>,
+    ) -> Option<TriggerHits> {
+        if !self.turn_level_pass(random_draw, trait_tags) {
+            return None;
+        }
+        if !self.models_pass(model_id) {
+            return None;
+        }
+        Some(TriggerHits {
+            random: match (self.random, random_draw) {
+                (Some(p), Some(d)) => Some(RandomHit { p, draw: d }),
+                _ => None,
+            },
+            models: self
+                .models
+                .as_ref()
+                .filter(|list| list.iter().any(|m| m == model_id))
+                .map(|_| model_id.to_string()),
+            traits: self.traits.as_ref().map(|tp| match tp.when {
+                // Present: record which tags from `tp.any` were actually seen.
+                TraitWhen::Present => tp
+                    .any
+                    .iter()
+                    .filter(|tag| trait_tags.contains(&tag.as_str()))
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                // Absent: the predicate fires because the tags are NOT present.
+                // Nothing to enumerate; record an empty vec.
+                TraitWhen::Absent => Vec::new(),
+            }),
+        })
     }
 
     fn models_pass(&self, model_id: &str) -> bool {
@@ -1481,29 +1542,25 @@ trigger = { traits = { any = ["a"] } }
             models: None,
             traits: None,
         };
-        // empty trigger ⇒ always filter
-        assert!(none.should_filter("any/model", &[], true));
-        assert!(none.should_filter("any/model", &[], false));
+        assert!(none.should_filter("any/model", &[], None).is_some());
+        assert!(none.should_filter("any/model", &[], Some(0.999)).is_some());
 
-        // random only
         let r = OutputFilterTrigger {
             random: Some(0.5),
             models: None,
             traits: None,
         };
-        assert!(r.should_filter("m", &[], true));
-        assert!(!r.should_filter("m", &[], false));
+        assert!(r.should_filter("m", &[], Some(0.0)).is_some()); // draw < 0.5
+        assert!(r.should_filter("m", &[], Some(0.999)).is_none()); // draw >= 0.5
 
-        // models only
         let m = OutputFilterTrigger {
             random: None,
             models: Some(vec!["x/y".into()]),
             traits: None,
         };
-        assert!(m.should_filter("x/y", &[], true));
-        assert!(!m.should_filter("a/b", &[], true));
+        assert!(m.should_filter("x/y", &[], None).is_some());
+        assert!(m.should_filter("a/b", &[], None).is_none());
 
-        // traits present / absent
         let tp = OutputFilterTrigger {
             random: None,
             models: None,
@@ -1512,8 +1569,9 @@ trigger = { traits = { any = ["a"] } }
                 when: TraitWhen::Present,
             }),
         };
-        assert!(tp.should_filter("m", &["nsfw"], true));
-        assert!(!tp.should_filter("m", &["sfw"], true));
+        assert!(tp.should_filter("m", &["nsfw"], None).is_some());
+        assert!(tp.should_filter("m", &["sfw"], None).is_none());
+
         let ta = OutputFilterTrigger {
             random: None,
             models: None,
@@ -1522,26 +1580,125 @@ trigger = { traits = { any = ["a"] } }
                 when: TraitWhen::Absent,
             }),
         };
-        assert!(ta.should_filter("m", &["sfw"], true));
-        assert!(!ta.should_filter("m", &["nsfw"], true));
+        assert!(ta.should_filter("m", &["sfw"], None).is_some());
+        assert!(ta.should_filter("m", &["nsfw"], None).is_none());
 
-        // AND of all three
         let all = OutputFilterTrigger {
-            random: Some(0.9),
+            random: Some(0.5),
             models: Some(vec!["x/y".into()]),
             traits: Some(TraitPredicate {
                 any: vec!["nsfw".into()],
                 when: TraitWhen::Present,
             }),
         };
-        assert!(all.should_filter("x/y", &["nsfw"], true));
-        assert!(!all.should_filter("x/y", &["nsfw"], false)); // random fails
-        assert!(!all.should_filter("a/b", &["nsfw"], true)); // model fails
+        assert!(all.should_filter("x/y", &["nsfw"], Some(0.0)).is_some());
+        assert!(all.should_filter("x/y", &["nsfw"], Some(0.999)).is_none()); // random fails
+        assert!(all.should_filter("a/b", &["nsfw"], Some(0.0)).is_none()); // model fails
 
         // turn_level_pass ignores models
-        assert!(all.turn_level_pass(true, &["nsfw"]));
-        assert!(!all.turn_level_pass(false, &["nsfw"]));
-        assert!(!all.turn_level_pass(true, &["sfw"]));
+        assert!(all.turn_level_pass(Some(0.0), &["nsfw"]));
+        assert!(!all.turn_level_pass(Some(0.999), &["nsfw"]));
+        assert!(!all.turn_level_pass(Some(0.0), &["sfw"]));
+    }
+
+    #[test]
+    fn should_filter_returns_hits_on_match() {
+        let t = OutputFilterTrigger {
+            random: Some(0.3),
+            models: Some(vec!["x/y".into()]),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            }),
+        };
+        let hits = t
+            .should_filter("x/y", &["nsfw"], Some(0.18))
+            .expect("should fire");
+        assert_eq!(hits.random.as_ref().unwrap().p, 0.3);
+        assert_eq!(hits.random.as_ref().unwrap().draw, 0.18);
+        assert_eq!(hits.models.as_deref(), Some("x/y"));
+        assert_eq!(hits.traits.as_deref(), Some(&["nsfw".to_string()][..]));
+    }
+
+    #[test]
+    fn should_filter_returns_none_when_any_predicate_fails() {
+        let t = OutputFilterTrigger {
+            random: Some(0.3),
+            models: Some(vec!["x/y".into()]),
+            traits: None,
+        };
+        // random draw above p → fail.
+        assert!(t.should_filter("x/y", &[], Some(0.9)).is_none());
+        // model not in list → fail.
+        assert!(t.should_filter("a/b", &[], Some(0.18)).is_none());
+    }
+
+    #[test]
+    fn should_filter_empty_trigger_returns_empty_hits() {
+        let t = OutputFilterTrigger {
+            random: None,
+            models: None,
+            traits: None,
+        };
+        let hits = t.should_filter("any/model", &[], None).expect("fires");
+        assert!(hits.random.is_none());
+        assert!(hits.models.is_none());
+        assert!(hits.traits.is_none());
+    }
+
+    #[test]
+    fn should_filter_traits_absent_predicate_returns_empty_traits_vec() {
+        let t = OutputFilterTrigger {
+            random: None,
+            models: None,
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Absent,
+            }),
+        };
+        // "nsfw" not in tags → predicate passes; traits hit recorded as empty vec.
+        let hits = t.should_filter("m", &["sfw"], None).expect("fires");
+        assert_eq!(hits.traits.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn trigger_hits_serializes_only_fired_fields() {
+        let hits = TriggerHits {
+            random: Some(RandomHit { p: 0.3, draw: 0.18 }),
+            models: None,
+            traits: Some(vec!["nsfw_boost".into()]),
+        };
+        let v = serde_json::to_value(&hits).unwrap();
+        assert!(v.get("random").is_some());
+        assert!(v.get("models").is_none(), "absent fields skipped");
+        assert_eq!(v["traits"], serde_json::json!(["nsfw_boost"]));
+    }
+
+    #[test]
+    fn should_filter_returns_none_when_random_configured_but_no_draw() {
+        // Defensive: if the caller wires random=Some(p) but forgets to thread
+        // a per-turn random_draw, treat as "no fire" rather than silently
+        // assume pass. Guards against a Task 7-era wiring mistake.
+        let r = OutputFilterTrigger {
+            random: Some(0.5),
+            models: None,
+            traits: None,
+        };
+        assert!(r.should_filter("m", &[], None).is_none());
+        assert!(!r.turn_level_pass(None, &[]));
+    }
+
+    #[test]
+    fn trigger_hits_empty_serializes_to_empty_object() {
+        // Spec §4.2: when an always-fire trigger (no configured predicates)
+        // is recorded, filter_triggers JSONB must be `{}` — not `{"random":null, ...}`.
+        let hits = TriggerHits {
+            random: None,
+            models: None,
+            traits: None,
+        };
+        let v = serde_json::to_value(&hits).unwrap();
+        assert_eq!(v, serde_json::json!({}));
     }
 
     #[test]

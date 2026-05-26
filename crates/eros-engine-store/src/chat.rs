@@ -69,6 +69,12 @@ pub struct ChatMessageSlim {
     /// Client-supplied message id forwarded during streaming (idempotency
     /// key). NULL for rows that never carried one (e.g. assistant turns).
     pub client_msg_id: Option<String>,
+    /// Structured tip amount extracted from `metadata->>'tips_amount_usd'`.
+    /// Present on `role='gift_user'` rows that carry tip metadata; NULL on
+    /// all other rows. Lets BFF / FE render tips as a structured field
+    /// instead of parsing the `(打赏 $X)` content marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tips_amount_usd: Option<f64>,
 }
 
 pub struct ChatRepo<'a> {
@@ -227,7 +233,9 @@ impl<'a> ChatRepo<'a> {
         offset: i64,
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
-            "SELECT id, role, content, sent_at, client_msg_id FROM engine.chat_messages \
+            "SELECT id, role, content, sent_at, client_msg_id, \
+                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd \
+             FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
              LIMIT $2 OFFSET $3",
@@ -254,6 +262,19 @@ impl<'a> ChatRepo<'a> {
     }
 }
 
+/// Audit metadata for a filtered-success assistant row. Threaded through
+/// `AssistantInsert::filter_audit` and bound into the five `chat_messages`
+/// audit columns. `None` ⇒ all five columns are NULL. See
+/// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §4.
+#[derive(Debug, Clone)]
+pub struct FilterAudit {
+    pub pre_filter_content: String,
+    pub filter_model: String,
+    pub filter_triggers: serde_json::Value,
+    pub f_client_msg_id: String,
+    pub f_generation_id: Option<String>,
+}
+
 /// One assistant row to insert in a burst.
 #[derive(Debug, Clone)]
 pub struct AssistantInsert {
@@ -265,6 +286,13 @@ pub struct AssistantInsert {
     pub model: Option<String>,
     pub usage: Option<serde_json::Value>,
     pub generation_id: Option<String>,
+    pub filter_audit: Option<FilterAudit>,
+    /// Open marker bag for assistant rows. Today carries `{"prompt_traits": [...]}`
+    /// — the kept (post-tier-gated) prompt-trait tags injected this turn,
+    /// mirroring the final frame's `prompt_injected`. Always written when
+    /// trait info is known (potentially `{"prompt_traits": []}`). NULL on
+    /// legacy rows from before this column existed.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Outcome of `upsert_user_message_idempotent`. The application uses this
@@ -299,14 +327,18 @@ impl<'a> ChatRepo<'a> {
         session_id: Uuid,
         content: &str,
         client_msg_id: &str,
+        role: &str,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<UpsertUserOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Look for an existing user row with the same (session_id, client_msg_id).
-        // The partial unique index guarantees at most one match if any.
+        // Widened role filter: tip path writes 'gift_user', and idempotency is
+        // keyed on (session_id, client_msg_id) regardless of which user-side
+        // role was originally persisted.
         let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
             "SELECT * FROM engine.chat_messages \
-             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
+             WHERE session_id = $1 AND client_msg_id = $2 \
+               AND role IN ('user', 'gift_user') \
              LIMIT 1",
         )
         .bind(session_id)
@@ -345,14 +377,16 @@ impl<'a> ChatRepo<'a> {
             });
         }
 
-        // First time: insert + bump last_active_at.
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
-             VALUES ($1, 'user', $2, $3) RETURNING id",
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(session_id)
+        .bind(role)
         .bind(content)
         .bind(client_msg_id)
+        .bind(metadata)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
@@ -393,12 +427,26 @@ impl<'a> ChatRepo<'a> {
         }
         let mut tx = self.pool.begin().await?;
         for row in rows {
+            let (pre_filter, filter_model, filter_triggers, f_client_msg_id, f_generation_id) =
+                match &row.filter_audit {
+                    Some(a) => (
+                        Some(a.pre_filter_content.as_str()),
+                        Some(a.filter_model.as_str()),
+                        Some(&a.filter_triggers),
+                        Some(a.f_client_msg_id.as_str()),
+                        a.f_generation_id.as_deref(),
+                    ),
+                    None => (None, None, None, None, None),
+                };
             sqlx::query(
                 "INSERT INTO engine.chat_messages \
                    (id, session_id, role, content, user_message_id, \
                     continues_from_message_id, truncated, model, usage, generation_id, \
-                    assistant_action_type) \
-                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10)",
+                    assistant_action_type, \
+                    pre_filter_content, filter_model, filter_triggers, \
+                    f_client_msg_id, f_generation_id, metadata) \
+                 VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, \
+                         $11, $12, $13, $14, $15, $16)",
             )
             .bind(row.id)
             .bind(session_id)
@@ -410,6 +458,12 @@ impl<'a> ChatRepo<'a> {
             .bind(&row.usage)
             .bind(&row.generation_id)
             .bind(&row.assistant_action_type)
+            .bind(pre_filter)
+            .bind(filter_model)
+            .bind(filter_triggers)
+            .bind(f_client_msg_id)
+            .bind(f_generation_id)
+            .bind(&row.metadata)
             .execute(&mut *tx)
             .await?;
         }
@@ -551,7 +605,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap();
         match outcome {
@@ -570,7 +630,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -592,13 +658,21 @@ mod tests {
                     serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}),
                 ),
                 generation_id: Some("gen-1".into()),
+                filter_audit: None,
+                metadata: None,
             }],
         )
         .await
         .unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap();
         match outcome {
@@ -624,7 +698,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -633,7 +713,13 @@ mod tests {
         };
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -652,7 +738,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -662,7 +754,13 @@ mod tests {
         repo.mark_user_message_ghosted(first).await.unwrap();
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A")
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -728,5 +826,421 @@ mod tests {
             resumed.last_active_at >= before,
             "last_active_at must be bumped"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_writes_role_user_and_no_metadata(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let outcome = repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000000A", "user", None)
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::Inserted { .. } => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+        let (role, metadata): (String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "user");
+        assert!(
+            metadata.is_none(),
+            "metadata should be NULL on plain user rows"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_writes_gift_user_role_and_tip_metadata(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let meta = serde_json::json!({ "tips_amount_usd": 20.0, "tier": "gold" });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "(打赏 $20)",
+            "01J0000000000000000000000B",
+            "gift_user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+        let (role, metadata): (String, serde_json::Value) =
+            sqlx::query_as("SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "gift_user");
+        assert_eq!(metadata["tips_amount_usd"].as_f64(), Some(20.0));
+        assert_eq!(metadata["tier"], serde_json::json!("gold"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_user_message_replay_finds_gift_user_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let meta = serde_json::json!({ "tips_amount_usd": 5.0 });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "(打赏 $5)",
+            "01J0000000000000000000000C",
+            "gift_user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+        // Second call with the same client_msg_id is a replay candidate even
+        // though the original wrote role='gift_user'. The widened role filter
+        // in the dedup lookup is what we're exercising.
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "(打赏 $5)",
+                "01J0000000000000000000000C",
+                "gift_user",
+                Some(&meta),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            UpsertUserOutcome::DuplicateInProgress { .. } => {}
+            other => panic!("expected DuplicateInProgress, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
+    async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000001A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+
+        let triggers = serde_json::json!({
+            "random": { "p": 0.3, "draw": 0.18 },
+            "models": "deepseek/deepseek-v4-flash",
+            "traits": ["nsfw_boost"]
+        });
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "filtered reply".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: Some(FilterAudit {
+                pre_filter_content: "raw reply".into(),
+                filter_model: "anthropic/claude-haiku-4.5".into(),
+                filter_triggers: triggers.clone(),
+                f_client_msg_id: "f_01J0000000000000000000001Z".into(),
+                f_generation_id: Some("gen_filter_abc".into()),
+            }),
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+
+        let (content, pre_filter, filter_model, filter_triggers, f_client, f_gen): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers, \
+                    f_client_msg_id, f_generation_id \
+             FROM engine.chat_messages WHERE role = 'assistant' AND session_id = $1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "filtered reply");
+        assert_eq!(pre_filter.as_deref(), Some("raw reply"));
+        assert_eq!(filter_model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+        assert_eq!(filter_triggers, Some(triggers));
+        assert_eq!(f_client.as_deref(), Some("f_01J0000000000000000000001Z"));
+        assert_eq!(f_gen.as_deref(), Some("gen_filter_abc"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_filter_audit_columns_default_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000002A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "plain reply".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1 \
+               AND pre_filter_content IS NULL AND filter_model IS NULL \
+               AND filter_triggers IS NULL AND f_client_msg_id IS NULL \
+               AND f_generation_id IS NULL",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0019_adds_chat_messages_columns(pool: PgPool) {
+        // Probe the six new columns by name. Each query should succeed (NULL on
+        // legacy rows). If any column is missing, the SELECT errors out.
+        for col in [
+            "metadata",
+            "pre_filter_content",
+            "filter_model",
+            "filter_triggers",
+            "f_client_msg_id",
+            "f_generation_id",
+        ] {
+            let q = format!("SELECT {col} FROM engine.chat_messages LIMIT 0");
+            sqlx::query(&q)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("expected column {col} on engine.chat_messages: {e}"));
+        }
+        // Indexes exist.
+        let idx_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes \
+             WHERE schemaname = 'engine' \
+               AND tablename = 'chat_messages' \
+               AND indexname IN ('chat_messages_tips_amount_idx',
+                                 'chat_messages_f_client_msg_id_uidx')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx_count, 2, "both new indexes should exist");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_filter_audit_with_none_generation_id_writes_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000003A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "filtered no gen".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: Some(FilterAudit {
+                pre_filter_content: "raw".into(),
+                filter_model: "anthropic/claude-haiku-4.5".into(),
+                filter_triggers: serde_json::json!({}),
+                f_client_msg_id: "f_01J0000000000000000000003Z".into(),
+                f_generation_id: None,
+            }),
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let (pre_filter, f_gen): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT pre_filter_content, f_generation_id \
+             FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pre_filter.as_deref(), Some("raw"));
+        assert!(
+            f_gen.is_none(),
+            "f_generation_id should be NULL when None inside Some(FilterAudit)"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_persists_metadata_with_prompt_traits(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000004A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let metadata = serde_json::json!({ "prompt_traits": ["nsfw_boost", "tsundere"] });
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: Some(metadata.clone()),
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(m, Some(metadata));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_metadata_default_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000005A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(m.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_persists_metadata_with_tier(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000006A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let metadata = serde_json::json!({
+            "prompt_traits": ["nsfw_boost"],
+            "tier": "gold"
+        });
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "hi".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: None,
+            metadata: Some(metadata.clone()),
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        let m: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(m, Some(metadata));
     }
 }
