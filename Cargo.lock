@@ -484,6 +484,7 @@ dependencies = [
  "bs58",
  "chrono",
  "eros-engine-core",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sqlx",
