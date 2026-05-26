@@ -1,7 +1,7 @@
 # Error Fallback Config Design
 
-**Spec:** 2026-05-26  
-**Status:** implemented (v0.5.0 Bundle B)  
+**Spec:** 2026-05-26
+**Status:** implemented (v0.5.0 Bundle B)
 **Crates:** `eros-engine-store`, `eros-engine-server`
 
 ---

@@ -18,3 +18,17 @@ CREATE TABLE engine.error_handling_config (
 INSERT INTO engine.error_handling_config (kind, payload) VALUES
   ('chat_stream_failure_fallback_phrases',
    '["huh?","hm?","...","oh?","mhm","ok","👀","😅","say again?","wait what?"]'::jsonb);
+
+-- Supabase lockdown (mirror of 0013) for the new table. Defense-in-depth
+-- if a Supabase deployment ever exposes the `engine` schema via PostgREST.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON engine.error_handling_config FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON engine.error_handling_config FROM authenticated;
+    END IF;
+END
+$$;
+ALTER TABLE engine.error_handling_config ENABLE ROW LEVEL SECURITY;
