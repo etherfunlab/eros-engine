@@ -514,9 +514,99 @@ struct RunFilterOutcome {
     f_generation_id: Option<String>,
 }
 
-/// Run the output-filter LLM over `original`. `execute()` walks the (already
-/// depth-capped) chain; `ChatResponse.model` reports the model served. Returns
-/// `RunFilterOutcome` on success. `None` on error/timeout/empty.
+// ── Output validity gate ─────────────────────────────────────────────────────
+
+/// Refusal phrases checked in the leading [`REFUSAL_HEAD_SCAN_CHARS`] chars
+/// of the filter output.  When any prefix matches, the call is treated as a
+/// model refusal regardless of HTTP status.
+const REFUSAL_PATTERNS_HEAD: &[&str] = &[
+    // Chinese refusals — observed in production from gpt-4.1-nano
+    "抱歉，我无法",
+    "抱歉，我不能",
+    "对不起，我无法",
+    "对不起，我不能",
+    "抱歉，无法",
+    "对不起，无法",
+    "很抱歉，我无法",
+    "很抱歉，我不能",
+    // English refusals — standard OpenAI/Anthropic apology shapes
+    "I'm sorry, but I can't",
+    "I'm sorry, but I cannot",
+    "I cannot rewrite",
+    "I can't rewrite",
+    "I cannot help",
+    "I can't help",
+    "I won't be able to",
+    "I'm not able to",
+    "I am not able to",
+    "As an AI",
+    "I apologize, but",
+    "Sorry, I can't",
+    "Sorry, I cannot",
+    "Unfortunately, I can't",
+    "Unfortunately, I cannot",
+];
+
+/// Refusal verbs used in the short-response branch: if the total response is
+/// shorter than [`MIN_FILTERED_OUTPUT_CHARS`] and contains any of these
+/// anywhere in the text, it is treated as a refusal rather than just too-short.
+const REFUSAL_SHORT_VERBS: &[&str] = &[
+    "无法", "不能", "拒绝", "won't", "cannot", "can't", "unable", "refuse",
+];
+
+/// How many Unicode characters to scan from the start of the response when
+/// checking [`REFUSAL_PATTERNS_HEAD`].
+const REFUSAL_HEAD_SCAN_CHARS: usize = 120;
+
+/// Minimum character count for a valid filter output.  A real rewrite is at
+/// least this long.  Responses shorter than this threshold are either flagged
+/// as `"refusal_pattern"` (if a refusal verb appears) or `"too_short"`.
+const MIN_FILTERED_OUTPUT_CHARS: usize = 80;
+
+/// Check whether a filter LLM response should be rejected by the validity gate.
+///
+/// Returns `Some(reason_label)` when the output is invalid, `None` when valid.
+/// The label is a stable lowercase ASCII string used for log fields:
+/// - `"content_filter"` — `finish_reason == "content_filter"` (Gemini/OpenAI safety block)
+/// - `"refusal_pattern"` — refusal phrase found in the head, or short text with a refusal verb
+/// - `"too_short"` — text is shorter than [`MIN_FILTERED_OUTPUT_CHARS`] with no refusal verb
+///
+/// Checks are ordered cheapest-first:
+/// 1. `finish_reason`
+/// 2. Refusal pattern in head (first `REFUSAL_HEAD_SCAN_CHARS` chars)
+/// 3. Short-text checks (refusal-verb-or-too-short)
+fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&'static str> {
+    if finish_reason == Some("content_filter") {
+        return Some("content_filter");
+    }
+    let total_chars = text.chars().count();
+    let head: String = text.chars().take(REFUSAL_HEAD_SCAN_CHARS).collect();
+    for pat in REFUSAL_PATTERNS_HEAD {
+        if head.contains(pat) {
+            return Some("refusal_pattern");
+        }
+    }
+    if total_chars < MIN_FILTERED_OUTPUT_CHARS {
+        for verb in REFUSAL_SHORT_VERBS {
+            if text.contains(verb) {
+                return Some("refusal_pattern");
+            }
+        }
+        return Some("too_short");
+    }
+    None
+}
+
+// ── run_output_filter ────────────────────────────────────────────────────────
+
+/// Per-model timeout for a single filter LLM call.
+const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run the output-filter LLM over `original`, walking the (already
+/// depth-capped) fallback chain one model at a time.  After each successful
+/// HTTP 200 response, `filter_output_invalidity` is applied; on failure the
+/// next model is tried.  Returns `None` when the whole chain exhausts (callers
+/// fall open and emit the original reply).
 async fn run_output_filter(
     state: &AppState,
     f: &eros_engine_llm::model_config::ResolvedOutputFilter,
@@ -524,65 +614,62 @@ async fn run_output_filter(
 ) -> Option<RunFilterOutcome> {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let f_client_msg_id = format!("f_{}", Ulid::new());
-    let req = ChatRequest {
-        model: f.model.clone(),
-        fallback_model: f.fallback_model.clone(),
-        messages: vec![
-            ChatMessage {
-                role: "system".into(),
-                content: f.filter_prompt.clone(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: original.to_string(),
-            },
-        ],
-        temperature: f.temperature as f32,
-        max_tokens: f.max_tokens,
-        reasoning: f.reasoning.clone(),
-        ..Default::default()
-    };
-    const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-    match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
-        Ok(Ok(resp)) => {
-            super::log_openrouter_usage("chat_output_filter", None, &resp);
-            let out = resp.reply.trim().to_string();
-            if out.is_empty() {
-                return None;
+    let chain: Vec<String> = std::iter::once(f.model.clone())
+        .chain(f.fallback_model.iter().cloned())
+        .collect();
+    for (idx, model_id) in chain.iter().enumerate() {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: f.filter_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: original.to_string(),
+                },
+            ],
+            temperature: f.temperature as f32,
+            max_tokens: f.max_tokens,
+            reasoning: f.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "filter: model error; walking to next");
+                continue;
             }
-            let served = resp.model.clone();
-            let chain = std::iter::once(f.model.as_str())
-                .chain(f.fallback_model.iter().map(String::as_str));
-            let retries_filter = served
-                .as_deref()
-                .and_then(|s| {
-                    chain
-                        .enumerate()
-                        .find(|(_, m)| *m == s)
-                        .map(|(i, _)| i as u32)
-                })
-                .unwrap_or(0);
-            // Falling back to f.model when the response omits the served model is
-            // safe: that is the model we requested, and OpenRouter only omits it
-            // on error paths (which we have already excluded via .reply.is_empty()).
-            let filter_model = served.unwrap_or_else(|| f.model.clone());
-            Some(RunFilterOutcome {
-                filtered_text: out,
-                retries_filter,
-                filter_model,
-                f_client_msg_id,
-                f_generation_id: resp.generation_id,
-            })
+            Err(_) => {
+                tracing::warn!(model = %model_id, "filter: model timeout; walking to next");
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_output_filter", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if let Some(reason) = filter_output_invalidity(&text, resp.finish_reason.as_deref()) {
+            tracing::warn!(
+                model = %model_id,
+                invalidity = %reason,
+                "filter: output failed validity gate; walking to next model"
+            );
+            continue;
         }
-        Ok(Err(e)) => {
-            tracing::warn!("output filter LLM failed: {e}");
-            None
-        }
-        Err(_) => {
-            tracing::warn!("output filter timed out");
-            None
-        }
+        // Falling back to model_id when the response omits the served model is
+        // safe: that is the model we requested, and OpenRouter only omits it
+        // on error paths (which we have already excluded via the validity gate).
+        let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
+        return Some(RunFilterOutcome {
+            filtered_text: text,
+            retries_filter: idx as u32,
+            filter_model,
+            f_client_msg_id,
+            f_generation_id: resp.generation_id,
+        });
     }
+    None
 }
 
 /// Try to emit a pseudo-ghost on chain exhaustion.
@@ -1723,6 +1810,99 @@ data: [DONE]\n\n";
         assert_eq!(extract_text(BeforeExtract, "orig", "filt"), "filt");
     }
 
+    // ── filter_output_invalidity unit tests ──────────────────────────────────
+
+    #[test]
+    fn filter_output_invalidity_detects_chinese_refusal_in_head() {
+        let text = "抱歉，我无法协助完成您的请求。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "Chinese refusal in head must be detected"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_english_refusal_in_head() {
+        let text = "I'm sorry, but I can't rewrite this content.";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "English refusal in head must be detected"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_content_filter_finish_reason() {
+        // Long text that would otherwise pass — finish_reason overrides.
+        let text = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，记得那些再也回不去的日子。";
+        assert_eq!(
+            filter_output_invalidity(text, Some("content_filter")),
+            Some("content_filter"),
+            "content_filter finish_reason must be detected regardless of text length"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_short_response_with_refusal_verb() {
+        let text = "我无法。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "short text containing refusal verb must be flagged as refusal_pattern"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_short_response_without_refusal_verb() {
+        // A genuinely short clean rewrite — still fails the length gate.
+        let text = "她笑了。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("too_short"),
+            "short text with no refusal verb must be flagged as too_short"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_passes_long_clean_rewrite() {
+        // 200+ chars, finish_reason = "stop", no refusal pattern.
+        let text = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，记得那些再也回不去的日子。风轻轻吹过，带走了她的叹息，也带走了那些沉甸甸的思念。";
+        assert_eq!(
+            filter_output_invalidity(text, Some("stop")),
+            None,
+            "long clean rewrite with stop finish_reason must pass the gate"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_passes_when_refusal_word_appears_late() {
+        // Regression guard: a clean rewrite that incidentally contains "won't"
+        // well past character 120 must NOT be flagged.  The prefix must be
+        // >= REFUSAL_HEAD_SCAN_CHARS (120) chars so "won't" lands outside the
+        // scan window.  The full text must also be >= MIN_FILTERED_OUTPUT_CHARS
+        // (80) so it does not hit the too_short branch.
+        let prefix = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，那些记忆再也不会消逝。她告诉自己要坚强，岁月会带走一切，但那段回忆会永远珍藏在心底，无论时光如何流逝，她都不会忘记那些岁月里的每一天每一刻。";
+        // suffix contains "won't" deep in the text — past the 120-char head window.
+        let text = format!("{prefix}但她won't忘记那段岁月，那是她最珍贵的时光，永远珍藏心底。");
+        // Verify the premise: prefix is beyond the scan window.
+        let prefix_chars = prefix.chars().count();
+        assert!(
+            prefix_chars >= REFUSAL_HEAD_SCAN_CHARS,
+            "prefix must be >= {REFUSAL_HEAD_SCAN_CHARS} chars so won't is outside the head window; got {prefix_chars}"
+        );
+        assert!(
+            text.chars().count() >= MIN_FILTERED_OUTPUT_CHARS,
+            "full text must be >= {MIN_FILTERED_OUTPUT_CHARS} chars to bypass too_short; got {}",
+            text.chars().count()
+        );
+        assert_eq!(
+            filter_output_invalidity(&text, Some("stop")),
+            None,
+            "refusal word past char 120 must not trigger refusal_pattern"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn filtered_turn_emits_filtered_and_persists_filtered(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -1735,10 +1915,13 @@ data: [DONE]\n\n";
         // The output filter uses the NON-streaming `execute()` path, so its mock
         // must return a JSON completion object (choices[].message.content), not
         // SSE. `model:"fast/m"` makes retries_filter resolve to the primary (0).
+        // The filtered content must be >= MIN_FILTERED_OUTPUT_CHARS (80) chars to
+        // pass the validity gate (a real rewrite is always that long).
+        let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
         let filt_body = serde_json::json!({
             "id": "gf", "model": "fast/m",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "FILT"}}],
+            "choices": [{"message": {"content": filt_text}}],
         });
         // Route the two calls by the MODEL ID present in the request body so the two
         // mocks are MUTUALLY EXCLUSIVE (mount order / precedence cannot matter):
@@ -1823,7 +2006,7 @@ data: [DONE]\n\n";
             .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
         {
             assert!(
-                deltas.contains("FILT"),
+                deltas.contains("FILT_START"),
                 "client must see filtered text, got {deltas:?}"
             );
             assert!(
@@ -1848,7 +2031,10 @@ data: [DONE]\n\n";
             let row = sqlx::query_scalar::<_, String>(
                 "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
                 .bind(session_id).fetch_one(&pool).await.unwrap();
-            assert_eq!(row, "FILT");
+            assert!(
+                row.contains("FILT_START"),
+                "persisted content must be the filtered text, got {row:?}"
+            );
         }
     }
 
