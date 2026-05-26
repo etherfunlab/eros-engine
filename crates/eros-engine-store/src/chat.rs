@@ -69,6 +69,12 @@ pub struct ChatMessageSlim {
     /// Client-supplied message id forwarded during streaming (idempotency
     /// key). NULL for rows that never carried one (e.g. assistant turns).
     pub client_msg_id: Option<String>,
+    /// Structured tip amount extracted from `metadata->>'tips_amount_usd'`.
+    /// Present on `role='gift_user'` rows that carry tip metadata; NULL on
+    /// all other rows. Lets BFF / FE render tips as a structured field
+    /// instead of parsing the `(打赏 $X)` content marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tips_amount_usd: Option<f64>,
 }
 
 pub struct ChatRepo<'a> {
@@ -227,7 +233,9 @@ impl<'a> ChatRepo<'a> {
         offset: i64,
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
-            "SELECT id, role, content, sent_at, client_msg_id FROM engine.chat_messages \
+            "SELECT id, role, content, sent_at, client_msg_id, \
+                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd \
+             FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
              LIMIT $2 OFFSET $3",
