@@ -289,6 +289,7 @@ fn drive_chat_burst(
                         user_message_id,
                         frame_action,
                         persist_action,
+                        plan_action,
                         &trait_tags,
                         &tier,
                         fallback_retries,
@@ -299,7 +300,19 @@ fn drive_chat_burst(
                     )
                     .await
                     {
-                        Some(frames) => {
+                        Some((frames, produced)) => {
+                            // Replace any truncated-attempt entries already in
+                            // outcome.produced with just the pseudo-ghost — so
+                            // post_process (memory / affinity / insight) runs on
+                            // the safe fallback phrase the user actually saw,
+                            // NOT on the failed partial outputs from earlier
+                            // chain attempts. Filtered mode never pushed to
+                            // produced anyway, so clear() is a no-op there.
+                            {
+                                let mut o = outcome.lock().unwrap();
+                                o.produced.clear();
+                                o.produced.push(produced);
+                            }
                             for f in frames { yield f; }
                         }
                         None => {
@@ -365,6 +378,7 @@ fn drive_chat_burst(
                         user_message_id,
                         frame_action,
                         persist_action,
+                        plan_action,
                         &trait_tags,
                         &tier,
                         fallback_retries,
@@ -374,7 +388,19 @@ fn drive_chat_burst(
                     )
                     .await
                     {
-                        Some(frames) => {
+                        Some((frames, produced)) => {
+                            // Replace any truncated-attempt entries already in
+                            // outcome.produced with just the pseudo-ghost — so
+                            // post_process (memory / affinity / insight) runs on
+                            // the safe fallback phrase the user actually saw,
+                            // NOT on the failed partial outputs from earlier
+                            // chain attempts. Filtered mode never pushed to
+                            // produced anyway, so clear() is a no-op there.
+                            {
+                                let mut o = outcome.lock().unwrap();
+                                o.produced.clear();
+                                o.produced.push(produced);
+                            }
                             for f in frames { yield f; }
                         }
                         None => {
@@ -580,11 +606,15 @@ async fn build_stream_failure_pseudo_ghost(
     user_message_id: Uuid,
     frame_action: FrameActionType,
     persist_action: &str,
+    plan_action: ActionType,
     trait_tags: &[String],
     tier: &Option<String>,
     fallback_retries: u32,
     continues_from_ulid: Option<Ulid>,
-) -> Option<Vec<ProtocolFrame>> {
+) -> Option<(
+    Vec<ProtocolFrame>,
+    crate::pipeline::post_process::ProducedMessage,
+)> {
     let repo = ErrorHandlingRepo { pool };
     let phrase = match repo.pick_chat_stream_fallback_phrase().await {
         Ok(Some(p)) => p,
@@ -640,7 +670,7 @@ async fn build_stream_failure_pseudo_ghost(
         // Still emit the frames — the row persisting is best-effort.
     }
 
-    Some(vec![
+    let frames = vec![
         ProtocolFrame::Meta {
             message_id: ulid_string(msg_ulid),
             action_type: frame_action,
@@ -649,7 +679,7 @@ async fn build_stream_failure_pseudo_ghost(
         },
         ProtocolFrame::Delta {
             message_id: ulid_string(msg_ulid),
-            content: phrase,
+            content: phrase.clone(),
         },
         ProtocolFrame::Done {
             message_id: ulid_string(msg_ulid),
@@ -657,7 +687,13 @@ async fn build_stream_failure_pseudo_ghost(
             usage: None,
             generation_id: None,
         },
-    ])
+    ];
+    let produced = crate::pipeline::post_process::ProducedMessage {
+        message_id: msg_uuid,
+        full_text: phrase,
+        action: plan_action,
+    };
+    Some((frames, produced))
 }
 
 /// All persisted bits needed to drive a streaming burst.
