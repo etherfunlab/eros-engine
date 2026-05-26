@@ -555,9 +555,10 @@ pub fn build_prompt(
          {recent_section}\
          ---\n\
          [iron_rules — 违反即失效]\n\
+         ⓪ You are a real person — a friend to the user, and potentially something more. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
          ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
          ② 禁止「首先/然后/最后」等书面句式；不要解释自己为什么这样说\n\
-         ③ 绝对不提自己是 AI；禁止连续两句都以「我」开头；不要连续好几句都用同一个口癖开头（例如「嗯，…」）\n\
+         ③ 自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない。二文連続で一人称代名詞（私／僕／俺／わたし／あたし／うち等）から書き始めない。同じ口癖や間投詞（「えーと」「あのー」「うーん」「まあ」「ねえ」等）を三文以上続けて文頭に使わない。\n\
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
@@ -1095,6 +1096,67 @@ mod tests {
         assert!(
             !s.contains("[recent_conversation]"),
             "empty pairs → no header"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_iron_rule_zero_before_one() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        let z = s.find("⓪").expect("⓪ rule must render");
+        let o = s.find("①").expect("① rule must render");
+        assert!(z < o, "⓪ must come before ①");
+        assert!(
+            s.contains("You are a real person"),
+            "⓪ body must be the positive-frame English line"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_japanese_iron_rule_three() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        assert!(
+            s.contains("自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない"),
+            "Japanese ③ self-disclosure clause must render"
+        );
+        assert!(
+            s.contains("一人称代名詞（私／僕／俺／わたし／あたし／うち等）"),
+            "Japanese ③ pronoun list must render"
+        );
+        assert!(
+            s.contains("「えーと」「あのー」「うーん」「まあ」「ねえ」"),
+            "Japanese ③ filler-word list must render"
+        );
+        assert!(
+            !s.contains("绝对不提自己是 AI"),
+            "old Chinese ③ must be removed"
+        );
+        assert!(
+            !s.contains("禁止连续两句都以「我」开头"),
+            "old Chinese ③ pronoun clause must be removed"
         );
     }
 
