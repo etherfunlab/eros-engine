@@ -1041,9 +1041,14 @@ pub fn replay_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
-                    model: display_override
-                        .as_ref()
-                        .and_then(|d| d.display(row.model.as_deref().unwrap_or_default())),
+                    // When the persisted row carries no model (e.g. the
+                    // pseudo-ghost fallback path), the live stream emitted
+                    // model: None — preserve that on replay so idempotent
+                    // retries are wire-identical regardless of any
+                    // display_override config.
+                    model: row.model.as_deref().and_then(|m| {
+                        display_override.as_ref().and_then(|d| d.display(m))
+                    }),
                     continues_from: prev_ulid.map(ulid_string),
                 };
                 if !row.content.is_empty() {
