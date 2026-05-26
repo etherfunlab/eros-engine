@@ -61,6 +61,11 @@ pub struct ChatResponse {
     /// OpenRouter `usage` block — tokens / cost. Opaque to engine;
     /// caller deserialises as needed.
     pub usage: Option<serde_json::Value>,
+    /// `finish_reason` from the first choice in the wire response.
+    /// `None` when the upstream omits it (most normal completions).
+    /// Present as `"content_filter"` when Gemini/OpenAI mid-response
+    /// safety truncation fires; callers can gate on this value.
+    pub finish_reason: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -94,6 +99,8 @@ struct WireMessage {
 #[derive(Debug, Deserialize)]
 struct WireChoice {
     message: WireMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,16 +367,18 @@ impl OpenRouterClient {
         }
 
         let parsed: WireResponse = resp.json().await?;
-        let raw = parsed
-            .choices
-            .first()
+        let first_choice = parsed.choices.into_iter().next();
+        let raw = first_choice
+            .as_ref()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        let finish_reason = first_choice.and_then(|c| c.finish_reason);
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
             generation_id: parsed.id,
             model: parsed.model,
             usage: parsed.usage,
+            finish_reason,
         })
     }
 
