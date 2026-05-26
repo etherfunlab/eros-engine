@@ -504,6 +504,7 @@ pub(super) async fn build_reply_request(
         &plan.context_hints,
         &kept_traits,
         affinity_scope,
+        &[], // recent_turns — populated in Task 7
     );
 
     if let Event::UserMessage {
@@ -578,6 +579,7 @@ pub(super) async fn build_gift_request(
         &plan.context_hints,
         &[],
         eros_engine_core::scope::AffinityScope::full(),
+        &[], // recent_turns — populated in Task 7
     );
 
     Ok((

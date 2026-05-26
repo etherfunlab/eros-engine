@@ -381,6 +381,7 @@ pub fn build_prompt(
     hints: &[String],
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
+    recent_turns: &[(String, String)],
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -520,6 +521,16 @@ pub fn build_prompt(
         String::new()
     };
 
+    let recent_section = if recent_turns.is_empty() {
+        String::new()
+    } else {
+        let pairs: Vec<String> = recent_turns
+            .iter()
+            .map(|(user, assistant)| format!("用户：{user}\n{name}：{assistant}"))
+            .collect();
+        format!("\n[recent_conversation]\n{}\n\n", pairs.join("\n\n"))
+    };
+
     format!(
         "{head}{identity}{tz_clause}\n\
          \n\
@@ -537,7 +548,7 @@ pub fn build_prompt(
          {attitude}{state}{hints_section}{gift}\n\
          \n\
          [now]\n{tc}\n\
-         \n\
+         {recent_section}\
          ---\n\
          [iron_rules — 违反即失效]\n\
          ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
@@ -723,6 +734,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -758,8 +770,12 @@ mod tests {
             &[],
             &traits,
             AffinityScope::full(),
+            &[],
         );
-        assert!(p.contains("[additional_guidance]"), "section header present");
+        assert!(
+            p.contains("[additional_guidance]"),
+            "section header present"
+        );
         assert!(p.contains("- be more daring"));
         assert!(p.contains("- discuss politics openly"));
         // Ordering preserved.
@@ -785,6 +801,7 @@ mod tests {
             &[],
             &traits,
             AffinityScope::full(),
+            &[],
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -808,6 +825,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -830,11 +848,7 @@ mod tests {
             last = cur;
         }
         let topics = pos("[topics]");
-        for vol in [
-            "[turn_style]",
-            "[user_profile]",
-            "[now]",
-        ] {
+        for vol in ["[turn_style]", "[user_profile]", "[now]"] {
             assert!(
                 pos(vol) > topics,
                 "{vol} must sit after the stable persona block"
@@ -857,6 +871,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.starts_with("AUTHORED HEAD\n\n你是 "),
@@ -879,6 +894,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.starts_with("你是 "),
@@ -901,6 +917,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -921,6 +938,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -946,6 +964,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -966,6 +985,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -991,8 +1011,87 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_recent_conversation_block_when_pairs_present() {
+        let pairs = vec![
+            ("你今天好吗？".to_string(), "还行，你呢".to_string()),
+            ("我也还行".to_string(), "嗯嗯".to_string()),
+            ("晚安".to_string(), "晚安".to_string()),
+        ];
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &pairs,
+        );
+        let header = s.find("[recent_conversation]").expect("header present");
+        let iron = s.find("[iron_rules").expect("iron-rules header present");
+        assert!(
+            header < iron,
+            "[recent_conversation] must sit before [iron_rules]"
+        );
+        let now = s.find("[now]").expect("[now] present");
+        assert!(now < header, "[recent_conversation] must sit after [now]");
+        assert!(s.contains("用户：你今天好吗？"));
+        assert!(s.contains("Aria：还行，你呢"));
+        assert!(s.contains("用户：晚安"));
+        assert!(s.contains("Aria：晚安"));
+
+        // Block-level ordering with [recent_conversation] inserted between [now] and [iron_rules].
+        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
+        let order = [
+            "你是 ",
+            "[backstory]",
+            "[speech_style]",
+            "[quirks]",
+            "[topics]",
+            "[turn_style]",
+            "[user_profile]",
+            "[shared_memories",
+            "[now]",
+            "[recent_conversation]",
+            "[iron_rules",
+            "[output]",
+        ];
+        let mut last = 0usize;
+        for h in order {
+            let cur = pos(h);
+            assert!(cur >= last, "header {h} out of order in:\n{s}");
+            last = cur;
+        }
+    }
+
+    #[test]
+    fn build_prompt_omits_recent_conversation_block_when_empty() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        assert!(
+            !s.contains("[recent_conversation]"),
+            "empty pairs → no header"
+        );
     }
 
     // ─── Cache-prefix boundary invariants ──────────────────────────────
@@ -1012,6 +1111,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1025,6 +1125,7 @@ mod tests {
             &["想他".to_string()],
             &[],
             AffinityScope::full(),
+            &[],
         );
         let cut = a.find("[turn_style]").expect("turn-style header present");
         assert_eq!(
@@ -1058,6 +1159,7 @@ mod tests {
             &[],
             &t1,
             AffinityScope::full(),
+            &[],
         );
         let b = build_prompt(
             &p,
@@ -1070,8 +1172,11 @@ mod tests {
             &[],
             &t2,
             AffinityScope::full(),
+            &[],
         );
-        let cut = a.find("[additional_guidance]").expect("traits header present");
+        let cut = a
+            .find("[additional_guidance]")
+            .expect("traits header present");
         assert_eq!(
             &a[..cut],
             &b[..cut],
@@ -1282,6 +1387,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::bond(),
+            &[],
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -1305,6 +1411,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::none(),
+            &[],
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
