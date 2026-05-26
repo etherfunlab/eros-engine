@@ -36,6 +36,13 @@ pub struct BffHistoryEntry {
     pub role: String,
     pub content: String,
     pub sent_at: DateTime<Utc>,
+    /// Structured tip amount for `role='gift_user'` rows. Omitted from
+    /// response when None (`skip_serializing_if`). Lets clients render tips
+    /// at the right point in the timeline without parsing the `(打赏 $X)`
+    /// content marker. Spec:
+    /// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tips_amount_usd: Option<f64>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -126,6 +133,7 @@ async fn bff_get_history(
             role: r.role,
             content: r.content,
             sent_at: r.sent_at,
+            tips_amount_usd: r.tips_amount_usd,
         })
         .collect();
     let total = messages.len();
@@ -181,6 +189,7 @@ async fn bff_start_chat(
                 role: r.role,
                 content: r.content,
                 sent_at: r.sent_at,
+                tips_amount_usd: r.tips_amount_usd,
             })
             .collect()
     };
@@ -607,6 +616,70 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_exposes_tips_amount_usd_on_gift_user_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'gift_user', '(打赏 $20)', \
+                     '{\"tips_amount_usd\": 20.0, \"tier\": \"gold\", \"prompt_traits\": [\"nsfw\"]}'::jsonb, \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'hello', '{\"tier\": \"silver\"}'::jsonb, now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+
+        let tip = messages
+            .iter()
+            .find(|m| m["role"] == "gift_user")
+            .expect("tip row");
+        assert_eq!(tip["tips_amount_usd"], json!(20.0));
+
+        let normal = messages
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("user row");
+        assert!(
+            normal.get("tips_amount_usd").is_none(),
+            "non-tip user row must omit tips_amount_usd; got {normal}"
+        );
+
+        // BFF MUST NOT leak any metadata key other than the typed tips_amount_usd
+        // extract. Spec §3.4: tier / prompt_traits are audit-only on the DB side.
+        for m in messages {
+            assert!(
+                m.get("metadata").is_none(),
+                "BFF must never expose raw metadata; got {m}"
+            );
+            assert!(
+                m.get("tier").is_none(),
+                "BFF must not surface tier from metadata; got {m}"
+            );
+            assert!(
+                m.get("prompt_traits").is_none(),
+                "BFF must not surface prompt_traits from metadata; got {m}"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

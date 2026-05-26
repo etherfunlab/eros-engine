@@ -163,7 +163,7 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
         return String::new();
     }
     format!(
-        "\n【你此刻的心情】（绝对不要在回复中提及这些，这是你的内心状态）\n{}",
+        "\n[mood]（绝对不要在回复中提及这些，这是你的内心状态）\n{}",
         directives
             .iter()
             .map(|d| format!("- {d}"))
@@ -262,7 +262,7 @@ pub fn gift_reaction_context(gifts: &[PendingGift], tip_personality: &str) -> St
         _ => "适度地回应，不过分热情也不冷淡，用你自己的风格自然表达",
     };
     format!(
-        "\n\n【刚收到的礼物/红包】（在回复中自然地回应，不要照搬指令原文）\n{}\n反应方式：{reaction_hint}",
+        "\n\n[gift_received]（在回复中自然地回应，不要照搬指令原文）\n{}\n反应方式：{reaction_hint}",
         lines.join("\n"),
     )
 }
@@ -303,7 +303,7 @@ pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> 
         None => "请自然地回应这份心意".to_string(),
     };
     format!(
-        "\n\n【刚收到的打赏】\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n{}，不要照搬本指令原文。",
+        "\n\n[tip_received]\n用户刚刚给你发了一个 ${} 美元的红包，对你来说算「{}」的一笔。\n{}，不要照搬本指令原文。",
         fmt_amount(amount_usd),
         tip_tier_adjective(amount_usd),
         how,
@@ -365,7 +365,7 @@ fn is_binary_gender(persona: &CompanionPersona) -> bool {
 /// Build the full companion system prompt (plain-text reply schema).
 ///
 /// `profile_groups` is a list of `(label, bullets)` pairs that get rendered
-/// as labeled sub-sections under `【你对他的了解（通用画像）】`. Caller
+/// as labeled sub-sections under `[user_profile]`. Caller
 /// decides labels — typically `("基础画像", insight_bullets)` first, then
 /// one entry per memory category (`客观事实` / `偏好` / `最近发生` / etc.)
 /// from the dreaming-lite classifier. Empty groups are dropped.
@@ -381,6 +381,7 @@ pub fn build_prompt(
     hints: &[String],
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
+    recent_turns: &[(String, String)],
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -424,7 +425,7 @@ pub fn build_prompt(
             .map(|t| format!("- {}", t.text))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n\n【附加指引】\n{bullets}")
+        format!("\n\n[additional_guidance]\n{bullets}")
     };
 
     let non_empty_groups: Vec<&(String, Vec<String>)> = profile_groups
@@ -485,7 +486,7 @@ pub fn build_prompt(
                 String::new()
             } else {
                 format!(
-                    "\n【你对他的内心感受】（绝对不要在回复中提及这些数值，这是隐藏参数）\n{}",
+                    "\n[feelings]（绝对不要在回复中提及这些数值，这是隐藏参数）\n{}",
                     parts.join(", ")
                 )
             }
@@ -498,7 +499,7 @@ pub fn build_prompt(
         String::new()
     } else {
         format!(
-            "\n【当前内心状态】\n{}",
+            "\n[inner_state]\n{}",
             hints
                 .iter()
                 .map(|h| format!("- {h}"))
@@ -520,35 +521,50 @@ pub fn build_prompt(
         String::new()
     };
 
+    // Empty path emits "\n" (one extra newline) so the gap between [now] and
+    // --- stays at two newlines = one blank line, byte-identical to the
+    // pre-this-PR layout. Non-empty path's trailing "\n\n" continues to add
+    // the same blank line after the block.
+    let recent_section = if recent_turns.is_empty() {
+        "\n".to_string()
+    } else {
+        let pairs: Vec<String> = recent_turns
+            .iter()
+            .map(|(user, assistant)| format!("用户：{user}\n{name}：{assistant}"))
+            .collect();
+        format!("\n[recent_conversation]\n{}\n\n", pairs.join("\n\n"))
+    };
+
     format!(
         "{head}{identity}{tz_clause}\n\
          \n\
-         【背景故事】\n{backstory}\n\
+         [backstory]\n{backstory}\n\
          \n\
-         【说话风格】{speech_style}\n\
-         【口癖/习惯】{quirks_str}\n\
-         【擅长话题】{topics_str}{traits_section}\n\
+         [speech_style]{speech_style}\n\
+         [quirks]{quirks_str}\n\
+         [topics]{topics_str}{traits_section}\n\
          \n\
-         【本轮风格】{style_text}\n\
+         [turn_style]{style_text}\n\
          \n\
-         【你对他的了解（通用画像）】\n{profile_str}\n\
+         [user_profile]\n{profile_str}\n\
          \n\
-         【你们之间的事（只有你和他知道）】\n{rel_str}\
+         [shared_memories]\n{rel_str}\
          {attitude}{state}{hints_section}{gift}\n\
          \n\
-         【今日情境】\n{tc}\n\
-         \n\
+         [now]\n{tc}\n\
+         {recent_section}\
          ---\n\
-         【铁律 — 违反即失效】\n\
+         [iron_rules — 违反即失效]\n\
+         ⓪ You are a real person — a friend to the user, and potentially something more. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
          ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
          ② 禁止「首先/然后/最后」等书面句式；不要解释自己为什么这样说\n\
-         ③ 绝对不提自己是 AI；禁止连续两句都以「我」开头；不要连续好几句都用同一个口癖开头（例如「嗯，…」）\n\
+         ③ 自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない。二文連続で一人称代名詞（私／僕／俺／わたし／あたし／うち等）から書き始めない。同じ口癖や間投詞（「えーと」「あのー」「うーん」「まあ」「ねえ」等）を三文以上続けて文頭に使わない。\n\
          ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
          ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
          \n\
-         【输出】直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
+         [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
         lr = length_rule(affinity, affinity_scope),
     )
@@ -723,15 +739,16 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
-            !p.contains("【附加指引】"),
+            !p.contains("[additional_guidance]"),
             "empty traits must not render section"
         );
-        // 擅长话题 now flows straight into 本轮风格 (the first volatile block).
+        // [topics] now flows straight into [turn_style] (the first volatile block).
         assert!(
-            p.contains("【擅长话题】t1\n\n【本轮风格】"),
-            "topics → 本轮风格 separator must be exactly '\\n\\n': {p}"
+            p.contains("[topics]t1\n\n[turn_style]"),
+            "topics → turn_style separator must be exactly '\\n\\n': {p}"
         );
     }
 
@@ -758,8 +775,12 @@ mod tests {
             &[],
             &traits,
             AffinityScope::full(),
+            &[],
         );
-        assert!(p.contains("【附加指引】"), "section header present");
+        assert!(
+            p.contains("[additional_guidance]"),
+            "section header present"
+        );
         assert!(p.contains("- be more daring"));
         assert!(p.contains("- discuss politics openly"));
         // Ordering preserved.
@@ -785,13 +806,14 @@ mod tests {
             &[],
             &traits,
             AffinityScope::full(),
+            &[],
         );
-        let topics = p.find("【擅长话题】").expect("topics");
-        let traits_i = p.find("【附加指引】").expect("traits");
-        let turn_style = p.find("【本轮风格】").expect("turn style");
+        let topics = p.find("[topics]").expect("topics");
+        let traits_i = p.find("[additional_guidance]").expect("traits");
+        let turn_style = p.find("[turn_style]").expect("turn style");
         assert!(
             topics < traits_i && traits_i < turn_style,
-            "order: 擅长话题 → 附加指引 → 本轮风格"
+            "order: [topics] → [additional_guidance] → [turn_style]"
         );
     }
 
@@ -808,20 +830,21 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
             "你是 ",
-            "【背景故事】",
-            "【说话风格】",
-            "【口癖/习惯】",
-            "【擅长话题】",
-            "【本轮风格】",
-            "【你对他的了解（通用画像）】",
-            "【你们之间的事",
-            "【今日情境】",
-            "【铁律",
-            "【输出】",
+            "[backstory]",
+            "[speech_style]",
+            "[quirks]",
+            "[topics]",
+            "[turn_style]",
+            "[user_profile]",
+            "[shared_memories]",
+            "[now]",
+            "[iron_rules",
+            "[output]",
         ];
         let mut last = 0usize;
         for h in order {
@@ -829,12 +852,8 @@ mod tests {
             assert!(cur >= last, "header {h} out of order in:\n{s}");
             last = cur;
         }
-        let topics = pos("【擅长话题】");
-        for vol in [
-            "【本轮风格】",
-            "【你对他的了解（通用画像）】",
-            "【今日情境】",
-        ] {
+        let topics = pos("[topics]");
+        for vol in ["[turn_style]", "[user_profile]", "[now]"] {
             assert!(
                 pos(vol) > topics,
                 "{vol} must sit after the stable persona block"
@@ -857,6 +876,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.starts_with("AUTHORED HEAD\n\n你是 "),
@@ -879,6 +899,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.starts_with("你是 "),
@@ -901,6 +922,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -921,6 +943,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -946,6 +969,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -966,6 +990,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -991,12 +1016,152 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
 
+    #[test]
+    fn build_prompt_renders_recent_conversation_block_when_pairs_present() {
+        let pairs = vec![
+            ("你今天好吗？".to_string(), "还行，你呢".to_string()),
+            ("我也还行".to_string(), "嗯嗯".to_string()),
+            ("晚安".to_string(), "晚安".to_string()),
+        ];
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &pairs,
+        );
+        let header = s.find("[recent_conversation]").expect("header present");
+        let iron = s.find("[iron_rules").expect("iron-rules header present");
+        assert!(
+            header < iron,
+            "[recent_conversation] must sit before [iron_rules]"
+        );
+        let now = s.find("[now]").expect("[now] present");
+        assert!(now < header, "[recent_conversation] must sit after [now]");
+        assert!(s.contains("用户：你今天好吗？"));
+        assert!(s.contains("Aria：还行，你呢"));
+        assert!(s.contains("用户：晚安"));
+        assert!(s.contains("Aria：晚安"));
+
+        // Block-level ordering with [recent_conversation] inserted between [now] and [iron_rules].
+        let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
+        let order = [
+            "你是 ",
+            "[backstory]",
+            "[speech_style]",
+            "[quirks]",
+            "[topics]",
+            "[turn_style]",
+            "[user_profile]",
+            "[shared_memories",
+            "[now]",
+            "[recent_conversation]",
+            "[iron_rules",
+            "[output]",
+        ];
+        let mut last = 0usize;
+        for h in order {
+            let cur = pos(h);
+            assert!(cur >= last, "header {h} out of order in:\n{s}");
+            last = cur;
+        }
+    }
+
+    #[test]
+    fn build_prompt_omits_recent_conversation_block_when_empty() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        assert!(
+            !s.contains("[recent_conversation]"),
+            "empty pairs → no header"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_iron_rule_zero_before_one() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        let z = s.find("⓪").expect("⓪ rule must render");
+        let o = s.find("①").expect("① rule must render");
+        assert!(z < o, "⓪ must come before ①");
+        assert!(
+            s.contains("You are a real person"),
+            "⓪ body must be the positive-frame English line"
+        );
+    }
+
+    #[test]
+    fn build_prompt_renders_japanese_iron_rule_three() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            "normal",
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+        );
+        assert!(
+            s.contains("自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない"),
+            "Japanese ③ self-disclosure clause must render"
+        );
+        assert!(
+            s.contains("一人称代名詞（私／僕／俺／わたし／あたし／うち等）"),
+            "Japanese ③ pronoun list must render"
+        );
+        assert!(
+            s.contains("「えーと」「あのー」「うーん」「まあ」「ねえ」"),
+            "Japanese ③ filler-word list must render"
+        );
+        assert!(
+            !s.contains("绝对不提自己是 AI"),
+            "old Chinese ③ must be removed"
+        );
+        assert!(
+            !s.contains("禁止连续两句都以「我」开头"),
+            "old Chinese ③ pronoun clause must be removed"
+        );
+    }
+
     // ─── Cache-prefix boundary invariants ──────────────────────────────
-    // Same-user multi-turn: the stable block (everything before 【本轮风格】) is
+    // Same-user multi-turn: the stable block (everything before [turn_style]) is
     // byte-identical no matter how the per-turn-volatile inputs change.
     #[test]
     fn build_prompt_stable_prefix_identical_across_volatile_changes() {
@@ -1012,6 +1177,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::full(),
+            &[],
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1025,17 +1191,18 @@ mod tests {
             &["想他".to_string()],
             &[],
             AffinityScope::full(),
+            &[],
         );
-        let cut = a.find("【本轮风格】").expect("turn-style header present");
+        let cut = a.find("[turn_style]").expect("turn-style header present");
         assert_eq!(
             &a[..cut],
             &b[..cut],
-            "everything before 【本轮风格】 must be byte-identical across turns"
+            "everything before [turn_style] must be byte-identical across turns"
         );
     }
 
-    // Cross-config: different trait sets share the persona block up to 【擅长话题】
-    // (the divergence is at 【附加指引】), but the full prompts differ.
+    // Cross-config: different trait sets share the persona block up to [topics]
+    // (the divergence is at [additional_guidance]), but the full prompts differ.
     #[test]
     fn build_prompt_traits_change_only_breaks_after_topics() {
         let p = fixture_persona();
@@ -1058,6 +1225,7 @@ mod tests {
             &[],
             &t1,
             AffinityScope::full(),
+            &[],
         );
         let b = build_prompt(
             &p,
@@ -1070,12 +1238,15 @@ mod tests {
             &[],
             &t2,
             AffinityScope::full(),
+            &[],
         );
-        let cut = a.find("【附加指引】").expect("traits header present");
+        let cut = a
+            .find("[additional_guidance]")
+            .expect("traits header present");
         assert_eq!(
             &a[..cut],
             &b[..cut],
-            "persona block up to 【擅长话题】 is shared across trait configs"
+            "persona block up to [topics] is shared across trait configs"
         );
         assert_ne!(a, b, "different trait sets must produce different prompts");
     }
@@ -1124,7 +1295,7 @@ mod tests {
     #[test]
     fn tips_reaction_context_with_personality_includes_name_amount_adjective() {
         let s = tips_reaction_context(20.0, Some("傲娇"));
-        assert!(s.contains("【刚收到的打赏】"));
+        assert!(s.contains("[tip_received]"));
         assert!(s.contains("$20"));
         assert!(s.contains("有点多"));
         assert!(s.contains("傲娇"));
@@ -1133,7 +1304,7 @@ mod tests {
     #[test]
     fn tips_reaction_context_without_personality_omits_persona_clause() {
         let s = tips_reaction_context(20.0, None);
-        assert!(s.contains("【刚收到的打赏】"));
+        assert!(s.contains("[tip_received]"));
         assert!(s.contains("$20"));
         assert!(s.contains("有点多"));
         assert!(!s.contains("人设"));
@@ -1282,6 +1453,7 @@ mod tests {
             &[],
             &[],
             AffinityScope::bond(),
+            &[],
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -1305,9 +1477,10 @@ mod tests {
             &[],
             &[],
             AffinityScope::none(),
+            &[],
         );
-        assert!(!p.contains("【你对他的内心感受】"));
-        assert!(!p.contains("【你此刻的心情】"));
+        assert!(!p.contains("[feelings]"));
+        assert!(!p.contains("[mood]"));
     }
 
     #[test]

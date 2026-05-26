@@ -86,12 +86,6 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
-/// Maximum number of model attempts per streaming burst (= 1 primary + up to
-/// 2 fallbacks). Each attempt surfaces as a separate visible bubble; the
-/// frontend masks attempts beyond the first behind a "thinking" affordance, so
-/// a depth of 3 buys extra resilience without looking like a bug to users.
-pub const MAX_STREAM_FALLBACK_DEPTH: usize = 3;
-
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -99,6 +93,7 @@ use eros_engine_core::pde;
 use eros_engine_core::types::{ActionType, DecisionInput, Event};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::error_handling::ErrorHandlingRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::routes::companion::filter_usage_keys;
@@ -140,15 +135,19 @@ fn drive_chat_burst(
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
     trait_tags: Vec<String>, // requested prompt-trait tags (the turn's)
-    random_pass: bool,       // drawn once per turn by run_stream
+    tier: Option<String>,    // user's tier at message time; None omitted from metadata
+    memory_scope: eros_engine_core::scope::MemoryScope, // post-resolve scope for assistant metadata
+    affinity_scope: eros_engine_core::scope::AffinityScope, // post-resolve scope for assistant metadata
+    random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
+        // The fallback_model is already truncated to retry_depth entries by
+        // resolve() — no cap needed here; the chain is just [primary] + fallbacks.
         let chain: Vec<String> = std::iter::once(req.model.clone())
             .chain(req.fallback_model.iter().cloned())
             .filter(|s| !s.is_empty())
-            .take(MAX_STREAM_FALLBACK_DEPTH)
             .collect();
         if chain.is_empty() {
             yield ProtocolFrame::Error {
@@ -163,8 +162,38 @@ fn drive_chat_burst(
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
         let filtered_mode = filter
             .as_ref()
-            .map(|f| f.trigger.turn_level_pass(random_pass, &tag_refs))
+            .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
+
+        // Build the assistant row metadata bag: always includes prompt_traits +
+        // resolved memory_scope / affinity_scope (the POST-resolve values
+        // actually used to serve this turn — pair with the user row's
+        // memory_scope_raw / affinity_scope_raw to surface allow-list / shape
+        // mismatches with a single metadata->>'...' diff); includes tier only
+        // when the request carried one (omit key entirely when None). When the
+        // filter chain failed entirely (fail-open), also writes the per-attempt
+        // audit log so ops can identify these rows.
+        let build_metadata = |filter_failure: Option<&FilterFailOpen>| -> Option<serde_json::Value> {
+            let mut m = serde_json::Map::new();
+            m.insert("prompt_traits".into(), serde_json::json!(&trait_tags));
+            m.insert(
+                "memory_scope".into(),
+                serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+            );
+            m.insert(
+                "affinity_scope".into(),
+                serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+            );
+            if let Some(t) = tier.as_deref() {
+                m.insert("tier".into(), serde_json::json!(t));
+            }
+            if let Some(fail) = filter_failure {
+                m.insert("filter_outcome".into(), serde_json::json!("fail_open"));
+                m.insert("f_client_msg_id".into(), serde_json::json!(&fail.f_client_msg_id));
+                m.insert("filter_attempts".into(), serde_json::json!(&fail.attempts));
+            }
+            Some(serde_json::Value::Object(m))
+        };
 
         if !filtered_mode {
             // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
@@ -234,6 +263,8 @@ fn drive_chat_burst(
                     model: Some(model_id.clone()),
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
+                    filter_audit: None,
+                    metadata: build_metadata(None),
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -264,12 +295,53 @@ fn drive_chat_burst(
                     return;
                 }
                 if idx + 1 == chain.len() {
-                    yield ProtocolFrame::Error {
-                        code: StreamErrorCode::UpstreamUnavailable,
-                        retryable: true,
-                        message: "all fallback models truncated".into(),
-                        user_message: "AI 服务暂时不可用，稍后再试".into(),
-                    };
+                    // retries_chat = fallback count consumed (NOT total attempts),
+                    // matching its 0-based semantics elsewhere (0 = primary served).
+                    let fallback_retries = (chain.len() as u32).saturating_sub(1);
+                    outcome.lock().unwrap().retries_chat = fallback_retries;
+                    match build_stream_failure_pseudo_ghost(
+                        &state.pool,
+                        session_id,
+                        user_message_id,
+                        frame_action,
+                        persist_action,
+                        plan_action,
+                        &trait_tags,
+                        &tier,
+                        memory_scope,
+                        affinity_scope,
+                        fallback_retries,
+                        // Live mode persisted the final truncated bubble; link
+                        // the pseudo-ghost to it so clients + replay can stitch
+                        // them as one logical conversation turn.
+                        Some(msg_ulid),
+                    )
+                    .await
+                    {
+                        Some((frames, produced)) => {
+                            // Replace any truncated-attempt entries already in
+                            // outcome.produced with just the pseudo-ghost — so
+                            // post_process (memory / affinity / insight) runs on
+                            // the safe fallback phrase the user actually saw,
+                            // NOT on the failed partial outputs from earlier
+                            // chain attempts. Filtered mode never pushed to
+                            // produced anyway, so clear() is a no-op there.
+                            {
+                                let mut o = outcome.lock().unwrap();
+                                o.produced.clear();
+                                o.produced.push(produced);
+                            }
+                            for f in frames { yield f; }
+                        }
+                        None => {
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "all fallback models truncated".into(),
+                                user_message: "AI 服务暂时不可用，稍后再试".into(),
+                            };
+                        }
+                    }
                     return;
                 }
                 continues_from = Some(msg_ulid);
@@ -316,18 +388,57 @@ fn drive_chat_burst(
 
             if truncated {
                 if idx + 1 == chain.len() {
-                    yield ProtocolFrame::Error {
-                        code: StreamErrorCode::UpstreamUnavailable,
-                        retryable: true,
-                        message: "all fallback models truncated".into(),
-                        user_message: "AI 服务暂时不可用，稍后再试".into(),
-                    };
+                    let fallback_retries = (chain.len() as u32).saturating_sub(1);
+                    outcome.lock().unwrap().retries_chat = fallback_retries;
+                    match build_stream_failure_pseudo_ghost(
+                        &state.pool,
+                        session_id,
+                        user_message_id,
+                        frame_action,
+                        persist_action,
+                        plan_action,
+                        &trait_tags,
+                        &tier,
+                        memory_scope,
+                        affinity_scope,
+                        fallback_retries,
+                        // Filtered mode never persists intermediate truncated
+                        // attempts, so there is no prior bubble to continue from.
+                        None,
+                    )
+                    .await
+                    {
+                        Some((frames, produced)) => {
+                            // Replace any truncated-attempt entries already in
+                            // outcome.produced with just the pseudo-ghost — so
+                            // post_process (memory / affinity / insight) runs on
+                            // the safe fallback phrase the user actually saw,
+                            // NOT on the failed partial outputs from earlier
+                            // chain attempts. Filtered mode never pushed to
+                            // produced anyway, so clear() is a no-op there.
+                            {
+                                let mut o = outcome.lock().unwrap();
+                                o.produced.clear();
+                                o.produced.push(produced);
+                            }
+                            for f in frames { yield f; }
+                        }
+                        None => {
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "all fallback models truncated".into(),
+                                user_message: "AI 服务暂时不可用，稍后再试".into(),
+                            };
+                        }
+                    }
+                    return;
                 }
                 continue;
             }
 
             outcome.lock().unwrap().retries_chat = idx as u32;
-            let do_filter = f.trigger.should_filter(model_id, &tag_refs, random_pass);
+            let hits = f.trigger.should_filter(model_id, &tag_refs, random_draw);
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
@@ -335,18 +446,40 @@ fn drive_chat_burst(
                 continues_from: None,
             };
 
-            let visible: String = if do_filter {
-                match run_output_filter(&state, &f, &acc).await {
-                    Some((filtered_text, retries_filter)) => {
+            // `filter_failure` carries the per-attempt audit when filter fails.
+            // Threaded into AssistantInsert via build_metadata — distinct from
+            // the prompt_traits/tier metadata to keep concerns separate.
+            let (visible, filter_audit, filter_failure): (
+                String,
+                Option<eros_engine_store::chat::FilterAudit>,
+                Option<FilterFailOpen>,
+            ) = match hits {
+                Some(h) => match run_output_filter(&state, &f, &acc).await {
+                    Ok(out) => {
                         let mut o = outcome.lock().unwrap();
                         o.filtered = true;
-                        o.retries_filter = retries_filter;
-                        filtered_text
+                        o.retries_filter = out.retries_filter;
+                        drop(o); // release MutexGuard before the yield below — must not cross suspension point
+                        let audit = eros_engine_store::chat::FilterAudit {
+                            pre_filter_content: acc.clone(),
+                            filter_model: out.filter_model,
+                            filter_triggers: serde_json::to_value(&h)
+                                .expect("TriggerHits Serialize is infallible"),
+                            f_client_msg_id: out.f_client_msg_id,
+                            f_generation_id: out.f_generation_id,
+                        };
+                        (out.filtered_text, Some(audit), None)
                     }
-                    None => acc.clone(),
-                }
-            } else {
-                acc.clone()
+                    Err(fail) => {
+                        tracing::warn!(
+                            f_client_msg_id = %fail.f_client_msg_id,
+                            attempts = ?fail.attempts,
+                            "filter: all models in chain failed validity; falling open"
+                        );
+                        (acc.clone(), None, Some(fail))
+                    }
+                },
+                None => (acc.clone(), None, None), // models-miss or trigger off — not a failure
             };
 
             if !visible.is_empty() {
@@ -365,6 +498,8 @@ fn drive_chat_burst(
                 model: Some(model_id.clone()),
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
+                filter_audit,
+                metadata: build_metadata(filter_failure.as_ref()),
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -401,64 +536,362 @@ fn extract_text(
     }
 }
 
-/// Run the output-filter LLM over `original`. `execute()` walks the (already
-/// depth-capped) chain; `ChatResponse.model` reports the model served. Returns
-/// `(filtered_text, retries_filter)` where retries_filter = served model's index
-/// in `[f.model] + f.fallback_model` (0 = primary). `None` on error/timeout/empty.
+/// Result of a filter LLM call. `f_client_msg_id` is the engine-generated
+/// idempotency / trace ULID for the call (prefix `f_`), reused across the
+/// filter's internal fallback retries. `filter_model` is the model actually
+/// served (from `ChatResponse.model`), falling back to the requested primary
+/// model if the response omits it. `f_generation_id` mirrors the optional
+/// nature of `ChatResponse.generation_id` so SQL NULL propagates cleanly.
+struct RunFilterOutcome {
+    filtered_text: String,
+    retries_filter: u32,
+    filter_model: String,
+    f_client_msg_id: String,
+    f_generation_id: Option<String>,
+}
+
+/// One filter-chain attempt that did NOT produce a valid filtered reply.
+/// Recorded into `chat_messages.metadata.filter_attempts[]` when fail-open
+/// kicks in so ops can see WHY filter didn't apply on this row.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FilterAttemptFailure {
+    /// OpenRouter model id of the attempted filter model.
+    model: String,
+    /// Stable lowercase ASCII label. Same vocabulary as
+    /// `filter_output_invalidity` plus `"error"`, `"timeout"`, `"empty"`.
+    reason: &'static str,
+}
+
+/// Returned by `run_output_filter` when the whole chain failed validity /
+/// errored / timed out. Caller writes these into `chat_messages.metadata`
+/// before emitting the original reply (fail-open).
+#[derive(Debug, Clone)]
+struct FilterFailOpen {
+    f_client_msg_id: String,
+    attempts: Vec<FilterAttemptFailure>,
+}
+
+// ── Output validity gate ─────────────────────────────────────────────────────
+
+/// Refusal phrases checked in the leading [`REFUSAL_HEAD_SCAN_CHARS`] chars
+/// of the filter output.  When any prefix matches, the call is treated as a
+/// model refusal regardless of HTTP status.
+///
+/// **Matching is ASCII-case-insensitive** — the input head is lowercased before
+/// `contains` runs, so models that emit `"as an ai ..."` or `"I'M SORRY"` are
+/// caught.  All English patterns are stored lowercase; Chinese patterns are
+/// unaffected by lowercasing (CJK code points have no case).
+const REFUSAL_PATTERNS_HEAD: &[&str] = &[
+    // Chinese refusals — observed in production from gpt-4.1-nano
+    "抱歉，我无法",
+    "抱歉，我不能",
+    "对不起，我无法",
+    "对不起，我不能",
+    "抱歉，无法",
+    "对不起，无法",
+    "很抱歉，我无法",
+    "很抱歉，我不能",
+    // English refusals — standard OpenAI/Anthropic apology shapes (lowercase)
+    "i'm sorry, but i can't",
+    "i'm sorry, but i cannot",
+    "i cannot rewrite",
+    "i can't rewrite",
+    "i cannot help",
+    "i can't help",
+    "i won't be able to",
+    "i'm not able to",
+    "i am not able to",
+    "as an ai",
+    "i apologize, but",
+    "sorry, i can't",
+    "sorry, i cannot",
+    "unfortunately, i can't",
+    "unfortunately, i cannot",
+];
+
+/// Refusal verbs used in the short-response branch: if the total response is
+/// shorter than [`MIN_FILTERED_OUTPUT_CHARS`] and contains any of these
+/// anywhere in the text, it is treated as a refusal rather than just too-short.
+///
+/// English entries are stored lowercase; the input is lowercased before
+/// matching (see [`filter_output_invalidity`]).
+const REFUSAL_SHORT_VERBS: &[&str] = &[
+    "无法", "不能", "拒绝", "won't", "cannot", "can't", "unable", "refuse",
+];
+
+/// How many Unicode characters to scan from the start of the response when
+/// checking [`REFUSAL_PATTERNS_HEAD`].
+const REFUSAL_HEAD_SCAN_CHARS: usize = 120;
+
+/// Minimum character count for a valid filter output.  A real rewrite is at
+/// least this long.  Responses shorter than this threshold are either flagged
+/// as `"refusal_pattern"` (if a refusal verb appears) or `"too_short"`.
+const MIN_FILTERED_OUTPUT_CHARS: usize = 80;
+
+/// Check whether a filter LLM response should be rejected by the validity gate.
+///
+/// Returns `Some(reason_label)` when the output is invalid, `None` when valid.
+/// The label is a stable lowercase ASCII string used for log fields:
+/// - `"content_filter"` — `finish_reason == "content_filter"` (Gemini/OpenAI safety block)
+/// - `"refusal_pattern"` — refusal phrase found in the head, or short text with a refusal verb
+/// - `"too_short"` — text is shorter than [`MIN_FILTERED_OUTPUT_CHARS`] with no refusal verb
+///
+/// Checks are ordered cheapest-first:
+/// 1. `finish_reason`
+/// 2. Refusal pattern in head (first `REFUSAL_HEAD_SCAN_CHARS` chars)
+/// 3. Short-text checks (refusal-verb-or-too-short)
+fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&'static str> {
+    if finish_reason == Some("content_filter") {
+        return Some("content_filter");
+    }
+    let total_chars = text.chars().count();
+    // ASCII-case-insensitive matching: lowercase the head (and the short-text
+    // body below) once so models that emit `"as an ai ..."` or `"I'M SORRY"`
+    // are caught.  `to_lowercase` is Unicode-aware; CJK code points are
+    // unchanged, so the Chinese patterns still match exactly.
+    let head_lower: String = text
+        .chars()
+        .take(REFUSAL_HEAD_SCAN_CHARS)
+        .flat_map(char::to_lowercase)
+        .collect();
+    for pat in REFUSAL_PATTERNS_HEAD {
+        if head_lower.contains(pat) {
+            return Some("refusal_pattern");
+        }
+    }
+    if total_chars < MIN_FILTERED_OUTPUT_CHARS {
+        let text_lower = text.to_lowercase();
+        for verb in REFUSAL_SHORT_VERBS {
+            if text_lower.contains(verb) {
+                return Some("refusal_pattern");
+            }
+        }
+        return Some("too_short");
+    }
+    None
+}
+
+// ── run_output_filter ────────────────────────────────────────────────────────
+
+/// Per-model timeout for a single filter LLM call.
+const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run the output-filter LLM over `original`, walking the (already
+/// depth-capped) fallback chain one model at a time.  After each successful
+/// HTTP 200 response, `filter_output_invalidity` is applied; on failure the
+/// next model is tried.  Returns `Err(FilterFailOpen)` when the whole chain
+/// exhausts (callers fall open and emit the original reply, and write the
+/// per-attempt audit log into `chat_messages.metadata`).
 async fn run_output_filter(
     state: &AppState,
     f: &eros_engine_llm::model_config::ResolvedOutputFilter,
     original: &str,
-) -> Option<(String, u32)> {
+) -> Result<RunFilterOutcome, FilterFailOpen> {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-    let req = ChatRequest {
-        model: f.model.clone(),
-        fallback_model: f.fallback_model.clone(),
-        messages: vec![
-            ChatMessage {
-                role: "system".into(),
-                content: f.filter_prompt.clone(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: original.to_string(),
-            },
-        ],
-        temperature: f.temperature as f32,
-        max_tokens: f.max_tokens,
-        ..Default::default()
-    };
-    const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-    match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
-        Ok(Ok(resp)) => {
-            super::log_openrouter_usage("chat_output_filter", None, &resp);
-            let out = resp.reply.trim().to_string();
-            if out.is_empty() {
-                return None;
+    let f_client_msg_id = format!("f_{}", Ulid::new());
+    let chain: Vec<String> = std::iter::once(f.model.clone())
+        .chain(f.fallback_model.iter().cloned())
+        .collect();
+    let mut attempts: Vec<FilterAttemptFailure> = Vec::with_capacity(chain.len());
+    for (idx, model_id) in chain.iter().enumerate() {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: f.filter_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: original.to_string(),
+                },
+            ],
+            temperature: f.temperature as f32,
+            max_tokens: f.max_tokens,
+            reasoning: f.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "filter: model error; walking to next");
+                attempts.push(FilterAttemptFailure {
+                    model: model_id.clone(),
+                    reason: "error",
+                });
+                continue;
             }
-            let chain = std::iter::once(f.model.as_str())
-                .chain(f.fallback_model.iter().map(String::as_str));
-            let retries_filter = resp
-                .model
-                .as_deref()
-                .and_then(|served| {
-                    chain
-                        .enumerate()
-                        .find(|(_, m)| *m == served)
-                        .map(|(i, _)| i as u32)
-                })
-                .unwrap_or(0);
-            Some((out, retries_filter))
+            Err(_) => {
+                tracing::warn!(model = %model_id, "filter: model timeout; walking to next");
+                attempts.push(FilterAttemptFailure {
+                    model: model_id.clone(),
+                    reason: "timeout",
+                });
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_output_filter", None, &resp);
+        let text = resp.reply.trim().to_string();
+        // Empty reply check before the validity gate: "model returned literally
+        // nothing" is distinguished from "model returned a short non-empty
+        // response" so ops can see the difference in filter_attempts.
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "filter: empty reply; walking to next");
+            attempts.push(FilterAttemptFailure {
+                model: model_id.clone(),
+                reason: "empty",
+            });
+            continue;
         }
-        Ok(Err(e)) => {
-            tracing::warn!("output filter LLM failed: {e}");
-            None
+        if let Some(reason) = filter_output_invalidity(&text, resp.finish_reason.as_deref()) {
+            tracing::warn!(
+                model = %model_id,
+                invalidity = %reason,
+                "filter: output failed validity gate; walking to next model"
+            );
+            attempts.push(FilterAttemptFailure {
+                model: model_id.clone(),
+                reason,
+            });
+            continue;
         }
-        Err(_) => {
-            tracing::warn!("output filter timed out");
-            None
-        }
+        // Falling back to model_id when the response omits the served model is
+        // safe: that is the model we requested, and OpenRouter only omits it
+        // on error paths (which we have already excluded via the validity gate).
+        let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
+        return Ok(RunFilterOutcome {
+            filtered_text: text,
+            retries_filter: idx as u32,
+            filter_model,
+            f_client_msg_id,
+            f_generation_id: resp.generation_id,
+        });
     }
+    Err(FilterFailOpen {
+        f_client_msg_id,
+        attempts,
+    })
+}
+
+/// Try to emit a pseudo-ghost on chain exhaustion.
+///
+/// Picks a configured fallback phrase from `engine.error_handling_config`,
+/// emits Meta + Delta(phrase) + Done frames as if the LLM returned a brief
+/// reply, and persists an assistant row tagged with
+/// `metadata.fallback_reason = "stream_failure"`.
+///
+/// Returns `Some(frames)` when the pseudo-ghost was produced; `None` when
+/// the config lookup returns nothing (missing row / empty array / DB error),
+/// signalling the caller to fall back to the original Error frame.
+#[allow(clippy::too_many_arguments)]
+async fn build_stream_failure_pseudo_ghost(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &str,
+    plan_action: ActionType,
+    trait_tags: &[String],
+    tier: &Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    fallback_retries: u32,
+    continues_from_ulid: Option<Ulid>,
+) -> Option<(
+    Vec<ProtocolFrame>,
+    crate::pipeline::post_process::ProducedMessage,
+)> {
+    let repo = ErrorHandlingRepo { pool };
+    let phrase = match repo.pick_chat_stream_fallback_phrase().await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!("stream: no fallback phrase configured; emitting Error frame");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("stream: fallback phrase lookup failed: {e}; emitting Error frame");
+            return None;
+        }
+    };
+
+    let msg_ulid = Ulid::new();
+    let msg_uuid: Uuid = msg_ulid.into();
+
+    // Build metadata bag: fallback_reason + prompt_traits + resolved
+    // memory_scope / affinity_scope (mirrors build_metadata's contract so the
+    // pseudo-ghost row carries the same post-resolve scope snapshot as a
+    // normal assistant row) + optional tier.
+    let mut meta_map = serde_json::Map::new();
+    meta_map.insert(
+        "fallback_reason".into(),
+        serde_json::json!("stream_failure"),
+    );
+    meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert(
+        "memory_scope".into(),
+        serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+    );
+    meta_map.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+    );
+    meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
+    if let Some(t) = tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let metadata = Some(serde_json::Value::Object(meta_map));
+
+    let chat_repo = ChatRepo { pool };
+    let row = eros_engine_store::chat::AssistantInsert {
+        id: msg_uuid,
+        content: phrase.clone(),
+        assistant_action_type: persist_action.into(),
+        continues_from_message_id: continues_from_ulid.map(Uuid::from),
+        truncated: false,
+        // No model served this row — live emits Meta with model: None, and
+        // replay_stream applies display_override to Some(...) values, so a
+        // sentinel like "__fallback_phrase__" would surface differently on
+        // replay than on the original stream and break idempotency.
+        // metadata.fallback_reason carries the audit signal instead.
+        model: None,
+        usage: None,
+        generation_id: None,
+        filter_audit: None,
+        metadata,
+    };
+    if let Err(e) = chat_repo
+        .insert_assistant_batch(session_id, user_message_id, &[row])
+        .await
+    {
+        tracing::warn!("stream: pseudo-ghost persist failed: {e}");
+        // Still emit the frames — the row persisting is best-effort.
+    }
+
+    let frames = vec![
+        ProtocolFrame::Meta {
+            message_id: ulid_string(msg_ulid),
+            action_type: frame_action,
+            model: None,
+            continues_from: continues_from_ulid.map(ulid_string),
+        },
+        ProtocolFrame::Delta {
+            message_id: ulid_string(msg_ulid),
+            content: phrase.clone(),
+        },
+        ProtocolFrame::Done {
+            message_id: ulid_string(msg_ulid),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+    ];
+    let produced = crate::pipeline::post_process::ProducedMessage {
+        message_id: msg_uuid,
+        full_text: phrase,
+        action: plan_action,
+    };
+    Some((frames, produced))
 }
 
 /// All persisted bits needed to drive a streaming burst.
@@ -583,12 +1016,14 @@ pub fn run_stream(
                     crate::pipeline::handlers::build_gift_request(
                         &state, &input, &plan,
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id,
                         &[],
                     ).await
                 } else {
                     crate::pipeline::handlers::build_reply_request(
                         &state, &input, &plan,
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id,
                     ).await
                 };
                 let (req, injected_tags) = match req_res {
@@ -620,11 +1055,10 @@ pub fn run_stream(
                 // random gate ONCE (so live/filter share the same coin flip).
                 let tier = user_msg.tier.as_deref();
                 let filter = state.model_config.resolve_output_filter(tier);
-                let random_pass = filter
+                let random_draw: Option<f64> = filter
                     .as_ref()
                     .and_then(|f| f.trigger.random)
-                    .map(|p| rand::thread_rng().gen::<f64>() < p)
-                    .unwrap_or(true);
+                    .map(|_| rand::thread_rng().gen::<f64>());
 
                 let outcome = std::sync::Arc::new(std::sync::Mutex::new(
                     crate::pipeline::stream::BurstOutcome::default(),
@@ -640,7 +1074,10 @@ pub fn run_stream(
                     display_override,
                     filter,
                     trait_tags,
-                    random_pass,
+                    user_msg.tier.clone(),
+                    user_msg.memory_scope,
+                    user_msg.affinity_scope,
+                    random_draw,
                     outcome.clone(),
                 );
                 {
@@ -806,9 +1243,14 @@ pub fn replay_stream(
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
-                    model: display_override
-                        .as_ref()
-                        .and_then(|d| d.display(row.model.as_deref().unwrap_or_default())),
+                    // When the persisted row carries no model (e.g. the
+                    // pseudo-ghost fallback path), the live stream emitted
+                    // model: None — preserve that on replay so idempotent
+                    // retries are wire-identical regardless of any
+                    // display_override config.
+                    model: row.model.as_deref().and_then(|m| {
+                        display_override.as_ref().and_then(|d| d.display(m))
+                    }),
                     continues_from: prev_ulid.map(ulid_string),
                 };
                 if !row.content.is_empty() {
@@ -1038,7 +1480,13 @@ mod tests {
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
         let chat_repo = ChatRepo { pool: &state.pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A")
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J1111111111111111111111A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1163,7 +1611,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A")
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J2222222222222222222222A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1240,7 +1694,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A")
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1333,7 +1793,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A")
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J4444444444444444444444A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1463,6 +1929,124 @@ data: [DONE]\n\n";
         assert_eq!(extract_text(BeforeExtract, "orig", "filt"), "filt");
     }
 
+    // ── filter_output_invalidity unit tests ──────────────────────────────────
+
+    #[test]
+    fn filter_output_invalidity_detects_chinese_refusal_in_head() {
+        let text = "抱歉，我无法协助完成您的请求。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "Chinese refusal in head must be detected"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_english_refusal_in_head() {
+        let text = "I'm sorry, but I can't rewrite this content.";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "English refusal in head must be detected"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_content_filter_finish_reason() {
+        // Long text that would otherwise pass — finish_reason overrides.
+        let text = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，记得那些再也回不去的日子。";
+        assert_eq!(
+            filter_output_invalidity(text, Some("content_filter")),
+            Some("content_filter"),
+            "content_filter finish_reason must be detected regardless of text length"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_short_response_with_refusal_verb() {
+        let text = "我无法。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("refusal_pattern"),
+            "short text containing refusal verb must be flagged as refusal_pattern"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_short_response_without_refusal_verb() {
+        // A genuinely short clean rewrite — still fails the length gate.
+        let text = "她笑了。";
+        assert_eq!(
+            filter_output_invalidity(text, None),
+            Some("too_short"),
+            "short text with no refusal verb must be flagged as too_short"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_passes_long_clean_rewrite() {
+        // 200+ chars, finish_reason = "stop", no refusal pattern.
+        let text = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，记得那些再也回不去的日子。风轻轻吹过，带走了她的叹息，也带走了那些沉甸甸的思念。";
+        assert_eq!(
+            filter_output_invalidity(text, Some("stop")),
+            None,
+            "long clean rewrite with stop finish_reason must pass the gate"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_detects_lowercase_english_refusal() {
+        // Codex regression guard: a model that emits the apology shape with
+        // lowercase `i` / `ai` (or all-caps `I'M SORRY`) must still be caught,
+        // because the gate runs case-insensitively after lowercasing the head.
+        let lower = "i'm sorry, but i can't help with rewriting that content. it's outside what i can produce safely.";
+        assert_eq!(
+            filter_output_invalidity(lower, None),
+            Some("refusal_pattern"),
+            "lowercase apology must hit the head pattern via case-insensitive match"
+        );
+        let mixed = "As an ai language model, I am not able to rewrite the text in the way you have requested.";
+        assert_eq!(
+            filter_output_invalidity(mixed, None),
+            Some("refusal_pattern"),
+            "mixed-case 'As an ai' must still match the lowercase pattern"
+        );
+        let upper = "I'M SORRY, BUT I CAN'T REWRITE THIS PASSAGE IN THE FORM YOU'VE REQUESTED — IT VIOLATES POLICY.";
+        assert_eq!(
+            filter_output_invalidity(upper, None),
+            Some("refusal_pattern"),
+            "uppercase apology must match via lowercased head"
+        );
+    }
+
+    #[test]
+    fn filter_output_invalidity_passes_when_refusal_word_appears_late() {
+        // Regression guard: a clean rewrite that incidentally contains "won't"
+        // well past character 120 must NOT be flagged.  The prefix must be
+        // >= REFUSAL_HEAD_SCAN_CHARS (120) chars so "won't" lands outside the
+        // scan window.  The full text must also be >= MIN_FILTERED_OUTPUT_CHARS
+        // (80) so it does not hit the too_short branch.
+        let prefix = "她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天，记得他说过的每一句话，那些记忆再也不会消逝。她告诉自己要坚强，岁月会带走一切，但那段回忆会永远珍藏在心底，无论时光如何流逝，她都不会忘记那些岁月里的每一天每一刻。";
+        // suffix contains "won't" deep in the text — past the 120-char head window.
+        let text = format!("{prefix}但她won't忘记那段岁月，那是她最珍贵的时光，永远珍藏心底。");
+        // Verify the premise: prefix is beyond the scan window.
+        let prefix_chars = prefix.chars().count();
+        assert!(
+            prefix_chars >= REFUSAL_HEAD_SCAN_CHARS,
+            "prefix must be >= {REFUSAL_HEAD_SCAN_CHARS} chars so won't is outside the head window; got {prefix_chars}"
+        );
+        assert!(
+            text.chars().count() >= MIN_FILTERED_OUTPUT_CHARS,
+            "full text must be >= {MIN_FILTERED_OUTPUT_CHARS} chars to bypass too_short; got {}",
+            text.chars().count()
+        );
+        assert_eq!(
+            filter_output_invalidity(&text, Some("stop")),
+            None,
+            "refusal word past char 120 must not trigger refusal_pattern"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn filtered_turn_emits_filtered_and_persists_filtered(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -1475,10 +2059,13 @@ data: [DONE]\n\n";
         // The output filter uses the NON-streaming `execute()` path, so its mock
         // must return a JSON completion object (choices[].message.content), not
         // SSE. `model:"fast/m"` makes retries_filter resolve to the primary (0).
+        // The filtered content must be >= MIN_FILTERED_OUTPUT_CHARS (80) chars to
+        // pass the validity gate (a real rewrite is always that long).
+        let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
         let filt_body = serde_json::json!({
             "id": "gf", "model": "fast/m",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "FILT"}}],
+            "choices": [{"message": {"content": filt_text}}],
         });
         // Route the two calls by the MODEL ID present in the request body so the two
         // mocks are MUTUALLY EXCLUSIVE (mount order / precedence cannot matter):
@@ -1522,6 +2109,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999A",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1561,7 +2150,7 @@ data: [DONE]\n\n";
             .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
         {
             assert!(
-                deltas.contains("FILT"),
+                deltas.contains("FILT_START"),
                 "client must see filtered text, got {deltas:?}"
             );
             assert!(
@@ -1586,7 +2175,10 @@ data: [DONE]\n\n";
             let row = sqlx::query_scalar::<_, String>(
                 "SELECT content FROM engine.chat_messages WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1")
                 .bind(session_id).fetch_one(&pool).await.unwrap();
-            assert_eq!(row, "FILT");
+            assert!(
+                row.contains("FILT_START"),
+                "persisted content must be the filtered text, got {row:?}"
+            );
         }
     }
 
@@ -1639,6 +2231,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999B",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1701,6 +2295,287 @@ data: [DONE]\n\n";
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filter_fail_open_writes_attempt_audit_to_metadata(pool: PgPool) {
+        // Filter chain = primary + 1 fallback. Both return refusal text (200 OK
+        // with a Chinese refusal phrase) → validity gate rejects both → engine
+        // fails open, emits the ORIGINAL reply, and the persisted row's metadata
+        // carries filter_outcome=fail_open + filter_attempts (2 entries).
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+
+        // Both filter models return a refusal — Chinese phrase caught by the
+        // head-pattern gate.
+        let refusal_body_1 = serde_json::json!({
+            "id": "gf1", "model": "filter-1",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "抱歉，我无法协助完成您的请求。"}}],
+        });
+        let refusal_body_2 = serde_json::json!({
+            "id": "gf2", "model": "filter-2",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "抱歉，我无法协助完成您的请求。"}}],
+        });
+
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("filter-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refusal_body_1))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("filter-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refusal_body_2))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"filter-1\"\nfallback=[\"filter-2\"]\n\
+                 retry_depth=1\nfilter_prompt=\"REWRITE\"\ntrigger = { random = 1.0 }\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello",
+                "01JFAILOPEN111111111111111",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Only run assertions when PDE chose Reply (not Ghost).
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            // Client must see the original, not the refusals.
+            let deltas: String = frames
+                .iter()
+                .filter_map(|f| match f {
+                    ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                deltas.contains("ORIG"),
+                "fail-open must emit original, got {deltas:?}"
+            );
+
+            // final.filtered must be false (we failed open).
+            let filtered = frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Final { filtered, .. } => Some(*filtered),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!filtered, "final.filtered must be false on fail-open");
+
+            // The persisted row must carry the fail-open audit in metadata.
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                metadata["filter_outcome"], "fail_open",
+                "metadata.filter_outcome must be 'fail_open', got {metadata}"
+            );
+            let attempts = metadata["filter_attempts"].as_array().unwrap();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "both filter models must be recorded in filter_attempts, got {attempts:?}"
+            );
+            // Both should have reason=refusal_pattern.
+            for attempt in attempts {
+                assert_eq!(
+                    attempt["reason"], "refusal_pattern",
+                    "expected refusal_pattern reason, got {attempt}"
+                );
+            }
+            // f_client_msg_id must be present and start with "f_".
+            let fid = metadata["f_client_msg_id"].as_str().unwrap();
+            assert!(
+                fid.starts_with("f_"),
+                "f_client_msg_id must start with 'f_', got {fid}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filter_success_does_not_write_fail_open_metadata(pool: PgPool) {
+        // Sanity: when filter succeeds the metadata does NOT contain
+        // filter_outcome / filter_attempts keys (no false-positive audit).
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        let filt_text = "FILT_OK 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_OK_END";
+        let filt_body = serde_json::json!({
+            "id": "gf", "model": "fast/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": filt_text}}],
+        });
+
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello",
+                "01JFILTSUCCESS1111111111A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            // Filter succeeded — no fail-open audit keys must appear.
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id=$1 AND role='assistant' ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert!(
+                metadata.get("filter_outcome").is_none(),
+                "successful filter must not write filter_outcome, got {metadata}"
+            );
+            assert!(
+                metadata.get("filter_attempts").is_none(),
+                "successful filter must not write filter_attempts, got {metadata}"
+            );
+            // prompt_traits must still be present.
+            assert!(
+                metadata.get("prompt_traits").is_some(),
+                "prompt_traits must still be present, got {metadata}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn live_mode_when_random_zero(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
@@ -1753,6 +2628,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999C",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1840,7 +2717,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "(打赏 $20)", "01J5555555555555555555555A")
+            .upsert_user_message_idempotent(
+                session_id,
+                "(打赏 $20)",
+                "01J5555555555555555555555A",
+                "gift_user",
+                Some(&serde_json::json!({"tips_amount_usd": 20.0})),
+            )
             .await
             .unwrap()
         {
@@ -1884,7 +2767,7 @@ data: [DONE]\n\n";
         );
         let sent = String::from_utf8_lossy(&reqs[0].body);
         assert!(
-            sent.contains("【刚收到的打赏】") && sent.contains("$20 美元的红包"),
+            sent.contains("[tip_received]") && sent.contains("$20 美元的红包"),
             "system prompt must contain the tip block, got: {sent}",
         );
     }
@@ -1943,6 +2826,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999D",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -2006,6 +2891,255 @@ data: [DONE]\n\n";
                 .count();
             assert_eq!(meta_count, 1, "exactly one Meta frame");
             assert_eq!(done_count, 1, "exactly one Done frame");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn assistant_row_writes_memory_and_affinity_scope_keys(pool: PgPool) {
+        // Success-path sanity: the assistant row's metadata must carry the
+        // POST-resolve memory_scope (snake_case enum string) + affinity_scope
+        // (6-bool record) on every turn — paired with the user row's
+        // *_raw counterparts so ops can diff for shape mismatches.
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JSCOPEKEYS1111111111111A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Only assert when PDE chose Reply (not Ghost) — same gate as siblings.
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                metadata["memory_scope"],
+                serde_json::json!("neutral_and_relationship"),
+                "default MemoryScope should serialize as snake_case, got {metadata}",
+            );
+            assert!(
+                metadata["affinity_scope"].is_object(),
+                "AffinityScope serializes as a 6-boolean record, got {metadata}",
+            );
+            // Default AffinityScope is `bond` = {warmth, intimacy, tension}=true;
+            // trust, intrigue, patience=false.
+            assert_eq!(
+                metadata["affinity_scope"]["warmth"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["intimacy"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["tension"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["trust"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["intrigue"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["patience"],
+                serde_json::json!(false)
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pseudo_ghost_assistant_row_carries_scope_metadata(pool: PgPool) {
+        // Chain-exhaustion path: primary returns an empty SSE stream ⇒
+        // `acc.is_empty()` flips `truncated = true`. With no fallback model
+        // configured the chain = [primary], so `idx + 1 == chain.len()` ⇒
+        // build_stream_failure_pseudo_ghost fires. The pseudo-ghost row's
+        // metadata must carry memory_scope + affinity_scope alongside the
+        // existing fallback_reason = "stream_failure" audit signal.
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Empty SSE stream ⇒ acc stays empty ⇒ truncated path.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Default ModelConfig has empty fallback_model ⇒ chain = [primary],
+        // so a single truncated attempt exhausts the chain. The compiled-in
+        // FALLBACK_MODEL is used as primary; it's only ever passed through
+        // to the mocked openrouter, never actually served.
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JPSEUDOGHOSTSCOPE1111111",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Only assert when PDE chose Reply (not Ghost). Inside that gate the
+        // pseudo-ghost must have run (chain = [primary], primary truncated).
+        if frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Delta { .. }))
+        {
+            // The pseudo-ghost row is the LATEST assistant row (and the only
+            // one in live mode where the truncated attempt also persists a
+            // bubble — we want the most recent, which is the pseudo-ghost).
+            let metadata: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' \
+                   AND metadata->>'fallback_reason' = 'stream_failure' \
+                 ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                metadata["fallback_reason"],
+                serde_json::json!("stream_failure"),
+                "this test must exercise the pseudo-ghost path, got {metadata}",
+            );
+            assert!(
+                metadata.get("memory_scope").is_some(),
+                "pseudo-ghost row must carry memory_scope, got {metadata}",
+            );
+            assert!(
+                metadata.get("affinity_scope").is_some(),
+                "pseudo-ghost row must carry affinity_scope, got {metadata}",
+            );
+            assert_eq!(
+                metadata["memory_scope"],
+                serde_json::json!("neutral_and_relationship"),
+                "default MemoryScope should serialize as snake_case, got {metadata}",
+            );
+            // Spot-check the affinity_scope shape (full 6-bool assertions are
+            // already covered in the success-path test above).
+            assert!(
+                metadata["affinity_scope"].is_object(),
+                "AffinityScope serializes as a 6-boolean record, got {metadata}",
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["warmth"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                metadata["affinity_scope"]["trust"],
+                serde_json::json!(false)
+            );
         }
     }
 }

@@ -6,6 +6,11 @@
 
 ---
 
+> **Update (2026-05-26):** §2.6 "in-memory only / not recoverable" superseded
+> by `2026-05-26-tip-role-and-filter-audit-design.md` §4. The original
+> pre-filter text is now persisted on the assistant row as
+> `pre_filter_content` when the filter rewrites the reply.
+
 ## 0. Background
 
 The streaming chat path (`crates/eros-engine-server/src/pipeline/stream.rs`,
