@@ -729,4 +729,35 @@ mod tests {
             "last_active_at must be bumped"
         );
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0019_adds_chat_messages_columns(pool: PgPool) {
+        // Probe the six new columns by name. Each query should succeed (NULL on
+        // legacy rows). If any column is missing, the SELECT errors out.
+        for col in [
+            "metadata",
+            "pre_filter_content",
+            "filter_model",
+            "filter_triggers",
+            "f_client_msg_id",
+            "f_generation_id",
+        ] {
+            let q = format!("SELECT {col} FROM engine.chat_messages LIMIT 0");
+            sqlx::query(&q).execute(&pool).await.unwrap_or_else(|e| {
+                panic!("expected column {col} on engine.chat_messages: {e}")
+            });
+        }
+        // Indexes exist.
+        let idx_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes \
+             WHERE schemaname = 'engine' \
+               AND tablename = 'chat_messages' \
+               AND indexname IN ('chat_messages_tips_amount_idx',
+                                 'chat_messages_f_client_msg_id_uidx')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx_count, 2, "both new indexes should exist");
+    }
 }
