@@ -99,6 +99,7 @@ use eros_engine_core::pde;
 use eros_engine_core::types::{ActionType, DecisionInput, Event};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::error_handling::ErrorHandlingRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::routes::companion::filter_usage_keys;
@@ -278,12 +279,31 @@ fn drive_chat_burst(
                     return;
                 }
                 if idx + 1 == chain.len() {
-                    yield ProtocolFrame::Error {
-                        code: StreamErrorCode::UpstreamUnavailable,
-                        retryable: true,
-                        message: "all fallback models truncated".into(),
-                        user_message: "AI 服务暂时不可用，稍后再试".into(),
-                    };
+                    outcome.lock().unwrap().retries_chat = chain.len() as u32;
+                    match build_stream_failure_pseudo_ghost(
+                        &state.pool,
+                        session_id,
+                        user_message_id,
+                        frame_action,
+                        persist_action,
+                        &trait_tags,
+                        &tier,
+                        chain.len() as u32,
+                    )
+                    .await
+                    {
+                        Some(frames) => {
+                            for f in frames { yield f; }
+                        }
+                        None => {
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "all fallback models truncated".into(),
+                                user_message: "AI 服务暂时不可用，稍后再试".into(),
+                            };
+                        }
+                    }
                     return;
                 }
                 continues_from = Some(msg_ulid);
@@ -330,12 +350,32 @@ fn drive_chat_burst(
 
             if truncated {
                 if idx + 1 == chain.len() {
-                    yield ProtocolFrame::Error {
-                        code: StreamErrorCode::UpstreamUnavailable,
-                        retryable: true,
-                        message: "all fallback models truncated".into(),
-                        user_message: "AI 服务暂时不可用，稍后再试".into(),
-                    };
+                    outcome.lock().unwrap().retries_chat = chain.len() as u32;
+                    match build_stream_failure_pseudo_ghost(
+                        &state.pool,
+                        session_id,
+                        user_message_id,
+                        frame_action,
+                        persist_action,
+                        &trait_tags,
+                        &tier,
+                        chain.len() as u32,
+                    )
+                    .await
+                    {
+                        Some(frames) => {
+                            for f in frames { yield f; }
+                        }
+                        None => {
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "all fallback models truncated".into(),
+                                user_message: "AI 服务暂时不可用，稍后再试".into(),
+                            };
+                        }
+                    }
+                    return;
                 }
                 continue;
             }
@@ -510,6 +550,97 @@ async fn run_output_filter(
             None
         }
     }
+}
+
+/// Try to emit a pseudo-ghost on chain exhaustion.
+///
+/// Picks a configured fallback phrase from `engine.error_handling_config`,
+/// emits Meta + Delta(phrase) + Done frames as if the LLM returned a brief
+/// reply, and persists an assistant row tagged with
+/// `metadata.fallback_reason = "stream_failure"`.
+///
+/// Returns `Some(frames)` when the pseudo-ghost was produced; `None` when
+/// the config lookup returns nothing (missing row / empty array / DB error),
+/// signalling the caller to fall back to the original Error frame.
+#[allow(clippy::too_many_arguments)]
+async fn build_stream_failure_pseudo_ghost(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &str,
+    trait_tags: &[String],
+    tier: &Option<String>,
+    retries_chat_total: u32,
+) -> Option<Vec<ProtocolFrame>> {
+    let repo = ErrorHandlingRepo { pool };
+    let phrase = match repo.pick_chat_stream_fallback_phrase().await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!("stream: no fallback phrase configured; emitting Error frame");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("stream: fallback phrase lookup failed: {e}; emitting Error frame");
+            return None;
+        }
+    };
+
+    let msg_ulid = Ulid::new();
+    let msg_uuid: Uuid = msg_ulid.into();
+
+    // Build metadata bag: fallback_reason + prompt_traits + optional tier.
+    let mut meta_map = serde_json::Map::new();
+    meta_map.insert(
+        "fallback_reason".into(),
+        serde_json::json!("stream_failure"),
+    );
+    meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert("retries_chat".into(), serde_json::json!(retries_chat_total));
+    if let Some(t) = tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let metadata = Some(serde_json::Value::Object(meta_map));
+
+    let chat_repo = ChatRepo { pool };
+    let row = eros_engine_store::chat::AssistantInsert {
+        id: msg_uuid,
+        content: phrase.clone(),
+        assistant_action_type: persist_action.into(),
+        continues_from_message_id: None,
+        truncated: false,
+        model: Some("__fallback_phrase__".into()),
+        usage: None,
+        generation_id: None,
+        filter_audit: None,
+        metadata,
+    };
+    if let Err(e) = chat_repo
+        .insert_assistant_batch(session_id, user_message_id, &[row])
+        .await
+    {
+        tracing::warn!("stream: pseudo-ghost persist failed: {e}");
+        // Still emit the frames — the row persisting is best-effort.
+    }
+
+    Some(vec![
+        ProtocolFrame::Meta {
+            message_id: ulid_string(msg_ulid),
+            action_type: frame_action,
+            model: None,
+            continues_from: None,
+        },
+        ProtocolFrame::Delta {
+            message_id: ulid_string(msg_ulid),
+            content: phrase,
+        },
+        ProtocolFrame::Done {
+            message_id: ulid_string(msg_ulid),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+    ])
 }
 
 /// All persisted bits needed to drive a streaming burst.
