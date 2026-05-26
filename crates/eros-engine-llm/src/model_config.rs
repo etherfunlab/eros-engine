@@ -258,7 +258,7 @@ impl OutputFilterTrigger {
                 TraitWhen::Present => tp
                     .any
                     .iter()
-                    .filter(|tag| trait_tags.iter().any(|t| *t == tag.as_str()))
+                    .filter(|tag| trait_tags.contains(&tag.as_str()))
                     .cloned()
                     .collect::<Vec<String>>(),
                 // Absent: the predicate fires because the tags are NOT present.
@@ -1537,22 +1537,37 @@ trigger = { traits = { any = ["a"] } }
     #[test]
     fn should_filter_predicate_combinations() {
         use super::*;
-        let none = OutputFilterTrigger { random: None, models: None, traits: None };
+        let none = OutputFilterTrigger {
+            random: None,
+            models: None,
+            traits: None,
+        };
         assert!(none.should_filter("any/model", &[], None).is_some());
         assert!(none.should_filter("any/model", &[], Some(0.999)).is_some());
 
-        let r = OutputFilterTrigger { random: Some(0.5), models: None, traits: None };
-        assert!(r.should_filter("m", &[], Some(0.0)).is_some());      // draw < 0.5
-        assert!(r.should_filter("m", &[], Some(0.999)).is_none());    // draw >= 0.5
+        let r = OutputFilterTrigger {
+            random: Some(0.5),
+            models: None,
+            traits: None,
+        };
+        assert!(r.should_filter("m", &[], Some(0.0)).is_some()); // draw < 0.5
+        assert!(r.should_filter("m", &[], Some(0.999)).is_none()); // draw >= 0.5
 
-        let m = OutputFilterTrigger { random: None, models: Some(vec!["x/y".into()]), traits: None };
+        let m = OutputFilterTrigger {
+            random: None,
+            models: Some(vec!["x/y".into()]),
+            traits: None,
+        };
         assert!(m.should_filter("x/y", &[], None).is_some());
         assert!(m.should_filter("a/b", &[], None).is_none());
 
         let tp = OutputFilterTrigger {
             random: None,
             models: None,
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            }),
         };
         assert!(tp.should_filter("m", &["nsfw"], None).is_some());
         assert!(tp.should_filter("m", &["sfw"], None).is_none());
@@ -1560,7 +1575,10 @@ trigger = { traits = { any = ["a"] } }
         let ta = OutputFilterTrigger {
             random: None,
             models: None,
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Absent }),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Absent,
+            }),
         };
         assert!(ta.should_filter("m", &["sfw"], None).is_some());
         assert!(ta.should_filter("m", &["nsfw"], None).is_none());
@@ -1568,11 +1586,14 @@ trigger = { traits = { any = ["a"] } }
         let all = OutputFilterTrigger {
             random: Some(0.5),
             models: Some(vec!["x/y".into()]),
-            traits: Some(TraitPredicate { any: vec!["nsfw".into()], when: TraitWhen::Present }),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            }),
         };
         assert!(all.should_filter("x/y", &["nsfw"], Some(0.0)).is_some());
         assert!(all.should_filter("x/y", &["nsfw"], Some(0.999)).is_none()); // random fails
-        assert!(all.should_filter("a/b", &["nsfw"], Some(0.0)).is_none());   // model fails
+        assert!(all.should_filter("a/b", &["nsfw"], Some(0.0)).is_none()); // model fails
 
         // turn_level_pass ignores models
         assert!(all.turn_level_pass(Some(0.0), &["nsfw"]));
@@ -1658,16 +1679,24 @@ trigger = { traits = { any = ["a"] } }
         // Defensive: if the caller wires random=Some(p) but forgets to thread
         // a per-turn random_draw, treat as "no fire" rather than silently
         // assume pass. Guards against a Task 7-era wiring mistake.
-        let r = OutputFilterTrigger { random: Some(0.5), models: None, traits: None };
+        let r = OutputFilterTrigger {
+            random: Some(0.5),
+            models: None,
+            traits: None,
+        };
         assert!(r.should_filter("m", &[], None).is_none());
-        assert!(r.turn_level_pass(None, &[]) == false);
+        assert!(!r.turn_level_pass(None, &[]));
     }
 
     #[test]
     fn trigger_hits_empty_serializes_to_empty_object() {
         // Spec §4.2: when an always-fire trigger (no configured predicates)
         // is recorded, filter_triggers JSONB must be `{}` — not `{"random":null, ...}`.
-        let hits = TriggerHits { random: None, models: None, traits: None };
+        let hits = TriggerHits {
+            random: None,
+            models: None,
+            traits: None,
+        };
         let v = serde_json::to_value(&hits).unwrap();
         assert_eq!(v, serde_json::json!({}));
     }

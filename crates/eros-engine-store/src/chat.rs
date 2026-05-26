@@ -598,7 +598,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap();
         match outcome {
@@ -617,7 +623,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -646,7 +658,13 @@ mod tests {
         .unwrap();
 
         let outcome = repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap();
         match outcome {
@@ -672,7 +690,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -681,7 +705,13 @@ mod tests {
         };
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -700,7 +730,13 @@ mod tests {
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -710,7 +746,13 @@ mod tests {
         repo.mark_user_message_ghosted(first).await.unwrap();
 
         match repo
-            .upsert_user_message_idempotent(s.id, "hello", "01J0000000000000000000000A", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hello",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -786,28 +828,24 @@ mod tests {
             .await
             .unwrap();
         let outcome = repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "hi",
-                "01J0000000000000000000000A",
-                "user",
-                None,
-            )
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000000A", "user", None)
             .await
             .unwrap();
         match outcome {
             UpsertUserOutcome::Inserted { .. } => {}
-            other => panic!("expected Inserted, got {:?}", other),
+            other => panic!("expected Inserted, got {other:?}"),
         }
-        let (role, metadata): (String, Option<serde_json::Value>) = sqlx::query_as(
-            "SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1",
-        )
-        .bind(s.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (role, metadata): (String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(role, "user");
-        assert!(metadata.is_none(), "metadata should be NULL on plain user rows");
+        assert!(
+            metadata.is_none(),
+            "metadata should be NULL on plain user rows"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -827,13 +865,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let (role, metadata): (String, serde_json::Value) = sqlx::query_as(
-            "SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1",
-        )
-        .bind(s.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (role, metadata): (String, serde_json::Value) =
+            sqlx::query_as("SELECT role, metadata FROM engine.chat_messages WHERE session_id = $1")
+                .bind(s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(role, "gift_user");
         assert_eq!(metadata["tips_amount_usd"].as_f64(), Some(20.0));
     }
@@ -870,11 +907,12 @@ mod tests {
             .unwrap();
         match outcome {
             UpsertUserOutcome::DuplicateInProgress { .. } => {}
-            other => panic!("expected DuplicateInProgress, got {:?}", other),
+            other => panic!("expected DuplicateInProgress, got {other:?}"),
         }
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let s = repo
@@ -882,13 +920,7 @@ mod tests {
             .await
             .unwrap();
         let user_msg_id = match repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "hi",
-                "01J0000000000000000000001A",
-                "user",
-                None,
-            )
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000001A", "user", None)
             .await
             .unwrap()
         {
@@ -922,14 +954,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (
-            content,
-            pre_filter,
-            filter_model,
-            filter_triggers,
-            f_client,
-            f_gen,
-        ): (
+        let (content, pre_filter, filter_model, filter_triggers, f_client, f_gen): (
             String,
             Option<String>,
             Option<String>,
@@ -961,13 +986,7 @@ mod tests {
             .await
             .unwrap();
         let user_msg_id = match repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "hi",
-                "01J0000000000000000000002A",
-                "user",
-                None,
-            )
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000002A", "user", None)
             .await
             .unwrap()
         {
@@ -1015,9 +1034,10 @@ mod tests {
             "f_generation_id",
         ] {
             let q = format!("SELECT {col} FROM engine.chat_messages LIMIT 0");
-            sqlx::query(&q).execute(&pool).await.unwrap_or_else(|e| {
-                panic!("expected column {col} on engine.chat_messages: {e}")
-            });
+            sqlx::query(&q)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("expected column {col} on engine.chat_messages: {e}"));
         }
         // Indexes exist.
         let idx_count: i64 = sqlx::query_scalar(
@@ -1041,13 +1061,7 @@ mod tests {
             .await
             .unwrap();
         let user_msg_id = match repo
-            .upsert_user_message_idempotent(
-                s.id,
-                "hi",
-                "01J0000000000000000000003A",
-                "user",
-                None,
-            )
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000003A", "user", None)
             .await
             .unwrap()
         {
@@ -1084,6 +1098,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pre_filter.as_deref(), Some("raw"));
-        assert!(f_gen.is_none(), "f_generation_id should be NULL when None inside Some(FilterAudit)");
+        assert!(
+            f_gen.is_none(),
+            "f_generation_id should be NULL when None inside Some(FilterAudit)"
+        );
     }
 }

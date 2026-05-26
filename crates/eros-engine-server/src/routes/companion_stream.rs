@@ -606,7 +606,13 @@ mod tests {
         // Pre-seed an original-request outcome.
         let chat_repo = ChatRepo { pool: &pool };
         let user_msg_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {

@@ -139,7 +139,7 @@ fn drive_chat_burst(
     req: eros_engine_llm::openrouter::ChatRequest,
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
-    trait_tags: Vec<String>, // requested prompt-trait tags (the turn's)
+    trait_tags: Vec<String>,  // requested prompt-trait tags (the turn's)
     random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
@@ -1074,7 +1074,13 @@ mod tests {
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
         let chat_repo = ChatRepo { pool: &state.pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J1111111111111111111111A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1199,7 +1205,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J2222222222222222222222A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1276,7 +1288,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1369,7 +1387,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A", "user", None)
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J4444444444444444444444A",
+                "user",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1882,7 +1906,13 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "(打赏 $20)", "01J5555555555555555555555A", "gift_user", Some(&serde_json::json!({"tips_amount_usd": 20.0})))
+            .upsert_user_message_idempotent(
+                session_id,
+                "(打赏 $20)",
+                "01J5555555555555555555555A",
+                "gift_user",
+                Some(&serde_json::json!({"tips_amount_usd": 20.0})),
+            )
             .await
             .unwrap()
         {
