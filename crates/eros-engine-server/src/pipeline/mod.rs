@@ -60,7 +60,10 @@ pub async fn compute_signals_for_session(
 ) -> Result<ConversationSignals, AppError> {
     let message_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM engine.chat_messages \
-         WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+         WHERE session_id = $1 AND (\
+             role = 'user' \
+             OR (role = 'gift_user' AND metadata ? 'tips_amount_usd')\
+         )",
     )
     .bind(session_id)
     .fetch_one(pool)
@@ -69,7 +72,10 @@ pub async fn compute_signals_for_session(
 
     let last_time: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
         "SELECT MAX(sent_at) FROM engine.chat_messages \
-         WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+         WHERE session_id = $1 AND (\
+             role = 'user' \
+             OR (role = 'gift_user' AND metadata ? 'tips_amount_usd')\
+         )",
     )
     .bind(session_id)
     .fetch_optional(pool)
@@ -152,17 +158,20 @@ mod tests {
         (genome_id, instance_id, session_id)
     }
 
-    /// Tip turns persisted as `gift_user` must be counted by
-    /// `compute_signals_for_session` exactly like `user` turns.
-    /// Regression guard for the codex P2 finding on PR #52.
+    /// Tip `gift_user` rows (with `tips_amount_usd` in metadata) must be
+    /// counted exactly like `user` turns; legacy in-app-gift `gift_user` rows
+    /// (no tip metadata, written by routes/companion.rs:827) must NOT count.
+    /// Regression guard for codex P2 v2 finding on PR #52.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn signals_count_includes_gift_user_rows(pool: PgPool) {
+    async fn signals_count_includes_tip_gift_user_but_excludes_legacy_gifts(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
 
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'user', 'hi'), ($1, 'gift_user', '(打赏 $20)')",
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+                 ($1, 'user', 'hi', NULL), \
+                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb), \
+                 ($1, 'gift_user', 'in-app gift label', NULL)",
         )
         .bind(session_id)
         .execute(&pool)
@@ -176,7 +185,7 @@ mod tests {
 
         assert_eq!(
             signals.message_count, 2,
-            "gift_user tip rows must count toward message_count signals"
+            "user + tip gift_user count (2); legacy gift_user row does not"
         );
     }
 
