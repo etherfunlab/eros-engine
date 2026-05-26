@@ -234,6 +234,7 @@ fn drive_chat_burst(
                     model: Some(model_id.clone()),
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
+                    filter_audit: None,
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -365,6 +366,7 @@ fn drive_chat_burst(
                 model: Some(model_id.clone()),
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
+                filter_audit: None,
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -1038,7 +1040,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
         let chat_repo = ChatRepo { pool: &state.pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A")
+            .upsert_user_message_idempotent(session_id, "hi", "01J1111111111111111111111A", "user", None)
             .await
             .unwrap()
         {
@@ -1163,7 +1165,7 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A")
+            .upsert_user_message_idempotent(session_id, "hi", "01J2222222222222222222222A", "user", None)
             .await
             .unwrap()
         {
@@ -1240,7 +1242,7 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A")
+            .upsert_user_message_idempotent(session_id, "hi", "01J3333333333333333333333A", "user", None)
             .await
             .unwrap()
         {
@@ -1333,7 +1335,7 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A")
+            .upsert_user_message_idempotent(session_id, "hi", "01J4444444444444444444444A", "user", None)
             .await
             .unwrap()
         {
@@ -1522,6 +1524,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999A",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1639,6 +1643,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999B",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1753,6 +1759,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999C",
+                "user",
+                None,
             )
             .await
             .unwrap()
@@ -1840,7 +1848,7 @@ data: [DONE]\n\n";
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .upsert_user_message_idempotent(session_id, "(打赏 $20)", "01J5555555555555555555555A")
+            .upsert_user_message_idempotent(session_id, "(打赏 $20)", "01J5555555555555555555555A", "gift_user", Some(&serde_json::json!({"tips_amount_usd": 20.0})))
             .await
             .unwrap()
         {
@@ -1943,6 +1951,8 @@ data: [DONE]\n\n";
                 session_id,
                 "hello there friend",
                 "01J9999999999999999999999D",
+                "user",
+                None,
             )
             .await
             .unwrap()
