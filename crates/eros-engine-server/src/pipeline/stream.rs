@@ -140,6 +140,7 @@ fn drive_chat_burst(
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
     filter: Option<eros_engine_llm::model_config::ResolvedOutputFilter>,
     trait_tags: Vec<String>,  // requested prompt-trait tags (the turn's)
+    tier: Option<String>,     // user's tier at message time; None omitted from metadata
     random_draw: Option<f64>, // sampled once per turn by run_stream; None when trigger.random is unset
     outcome: std::sync::Arc<std::sync::Mutex<BurstOutcome>>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
@@ -165,6 +166,17 @@ fn drive_chat_burst(
             .as_ref()
             .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
+
+        // Build the assistant row metadata bag: always includes prompt_traits;
+        // includes tier only when the request carried one (omit key entirely when None).
+        let build_metadata = || {
+            let mut m = serde_json::Map::new();
+            m.insert("prompt_traits".into(), serde_json::json!(&trait_tags));
+            if let Some(t) = tier.as_deref() {
+                m.insert("tier".into(), serde_json::json!(t));
+            }
+            Some(serde_json::Value::Object(m))
+        };
 
         if !filtered_mode {
             // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
@@ -235,7 +247,7 @@ fn drive_chat_burst(
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
                     filter_audit: None,
-                    metadata: Some(serde_json::json!({ "prompt_traits": &trait_tags })),
+                    metadata: build_metadata(),
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -379,7 +391,7 @@ fn drive_chat_burst(
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
                 filter_audit,
-                metadata: Some(serde_json::json!({ "prompt_traits": &trait_tags })),
+                metadata: build_metadata(),
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -678,6 +690,7 @@ pub fn run_stream(
                     display_override,
                     filter,
                     trait_tags,
+                    user_msg.tier.clone(),
                     random_draw,
                     outcome.clone(),
                 );

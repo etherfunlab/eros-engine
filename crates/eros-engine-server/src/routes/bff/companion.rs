@@ -628,9 +628,10 @@ mod tests {
         sqlx::query(
             "INSERT INTO engine.chat_messages \
                  (session_id, role, content, metadata, sent_at) \
-             VALUES ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb, \
+             VALUES ($1, 'gift_user', '(打赏 $20)', \
+                     '{\"tips_amount_usd\": 20.0, \"tier\": \"gold\", \"prompt_traits\": [\"nsfw\"]}'::jsonb, \
                      now() - interval '2 seconds'),
-                    ($1, 'user', 'hello', NULL, now() - interval '1 second')",
+                    ($1, 'user', 'hello', '{\"tier\": \"silver\"}'::jsonb, now() - interval '1 second')",
         )
         .bind(session_id)
         .execute(&pool)
@@ -662,6 +663,23 @@ mod tests {
             normal.get("tips_amount_usd").is_none(),
             "non-tip user row must omit tips_amount_usd; got {normal}"
         );
+
+        // BFF MUST NOT leak any metadata key other than the typed tips_amount_usd
+        // extract. Spec §3.4: tier / prompt_traits are audit-only on the DB side.
+        for m in messages {
+            assert!(
+                m.get("metadata").is_none(),
+                "BFF must never expose raw metadata; got {m}"
+            );
+            assert!(
+                m.get("tier").is_none(),
+                "BFF must not surface tier from metadata; got {m}"
+            );
+            assert!(
+                m.get("prompt_traits").is_none(),
+                "BFF must not surface prompt_traits from metadata; got {m}"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

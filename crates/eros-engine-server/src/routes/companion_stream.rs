@@ -271,18 +271,28 @@ pub async fn send_message_stream(
             })
         })?;
 
-    let (persisted_content, persisted_role, persisted_metadata) = match req.tips_amount_usd {
+    // Build metadata: conditionally include tips_amount_usd and tier.
+    // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
+    let mut meta_map = serde_json::Map::new();
+    if let Some(amount) = req.tips_amount_usd {
+        meta_map.insert("tips_amount_usd".into(), serde_json::json!(amount));
+    }
+    if let Some(t) = req.tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let persisted_metadata: Option<serde_json::Value> = if meta_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(meta_map))
+    };
+
+    let (persisted_content, persisted_role) = match req.tips_amount_usd {
         Some(amount) if req.content.is_empty() => (
             format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
             "gift_user",
-            Some(serde_json::json!({ "tips_amount_usd": amount })),
         ),
-        Some(amount) => (
-            req.content.clone(),
-            "gift_user",
-            Some(serde_json::json!({ "tips_amount_usd": amount })),
-        ),
-        None => (req.content.clone(), "user", None),
+        Some(_) => (req.content.clone(), "gift_user"),
+        None => (req.content.clone(), "user"),
     };
     let outcome = chat_repo
         .upsert_user_message_idempotent(

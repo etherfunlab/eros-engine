@@ -202,6 +202,11 @@ field; omitted otherwise via `skip_serializing_if`.
 `"gift_user"` for tip rows where they previously saw `"user"`. This is the
 behaviour change clients act on.
 
+The BFF SELECT extracts ONLY `tips_amount_usd` from `metadata` —
+`(metadata->>'tips_amount_usd')::float8`. Other metadata keys (`tier`,
+`prompt_traits`, future additions) are intentionally NOT exposed; they remain
+audit-only on the DB side. Use a future admin endpoint if needed.
+
 ### 3.5 `prompt_traits` on assistant rows' `metadata`
 
 In addition to the user-side tip case, `engine.chat_messages.metadata` is also written
@@ -218,6 +223,16 @@ traits were injected (distinct from legacy rows with NULL metadata).
 
 **Not** exposed via BFF history — audit-only. A future admin/debug endpoint can read
 it if needed.
+
+Additionally, `metadata` records `{"tier": "<tier>"}` on every row where the
+user's tier-at-time is known — assistant rows (always, when the request
+carried a tier) and user-side rows (both tip and non-tip). Reason: the
+canonical tier table only stores the user's CURRENT tier; the row needs the
+tier-at-message-time for historical correctness. When `tier` is None on the
+request, the key is omitted entirely (not written as `null`) to keep the
+JSONB shape sparse.
+
+Example combined assistant metadata: `{"prompt_traits": ["nsfw_boost"], "tier": "gold"}`.
 
 ---
 
