@@ -195,24 +195,30 @@ pub struct OutputFilterTrigger {
     pub traits: Option<TraitPredicate>,
 }
 
-/// Detail of which predicates a turn matched. Each field present ⇒ that
-/// predicate was configured **and** passed. Serialises to JSONB for
-/// `chat_messages.filter_triggers`; absent fields skip serialization so the
-/// stored shape matches the spec (only fired predicates appear).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct TriggerHits {
+/// Which predicates fired this turn, echoing the **source config verbatim**
+/// (config-as-declared). Serialises to JSONB for
+/// `chat_messages.filter_triggers`; absent fields skip serialization so only
+/// configured-and-fired predicates appear. An all-`None` value (empty trigger
+/// that always fires) serialises to `{}` and `is_empty()` is true — the
+/// stream layer maps that to SQL `NULL`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct FiredPredicates {
+    /// The configured probability `p` (NOT the per-turn draw).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub random: Option<RandomHit>,
+    pub random: Option<f64>,
+    /// The configured model allowlist (NOT just the matched id).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub models: Option<String>,
+    pub models: Option<Vec<String>>,
+    /// The configured trait predicate `{ any, when }` (NOT observed tags).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub traits: Option<Vec<String>>,
+    pub traits: Option<TraitPredicate>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct RandomHit {
-    pub p: f64,
-    pub draw: f64,
+impl FiredPredicates {
+    /// True when no predicate was configured (empty/always-fire trigger).
+    pub fn is_empty(&self) -> bool {
+        self.random.is_none() && self.models.is_none() && self.traits.is_none()
+    }
 }
 
 impl OutputFilterTrigger {
@@ -228,43 +234,26 @@ impl OutputFilterTrigger {
         random_ok && self.traits_pass(trait_tags)
     }
 
-    /// Per-attempt decision. Returns `Some(hits)` when the trigger fires for
-    /// this attempt, with hit detail; `None` otherwise. Hits serialise to
-    /// `chat_messages.filter_triggers` JSONB on write.
+    /// Per-attempt decision. Returns `Some(fired)` when the trigger fires for
+    /// this attempt, echoing the configured predicates verbatim; `None`
+    /// otherwise. `fired` serialises to `chat_messages.filter_triggers` JSONB
+    /// on write (empty ⇒ SQL NULL, handled by the stream layer).
     pub fn should_filter(
         &self,
         model_id: &str,
         trait_tags: &[&str],
         random_draw: Option<f64>,
-    ) -> Option<TriggerHits> {
+    ) -> Option<FiredPredicates> {
         if !self.turn_level_pass(random_draw, trait_tags) {
             return None;
         }
         if !self.models_pass(model_id) {
             return None;
         }
-        Some(TriggerHits {
-            random: match (self.random, random_draw) {
-                (Some(p), Some(d)) => Some(RandomHit { p, draw: d }),
-                _ => None,
-            },
-            models: self
-                .models
-                .as_ref()
-                .filter(|list| list.iter().any(|m| m == model_id))
-                .map(|_| model_id.to_string()),
-            traits: self.traits.as_ref().map(|tp| match tp.when {
-                // Present: record which tags from `tp.any` were actually seen.
-                TraitWhen::Present => tp
-                    .any
-                    .iter()
-                    .filter(|tag| trait_tags.contains(&tag.as_str()))
-                    .cloned()
-                    .collect::<Vec<String>>(),
-                // Absent: the predicate fires because the tags are NOT present.
-                // Nothing to enumerate; record an empty vec.
-                TraitWhen::Absent => Vec::new(),
-            }),
+        Some(FiredPredicates {
+            random: self.random,
+            models: self.models.clone(),
+            traits: self.traits.clone(),
         })
     }
 
@@ -291,7 +280,7 @@ impl OutputFilterTrigger {
 /// Trait-match predicate: the predicate passes when at least one tag in `any`
 /// is present among the turn's prompt traits (`when = present`) or absent
 /// (`when = absent`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct TraitPredicate {
     #[serde(default)]
     pub any: Vec<String>,
@@ -299,7 +288,7 @@ pub struct TraitPredicate {
     pub when: TraitWhen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TraitWhen {
     #[default]
@@ -1628,7 +1617,7 @@ trigger = { traits = { any = ["a"] } }
     }
 
     #[test]
-    fn should_filter_returns_hits_on_match() {
+    fn should_filter_returns_fired_config_on_match() {
         let t = OutputFilterTrigger {
             random: Some(0.3),
             models: Some(vec!["x/y".into()]),
@@ -1637,13 +1626,19 @@ trigger = { traits = { any = ["a"] } }
                 when: TraitWhen::Present,
             }),
         };
-        let hits = t
+        let fired = t
             .should_filter("x/y", &["nsfw"], Some(0.18))
             .expect("should fire");
-        assert_eq!(hits.random.as_ref().unwrap().p, 0.3);
-        assert_eq!(hits.random.as_ref().unwrap().draw, 0.18);
-        assert_eq!(hits.models.as_deref(), Some("x/y"));
-        assert_eq!(hits.traits.as_deref(), Some(&["nsfw".to_string()][..]));
+        // Echoes config verbatim — NOT observed values.
+        assert_eq!(fired.random, Some(0.3));
+        assert_eq!(fired.models.as_deref(), Some(&["x/y".to_string()][..]));
+        assert_eq!(
+            fired.traits,
+            Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Present,
+            })
+        );
     }
 
     #[test]
@@ -1673,7 +1668,7 @@ trigger = { traits = { any = ["a"] } }
     }
 
     #[test]
-    fn should_filter_traits_absent_predicate_returns_empty_traits_vec() {
+    fn should_filter_traits_absent_echoes_config_not_empty_vec() {
         let t = OutputFilterTrigger {
             random: None,
             models: None,
@@ -1682,22 +1677,35 @@ trigger = { traits = { any = ["a"] } }
                 when: TraitWhen::Absent,
             }),
         };
-        // "nsfw" not in tags → predicate passes; traits hit recorded as empty vec.
-        let hits = t.should_filter("m", &["sfw"], None).expect("fires");
-        assert_eq!(hits.traits.as_deref(), Some(&[][..]));
+        // "nsfw" not in tags → predicate passes; the FIRED record echoes the
+        // configured {any, when}, so a reader sees `when="absent"` directly.
+        let fired = t.should_filter("m", &["sfw"], None).expect("fires");
+        assert_eq!(
+            fired.traits,
+            Some(TraitPredicate {
+                any: vec!["nsfw".into()],
+                when: TraitWhen::Absent,
+            })
+        );
     }
 
     #[test]
-    fn trigger_hits_serializes_only_fired_fields() {
-        let hits = TriggerHits {
-            random: Some(RandomHit { p: 0.3, draw: 0.18 }),
+    fn fired_predicates_serializes_only_fired_fields() {
+        let fired = FiredPredicates {
+            random: Some(0.3),
             models: None,
-            traits: Some(vec!["nsfw_boost".into()]),
+            traits: Some(TraitPredicate {
+                any: vec!["nsfw_boost".into()],
+                when: TraitWhen::Absent,
+            }),
         };
-        let v = serde_json::to_value(&hits).unwrap();
-        assert!(v.get("random").is_some());
+        let v = serde_json::to_value(&fired).unwrap();
+        assert_eq!(v["random"], serde_json::json!(0.3));
         assert!(v.get("models").is_none(), "absent fields skipped");
-        assert_eq!(v["traits"], serde_json::json!(["nsfw_boost"]));
+        assert_eq!(
+            v["traits"],
+            serde_json::json!({ "any": ["nsfw_boost"], "when": "absent" })
+        );
     }
 
     #[test]
@@ -1715,15 +1723,12 @@ trigger = { traits = { any = ["a"] } }
     }
 
     #[test]
-    fn trigger_hits_empty_serializes_to_empty_object() {
-        // Spec §4.2: when an always-fire trigger (no configured predicates)
-        // is recorded, filter_triggers JSONB must be `{}` — not `{"random":null, ...}`.
-        let hits = TriggerHits {
-            random: None,
-            models: None,
-            traits: None,
-        };
-        let v = serde_json::to_value(&hits).unwrap();
+    fn fired_predicates_empty_serializes_to_empty_object_and_is_empty() {
+        // Empty/always-fire trigger: no configured predicates. Serialises to
+        // `{}` and is_empty() is true; the stream layer maps that to SQL NULL.
+        let fired = FiredPredicates::default();
+        assert!(fired.is_empty());
+        let v = serde_json::to_value(&fired).unwrap();
         assert_eq!(v, serde_json::json!({}));
     }
 
