@@ -52,6 +52,38 @@ pub(crate) fn parse_usage_hidden_keys(raw: Option<&str>) -> HashSet<String> {
         .collect()
 }
 
+/// Knobs for the companion_insights_snapshot sweeper. Defaults: daily
+/// 23:00 SGT, enabled. The cron string is stored raw and validated by
+/// the sweeper at task start (so an invalid expression fails the sweeper
+/// task only, not the whole server boot).
+#[derive(Clone, Debug)]
+pub struct SnapshotConfig {
+    pub disabled: bool,
+    pub cron: String,
+    pub tz: chrono_tz::Tz,
+}
+
+/// Pure parser for the three env vars. Mirrors `parse_usage_hidden_keys`
+/// in that tests can exercise edge cases without touching process env.
+///
+/// - `SNAPSHOT_DISABLED=1` → disabled
+/// - `SNAPSHOT_CRON` raw 6-field cron string (default `"0 0 23 * * *"`)
+/// - `SNAPSHOT_TZ` IANA zone (default `"Asia/Singapore"`; falls back on parse failure)
+pub(crate) fn parse_snapshot_config(
+    disabled_raw: Option<&str>,
+    cron_raw: Option<&str>,
+    tz_raw: Option<&str>,
+) -> SnapshotConfig {
+    let disabled = disabled_raw.map(|v| v == "1").unwrap_or(false);
+    let cron = cron_raw
+        .map(str::to_owned)
+        .unwrap_or_else(|| "0 0 23 * * *".to_string());
+    let tz = tz_raw
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Asia::Singapore);
+    SnapshotConfig { disabled, cron, tz }
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -136,6 +168,9 @@ pub struct ServerConfig {
     /// stays intact. Populated from `OPENROUTER_USAGE_HIDDEN_KEYS`
     /// (comma-separated).
     pub openrouter_usage_hidden_keys: HashSet<String>,
+    /// Cron-scheduled companion_insights_snapshot sweeper config. See
+    /// `pipeline::snapshot` for the sweep loop.
+    pub snapshot: SnapshotConfig,
 }
 
 impl ServerConfig {
@@ -169,6 +204,11 @@ impl ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),
         );
+        let snapshot = parse_snapshot_config(
+            std::env::var("SNAPSHOT_DISABLED").ok().as_deref(),
+            std::env::var("SNAPSHOT_CRON").ok().as_deref(),
+            std::env::var("SNAPSHOT_TZ").ok().as_deref(),
+        );
         Self {
             expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
                 .map(|v| v == "true" || v == "1")
@@ -187,6 +227,7 @@ impl ServerConfig {
                     .ok()
                     .as_deref(),
             ),
+            snapshot,
         }
     }
 }
@@ -246,5 +287,35 @@ mod tests {
         drop(g1);
         let _g3 = slots.try_acquire(uid, 2).expect("acquire after drop ok");
         drop(g2);
+    }
+
+    #[test]
+    fn snapshot_config_defaults_when_env_unset() {
+        let cfg = parse_snapshot_config(None, None, None);
+        assert!(!cfg.disabled);
+        assert_eq!(cfg.cron, "0 0 23 * * *");
+        assert_eq!(cfg.tz, chrono_tz::Asia::Singapore);
+    }
+
+    #[test]
+    fn snapshot_config_disabled_when_env_says_one() {
+        let cfg = parse_snapshot_config(Some("1"), None, None);
+        assert!(cfg.disabled);
+        let cfg = parse_snapshot_config(Some("0"), None, None);
+        assert!(!cfg.disabled, "any value other than 1 leaves it enabled");
+    }
+
+    #[test]
+    fn snapshot_config_honours_env_overrides() {
+        let cfg = parse_snapshot_config(None, Some("0 */5 * * * *"), Some("UTC"));
+        assert_eq!(cfg.cron, "0 */5 * * * *");
+        assert_eq!(cfg.tz, chrono_tz::UTC);
+    }
+
+    #[test]
+    fn snapshot_config_falls_back_on_bad_tz() {
+        // Misspelled tz → default + (caller will warn-log; we just verify fallback)
+        let cfg = parse_snapshot_config(None, None, Some("Not/A_Real_Zone"));
+        assert_eq!(cfg.tz, chrono_tz::Asia::Singapore);
     }
 }

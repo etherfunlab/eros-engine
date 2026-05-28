@@ -898,6 +898,12 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             dreaming_idle_threshold: std::time::Duration::from_secs(1800),
             dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
             openrouter_usage_hidden_keys: std::collections::HashSet::new(),
+            // Snapshot sweeper disabled in tests — same rationale as dreaming.
+            snapshot: crate::state::SnapshotConfig {
+                disabled: true,
+                cron: "0 0 23 * * *".into(),
+                tz: chrono_tz::Asia::Singapore,
+            },
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
