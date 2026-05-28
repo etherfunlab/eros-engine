@@ -51,6 +51,9 @@ tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 ulid         = { workspace = true }
 rand = "0.8"
+# 6-field cron schedule parser (sec min hr dom mon dow). Pure parser; the
+# sweeper drives ticks via tokio::time::sleep. No runtime scheduler.
+cron = "0.12"
 
 [dev-dependencies]
 wiremock = "0.6"
