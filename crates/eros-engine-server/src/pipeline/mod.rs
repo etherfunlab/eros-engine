@@ -6,6 +6,7 @@
 pub mod dreaming;
 pub mod handlers;
 pub mod post_process;
+pub mod snapshot;
 pub mod stream;
 pub mod sync;
 

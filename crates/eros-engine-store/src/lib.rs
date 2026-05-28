@@ -211,4 +211,61 @@ mod migration_tests {
         let phrase = repo.pick_chat_stream_fallback_phrase().await.unwrap();
         assert!(phrase.is_none(), "expected None when config row absent");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn companion_insights_snapshot_schema(pool: PgPool) {
+        // Table exists with the five expected columns at expected types.
+        let cols: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'engine' \
+               AND table_name   = 'companion_insights_snapshot' \
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query columns for companion_insights_snapshot");
+        let names: Vec<&str> = cols.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "user_id", "insights", "training_level", "captured_at"],
+            "column order/identity must match the migration"
+        );
+        // captured_at must be NOT NULL — sweeper sets it explicitly.
+        let captured_at_null = cols
+            .iter()
+            .find(|(n, _, _)| n == "captured_at")
+            .map(|(_, _, nullable)| nullable.as_str())
+            .unwrap();
+        assert_eq!(captured_at_null, "NO", "captured_at must be NOT NULL");
+
+        // Index on (user_id, captured_at DESC) exists.
+        let idx_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'engine' \
+                   AND tablename  = 'companion_insights_snapshot' \
+                   AND indexname  = 'idx_companion_insights_snapshot_user_time')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query pg_indexes");
+        assert!(
+            idx_exists,
+            "idx_companion_insights_snapshot_user_time must be created by 0021"
+        );
+
+        // RLS enabled (no policy → server-side only access).
+        let rls_enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+              WHERE oid = 'engine.companion_insights_snapshot'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity");
+        assert!(
+            rls_enabled,
+            "RLS must be enabled on companion_insights_snapshot"
+        );
+    }
 }

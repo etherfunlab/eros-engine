@@ -327,6 +327,11 @@ async fn run_server() -> Result<()> {
     // Cloned because the next line moves `state` into the router.
     tokio::spawn(crate::pipeline::dreaming::sweeper(state.clone()));
 
+    // companion_insights_snapshot sweeper. Returns immediately when
+    // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
+    // chat path is unaffected by snapshot misconfig.
+    tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
+
     if state.marketplace_svc_url.is_some() {
         tokio::spawn(crate::pipeline::sync::run(state.clone()));
         tracing::info!("marketplace self-heal task spawned");

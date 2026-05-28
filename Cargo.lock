@@ -297,6 +297,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "cron"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8c3e73077b4b4a6ab1ea5047c37c57aee77657bc8ecd6f29b0af082d0b0c07"
+dependencies = [
+ "chrono",
+ "nom",
+ "once_cell",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,7 +416,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eros-engine-core"
-version = "0.4.3-dev"
+version = "0.5.1-dev"
 dependencies = [
  "chrono",
  "serde",
@@ -415,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-llm"
-version = "0.4.3-dev"
+version = "0.5.1-dev"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -436,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-server"
-version = "0.4.3-dev"
+version = "0.5.1-dev"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -444,6 +455,7 @@ dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
+ "cron",
  "dotenvy",
  "eros-engine-core",
  "eros-engine-llm",
@@ -478,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "eros-engine-store"
-version = "0.4.3-dev"
+version = "0.5.1-dev"
 dependencies = [
  "async-trait",
  "bs58",

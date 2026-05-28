@@ -110,6 +110,25 @@ impl<'a> InsightRepo<'a> {
         .await?;
         Ok(row)
     }
+
+    /// Append one snapshot row per companion_insights record at the given
+    /// instant. Single server-side INSERT … SELECT; no per-user roundtrip.
+    /// Returns the number of rows written.
+    pub async fn snapshot_all_users(
+        &self,
+        captured_at: DateTime<Utc>,
+    ) -> Result<usize, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO engine.companion_insights_snapshot
+                (user_id, insights, training_level, captured_at)
+             SELECT user_id, insights, training_level, $1
+               FROM engine.companion_insights",
+        )
+        .bind(captured_at)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() as usize)
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +216,50 @@ mod tests {
         let repo = InsightRepo { pool: &pool };
         let result = repo.load(Uuid::new_v4()).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn snapshot_all_users_writes_one_row_per_user_at_same_ts(pool: PgPool) {
+        let repo = InsightRepo { pool: &pool };
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        repo.merge(u1, serde_json::json!({ "city": "Shanghai" }))
+            .await
+            .unwrap();
+        repo.merge(u2, serde_json::json!({ "occupation": "engineer" }))
+            .await
+            .unwrap();
+
+        let t = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let n = repo.snapshot_all_users(t).await.unwrap();
+        assert_eq!(n, 2, "one row per companion_insights row");
+
+        let rows: Vec<(Uuid, serde_json::Value, f64, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT user_id, insights, training_level, captured_at
+               FROM engine.companion_insights_snapshot
+              ORDER BY user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (_, _, _, ts) in &rows {
+            assert_eq!(*ts, t, "every row in the same fire shares captured_at");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn snapshot_all_users_with_empty_table_writes_nothing(pool: PgPool) {
+        let repo = InsightRepo { pool: &pool };
+        let t = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let n = repo.snapshot_all_users(t).await.unwrap();
+        assert_eq!(n, 0, "no companion_insights rows ⇒ no snapshot rows");
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.companion_insights_snapshot")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 }
