@@ -7,9 +7,11 @@
 -- signal is preserved on the row via filter_model NOT NULL; only the
 -- per-predicate detail is lost.
 --
+-- This runs at the v0.5.1 upgrade, before any new-shape row can exist, so
+-- every non-null filter_triggers is legacy — wipe on that condition alone.
+--
 -- Spec: docs/superpowers/specs/2026-05-29-engine-cleanup-and-snapshot-design.md §2
 
 UPDATE engine.chat_messages
    SET filter_triggers = NULL
- WHERE filter_model    IS NOT NULL
-   AND filter_triggers IS NOT NULL;
+ WHERE filter_triggers IS NOT NULL;
