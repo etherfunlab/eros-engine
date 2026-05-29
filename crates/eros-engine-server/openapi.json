@@ -99,7 +99,7 @@
             "description": "missing or invalid bearer"
           },
           "403": {
-            "description": "not your instance / nft gate"
+            "description": "not your instance"
           },
           "404": {
             "description": "instance/genome not found"
