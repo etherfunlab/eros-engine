@@ -460,11 +460,19 @@ fn drive_chat_burst(
                         o.filtered = true;
                         o.retries_filter = out.retries_filter;
                         drop(o); // release MutexGuard before the yield below — must not cross suspension point
+                        // Empty/always-fire trigger serialises to `{}`; substitute
+                        // JSON null so the store layer's guard lands SQL NULL. A
+                        // reader tells "filter ran" from "filter absent" via filter_model.
+                        let filter_triggers = if h.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::to_value(&h)
+                                .expect("FiredPredicates Serialize is infallible")
+                        };
                         let audit = eros_engine_store::chat::FilterAudit {
                             pre_filter_content: acc.clone(),
                             filter_model: out.filter_model,
-                            filter_triggers: serde_json::to_value(&h)
-                                .expect("TriggerHits Serialize is infallible"),
+                            filter_triggers,
                             f_client_msg_id: out.f_client_msg_id,
                             f_generation_id: out.f_generation_id,
                         };
