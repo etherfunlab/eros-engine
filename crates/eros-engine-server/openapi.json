@@ -340,6 +340,9 @@
           "401": {
             "description": "missing or invalid bearer"
           },
+          "403": {
+            "description": "instance not owned by this user"
+          },
           "404": {
             "description": "instance/genome not found"
           }

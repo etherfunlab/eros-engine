@@ -594,6 +594,7 @@ pub(crate) async fn resolve_or_create_session(
         (status = 200, body = StartChatResponse),
         (status = 400, description = "missing genome_id and no existing instance"),
         (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "instance not owned by this user"),
         (status = 404, description = "instance/genome not found")
     ),
     security(("bearer" = []))
