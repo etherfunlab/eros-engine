@@ -7,12 +7,8 @@ pub mod error_handling;
 pub mod human_insight;
 pub mod insight;
 pub mod memory;
-pub mod ownership;
 pub mod persona;
 pub mod pool;
-pub mod pubkey;
-pub mod sync_cursors;
-pub mod wallets;
 
 pub use sqlx::PgPool;
 
