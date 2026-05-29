@@ -868,10 +868,10 @@ pub fn router() -> OpenApiRouter<AppState> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test helpers — visible to other modules' #[cfg(test)] blocks so the
-// /s2s/* integration tests in routes/s2s.rs can reuse `test_state`.
-// Lives outside the inner `tests` module on purpose; Rust's visibility
-// rules don't let a sibling module reach into a private `mod tests`.
+// Test helpers — visible to other modules' #[cfg(test)] blocks so sibling
+// test modules can reuse `test_state`. Lives outside the inner `tests`
+// module on purpose; Rust's visibility rules don't let a sibling module
+// reach into a private `mod tests`.
 // ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(crate) const TEST_SECRET: &str = "test-secret-companion-routes";
@@ -912,14 +912,6 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
-        // s2s middleware is opted-out in companion tests (no secret
-        // configured → /s2s/* returns 401). The s2s integration tests
-        // in routes/s2s.rs override `marketplace_s2s_secret` after
-        // calling this helper.
-        marketplace_svc_url: None,
-        marketplace_s2s_secret: None,
-        marketplace_s2s_secret_previous: None,
-        http_client: reqwest::Client::new(),
     }
 }
 
