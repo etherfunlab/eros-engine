@@ -238,11 +238,20 @@ for frame layout and error semantics.
 | `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
 | `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
-| `SUPABASE_URL` | no | Supabase project URL. Kept in `.env.example` for client/deploy conventions; the server does not read it today. |
-| `SUPABASE_JWT_SECRET` | yes | JWT signing secret for default auth. |
+| `SUPABASE_URL` | no | Supabase project URL. When set, the server derives the JWKS endpoint (`<url>/auth/v1/.well-known/jwks.json`) for asymmetric (RS256/ES256) JWT validation — the post-2025 Supabase default. |
+| `SUPABASE_JWKS_URL` | no | Explicit JWKS endpoint; takes precedence over deriving it from `SUPABASE_URL`. |
+| `SUPABASE_JWT_SECRET` | no | Legacy HS256 shared secret. At least one auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS) or `SUPABASE_JWT_SECRET` (HS256) — must be set, or the server refuses to boot (fail-closed). |
 | `BIND_ADDR` | no | Defaults to `0.0.0.0:8080`. |
 | `EXPOSE_AFFINITY_DEBUG` | no | Set `true` to enable `/comp/affinity/{session_id}`. |
 | `EMA_INERTIA` | no | EMA smoothing for affinity updates, in `[0, 1]`; defaults to `0.8`. Each turn applies `1 − inertia` of the evaluated delta, so a higher value moves the affinity vector less per turn (slower to build or lose) — a relationship-difficulty dial; `0` applies every delta in full. |
+| `DEMO_EMA_INERTIA` | no | EMA inertia applied only to sessions opened with `is_demo: true`; defaults to `0.3` so meters move visibly across a short demo. Falls back to `EMA_INERTIA` semantics otherwise. |
+| `DREAMING_DISABLED` | no | Set `1` to skip spawning the dreaming-lite sweeper (session-end memory extraction). |
+| `DREAMING_TICK_SECS` | no | How often the dreaming-lite sweeper wakes; defaults to `300`. |
+| `DREAMING_IDLE_SECS` | no | Minimum idle time before a session is eligible for classification; defaults to `1800`. |
+| `DREAMING_CLAIM_STALE_SECS` | no | How long a classification claim stays fresh before a crashed worker's row is re-claimed; defaults to `600`. |
+| `SNAPSHOT_DISABLED` | no | Set `1` to skip spawning the `companion_insights_snapshot` sweeper. |
+| `SNAPSHOT_CRON` | no | 6-field cron (`sec min hr dom mon dow`) for the snapshot sweeper; defaults to `0 0 23 * * *` (daily 23:00). |
+| `SNAPSHOT_TZ` | no | IANA timezone the snapshot cron is evaluated in; defaults to `Asia/Singapore`. |
 | `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
 | `RUST_LOG` | no | Defaults to `info`. |
 
