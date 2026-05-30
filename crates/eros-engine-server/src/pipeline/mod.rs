@@ -8,7 +8,6 @@ pub mod handlers;
 pub mod post_process;
 pub mod snapshot;
 pub mod stream;
-pub mod sync;
 
 use uuid::Uuid;
 
@@ -161,7 +160,8 @@ mod tests {
 
     /// Tip `gift_user` rows (with `tips_amount_usd` in metadata) must be
     /// counted exactly like `user` turns; legacy in-app-gift `gift_user` rows
-    /// (no tip metadata, written by routes/companion.rs:827) must NOT count.
+    /// (no tip metadata, written by the gift-event handler in routes/companion.rs)
+    /// must NOT count.
     /// Regression guard for codex P2 v2 finding on PR #52.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn signals_count_includes_tip_gift_user_but_excludes_legacy_gifts(pool: PgPool) {

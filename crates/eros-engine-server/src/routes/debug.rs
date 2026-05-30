@@ -272,15 +272,13 @@ mod tests {
         let token = mint_test_jwt(user_id);
 
         let (status, _b) = send_request(&mut app, req(&token, session_id, "")).await;
-        // Gate closed ⇒ the /event route is not registered. The request then
-        // falls through to the merged s2s-auth catch-all fallback (s2s router
-        // is merged last in routes::mod), which rejects a non-s2s bearer with
-        // 401 — proving the debug handler never ran. A clean-404 router fix
-        // would make this 404 instead; either way the route is absent (not 2xx).
-        assert!(
-            status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED,
-            "gate-closed event route must be absent (404) or rejected by the \
-             merged auth fallback (401); got {status}"
+        // Gate closed ⇒ the /event route is not registered, so an authenticated
+        // request to it finds no matching route and gets a clean 404 — proving
+        // the debug handler never ran.
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "gate-closed event route must be absent (404); got {status}"
         );
     }
 

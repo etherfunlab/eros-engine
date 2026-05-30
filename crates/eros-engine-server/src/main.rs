@@ -273,32 +273,6 @@ async fn run_server() -> Result<()> {
             .with_context(|| format!("model_config parse failed: {model_config_path}"))?,
     );
 
-    // Marketplace-svc env wiring. The /s2s/* surface is "off" by default:
-    //   - URL set + secret set        → outbound self-heal pull enabled
-    //   - URL unset                   → OSS-only mode, no pull task
-    //   - URL set + secret unset      → boot fails fast (footgun guard)
-    // The previous-secret slot is always optional (used only during rotation).
-    let marketplace_svc_url = std::env::var("MARKETPLACE_SVC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let marketplace_s2s_secret = std::env::var("MARKETPLACE_SVC_S2S_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let marketplace_s2s_secret_previous = std::env::var("MARKETPLACE_SVC_S2S_SECRET_PREVIOUS")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if marketplace_svc_url.is_some() && marketplace_s2s_secret.is_none() {
-        anyhow::bail!(
-            "MARKETPLACE_SVC_URL is set but MARKETPLACE_SVC_S2S_SECRET is not. \
-             The self-heal pull cannot sign outbound requests without a secret. \
-             Set the secret, or unset the URL to run in OSS-only mode."
-        );
-    }
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("build reqwest client for marketplace-svc pulls")?;
-
     let state = AppState {
         pool,
         auth,
@@ -307,10 +281,6 @@ async fn run_server() -> Result<()> {
         voyage,
         model_config,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
-        marketplace_svc_url,
-        marketplace_s2s_secret,
-        marketplace_s2s_secret_previous,
-        http_client,
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth
@@ -331,11 +301,6 @@ async fn run_server() -> Result<()> {
     // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
     // chat path is unaffected by snapshot misconfig.
     tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
-
-    if state.marketplace_svc_url.is_some() {
-        tokio::spawn(crate::pipeline::sync::run(state.clone()));
-        tracing::info!("marketplace self-heal task spawned");
-    }
 
     let app: Router = open_router
         .with_state(state)

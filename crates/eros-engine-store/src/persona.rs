@@ -17,28 +17,25 @@ struct GenomeRow {
     is_active: bool,
 }
 
-/// Narrow gate-fields view of a genome for the chat-start path: the three
-/// fields `resolve_or_create_session` needs — `name` (response),
-/// `is_active` (400 check), `asset_id` (NFT gate) — in one row. Folds the
-/// former `get_genome` + `get_asset_id_for_genome` reads.
+/// Narrow gate-fields view of a genome for the chat-start path: the two
+/// fields `resolve_or_create_session` needs — `name` (response) and
+/// `is_active` (400 check) — in one row. Folds the former `get_genome` read.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GenomeGate {
     pub name: String,
     pub is_active: bool,
-    pub asset_id: Option<String>,
 }
 
 /// Gate-fields view for the explicit-`instance_id` chat-start path: owner
-/// (403 check), genome name (response), asset_id (NFT gate), in one JOIN.
+/// (403 check) and genome name (response) in one JOIN.
 /// Filters `status='active'` like `load_companion`, so an archived instance
-/// yields `None`. Folds the former `load_companion` + `get_asset_id_for_genome`.
+/// yields `None`. Folds the former `load_companion` read.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InstanceGate {
     pub instance_id: Uuid,
     pub genome_id: Uuid,
     pub owner_uid: Uuid,
     pub genome_name: String,
-    pub asset_id: Option<String>,
 }
 
 impl From<GenomeRow> for PersonaGenome {
@@ -113,7 +110,7 @@ impl<'a> PersonaRepo<'a> {
         genome_id: Uuid,
     ) -> Result<Option<GenomeGate>, sqlx::Error> {
         sqlx::query_as::<_, GenomeGate>(
-            "SELECT name, is_active, asset_id \
+            "SELECT name, is_active \
              FROM engine.persona_genomes WHERE id = $1",
         )
         .bind(genome_id)
@@ -194,8 +191,7 @@ impl<'a> PersonaRepo<'a> {
                 pi.id        AS instance_id, \
                 pi.genome_id AS genome_id, \
                 pi.owner_uid AS owner_uid, \
-                pg.name      AS genome_name, \
-                pg.asset_id  AS asset_id \
+                pg.name      AS genome_name \
              FROM engine.persona_instances pi \
              JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
@@ -299,7 +295,6 @@ impl<'a> PersonaRepo<'a> {
     /// (possibly archived) one. `persona_instances` is
     /// `UNIQUE(genome_id, owner_uid)`, so a plain INSERT 500s on an archived
     /// row (issue #37); the `ON CONFLICT DO UPDATE` flips it back to active.
-    /// Caller MUST run the NFT-ownership gate before this write.
     pub async fn ensure_active_instance(
         &self,
         genome_id: Uuid,
@@ -315,22 +310,6 @@ impl<'a> PersonaRepo<'a> {
         .bind(owner_uid)
         .fetch_one(self.pool)
         .await
-    }
-
-    /// Returns the `asset_id` for an NFT-backed genome, or `None` for legacy
-    /// seed-persona rows where the column is NULL. Used by the chat-start
-    /// and per-message gates to decide whether to invoke the NFT ownership
-    /// check.
-    pub async fn get_asset_id_for_genome(
-        &self,
-        genome_id: uuid::Uuid,
-    ) -> sqlx::Result<Option<String>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT asset_id FROM engine.persona_genomes WHERE id = $1")
-                .bind(genome_id)
-                .fetch_optional(self.pool)
-                .await?;
-        Ok(row.and_then(|(opt,)| opt))
     }
 }
 
@@ -406,29 +385,27 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn get_genome_gate_returns_name_active_and_asset_id(pool: PgPool) {
+    async fn get_genome_gate_returns_name_and_active(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
 
-        // legacy genome → asset_id NULL
+        // legacy genome → is_active true
         let legacy = insert_genome(&pool, "Legacy", true, serde_json::json!({})).await;
         let g = repo.get_genome_gate(legacy).await.unwrap().unwrap();
         assert_eq!(g.name, "Legacy");
         assert!(g.is_active);
-        assert_eq!(g.asset_id, None);
 
-        // NFT genome, inactive → asset_id Some, is_active false
-        let nft = sqlx::query_scalar::<_, Uuid>(
+        // inactive genome → is_active false
+        let inactive = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes \
-                (name, system_prompt, art_metadata, is_active, asset_id) \
-             VALUES ('Nft', 'p', '{}'::jsonb, false, 'asset-xyz') RETURNING id",
+                (name, system_prompt, art_metadata, is_active) \
+             VALUES ('NftGenome', 'sp', '{}'::jsonb, false) RETURNING id",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        let g2 = repo.get_genome_gate(nft).await.unwrap().unwrap();
-        assert_eq!(g2.name, "Nft");
+        let g2 = repo.get_genome_gate(inactive).await.unwrap().unwrap();
+        assert_eq!(g2.name, "NftGenome");
         assert!(!g2.is_active);
-        assert_eq!(g2.asset_id.as_deref(), Some("asset-xyz"));
 
         // missing → None
         assert!(repo
@@ -494,8 +471,8 @@ mod tests {
         let owner = Uuid::new_v4();
         let genome_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes \
-                (name, system_prompt, art_metadata, is_active, asset_id) \
-             VALUES ('Nova', 'p', '{}'::jsonb, true, 'asset-1') RETURNING id",
+                (name, system_prompt, art_metadata, is_active) \
+             VALUES ('Nova', 'p', '{}'::jsonb, true) RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -511,7 +488,6 @@ mod tests {
         assert_eq!(gate.genome_id, genome_id);
         assert_eq!(gate.owner_uid, owner);
         assert_eq!(gate.genome_name, "Nova");
-        assert_eq!(gate.asset_id.as_deref(), Some("asset-1"));
 
         // archived → None (mirrors load_companion's active filter)
         sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
@@ -566,50 +542,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "exactly one instance per (genome, owner)");
-    }
-}
-
-#[cfg(test)]
-mod ownership_lookup_tests {
-    use super::*;
-    use sqlx::PgPool;
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn returns_none_for_legacy_genome(pool: PgPool) {
-        let repo = PersonaRepo { pool: &pool };
-        let id = uuid::Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active)
-             VALUES ($1, 'Legacy', 'p', '{}'::jsonb, true)",
-        )
-        .bind(id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(repo.get_asset_id_for_genome(id).await.unwrap(), None);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn returns_some_for_nft_genome(pool: PgPool) {
-        let repo = PersonaRepo { pool: &pool };
-        let id = uuid::Uuid::new_v4();
-        let asset = "11111111111111111111111111111111";
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active, asset_id)
-             VALUES ($1, 'Nft', 'p', '{}'::jsonb, true, $2)",
-        )
-        .bind(id)
-        .bind(asset)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            repo.get_asset_id_for_genome(id).await.unwrap().as_deref(),
-            Some(asset)
-        );
     }
 }

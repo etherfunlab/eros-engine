@@ -23,7 +23,7 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::stream::{replay_stream, run_stream, PersistedUserMessage, ProtocolFrame};
 use crate::routes::companion::{
-    enforce_nft_ownership, validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
+    validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
 use crate::state::AppState;
 
@@ -246,16 +246,13 @@ pub async fn send_message_stream(
             original_user_message_id: None,
         })
     })?;
+    // Verify the instance still exists and is active (404 otherwise) before
+    // opening the stream. (Previously this load also fed the NFT-ownership gate.)
     let persona_repo = PersonaRepo { pool: &state.pool };
-    let companion = persona_repo
+    persona_repo
         .load_companion(instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
-    let asset_id_opt = persona_repo
-        .get_asset_id_for_genome(companion.instance.genome_id)
-        .await?;
-    enforce_nft_ownership(&state.pool, user_id, asset_id_opt.as_deref()).await?;
-
     // Acquire a stream slot. `StreamSlotGuard` is now `'static` (holds Arc),
     // so it can be moved into the SSE body below.
     let guard = state
