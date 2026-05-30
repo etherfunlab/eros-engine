@@ -161,7 +161,7 @@ async fn bff_get_history(
         (status = 200, body = BffStartResponse),
         (status = 400, description = "missing genome_id and no existing instance"),
         (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your instance / nft gate"),
+        (status = 403, description = "not your instance"),
         (status = 404, description = "instance/genome not found")
     ),
     security(("bearer" = []))
@@ -595,27 +595,6 @@ mod tests {
             body.get("affinity").is_none(),
             "start must not bundle affinity; got {body}"
         );
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_start_403_on_nft_unowned_genome(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active, asset_id) \
-             VALUES ('Locked', 'sys', '{}'::jsonb, true, 'asset-x') RETURNING id",
-        )
-        .fetch_one(&pool).await.unwrap();
-
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let (status, _body) = send_request(
-            &mut app,
-            bff_start_request(&token, json!({ "genome_id": genome_id })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

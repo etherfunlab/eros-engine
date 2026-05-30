@@ -46,7 +46,6 @@ use eros_engine_core::types::PromptTrait;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
-use eros_engine_store::ownership::OwnershipRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
@@ -70,32 +69,6 @@ const MAX_LLM_AUDIT_METADATA_KEYS: usize = 16;
 const MAX_LLM_AUDIT_METADATA_KEY_CHARS: usize = 64;
 /// OpenRouter documented cap.
 const MAX_LLM_AUDIT_METADATA_VALUE_CHARS: usize = 512;
-
-/// NFT-ownership gate. Returns `Ok(())` immediately if `asset_id` is `None`
-/// (legacy seed-persona genome). Otherwise joins persona_ownership with
-/// wallet_links (linked=true) and returns 403 on no match.
-///
-/// Called at chat-start (before create_instance) and at every chat message
-/// (sync + async). The join is a single indexed PK lookup followed by an
-/// index lookup on wallet_pubkey — sub-ms.
-pub(crate) async fn enforce_nft_ownership(
-    pool: &sqlx::PgPool,
-    user_id: Uuid,
-    asset_id: Option<&str>,
-) -> Result<(), AppError> {
-    let Some(asset_id) = asset_id else {
-        return Ok(());
-    };
-    let owns = OwnershipRepo { pool }
-        .owns(user_id, asset_id)
-        .await
-        .map_err(AppError::from)?;
-    if owns {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("nft_ownership_required".into()))
-    }
-}
 
 // ─── DTOs ───────────────────────────────────────────────────────────
 
@@ -520,17 +493,10 @@ pub(crate) struct ResolvedSession {
 }
 
 /// Shared session-resolution flow used by `POST /comp/chat/start` and
-/// `POST /bff/v1/comp/chat/start`. Encapsulates instance lookup, NFT
-/// ownership gate (with the **exact** ordering both endpoints depend on),
-/// and resume-or-create on `chat_sessions`. Caller is responsible for
-/// building its own response DTO from the returned `ResolvedSession`.
-///
-/// **NFT gate ordering (load-bearing):**
-///   * Explicit `instance_id` → gate runs AFTER load + owner check, so we
-///     never gate a missing or non-owned instance.
-///   * `genome_id` only → gate runs BEFORE find-or-create on
-///     `persona_instances`, so a non-owner who hits the create-fallback
-///     does NOT leave a stray row.
+/// `POST /bff/v1/comp/chat/start`. Encapsulates instance lookup (with the
+/// explicit-`instance_id` owner check) and resume-or-create on
+/// `chat_sessions`. Caller is responsible for building its own response DTO
+/// from the returned `ResolvedSession`.
 pub(crate) async fn resolve_or_create_session(
     state: &AppState,
     user_id: Uuid,
@@ -541,8 +507,8 @@ pub(crate) async fn resolve_or_create_session(
 
     let (instance_id, persona_name) = match req.instance_id {
         Some(iid) => {
-            // Explicit instance: one JOIN read gives owner + genome name +
-            // asset_id (replaces the former double load_companion + asset read).
+            // Explicit instance: one JOIN read gives owner + genome name
+            // (replaces the former double load_companion + asset read).
             let gate = persona_repo
                 .load_instance_gate(iid)
                 .await?
@@ -552,7 +518,6 @@ pub(crate) async fn resolve_or_create_session(
                     "instance not owned by this user".into(),
                 ));
             }
-            enforce_nft_ownership(&state.pool, user_id, gate.asset_id.as_deref()).await?;
             (iid, gate.genome_name)
         }
         None => {
@@ -571,10 +536,6 @@ pub(crate) async fn resolve_or_create_session(
             if !gate.is_active {
                 return Err(AppError::BadRequest("genome is not active".into()));
             }
-
-            // NFT gate runs BEFORE any instance write (load-bearing: a non-owner
-            // who hits the create/reactivate fallback must not leave or revive a row).
-            enforce_nft_ownership(&state.pool, user_id, gate.asset_id.as_deref()).await?;
 
             let iid = match existing_instance {
                 Some(iid) => iid,
@@ -633,6 +594,7 @@ pub(crate) async fn resolve_or_create_session(
         (status = 200, body = StartChatResponse),
         (status = 400, description = "missing genome_id and no existing instance"),
         (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "instance not owned by this user"),
         (status = 404, description = "instance/genome not found")
     ),
     security(("bearer" = []))
@@ -868,10 +830,10 @@ pub fn router() -> OpenApiRouter<AppState> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test helpers — visible to other modules' #[cfg(test)] blocks so the
-// /s2s/* integration tests in routes/s2s.rs can reuse `test_state`.
-// Lives outside the inner `tests` module on purpose; Rust's visibility
-// rules don't let a sibling module reach into a private `mod tests`.
+// Test helpers — visible to other modules' #[cfg(test)] blocks so sibling
+// test modules can reuse `test_state`. Lives outside the inner `tests`
+// module on purpose; Rust's visibility rules don't let a sibling module
+// reach into a private `mod tests`.
 // ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(crate) const TEST_SECRET: &str = "test-secret-companion-routes";
@@ -898,6 +860,12 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             dreaming_idle_threshold: std::time::Duration::from_secs(1800),
             dreaming_claim_stale_threshold: std::time::Duration::from_secs(600),
             openrouter_usage_hidden_keys: std::collections::HashSet::new(),
+            // Snapshot sweeper disabled in tests — same rationale as dreaming.
+            snapshot: crate::state::SnapshotConfig {
+                disabled: true,
+                cron: "0 0 23 * * *".into(),
+                tz: chrono_tz::Asia::Singapore,
+            },
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
@@ -906,14 +874,6 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
-        // s2s middleware is opted-out in companion tests (no secret
-        // configured → /s2s/* returns 401). The s2s integration tests
-        // in routes/s2s.rs override `marketplace_s2s_secret` after
-        // calling this helper.
-        marketplace_svc_url: None,
-        marketplace_s2s_secret: None,
-        marketplace_s2s_secret_previous: None,
-        http_client: reqwest::Client::new(),
     }
 }
 
@@ -1253,90 +1213,6 @@ mod tests {
     // ─── Bonus: debug affinity endpoint round-trips when enabled ────
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn enforce_passes_for_legacy_genome(pool: PgPool) {
-        let user = Uuid::new_v4();
-        let res = enforce_nft_ownership(&pool, user, None).await;
-        assert!(res.is_ok(), "asset_id=None must always pass");
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn enforce_rejects_when_not_owner(pool: PgPool) {
-        let user = Uuid::new_v4();
-        let res =
-            enforce_nft_ownership(&pool, user, Some("11111111111111111111111111111111")).await;
-        match res {
-            Err(AppError::Forbidden(_)) => {}
-            other => panic!("expected Forbidden, got {other:?}"),
-        }
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn enforce_passes_for_owner(pool: PgPool) {
-        use chrono::Utc;
-        use eros_engine_store::ownership::OwnershipRepo;
-        use eros_engine_store::wallets::WalletLinkRepo;
-
-        let user = Uuid::new_v4();
-        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
-        let asset = "11111111111111111111111111111131";
-        WalletLinkRepo { pool: &pool }
-            .upsert(user, wallet, true, Utc::now())
-            .await
-            .unwrap();
-        OwnershipRepo { pool: &pool }
-            .upsert(asset, "p-1", wallet, Utc::now())
-            .await
-            .unwrap();
-
-        assert!(enforce_nft_ownership(&pool, user, Some(asset))
-            .await
-            .is_ok());
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn start_chat_403_on_unowned_nft_genome(pool: PgPool) {
-        // Seed an NFT-backed genome whose asset_id no one currently owns.
-        let genome_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active, asset_id)
-             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true,
-                     '11111111111111111111111111111131')",
-        )
-        .bind(genome_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(Uuid::new_v4());
-
-        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/comp/chat/start")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-
-        // Crucially: NO instance row was created.
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM engine.persona_instances WHERE genome_id = $1")
-                .bind(genome_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            count.0, 0,
-            "non-owner must not create a hidden persona_instance"
-        );
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn start_chat_passes_for_legacy_genome(pool: PgPool) {
         // Unchanged path: legacy seed-persona must still work.
         let genome_id = seed_genome(&pool, "Echo").await;
@@ -1355,79 +1231,6 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::OK);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn message_403_after_unlink(pool: PgPool) {
-        use chrono::Utc;
-        use eros_engine_store::ownership::OwnershipRepo;
-        use eros_engine_store::wallets::WalletLinkRepo;
-
-        // Setup: NFT genome, owner, started a session.
-        let user = Uuid::new_v4();
-        let wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
-        let asset = "11111111111111111111111111111131";
-        let genome_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active, asset_id)
-             VALUES ($1, 'NftGenome', 'p', '{}'::jsonb, true, $2)",
-        )
-        .bind(genome_id)
-        .bind(asset)
-        .execute(&pool)
-        .await
-        .unwrap();
-        WalletLinkRepo { pool: &pool }
-            .upsert(user, wallet, true, Utc::now())
-            .await
-            .unwrap();
-        OwnershipRepo { pool: &pool }
-            .upsert(asset, "p-1", wallet, Utc::now())
-            .await
-            .unwrap();
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user);
-
-        // Start a chat (passes the gate).
-        let body = serde_json::to_vec(&serde_json::json!({ "genome_id": genome_id })).unwrap();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/comp/chat/start")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::OK, "start should succeed: {resp}");
-        let session_id = resp["session_id"].as_str().unwrap().to_string();
-
-        // Unlink the wallet — ownership chain now broken.
-        WalletLinkRepo { pool: &pool }
-            .upsert(user, wallet, false, Utc::now())
-            .await
-            .unwrap();
-
-        // Sending a message should now 403. The per-message NFT recheck
-        // lives on the streaming endpoint (the sync endpoint is gone); the
-        // ownership failure is returned before any SSE body is produced, so
-        // we can assert on the pre-stream status directly.
-        let body = serde_json::to_vec(&serde_json::json!({
-            "content": "hi",
-            "client_msg_id": "01J4444444444444444444444A",
-        }))
-        .unwrap();
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/message/stream"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, _resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1846,45 +1649,6 @@ mod tests {
         assert!(!resumed.is_new);
         assert_eq!(resumed.session_id, resolved.session_id);
         assert_eq!(resumed.instance_id, resolved.instance_id);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn resolve_or_create_session_nft_gate_blocks_unowned_genome(pool: PgPool) {
-        // genome_id branch: NFT gate must run BEFORE we look for an instance.
-        let user_id = Uuid::new_v4();
-        let genome_id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active, asset_id) \
-             VALUES ('NftPersona', 'sys', '{}'::jsonb, true, 'asset-x') RETURNING id",
-        )
-        .fetch_one(&pool).await.unwrap();
-        let state = test_state(pool.clone());
-
-        let req = StartChatRequest {
-            instance_id: None,
-            genome_id: Some(genome_id),
-            is_demo: None,
-        };
-        let err = resolve_or_create_session(&state, user_id, &req)
-            .await
-            .expect_err("should reject unowned NFT-gated genome");
-        match err {
-            AppError::Forbidden(msg) => {
-                assert!(msg.contains("nft_ownership_required"), "msg={msg}")
-            }
-            other => panic!("expected Forbidden, got {other:?}"),
-        }
-
-        // Confirm no orphan persona_instances row was created — this is what
-        // makes "gate before find-or-create" load-bearing.
-        let leftover: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.persona_instances WHERE genome_id = $1 AND owner_uid = $2",
-        )
-        .bind(genome_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(leftover, 0, "NFT gate must reject before create_instance");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

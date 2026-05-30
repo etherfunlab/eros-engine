@@ -2,18 +2,14 @@
 //! Top-level OpenAPI document. Each router that wants to be in the spec
 //! lives inside `utoipa_axum::router::OpenApiRouter` and gets `.routes(routes!(...))`.
 
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-/// Registers the two security schemes used by handlers:
-///   - `bearer`         — Supabase JWT, attached to /comp/* routes
-///   - `hmac_signature` — server-to-server HMAC, attached to /s2s/* routes
+/// Registers the security scheme used by handlers:
+///   - `bearer` — Supabase JWT, attached to /comp/* and /bff/* routes
 ///
-/// Without these declarations the generated spec has dangling
-/// `security(...)` references and fails standard OpenAPI validators /
-/// client codegen. The HMAC scheme is modelled as an API-key-in-header
-/// because OpenAPI 3.1 has no first-class "request signature" vocabulary;
-/// the canonical signing string layout is documented in `auth::s2s`.
+/// Without this declaration the generated spec has dangling
+/// `security(...)` references and fails standard OpenAPI validators.
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
@@ -30,15 +26,6 @@ impl Modify for SecurityAddon {
                     .description(Some("Supabase JWT bearer token"))
                     .build(),
             ),
-        );
-        components.add_security_scheme(
-            "hmac_signature",
-            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "X-S2S-Signature",
-                "HMAC-SHA256 signature over the canonical signing string. \
-                 Requires companion `X-S2S-Timestamp` header. \
-                 See auth::s2s for the canonical layout.",
-            ))),
         );
     }
 }
@@ -59,9 +46,7 @@ impl Modify for SecurityAddon {
         (name = "companion", description = "Chat sessions, messages, affinity, profile"),
         (name = "bff-companion", description = "Frontend-shaped mirror of /comp/* for first-party clients; \
                                                 shape may diverge from canonical without notice"),
-        (name = "debug", description = "Env-gated introspection (affinity vector exposure)"),
-        (name = "s2s", description = "Server-to-server endpoints for the marketplace svc \
-                                      (HMAC-signed; do not expose to user-agent traffic)")
+        (name = "debug", description = "Env-gated introspection (affinity vector exposure)")
     ),
     modifiers(&SecurityAddon)
 )]

@@ -552,7 +552,11 @@ impl<'a> ChatRepo<'a> {
                     Some(a) => (
                         Some(a.pre_filter_content.as_str()),
                         Some(a.filter_model.as_str()),
-                        Some(&a.filter_triggers),
+                        // JSON null and SQL NULL are equivalent "no predicate data"
+                        // for this audit column; normalize JSON null to SQL NULL so
+                        // `filter_triggers IS NULL` is a clean "no predicates fired"
+                        // probe. (Binding Value::Null would otherwise write JSONB 'null'.)
+                        (!a.filter_triggers.is_null()).then_some(&a.filter_triggers),
                         Some(a.f_client_msg_id.as_str()),
                         a.f_generation_id.as_deref(),
                     ),
@@ -1058,9 +1062,9 @@ mod tests {
         };
 
         let triggers = serde_json::json!({
-            "random": { "p": 0.3, "draw": 0.18 },
-            "models": "deepseek/deepseek-v4-flash",
-            "traits": ["nsfw_boost"]
+            "random": 0.3,
+            "models": ["deepseek/deepseek-v4-flash"],
+            "traits": { "any": ["nsfw_boost"], "when": "absent" }
         });
         let row = AssistantInsert {
             id: Uuid::new_v4(),
@@ -1233,6 +1237,62 @@ mod tests {
         assert!(
             f_gen.is_none(),
             "f_generation_id should be NULL when None inside Some(FilterAudit)"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn assistant_batch_filter_triggers_json_null_persists_as_sql_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000004A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        // Empty-trigger case: filter ran (filter_model set) but no predicates
+        // fired, so filter_triggers is JSON null → must land as SQL NULL.
+        let row = AssistantInsert {
+            id: Uuid::new_v4(),
+            content: "filtered empty-trigger".into(),
+            assistant_action_type: "reply".into(),
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("anthropic/claude-sonnet-4.6".into()),
+            usage: None,
+            generation_id: Some("gen_chat_xyz".into()),
+            filter_audit: Some(FilterAudit {
+                pre_filter_content: "raw".into(),
+                filter_model: "anthropic/claude-haiku-4.5".into(),
+                filter_triggers: serde_json::Value::Null,
+                f_client_msg_id: "f_01J0000000000000000000004Z".into(),
+                f_generation_id: None,
+            }),
+            metadata: None,
+        };
+        repo.insert_assistant_batch(s.id, user_msg_id, &[row])
+            .await
+            .unwrap();
+        // filter_triggers IS NULL (SQL NULL), but filter_model IS NOT NULL —
+        // the "filter ran with no predicates" signal.
+        let (triggers_is_null, model_is_set): (bool, bool) = sqlx::query_as(
+            "SELECT filter_triggers IS NULL, filter_model IS NOT NULL \
+             FROM engine.chat_messages \
+             WHERE role='assistant' AND session_id=$1",
+        )
+        .bind(s.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(triggers_is_null, "JSON null must persist as SQL NULL");
+        assert!(
+            model_is_set,
+            "filter_model retained as the filter-ran signal"
         );
     }
 

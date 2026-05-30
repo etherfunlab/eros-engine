@@ -267,6 +267,14 @@ not five independent `Option`s.
 | `f_client_msg_id` | Engine-generated ULID, prefix `f_`, created **once per logical filter call** before invoking `execute()`; reused across the filter's internal fallback retries | Used as an idempotency / trace key by ops; unique per `(session_id, f_client_msg_id)`. |
 | `f_generation_id` | `ChatResponse.generation_id` from the filter LLM call | OpenRouter generation id for the filter call. |
 
+> **Update (2026-05-29, v0.5.1):** The `TriggerHits`/observed-value shape below
+> is superseded by `2026-05-29-engine-cleanup-and-snapshot-design.md` §2.
+> `filter_triggers` now echoes the **source predicate config verbatim**
+> (`random` = configured `p`; `models` = configured allowlist; `traits` =
+> configured `{any, when}`). An empty/always-fire trigger persists SQL `NULL`
+> (not `{}`); "filter ran" is read from `filter_model IS NOT NULL`. Legacy-shape
+> rows were wiped by migration 0022.
+
 `filter_triggers` JSON shape — **only fired predicates appear**:
 
 ```json

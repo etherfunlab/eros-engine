@@ -15,27 +15,6 @@ pub struct AppState {
     pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
     pub stream_slots: Arc<StreamSlots>,
-    /// Base URL of the marketplace service used by the self-heal /since
-    /// puller. `None` runs the engine in OSS-only mode (no outbound pull
-    /// loop spawned). Populated from `MARKETPLACE_SVC_URL` in main.rs.
-    /// Read by the puller task — added in a follow-up task; the field is
-    /// wired here so the env / boot-validation layer can land first.
-    #[allow(dead_code)]
-    pub marketplace_svc_url: Option<String>,
-    /// Active HMAC secret used by `auth::s2s` middleware to verify (and
-    /// sign outbound) /s2s/* requests. Populated from
-    /// `MARKETPLACE_SVC_S2S_SECRET` in main.rs.
-    pub marketplace_s2s_secret: Option<String>,
-    /// Previous HMAC secret retained during rotation. Verify-only — never
-    /// used to sign outbound. Populated from
-    /// `MARKETPLACE_SVC_S2S_SECRET_PREVIOUS` in main.rs.
-    pub marketplace_s2s_secret_previous: Option<String>,
-    /// Shared reqwest client used by the self-heal /since puller for
-    /// outbound calls to the marketplace service. Cheaply cloneable
-    /// (internally Arc'd); construct once at boot with a sensible
-    /// per-request timeout. Consumer task lands in a follow-up.
-    #[allow(dead_code)]
-    pub http_client: reqwest::Client,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -50,6 +29,38 @@ pub(crate) fn parse_usage_hidden_keys(raw: Option<&str>) -> HashSet<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Knobs for the companion_insights_snapshot sweeper. Defaults: daily
+/// 23:00 SGT, enabled. The cron string is stored raw and validated by
+/// the sweeper at task start (so an invalid expression fails the sweeper
+/// task only, not the whole server boot).
+#[derive(Clone, Debug)]
+pub struct SnapshotConfig {
+    pub disabled: bool,
+    pub cron: String,
+    pub tz: chrono_tz::Tz,
+}
+
+/// Pure parser for the three env vars. Mirrors `parse_usage_hidden_keys`
+/// in that tests can exercise edge cases without touching process env.
+///
+/// - `SNAPSHOT_DISABLED=1` → disabled
+/// - `SNAPSHOT_CRON` raw 6-field cron string (default `"0 0 23 * * *"`)
+/// - `SNAPSHOT_TZ` IANA zone (default `"Asia/Singapore"`; falls back on parse failure)
+pub(crate) fn parse_snapshot_config(
+    disabled_raw: Option<&str>,
+    cron_raw: Option<&str>,
+    tz_raw: Option<&str>,
+) -> SnapshotConfig {
+    let disabled = disabled_raw.map(|v| v == "1").unwrap_or(false);
+    let cron = cron_raw
+        .map(str::to_owned)
+        .unwrap_or_else(|| "0 0 23 * * *".to_string());
+    let tz = tz_raw
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Asia::Singapore);
+    SnapshotConfig { disabled, cron, tz }
 }
 
 /// Per-user in-flight SSE stream counter. Used by the
@@ -136,6 +147,9 @@ pub struct ServerConfig {
     /// stays intact. Populated from `OPENROUTER_USAGE_HIDDEN_KEYS`
     /// (comma-separated).
     pub openrouter_usage_hidden_keys: HashSet<String>,
+    /// Cron-scheduled companion_insights_snapshot sweeper config. See
+    /// `pipeline::snapshot` for the sweep loop.
+    pub snapshot: SnapshotConfig,
 }
 
 impl ServerConfig {
@@ -169,6 +183,11 @@ impl ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),
         );
+        let snapshot = parse_snapshot_config(
+            std::env::var("SNAPSHOT_DISABLED").ok().as_deref(),
+            std::env::var("SNAPSHOT_CRON").ok().as_deref(),
+            std::env::var("SNAPSHOT_TZ").ok().as_deref(),
+        );
         Self {
             expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
                 .map(|v| v == "true" || v == "1")
@@ -187,6 +206,7 @@ impl ServerConfig {
                     .ok()
                     .as_deref(),
             ),
+            snapshot,
         }
     }
 }
@@ -246,5 +266,35 @@ mod tests {
         drop(g1);
         let _g3 = slots.try_acquire(uid, 2).expect("acquire after drop ok");
         drop(g2);
+    }
+
+    #[test]
+    fn snapshot_config_defaults_when_env_unset() {
+        let cfg = parse_snapshot_config(None, None, None);
+        assert!(!cfg.disabled);
+        assert_eq!(cfg.cron, "0 0 23 * * *");
+        assert_eq!(cfg.tz, chrono_tz::Asia::Singapore);
+    }
+
+    #[test]
+    fn snapshot_config_disabled_when_env_says_one() {
+        let cfg = parse_snapshot_config(Some("1"), None, None);
+        assert!(cfg.disabled);
+        let cfg = parse_snapshot_config(Some("0"), None, None);
+        assert!(!cfg.disabled, "any value other than 1 leaves it enabled");
+    }
+
+    #[test]
+    fn snapshot_config_honours_env_overrides() {
+        let cfg = parse_snapshot_config(None, Some("0 */5 * * * *"), Some("UTC"));
+        assert_eq!(cfg.cron, "0 */5 * * * *");
+        assert_eq!(cfg.tz, chrono_tz::UTC);
+    }
+
+    #[test]
+    fn snapshot_config_falls_back_on_bad_tz() {
+        // Misspelled tz → default + (caller will warn-log; we just verify fallback)
+        let cfg = parse_snapshot_config(None, None, Some("Not/A_Real_Zone"));
+        assert_eq!(cfg.tz, chrono_tz::Asia::Singapore);
     }
 }

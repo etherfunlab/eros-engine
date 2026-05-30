@@ -7,114 +7,14 @@ pub mod error_handling;
 pub mod human_insight;
 pub mod insight;
 pub mod memory;
-pub mod ownership;
 pub mod persona;
 pub mod pool;
-pub mod pubkey;
-pub mod sync_cursors;
-pub mod wallets;
 
 pub use sqlx::PgPool;
 
 #[cfg(test)]
 mod migration_tests {
     use sqlx::PgPool;
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn wallet_links_schema_is_correct(pool: PgPool) {
-        // Insert one row; assert the columns we documented exist.
-        sqlx::query(
-            "INSERT INTO engine.wallet_links
-                (user_id, wallet_pubkey, linked, source_updated_at)
-             VALUES ($1, $2, true, now())",
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind("BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt")
-        .execute(&pool)
-        .await
-        .expect("insert into wallet_links");
-
-        // The partial unique index allows another row with linked=false.
-        let same_wallet = "BvHvbHBeF2zXa1pT5eExMzTAydPGFTyhqMAbPyuMTfQt";
-        let res = sqlx::query(
-            "INSERT INTO engine.wallet_links
-                (user_id, wallet_pubkey, linked, source_updated_at)
-             VALUES ($1, $2, false, now())",
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(same_wallet)
-        .execute(&pool)
-        .await;
-        // The PK is (user_id, wallet_pubkey) so different user_id is fine.
-        // The active-only UNIQUE index is on wallet_pubkey WHERE linked=true,
-        // so a tombstone for the same pubkey but different user_id is allowed.
-        assert!(res.is_ok(), "tombstone insert must succeed: {res:?}");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn persona_ownership_and_sync_cursors_schema(pool: PgPool) {
-        // persona_ownership: PK = asset_id, must accept source_updated_at.
-        let asset = "11111111111111111111111111111111";
-        sqlx::query(
-            "INSERT INTO engine.persona_ownership
-                (asset_id, persona_id, owner_wallet, source_updated_at)
-             VALUES ($1, 'persona-test', 'OwnerWallet1111111111111111111111', now())",
-        )
-        .bind(asset)
-        .execute(&pool)
-        .await
-        .expect("insert into persona_ownership");
-
-        // sync_cursors: PK = name, compound (cursor_ts, cursor_pk) writeable.
-        sqlx::query(
-            "INSERT INTO engine.sync_cursors (name, cursor_ts, cursor_pk)
-             VALUES ('ownership', now(), '')",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert into sync_cursors");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn persona_genomes_gains_nullable_asset_id(pool: PgPool) {
-        // The legacy seed-persona path inserts WITHOUT asset_id and must keep working.
-        let legacy_id = uuid::Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active)
-             VALUES ($1, 'LegacyGenome', 'prompt', '{}'::jsonb, true)",
-        )
-        .bind(legacy_id)
-        .execute(&pool)
-        .await
-        .expect("legacy insert without asset_id");
-
-        // A new NFT-backed genome carries asset_id.
-        let nft_id = uuid::Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active, asset_id)
-             VALUES ($1, 'NftGenome', 'prompt', '{}'::jsonb, true, $2)",
-        )
-        .bind(nft_id)
-        .bind("11111111111111111111111111111112")
-        .execute(&pool)
-        .await
-        .expect("nft insert with asset_id");
-
-        // Partial unique: the same non-NULL asset_id cannot be claimed twice.
-        let dup_id = uuid::Uuid::new_v4();
-        let dup_res = sqlx::query(
-            "INSERT INTO engine.persona_genomes
-                (id, name, system_prompt, art_metadata, is_active, asset_id)
-             VALUES ($1, 'Dup', 'prompt', '{}'::jsonb, true, $2)",
-        )
-        .bind(dup_id)
-        .bind("11111111111111111111111111111112")
-        .execute(&pool)
-        .await;
-        assert!(dup_res.is_err(), "duplicate asset_id must be rejected");
-    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn human_insights_has_rls_enabled(pool: PgPool) {
@@ -210,5 +110,97 @@ mod migration_tests {
         .unwrap();
         let phrase = repo.pick_chat_stream_fallback_phrase().await.unwrap();
         assert!(phrase.is_none(), "expected None when config row absent");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn companion_insights_snapshot_schema(pool: PgPool) {
+        // Table exists with the five expected columns at expected types.
+        let cols: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'engine' \
+               AND table_name   = 'companion_insights_snapshot' \
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query columns for companion_insights_snapshot");
+        let names: Vec<&str> = cols.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "user_id", "insights", "training_level", "captured_at"],
+            "column order/identity must match the migration"
+        );
+        // captured_at must be NOT NULL — sweeper sets it explicitly.
+        let captured_at_null = cols
+            .iter()
+            .find(|(n, _, _)| n == "captured_at")
+            .map(|(_, _, nullable)| nullable.as_str())
+            .unwrap();
+        assert_eq!(captured_at_null, "NO", "captured_at must be NOT NULL");
+
+        // Index on (user_id, captured_at DESC) exists.
+        let idx_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'engine' \
+                   AND tablename  = 'companion_insights_snapshot' \
+                   AND indexname  = 'idx_companion_insights_snapshot_user_time')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query pg_indexes");
+        assert!(
+            idx_exists,
+            "idx_companion_insights_snapshot_user_time must be created by 0021"
+        );
+
+        // RLS enabled (no policy → server-side only access).
+        let rls_enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+              WHERE oid = 'engine.companion_insights_snapshot'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity");
+        assert!(
+            rls_enabled,
+            "RLS must be enabled on companion_insights_snapshot"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0023_drops_nft_ownership_stack(pool: PgPool) {
+        // The three tables are gone.
+        for tbl in ["wallet_links", "persona_ownership", "sync_cursors"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'engine' AND table_name = $1)",
+            )
+            .bind(tbl)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(!exists, "engine.{tbl} must be dropped by migration 0023");
+        }
+        // persona_genomes.asset_id is gone.
+        let col_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'persona_genomes' \
+               AND column_name = 'asset_id')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!col_exists, "persona_genomes.asset_id must be dropped");
+        // persona_genomes itself survives (sanity).
+        let pg_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'engine' AND table_name = 'persona_genomes')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(pg_exists, "persona_genomes table must survive");
     }
 }
