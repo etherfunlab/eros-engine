@@ -2039,7 +2039,10 @@ reasoning = { enabled = false }
         assert_eq!(f.max_tokens, 400);
         assert_eq!(
             f.reasoning,
-            Some(ReasoningConfig { enabled: Some(false), exclude: None })
+            Some(ReasoningConfig {
+                enabled: Some(false),
+                exclude: None
+            })
         );
     }
 

@@ -1826,7 +1826,10 @@ mod tests {
         assert_eq!(content, "1111", "original content must be preserved");
         assert_eq!(pre.as_deref(), Some("那你平常都怎么放松呀？"));
         assert_eq!(model.as_deref(), Some("fast/in"));
-        assert_eq!(triggers, Some(serde_json::json!({"reason": "meaningless digits"})));
+        assert_eq!(
+            triggers,
+            Some(serde_json::json!({"reason": "meaningless digits"}))
+        );
         assert_eq!(fgen.as_deref(), Some("gen-x"));
     }
 
@@ -1860,7 +1863,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(triggers.is_none(), "blank reason → SQL NULL filter_triggers");
+        assert!(
+            triggers.is_none(),
+            "blank reason → SQL NULL filter_triggers"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

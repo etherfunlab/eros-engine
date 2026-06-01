@@ -3530,6 +3530,9 @@ data: [DONE]\n\n";
         assert_eq!(content, "1111", "client-visible content must stay original");
         assert_eq!(pre.as_deref(), Some("那你平常都怎么放松呀？"));
         assert_eq!(fmodel.as_deref(), Some("infilt/m"));
-        assert_eq!(triggers, Some(serde_json::json!({"reason": "meaningless digits"})));
+        assert_eq!(
+            triggers,
+            Some(serde_json::json!({"reason": "meaningless digits"}))
+        );
     }
 }
