@@ -151,7 +151,6 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 
 重點 endpoint：
 
-- `GET  /comp/personas`——列出啟用中的 persona genomes。
 - `POST /comp/chat/start`——對指定 persona 開啟 chat session。
 - `POST /comp/chat/{session_id}/message/stream`——**唯一**的聊天輪 endpoint：逐 token 的 Server-Sent Events (SSE) 串流。（舊的阻塞式同步 `/message` endpoint 已在 0.3 移除——SSE 現在是唯一的聊天路徑。）
 - `GET  /comp/chat/{session_id}/history`——分頁讀聊天歷史。

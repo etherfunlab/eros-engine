@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.5.1"
+    "version": "0.5.2"
   },
   "servers": [
     {
@@ -629,35 +629,6 @@
         ]
       }
     },
-    "/comp/personas": {
-      "get": {
-        "tags": [
-          "companion"
-        ],
-        "summary": "List active platform-owned persona genomes available for new sessions.",
-        "operationId": "list_personas",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListPersonasResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
     "/comp/user/{user_id}/profile": {
       "get": {
         "tags": [
@@ -1200,20 +1171,6 @@
           }
         }
       },
-      "ListPersonasResponse": {
-        "type": "object",
-        "required": [
-          "personas"
-        ],
-        "properties": {
-          "personas": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PersonaGenomeDto"
-            }
-          }
-        }
-      },
       "ListSessionsResponse": {
         "type": "object",
         "required": [
@@ -1261,47 +1218,6 @@
               "null"
             ],
             "description": "Free-form caller identifier (recommended: hash of internal user id).\n`chars ≤ 256`. Forwarded as OpenRouter wire `user`."
-          }
-        }
-      },
-      "PersonaGenomeDto": {
-        "type": "object",
-        "description": "Genome row exposed on `GET /comp/personas`. Matches\n`eros_engine_core::persona::PersonaGenome` field-for-field but with\n`ToSchema` so utoipa can render it.",
-        "required": [
-          "id",
-          "name",
-          "system_prompt",
-          "art_metadata",
-          "is_active"
-        ],
-        "properties": {
-          "art_metadata": {
-            "type": "object"
-          },
-          "avatar_url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "is_active": {
-            "type": "boolean"
-          },
-          "name": {
-            "type": "string"
-          },
-          "system_prompt": {
-            "type": "string"
-          },
-          "tip_personality": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },

@@ -72,26 +72,6 @@ const MAX_LLM_AUDIT_METADATA_VALUE_CHARS: usize = 512;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
 
-/// Genome row exposed on `GET /comp/personas`. Matches
-/// `eros_engine_core::persona::PersonaGenome` field-for-field but with
-/// `ToSchema` so utoipa can render it.
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-pub struct PersonaGenomeDto {
-    pub id: Uuid,
-    pub name: String,
-    pub system_prompt: String,
-    pub tip_personality: Option<String>,
-    pub avatar_url: Option<String>,
-    #[schema(value_type = Object)]
-    pub art_metadata: serde_json::Value,
-    pub is_active: bool,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ListPersonasResponse {
-    pub personas: Vec<PersonaGenomeDto>,
-}
-
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StartChatRequest {
     /// Optional explicit instance id. If absent, the server picks (or
@@ -448,38 +428,6 @@ pub(crate) fn validate_llm_audit(dto: Option<LlmAuditDto>) -> Result<Option<LlmA
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
-/// List active platform-owned persona genomes available for new sessions.
-#[utoipa::path(
-    get,
-    path = "/comp/personas",
-    tag = "companion",
-    responses(
-        (status = 200, body = ListPersonasResponse),
-        (status = 401, description = "missing or invalid bearer")
-    ),
-    security(("bearer" = []))
-)]
-async fn list_personas(
-    State(state): State<AppState>,
-    Extension(AuthUser(_user_id)): Extension<AuthUser>,
-) -> Result<Json<ListPersonasResponse>, AppError> {
-    let repo = PersonaRepo { pool: &state.pool };
-    let genomes = repo.list_active().await?;
-    let personas = genomes
-        .into_iter()
-        .map(|g| PersonaGenomeDto {
-            id: g.id,
-            name: g.name,
-            system_prompt: g.system_prompt,
-            tip_personality: g.tip_personality,
-            avatar_url: g.avatar_url,
-            art_metadata: g.art_metadata,
-            is_active: g.is_active,
-        })
-        .collect();
-    Ok(Json(ListPersonasResponse { personas }))
-}
-
 /// Output of `resolve_or_create_session`. Carries everything either the
 /// canonical `start_chat` or the BFF `bff_start_chat` needs to build its
 /// response. `is_new` is `true` when this call **created** the session row,
@@ -533,9 +481,6 @@ pub(crate) async fn resolve_or_create_session(
             )?;
 
             let gate = gate.ok_or_else(|| AppError::NotFound("genome not found".into()))?;
-            if !gate.is_active {
-                return Err(AppError::BadRequest("genome is not active".into()));
-            }
 
             let iid = match existing_instance {
                 Some(iid) => iid,
@@ -821,7 +766,6 @@ async fn event_gift(
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list_personas))
         .routes(routes!(start_chat))
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
@@ -943,8 +887,8 @@ pub(crate) mod testutil {
 
     pub(crate) async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ($1, 'you are a companion', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ($1, 'you are a companion', '{}'::jsonb) RETURNING id",
         )
         .bind(name)
         .fetch_one(pool)
@@ -1010,44 +954,19 @@ mod tests {
     // ─── Test 2: protected route rejects requests without bearer ────
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn comp_personas_401_without_bearer(pool: PgPool) {
+    async fn protected_route_401_without_bearer(pool: PgPool) {
         let state = test_state(pool);
         let mut app = build_router(state);
 
         let req = Request::builder()
-            .uri("/comp/personas")
+            .uri(format!("/comp/chat/{}/sessions", Uuid::new_v4()))
             .body(Body::empty())
             .unwrap();
         let (status, _body) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    // ─── Test 3: GET /comp/personas returns active genomes ──────────
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn comp_personas_returns_active_genomes(pool: PgPool) {
-        let _g = seed_genome(&pool, "Aria").await;
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(Uuid::new_v4());
-
-        let req = Request::builder()
-            .uri("/comp/personas")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap();
-        let (status, body) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::OK);
-        let names: Vec<&str> = body["personas"]
-            .as_array()
-            .expect("array")
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"Aria"), "expected Aria in {names:?}");
-    }
-
-    // ─── Test 4: start_chat creates a session for the JWT user ──────
+    // ─── Test 3: start_chat creates a session for the JWT user ──────
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn start_chat_creates_session_for_jwt_user_id(pool: PgPool) {
@@ -1084,7 +1003,7 @@ mod tests {
         assert_eq!(row_user_id, user_id);
     }
 
-    // ─── Test 5: cross-user GET /chat/{user_id}/sessions → 403 ──────
+    // ─── Test 4: cross-user GET /chat/{user_id}/sessions → 403 ──────
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn get_sessions_403_when_path_user_id_differs_from_jwt(pool: PgPool) {
@@ -1104,7 +1023,7 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    // ─── Test 6: event/gift appends gift_user message + emits event ──
+    // ─── Test 5: event/gift appends gift_user message + emits event ──
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn event_gift_appends_message_and_emits_event(pool: PgPool) {

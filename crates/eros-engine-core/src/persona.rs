@@ -9,9 +9,7 @@ pub struct PersonaGenome {
     pub name: String,
     pub system_prompt: String,
     pub tip_personality: Option<String>,
-    pub avatar_url: Option<String>,
     pub art_metadata: Value, // JSONB: gender/age/mbti/backstory/speech_style/quirks/topics/model
-    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1448,8 +1448,8 @@ mod tests {
 
     async fn seed_persona_and_session(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid, Uuid) {
         let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ('GhostTest', 'sp', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('GhostTest', 'sp', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(pool)
         .await

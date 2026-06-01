@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 name = "Aria"
-avatar_url = "https://avatars.etherfun.xyz/aria.png"
 tip_personality = "warm-but-reserved"
 
 system_prompt = """
