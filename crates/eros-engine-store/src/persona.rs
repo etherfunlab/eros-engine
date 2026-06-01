@@ -77,20 +77,6 @@ pub struct PersonaRepo<'a> {
 }
 
 impl<'a> PersonaRepo<'a> {
-    /// Active platform genomes, ordered by name.
-    pub async fn list_active(&self) -> Result<Vec<PersonaGenome>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, GenomeRow>(
-            "SELECT id, name, system_prompt, tip_personality, avatar_url, \
-                    art_metadata, is_active \
-             FROM engine.persona_genomes \
-             WHERE is_active = true \
-             ORDER BY name",
-        )
-        .fetch_all(self.pool)
-        .await?;
-        Ok(rows.into_iter().map(PersonaGenome::from).collect())
-    }
-
     pub async fn get_genome(&self, genome_id: Uuid) -> Result<Option<PersonaGenome>, sqlx::Error> {
         let row = sqlx::query_as::<_, GenomeRow>(
             "SELECT id, name, system_prompt, tip_personality, avatar_url, \
@@ -334,21 +320,6 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn list_active_filters_by_is_active(pool: PgPool) {
-        let repo = PersonaRepo { pool: &pool };
-        let _g_active1 = insert_genome(&pool, "Aria", true, serde_json::json!({})).await;
-        let _g_inactive = insert_genome(&pool, "Boris", false, serde_json::json!({})).await;
-        let _g_active2 = insert_genome(&pool, "Cara", true, serde_json::json!({})).await;
-
-        let active = repo.list_active().await.unwrap();
-        assert_eq!(active.len(), 2);
-        // ordered by name
-        assert_eq!(active[0].name, "Aria");
-        assert_eq!(active[1].name, "Cara");
-        assert!(active.iter().all(|g| g.is_active));
     }
 
     #[sqlx::test(migrations = "./migrations")]
