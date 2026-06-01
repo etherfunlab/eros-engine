@@ -636,6 +636,17 @@ const REFUSAL_HEAD_SCAN_CHARS: usize = 120;
 /// as `"refusal_pattern"` (if a refusal verb appears) or `"too_short"`.
 const MIN_FILTERED_OUTPUT_CHARS: usize = 80;
 
+/// True when a refusal phrase appears in the leading `REFUSAL_HEAD_SCAN_CHARS`
+/// (lowercased) of `text`. Shared by the output and input validity gates.
+fn refusal_in_head(text: &str) -> bool {
+    let head_lower: String = text
+        .chars()
+        .take(REFUSAL_HEAD_SCAN_CHARS)
+        .flat_map(char::to_lowercase)
+        .collect();
+    REFUSAL_PATTERNS_HEAD.iter().any(|p| head_lower.contains(p))
+}
+
 /// Check whether a filter LLM response should be rejected by the validity gate.
 ///
 /// Returns `Some(reason_label)` when the output is invalid, `None` when valid.
@@ -653,19 +664,8 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
         return Some("content_filter");
     }
     let total_chars = text.chars().count();
-    // ASCII-case-insensitive matching: lowercase the head (and the short-text
-    // body below) once so models that emit `"as an ai ..."` or `"I'M SORRY"`
-    // are caught.  `to_lowercase` is Unicode-aware; CJK code points are
-    // unchanged, so the Chinese patterns still match exactly.
-    let head_lower: String = text
-        .chars()
-        .take(REFUSAL_HEAD_SCAN_CHARS)
-        .flat_map(char::to_lowercase)
-        .collect();
-    for pat in REFUSAL_PATTERNS_HEAD {
-        if head_lower.contains(pat) {
-            return Some("refusal_pattern");
-        }
+    if refusal_in_head(text) {
+        return Some("refusal_pattern");
     }
     if total_chars < MIN_FILTERED_OUTPUT_CHARS {
         let text_lower = text.to_lowercase();
@@ -780,6 +780,174 @@ async fn run_output_filter(
         f_client_msg_id,
         attempts,
     })
+}
+
+// ── Input filter (user-input rewrite) ────────────────────────────────────────
+
+/// Parsed verdict from the input-filter LLM. `rewrite=false` ⇒ keep the
+/// original input; `rewrite=true` ⇒ use `content` (with `reason` for audit).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct InputFilterVerdict {
+    #[serde(default)]
+    rewrite: bool,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Parse the filter reply into a verdict: direct JSON first, then a balanced
+/// JSON block embedded in prose (mirrors post_process extraction parsing).
+fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
+    serde_json::from_str::<InputFilterVerdict>(text)
+        .ok()
+        .or_else(|| {
+            super::post_process::find_json_block(text)
+                .and_then(|b| serde_json::from_str::<InputFilterVerdict>(b).ok())
+        })
+}
+
+/// Validity gate for an INPUT rewrite's `content`. Unlike
+/// `filter_output_invalidity`, there is NO minimum-length floor — a rewritten
+/// user message is naturally short (often < 80 chars). Only a `content_filter`
+/// finish reason or a refusal-shaped head is rejected.
+fn rewrite_content_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&'static str> {
+    if finish_reason == Some("content_filter") {
+        return Some("content_filter");
+    }
+    if refusal_in_head(text) {
+        return Some("refusal_pattern");
+    }
+    None
+}
+
+/// Outcome of a successful input rewrite (`None` ⇒ keep the original input).
+#[derive(Debug, Clone)]
+struct InputRewrite {
+    rewritten_text: String,
+    filter_model: String,
+    reason: Option<String>,
+    f_generation_id: Option<String>,
+}
+
+/// Recent rows fed to the rewrite LLM as `[最近对话]` context.
+const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
+
+/// Build the compact transcript block for the input filter, excluding the turn
+/// being rewritten. Best-effort: a DB error yields an empty transcript.
+async fn build_input_filter_transcript(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+    current_user_message_id: Uuid,
+) -> String {
+    let rows = chat_repo
+        .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
+        .await
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    for m in rows {
+        if m.id == current_user_message_id {
+            continue;
+        }
+        // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
+        // present) so the filter sees the same conversation the chat model does;
+        // assistant rows use content (their pre_filter_content means the opposite).
+        let (label, text) = match m.role.as_str() {
+            "user" | "gift_user" => ("用户", crate::pipeline::handlers::effective_user_text(&m)),
+            "assistant" => ("AI", m.content.as_str()),
+            _ => continue,
+        };
+        lines.push(format!("{label}: {text}"));
+    }
+    lines.join("\n")
+}
+
+/// Run the input-filter LLM over the raw user input with recent context.
+/// Returns `Some(InputRewrite)` ONLY when the model explicitly asked to rewrite
+/// with valid content; every other outcome (keep verdict, parse failure,
+/// refusal, error, timeout, empty) returns `None` ⇒ caller uses the original.
+/// Note: a `{"rewrite": false}` verdict is a DEFINITIVE keep — it returns `None`
+/// immediately and does NOT try the remaining fallback models.
+async fn run_input_filter(
+    state: &AppState,
+    f: &eros_engine_llm::model_config::ResolvedInputFilter,
+    recent_transcript: &str,
+    raw_input: &str,
+) -> Option<InputRewrite> {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let transcript = if recent_transcript.trim().is_empty() {
+        "（无）"
+    } else {
+        recent_transcript
+    };
+    let user_payload = format!("[最近对话]\n{transcript}\n\n[用户最新输入]\n{raw_input}");
+    let chain: Vec<String> = std::iter::once(f.model.clone())
+        .chain(f.fallback_model.iter().cloned())
+        .collect();
+    for model_id in &chain {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: f.filter_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: user_payload.clone(),
+                },
+            ],
+            temperature: f.temperature as f32,
+            max_tokens: f.max_tokens,
+            reasoning: f.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "input-filter: model error; next");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "input-filter: timeout; next");
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_input_filter", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "input-filter: empty reply; next");
+            continue;
+        }
+        let verdict = match parse_input_filter_verdict(&text) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(model = %model_id, "input-filter: unparseable verdict; next");
+                continue;
+            }
+        };
+        if !verdict.rewrite {
+            return None; // meaningful → keep (definitive)
+        }
+        let content = verdict.content.unwrap_or_default().trim().to_string();
+        if content.is_empty() {
+            tracing::warn!(model = %model_id, "input-filter: rewrite=true but blank content; next");
+            continue;
+        }
+        if let Some(reason) = rewrite_content_invalidity(&content, resp.finish_reason.as_deref()) {
+            tracing::warn!(model = %model_id, invalidity = %reason, "input-filter: invalid rewrite content; next");
+            continue;
+        }
+        let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
+        return Some(InputRewrite {
+            rewritten_text: content,
+            filter_model,
+            reason: verdict.reason.filter(|r| !r.trim().is_empty()),
+            f_generation_id: resp.generation_id,
+        });
+    }
+    None // chain exhausted → keep
 }
 
 /// Try to emit a pseudo-ghost on chain exhaustion.
@@ -1020,6 +1188,40 @@ pub fn run_stream(
             }
             ActionType::Reply | ActionType::GiftReaction => {
                 let is_gift = matches!(plan.action_type, ActionType::GiftReaction);
+                // ── User-input rewrite filter (Reply turns only) ──────────────
+                // Runs after the idempotency gate, before prompt assembly. The
+                // rewrite is persisted on the user row's pre_filter_content;
+                // build_reply_request then feeds the EFFECTIVE text to the model
+                // and recall. Fail-open: any non-rewrite outcome is a no-op.
+                if !is_gift {
+                    if let Some(f) = state.model_config.resolve_input_filter() {
+                        // Note: this issues its own small (8-row) history fetch;
+                        // build_reply_request below fetches history again (20 rows).
+                        // Two round-trips per reply turn — acceptable, not a hot loop.
+                        let transcript = build_input_filter_transcript(
+                            &chat_repo,
+                            user_msg.session_id,
+                            user_msg.user_message_id,
+                        )
+                        .await;
+                        if let Some(rw) =
+                            run_input_filter(&state, &f, &transcript, &user_msg.content).await
+                        {
+                            if let Err(e) = chat_repo
+                                .set_user_input_rewrite(
+                                    user_msg.user_message_id,
+                                    &rw.rewritten_text,
+                                    &rw.filter_model,
+                                    rw.reason.as_deref(),
+                                    rw.f_generation_id.as_deref(),
+                                )
+                                .await
+                            {
+                                tracing::warn!("stream: input-filter rewrite persist failed: {e}");
+                            }
+                        }
+                    }
+                }
                 let req_res = if is_gift {
                     crate::pipeline::handlers::build_gift_request(
                         &state, &input, &plan,
@@ -3151,5 +3353,183 @@ data: [DONE]\n\n";
                 serde_json::json!(false)
             );
         }
+    }
+
+    #[test]
+    fn parse_input_filter_verdict_direct_and_embedded() {
+        let v = parse_input_filter_verdict(r#"{"rewrite": false}"#).unwrap();
+        assert!(!v.rewrite);
+
+        let v = parse_input_filter_verdict(
+            r#"prefix {"rewrite": true, "content": "你好呀", "reason": "noise"} suffix"#,
+        )
+        .unwrap();
+        assert!(v.rewrite);
+        assert_eq!(v.content.as_deref(), Some("你好呀"));
+        assert_eq!(v.reason.as_deref(), Some("noise"));
+    }
+
+    #[test]
+    fn parse_input_filter_verdict_unparseable_is_none() {
+        assert!(parse_input_filter_verdict("not json at all").is_none());
+    }
+
+    #[test]
+    fn parse_input_filter_verdict_rewrite_false_keeps_with_content_ignored() {
+        // rewrite=false is a keep; any content field is parsed but irrelevant.
+        let v = parse_input_filter_verdict(r#"{"rewrite": false, "content": "ignored"}"#).unwrap();
+        assert!(!v.rewrite);
+        assert_eq!(v.content.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn rewrite_content_invalidity_accepts_short_user_line() {
+        // A short rewrite (< 80 chars) must NOT be rejected — there is no
+        // length floor (unlike filter_output_invalidity).
+        assert!(rewrite_content_invalidity("那你平常都怎么放松呀？", None).is_none());
+    }
+
+    #[test]
+    fn rewrite_content_invalidity_rejects_refusal_and_content_filter() {
+        assert_eq!(
+            rewrite_content_invalidity("对不起，我无法满足你的要求", None),
+            Some("refusal_pattern")
+        );
+        assert_eq!(
+            rewrite_content_invalidity("你好", Some("content_filter")),
+            Some("content_filter")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn input_filter_rewrites_meaningless_turn(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Input-filter model ("infilt/m") returns a JSON verdict via the
+        // non-streaming execute() path (JSON completion object). The rewritten
+        // user line is a JSON string inside `content`.
+        let verdict = serde_json::json!({
+            "rewrite": true,
+            "content": "那你平常都怎么放松呀？",
+            "reason": "meaningless digits"
+        })
+        .to_string();
+        let infilt_body = serde_json::json!({
+            "id": "gi", "model": "infilt/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("infilt/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(infilt_body))
+            .mount(&mock)
+            .await;
+
+        // Chat model ("deepseek/x") — REQUIRE the rewritten text in the request
+        // body, proving the rewrite went to pre_filter_content; build_reply_request
+        // then feeds the EFFECTIVE text to the model. If the wiring is broken,
+        // this mock won't match → no REPLY delta.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .and(body_string_contains("那你平常都怎么放松呀？"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\ninput_filter=true\n\
+                 [tasks.chat_input_filter]\nmodel=\"infilt/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "1111",
+                "01J7777777777777777777777A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "1111".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // The chat mock only matches when the body carries the rewrite, so a
+        // REPLY delta proves the model saw the effective (rewritten) input.
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "chat model must have been called with the rewritten input; got {deltas:?}"
+        );
+
+        // content preserved; rewrite + audit stamped on the user row.
+        let (content, pre, fmodel, triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "1111", "client-visible content must stay original");
+        assert_eq!(pre.as_deref(), Some("那你平常都怎么放松呀？"));
+        assert_eq!(fmodel.as_deref(), Some("infilt/m"));
+        assert_eq!(triggers, Some(serde_json::json!({"reason": "meaningless digits"})));
     }
 }

@@ -79,7 +79,7 @@ pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> 
 /// `content`. Assistant rows must NOT use this (their `pre_filter_content` is
 /// the pre-OUTPUT-filter original); `assemble_chat_request` routes assistant
 /// rows to `content` directly.
-fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) -> &str {
+pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) -> &str {
     match msg.pre_filter_content.as_deref() {
         Some(s) if !s.trim().is_empty() => s,
         _ => &msg.content,
