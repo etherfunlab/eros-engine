@@ -1193,7 +1193,10 @@ pub fn run_stream(
                 // rewrite is persisted on the user row's pre_filter_content;
                 // build_reply_request then feeds the EFFECTIVE text to the model
                 // and recall. Fail-open: any non-rewrite outcome is a no-op.
-                if !is_gift {
+                // Skip tipped turns too: a tip persists as role='gift_user', which
+                // set_user_input_rewrite can't update and the prompt drops anyway —
+                // running the filter there is a wasted LLM call.
+                if !is_gift && user_msg.tips_amount_usd.is_none() {
                     if let Some(f) = state.model_config.resolve_input_filter() {
                         // Note: this issues its own small (8-row) history fetch;
                         // build_reply_request below fetches history again (20 rows).

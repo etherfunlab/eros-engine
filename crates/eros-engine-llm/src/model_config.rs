@@ -985,6 +985,7 @@ temperature  = 0.85
 max_tokens   = 600
 description  = "AI companion chat"
 allow_traits = ["allow_politics"]
+input_filter = true
 
 [tasks.chat_companion.tiers.gold]
 model        = "x-ai/grok-4.20"
@@ -1008,6 +1009,15 @@ description  = "reserved — current PDE is rule-based"
 model        = "voyage-3-lite"
 dimensions   = 512
 description  = "reserved — Voyage hard-codes its own model"
+
+[tasks.chat_input_filter]
+model        = "openai/gpt-5.4-nano"
+fallback     = "deepseek/deepseek-chat-v3.2"
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 400
+filter_prompt = "Rewrite per policy."
+reasoning    = { enabled = false }
 "#;
 
     #[test]
@@ -1114,6 +1124,16 @@ description  = "reserved — Voyage hard-codes its own model"
             r.allow_traits,
             Some(vec!["allow_nsfw".to_string(), "allow_politics".to_string()])
         );
+
+        // chat_input_filter schema lock (input-filter feature).
+        assert_eq!(chat.input_filter, Some(true));
+        let inf = cfg
+            .resolve_input_filter()
+            .expect("input filter resolves from fixture");
+        assert_eq!(inf.model, "openai/gpt-5.4-nano");
+        assert_eq!(inf.retry_depth, 1);
+        assert_eq!(inf.max_tokens, 400);
+        assert_eq!(inf.filter_prompt, "Rewrite per policy.");
     }
 
     #[test]
