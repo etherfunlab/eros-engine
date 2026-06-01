@@ -529,8 +529,8 @@ mod tests {
     async fn stream_422_when_content_empty(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ('S', 'p', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -572,8 +572,8 @@ mod tests {
     async fn stream_400_when_tier_malformed(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ('S', 'p', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -619,8 +619,8 @@ mod tests {
         use eros_engine_store::chat::{AssistantInsert, ChatRepo, UpsertUserOutcome};
         let user_id = Uuid::new_v4();
         let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ('R', 'p', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('R', 'p', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(&pool)
         .await

@@ -12,9 +12,7 @@ struct GenomeRow {
     name: String,
     system_prompt: String,
     tip_personality: Option<String>,
-    avatar_url: Option<String>,
     art_metadata: serde_json::Value,
-    is_active: bool,
 }
 
 /// Narrow gate-field view of a genome for the chat-start path: just
@@ -44,9 +42,7 @@ impl From<GenomeRow> for PersonaGenome {
             name: r.name,
             system_prompt: r.system_prompt,
             tip_personality: r.tip_personality,
-            avatar_url: r.avatar_url,
             art_metadata: r.art_metadata,
-            is_active: r.is_active,
         }
     }
 }
@@ -78,8 +74,8 @@ pub struct PersonaRepo<'a> {
 impl<'a> PersonaRepo<'a> {
     pub async fn get_genome(&self, genome_id: Uuid) -> Result<Option<PersonaGenome>, sqlx::Error> {
         let row = sqlx::query_as::<_, GenomeRow>(
-            "SELECT id, name, system_prompt, tip_personality, avatar_url, \
-                    art_metadata, is_active \
+            "SELECT id, name, system_prompt, tip_personality, \
+                    art_metadata \
              FROM engine.persona_genomes \
              WHERE id = $1",
         )
@@ -120,9 +116,7 @@ impl<'a> PersonaRepo<'a> {
             name: String,
             system_prompt: String,
             tip_personality: Option<String>,
-            avatar_url: Option<String>,
             art_metadata: serde_json::Value,
-            is_active: bool,
         }
 
         let row = sqlx::query_as::<_, Joined>(
@@ -135,9 +129,7 @@ impl<'a> PersonaRepo<'a> {
                 pg.name        AS name, \
                 pg.system_prompt    AS system_prompt, \
                 pg.tip_personality  AS tip_personality, \
-                pg.avatar_url       AS avatar_url, \
-                pg.art_metadata     AS art_metadata, \
-                pg.is_active        AS is_active \
+                pg.art_metadata     AS art_metadata \
              FROM engine.persona_instances pi \
              JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
              WHERE pi.id = $1 AND pi.status = 'active'",
@@ -153,9 +145,7 @@ impl<'a> PersonaRepo<'a> {
                 name: r.name,
                 system_prompt: r.system_prompt,
                 tip_personality: r.tip_personality,
-                avatar_url: r.avatar_url,
                 art_metadata: r.art_metadata,
-                is_active: r.is_active,
             },
             instance: PersonaInstance {
                 id: r.instance_id,
@@ -196,9 +186,7 @@ impl<'a> PersonaRepo<'a> {
         name: &str,
         system_prompt: &str,
         tip_personality: Option<&str>,
-        avatar_url: Option<&str>,
         art_metadata: serde_json::Value,
-        is_active: bool,
     ) -> Result<(Uuid, bool), sqlx::Error> {
         if let Some(id) =
             sqlx::query_scalar::<_, Uuid>("SELECT id FROM engine.persona_genomes WHERE name = $1")
@@ -210,32 +198,26 @@ impl<'a> PersonaRepo<'a> {
                 "UPDATE engine.persona_genomes SET \
                     system_prompt = $2, \
                     tip_personality = $3, \
-                    avatar_url = $4, \
-                    art_metadata = $5, \
-                    is_active = $6 \
+                    art_metadata = $4 \
                  WHERE id = $1",
             )
             .bind(id)
             .bind(system_prompt)
             .bind(tip_personality)
-            .bind(avatar_url)
             .bind(art_metadata)
-            .bind(is_active)
             .execute(self.pool)
             .await?;
             return Ok((id, false));
         }
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes \
-                (name, system_prompt, tip_personality, avatar_url, art_metadata, is_active) \
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                (name, system_prompt, tip_personality, art_metadata) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
         )
         .bind(name)
         .bind(system_prompt)
         .bind(tip_personality)
-        .bind(avatar_url)
         .bind(art_metadata)
-        .bind(is_active)
         .fetch_one(self.pool)
         .await?;
         Ok((id, true))
@@ -302,20 +284,14 @@ impl<'a> PersonaRepo<'a> {
 mod tests {
     use super::*;
 
-    async fn insert_genome(
-        pool: &PgPool,
-        name: &str,
-        is_active: bool,
-        art: serde_json::Value,
-    ) -> Uuid {
+    async fn insert_genome(pool: &PgPool, name: &str, art: serde_json::Value) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ($1, $2, $3) RETURNING id",
         )
         .bind(name)
         .bind("you are a companion")
         .bind(art)
-        .bind(is_active)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -324,7 +300,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn get_genome_returns_full_record(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
-        let id = insert_genome(&pool, "Nova", true, serde_json::json!({ "mbti": "INFP" })).await;
+        let id = insert_genome(&pool, "Nova", serde_json::json!({ "mbti": "INFP" })).await;
 
         let g = repo.get_genome(id).await.unwrap().unwrap();
         assert_eq!(g.name, "Nova");
@@ -338,7 +314,7 @@ mod tests {
     async fn create_instance_and_load_companion(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
         let owner = Uuid::new_v4();
-        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({ "age": 27 })).await;
+        let genome_id = insert_genome(&pool, "Echo", serde_json::json!({ "age": 27 })).await;
 
         let instance_id = repo.create_instance(genome_id, owner).await.unwrap();
 
@@ -381,7 +357,7 @@ mod tests {
     async fn find_active_instance_skips_archived_and_missing(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
         let owner = Uuid::new_v4();
-        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
+        let genome_id = insert_genome(&pool, "Echo", serde_json::json!({})).await;
 
         // none yet
         assert!(repo
@@ -414,7 +390,7 @@ mod tests {
     async fn load_companion_skips_non_active_instances(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
         let owner = Uuid::new_v4();
-        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
+        let genome_id = insert_genome(&pool, "Echo", serde_json::json!({})).await;
         let instance_id = repo.create_instance(genome_id, owner).await.unwrap();
 
         sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
@@ -433,8 +409,8 @@ mod tests {
         let owner = Uuid::new_v4();
         let genome_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.persona_genomes \
-                (name, system_prompt, art_metadata, is_active) \
-             VALUES ('Nova', 'p', '{}'::jsonb, true) RETURNING id",
+                (name, system_prompt, art_metadata) \
+             VALUES ('Nova', 'p', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -467,7 +443,7 @@ mod tests {
         // upsert must reactivate the SAME row instead.
         let repo = PersonaRepo { pool: &pool };
         let owner = Uuid::new_v4();
-        let genome_id = insert_genome(&pool, "Echo", true, serde_json::json!({})).await;
+        let genome_id = insert_genome(&pool, "Echo", serde_json::json!({})).await;
 
         // first call creates
         let iid = repo.ensure_active_instance(genome_id, owner).await.unwrap();

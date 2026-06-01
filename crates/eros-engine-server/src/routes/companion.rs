@@ -887,8 +887,8 @@ pub(crate) mod testutil {
 
     pub(crate) async fn seed_genome(pool: &PgPool, name: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ($1, 'you are a companion', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ($1, 'you are a companion', '{}'::jsonb) RETURNING id",
         )
         .bind(name)
         .fetch_one(pool)

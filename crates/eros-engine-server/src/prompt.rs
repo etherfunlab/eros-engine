@@ -706,7 +706,6 @@ mod tests {
                 name: "Aria".into(),
                 system_prompt: "p".into(),
                 tip_personality: Some("normal".into()),
-                avatar_url: None,
                 art_metadata: serde_json::json!({
                     "age": 24,
                     "mbti": "INFP",
@@ -715,7 +714,6 @@ mod tests {
                     "quirks": ["q1"],
                     "topics": ["t1"]
                 }),
-                is_active: true,
             },
             instance: PersonaInstance {
                 id: uid,
