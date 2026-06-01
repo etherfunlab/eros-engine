@@ -31,33 +31,6 @@ curl http://localhost:8080/healthz
 }
 ```
 
-## 人格
-
-### `GET /comp/personas`
-
-列出所有處於 active 狀態的人格基因。需鑒權。
-
-```bash
-curl -H "Authorization: Bearer $JWT" \
-  http://localhost:8080/comp/personas
-```
-
-```json
-{
-  "personas": [
-    {
-      "id": "11d6a45a-1fd9-4fe6-a943-3f049035eb68",
-      "name": "Aria",
-      "system_prompt": "…",
-      "tip_personality": "warm-but-reserved",
-      "avatar_url": "https://avatars.etherfun.xyz/aria.png",
-      "art_metadata": { "age": 27, "mbti": "INFJ", "model": "x-ai/grok-4-fast", … },
-      "is_active": true
-    }
-  ]
-}
-```
-
 ## 對話生命周期
 
 ### `POST /comp/chat/start`

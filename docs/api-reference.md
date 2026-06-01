@@ -31,33 +31,6 @@ curl http://localhost:8080/healthz
 }
 ```
 
-## Personas
-
-### `GET /comp/personas`
-
-List active persona genomes. Auth required.
-
-```bash
-curl -H "Authorization: Bearer $JWT" \
-  http://localhost:8080/comp/personas
-```
-
-```json
-{
-  "personas": [
-    {
-      "id": "11d6a45a-1fd9-4fe6-a943-3f049035eb68",
-      "name": "Aria",
-      "system_prompt": "…",
-      "tip_personality": "warm-but-reserved",
-      "avatar_url": "https://avatars.etherfun.xyz/aria.png",
-      "art_metadata": { "age": 27, "mbti": "INFJ", "model": "x-ai/grok-4-fast", … },
-      "is_active": true
-    }
-  ]
-}
-```
-
 ## Chat lifecycle
 
 ### `POST /comp/chat/start`
