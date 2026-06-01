@@ -179,9 +179,7 @@ mod tests {
                 name: "Mia".into(),
                 system_prompt: "You are Mia.".into(),
                 tip_personality: Some("normal".into()),
-                avatar_url: None,
                 art_metadata: serde_json::json!({}),
-                is_active: true,
             },
             instance: PersonaInstance {
                 id: iid,

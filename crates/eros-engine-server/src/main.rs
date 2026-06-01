@@ -89,15 +89,15 @@ fn run_print_openapi() -> Result<()> {
 }
 
 /// Read a directory of `*.toml` persona files and insert each into
-/// `engine.persona_genomes`. Idempotent: rows are matched by `name`,
-/// so re-running won't duplicate or overwrite.
+/// `engine.persona_genomes`. Idempotent: rows are matched by `name`, so
+/// re-running won't create duplicate rows — an existing row is updated in
+/// place (id stable, content refreshed, FK references preserved).
 async fn run_seed_personas(dir: &str) -> Result<()> {
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
     struct PersonaFile {
         name: String,
-        avatar_url: Option<String>,
         tip_personality: Option<String>,
         system_prompt: String,
         #[serde(default)]
@@ -127,9 +127,7 @@ async fn run_seed_personas(dir: &str) -> Result<()> {
                 &f.name,
                 &f.system_prompt,
                 f.tip_personality.as_deref(),
-                f.avatar_url.as_deref(),
                 f.art_metadata,
-                true,
             )
             .await
             .with_context(|| format!("upsert {}", f.name))?;

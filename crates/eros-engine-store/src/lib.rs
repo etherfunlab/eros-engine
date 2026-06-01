@@ -203,4 +203,36 @@ mod migration_tests {
         .unwrap();
         assert!(pg_exists, "persona_genomes table must survive");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0024_strips_persona_genomes_to_chat_data(pool: PgPool) {
+        for col in ["is_active", "avatar_url"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'engine' AND table_name = 'persona_genomes' \
+                   AND column_name = $1)",
+            )
+            .bind(col)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                !exists,
+                "persona_genomes.{col} must be dropped by migration 0024"
+            );
+        }
+        // The chat-relevant columns survive.
+        for col in ["name", "system_prompt", "tip_personality", "art_metadata"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'engine' AND table_name = 'persona_genomes' \
+                   AND column_name = $1)",
+            )
+            .bind(col)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(exists, "persona_genomes.{col} must survive migration 0024");
+        }
+    }
 }

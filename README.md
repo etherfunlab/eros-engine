@@ -191,7 +191,6 @@ All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default.
 
 Highlights:
 
-- `GET  /comp/personas` — list active persona genomes.
 - `POST /comp/chat/start` — open a chat session against a persona.
 - `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events (SSE) streaming. (The old blocking synchronous `/message` endpoint was removed in 0.3 — SSE is now the only chat path.)
 - `GET  /comp/chat/{session_id}/history` — paginated chat history.

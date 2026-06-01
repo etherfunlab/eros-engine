@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 name = "Miel"
-avatar_url = "https://avatars.etherfun.xyz/miel.png"
 tip_personality = "playful-grateful-then-shy"
 
 system_prompt = """

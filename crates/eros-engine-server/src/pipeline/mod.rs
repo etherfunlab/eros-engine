@@ -131,8 +131,8 @@ mod tests {
     /// the chat_messages FK is satisfied. Returns (genome_id, instance_id, session_id).
     async fn seed_session(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid, Uuid) {
         let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata, is_active) \
-             VALUES ('SignalsTest', 'sp', '{}'::jsonb, true) RETURNING id",
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('SignalsTest', 'sp', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(pool)
         .await
