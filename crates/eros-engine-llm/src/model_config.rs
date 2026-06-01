@@ -377,6 +377,11 @@ pub struct TaskConfig {
     pub model_name_display_override: Option<DisplayOverride>,
     #[serde(default)]
     pub output_filter: Option<bool>,
+    /// Global switch for the user-input rewrite filter (chat_input_filter).
+    /// Read ONLY on [tasks.chat_companion]; task-level, no per-tier override
+    /// (unlike `output_filter`). Default false.
+    #[serde(default)]
+    pub input_filter: Option<bool>,
     /// System instruction sent to the filter LLM; the assistant reply to
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
@@ -447,6 +452,21 @@ pub struct ResolvedOutputFilter {
     /// Reasoning config forwarded from `[tasks.chat_output_filter]`. Task-level
     /// only (no per-tier override), consistent with `chat_companion`'s own
     /// `reasoning` field shape.
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved user-input rewrite filter (`chat_input_filter`). Mirrors
+/// `ResolvedOutputFilter` minus `trigger`/`timing` (the input filter has no
+/// triggers and no extract-timing). `fallback_model` is already truncated to
+/// `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedInputFilter {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub filter_prompt: String,
+    pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
 }
 
@@ -643,6 +663,42 @@ impl ModelConfig {
             timing,
             retry_depth,
             reasoning,
+        })
+    }
+
+    /// chat_companion task-level `input_filter` switch; no tier override. Default false.
+    pub fn input_filter_enabled(&self) -> bool {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.input_filter)
+            .unwrap_or(false)
+    }
+
+    /// Resolve the user-input rewrite filter. `None` (disabled) when:
+    /// chat_companion `input_filter` is false (task-level → false), OR `[tasks.chat_input_filter]`
+    /// is absent, OR its resolved `filter_prompt` is blank.
+    pub fn resolve_input_filter(&self) -> Option<ResolvedInputFilter> {
+        const FILTER_TASK: &str = "chat_input_filter";
+        if !self.input_filter_enabled() {
+            return None;
+        }
+        let task_cfg = self.tasks.get(FILTER_TASK)?;
+        let filter_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if filter_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(FILTER_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedInputFilter {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            filter_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
         })
     }
 }
@@ -1922,5 +1978,90 @@ model = "gold/m"
         assert_eq!(rg.model, "gold/m"); // tier model
         assert_eq!(rg.filter_prompt, "DEFAULT"); // fell back to default block (#5)
         assert_eq!(rg.timing, FilterTiming::AfterExtract); // default timing
+    }
+
+    #[test]
+    fn resolve_input_filter_disabled_when_switch_off() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+[tasks.chat_input_filter]
+model = "f"
+filter_prompt = "REWRITE"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.input_filter_enabled());
+        assert!(cfg.resolve_input_filter().is_none());
+    }
+
+    #[test]
+    fn resolve_input_filter_none_when_table_absent_or_blank_prompt() {
+        // switch on, table absent
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n",
+        )
+        .unwrap();
+        assert!(cfg.input_filter_enabled());
+        assert!(cfg.resolve_input_filter().is_none());
+
+        // switch on, table present, blank prompt
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_input_filter().is_none());
+    }
+
+    #[test]
+    fn resolve_input_filter_some_when_enabled() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+input_filter = true
+[tasks.chat_input_filter]
+model = "fast/in"
+fallback = ["fb1", "fb2"]
+retry_depth = 1
+temperature = 0.3
+max_tokens = 400
+filter_prompt = "REWRITE"
+reasoning = { enabled = false }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.model, "fast/in");
+        // fallback truncated to retry_depth = 1
+        assert_eq!(f.fallback_model, vec!["fb1".to_string()]);
+        assert_eq!(f.retry_depth, 1);
+        assert_eq!(f.filter_prompt, "REWRITE");
+        assert_eq!(f.temperature, 0.3);
+        assert_eq!(f.max_tokens, 400);
+        assert_eq!(
+            f.reasoning,
+            Some(ReasoningConfig { enabled: Some(false), exclude: None })
+        );
+    }
+
+    #[test]
+    fn resolve_input_filter_retry_depth_zero_drops_fallback() {
+        // retry_depth = 0 ⇒ primary only, no fallback (mirrors the output
+        // filter's retry_depth=0 edge case).
+        let cfg = ModelConfig::from_toml_str(
+            r#"
+[tasks.chat_companion]
+model = "m"
+input_filter = true
+[tasks.chat_input_filter]
+model = "fast/in"
+fallback = ["a", "b"]
+filter_prompt = "REWRITE"
+retry_depth = 0
+"#,
+        )
+        .unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.retry_depth, 0);
+        assert!(f.fallback_model.is_empty());
     }
 }
