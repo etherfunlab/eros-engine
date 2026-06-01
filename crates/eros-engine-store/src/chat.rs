@@ -55,6 +55,12 @@ pub struct ChatMessage {
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
+    /// Input-filter rewrite of a `role='user'` row: the model-facing effective
+    /// text when the user's original was rewritten (NULL otherwise). On
+    /// assistant rows this column holds the OPPOSITE direction (the
+    /// pre-OUTPUT-filter original) — see chat_input_filter design.
+    #[serde(default)]
+    pub pre_filter_content: Option<String>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -528,6 +534,40 @@ impl<'a> ChatRepo<'a> {
              WHERE id = $1 AND role = 'user' AND ghost_decision = false",
         )
         .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp an input-filter rewrite onto an existing `role='user'` row. The
+    /// original text in `content` is left untouched (the client always sees the
+    /// original); the rewrite lands in `pre_filter_content` (model-facing).
+    /// `reason`, when non-blank, is stored as `filter_triggers = {"reason": …}`.
+    /// `f_client_msg_id` stays NULL — the user row is updated in place rather
+    /// than inserting a separate filter row.
+    pub async fn set_user_input_rewrite(
+        &self,
+        user_message_id: Uuid,
+        pre_filter_content: &str,
+        filter_model: &str,
+        reason: Option<&str>,
+        f_generation_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let filter_triggers: Option<serde_json::Value> = reason
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|r| serde_json::json!({ "reason": r }));
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET pre_filter_content = $2, filter_model = $3, \
+                 filter_triggers = $4, f_generation_id = $5 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(pre_filter_content)
+        .bind(filter_model)
+        .bind(filter_triggers)
+        .bind(f_generation_id)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -1734,6 +1774,93 @@ mod tests {
             pairs,
             vec![("(打赏 $20)".to_string(), "thanks!".to_string())]
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_input_rewrite_stamps_audit_keeps_content(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let umid = match repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "1111",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        repo.set_user_input_rewrite(
+            umid,
+            "那你平常都怎么放松呀？",
+            "fast/in",
+            Some("meaningless digits"),
+            Some("gen-x"),
+        )
+        .await
+        .unwrap();
+
+        let (content, pre, model, triggers, fgen): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers, f_generation_id \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "1111", "original content must be preserved");
+        assert_eq!(pre.as_deref(), Some("那你平常都怎么放松呀？"));
+        assert_eq!(model.as_deref(), Some("fast/in"));
+        assert_eq!(triggers, Some(serde_json::json!({"reason": "meaningless digits"})));
+        assert_eq!(fgen.as_deref(), Some("gen-x"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_input_rewrite_blank_reason_leaves_triggers_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let umid = match repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "????",
+                "01J0000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        repo.set_user_input_rewrite(umid, "你今天过得怎么样？", "fast/in", Some("  "), None)
+            .await
+            .unwrap();
+        let triggers: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT filter_triggers FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(triggers.is_none(), "blank reason → SQL NULL filter_triggers");
     }
 
     #[sqlx::test(migrations = "./migrations")]
