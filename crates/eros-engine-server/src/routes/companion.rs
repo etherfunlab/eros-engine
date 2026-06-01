@@ -481,9 +481,6 @@ pub(crate) async fn resolve_or_create_session(
             )?;
 
             let gate = gate.ok_or_else(|| AppError::NotFound("genome not found".into()))?;
-            if !gate.is_active {
-                return Err(AppError::BadRequest("genome is not active".into()));
-            }
 
             let iid = match existing_instance {
                 Some(iid) => iid,

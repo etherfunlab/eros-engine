@@ -17,13 +17,12 @@ struct GenomeRow {
     is_active: bool,
 }
 
-/// Narrow gate-fields view of a genome for the chat-start path: the two
-/// fields `resolve_or_create_session` needs — `name` (response) and
-/// `is_active` (400 check) — in one row. Folds the former `get_genome` read.
+/// Narrow gate-field view of a genome for the chat-start path: just
+/// `name` (used in the response). The engine no longer gates on
+/// availability, so existence of the row is the only check.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GenomeGate {
     pub name: String,
-    pub is_active: bool,
 }
 
 /// Gate-fields view for the explicit-`instance_id` chat-start path: owner
@@ -96,7 +95,7 @@ impl<'a> PersonaRepo<'a> {
         genome_id: Uuid,
     ) -> Result<Option<GenomeGate>, sqlx::Error> {
         sqlx::query_as::<_, GenomeGate>(
-            "SELECT name, is_active \
+            "SELECT name \
              FROM engine.persona_genomes WHERE id = $1",
         )
         .bind(genome_id)
@@ -356,27 +355,19 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn get_genome_gate_returns_name_and_active(pool: PgPool) {
+    async fn get_genome_gate_returns_name(pool: PgPool) {
         let repo = PersonaRepo { pool: &pool };
 
-        // legacy genome → is_active true
-        let legacy = insert_genome(&pool, "Legacy", true, serde_json::json!({})).await;
-        let g = repo.get_genome_gate(legacy).await.unwrap().unwrap();
-        assert_eq!(g.name, "Legacy");
-        assert!(g.is_active);
-
-        // inactive genome → is_active false
-        let inactive = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO engine.persona_genomes \
-                (name, system_prompt, art_metadata, is_active) \
-             VALUES ('NftGenome', 'sp', '{}'::jsonb, false) RETURNING id",
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('Legacy', 'sp', '{}'::jsonb) RETURNING id",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        let g2 = repo.get_genome_gate(inactive).await.unwrap().unwrap();
-        assert_eq!(g2.name, "NftGenome");
-        assert!(!g2.is_active);
+
+        let g = repo.get_genome_gate(id).await.unwrap().unwrap();
+        assert_eq!(g.name, "Legacy");
 
         // missing → None
         assert!(repo
