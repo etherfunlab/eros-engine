@@ -579,6 +579,34 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
+    /// Merge a `chat_vision` describe result into a `role='user'` row's
+    /// metadata. Top-level JSONB merge; `COALESCE` handles a NULL metadata
+    /// column. Leaves `content`, `pre_filter_content`, and existing keys (e.g.
+    /// `image_url`) intact.
+    pub async fn set_user_image_vision(
+        &self,
+        user_message_id: Uuid,
+        vision: &serde_json::Value,
+        vision_model: &str,
+        generation_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let patch = serde_json::json!({
+            "vision": vision,
+            "vision_model": vision_model,
+            "vision_generation_id": generation_id,
+        });
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata, '{}'::jsonb) || $2 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(patch)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Persist a burst of assistant messages keyed back to the driving user
     /// message. Caller picks the ULID-shaped `id` so the streamed `meta.message_id`
     /// matches the DB row. Bumps `last_active_at` once at the end.
@@ -1975,5 +2003,44 @@ mod tests {
             rows[0].metadata.as_ref().unwrap()["image_url"],
             "https://x/y.png"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_image_vision_merges_and_preserves(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let seed = serde_json::json!({ "image_url": "https://x/y.png" });
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "",
+                "01J000000000000000000VISION",
+                "user",
+                Some(&seed),
+            )
+            .await
+            .unwrap();
+        let uid = match outcome {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let vision = serde_json::json!({
+            "description": "a cat", "ocr_text": "", "people": "", "scene": "indoors"
+        });
+        repo.set_user_image_vision(uid, &vision, "vision-model", Some("gen-1"))
+            .await
+            .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        let meta = rows[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["image_url"], "https://x/y.png"); // preserved
+        assert_eq!(meta["vision"]["description"], "a cat");
+        assert_eq!(meta["vision_model"], "vision-model");
+        assert_eq!(meta["vision_generation_id"], "gen-1");
+        assert_eq!(rows[0].content, ""); // untouched
     }
 }
