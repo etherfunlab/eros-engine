@@ -18,15 +18,9 @@
 //!   to the JWT user; otherwise 403 Forbidden.
 //! - All DB I/O routes through the `eros-engine-store` repos
 //!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `InsightRepo`).
-//! - The credit ledger is gone in OSS — the gateway's two legacy
-//!   credit-spending endpoints collapse into a single `event/gift`
-//!   endpoint that takes
-//!   `{ deltas, label, metadata }` from the body and applies them
-//!   directly via `AffinityRepo::persist_with_event`. We deliberately
-//!   bypass `pipeline::run` for the gift route so the HTTP+DB side-effects
-//!   can be tested without a live LLM (the full gift→reply flow remains
-//!   reachable through the streaming `/message/stream` path with whatever
-//!   client-driven semantics the host app prefers).
+//! - The credit ledger is gone in OSS — tipping is handled inline on the
+//!   streaming `/message/stream` path via `tips_amount_usd`, not through a
+//!   separate credit-spending endpoint.
 //! - `lead_score` / CTA-gating fields are computed from the same store
 //!   primitives used by post-process; no inline `companion_insights`
 //!   table read.
@@ -230,20 +224,6 @@ pub(crate) async fn require_session_for_user(
         return Err(AppError::Forbidden("not your session".into()));
     }
     Ok(session)
-}
-
-fn label_to_string(label: Option<eros_engine_core::affinity::RelationshipLabel>) -> Option<String> {
-    use eros_engine_core::affinity::RelationshipLabel as L;
-    label.map(|l| {
-        match l {
-            L::Stranger => "stranger",
-            L::Romantic => "romantic",
-            L::Friend => "friend",
-            L::Frenemy => "frenemy",
-            L::SlowBurn => "slow_burn",
-        }
-        .to_string()
-    })
 }
 
 /// Validate a caller-supplied list of `PromptTraitDto` and convert to the
@@ -732,13 +712,9 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
 //
 // These exercise the route module's HTTP+DB side-effects against a
 // live Postgres instance (via `#[sqlx::test]`). They do NOT exercise
-// the LLM-driven path: the gift route deliberately bypasses
-// `pipeline::run`, and the message routes are not tested here for the
-// same reason (full end-to-end LLM testing is the job of T14's deploy
-// smoke). Per the T11 spec: "directly insert a chat_messages row +
-// call AffinityRepo::persist_with_event in the test, BYPASSING the
-// pipeline" — this is exactly what the gift-event test does, and it
-// matches the route's chosen implementation strategy.
+// the LLM-driven path (full end-to-end LLM testing is the job of the
+// deploy smoke); the message/streaming routes are covered by the
+// pipeline tests instead.
 // ────────────────────────────────────────────────────────────────────
 
 // Test helpers shared with sibling test modules (e.g. routes::bff::companion).
