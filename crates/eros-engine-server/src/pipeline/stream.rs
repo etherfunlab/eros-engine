@@ -864,10 +864,12 @@ async fn build_input_filter_transcript(
 
 /// Run the input-filter LLM over the raw user input with recent context.
 /// Returns `Some(InputRewrite)` ONLY when the model explicitly asked to rewrite
-/// with valid content; every other outcome (keep verdict, parse failure,
-/// refusal, error, timeout, empty) returns `None` ⇒ caller uses the original.
-/// Note: a `{"rewrite": false}` verdict is a DEFINITIVE keep — it returns `None`
-/// immediately and does NOT try the remaining fallback models.
+/// with valid content; every other outcome returns `None` ⇒ caller uses the
+/// original. The fallback chain is walked ONLY on transport-level failures
+/// (error / timeout / empty reply). A CONTENT-level non-success — `{"rewrite":
+/// false}`, an unparseable verdict, blank content, or a refusal — is a
+/// DEFINITIVE keep: it returns `None` immediately and does NOT try the remaining
+/// models, so a fallback can never rewrite a message the primary left alone.
 async fn run_input_filter(
     state: &AppState,
     f: &eros_engine_llm::model_config::ResolvedInputFilter,
@@ -920,11 +922,15 @@ async fn run_input_filter(
             tracing::warn!(model = %model_id, "input-filter: empty reply; next");
             continue;
         }
+        // Content-level non-success ⇒ DEFINITIVE keep (return None, no chain
+        // walk). The model responded but not with a usable rewrite; walking to a
+        // fallback here would risk rewriting a meaningful message the primary
+        // left alone. Only transport failures above (error/timeout/empty) walk.
         let verdict = match parse_input_filter_verdict(&text) {
             Some(v) => v,
             None => {
-                tracing::warn!(model = %model_id, "input-filter: unparseable verdict; next");
-                continue;
+                tracing::warn!(model = %model_id, "input-filter: unparseable verdict; keep original");
+                return None;
             }
         };
         if !verdict.rewrite {
@@ -932,12 +938,12 @@ async fn run_input_filter(
         }
         let content = verdict.content.unwrap_or_default().trim().to_string();
         if content.is_empty() {
-            tracing::warn!(model = %model_id, "input-filter: rewrite=true but blank content; next");
-            continue;
+            tracing::warn!(model = %model_id, "input-filter: rewrite=true but blank content; keep original");
+            return None;
         }
         if let Some(reason) = rewrite_content_invalidity(&content, resp.finish_reason.as_deref()) {
-            tracing::warn!(model = %model_id, invalidity = %reason, "input-filter: invalid rewrite content; next");
-            continue;
+            tracing::warn!(model = %model_id, invalidity = %reason, "input-filter: invalid rewrite content; keep original");
+            return None;
         }
         let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
         return Some(InputRewrite {
@@ -3545,5 +3551,137 @@ data: [DONE]\n\n";
             triggers,
             Some(serde_json::json!({"reason": "meaningless digits"}))
         );
+    }
+
+    // Regression (codex P2): a content-level non-verdict from the primary
+    // input-filter model (here: unparseable prose) must be a DEFINITIVE keep —
+    // the chain must NOT walk to the fallback, even though the fallback would
+    // happily rewrite. Otherwise a meaningful message could be rewritten by a
+    // later model the primary effectively declined to touch.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn input_filter_malformed_primary_keeps_original_no_chain_walk(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Primary filter model returns UNPARSEABLE prose (no JSON object).
+        let primary_body = serde_json::json!({
+            "id": "gp", "model": "infilt/primary",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "Looks fine to me, leaving it as is."}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("infilt/primary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(primary_body))
+            .mount(&mock)
+            .await;
+
+        // Fallback model WOULD rewrite — if the chain wrongly walked, the user
+        // row's pre_filter_content would end up set to this. The fix means this
+        // mock is never reached.
+        let fallback_body = serde_json::json!({
+            "id": "gfb", "model": "infilt/fallback",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"rewrite\": true, \"content\": \"FALLBACK REWRITE\"}"}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("infilt/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fallback_body))
+            .mount(&mock)
+            .await;
+
+        // Chat model — the prompt carries the ORIGINAL (meaningful) message.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\ninput_filter=true\n\
+                 [tasks.chat_input_filter]\nmodel=\"infilt/primary\"\nfallback=[\"infilt/fallback\"]\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01J8888888888888888888888A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.contains("REPLY"), "turn must complete normally");
+
+        // The original is kept and NO rewrite is stamped — proving the chain did
+        // not walk to the (rewrite-producing) fallback on the malformed verdict.
+        let (content, pre, fmodel): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "hello there friend");
+        assert!(
+            pre.is_none(),
+            "malformed primary verdict must keep original (no fallback walk); got {pre:?}"
+        );
+        assert!(fmodel.is_none(), "no filter model stamped; got {fmodel:?}");
     }
 }

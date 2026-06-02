@@ -514,6 +514,9 @@ The `pre_filter_content`, `filter_model`, `filter_triggers`, `f_generation_id`,
   verdict carried a reason (NULL when it did not); assembled prompt (and recall
   query) use the rewritten text.
 - Keep turn: all audit columns NULL, prompt uses original.
+- Malformed primary verdict + rewrite-producing fallback configured: the original
+  is kept and no rewrite is stamped — the chain does NOT walk on a content-level
+  non-verdict (only transport failures walk; see §4.2).
 - Filter-off (no switch / blank prompt): behaviour byte-identical to today.
 - Past-turn carry-through: a prior rewritten user row feeds its rewrite into a
   later turn's history.
