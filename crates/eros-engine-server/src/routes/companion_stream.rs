@@ -284,7 +284,7 @@ pub async fn send_message_stream(
             })
         })?;
 
-    // Build metadata: conditionally include tips_amount_usd and tier.
+    // Build metadata: conditionally include tips_amount_usd, tier, and image_url.
     // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
     let mut meta_map = serde_json::Map::new();
     if let Some(amount) = req.tips_amount_usd {
@@ -292,6 +292,9 @@ pub async fn send_message_stream(
     }
     if let Some(t) = req.tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    if let Some(url) = req.image_url.as_deref() {
+        meta_map.insert("image_url".into(), serde_json::json!(url));
     }
     // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
     // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
@@ -368,6 +371,7 @@ pub async fn send_message_stream(
                     memory_scope,
                     affinity_scope,
                     tips_amount_usd: req.tips_amount_usd,
+                    image_url: req.image_url.clone(),
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }

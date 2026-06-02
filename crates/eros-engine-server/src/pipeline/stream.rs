@@ -1090,6 +1090,9 @@ pub struct PersistedUserMessage {
     pub memory_scope: eros_engine_core::scope::MemoryScope,
     pub affinity_scope: eros_engine_core::scope::AffinityScope,
     pub tips_amount_usd: Option<f64>,
+    /// The image URL the client attached to this turn (`https`/`http`), or
+    /// `None` for a text/tip-only turn. Drives the `chat_vision` pre-stage.
+    pub image_url: Option<String>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -1735,6 +1738,7 @@ mod tests {
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -1868,6 +1872,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -1951,6 +1956,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2050,6 +2056,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2364,6 +2371,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2486,6 +2494,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2621,6 +2630,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2771,6 +2781,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2883,6 +2894,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2976,6 +2988,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(20.0),
+                image_url: None,
             },
         )
         .collect()
@@ -3081,6 +3094,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3188,6 +3202,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3314,6 +3329,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3513,6 +3529,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3655,6 +3672,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
