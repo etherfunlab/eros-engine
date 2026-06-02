@@ -25,7 +25,7 @@ use eros_engine_llm::voyage::VoyageClient;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::HumanInsightRepo;
-use eros_engine_store::insight::InsightRepo;
+use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo, InsightRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -79,6 +79,7 @@ pub async fn run(
                     &state,
                     session_id,
                     user_id,
+                    m.message_id,
                     &user_msg,
                     &m.full_text,
                     client_id.as_deref(),
@@ -120,7 +121,7 @@ pub async fn run(
             && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
             && !assistant_msg.trim().is_empty();
 
-        let (llm_deltas, reason) = if run_eval {
+        let (llm_deltas, reason, affinity_meta) = if run_eval {
             let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
             let persona_name = match persona_repo.load_companion(instance_id).await {
@@ -145,12 +146,14 @@ pub async fn run(
                 _ => (
                     eros_engine_core::affinity::AffinityDeltas::default(),
                     String::new(),
+                    None,
                 ),
             }
         } else {
             (
                 eros_engine_core::affinity::AffinityDeltas::default(),
                 String::new(),
+                None,
             )
         };
 
@@ -169,6 +172,7 @@ pub async fn run(
             plan.action_type,
             combined,
             context,
+            affinity_meta,
         )
         .await;
     };
@@ -195,6 +199,7 @@ pub async fn run(
 /// does not touch ghost_streak in `persist_with_event` — that's a caller
 /// responsibility because the streak reset is a pipeline-policy concern,
 /// not a row-update concern.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct affinity-persist concern
 async fn persist_affinity(
     state: &AppState,
     session_id: Uuid,
@@ -203,6 +208,7 @@ async fn persist_affinity(
     action: ActionType,
     deltas: eros_engine_core::affinity::AffinityDeltas,
     context: serde_json::Value,
+    meta: Option<eros_engine_store::OpenRouterCallMeta>,
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -247,7 +253,14 @@ async fn persist_affinity(
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo
-                .persist_with_event(&mut affinity, &deltas, ema_inertia, event_type, context)
+                .persist_with_event(
+                    &mut affinity,
+                    &deltas,
+                    ema_inertia,
+                    event_type,
+                    context,
+                    meta.as_ref(),
+                )
                 .await
             {
                 tracing::warn!("affinity persist_with_event failed: {e}");
@@ -469,7 +482,11 @@ async fn evaluate_affinity(
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
-) -> (eros_engine_core::affinity::AffinityDeltas, String) {
+) -> (
+    eros_engine_core::affinity::AffinityDeltas,
+    String,
+    Option<eros_engine_store::OpenRouterCallMeta>,
+) {
     use eros_engine_core::affinity::AffinityDeltas;
 
     let prompt =
@@ -489,41 +506,71 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let raw = match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await
-    {
-        Ok(Ok(resp)) => {
-            super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
-            resp.reply
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("affinity eval LLM call failed: {e}");
-            return (AffinityDeltas::default(), String::new());
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
+    let (raw, meta) =
+        match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(resp)) => {
+                super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
+                let meta = eros_engine_store::OpenRouterCallMeta {
+                    generation_id: resp.generation_id.clone(),
+                    model: resp.model.clone(),
+                    usage: resp.usage.clone(),
+                };
+                (resp.reply, Some(meta))
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("affinity eval LLM call failed: {e}");
+                return (AffinityDeltas::default(), String::new(), None);
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
                 "affinity eval timed out after {AFFINITY_EVAL_TIMEOUT:?}; using rule-only deltas"
             );
-            return (AffinityDeltas::default(), String::new());
-        }
-    };
+                return (AffinityDeltas::default(), String::new(), None);
+            }
+        };
 
     let (deltas, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
-    (deltas, reason)
+    (deltas, reason, meta)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
 
+/// Per-call audit captured from one insight_extraction OpenRouter call that
+/// returned a response. `None` (at the call site) means the call got no response
+/// (transport error / timeout) → no row is written.
+struct CallAudit {
+    status: &'static str,
+    payload: Option<serde_json::Value>,
+    meta: eros_engine_store::OpenRouterCallMeta,
+}
+
+fn call_meta(
+    resp: &eros_engine_llm::openrouter::ChatResponse,
+) -> eros_engine_store::OpenRouterCallMeta {
+    eros_engine_store::OpenRouterCallMeta {
+        generation_id: resp.generation_id.clone(),
+        model: resp.model.clone(),
+        usage: resp.usage.clone(),
+    }
+}
+
 /// Top-level entry: extract facts → structured insights → InsightRepo merge.
+/// Writes one companion_insights_events row per OpenRouter call that returned a
+/// response (facts, then structured), tied by a shared run_id. Fail-open: an
+/// audit-row insert failure only warns and never breaks the turn.
 async fn extract_insights(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
+    message_id: Uuid,
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
 ) {
-    let facts = extract_facts(
+    let run_id = Uuid::new_v4();
+
+    let (facts, facts_audit) = extract_facts(
         &state.openrouter,
         &state.model_config,
         session_id,
@@ -532,6 +579,18 @@ async fn extract_insights(
         audit_user,
     )
     .await;
+    if let Some(a) = facts_audit {
+        write_insight_event(
+            &state.pool,
+            run_id,
+            user_id,
+            session_id,
+            message_id,
+            "facts",
+            a,
+        )
+        .await;
+    }
     if facts.is_empty() {
         return;
     }
@@ -545,7 +604,7 @@ async fn extract_insights(
         }
     };
 
-    let new_insights = extract_structured_insights(
+    let (new_insights, struct_audit) = extract_structured_insights(
         &state.openrouter,
         &state.model_config,
         session_id,
@@ -554,15 +613,24 @@ async fn extract_insights(
         audit_user,
     )
     .await;
+    if let Some(a) = struct_audit {
+        write_insight_event(
+            &state.pool,
+            run_id,
+            user_id,
+            session_id,
+            message_id,
+            "structured",
+            a,
+        )
+        .await;
+    }
     if new_insights.as_object().is_none_or(|o| o.is_empty()) {
         return;
     }
 
     match insights_repo.merge(user_id, new_insights).await {
         Ok(row) => {
-            // Write-through: project the just-merged JSONB into the flat
-            // matching table. No extra read — merge returned the merged row.
-            // Failure only warns; it must not break the chat turn.
             let human_repo = HumanInsightRepo { pool: &state.pool };
             if let Err(e) = human_repo
                 .project_from_insights(user_id, &row.insights)
@@ -575,6 +643,33 @@ async fn extract_insights(
     }
 }
 
+/// Fail-open insert of one companion_insights_events row. Never returns an
+/// error to the caller — an audit-row failure must not break the chat turn.
+async fn write_insight_event(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    user_id: Uuid,
+    session_id: Uuid,
+    message_id: Uuid,
+    stage: &'static str,
+    audit: CallAudit,
+) {
+    let repo = InsightEventRepo { pool };
+    let ev = InsightEventInsert {
+        run_id,
+        user_id,
+        session_id: Some(session_id),
+        message_id: Some(message_id),
+        stage,
+        status: audit.status,
+        payload: audit.payload,
+        meta: audit.meta,
+    };
+    if let Err(e) = repo.record(ev).await {
+        tracing::warn!("insight event ({stage}) persist failed: {e}");
+    }
+}
+
 async fn extract_facts(
     llm: &OpenRouterClient,
     model_config: &ModelConfig,
@@ -582,9 +677,9 @@ async fn extract_facts(
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
-) -> Vec<String> {
+) -> (Vec<String>, Option<CallAudit>) {
     if user_msg.trim().is_empty() {
-        return vec![];
+        return (vec![], None);
     }
     let prompt = crate::prompt::extract_facts_prompt(user_msg, assistant_msg);
 
@@ -603,30 +698,41 @@ async fn extract_facts(
         ..Default::default()
     };
 
-    let raw = match llm.execute(req).await {
+    let (raw, meta) = match llm.execute(req).await {
         Ok(resp) => {
             super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &resp);
-            resp.reply.trim().to_string()
+            (resp.reply.trim().to_string(), call_meta(&resp))
         }
         Err(e) => {
             tracing::warn!("fact extraction LLM call failed: {e}");
-            return vec![];
+            return (vec![], None);
         }
     };
 
-    parse_facts(&raw)
-}
-
-fn parse_facts(raw: &str) -> Vec<String> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        return extract_facts_array(&v);
-    }
-    if let Some(block) = find_json_block(raw) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
-            return extract_facts_array(&v);
+    // Parse once; distinguish parse_error (no JSON at all) from empty/ok.
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .or_else(|| find_json_block(&raw).and_then(|b| serde_json::from_str(b).ok()));
+    match parsed {
+        Some(v) => {
+            let facts = extract_facts_array(&v);
+            let status = if facts.is_empty() { "empty" } else { "ok" };
+            let audit = CallAudit {
+                status,
+                payload: Some(serde_json::json!(facts)),
+                meta,
+            };
+            (facts, Some(audit))
         }
+        None => (
+            vec![],
+            Some(CallAudit {
+                status: "parse_error",
+                payload: None,
+                meta,
+            }),
+        ),
     }
-    vec![]
 }
 
 fn extract_facts_array(v: &serde_json::Value) -> Vec<String> {
@@ -647,9 +753,10 @@ async fn extract_structured_insights(
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
     audit_user: Option<&str>,
-) -> serde_json::Value {
+) -> (serde_json::Value, Option<CallAudit>) {
+    let empty = || serde_json::Value::Object(serde_json::Map::new());
     if facts.is_empty() {
-        return serde_json::Value::Object(serde_json::Map::new());
+        return (empty(), None);
     }
 
     let prompt = crate::prompt::extract_structured_insights_prompt(facts, existing_insights);
@@ -669,27 +776,45 @@ async fn extract_structured_insights(
         ..Default::default()
     };
 
-    let raw = match llm.execute(req).await {
+    let (raw, meta) = match llm.execute(req).await {
         Ok(r) => {
             super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &r);
-            r.reply.trim().to_string()
+            (r.reply.trim().to_string(), call_meta(&r))
         }
-        Err(_) => return serde_json::Value::Object(serde_json::Map::new()),
+        Err(_) => return (empty(), None),
     };
 
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-        if v.is_object() {
-            return v;
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .filter(|v| v.is_object())
+        .or_else(|| {
+            find_json_block(&raw)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .filter(|v| v.is_object())
+        });
+    match parsed {
+        Some(v) => {
+            let status = if v.as_object().is_some_and(|o| o.is_empty()) {
+                "empty"
+            } else {
+                "ok"
+            };
+            let audit = CallAudit {
+                status,
+                payload: Some(v.clone()),
+                meta,
+            };
+            (v, Some(audit))
         }
+        None => (
+            empty(),
+            Some(CallAudit {
+                status: "parse_error",
+                payload: None,
+                meta,
+            }),
+        ),
     }
-    if let Some(block) = find_json_block(&raw) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
-            if v.is_object() {
-                return v;
-            }
-        }
-    }
-    serde_json::Value::Object(serde_json::Map::new())
 }
 
 // ─── Lead score refresh ────────────────────────────────────────────
@@ -767,25 +892,6 @@ mod tests {
             amount: 100,
         };
         assert_eq!(client_id_from_event(&event), None);
-    }
-
-    #[test]
-    fn parse_facts_empty_array() {
-        assert!(parse_facts(r#"{"facts": []}"#).is_empty());
-    }
-
-    #[test]
-    fn parse_facts_with_items() {
-        let raw = r#"{"facts": ["住在上海", "喜欢咖啡"]}"#;
-        let facts = parse_facts(raw);
-        assert_eq!(facts, vec!["住在上海".to_string(), "喜欢咖啡".to_string()]);
-    }
-
-    #[test]
-    fn parse_facts_regex_fallback_in_fenced_code() {
-        let raw = "Here you go:\n```json\n{\"facts\": [\"爱猫\"]}\n```";
-        let facts = parse_facts(raw);
-        assert_eq!(facts, vec!["爱猫".to_string()]);
     }
 
     #[test]
@@ -888,5 +994,221 @@ mod tests {
         );
         assert_eq!(c.trust, 0.0);
         assert_eq!(c.intimacy, 0.0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insight_extraction_writes_two_events_sharing_run_id(pool: sqlx::PgPool) {
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Stage-1 facts call → non-empty facts. Matched by a substring unique to
+        // extract_facts_prompt.
+        let facts_body = serde_json::json!({
+            "id": "gen-facts", "model": "ins/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"facts\":[\"用户在深圳工作\"]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("列出你对用户的新事实发现"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+
+        // Stage-2 structured call. Matched by a substring unique to
+        // extract_structured_insights_prompt.
+        let struct_body = serde_json::json!({
+            "id": "gen-struct", "model": "ins/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"city\":\"深圳\"}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("填充以下 schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let user_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let message_id = uuid::Uuid::new_v4();
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        let rows: Vec<(uuid::Uuid, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT run_id, stage, status, generation_id \
+             FROM engine.companion_insights_events WHERE user_id = $1 ORDER BY stage",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "facts + structured rows; got {rows:?}");
+        assert_eq!(rows[0].1, "facts");
+        assert_eq!(rows[1].1, "structured");
+        assert_eq!(rows[0].0, rows[1].0, "both rows share one run_id");
+        assert_eq!(rows[0].3.as_deref(), Some("gen-facts"));
+        assert_eq!(rows[1].3.as_deref(), Some("gen-struct"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insight_extraction_empty_facts_writes_one_event(pool: sqlx::PgPool) {
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Facts call returns an empty list ⇒ status='empty', no structured call.
+        let facts_body = serde_json::json!({
+            "id": "gen-facts", "model": "ins/m",
+            "usage": {"total_tokens": 2},
+            "choices": [{"message": {"content": "{\"facts\":[]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("列出你对用户的新事实发现"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+        // Structured mock must NOT be hit.
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("填充以下 schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let user_id = uuid::Uuid::new_v4();
+        extract_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            user_id,
+            uuid::Uuid::new_v4(),
+            "hi there",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT stage, status FROM engine.companion_insights_events WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
+        assert_eq!(rows[0].0, "facts");
+        assert_eq!(rows[0].1, "empty");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insight_extraction_facts_parse_error_writes_one_event(pool: sqlx::PgPool) {
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Facts call returns non-JSON garbage ⇒ status='parse_error', payload NULL,
+        // and the structured call is never made.
+        let facts_body = serde_json::json!({
+            "id": "gen-facts", "model": "ins/m",
+            "usage": {"total_tokens": 2},
+            "choices": [{"message": {"content": "这不是 JSON"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("列出你对用户的新事实发现"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("填充以下 schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let user_id = uuid::Uuid::new_v4();
+        extract_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            user_id,
+            uuid::Uuid::new_v4(),
+            "hi there",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
+        assert_eq!(rows[0].0, "facts");
+        assert_eq!(rows[0].1, "parse_error");
+        assert_eq!(rows[0].2, None, "parse_error ⇒ NULL payload");
     }
 }

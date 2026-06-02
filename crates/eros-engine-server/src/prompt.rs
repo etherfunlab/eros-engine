@@ -609,8 +609,8 @@ Do not invent or guess anything not clearly supported by the facts.
 
 /// Stage-1 insight extraction prompt: ask the LLM to mine fresh user
 /// facts from a single chat turn. Output expected as
-/// `{"facts": ["...", "..."]}` — `parse_facts` in `post_process.rs`
-/// handles regex fallback for fenced / wrapped JSON.
+/// `{"facts": ["...", "..."]}` — the inline parse in `extract_facts`
+/// (`post_process.rs`) handles the fenced / wrapped JSON fallback.
 pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
     format!(
         "分析以下一轮对话，列出你对用户的新事实发现（仅限用户，不是 AI）。\n\n\
@@ -626,7 +626,7 @@ pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
 /// a category tag. Output expected as
 /// `{"memories": [{"content": "...", "category": "fact"}, ...]}` —
 /// `parse_memory_candidates` in `pipeline::dreaming` handles the
-/// fenced-JSON fallback the same way `parse_facts` does.
+/// fenced-JSON fallback the same way `extract_facts` does.
 ///
 /// `turns` is the chronologically ordered list of `用户：X / AI：Y` lines
 /// (or whatever pre-format the caller chose); the prompt does not assume
