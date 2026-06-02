@@ -4005,4 +4005,132 @@ data: [DONE]\n\n";
             Some("refusal_pattern")
         );
     }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn vision_turn_folds_description_and_persists(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Vision model ("vis/m"): non-streaming JSON describe.
+        let describe = "{\"description\":\"一只猫在沙滩\",\"ocr_text\":\"\",\"people\":\"\",\"scene\":\"海边\"}";
+        let vis_body = serde_json::json!({
+            "id": "gv", "model": "vis/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": describe}}],
+        });
+        // Lower priority (2) than the chat mock: the two matchers are disjoint
+        // today, but pinning priorities keeps dispatch deterministic if the prompt
+        // preamble ever grows to mention the vision model name.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("vis/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vis_body))
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        // Chat model ("deepseek/x"): SSE, matches ONLY when the body carries the
+        // folded description — proves the describe reached the main prompt.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .and(body_string_contains("一只猫在沙滩"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.chat_vision]\nmodel=\"vis/m\"\nfilter_prompt=\"DESCRIBE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // Image-only turn: role='user', empty content, metadata carries image_url.
+        let seed_meta = serde_json::json!({ "image_url": "https://x/y.png" });
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01J9999999999999999999999E",
+                "user",
+                Some(&seed_meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: Some("https://x/y.png".into()),
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "describe must reach the chat model (mock requires it in the body); got {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected on a vision turn; got frames {frames:?}"
+        );
+
+        // metadata.vision persisted on the user row.
+        let meta: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            meta.unwrap()["vision"]["description"],
+            "一只猫在沙滩",
+            "vision describe must be merged into the user row metadata"
+        );
+    }
 }
