@@ -1322,8 +1322,8 @@ pub fn run_stream(
                 // undescribed image). Run-once is guaranteed by the upsert
                 // idempotency gate — run_stream only runs on a fresh Insert.
                 // Skip tipped turns (same as the input filter): a tip persists as
-                // role='gift_user', which set_user_image_vision can't update and
-                // the prompt drops anyway — describing it would waste the call.
+                // role='gift_user' and carries no image (tip+image is rejected at
+                // validation), so describing it would waste the call.
                 if !is_gift && user_msg.tips_amount_usd.is_none() {
                     if let (Some(image_url), Some(v)) = (
                         user_msg.image_url.as_deref(),
@@ -1350,9 +1350,9 @@ pub fn run_stream(
                 // rewrite is persisted on the user row's pre_filter_content;
                 // build_reply_request then feeds the EFFECTIVE text to the model
                 // and recall. Fail-open: any non-rewrite outcome is a no-op.
-                // Skip tipped turns too: a tip persists as role='gift_user', which
-                // set_user_input_rewrite can't update and the prompt drops anyway —
-                // running the filter there is a wasted LLM call.
+                // Skip tipped turns too: a tip persists as role='gift_user' whose
+                // "(打赏 $X)" marker / typed message should reach the model as-is,
+                // not be rewritten by the filter — running it would waste the call.
                 if !is_gift && user_msg.tips_amount_usd.is_none() {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
@@ -3851,6 +3851,102 @@ data: [DONE]\n\n";
             "malformed primary verdict must keep original (no fallback walk); got {pre:?}"
         );
         assert!(fmodel.is_none(), "no filter model stamped; got {fmodel:?}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn tip_turn_reaches_model_not_parrot(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Chat model replies ONLY when the request body carries the tip turn
+        // ("(打赏"). A REPLY delta therefore proves the gift_user turn reached the
+        // model (pre-fix it is dropped, so the mock never matches → no REPLY).
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .and(body_string_contains("(打赏"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // A tip-only turn: persisted as role='gift_user' with the "(打赏 $X)" marker.
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "(打赏 $0.5)",
+                "01J8888888888888888888888B",
+                "gift_user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "(打赏 $0.5)".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: Some(0.5),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "tip turn must reach the model (chat mock requires the tip text in the body); got frames {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected on a tip turn; got frames {frames:?}"
+        );
     }
 
     #[test]

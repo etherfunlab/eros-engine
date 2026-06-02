@@ -178,17 +178,19 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        // User rows feed the MODEL-FACING text (image preamble folded onto the
-        // effective text when an image was attached); assistant rows always feed
-        // `content` (their pre_filter_content is the pre-output-filter original
-        // and must never re-enter the prompt).
-        let content = match msg.role.as_str() {
-            "user" => model_facing_user_text(&msg),
-            "assistant" => msg.content,
+        // User + gift_user (tip) rows feed the MODEL-FACING text and are emitted
+        // under the "user" role — a tip turn IS a user turn to the model (OpenRouter
+        // only knows system/user/assistant). Dropping gift_user rows here made tip
+        // turns invisible, so the model parroted history. Assistant rows always feed
+        // `content` (their pre_filter_content is the pre-output-filter original and
+        // must never re-enter the prompt).
+        let (role, content) = match msg.role.as_str() {
+            "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
+            "assistant" => ("assistant", msg.content),
             _ => continue,
         };
         messages.push(ChatMessage {
-            role: msg.role,
+            role: role.to_string(),
             content,
         });
     }
