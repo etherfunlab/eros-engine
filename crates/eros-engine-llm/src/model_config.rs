@@ -528,6 +528,20 @@ pub struct ResolvedInputFilter {
     pub probability: f64,
 }
 
+/// Resolved image-describe task (`chat_vision`). Mirrors `ResolvedInputFilter`
+/// minus the per-turn probability — the trigger is "image present", decided in
+/// the stream wiring. `fallback_model` is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedVision {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub describe_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
@@ -768,6 +782,33 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             probability,
+        })
+    }
+
+    /// Resolve the image-describe task. `None` (feature off) when
+    /// `[tasks.chat_vision]` is absent OR its `filter_prompt` is blank. Reuses
+    /// the generic `TaskConfig.filter_prompt` field and the standard `resolve()`
+    /// model/fallback machinery. No probability gate — image presence is the
+    /// trigger, decided in the stream wiring.
+    pub fn resolve_vision(&self) -> Option<ResolvedVision> {
+        const VISION_TASK: &str = "chat_vision";
+        let task_cfg = self.tasks.get(VISION_TASK)?;
+        let describe_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if describe_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(VISION_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedVision {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            describe_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
         })
     }
 }
@@ -2221,5 +2262,55 @@ retry_depth = 0
         let f = cfg.resolve_input_filter().expect("enabled");
         assert_eq!(f.retry_depth, 0);
         assert!(f.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_vision_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_vision().is_none());
+    }
+
+    #[test]
+    fn resolve_vision_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\nmodel = \"v\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_vision().is_none());
+    }
+
+    #[test]
+    fn resolve_vision_some_truncates_fallback_to_retry_depth() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\n\
+             model = \"v\"\n\
+             fallback = [\"f1\", \"f2\", \"f3\"]\n\
+             temperature = 0.2\n\
+             max_tokens = 400\n\
+             retry_depth = 1\n\
+             filter_prompt = \"describe as json\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_vision().expect("vision resolves");
+        assert_eq!(r.model, "v");
+        assert_eq!(r.fallback_model, vec!["f1".to_string()]); // truncated to retry_depth=1
+        assert_eq!(r.describe_prompt, "describe as json");
+        assert_eq!(r.max_tokens, 400);
+        assert_eq!(r.retry_depth, 1);
+    }
+
+    #[test]
+    fn resolve_vision_retry_depth_zero_drops_fallback() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\n\
+             model = \"v\"\n\
+             fallback = [\"f1\", \"f2\"]\n\
+             retry_depth = 0\n\
+             filter_prompt = \"describe as json\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_vision().expect("vision resolves");
+        assert_eq!(r.retry_depth, 0);
+        assert!(r.fallback_model.is_empty());
     }
 }
