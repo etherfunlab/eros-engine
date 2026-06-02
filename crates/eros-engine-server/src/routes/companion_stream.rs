@@ -101,12 +101,17 @@ pub struct StreamPreErrorBody {
     pub original_user_message_id: Option<String>,
 }
 
-/// True when `url` is an absolute http(s) URL with a non-empty, whitespace-free
-/// host and within the length cap. Dependency-free: we never dereference the URL
-/// (it is forwarded to the vision model), so we only require a plausible host —
-/// not full RFC-3986 parsing.
+/// True when `url` is an absolute http(s) URL with a non-empty host, no
+/// whitespace anywhere, and within the length cap. Dependency-free: we never
+/// dereference the URL (it is forwarded to the vision model), so we only require
+/// a plausible, whitespace-free absolute URL — not full RFC-3986 parsing.
 fn image_url_is_valid(url: &str) -> bool {
     if url.is_empty() || url.len() > MAX_IMAGE_URL_LEN {
+        return false;
+    }
+    // A URL never contains whitespace — reject it anywhere (host, path, query),
+    // not just the host segment.
+    if url.chars().any(char::is_whitespace) {
         return false;
     }
     let rest = match url
@@ -116,10 +121,9 @@ fn image_url_is_valid(url: &str) -> bool {
         Some(r) => r,
         None => return false,
     };
-    // Host = everything up to the first '/', '?' or '#'. Reject empty or
-    // whitespace-containing hosts ("https://", "http:// ", "http:// x").
+    // Require a non-empty host (reject "https://").
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    !host.is_empty() && !host.chars().any(char::is_whitespace)
+    !host.is_empty()
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
@@ -927,6 +931,14 @@ mod validate_payload_tests {
         assert!(!image_url_is_valid("http:// "));
         assert!(!image_url_is_valid("ftp://x/y.png"));
         assert!(!image_url_is_valid(""));
+        assert!(!image_url_is_valid("https://example.com/a b.png"));
+    }
+
+    #[test]
+    fn image_url_with_space_in_path_rejected() {
+        let mut r = base();
+        r.image_url = Some("https://example.com/a b.png".into());
+        assert!(validate_payload(&r).is_err());
     }
 
     #[test]
