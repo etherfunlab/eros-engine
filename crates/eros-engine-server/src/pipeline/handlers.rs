@@ -1278,6 +1278,9 @@ mod tests {
         HumanInsightsRow {
             user_id: Uuid::new_v4(),
             city: Some("上海".into()),
+            location: None,
+            hometown: None,
+            nationality: None,
             occupation: Some("设计师".into()),
             mbti_guess: Some("INFP".into()),
             love_values: Some("慢热".into()),
