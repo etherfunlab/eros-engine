@@ -575,13 +575,7 @@ pub fn build_prompt(
 // These were inline `format!()` blocks inside `pipeline/post_process.rs`
 // until 2026-05-08 — moved here so all LLM prompt strings live in one
 // module and future syncs from the closed-source `eros-gateway/src/ai/
-// prompts.rs` have a clear destination. String contents are byte-identical
-// to the previous inline versions; this is a pure relocation refactor.
-//
-// Note: the second prompt mixes Traditional Chinese with the rest of the
-// codebase's Simplified Chinese — that's a copy-paste artefact from the
-// gateway. Not normalised here because changing prompt strings can shift
-// LLM behaviour subtly; treat as a separate i18n cleanup ticket.
+// prompts.rs` have a clear destination.
 
 /// Schema description used in `extract_structured_insights_prompt`. Mirrors
 /// the JSONB shape that `InsightRepo::merge` accepts, with each field's
