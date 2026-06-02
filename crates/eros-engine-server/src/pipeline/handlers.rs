@@ -20,7 +20,7 @@ use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::MemoryRepo;
 
 use crate::error::AppError;
-use crate::prompt::{build_prompt, PendingGift};
+use crate::prompt::build_prompt;
 use crate::state::AppState;
 
 /// Memory recall fan-out sizes — mirror the gateway's Mem0 era defaults
@@ -584,8 +584,6 @@ pub(super) async fn build_reply_request(
         .as_deref()
         .unwrap_or("normal");
 
-    let pending_gifts: Vec<PendingGift> = vec![];
-
     let tier = match &input.event {
         Event::UserMessage { tier, .. } => tier.as_deref(),
         _ => None,
@@ -614,7 +612,6 @@ pub(super) async fn build_reply_request(
         &profile_groups,
         &relationship_facts,
         Some(&input.affinity),
-        &pending_gifts,
         tip_personality,
         plan.reply_style,
         &plan.context_hints,
@@ -675,68 +672,6 @@ async fn fetch_recent_turn_pairs(
             );
             Vec::new()
         })
-}
-
-/// Build a ChatRequest for the GiftReaction action. Called by the streaming
-/// pipeline (`pipeline::stream::run_stream`).
-#[allow(clippy::too_many_arguments)] // mirrors build_reply_request + pending gifts
-pub(super) async fn build_gift_request(
-    state: &AppState,
-    input: &DecisionInput,
-    plan: &ActionPlan,
-    session_id: Uuid,
-    user_id: Uuid,
-    instance_id: Uuid,
-    user_message_id: Uuid,
-    pending: &[PendingGift],
-) -> Result<(ChatRequest, Vec<String>), AppError> {
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
-
-    let query_text = history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
-
-    let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text, true, true).await;
-
-    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
-    if !insight_bullets.is_empty() {
-        profile_groups.insert(0, ("基础画像".into(), insight_bullets));
-    }
-
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
-    let resolved = state.model_config.resolve(CHAT_TASK, None);
-
-    let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
-
-    let system_prompt = build_prompt(
-        &input.persona,
-        &profile_groups,
-        &relationship_facts,
-        Some(&input.affinity),
-        pending,
-        tip_personality,
-        plan.reply_style,
-        &plan.context_hints,
-        &[],
-        eros_engine_core::scope::AffinityScope::full(),
-        &recent_turns,
-    );
-
-    Ok((
-        assemble_chat_request(resolved, system_prompt, history, None),
-        Vec::new(),
-    ))
 }
 
 #[cfg(test)]

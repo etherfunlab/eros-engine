@@ -31,22 +31,6 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::ReplyStyle;
 
-/// A pending gift/tip that the prompt builder must surface to the LLM.
-///
-/// Replaces the gateway's `(GiftRecord, Option<String>)` tuple. The OSS
-/// engine has no credit ledger, no `shop_items` table, and no
-/// `gift_records` table — the gift event endpoint (T11) will hand a list
-/// of these to the orchestrator directly.
-#[derive(Debug, Clone)]
-pub struct PendingGift {
-    /// `"tip"` or `"gift"` — mirrors the gateway's `gift_records.gift_type`.
-    pub gift_type: String,
-    /// Credit amount for tips. Ignored when `gift_type == "gift"`.
-    pub amount: i64,
-    /// Item name for non-tip gifts. `None` for tips.
-    pub item_name: Option<String>,
-}
-
 fn weekday_cn(wd: Weekday) -> &'static str {
     match wd {
         Weekday::Mon => "周一",
@@ -224,49 +208,6 @@ pub fn affinity_eval_prompt(
     )
 }
 
-/// Gift reaction directives keyed on persona.tip_personality.
-pub fn gift_reaction_context(gifts: &[PendingGift], tip_personality: &str) -> String {
-    if gifts.is_empty() {
-        return String::new();
-    }
-    let mut lines = Vec::new();
-    for gift in gifts {
-        match gift.gift_type.as_str() {
-            "tip" => {
-                let intensity = if gift.amount >= 200 {
-                    "一个超级大红包"
-                } else if gift.amount >= 50 {
-                    "一个大红包"
-                } else if gift.amount >= 10 {
-                    "一个红包"
-                } else {
-                    "一个小红包"
-                };
-                lines.push(format!(
-                    "- 他刚刚给你发了{intensity}（{} credits）",
-                    gift.amount,
-                ));
-            }
-            "gift" => {
-                let name = gift.item_name.as_deref().unwrap_or("礼物");
-                lines.push(format!("- 他刚刚送了你一个「{name}」"));
-            }
-            _ => {}
-        }
-    }
-    let reaction_hint = match tip_personality {
-        "gold_digger" => "你超级开心！大方地表达喜悦，暗示还想要更多",
-        "tsundere" => "你嘴上说不要，心里有点动摇。用傲娇的方式回应，比如「谁要你的钱啊」",
-        "zen" => "你对钱没什么感觉，轻描淡写地回应，不用特别在意这件事",
-        "slow_warm" => "根据你和他的关系深浅决定反应：关系还浅的话有点不安，关系深了才觉得感动",
-        _ => "适度地回应，不过分热情也不冷淡，用你自己的风格自然表达",
-    };
-    format!(
-        "\n\n[gift_received]（在回复中自然地回应，不要照搬指令原文）\n{}\n反应方式：{reaction_hint}",
-        lines.join("\n"),
-    )
-}
-
 /// Format a USD amount for display: whole numbers drop decimals (`$20`),
 /// fractional amounts keep two (`$5.50`). Used by the tip prompt fragment and
 /// the persisted tip marker content.
@@ -375,8 +316,7 @@ pub fn build_prompt(
     profile_groups: &[(String, Vec<String>)],
     relationship_facts: &[String],
     affinity: Option<&Affinity>,
-    pending_gifts: &[PendingGift],
-    tip_personality: &str,
+    _tip_personality: &str,
     style: ReplyStyle,
     hints: &[String],
     prompt_traits: &[PromptTrait],
@@ -492,7 +432,6 @@ pub fn build_prompt(
             }
         })
         .unwrap_or_default();
-    let gift = gift_reaction_context(pending_gifts, tip_personality);
     let style_text = style_directive(style);
 
     let hints_section = if hints.is_empty() {
@@ -549,7 +488,7 @@ pub fn build_prompt(
          [user_profile]\n{profile_str}\n\
          \n\
          [shared_memories]\n{rel_str}\
-         {attitude}{state}{hints_section}{gift}\n\
+         {attitude}{state}{hints_section}\n\
          \n\
          [now]\n{tc}\n\
          {recent_section}\
@@ -699,7 +638,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -735,7 +673,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -766,7 +703,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -790,7 +726,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -836,7 +771,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -859,7 +793,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -882,7 +815,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -903,7 +835,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -929,7 +860,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -950,7 +880,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -976,7 +905,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -999,7 +927,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1051,7 +978,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1072,7 +998,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1096,7 +1021,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1137,7 +1061,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1151,7 +1074,6 @@ mod tests {
             &groups,
             &["聊到深夜".to_string()],
             Some(&fixture_affinity()),
-            &[],
             "normal",
             ReplyStyle::Warm,
             &["想他".to_string()],
@@ -1185,7 +1107,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1198,7 +1119,6 @@ mod tests {
             &[],
             &[],
             None,
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1224,11 +1144,6 @@ mod tests {
         assert!(!style_directive(ReplyStyle::Cold).is_empty());
         assert!(!style_directive(ReplyStyle::Tsundere).is_empty());
         assert!(!style_directive(ReplyStyle::Excited).is_empty());
-    }
-
-    #[test]
-    fn test_gift_reaction_empty_when_no_gifts() {
-        assert!(gift_reaction_context(&[], "normal").is_empty());
     }
 
     #[test]
@@ -1420,7 +1335,6 @@ mod tests {
             &[],
             &[],
             Some(&a),
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],
@@ -1444,7 +1358,6 @@ mod tests {
             &[],
             &[],
             Some(&a),
-            &[],
             "normal",
             ReplyStyle::Neutral,
             &[],

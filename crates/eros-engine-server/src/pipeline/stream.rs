@@ -1313,7 +1313,6 @@ pub fn run_stream(
                 yield final_frame;
             }
             ActionType::Reply | ActionType::GiftReaction => {
-                let is_gift = matches!(plan.action_type, ActionType::GiftReaction);
                 // ── Image describe (chat_vision) — Reply turns with an image ──
                 // Runs before the input filter; both may fire (orthogonal). The
                 // describe result is merged into metadata.vision; the prompt
@@ -1324,7 +1323,7 @@ pub fn run_stream(
                 // Skip tipped turns (same as the input filter): a tip persists as
                 // role='gift_user' and carries no image (tip+image is rejected at
                 // validation), so describing it would waste the call.
-                if !is_gift && user_msg.tips_amount_usd.is_none() {
+                if user_msg.tips_amount_usd.is_none() {
                     if let (Some(image_url), Some(v)) = (
                         user_msg.image_url.as_deref(),
                         state.model_config.resolve_vision(),
@@ -1353,7 +1352,7 @@ pub fn run_stream(
                 // Skip tipped turns too: a tip persists as role='gift_user' whose
                 // "(打赏 $X)" marker / typed message should reach the model as-is,
                 // not be rewritten by the filter — running it would waste the call.
-                if !is_gift && user_msg.tips_amount_usd.is_none() {
+                if user_msg.tips_amount_usd.is_none() {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
                     // is in [0,1), so `< 1.0` always fires); `false` ⇒ resolve
@@ -1390,20 +1389,11 @@ pub fn run_stream(
                         }
                     }
                 }
-                let req_res = if is_gift {
-                    crate::pipeline::handlers::build_gift_request(
-                        &state, &input, &plan,
-                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                        user_msg.user_message_id,
-                        &[],
-                    ).await
-                } else {
-                    crate::pipeline::handlers::build_reply_request(
-                        &state, &input, &plan,
-                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
-                        user_msg.user_message_id,
-                    ).await
-                };
+                let req_res = crate::pipeline::handlers::build_reply_request(
+                    &state, &input, &plan,
+                    user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                    user_msg.user_message_id,
+                ).await;
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
@@ -1421,11 +1411,8 @@ pub fn run_stream(
                 // tier that drops a requested trait can't trigger filtering on it.
                 let trait_tags: Vec<String> = injected_tags.clone();
                 let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
-                let (frame_action, persist_action, plan_action) = if is_gift {
-                    (FrameActionType::GiftReaction, "gift_reaction", ActionType::GiftReaction)
-                } else {
-                    (FrameActionType::Reply, "reply", ActionType::Reply)
-                };
+                let (frame_action, persist_action, plan_action) =
+                    (FrameActionType::Reply, "reply", ActionType::Reply);
 
                 let display_override = state.model_config.display_override("chat_companion");
 
@@ -3896,8 +3883,8 @@ data: [DONE]\n\n";
         );
 
         // A tip-only turn: persisted as role='gift_user' with the "(打赏 $X)" marker
-        // and tip metadata (`tips_amount_usd`) — the prompt gate promotes only tip
-        // gift_user rows, so the metadata must be present (as production persists it).
+        // and tip metadata (`tips_amount_usd`) — a gift_user row is always a tip
+        // now, and production persists the tip amount in metadata.
         let tip_meta = serde_json::json!({ "tips_amount_usd": 0.5 });
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
