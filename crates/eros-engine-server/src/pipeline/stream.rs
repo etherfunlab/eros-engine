@@ -3944,7 +3944,9 @@ data: [DONE]\n\n";
             "tip turn must reach the model (chat mock requires the tip text in the body); got frames {frames:?}"
         );
         assert!(
-            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "no error frame expected on a tip turn; got frames {frames:?}"
         );
     }
@@ -4116,7 +4118,9 @@ data: [DONE]\n\n";
             "describe must reach the chat model (mock requires it in the body); got {frames:?}"
         );
         assert!(
-            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "no error frame expected on a vision turn; got frames {frames:?}"
         );
 
