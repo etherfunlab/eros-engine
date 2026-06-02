@@ -194,6 +194,7 @@ impl<'a> AffinityRepo<'a> {
         ema_inertia: f64,
         event_type: &str,
         context: serde_json::Value,
+        meta: Option<&crate::OpenRouterCallMeta>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -254,14 +255,18 @@ impl<'a> AffinityRepo<'a> {
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, context) \
-             VALUES ($1, $2, $3, $4, $5)",
+               (affinity_id, event_type, deltas, effective_deltas, context, \
+                model, usage, generation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(current.id)
         .bind(event_type)
         .bind(deltas_json)
         .bind(effective_json)
         .bind(context)
+        .bind(meta.and_then(|m| m.model.clone()))
+        .bind(meta.and_then(|m| m.usage.clone()))
+        .bind(meta.and_then(|m| m.generation_id.clone()))
         .execute(&mut *tx)
         .await?;
 
@@ -370,6 +375,7 @@ mod tests {
             0.0, // no smoothing → full apply
             "message",
             serde_json::json!({ "source": "test" }),
+            None,
         )
         .await
         .unwrap();
@@ -431,7 +437,7 @@ mod tests {
             warmth: 0.4,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.8, "message", serde_json::json!({}))
+        repo.persist_with_event(&mut a, &deltas, 0.8, "message", serde_json::json!({}), None)
             .await
             .unwrap();
 
@@ -469,7 +475,7 @@ mod tests {
             trust: 5.0,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}))
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
             .await
             .unwrap();
 
@@ -541,6 +547,7 @@ mod tests {
                 0.0,
                 "message",
                 serde_json::json!({}),
+                None,
             )
             .await
             .unwrap();
@@ -557,6 +564,7 @@ mod tests {
                 0.0,
                 "message",
                 serde_json::json!({}),
+                None,
             )
             .await
             .unwrap();
@@ -600,7 +608,7 @@ mod tests {
             tension: 0.3,  // 0.1 -> 0.4
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}))
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
             .await
             .unwrap();
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
@@ -716,5 +724,46 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.latest_turn_event(session_id).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_stores_openrouter_audit_trio(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let deltas = AffinityDeltas {
+            warmth: 0.1,
+            trust: 0.0,
+            intrigue: 0.0,
+            intimacy: 0.0,
+            patience: 0.0,
+            tension: 0.0,
+        };
+        let meta = crate::OpenRouterCallMeta {
+            generation_id: Some("gen-aff".into()),
+            model: Some("aff/m".into()),
+            usage: Some(serde_json::json!({"total_tokens": 9})),
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), Some(&meta))
+            .await
+            .unwrap();
+
+        let row: (Option<String>, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT generation_id, model, usage FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("gen-aff"));
+        assert_eq!(row.1.as_deref(), Some("aff/m"));
+        assert_eq!(row.2, Some(serde_json::json!({"total_tokens": 9})));
     }
 }

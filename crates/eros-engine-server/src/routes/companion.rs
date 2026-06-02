@@ -751,6 +751,7 @@ async fn event_gift(
             state.config.ema_inertia,
             "gift",
             context,
+            None,
         )
         .await?;
 

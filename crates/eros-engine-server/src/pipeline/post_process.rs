@@ -120,7 +120,7 @@ pub async fn run(
             && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
             && !assistant_msg.trim().is_empty();
 
-        let (llm_deltas, reason) = if run_eval {
+        let (llm_deltas, reason, affinity_meta) = if run_eval {
             let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
             let persona_name = match persona_repo.load_companion(instance_id).await {
@@ -145,12 +145,14 @@ pub async fn run(
                 _ => (
                     eros_engine_core::affinity::AffinityDeltas::default(),
                     String::new(),
+                    None,
                 ),
             }
         } else {
             (
                 eros_engine_core::affinity::AffinityDeltas::default(),
                 String::new(),
+                None,
             )
         };
 
@@ -169,6 +171,7 @@ pub async fn run(
             plan.action_type,
             combined,
             context,
+            affinity_meta,
         )
         .await;
     };
@@ -203,6 +206,7 @@ async fn persist_affinity(
     action: ActionType,
     deltas: eros_engine_core::affinity::AffinityDeltas,
     context: serde_json::Value,
+    meta: Option<eros_engine_store::OpenRouterCallMeta>,
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -247,7 +251,7 @@ async fn persist_affinity(
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo
-                .persist_with_event(&mut affinity, &deltas, ema_inertia, event_type, context)
+                .persist_with_event(&mut affinity, &deltas, ema_inertia, event_type, context, meta.as_ref())
                 .await
             {
                 tracing::warn!("affinity persist_with_event failed: {e}");
@@ -469,7 +473,11 @@ async fn evaluate_affinity(
     user_msg: &str,
     assistant_msg: &str,
     audit_user: Option<&str>,
-) -> (eros_engine_core::affinity::AffinityDeltas, String) {
+) -> (
+    eros_engine_core::affinity::AffinityDeltas,
+    String,
+    Option<eros_engine_store::OpenRouterCallMeta>,
+) {
     use eros_engine_core::affinity::AffinityDeltas;
 
     let prompt =
@@ -489,27 +497,32 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let raw = match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await
+    let (raw, meta) = match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await
     {
         Ok(Ok(resp)) => {
             super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
-            resp.reply
+            let meta = eros_engine_store::OpenRouterCallMeta {
+                generation_id: resp.generation_id.clone(),
+                model: resp.model.clone(),
+                usage: resp.usage.clone(),
+            };
+            (resp.reply, Some(meta))
         }
         Ok(Err(e)) => {
             tracing::warn!("affinity eval LLM call failed: {e}");
-            return (AffinityDeltas::default(), String::new());
+            return (AffinityDeltas::default(), String::new(), None);
         }
         Err(_elapsed) => {
             tracing::warn!(
                 "affinity eval timed out after {AFFINITY_EVAL_TIMEOUT:?}; using rule-only deltas"
             );
-            return (AffinityDeltas::default(), String::new());
+            return (AffinityDeltas::default(), String::new(), None);
         }
     };
 
     let (deltas, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
-    (deltas, reason)
+    (deltas, reason, meta)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
