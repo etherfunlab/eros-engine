@@ -399,9 +399,10 @@ mod tests {
         assert_eq!(n, 1);
 
         // companion_affinity_events now has the audit trio (select compiles ⇒ columns exist).
-        let _ = sqlx::query("SELECT model, usage, generation_id FROM engine.companion_affinity_events")
-            .fetch_all(&pool)
-            .await
-            .expect("affinity audit columns exist");
+        let _ =
+            sqlx::query("SELECT model, usage, generation_id FROM engine.companion_affinity_events")
+                .fetch_all(&pool)
+                .await
+                .expect("affinity audit columns exist");
     }
 }

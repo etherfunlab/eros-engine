@@ -252,7 +252,14 @@ async fn persist_affinity(
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo
-                .persist_with_event(&mut affinity, &deltas, ema_inertia, event_type, context, meta.as_ref())
+                .persist_with_event(
+                    &mut affinity,
+                    &deltas,
+                    ema_inertia,
+                    event_type,
+                    context,
+                    meta.as_ref(),
+                )
                 .await
             {
                 tracing::warn!("affinity persist_with_event failed: {e}");
@@ -498,28 +505,28 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let (raw, meta) = match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await
-    {
-        Ok(Ok(resp)) => {
-            super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
-            let meta = eros_engine_store::OpenRouterCallMeta {
-                generation_id: resp.generation_id.clone(),
-                model: resp.model.clone(),
-                usage: resp.usage.clone(),
-            };
-            (resp.reply, Some(meta))
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("affinity eval LLM call failed: {e}");
-            return (AffinityDeltas::default(), String::new(), None);
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
+    let (raw, meta) =
+        match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(resp)) => {
+                super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
+                let meta = eros_engine_store::OpenRouterCallMeta {
+                    generation_id: resp.generation_id.clone(),
+                    model: resp.model.clone(),
+                    usage: resp.usage.clone(),
+                };
+                (resp.reply, Some(meta))
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("affinity eval LLM call failed: {e}");
+                return (AffinityDeltas::default(), String::new(), None);
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
                 "affinity eval timed out after {AFFINITY_EVAL_TIMEOUT:?}; using rule-only deltas"
             );
-            return (AffinityDeltas::default(), String::new(), None);
-        }
-    };
+                return (AffinityDeltas::default(), String::new(), None);
+            }
+        };
 
     let (deltas, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
@@ -537,7 +544,9 @@ struct CallAudit {
     meta: eros_engine_store::OpenRouterCallMeta,
 }
 
-fn call_meta(resp: &eros_engine_llm::openrouter::ChatResponse) -> eros_engine_store::OpenRouterCallMeta {
+fn call_meta(
+    resp: &eros_engine_llm::openrouter::ChatResponse,
+) -> eros_engine_store::OpenRouterCallMeta {
     eros_engine_store::OpenRouterCallMeta {
         generation_id: resp.generation_id.clone(),
         model: resp.model.clone(),
@@ -570,7 +579,16 @@ async fn extract_insights(
     )
     .await;
     if let Some(a) = facts_audit {
-        write_insight_event(&state.pool, run_id, user_id, session_id, message_id, "facts", a).await;
+        write_insight_event(
+            &state.pool,
+            run_id,
+            user_id,
+            session_id,
+            message_id,
+            "facts",
+            a,
+        )
+        .await;
     }
     if facts.is_empty() {
         return;
@@ -595,7 +613,16 @@ async fn extract_insights(
     )
     .await;
     if let Some(a) = struct_audit {
-        write_insight_event(&state.pool, run_id, user_id, session_id, message_id, "structured", a).await;
+        write_insight_event(
+            &state.pool,
+            run_id,
+            user_id,
+            session_id,
+            message_id,
+            "structured",
+            a,
+        )
+        .await;
     }
     if new_insights.as_object().is_none_or(|o| o.is_empty()) {
         return;
@@ -698,7 +725,11 @@ async fn extract_facts(
         }
         None => (
             vec![],
-            Some(CallAudit { status: "parse_error", payload: None, meta }),
+            Some(CallAudit {
+                status: "parse_error",
+                payload: None,
+                meta,
+            }),
         ),
     }
 }
@@ -776,7 +807,11 @@ async fn extract_structured_insights(
         }
         None => (
             empty(),
-            Some(CallAudit { status: "parse_error", payload: None, meta }),
+            Some(CallAudit {
+                status: "parse_error",
+                payload: None,
+                meta,
+            }),
         ),
     }
 }
@@ -1014,7 +1049,16 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         let message_id = uuid::Uuid::new_v4();
 
-        extract_insights(&state, session_id, user_id, message_id, "我在深圳工作", "嗯嗯", None).await;
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
 
         let rows: Vec<(uuid::Uuid, String, String, Option<String>)> = sqlx::query_as(
             "SELECT run_id, stage, status, generation_id \
@@ -1076,7 +1120,16 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
-        extract_insights(&state, uuid::Uuid::new_v4(), user_id, uuid::Uuid::new_v4(), "hi there", "嗯嗯", None).await;
+        extract_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            user_id,
+            uuid::Uuid::new_v4(),
+            "hi there",
+            "嗯嗯",
+            None,
+        )
+        .await;
 
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT stage, status FROM engine.companion_insights_events WHERE user_id = $1",
@@ -1134,7 +1187,16 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
-        extract_insights(&state, uuid::Uuid::new_v4(), user_id, uuid::Uuid::new_v4(), "hi there", "嗯嗯", None).await;
+        extract_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            user_id,
+            uuid::Uuid::new_v4(),
+            "hi there",
+            "嗯嗯",
+            None,
+        )
+        .await;
 
         let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
             "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",

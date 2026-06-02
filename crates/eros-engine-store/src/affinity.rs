@@ -750,9 +750,16 @@ mod tests {
             model: Some("aff/m".into()),
             usage: Some(serde_json::json!({"total_tokens": 9})),
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), Some(&meta))
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            Some(&meta),
+        )
+        .await
+        .unwrap();
 
         let row: (Option<String>, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT generation_id, model, usage FROM engine.companion_affinity_events \
