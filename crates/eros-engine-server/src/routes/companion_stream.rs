@@ -194,6 +194,15 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
         }
     }
     if let Some(url) = req.image_url.as_deref() {
+        if req.tips_amount_usd.is_some() {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "image_url cannot be combined with tips_amount_usd".into(),
+                user_message: "图片消息暂不支持同时打赏".into(),
+                original_user_message_id: None,
+            }));
+        }
         if !image_url_is_valid(url) {
             return Err(AppError::StreamPre(StreamPreError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -918,5 +927,13 @@ mod validate_payload_tests {
         assert!(!image_url_is_valid("http:// "));
         assert!(!image_url_is_valid("ftp://x/y.png"));
         assert!(!image_url_is_valid(""));
+    }
+
+    #[test]
+    fn tip_plus_image_rejected() {
+        let mut r = base();
+        r.tips_amount_usd = Some(1.0);
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_err());
     }
 }

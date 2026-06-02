@@ -117,6 +117,11 @@ pub image_url: Option<String>,
       → 422 "请输入一条消息"
   }
   ```
+- **No tip + image:** `image_url` combined with `tips_amount_usd` is rejected with
+  `422` (`user_message: "图片消息暂不支持同时打赏"`). Tip turns persist as
+  `gift_user`, which don't feed the main prompt, so an image there would be
+  silently dropped — reject it explicitly instead. Images are a normal-Reply-turn
+  feature only.
 - `MAX_CONTENT_CHARS` (4096) still applies to the caption.
 
 The `image_url` is stored on the user row at upsert time (see §7); it is **not**
