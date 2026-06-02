@@ -199,6 +199,7 @@ pub async fn run(
 /// does not touch ghost_streak in `persist_with_event` — that's a caller
 /// responsibility because the streak reset is a pipeline-policy concern,
 /// not a row-update concern.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct affinity-persist concern
 async fn persist_affinity(
     state: &AppState,
     session_id: Uuid,
