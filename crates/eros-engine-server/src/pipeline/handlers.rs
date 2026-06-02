@@ -74,6 +74,18 @@ pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> 
     }
 }
 
+/// Effective model-facing text for a user-side history row: the input-filter
+/// rewrite (`pre_filter_content`) when present and non-blank, else the original
+/// `content`. Assistant rows must NOT use this (their `pre_filter_content` is
+/// the pre-OUTPUT-filter original); `assemble_chat_request` routes assistant
+/// rows to `content` directly.
+pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) -> &str {
+    match msg.pre_filter_content.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => &msg.content,
+    }
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -89,13 +101,18 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        match msg.role.as_str() {
-            "user" | "assistant" => messages.push(ChatMessage {
-                role: msg.role,
-                content: msg.content,
-            }),
+        // User rows feed the EFFECTIVE text (input-filter rewrite when present);
+        // assistant rows always feed `content` (their pre_filter_content is the
+        // pre-output-filter original and must never re-enter the prompt).
+        let content = match msg.role.as_str() {
+            "user" => effective_user_text(&msg).to_string(),
+            "assistant" => msg.content,
             _ => continue,
-        }
+        };
+        messages.push(ChatMessage {
+            role: msg.role,
+            content,
+        });
     }
 
     let (audit_user, audit_session, audit_metadata) = audit
@@ -424,10 +441,19 @@ pub(super) async fn build_reply_request(
     let chat_repo = ChatRepo { pool: &state.pool };
     let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
 
-    let query_text = match &input.event {
-        Event::UserMessage { content, .. } => content.as_str(),
-        _ => "",
-    };
+    // The model and recall both see the EFFECTIVE text for the current user
+    // turn: if the input filter rewrote it, the rewrite is persisted on the
+    // row's pre_filter_content, so derive query_text from history rather than
+    // the raw event content.
+    let query_text: String = history
+        .iter()
+        .rev()
+        .find(|m| m.id == user_message_id && m.role == "user")
+        .map(|m| effective_user_text(m).to_string())
+        .unwrap_or_else(|| match &input.event {
+            Event::UserMessage { content, .. } => content.clone(),
+            _ => String::new(),
+        });
 
     let (memory_scope, affinity_scope) = match &input.event {
         Event::UserMessage {
@@ -457,7 +483,7 @@ pub(super) async fn build_reply_request(
     }
 
     let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text, x_on, y_on).await;
+        recall_memory(state, user_id, instance_id, &query_text, x_on, y_on).await;
 
     let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
     if !insight_bullets.is_empty() {
@@ -1337,6 +1363,36 @@ mod tests {
         let (kept, dropped) = filter_traits(&traits, Some(&allow));
         assert_eq!(kept.len(), 2);
         assert!(dropped.is_empty());
+    }
+
+    fn user_row(content: &str, pre: Option<&str>) -> eros_engine_store::chat::ChatMessage {
+        eros_engine_store::chat::ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            role: "user".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: None,
+            usage: None,
+            generation_id: None,
+            assistant_action_type: None,
+            pre_filter_content: pre.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn effective_user_text_prefers_nonblank_rewrite() {
+        let mut row = user_row("1111", None);
+        assert_eq!(effective_user_text(&row), "1111");
+        row.pre_filter_content = Some("有意义的问题".into());
+        assert_eq!(effective_user_text(&row), "有意义的问题");
+        row.pre_filter_content = Some("   ".into()); // blank → fall back to content
+        assert_eq!(effective_user_text(&row), "1111");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`

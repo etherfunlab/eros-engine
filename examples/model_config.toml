@@ -108,6 +108,53 @@ model_name_display_override = true
 # (NOT temperature/max_tokens — those are task-level only, like every other task)
 #filter_prompt = "..."
 
+# ── Optional user-input rewrite filter (OFF by default) ──────────────────────
+# Rewrites a MEANINGLESS user turn (e.g. "1111", "？？？", key-mashing) into one
+# natural, context-appropriate user message before it reaches chat_companion, so
+# the companion answers a real message instead of parroting history. Meaningful
+# turns — including short ones like "嗯"/"好啊"/"在吗" and genuine short
+# questions — are left untouched.
+#
+# Enable with a single global switch on [tasks.chat_companion]. It accepts a
+# bool OR a probability:
+#   [tasks.chat_companion]
+#   input_filter = false   # off (default)
+#   input_filter = true    # run on every user turn (= 1.0)
+#   input_filter = 0.8     # run on ~80% of user turns
+# A number outside [0.0, 1.0] (or non-finite) is rejected at load time.
+#
+# The filter runs only if BOTH input_filter fires (true/probability) AND this
+# table exists with a non-blank filter_prompt; otherwise it is inert. The user's
+# ORIGINAL text is
+# always persisted (content) and shown to the client; the rewrite is stored
+# separately in pre_filter_content and seen only by the model.
+#
+# Pick a fast, cheap model — this runs on every user turn before generation.
+# Recommended: google/gemini-3.1-flash-lite or deepseek/deepseek-v4-flash.
+#[tasks.chat_input_filter]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["deepseek/deepseek-v4-flash"]
+#retry_depth  = 1
+#temperature  = 0.3
+#max_tokens   = 400
+# Reasoning is OFF by default here (the filter only needs a short JSON verdict).
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#You are an input-cleaning filter for a companion chat. You receive the recent
+#conversation and the user's latest input. Decide whether the latest input is a
+#meaningful message.
+#
+#- If it IS meaningful (any real intent, INCLUDING short replies like "嗯",
+#  "好啊", "在吗", or a short question), respond EXACTLY:
+#    {"rewrite": false}
+#- If it is NOT meaningful (random characters, key-mashing, repeated chars,
+#  punctuation-only noise), rewrite it into ONE short, natural user message that
+#  fits the conversation, and give a brief reason. Respond EXACTLY:
+#    {"rewrite": true, "content": "<the rewritten user message>", "reason": "<why it was meaningless>"}
+#
+# Output JSON only. No explanation outside the JSON, no code fences.
+#"""
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]

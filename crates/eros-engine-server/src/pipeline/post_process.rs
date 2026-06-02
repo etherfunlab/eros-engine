@@ -340,7 +340,7 @@ async fn embed_and_upsert(
 /// Locate the first balanced `{...}` block in `raw`. Returned as a borrowed
 /// slice. Replaces the gateway's `regex::Regex::new(r"(?s)\{.*\}")` so the
 /// OSS server crate doesn't pick up a `regex` dependency just for this.
-fn find_json_block(raw: &str) -> Option<&str> {
+pub(crate) fn find_json_block(raw: &str) -> Option<&str> {
     let bytes = raw.as_bytes();
     let start = bytes.iter().position(|&b| b == b'{')?;
     // Walk forward, tracking nesting depth + string state, to find the
