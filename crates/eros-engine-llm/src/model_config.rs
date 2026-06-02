@@ -2403,4 +2403,20 @@ retry_depth = 0
         assert_eq!(r.model, "mem/m");
         assert_eq!(r.extract_prompt, "extract memories");
     }
+
+    #[test]
+    fn resolve_extract_keeps_resolve_default_retry_depth() {
+        // Deliberate behavior-preserving choice: extraction tasks are pre-existing
+        // and inherit resolve()'s default retry_depth (2) — they do NOT cap at 1
+        // like the newer chat_vision / chat_input_filter features. This pins that
+        // so a future refactor toward the vision pattern can't silently halve the
+        // extraction fallback chain.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"f1\", \"f2\"]\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_insight_extract().expect("resolves");
+        assert_eq!(r.retry_depth, 2);
+        assert_eq!(r.fallback_model, vec!["f1".to_string(), "f2".to_string()]);
+    }
 }
