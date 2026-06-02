@@ -3,7 +3,7 @@
 **Status**: design, pending implementation plan
 **Target release**: `0.5.x` dev track (`0.5.3-dev`). **No migration** — image URL and
 the extracted description ride on the existing `engine.chat_messages.metadata`
-JSONB column (added in migration `0012`). No new columns.
+JSONB column (added in migration `0019`). No new columns.
 **Audience**: anyone implementing image input on `POST /comp/chat/{session_id}/message/stream`.
 Mirrors the `chat_input_filter` pre-stage (`2026-06-02-chat-input-filter-design.md`)
 on the image side.
