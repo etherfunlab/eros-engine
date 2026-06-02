@@ -1321,7 +1321,10 @@ pub fn run_stream(
                 // failure keeps the turn text-only (placeholder covers an
                 // undescribed image). Run-once is guaranteed by the upsert
                 // idempotency gate — run_stream only runs on a fresh Insert.
-                if !is_gift {
+                // Skip tipped turns (same as the input filter): a tip persists as
+                // role='gift_user', which set_user_image_vision can't update and
+                // the prompt drops anyway — describing it would waste the call.
+                if !is_gift && user_msg.tips_amount_usd.is_none() {
                     if let (Some(image_url), Some(v)) = (
                         user_msg.image_url.as_deref(),
                         state.model_config.resolve_vision(),
