@@ -807,6 +807,111 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
         })
 }
 
+/// Fixed schema the `chat_vision` describe model must emit. `description` is
+/// required; the optional fields are dropped from the injected preamble when
+/// blank (see `model_facing_user_text`).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ImageVision {
+    description: String,
+    #[serde(default)]
+    ocr_text: Option<String>,
+    #[serde(default)]
+    people: Option<String>,
+    #[serde(default)]
+    scene: Option<String>,
+}
+
+/// Parse the describe reply: direct JSON first, then a balanced JSON block
+/// embedded in prose (mirrors `parse_input_filter_verdict`).
+fn parse_image_vision(text: &str) -> Option<ImageVision> {
+    serde_json::from_str::<ImageVision>(text).ok().or_else(|| {
+        super::post_process::find_json_block(text)
+            .and_then(|b| serde_json::from_str::<ImageVision>(b).ok())
+    })
+}
+
+/// Validity gate for a parsed describe. Reject a `content_filter` finish reason,
+/// a blank `description`, or a refusal-shaped description.
+fn image_vision_invalidity(v: &ImageVision, finish_reason: Option<&str>) -> Option<&'static str> {
+    if finish_reason == Some("content_filter") {
+        return Some("content_filter");
+    }
+    if v.description.trim().is_empty() {
+        return Some("blank_description");
+    }
+    if refusal_in_head(&v.description) {
+        return Some("refusal_pattern");
+    }
+    None
+}
+
+/// Outcome of a successful describe — the JSON to persist + audit.
+struct VisionOutcome {
+    vision: serde_json::Value,
+    vision_model: String,
+    v_generation_id: Option<String>,
+}
+
+/// Run the `chat_vision` describe over the image. Returns `Some(VisionOutcome)`
+/// only on a valid parse; every failure (transport, timeout, empty, unparseable,
+/// invalid) returns `None` ⇒ caller keeps the turn text-only and the placeholder
+/// path covers the undescribed image. `execute_vision` walks the model fallback
+/// chain internally, so this issues exactly one call.
+async fn run_vision(
+    state: &AppState,
+    v: &eros_engine_llm::model_config::ResolvedVision,
+    image_url: &str,
+    caption: &str,
+) -> Option<VisionOutcome> {
+    use eros_engine_llm::openrouter::VisionRequest;
+    let caption = caption.trim();
+    let req = VisionRequest {
+        model: v.model.clone(),
+        fallback_model: v.fallback_model.clone(),
+        system_prompt: v.describe_prompt.clone(),
+        image_url: image_url.to_string(),
+        caption: (!caption.is_empty()).then(|| caption.to_string()),
+        temperature: v.temperature as f32,
+        max_tokens: v.max_tokens,
+        reasoning: v.reasoning.clone(),
+    };
+    let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req)).await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "chat_vision: model error; keep text-only");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("chat_vision: timeout; keep text-only");
+            return None;
+        }
+    };
+    super::log_openrouter_usage("chat_vision", None, &resp);
+    let text = resp.reply.trim().to_string();
+    if text.is_empty() {
+        tracing::warn!("chat_vision: empty reply; keep text-only");
+        return None;
+    }
+    let vision = match parse_image_vision(&text) {
+        Some(v) => v,
+        None => {
+            tracing::warn!("chat_vision: unparseable describe JSON; keep text-only");
+            return None;
+        }
+    };
+    if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
+        tracing::warn!(invalidity = %reason, "chat_vision: invalid describe; keep text-only");
+        return None;
+    }
+    let vision_model = resp.model.unwrap_or_else(|| v.model.clone());
+    Some(VisionOutcome {
+        vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
+        vision_model,
+        v_generation_id: resp.generation_id,
+    })
+}
+
 /// Validity gate for an INPUT rewrite's `content`. Unlike
 /// `filter_output_invalidity`, there is NO minimum-length floor — a rewritten
 /// user message is naturally short (often < 80 chars). Only a `content_filter`
@@ -3703,5 +3808,56 @@ data: [DONE]\n\n";
             "malformed primary verdict must keep original (no fallback walk); got {pre:?}"
         );
         assert!(fmodel.is_none(), "no filter model stamped; got {fmodel:?}");
+    }
+
+    #[test]
+    fn parse_image_vision_direct_json() {
+        let v = parse_image_vision(r#"{"description":"a cat","ocr_text":"hi"}"#).unwrap();
+        assert_eq!(v.description, "a cat");
+        assert_eq!(v.ocr_text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_image_vision_embedded_block() {
+        let v = parse_image_vision("noise {\"description\":\"dog\"} tail").unwrap();
+        assert_eq!(v.description, "dog");
+    }
+
+    #[test]
+    fn image_vision_invalidity_flags_blank_and_filter() {
+        let blank = ImageVision {
+            description: "  ".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(image_vision_invalidity(&blank, None), Some("blank_description"));
+        let ok = ImageVision {
+            description: "x".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(
+            image_vision_invalidity(&ok, Some("content_filter")),
+            Some("content_filter")
+        );
+        assert_eq!(image_vision_invalidity(&ok, None), None);
+
+        // content_filter early-return wins over blank_description.
+        assert_eq!(
+            image_vision_invalidity(&blank, Some("content_filter")),
+            Some("content_filter"), // content_filter wins over blank_description
+        );
+
+        // Refusal-shaped description is rejected as refusal_pattern.
+        // String reused from `rewrite_content_invalidity_rejects_refusal_and_content_filter`.
+        let refusal = ImageVision {
+            description: "对不起，我无法满足你的要求".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(image_vision_invalidity(&refusal, None), Some("refusal_pattern"));
     }
 }
