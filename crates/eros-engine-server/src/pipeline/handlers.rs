@@ -142,6 +142,27 @@ pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage)
     }
 }
 
+/// Recall query text for a user row: the caption (`effective_user_text`) when
+/// non-blank, else the vision `description` for an image-only turn so memory
+/// recall can match the photo's content instead of running on empty text. Used
+/// ONLY for the recall/embedding query — the prompt path uses
+/// `model_facing_user_text` (which folds the full preamble).
+pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
+    let caption = effective_user_text(msg);
+    if !caption.trim().is_empty() {
+        return caption.to_string();
+    }
+    msg.metadata
+        .as_ref()
+        .and_then(|m| m.get("vision"))
+        .and_then(|v| v.get("description"))
+        .and_then(|d| d.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -498,15 +519,15 @@ pub(super) async fn build_reply_request(
     let chat_repo = ChatRepo { pool: &state.pool };
     let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
 
-    // The model and recall both see the EFFECTIVE text for the current user
-    // turn: if the input filter rewrote it, the rewrite is persisted on the
-    // row's pre_filter_content, so derive query_text from history rather than
-    // the raw event content.
+    // Recall query for the current user turn: the effective caption, or — for an
+    // image-only turn — the vision description (recall_query_text), so a photo
+    // with no caption still retrieves relevant memories. The MAIN prompt path
+    // separately folds the full image preamble via model_facing_user_text.
     let query_text: String = history
         .iter()
         .rev()
         .find(|m| m.id == user_message_id && m.role == "user")
-        .map(|m| effective_user_text(m).to_string())
+        .map(recall_query_text)
         .unwrap_or_else(|| match &input.event {
             Event::UserMessage { content, .. } => content.clone(),
             _ => String::new(),
@@ -1502,6 +1523,36 @@ mod tests {
     fn model_facing_text_plain_turn_unchanged() {
         let row = user_row("普通消息", None);
         assert_eq!(model_facing_user_text(&row), "普通消息");
+    }
+
+    #[test]
+    fn recall_query_prefers_caption() {
+        let row = user_row_meta(
+            "你看这个",
+            serde_json::json!({ "vision": { "description": "一只猫" } }),
+        );
+        assert_eq!(recall_query_text(&row), "你看这个");
+    }
+
+    #[test]
+    fn recall_query_falls_back_to_description_when_caption_blank() {
+        let row = user_row_meta(
+            "",
+            serde_json::json!({ "image_url": "https://x/y.png", "vision": { "description": "一只猫在沙滩" } }),
+        );
+        assert_eq!(recall_query_text(&row), "一只猫在沙滩");
+    }
+
+    #[test]
+    fn recall_query_empty_when_no_caption_no_vision() {
+        let row = user_row("", None);
+        assert_eq!(recall_query_text(&row), "");
+    }
+
+    #[test]
+    fn recall_query_plain_text_turn() {
+        let row = user_row("普通消息", None);
+        assert_eq!(recall_query_text(&row), "普通消息");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`

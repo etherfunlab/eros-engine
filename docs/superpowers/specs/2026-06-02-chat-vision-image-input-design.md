@@ -385,6 +385,14 @@ remembered by the main model):
 - `build_input_filter_transcript` — the input filter sees typed captions only
   for v1 (non-goal §1).
 
+**Recall query** (`build_reply_request` — separate from the prompt path):
+The recall/embedding query for the current user turn uses `recall_query_text`
+(not `effective_user_text`). `recall_query_text` returns the caption when
+non-blank; for an image-only turn (blank caption) it falls back to the vision
+`description` so memory recall matches the photo's content instead of running
+on empty text. The MAIN prompt path is unaffected — it still folds the full
+image preamble via `model_facing_user_text`.
+
 Edge case: a non-image text turn has neither `vision` nor `image_url` in
 metadata → `model_facing_user_text` returns `base`, i.e. identical to today.
 
