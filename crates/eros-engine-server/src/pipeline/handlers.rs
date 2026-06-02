@@ -163,6 +163,15 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
         .unwrap_or_default()
 }
 
+/// A `gift_user` row is a TIP (not a legacy in-app Gift Event) iff its metadata
+/// carries `tips_amount_usd`. Mirrors the `signals_count` gate in `pipeline/mod.rs`
+/// so tips and legacy gifts are classified identically across the pipeline.
+fn is_tip_row(msg: &eros_engine_store::chat::ChatMessage) -> bool {
+    msg.metadata
+        .as_ref()
+        .is_some_and(|m| m.get("tips_amount_usd").is_some())
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -178,14 +187,19 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        // User + gift_user (tip) rows feed the MODEL-FACING text and are emitted
+        // User + TIP gift_user rows feed the MODEL-FACING text and are emitted
         // under the "user" role — a tip turn IS a user turn to the model (OpenRouter
-        // only knows system/user/assistant). Dropping gift_user rows here made tip
-        // turns invisible, so the model parroted history. Assistant rows always feed
-        // `content` (their pre_filter_content is the pre-output-filter original and
-        // must never re-enter the prompt).
+        // only knows system/user/assistant). Dropping the tip turn here made it
+        // invisible, so the model parroted history. The gate matches the
+        // `signals_count` convention (mod.rs): only `gift_user` rows carrying
+        // `tips_amount_usd` are tips; legacy in-app Gift Event rows (a bare gift
+        // label, no tip metadata) stay dropped — see the open issue on splitting
+        // `gift_user` / legacy Gift Events. Assistant rows always feed `content`
+        // (their pre_filter_content is the pre-output-filter original and must
+        // never re-enter the prompt).
         let (role, content) = match msg.role.as_str() {
-            "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
+            "user" => ("user", model_facing_user_text(&msg)),
+            "gift_user" if is_tip_row(&msg) => ("user", model_facing_user_text(&msg)),
             "assistant" => ("assistant", msg.content),
             _ => continue,
         };
@@ -1525,6 +1539,61 @@ mod tests {
     fn model_facing_text_plain_turn_unchanged() {
         let row = user_row("普通消息", None);
         assert_eq!(model_facing_user_text(&row), "普通消息");
+    }
+
+    #[test]
+    fn assemble_includes_tip_gift_but_drops_legacy_gift() {
+        use eros_engine_llm::model_config::ResolvedModel;
+
+        // TIP gift_user (metadata carries tips_amount_usd) → promoted to a user msg.
+        let mut tip = user_row("(打赏 $5)", None);
+        tip.role = "gift_user".into();
+        tip.metadata = Some(serde_json::json!({ "tips_amount_usd": 5.0 }));
+        // LEGACY in-app Gift Event (bare label, no tip metadata) → stays dropped.
+        let mut legacy = user_row("rose", None);
+        legacy.role = "gift_user".into();
+        legacy.metadata = None;
+        let plain = user_row("普通消息", None);
+        let mut assistant = user_row("回复", None);
+        assistant.role = "assistant".into();
+
+        let resolved = ResolvedModel {
+            model: "m".into(),
+            fallback_model: vec![],
+            temperature: 0.7,
+            max_tokens: 100,
+            allow_traits: None,
+            reasoning: None,
+            retry_depth: 0,
+        };
+        let req = assemble_chat_request(
+            resolved,
+            "SYS".into(),
+            vec![tip, legacy, plain, assistant],
+            None,
+        );
+
+        let user_contents: Vec<&str> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            user_contents.contains(&"(打赏 $5)"),
+            "tip gift_user must be promoted under the user role: {user_contents:?}"
+        );
+        assert!(user_contents.contains(&"普通消息"));
+        assert!(
+            !req.messages.iter().any(|m| m.content == "rose"),
+            "legacy (no-tip) gift_user must stay dropped from the prompt"
+        );
+        // No `gift_user` role ever reaches the wire (OpenRouter knows only
+        // system/user/assistant).
+        assert!(req
+            .messages
+            .iter()
+            .all(|m| matches!(m.role.as_str(), "system" | "user" | "assistant")));
     }
 
     #[test]

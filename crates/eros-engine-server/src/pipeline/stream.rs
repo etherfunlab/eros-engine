@@ -3895,7 +3895,10 @@ data: [DONE]\n\n";
             ),
         );
 
-        // A tip-only turn: persisted as role='gift_user' with the "(打赏 $X)" marker.
+        // A tip-only turn: persisted as role='gift_user' with the "(打赏 $X)" marker
+        // and tip metadata (`tips_amount_usd`) — the prompt gate promotes only tip
+        // gift_user rows, so the metadata must be present (as production persists it).
+        let tip_meta = serde_json::json!({ "tips_amount_usd": 0.5 });
         let chat_repo = ChatRepo { pool: &pool };
         let umid = match chat_repo
             .upsert_user_message_idempotent(
@@ -3903,7 +3906,7 @@ data: [DONE]\n\n";
                 "(打赏 $0.5)",
                 "01J8888888888888888888888B",
                 "gift_user",
-                None,
+                Some(&tip_meta),
             )
             .await
             .unwrap()
