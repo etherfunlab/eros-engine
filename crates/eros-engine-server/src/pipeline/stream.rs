@@ -875,18 +875,18 @@ async fn run_vision(
         max_tokens: v.max_tokens,
         reasoning: v.reasoning.clone(),
     };
-    let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req)).await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "chat_vision: model error; keep text-only");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!("chat_vision: timeout; keep text-only");
-            return None;
-        }
-    };
+    let resp =
+        match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "chat_vision: model error; keep text-only");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("chat_vision: timeout; keep text-only");
+                return None;
+            }
+        };
     super::log_openrouter_usage("chat_vision", None, &resp);
     let text = resp.reply.trim().to_string();
     if text.is_empty() {
@@ -3859,7 +3859,10 @@ data: [DONE]\n\n";
             people: None,
             scene: None,
         };
-        assert_eq!(image_vision_invalidity(&blank, None), Some("blank_description"));
+        assert_eq!(
+            image_vision_invalidity(&blank, None),
+            Some("blank_description")
+        );
         let ok = ImageVision {
             description: "x".into(),
             ocr_text: None,
@@ -3886,6 +3889,9 @@ data: [DONE]\n\n";
             people: None,
             scene: None,
         };
-        assert_eq!(image_vision_invalidity(&refusal, None), Some("refusal_pattern"));
+        assert_eq!(
+            image_vision_invalidity(&refusal, None),
+            Some("refusal_pattern")
+        );
     }
 }

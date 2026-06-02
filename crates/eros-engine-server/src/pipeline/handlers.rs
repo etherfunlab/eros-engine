@@ -123,7 +123,7 @@ pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage)
     let meta = msg.metadata.as_ref();
     let preamble = meta
         .and_then(|m| m.get("vision"))
-        .and_then(|v| build_image_preamble(v))
+        .and_then(build_image_preamble)
         .or_else(|| {
             // Image sent but not described (vision failed) → neutral placeholder.
             meta.and_then(|m| m.get("image_url"))

@@ -155,6 +155,30 @@ model_name_display_override = true
 # Output JSON only. No explanation outside the JSON, no code fences.
 #"""
 
+# ── Image input (chat_vision) ────────────────────────────────────────────────
+# When a chat/stream turn carries an `image_url`, the image is described by a
+# vision model into a fixed JSON schema and the description is folded into the
+# user text the main chat model sees. The main chat model stays text-only.
+#
+# Feature is OFF unless this table exists with a non-blank filter_prompt.
+# The fixed schema is: { "description", "ocr_text", "people", "scene" }.
+# Pick a vision-capable model.
+#[tasks.chat_vision]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["openai/gpt-5.1-mini"]
+#retry_depth  = 1
+#temperature  = 0.2
+#max_tokens   = 400
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#你是图像识别助手。只输出 JSON，字段：
+#  "description": 画面/主体/正在发生什么（必填）
+#  "ocr_text":    图中文字；没有则空字符串
+#  "people":      是否有人物、表情/情绪；没有则空字符串
+#  "scene":       场景/地点/氛围；没有则空字符串
+#不要输出 JSON 以外的任何内容，不要代码围栏。
+#"""
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]

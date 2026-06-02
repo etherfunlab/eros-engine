@@ -1405,6 +1405,12 @@
           "content": {
             "type": "string"
           },
+          "image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "memory_scope": {
             "type": [
               "string",
