@@ -1402,6 +1402,15 @@ mod tests {
         assert!(p.contains("\"mbti_guess\": \"INFP\""));
     }
 
+    #[test]
+    fn extract_structured_insights_prompt_schema_includes_geo_fields() {
+        // The embedded schema must carry the geo cluster so the model can fill them.
+        let p = extract_structured_insights_prompt(&["住在上海".to_string()], None);
+        assert!(p.contains("location"));
+        assert!(p.contains("hometown"));
+        assert!(p.contains("nationality"));
+    }
+
     fn make_affinity(
         warmth: f64,
         trust: f64,
