@@ -14,7 +14,7 @@
 //!    - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
 //!      JSONB instead of a flat `CompanionPersona` DTO
 //!
-//! 2. **Insight extraction prompts** (`extract_facts_prompt`,
+//! 2. **Insight extraction prompts** (`facts_user_message`,
 //!    `extract_structured_insights_prompt`) — drive the post-process
 //!    `companion_insights` pipeline. The schema description constant
 //!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
@@ -611,18 +611,11 @@ Return ONLY a JSON object with the fields you are confident about.
 Do not invent or guess anything not clearly supported by the facts.
 "#;
 
-/// Stage-1 insight extraction prompt: ask the LLM to mine fresh user
-/// facts from a single chat turn. Output expected as
-/// `{"facts": ["...", "..."]}` — the inline parse in `extract_facts`
-/// (`post_process.rs`) handles the fenced / wrapped JSON fallback.
-pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
-    format!(
-        "分析以下一轮对话，列出你对用户的新事实发现（仅限用户，不是 AI）。\n\n\
-         用户: {user_msg}\n\
-         AI:   {assistant_msg}\n\n\
-         如果没有新的用户事实，返回空数组 []。\n\
-         严格输出 JSON，格式: {{\"facts\": [\"事实1\", \"事实2\"]}}",
-    )
+/// Build the *user* message for the facts-extraction call: just the turn,
+/// labelled. The instruction (with the anti-attribution clause) is the system
+/// message, sourced from `insight_extraction.filter_prompt` in model_config.toml.
+pub fn facts_user_message(user_msg: &str, assistant_msg: &str) -> String {
+    format!("用户: {user_msg}\nAI:   {assistant_msg}")
 }
 
 /// Session-end memory extraction prompt: feed the LLM all turns from a
@@ -1373,12 +1366,10 @@ mod tests {
     // ─── Insight prompt tests ──────────────────────────────────────
 
     #[test]
-    fn extract_facts_prompt_embeds_both_turns_verbatim() {
-        let p = extract_facts_prompt("我住在上海", "嗯嗯，魔都人");
+    fn facts_user_message_embeds_both_turns_verbatim() {
+        let p = facts_user_message("我住在上海", "嗯嗯，魔都人");
         assert!(p.contains("用户: 我住在上海"));
         assert!(p.contains("AI:   嗯嗯，魔都人"));
-        // Output schema instruction must be present.
-        assert!(p.contains(r#"{"facts": ["事实1", "事实2"]}"#));
     }
 
     #[test]

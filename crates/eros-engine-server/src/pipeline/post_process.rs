@@ -681,16 +681,24 @@ async fn extract_facts(
     if user_msg.trim().is_empty() {
         return (vec![], None);
     }
-    let prompt = crate::prompt::extract_facts_prompt(user_msg, assistant_msg);
+    let Some(resolved) = model_config.resolve_insight_extract() else {
+        // Boot gate (main.rs) guarantees this is Some in production; skip defensively.
+        return (vec![], None);
+    };
 
-    let resolved = model_config.resolve(INSIGHT_TASK, None);
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: prompt,
-        }],
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.extract_prompt,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: crate::prompt::facts_user_message(user_msg, assistant_msg),
+            },
+        ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
@@ -1004,7 +1012,7 @@ mod tests {
         let mock = MockServer::start().await;
 
         // Stage-1 facts call → non-empty facts. Matched by a substring unique to
-        // extract_facts_prompt.
+        // the system message (filter_prompt sentinel).
         let facts_body = serde_json::json!({
             "id": "gen-facts", "model": "ins/m",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -1012,7 +1020,7 @@ mod tests {
         });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("列出你对用户的新事实发现"))
+            .and(body_string_contains("facts-sys-prompt-sentinel"))
             .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
             .mount(&mock)
             .await;
@@ -1034,7 +1042,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
             )
             .unwrap(),
         );
@@ -1092,7 +1100,7 @@ mod tests {
         });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("列出你对用户的新事实发现"))
+            .and(body_string_contains("facts-sys-prompt-sentinel"))
             .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
             .mount(&mock)
             .await;
@@ -1108,7 +1116,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
             )
             .unwrap(),
         );
@@ -1160,7 +1168,7 @@ mod tests {
         });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("列出你对用户的新事实发现"))
+            .and(body_string_contains("facts-sys-prompt-sentinel"))
             .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
             .mount(&mock)
             .await;
@@ -1175,7 +1183,7 @@ mod tests {
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\n",
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
             )
             .unwrap(),
         );
