@@ -6,9 +6,11 @@
 //! model / fallback / allow_traits are resolved via `state.model_config`
 //! (task + per-request tier).
 
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+#[cfg(test)]
+use serde_json::Value;
 
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
@@ -16,7 +18,6 @@ use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
-use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::MemoryRepo;
 
 use crate::error::AppError;
@@ -380,28 +381,16 @@ fn build_profile_groups(
     vec![]
 }
 
-/// Load `companion_insights` for the user and render the structured fields
-/// as Chinese-language bullets that fit naturally into the
-/// `[user_profile]` prompt section. Takes `&PgPool` directly
-/// (not `&AppState`) so it's reachable from sqlx integration tests without
-/// constructing the full state.
-async fn load_insight_bullets(pool: &PgPool, user_id: Uuid) -> Vec<String> {
-    let repo = InsightRepo { pool };
-    let row = match repo.load(user_id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return vec![],
-        Err(e) => {
-            tracing::warn!("insight load failed: {e}");
-            return vec![];
-        }
-    };
-    insights_to_bullets(&row.insights)
-}
-
 /// Render the `companion_insights` JSONB blob as bullet strings. Skips
 /// empty / missing fields. `matching_preferences` is intentionally omitted
 /// — it's a structured sub-object that doesn't fit a single-line bullet
 /// and isn't useful in chat tone anyway.
+///
+/// Test-only parity reference: the live path renders the flat human_insights
+/// mirror via human_insights_to_bullets; this renders companion_insights JSONB
+/// directly and the parity tests pin the two together. No production caller
+/// remains (the gift path that used it was removed).
+#[cfg(test)]
 fn insights_to_bullets(insights: &Value) -> Vec<String> {
     let Some(obj) = insights.as_object() else {
         return vec![];
@@ -577,13 +566,6 @@ pub(super) async fn build_reply_request(
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
 
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
     let tier = match &input.event {
         Event::UserMessage { tier, .. } => tier.as_deref(),
         _ => None,
@@ -612,7 +594,6 @@ pub(super) async fn build_reply_request(
         &profile_groups,
         &relationship_facts,
         Some(&input.affinity),
-        tip_personality,
         plan.reply_style,
         &plan.context_hints,
         &kept_traits,
@@ -625,8 +606,8 @@ pub(super) async fn build_reply_request(
         ..
     } = &input.event
     {
-        // Raw Option (not the "normal"-defaulted local above): tips_reaction_context
-        // renders Some vs None as different prose, so the distinction must survive.
+        // Raw Option from the genome: tips_reaction_context renders Some vs None as
+        // different prose, so the distinction must survive.
         let tp = input.persona.genome.tip_personality.as_deref();
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }
@@ -778,16 +759,15 @@ mod tests {
         );
     }
 
-    // ─── Integration tests: recall_memory_with_embedding + load_insight_bullets ───
+    // ─── Integration tests: recall_memory_with_embedding ──────────────────
     //
-    // These exercise the pure-DB halves of the recall pipeline against a
+    // These exercise the pure-DB half of the recall pipeline against a
     // live Postgres (via `#[sqlx::test]`). The Voyage-dependent outer
     // wrapper `recall_memory` is intentionally not tested here — it would
     // either need a live Voyage key or a trait-mock indirection that
     // doesn't justify its weight for a single thin function.
 
     use eros_engine_store::human_insight::HumanInsightRepo;
-    use eros_engine_store::insight::InsightRepo;
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
 
@@ -1165,39 +1145,6 @@ mod tests {
             "profile groups should be present when X on"
         );
         assert!(!rel3.is_empty(), "relationship should be present when Y on");
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_returns_empty_when_no_row(pool: PgPool) {
-        let bullets = load_insight_bullets(&pool, Uuid::new_v4()).await;
-        assert!(bullets.is_empty());
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_renders_after_merge(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let repo = InsightRepo { pool: &pool };
-
-        repo.merge(
-            user_id,
-            json!({
-                "city": "上海",
-                "mbti_guess": "INFP",
-                "interests": ["登山", "精酿"],
-            }),
-        )
-        .await
-        .unwrap();
-
-        let bullets = load_insight_bullets(&pool, user_id).await;
-        assert_eq!(
-            bullets,
-            vec![
-                "城市：上海".to_string(),
-                "MBTI：INFP".to_string(),
-                "兴趣：登山、精酿".to_string(),
-            ]
-        );
     }
 
     // ─── human_insights_to_bullets ──────────────────────────────────────
