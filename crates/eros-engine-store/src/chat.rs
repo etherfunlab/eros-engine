@@ -61,6 +61,12 @@ pub struct ChatMessage {
     /// pre-OUTPUT-filter original) — see chat_input_filter design.
     #[serde(default)]
     pub pre_filter_content: Option<String>,
+    /// Freeform per-row metadata (JSONB). Carries tip amount + raw scopes and,
+    /// for image turns, `image_url` plus the `chat_vision` describe result under
+    /// `vision`. Nullable in the table ⇒ `Option`. Exposed so the pipeline can
+    /// read `metadata.vision` when rendering model-facing user text.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -1943,5 +1949,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_row_exposes_metadata_column(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let meta = serde_json::json!({ "image_url": "https://x/y.png" });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "hi",
+            "01J0000000000000000000000A",
+            "user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].metadata.as_ref().unwrap()["image_url"],
+            "https://x/y.png"
+        );
     }
 }

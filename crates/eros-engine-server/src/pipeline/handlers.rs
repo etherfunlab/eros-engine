@@ -1382,6 +1382,7 @@ mod tests {
             generation_id: None,
             assistant_action_type: None,
             pre_filter_content: pre.map(|s| s.to_string()),
+            metadata: None,
         }
     }
 

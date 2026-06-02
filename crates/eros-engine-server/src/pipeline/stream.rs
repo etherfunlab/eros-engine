@@ -1779,6 +1779,7 @@ mod tests {
             generation_id: Some("gen-1".into()),
             assistant_action_type: Some("reply".into()),
             pre_filter_content: None,
+            metadata: None,
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -2084,6 +2085,7 @@ data: [DONE]\n\n";
             generation_id: None,
             assistant_action_type: Some("reply".into()),
             pre_filter_content: None,
+            metadata: None,
         };
 
         let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {
