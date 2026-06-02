@@ -853,10 +853,11 @@ struct VisionOutcome {
 }
 
 /// Run the `chat_vision` describe over the image. Returns `Some(VisionOutcome)`
-/// only on a valid parse; every failure (transport, timeout, empty, unparseable,
-/// invalid) returns `None` ⇒ caller keeps the turn text-only and the placeholder
-/// path covers the undescribed image. `execute_vision` walks the model fallback
-/// chain internally, so this issues exactly one call.
+/// only on a valid parse. Walks the configured model chain, trying the next model
+/// on any failure (transport, timeout, empty, unparseable, invalid); returns Some
+/// only on a valid describe. Any failure keeps the turn text-only and the
+/// placeholder path covers the undescribed image. Each call passes a single model
+/// (no internal fallback) so content-level failures also advance the chain.
 async fn run_vision(
     state: &AppState,
     v: &eros_engine_llm::model_config::ResolvedVision,
@@ -865,51 +866,62 @@ async fn run_vision(
 ) -> Option<VisionOutcome> {
     use eros_engine_llm::openrouter::VisionRequest;
     let caption = caption.trim();
-    let req = VisionRequest {
-        model: v.model.clone(),
-        fallback_model: v.fallback_model.clone(),
-        system_prompt: v.describe_prompt.clone(),
-        image_url: image_url.to_string(),
-        caption: (!caption.is_empty()).then(|| caption.to_string()),
-        temperature: v.temperature as f32,
-        max_tokens: v.max_tokens,
-        reasoning: v.reasoning.clone(),
-    };
-    let resp =
-        match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req)).await {
+    // Walk [primary, ...fallback] ourselves so a content-level failure (empty /
+    // unparseable / invalid describe) advances to the next model — execute_vision
+    // only walks the chain on transport/HTTP/decode errors, and it cannot know the
+    // ImageVision schema. Each call passes a SINGLE model (no internal fallback).
+    let chain: Vec<String> = std::iter::once(v.model.clone())
+        .chain(v.fallback_model.iter().cloned())
+        .collect();
+    for model_id in &chain {
+        let req = VisionRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            system_prompt: v.describe_prompt.clone(),
+            image_url: image_url.to_string(),
+            caption: (!caption.is_empty()).then(|| caption.to_string()),
+            temperature: v.temperature as f32,
+            max_tokens: v.max_tokens,
+            reasoning: v.reasoning.clone(),
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req))
+            .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "chat_vision: model error; keep text-only");
-                return None;
+                tracing::warn!(model = %model_id, error = %e, "chat_vision: model error; next");
+                continue;
             }
             Err(_) => {
-                tracing::warn!("chat_vision: timeout; keep text-only");
-                return None;
+                tracing::warn!(model = %model_id, "chat_vision: timeout; next");
+                continue;
             }
         };
-    super::log_openrouter_usage("chat_vision", None, &resp);
-    let text = resp.reply.trim().to_string();
-    if text.is_empty() {
-        tracing::warn!("chat_vision: empty reply; keep text-only");
-        return None;
-    }
-    let vision = match parse_image_vision(&text) {
-        Some(v) => v,
-        None => {
-            tracing::warn!("chat_vision: unparseable describe JSON; keep text-only");
-            return None;
+        super::log_openrouter_usage("chat_vision", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "chat_vision: empty reply; next");
+            continue;
         }
-    };
-    if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
-        tracing::warn!(invalidity = %reason, "chat_vision: invalid describe; keep text-only");
-        return None;
+        let vision = match parse_image_vision(&text) {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
+                continue;
+            }
+        };
+        if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
+            tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
+            continue;
+        }
+        let vision_model = resp.model.unwrap_or_else(|| model_id.clone());
+        return Some(VisionOutcome {
+            vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
+            vision_model,
+            v_generation_id: resp.generation_id,
+        });
     }
-    let vision_model = resp.model.unwrap_or_else(|| v.model.clone());
-    Some(VisionOutcome {
-        vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
-        vision_model,
-        v_generation_id: resp.generation_id,
-    })
+    None
 }
 
 /// Validity gate for an INPUT rewrite's `content`. Unlike
