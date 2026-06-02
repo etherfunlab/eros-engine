@@ -115,12 +115,17 @@ model_name_display_override = true
 # turns — including short ones like "嗯"/"好啊"/"在吗" and genuine short
 # questions — are left untouched.
 #
-# Enable with a single global switch on [tasks.chat_companion]:
+# Enable with a single global switch on [tasks.chat_companion]. It accepts a
+# bool OR a probability:
 #   [tasks.chat_companion]
-#   input_filter = true                  # global default: false
+#   input_filter = false   # off (default)
+#   input_filter = true    # run on every user turn (= 1.0)
+#   input_filter = 0.8     # run on ~80% of user turns
+# A number outside [0.0, 1.0] (or non-finite) is rejected at load time.
 #
-# The filter runs only if BOTH input_filter is true AND this table exists with a
-# non-blank filter_prompt; otherwise it is inert. The user's ORIGINAL text is
+# The filter runs only if BOTH input_filter fires (true/probability) AND this
+# table exists with a non-blank filter_prompt; otherwise it is inert. The user's
+# ORIGINAL text is
 # always persisted (content) and shown to the client; the rewrite is stored
 # separately in pre_filter_content and seen only by the model.
 #

@@ -55,7 +55,8 @@ different where the problem differs:
 
 **Goals**
 - Optional, off-by-default user-input rewrite, configured like `chat_output_filter`.
-- A single global switch (`input_filter = true` on `[tasks.chat_companion]`).
+- A single global trigger (`input_filter` on `[tasks.chat_companion]`) accepting a
+  bool or a per-turn probability (`true`/`false`/`0.8`).
 - Original text always persisted as `content` and shown to the client.
 - Rewritten text persisted in the existing `pre_filter_content` audit column and
   fed to the model for the current turn **and** future turns' history.
@@ -73,16 +74,26 @@ different where the problem differs:
 
 ## 2. Config surface — `model_config.toml`
 
-### 2.1 Global switch on `[tasks.chat_companion]`
+### 2.1 Global trigger on `[tasks.chat_companion]`
 
-Add one task-level boolean, mirroring `output_filter`, **task-level only (no
-per-tier override)**:
+Add one task-level trigger, **task-level only (no per-tier override)**. It
+accepts a bool **or** a probability (a custom-`Deserialize` newtype
+`InputFilterTrigger(f64)`, like the file's other multi-form values):
 
 ```toml
 [tasks.chat_companion]
 # ... existing fields ...
-input_filter = true        # global default: false
+input_filter = false   # off (default)
+# input_filter = true  # always (= 1.0)
+# input_filter = 0.8   # per-turn coin flip — fire on ~80% of turns
 ```
+
+Semantics: `false`/absent → `0.0` (off), `true` → `1.0` (always), a number →
+that probability. A number **outside `[0.0, 1.0]`** (or non-finite) is a hard
+config error — the load fails loudly rather than silently clamping.
+`resolve_input_filter()` returns `None` when the probability is `0.0` and carries
+the probability otherwise; the stream wiring draws one coin flip per turn
+(`rand < probability`) before running the filter LLM.
 
 ### 2.2 The filter task block `[tasks.chat_input_filter]`
 
@@ -146,9 +157,14 @@ documented style as the `chat_output_filter` block:
 
 Mirror `resolve_output_filter`, minus `trigger` / `timing` / tier.
 
-### 3.1 New struct
+### 3.1 New structs
 
 ```rust
+/// Three TOML forms: false (0.0), true (1.0), or a number in [0.0, 1.0].
+/// Out-of-range / non-finite numbers are a hard deserialize error (no clamp).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputFilterTrigger(pub f64); // custom Deserialize (bool | number)
+
 #[derive(Debug, Clone)]
 pub struct ResolvedInputFilter {
     pub model: String,
@@ -158,35 +174,49 @@ pub struct ResolvedInputFilter {
     pub filter_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    pub probability: f64, // per-turn fire probability, always > 0.0 here
 }
 ```
+
+`InputFilterTrigger` implements `Deserialize` via a `Visitor`: `visit_bool` →
+`1.0`/`0.0`; `visit_f64`/`visit_i64`/`visit_u64` accept only finite values in
+`[0.0, 1.0]`, else `Err(custom(...))`.
 
 ### 3.2 New field on `TaskConfig`
 
 ```rust
-/// Global switch for the user-input rewrite filter. Task-level only on
-/// chat_companion (no per-tier override, unlike `output_filter`). Default false.
+/// Global trigger for the user-input rewrite filter. Task-level only on
+/// chat_companion (no per-tier override). false/absent ⇒ off, true ⇒ every
+/// turn, 0.8 ⇒ 80% of turns.
 #[serde(default)]
-pub input_filter: Option<bool>,
+pub input_filter: Option<InputFilterTrigger>,
 ```
 
 ### 3.3 New methods on `ModelConfig`
 
 ```rust
-/// chat_companion `input_filter` (task-level → false). No tier param.
-pub fn input_filter_enabled(&self) -> bool {
+/// chat_companion `input_filter` fire probability: false/absent → 0.0,
+/// true → 1.0, number → that probability. No tier param.
+pub fn input_filter_probability(&self) -> f64 {
     self.tasks
         .get("chat_companion")
         .and_then(|t| t.input_filter)
-        .unwrap_or(false)
+        .map(|t| t.0)
+        .unwrap_or(0.0)
 }
 
-/// Resolve the input filter. `None` (disabled) when: chat_companion
-/// `input_filter` is false, OR `[tasks.chat_input_filter]` is absent, OR its
-/// `filter_prompt` is blank.
+/// True when the filter can ever fire (probability > 0.0).
+pub fn input_filter_enabled(&self) -> bool {
+    self.input_filter_probability() > 0.0
+}
+
+/// Resolve the input filter. `None` (disabled) when: probability is 0.0
+/// (false/absent), OR `[tasks.chat_input_filter]` is absent, OR its
+/// `filter_prompt` is blank. The carried `probability` gates the per-turn run.
 pub fn resolve_input_filter(&self) -> Option<ResolvedInputFilter> {
     const FILTER_TASK: &str = "chat_input_filter";
-    if !self.input_filter_enabled() {
+    let probability = self.input_filter_probability();
+    if probability <= 0.0 {
         return None;
     }
     let task_cfg = self.tasks.get(FILTER_TASK)?;
@@ -206,6 +236,7 @@ pub fn resolve_input_filter(&self) -> Option<ResolvedInputFilter> {
         filter_prompt,
         retry_depth,
         reasoning: task_cfg.reasoning.clone(),
+        probability,
     })
 }
 ```
@@ -304,7 +335,14 @@ async fn run_input_filter(
 Near the top of `run_stream`, before prompt assembly, **for `UserMessage`-driven
 Reply turns only** (not gift / proactive):
 
-1. `let Some(f) = state.model_config.resolve_input_filter() else { /* skip */ }`.
+0. Skip on tipped turns (`user_msg.tips_amount_usd.is_some()`): a tip persists as
+   `role='gift_user'`, which `set_user_input_rewrite` can't update and the prompt
+   drops anyway — running the filter there is a wasted LLM call.
+1. `let Some(f) = state.model_config.resolve_input_filter()` then apply the
+   **per-turn probability gate**: keep `f` only when
+   `rand::thread_rng().gen::<f64>() < f.probability` (e.g. via `Option::filter`).
+   `true` ⇒ `probability = 1.0` ⇒ always; `0.8` ⇒ ~80%; `false` ⇒ resolve already
+   returned `None`. Skip otherwise.
 2. Build `recent_transcript` from a recent-history slice (reuse the history fetch
    `run_stream`/handlers already perform where practical; otherwise a small
    `history(session_id, K, 0)` slice).
@@ -449,9 +487,14 @@ The `pre_filter_content`, `filter_model`, `filter_triggers`, `f_generation_id`,
 ## 11. Testing
 
 **Unit (`model_config.rs`)**
-- `resolve_input_filter`: `None` when switch off / table absent / blank prompt;
-  `Some` with correct model/fallback (truncated to `retry_depth`)/prompt when on.
-- `input_filter_enabled`: default false; true when set.
+- `resolve_input_filter`: `None` when probability 0.0 / table absent / blank
+  prompt; `Some` with correct model/fallback (truncated to `retry_depth`)/prompt
+  /`probability` when on.
+- `InputFilterTrigger` parsing: `false`→0.0, `true`→1.0, `0.8`→0.8, integer
+  `0`/`1` accepted; out-of-range (`1.5`, `-0.2`, `2`, `nan`, `inf`) is a hard
+  load error.
+- `input_filter_enabled` / `input_filter_probability`: default 0.0/false; carry
+  the configured probability.
 - Compat fixture / committed-example parse test updated to include
   `chat_input_filter` + `input_filter` (schema lock).
 

@@ -377,11 +377,12 @@ pub struct TaskConfig {
     pub model_name_display_override: Option<DisplayOverride>,
     #[serde(default)]
     pub output_filter: Option<bool>,
-    /// Global switch for the user-input rewrite filter (chat_input_filter).
+    /// Global trigger for the user-input rewrite filter (chat_input_filter).
     /// Read ONLY on [tasks.chat_companion]; task-level, no per-tier override
-    /// (unlike `output_filter`). Default false.
+    /// (unlike `output_filter`). `false`/absent ⇒ off, `true` ⇒ every turn,
+    /// `0.8` ⇒ 80% of turns. See `InputFilterTrigger`.
     #[serde(default)]
-    pub input_filter: Option<bool>,
+    pub input_filter: Option<InputFilterTrigger>,
     /// System instruction sent to the filter LLM; the assistant reply to
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
@@ -455,10 +456,63 @@ pub struct ResolvedOutputFilter {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Per-turn trigger for the user-input rewrite filter (`input_filter` on
+/// `[tasks.chat_companion]`). Three TOML forms: `false` (never, probability
+/// 0.0), `true` (always, probability 1.0), or a number in `[0.0, 1.0]` (e.g.
+/// `0.8` ⇒ fire on ~80% of turns). A number outside `[0.0, 1.0]` (or non-finite)
+/// is a hard config error — the load fails loudly rather than silently clamping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputFilterTrigger(pub f64);
+
+impl<'de> Deserialize<'de> for InputFilterTrigger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TriggerVisitor;
+        impl<'de> serde::de::Visitor<'de> for TriggerVisitor {
+            type Value = InputFilterTrigger;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a bool, or a probability number in [0.0, 1.0]")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(InputFilterTrigger(if b { 1.0 } else { 0.0 }))
+            }
+            fn visit_f64<E>(self, x: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if x.is_finite() && (0.0..=1.0).contains(&x) {
+                    Ok(InputFilterTrigger(x))
+                } else {
+                    Err(E::custom(format!(
+                        "input_filter probability must be between 0.0 and 1.0, got {x}"
+                    )))
+                }
+            }
+            fn visit_i64<E>(self, x: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_f64(x as f64)
+            }
+            fn visit_u64<E>(self, x: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_f64(x as f64)
+            }
+        }
+        deserializer.deserialize_any(TriggerVisitor)
+    }
+}
+
 /// Resolved user-input rewrite filter (`chat_input_filter`). Mirrors
 /// `ResolvedOutputFilter` minus `trigger`/`timing` (the input filter has no
-/// triggers and no extract-timing). `fallback_model` is already truncated to
-/// `retry_depth`.
+/// extract-timing). `fallback_model` is already truncated to `retry_depth`.
 #[derive(Debug, Clone)]
 pub struct ResolvedInputFilter {
     pub model: String,
@@ -468,6 +522,10 @@ pub struct ResolvedInputFilter {
     pub filter_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Per-turn fire probability in `[0.0, 1.0]` (always > 0.0 here — a 0.0
+    /// trigger resolves to `None`). The stream wiring draws one coin flip per
+    /// turn and runs the filter LLM only when `draw < probability`.
+    pub probability: f64,
 }
 
 impl ModelConfig {
@@ -666,20 +724,30 @@ impl ModelConfig {
         })
     }
 
-    /// chat_companion task-level `input_filter` switch; no tier override. Default false.
-    pub fn input_filter_enabled(&self) -> bool {
+    /// chat_companion task-level `input_filter` fire probability; no tier
+    /// override. `false`/absent → 0.0, `true` → 1.0, number → that probability.
+    /// The per-turn coin flip happens in the stream wiring.
+    pub fn input_filter_probability(&self) -> f64 {
         self.tasks
             .get("chat_companion")
             .and_then(|t| t.input_filter)
-            .unwrap_or(false)
+            .map(|t| t.0)
+            .unwrap_or(0.0)
+    }
+
+    /// True when the input filter can ever fire (probability > 0.0).
+    pub fn input_filter_enabled(&self) -> bool {
+        self.input_filter_probability() > 0.0
     }
 
     /// Resolve the user-input rewrite filter. `None` (disabled) when:
-    /// chat_companion `input_filter` is false (task-level → false), OR `[tasks.chat_input_filter]`
-    /// is absent, OR its resolved `filter_prompt` is blank.
+    /// chat_companion `input_filter` probability is 0.0 (false/absent), OR
+    /// `[tasks.chat_input_filter]` is absent, OR its resolved `filter_prompt` is
+    /// blank. The carried `probability` gates the per-turn run in the wiring.
     pub fn resolve_input_filter(&self) -> Option<ResolvedInputFilter> {
         const FILTER_TASK: &str = "chat_input_filter";
-        if !self.input_filter_enabled() {
+        let probability = self.input_filter_probability();
+        if probability <= 0.0 {
             return None;
         }
         let task_cfg = self.tasks.get(FILTER_TASK)?;
@@ -699,6 +767,7 @@ impl ModelConfig {
             filter_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            probability,
         })
     }
 }
@@ -1126,7 +1195,7 @@ reasoning    = { enabled = false }
         );
 
         // chat_input_filter schema lock (input-filter feature).
-        assert_eq!(chat.input_filter, Some(true));
+        assert_eq!(chat.input_filter, Some(InputFilterTrigger(1.0)));
         let inf = cfg
             .resolve_input_filter()
             .expect("input filter resolves from fixture");
@@ -1134,6 +1203,7 @@ reasoning    = { enabled = false }
         assert_eq!(inf.retry_depth, 1);
         assert_eq!(inf.max_tokens, 400);
         assert_eq!(inf.filter_prompt, "Rewrite per policy.");
+        assert_eq!(inf.probability, 1.0);
     }
 
     #[test]
@@ -2057,6 +2127,7 @@ reasoning = { enabled = false }
         assert_eq!(f.filter_prompt, "REWRITE");
         assert_eq!(f.temperature, 0.3);
         assert_eq!(f.max_tokens, 400);
+        assert_eq!(f.probability, 1.0); // `input_filter = true` ⇒ always
         assert_eq!(
             f.reasoning,
             Some(ReasoningConfig {
@@ -2064,6 +2135,70 @@ reasoning = { enabled = false }
                 exclude: None
             })
         );
+    }
+
+    #[test]
+    fn input_filter_trigger_parses_three_forms() {
+        // false ⇒ probability 0.0 (disabled)
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 0.0);
+        assert!(!cfg.input_filter_enabled());
+
+        // true ⇒ 1.0
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 1.0);
+
+        // number ⇒ that probability
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.8\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 0.8);
+        assert!(cfg.input_filter_enabled());
+
+        // integer bounds 0 and 1 are accepted
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 1\n")
+                .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 1.0);
+    }
+
+    #[test]
+    fn input_filter_out_of_range_is_rejected() {
+        // > 1.0, < 0.0, and non-finite are hard config errors (not clamped).
+        for bad in ["1.5", "-0.2", "2", "nan", "inf"] {
+            let toml = format!("[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = {bad}\n");
+            assert!(
+                ModelConfig::from_toml_str(&toml).is_err(),
+                "input_filter = {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_input_filter_carries_probability_and_zero_disables() {
+        // 0.8 ⇒ Some with probability 0.8
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.8\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"REWRITE\"\n",
+        )
+        .unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.probability, 0.8);
+
+        // 0.0 ⇒ None (disabled), even with a valid filter table present
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.0\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"REWRITE\"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_input_filter().is_none());
     }
 
     #[test]

@@ -48,7 +48,7 @@ Field details:
 | `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. |
-| `tasks.chat_companion.input_filter` | `bool` | no | Global switch for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). Default `false`. See "`input_filter`". |
+| `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 | `tasks.<name>.dimensions` | `u32` | no | Embedding-only. Ignored by chat / insight tasks. |
 
@@ -191,10 +191,13 @@ when the frame is emitted.
 
 ### `input_filter` — user-input rewrite (chat task only)
 
-`input_filter` is a boolean flag on `[tasks.chat_companion]` (default `false`,
-task-level only — no per-tier override). When on, every user **Reply** turn is
-passed to a second LLM (`[tasks.chat_input_filter]`) BEFORE generation. The
-filter returns a JSON verdict:
+`input_filter` is a trigger on `[tasks.chat_companion]` (default `false`,
+task-level only — no per-tier override). It accepts a **bool or a probability**:
+`false` = off, `true` = every turn (= `1.0`), `0.8` = a per-turn coin flip that
+fires on ~80% of turns. A number outside `[0.0, 1.0]` (or non-finite) is rejected
+at config-load time. When it fires for a user **Reply** turn, that turn is passed
+to a second LLM (`[tasks.chat_input_filter]`) BEFORE generation. The filter
+returns a JSON verdict:
 
 - `{"rewrite": false}` — the input is meaningful; the engine uses it verbatim.
 - `{"rewrite": true, "content": "…", "reason": "…"}` — the input was meaningless
@@ -206,10 +209,11 @@ client. A rewrite is stored in `pre_filter_content` (model-facing only),
 model and memory recall see the effective text (`pre_filter_content ?? content`)
 for user rows; extraction (insight/memory/affinity) keeps reading the original.
 
-The filter runs only when BOTH `input_filter = true` AND `[tasks.chat_input_filter]`
-exists with a non-blank `filter_prompt`. It is **fail-open**: any error, timeout,
-unparseable verdict, or refusal leaves the original input untouched. Pick a fast,
-cheap model — it runs on every user turn before generation.
+The filter runs only when `input_filter` fires (`true`, or the per-turn draw
+passes its probability) AND `[tasks.chat_input_filter]` exists with a non-blank
+`filter_prompt`. It is **fail-open**: any error, timeout, unparseable verdict, or
+refusal leaves the original input untouched. Pick a fast, cheap model — at
+`input_filter = true` it runs on every user turn before generation.
 
 #### `[tasks.chat_input_filter]` fields
 

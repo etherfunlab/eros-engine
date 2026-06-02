@@ -1197,7 +1197,15 @@ pub fn run_stream(
                 // set_user_input_rewrite can't update and the prompt drops anyway —
                 // running the filter there is a wasted LLM call.
                 if !is_gift && user_msg.tips_amount_usd.is_none() {
-                    if let Some(f) = state.model_config.resolve_input_filter() {
+                    // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
+                    // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
+                    // is in [0,1), so `< 1.0` always fires); `false` ⇒ resolve
+                    // returns None and we never get here.
+                    if let Some(f) = state
+                        .model_config
+                        .resolve_input_filter()
+                        .filter(|f| rand::thread_rng().gen::<f64>() < f.probability)
+                    {
                         // Note: this issues its own small (8-row) history fetch;
                         // build_reply_request below fetches history again (20 rows).
                         // Two round-trips per reply turn — acceptable, not a hot loop.
