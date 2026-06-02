@@ -354,64 +354,6 @@
         ]
       }
     },
-    "/comp/chat/{session_id}/event/gift": {
-      "post": {
-        "tags": [
-          "companion"
-        ],
-        "summary": "Send a gift event to the session.",
-        "description": "Replaces the gateway's `tip` + `gift` endpoints. The OSS engine has\nno credit ledger / inventory, so the caller supplies the deltas\n(validated by client UX) and the optional human label. The route\ninserts a `gift_user` `chat_messages` row and applies the deltas via\n`AffinityRepo::persist_with_event` (which logs a `gift` row in\n`companion_affinity_events`). It deliberately does NOT call\n`pipeline::run` — the LLM-driven gift reaction reply is delegated to\nthe next user message turn so this route's HTTP+DB side-effects can\nbe exercised in tests without a live LLM.",
-        "operationId": "event_gift",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GiftEventBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GiftEventResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "not your session"
-          },
-          "404": {
-            "description": "session not found"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
     "/comp/chat/{session_id}/history": {
       "get": {
         "tags": [
@@ -1075,51 +1017,6 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
-          }
-        }
-      },
-      "GiftEventBody": {
-        "type": "object",
-        "description": "Body for `POST /comp/chat/{session_id}/event/gift`.\n\nReplaces the gateway's `tip` + `gift` endpoints. The OSS engine has\nno credit ledger, so the caller supplies the affinity deltas\ndirectly. `label` is the human-readable description (e.g. `\"rose\"`)\nand is also used as the `chat_messages.content` for the gift turn.",
-        "required": [
-          "deltas",
-          "metadata"
-        ],
-        "properties": {
-          "deltas": {
-            "$ref": "#/components/schemas/AffinityDeltasDto"
-          },
-          "label": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "metadata": {
-            "type": "object"
-          }
-        }
-      },
-      "GiftEventResponse": {
-        "type": "object",
-        "required": [
-          "applied_deltas"
-        ],
-        "properties": {
-          "applied_deltas": {
-            "$ref": "#/components/schemas/AffinityDeltasDto"
-          },
-          "relationship_label": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "reply": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
