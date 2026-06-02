@@ -1302,6 +1302,34 @@ pub fn run_stream(
             }
             ActionType::Reply | ActionType::GiftReaction => {
                 let is_gift = matches!(plan.action_type, ActionType::GiftReaction);
+                // ── Image describe (chat_vision) — Reply turns with an image ──
+                // Runs before the input filter; both may fire (orthogonal). The
+                // describe result is merged into metadata.vision; the prompt
+                // builder folds it via model_facing_user_text. Fail-open: any
+                // failure keeps the turn text-only (placeholder covers an
+                // undescribed image). Run-once is guaranteed by the upsert
+                // idempotency gate — run_stream only runs on a fresh Insert.
+                if !is_gift {
+                    if let (Some(image_url), Some(v)) = (
+                        user_msg.image_url.as_deref(),
+                        state.model_config.resolve_vision(),
+                    ) {
+                        if let Some(out) = run_vision(&state, &v, image_url, &user_msg.content).await
+                        {
+                            if let Err(e) = chat_repo
+                                .set_user_image_vision(
+                                    user_msg.user_message_id,
+                                    &out.vision,
+                                    &out.vision_model,
+                                    out.v_generation_id.as_deref(),
+                                )
+                                .await
+                            {
+                                tracing::warn!("stream: chat_vision metadata persist failed: {e}");
+                            }
+                        }
+                    }
+                }
                 // ── User-input rewrite filter (Reply turns only) ──────────────
                 // Runs after the idempotency gate, before prompt assembly. The
                 // rewrite is persisted on the user row's pre_filter_content;
