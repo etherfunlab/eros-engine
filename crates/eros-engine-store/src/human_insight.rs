@@ -235,6 +235,9 @@ mod tests {
     fn project_columns_missing_fields_are_null_and_empty() {
         let c = project_columns(&serde_json::json!({}));
         assert_eq!(c.city, None);
+        assert_eq!(c.location, None);
+        assert_eq!(c.hometown, None);
+        assert_eq!(c.nationality, None);
         assert_eq!(c.preferred_gender, None);
         assert_eq!(c.age_min, None);
         assert_eq!(c.age_max, None);
