@@ -262,4 +262,33 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 0);
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0025_creates_events_table_and_affinity_audit_cols(pool: PgPool) {
+        // companion_insights_events exists with every column.
+        sqlx::query(
+            "INSERT INTO engine.companion_insights_events \
+               (run_id, user_id, session_id, message_id, stage, status, payload, model, usage, generation_id) \
+             VALUES ($1,$2,$3,$4,'facts','ok','[]'::jsonb,'m','{}'::jsonb,'g')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("insert into companion_insights_events");
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine.companion_insights_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // companion_affinity_events now has the audit trio (select compiles ⇒ columns exist).
+        let _ = sqlx::query("SELECT model, usage, generation_id FROM engine.companion_affinity_events")
+            .fetch_all(&pool)
+            .await
+            .expect("affinity audit columns exist");
+    }
 }
