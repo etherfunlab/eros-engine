@@ -61,6 +61,12 @@ pub struct ChatMessage {
     /// pre-OUTPUT-filter original) — see chat_input_filter design.
     #[serde(default)]
     pub pre_filter_content: Option<String>,
+    /// Freeform per-row metadata (JSONB). Carries tip amount + raw scopes and,
+    /// for image turns, `image_url` plus the `chat_vision` describe result under
+    /// `vision`. Nullable in the table ⇒ `Option`. Exposed so the pipeline can
+    /// read `metadata.vision` when rendering model-facing user text.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -568,6 +574,34 @@ impl<'a> ChatRepo<'a> {
         .bind(filter_model)
         .bind(filter_triggers)
         .bind(f_generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Merge a `chat_vision` describe result into a `role='user'` row's
+    /// metadata. Top-level JSONB merge; `COALESCE` handles a NULL metadata
+    /// column. Leaves `content`, `pre_filter_content`, and existing keys (e.g.
+    /// `image_url`) intact.
+    pub async fn set_user_image_vision(
+        &self,
+        user_message_id: Uuid,
+        vision: &serde_json::Value,
+        vision_model: &str,
+        generation_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let patch = serde_json::json!({
+            "vision": vision,
+            "vision_model": vision_model,
+            "vision_generation_id": generation_id,
+        });
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata, '{}'::jsonb) || $2 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(patch)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -1943,5 +1977,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_row_exposes_metadata_column(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let meta = serde_json::json!({ "image_url": "https://x/y.png" });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "hi",
+            "01J0000000000000000000000A",
+            "user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].metadata.as_ref().unwrap()["image_url"],
+            "https://x/y.png"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_image_vision_merges_and_preserves(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let seed = serde_json::json!({ "image_url": "https://x/y.png" });
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "",
+                "01J000000000000000000VISION",
+                "user",
+                Some(&seed),
+            )
+            .await
+            .unwrap();
+        let uid = match outcome {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let vision = serde_json::json!({
+            "description": "a cat", "ocr_text": "", "people": "", "scene": "indoors"
+        });
+        repo.set_user_image_vision(uid, &vision, "vision-model", Some("gen-1"))
+            .await
+            .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        let meta = rows[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["image_url"], "https://x/y.png"); // preserved
+        assert_eq!(meta["vision"]["description"], "a cat");
+        assert_eq!(meta["vision_model"], "vision-model");
+        assert_eq!(meta["vision_generation_id"], "gen-1");
+        assert_eq!(rows[0].content, ""); // untouched
     }
 }

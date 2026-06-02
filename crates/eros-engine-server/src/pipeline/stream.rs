@@ -807,6 +807,123 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
         })
 }
 
+/// Fixed schema the `chat_vision` describe model must emit. `description` is
+/// required; the optional fields are dropped from the injected preamble when
+/// blank (see `model_facing_user_text`).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ImageVision {
+    description: String,
+    #[serde(default)]
+    ocr_text: Option<String>,
+    #[serde(default)]
+    people: Option<String>,
+    #[serde(default)]
+    scene: Option<String>,
+}
+
+/// Parse the describe reply: direct JSON first, then a balanced JSON block
+/// embedded in prose (mirrors `parse_input_filter_verdict`).
+fn parse_image_vision(text: &str) -> Option<ImageVision> {
+    serde_json::from_str::<ImageVision>(text).ok().or_else(|| {
+        super::post_process::find_json_block(text)
+            .and_then(|b| serde_json::from_str::<ImageVision>(b).ok())
+    })
+}
+
+/// Validity gate for a parsed describe. Reject a `content_filter` finish reason,
+/// a blank `description`, or a refusal-shaped description.
+fn image_vision_invalidity(v: &ImageVision, finish_reason: Option<&str>) -> Option<&'static str> {
+    if finish_reason == Some("content_filter") {
+        return Some("content_filter");
+    }
+    if v.description.trim().is_empty() {
+        return Some("blank_description");
+    }
+    if refusal_in_head(&v.description) {
+        return Some("refusal_pattern");
+    }
+    None
+}
+
+/// Outcome of a successful describe — the JSON to persist + audit.
+struct VisionOutcome {
+    vision: serde_json::Value,
+    vision_model: String,
+    v_generation_id: Option<String>,
+}
+
+/// Run the `chat_vision` describe over the image. Returns `Some(VisionOutcome)`
+/// only on a valid parse. Walks the configured model chain, trying the next model
+/// on any failure (transport, timeout, empty, unparseable, invalid); returns Some
+/// only on a valid describe. Any failure keeps the turn text-only and the
+/// placeholder path covers the undescribed image. Each call passes a single model
+/// (no internal fallback) so content-level failures also advance the chain.
+async fn run_vision(
+    state: &AppState,
+    v: &eros_engine_llm::model_config::ResolvedVision,
+    image_url: &str,
+    caption: &str,
+) -> Option<VisionOutcome> {
+    use eros_engine_llm::openrouter::VisionRequest;
+    let caption = caption.trim();
+    // Walk [primary, ...fallback] ourselves so a content-level failure (empty /
+    // unparseable / invalid describe) advances to the next model — execute_vision
+    // only walks the chain on transport/HTTP/decode errors, and it cannot know the
+    // ImageVision schema. Each call passes a SINGLE model (no internal fallback).
+    let chain: Vec<String> = std::iter::once(v.model.clone())
+        .chain(v.fallback_model.iter().cloned())
+        .collect();
+    for model_id in &chain {
+        let req = VisionRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            system_prompt: v.describe_prompt.clone(),
+            image_url: image_url.to_string(),
+            caption: (!caption.is_empty()).then(|| caption.to_string()),
+            temperature: v.temperature as f32,
+            max_tokens: v.max_tokens,
+            reasoning: v.reasoning.clone(),
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "chat_vision: model error; next");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "chat_vision: timeout; next");
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_vision", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "chat_vision: empty reply; next");
+            continue;
+        }
+        let vision = match parse_image_vision(&text) {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
+                continue;
+            }
+        };
+        if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
+            tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
+            continue;
+        }
+        let vision_model = resp.model.unwrap_or_else(|| model_id.clone());
+        return Some(VisionOutcome {
+            vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
+            vision_model,
+            v_generation_id: resp.generation_id,
+        });
+    }
+    None
+}
+
 /// Validity gate for an INPUT rewrite's `content`. Unlike
 /// `filter_output_invalidity`, there is NO minimum-length floor — a rewritten
 /// user message is naturally short (often < 80 chars). Only a `content_filter`
@@ -1090,6 +1207,9 @@ pub struct PersistedUserMessage {
     pub memory_scope: eros_engine_core::scope::MemoryScope,
     pub affinity_scope: eros_engine_core::scope::AffinityScope,
     pub tips_amount_usd: Option<f64>,
+    /// The image URL the client attached to this turn (`https`/`http`), or
+    /// `None` for a text/tip-only turn. Drives the `chat_vision` pre-stage.
+    pub image_url: Option<String>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -1194,6 +1314,37 @@ pub fn run_stream(
             }
             ActionType::Reply | ActionType::GiftReaction => {
                 let is_gift = matches!(plan.action_type, ActionType::GiftReaction);
+                // ── Image describe (chat_vision) — Reply turns with an image ──
+                // Runs before the input filter; both may fire (orthogonal). The
+                // describe result is merged into metadata.vision; the prompt
+                // builder folds it via model_facing_user_text. Fail-open: any
+                // failure keeps the turn text-only (placeholder covers an
+                // undescribed image). Run-once is guaranteed by the upsert
+                // idempotency gate — run_stream only runs on a fresh Insert.
+                // Skip tipped turns (same as the input filter): a tip persists as
+                // role='gift_user', which set_user_image_vision can't update and
+                // the prompt drops anyway — describing it would waste the call.
+                if !is_gift && user_msg.tips_amount_usd.is_none() {
+                    if let (Some(image_url), Some(v)) = (
+                        user_msg.image_url.as_deref(),
+                        state.model_config.resolve_vision(),
+                    ) {
+                        if let Some(out) = run_vision(&state, &v, image_url, &user_msg.content).await
+                        {
+                            if let Err(e) = chat_repo
+                                .set_user_image_vision(
+                                    user_msg.user_message_id,
+                                    &out.vision,
+                                    &out.vision_model,
+                                    out.v_generation_id.as_deref(),
+                                )
+                                .await
+                            {
+                                tracing::warn!("stream: chat_vision metadata persist failed: {e}");
+                            }
+                        }
+                    }
+                }
                 // ── User-input rewrite filter (Reply turns only) ──────────────
                 // Runs after the idempotency gate, before prompt assembly. The
                 // rewrite is persisted on the user row's pre_filter_content;
@@ -1735,6 +1886,7 @@ mod tests {
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -1779,6 +1931,7 @@ mod tests {
             generation_id: Some("gen-1".into()),
             assistant_action_type: Some("reply".into()),
             pre_filter_content: None,
+            metadata: None,
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -1867,6 +2020,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -1950,6 +2104,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2049,6 +2204,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2084,6 +2240,7 @@ data: [DONE]\n\n";
             generation_id: None,
             assistant_action_type: Some("reply".into()),
             pre_filter_content: None,
+            metadata: None,
         };
 
         let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {
@@ -2362,6 +2519,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2484,6 +2642,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2619,6 +2778,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2769,6 +2929,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2881,6 +3042,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -2974,6 +3136,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(20.0),
+                image_url: None,
             },
         )
         .collect()
@@ -3079,6 +3242,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3186,6 +3350,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3312,6 +3477,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3511,6 +3677,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3653,6 +3820,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                image_url: None,
             },
         )
         .collect()
@@ -3683,5 +3851,62 @@ data: [DONE]\n\n";
             "malformed primary verdict must keep original (no fallback walk); got {pre:?}"
         );
         assert!(fmodel.is_none(), "no filter model stamped; got {fmodel:?}");
+    }
+
+    #[test]
+    fn parse_image_vision_direct_json() {
+        let v = parse_image_vision(r#"{"description":"a cat","ocr_text":"hi"}"#).unwrap();
+        assert_eq!(v.description, "a cat");
+        assert_eq!(v.ocr_text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_image_vision_embedded_block() {
+        let v = parse_image_vision("noise {\"description\":\"dog\"} tail").unwrap();
+        assert_eq!(v.description, "dog");
+    }
+
+    #[test]
+    fn image_vision_invalidity_flags_blank_and_filter() {
+        let blank = ImageVision {
+            description: "  ".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(
+            image_vision_invalidity(&blank, None),
+            Some("blank_description")
+        );
+        let ok = ImageVision {
+            description: "x".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(
+            image_vision_invalidity(&ok, Some("content_filter")),
+            Some("content_filter")
+        );
+        assert_eq!(image_vision_invalidity(&ok, None), None);
+
+        // content_filter early-return wins over blank_description.
+        assert_eq!(
+            image_vision_invalidity(&blank, Some("content_filter")),
+            Some("content_filter"), // content_filter wins over blank_description
+        );
+
+        // Refusal-shaped description is rejected as refusal_pattern.
+        // String reused from `rewrite_content_invalidity_rejects_refusal_and_content_filter`.
+        let refusal = ImageVision {
+            description: "对不起，我无法满足你的要求".into(),
+            ocr_text: None,
+            people: None,
+            scene: None,
+        };
+        assert_eq!(
+            image_vision_invalidity(&refusal, None),
+            Some("refusal_pattern")
+        );
     }
 }
