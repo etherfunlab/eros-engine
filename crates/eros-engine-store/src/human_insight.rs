@@ -14,6 +14,9 @@ use uuid::Uuid;
 #[derive(Debug, Default, PartialEq)]
 pub struct ProjectedColumns {
     pub city: Option<String>,
+    pub location: Option<String>,
+    pub hometown: Option<String>,
+    pub nationality: Option<String>,
     pub occupation: Option<String>,
     pub mbti_guess: Option<String>,
     pub love_values: Option<String>,
@@ -75,6 +78,9 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
     let (age_min, age_max) = parse_age_range(prefs);
     ProjectedColumns {
         city: str_field(insights, "city"),
+        location: str_field(insights, "location"),
+        hometown: str_field(insights, "hometown"),
+        nationality: str_field(insights, "nationality"),
         occupation: str_field(insights, "occupation"),
         mbti_guess: str_field(insights, "mbti_guess"),
         love_values: str_field(insights, "love_values"),
@@ -95,6 +101,9 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
 pub struct HumanInsightsRow {
     pub user_id: Uuid,
     pub city: Option<String>,
+    pub location: Option<String>,
+    pub hometown: Option<String>,
+    pub nationality: Option<String>,
     pub occupation: Option<String>,
     pub mbti_guess: Option<String>,
     pub love_values: Option<String>,
@@ -127,8 +136,8 @@ impl<'a> HumanInsightRepo<'a> {
             "INSERT INTO engine.human_insights \
                 (user_id, city, occupation, mbti_guess, love_values, emotional_needs, \
                  life_rhythm, interests, personality_traits, preferred_gender, \
-                 age_min, age_max, deal_breakers) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 age_min, age_max, deal_breakers, location, hometown, nationality) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (user_id) DO UPDATE SET \
                  city               = EXCLUDED.city, \
                  occupation         = EXCLUDED.occupation, \
@@ -142,6 +151,9 @@ impl<'a> HumanInsightRepo<'a> {
                  age_min            = EXCLUDED.age_min, \
                  age_max            = EXCLUDED.age_max, \
                  deal_breakers      = EXCLUDED.deal_breakers, \
+                 location           = EXCLUDED.location, \
+                 hometown           = EXCLUDED.hometown, \
+                 nationality        = EXCLUDED.nationality, \
                  updated_at         = now()",
         )
         .bind(user_id)
@@ -157,6 +169,9 @@ impl<'a> HumanInsightRepo<'a> {
         .bind(c.age_min)
         .bind(c.age_max)
         .bind(c.deal_breakers)
+        .bind(c.location)
+        .bind(c.hometown)
+        .bind(c.nationality)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -202,6 +217,18 @@ mod tests {
         assert_eq!(c.age_min, Some(18));
         assert_eq!(c.age_max, Some(30));
         assert_eq!(c.deal_breakers, vec!["smoking"]);
+    }
+
+    #[test]
+    fn project_columns_geo_fields() {
+        let v = serde_json::json!({
+            "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
+        });
+        let c = project_columns(&v);
+        assert_eq!(c.city.as_deref(), Some("深圳"));
+        assert_eq!(c.location.as_deref(), Some("台北"));
+        assert_eq!(c.hometown.as_deref(), Some("新界"));
+        assert_eq!(c.nationality.as_deref(), Some("中国香港"));
     }
 
     #[test]
@@ -285,6 +312,25 @@ mod tests {
         assert_eq!(row.interests, vec!["a", "b"]);
         assert_eq!(row.personality_traits, vec!["x"]);
         assert_eq!(row.deal_breakers, vec!["d1", "d2"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn geo_fields_roundtrip(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        repo.project_from_insights(
+            user_id,
+            &serde_json::json!({
+                "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
+            }),
+        )
+        .await
+        .unwrap();
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(row.city.as_deref(), Some("深圳"));
+        assert_eq!(row.location.as_deref(), Some("台北"));
+        assert_eq!(row.hometown.as_deref(), Some("新界"));
+        assert_eq!(row.nationality.as_deref(), Some("中国香港"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
