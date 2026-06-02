@@ -682,7 +682,9 @@ async fn extract_facts(
         return (vec![], None);
     }
     let Some(resolved) = model_config.resolve_insight_extract() else {
-        // Boot gate (main.rs) guarantees this is Some in production; skip defensively.
+        // Defensive skip: production configs always set insight_extraction.filter_prompt
+        // (enforced by the boot gate added in this change set — see main.rs). Without it
+        // there is no instruction to extract with, so do nothing rather than guess.
         return (vec![], None);
     };
 
