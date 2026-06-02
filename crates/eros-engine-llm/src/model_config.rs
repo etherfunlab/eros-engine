@@ -542,6 +542,22 @@ pub struct ResolvedVision {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
+/// The configured `filter_prompt` is the system instruction; the server assembles
+/// the conversation as a separate user message. Model selection mirrors the generic
+/// `resolve()` exactly (this only adds the prompt), so call-site behaviour is unchanged
+/// apart from the system/user split.
+#[derive(Debug, Clone)]
+pub struct ResolvedExtract {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub extract_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
@@ -809,6 +825,39 @@ impl ModelConfig {
             describe_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// Resolve the insight-extraction (facts stage) prompt bundle. `None` when
+    /// `[tasks.insight_extraction]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_insight_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("insight_extraction")
+    }
+
+    /// Resolve the memory-extraction prompt bundle. `None` when
+    /// `[tasks.memory_extraction]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_memory_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("memory_extraction")
+    }
+
+    /// Shared resolver for the config-driven extraction prompts. Mirrors
+    /// `resolve_vision` but takes model/fallback/temp/max_tokens/reasoning/retry_depth
+    /// straight from `resolve()` so the call site keeps today's selection semantics.
+    fn resolve_extract(&self, task: &str) -> Option<ResolvedExtract> {
+        let task_cfg = self.tasks.get(task)?;
+        let extract_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if extract_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve(task, None);
+        Some(ResolvedExtract {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            extract_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
         })
     }
 }
@@ -2312,5 +2361,62 @@ retry_depth = 0
         let r = cfg.resolve_vision().expect("vision resolves");
         assert_eq!(r.retry_depth, 0);
         assert!(r.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_insight_extract_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_insight_extract_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_insight_extract_some_carries_prompt_and_model() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfilter_prompt = \"extract user facts\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_insight_extract().expect("resolves");
+        assert_eq!(r.model, "ins/m");
+        assert_eq!(r.extract_prompt, "extract user facts");
+    }
+
+    #[test]
+    fn resolve_memory_extract_some_and_none() {
+        let none =
+            ModelConfig::from_toml_str("[tasks.memory_extraction]\nmodel = \"m\"\n").unwrap();
+        assert!(none.resolve_memory_extract().is_none());
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.memory_extraction]\nmodel = \"mem/m\"\nfilter_prompt = \"extract memories\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_memory_extract().expect("resolves");
+        assert_eq!(r.model, "mem/m");
+        assert_eq!(r.extract_prompt, "extract memories");
+    }
+
+    #[test]
+    fn resolve_extract_keeps_resolve_default_retry_depth() {
+        // Deliberate behavior-preserving choice: extraction tasks are pre-existing
+        // and inherit resolve()'s default retry_depth (2) — they do NOT cap at 1
+        // like the newer chat_vision / chat_input_filter features. This pins that
+        // so a future refactor toward the vision pattern can't silently halve the
+        // extraction fallback chain.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"f1\", \"f2\"]\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_insight_extract().expect("resolves");
+        assert_eq!(r.retry_depth, 2);
+        assert_eq!(r.fallback_model, vec!["f1".to_string(), "f2".to_string()]);
     }
 }

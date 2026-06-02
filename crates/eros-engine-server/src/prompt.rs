@@ -14,7 +14,7 @@
 //!    - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
 //!      JSONB instead of a flat `CompanionPersona` DTO
 //!
-//! 2. **Insight extraction prompts** (`extract_facts_prompt`,
+//! 2. **Insight extraction prompts** (`facts_user_message`,
 //!    `extract_structured_insights_prompt`) — drive the post-process
 //!    `companion_insights` pipeline. The schema description constant
 //!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
@@ -575,13 +575,7 @@ pub fn build_prompt(
 // These were inline `format!()` blocks inside `pipeline/post_process.rs`
 // until 2026-05-08 — moved here so all LLM prompt strings live in one
 // module and future syncs from the closed-source `eros-gateway/src/ai/
-// prompts.rs` have a clear destination. String contents are byte-identical
-// to the previous inline versions; this is a pure relocation refactor.
-//
-// Note: the second prompt mixes Traditional Chinese with the rest of the
-// codebase's Simplified Chinese — that's a copy-paste artefact from the
-// gateway. Not normalised here because changing prompt strings can shift
-// LLM behaviour subtly; treat as a separate i18n cleanup ticket.
+// prompts.rs` have a clear destination.
 
 /// Schema description used in `extract_structured_insights_prompt`. Mirrors
 /// the JSONB shape that `InsightRepo::merge` accepts, with each field's
@@ -589,13 +583,16 @@ pub fn build_prompt(
 pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
 companion_insights schema (all fields optional, only include if confident):
 {
-  "city": "string — user's city",
+  "city": "string — 常住城市（用户长期居住的城市）",
+  "location": "string — 目前所在地（用户此刻所在的城市/地点，如出差、旅游）",
+  "hometown": "string — 老家（用户的籍贯 / 出生成长地）",
+  "nationality": "string — 国籍",
   "occupation": "string — job/career",
   "mbti_guess": "string — e.g. INFP",
   "love_values": "string — attitude toward love & relationships",
   "interests": ["list", "of", "hobbies"],
   "emotional_needs": "string — what emotional support they need",
-  "life_rhythm": "string — e.g. 夜貓子, 早睡早起",
+  "life_rhythm": "string — e.g. 夜猫子, 早睡早起",
   "matching_preferences": {
     "preferred_gender": "string",
     "age_range": [min_int, max_int],
@@ -603,55 +600,25 @@ companion_insights schema (all fields optional, only include if confident):
   },
   "personality_traits": ["list", "of", "traits"]
 }
+地理字段示例：一个在深圳工作的香港新界人到台北旅游 → city=深圳, location=台北, hometown=新界, nationality=中国香港
 Return ONLY a JSON object with the fields you are confident about.
 Do not invent or guess anything not clearly supported by the facts.
 "#;
 
-/// Stage-1 insight extraction prompt: ask the LLM to mine fresh user
-/// facts from a single chat turn. Output expected as
-/// `{"facts": ["...", "..."]}` — the inline parse in `extract_facts`
-/// (`post_process.rs`) handles the fenced / wrapped JSON fallback.
-pub fn extract_facts_prompt(user_msg: &str, assistant_msg: &str) -> String {
-    format!(
-        "分析以下一轮对话，列出你对用户的新事实发现（仅限用户，不是 AI）。\n\n\
-         用户: {user_msg}\n\
-         AI:   {assistant_msg}\n\n\
-         如果没有新的用户事实，返回空数组 []。\n\
-         严格输出 JSON，格式: {{\"facts\": [\"事实1\", \"事实2\"]}}",
-    )
+/// Build the *user* message for the facts-extraction call: just the turn,
+/// labelled. The instruction (with the anti-attribution clause) is the system
+/// message, sourced from `insight_extraction.filter_prompt` in model_config.toml.
+pub fn facts_user_message(user_msg: &str, assistant_msg: &str) -> String {
+    format!("用户: {user_msg}\nAI:   {assistant_msg}")
 }
 
-/// Session-end memory extraction prompt: feed the LLM all turns from a
-/// finished (idle) session and ask it to emit 0-N memory candidates with
-/// a category tag. Output expected as
-/// `{"memories": [{"content": "...", "category": "fact"}, ...]}` —
-/// `parse_memory_candidates` in `pipeline::dreaming` handles the
-/// fenced-JSON fallback the same way `extract_facts` does.
-///
-/// `turns` is the chronologically ordered list of `用户：X / AI：Y` lines
-/// (or whatever pre-format the caller chose); the prompt does not assume
-/// a specific shape beyond "this is the conversation".
-pub fn extract_memories_prompt(turns: &[String]) -> String {
-    let convo = turns.join("\n");
-    format!(
-        "下面是一段已经结束的对话。提取 0-10 条值得长期记住的关于「用户」的记忆条目，\
-         每条带一个 category 标签。\n\n\
-         category 取值（只能用这五种之一）：\n\
-         - fact: 客观事实，如住在哪、做什么工作、家庭状况\n\
-         - preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味\n\
-         - event: 发生的事件，如最近发生了什么、经历过什么\n\
-         - emotion: 情绪/心理状态，如对某事的感受、长期心理倾向\n\
-         - relation: 与他人的关系，如朋友、家人、同事\n\n\
-         过滤规则：\n\
-         - 只记关于用户的，不记关于 AI 的\n\
-         - 不记 AI 单方面的回复内容\n\
-         - 不记一次性的寒暄、玩笑\n\
-         - 同一事实合并成一条，不要重复\n\
-         - 没有任何值得记的就返回空数组\n\n\
-         对话：\n{convo}\n\n\
-         严格输出 JSON，格式：\
-         {{\"memories\": [{{\"content\": \"...\", \"category\": \"fact\"}}]}}",
-    )
+/// Build the *user* message for the memory-extraction call: the chronologically
+/// ordered `用户：X / AI：Y` lines joined as the conversation. The instruction
+/// (categories, filter rules, anti-attribution clause, output format) is the
+/// system message, sourced from `memory_extraction.filter_prompt` in
+/// model_config.toml.
+pub fn memories_user_message(turns: &[String]) -> String {
+    turns.join("\n")
 }
 
 /// Stage-2 insight extraction prompt: take the bullet list of facts mined
@@ -672,13 +639,14 @@ pub fn extract_structured_insights_prompt(
         .unwrap_or_else(|| "{}".into());
 
     format!(
-        "以下是從對話中提取的用戶事實：\n\
+        "以下是从对话中提取的【用户】事实：\n\
          {facts_str}\n\n\
-         現有的 companion_insights（供參考，不要重複已知信息）：\n\
+         现有的用户画像（companion_insights，供参考，不要重复已知信息）：\n\
          {existing_str}\n\n\
-         請根據上方的事實，填充以下 schema 中你有信心的字段：\n\
+         请根据上方的【用户事实】，填充以下 schema 中你有信心的字段。\
+         schema 描述的是【真人用户】本人——occupation、city、location 等都指用户，绝不是 AI 伴侣：\n\
          {COMPANION_INSIGHTS_SCHEMA}\n\n\
-         僅輸出 JSON，不要任何解釋。",
+         仅输出 JSON，不要任何解释。",
     )
 }
 
@@ -1368,12 +1336,10 @@ mod tests {
     // ─── Insight prompt tests ──────────────────────────────────────
 
     #[test]
-    fn extract_facts_prompt_embeds_both_turns_verbatim() {
-        let p = extract_facts_prompt("我住在上海", "嗯嗯，魔都人");
+    fn facts_user_message_embeds_both_turns_verbatim() {
+        let p = facts_user_message("我住在上海", "嗯嗯，魔都人");
         assert!(p.contains("用户: 我住在上海"));
         assert!(p.contains("AI:   嗯嗯，魔都人"));
-        // Output schema instruction must be present.
-        assert!(p.contains(r#"{"facts": ["事实1", "事实2"]}"#));
     }
 
     #[test]
@@ -1395,6 +1361,15 @@ mod tests {
         // Pretty-printed existing object should appear in the prompt.
         assert!(p.contains("\"city\": \"Shanghai\""));
         assert!(p.contains("\"mbti_guess\": \"INFP\""));
+    }
+
+    #[test]
+    fn extract_structured_insights_prompt_schema_includes_geo_fields() {
+        // The embedded schema must carry the geo cluster so the model can fill them.
+        let p = extract_structured_insights_prompt(&["住在上海".to_string()], None);
+        assert!(p.contains("location"));
+        assert!(p.contains("hometown"));
+        assert!(p.contains("nationality"));
     }
 
     fn make_affinity(

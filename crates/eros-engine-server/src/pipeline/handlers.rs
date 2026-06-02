@@ -444,6 +444,9 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
     };
 
     push_str(&mut out, "city", "城市");
+    push_str(&mut out, "location", "所在地");
+    push_str(&mut out, "hometown", "老家");
+    push_str(&mut out, "nationality", "国籍");
     push_str(&mut out, "occupation", "职业");
     push_str(&mut out, "mbti_guess", "MBTI");
     push_str(&mut out, "love_values", "感情观");
@@ -487,6 +490,9 @@ fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<S
     let intimate = matches!(mode, InsightMode::Full);
 
     push_str(&mut out, &row.city, "城市");
+    push_str(&mut out, &row.location, "所在地");
+    push_str(&mut out, &row.hometown, "老家");
+    push_str(&mut out, &row.nationality, "国籍");
     push_str(&mut out, &row.occupation, "职业");
     push_str(&mut out, &row.mbti_guess, "MBTI");
     if intimate {
@@ -1278,6 +1284,9 @@ mod tests {
         HumanInsightsRow {
             user_id: Uuid::new_v4(),
             city: Some("上海".into()),
+            location: None,
+            hometown: None,
+            nationality: None,
             occupation: Some("设计师".into()),
             mbti_guess: Some("INFP".into()),
             love_values: Some("慢热".into()),
@@ -1347,6 +1356,68 @@ mod tests {
         });
         assert_eq!(
             human_insights_to_bullets(&row, InsightMode::Full),
+            insights_to_bullets(&equivalent)
+        );
+    }
+
+    fn sample_geo_row() -> HumanInsightsRow {
+        HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: Some("深圳".into()),
+            location: Some("台北".into()),
+            hometown: Some("新界".into()),
+            nationality: Some("中国香港".into()),
+            occupation: None,
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec![],
+            personality_traits: vec![],
+            preferred_gender: None,
+            age_min: None,
+            age_max: None,
+            deal_breakers: vec![],
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn human_insights_renders_geo_cluster_in_both_modes() {
+        for mode in [InsightMode::Full, InsightMode::Neutral] {
+            let bullets = human_insights_to_bullets(&sample_geo_row(), mode);
+            assert_eq!(
+                bullets,
+                vec!["城市：深圳", "所在地：台北", "老家：新界", "国籍：中国香港"]
+            );
+        }
+    }
+
+    #[test]
+    fn insights_to_bullets_renders_geo_after_city() {
+        let v = serde_json::json!({
+            "city": "深圳", "location": "台北", "hometown": "新界",
+            "nationality": "中国香港", "occupation": "工程师"
+        });
+        assert_eq!(
+            insights_to_bullets(&v),
+            vec![
+                "城市：深圳",
+                "所在地：台北",
+                "老家：新界",
+                "国籍：中国香港",
+                "职业：工程师"
+            ]
+        );
+    }
+
+    #[test]
+    fn human_insights_geo_matches_companion_insights_renderer() {
+        let equivalent = serde_json::json!({
+            "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
+        });
+        assert_eq!(
+            human_insights_to_bullets(&sample_geo_row(), InsightMode::Full),
             insights_to_bullets(&equivalent)
         );
     }
