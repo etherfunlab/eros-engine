@@ -29,6 +29,7 @@ use crate::state::AppState;
 
 const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
+const MAX_IMAGE_URL_LEN: usize = 2048;
 const MAX_TIP_USD: f64 = 1_000_000.0;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
@@ -85,6 +86,8 @@ pub struct StreamSendRequest {
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
     pub tips_amount_usd: Option<f64>,
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -99,8 +102,8 @@ pub struct StreamPreErrorBody {
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip is attached (a tip is a button tap).
-    if req.content.is_empty() && req.tips_amount_usd.is_none() {
+    // Content may be empty only when a tip or an image is attached.
+    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -165,6 +168,19 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                 code: "invalid_payload",
                 message: format!("tier must match [a-z0-9_]{{1,{MAX_TIER_LEN}}}"),
                 user_message: "请求无效".into(),
+                original_user_message_id: None,
+            }));
+        }
+    }
+    if let Some(url) = req.image_url.as_deref() {
+        let ok = url.len() <= MAX_IMAGE_URL_LEN
+            && (url.starts_with("https://") || url.starts_with("http://"));
+        if !ok {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: format!("image_url must be http(s) and <= {MAX_IMAGE_URL_LEN} chars"),
+                user_message: "图片链接无效".into(),
                 original_user_message_id: None,
             }));
         }
@@ -430,6 +446,7 @@ mod tests {
             memory_scope: None,
             affinity_scope: None,
             tips_amount_usd: None,
+            image_url: None,
         }
     }
 
@@ -443,6 +460,7 @@ mod tests {
             memory_scope: None,
             affinity_scope: None,
             tips_amount_usd: amount,
+            image_url: None,
         }
     }
 
@@ -787,5 +805,70 @@ mod tests {
             stored.is_none(),
             "metadata must be NULL when no fields present"
         );
+    }
+}
+
+#[cfg(test)]
+mod validate_payload_tests {
+    use super::*;
+
+    fn base() -> StreamSendRequest {
+        StreamSendRequest {
+            content: "hi".into(),
+            client_msg_id: "01J0000000000000000000000A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: None,
+            memory_scope: None,
+            affinity_scope: None,
+            tips_amount_usd: None,
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn empty_content_ok_with_image() {
+        let mut r = base();
+        r.content = String::new();
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn empty_content_rejected_without_image_or_tip() {
+        let mut r = base();
+        r.content = String::new();
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn bad_image_url_scheme_rejected() {
+        let mut r = base();
+        r.image_url = Some("ftp://x/y.png".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn good_https_image_url_ok() {
+        let mut r = base();
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn http_scheme_image_url_ok() {
+        let mut r = base();
+        r.image_url = Some("http://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn over_length_image_url_rejected() {
+        let mut r = base();
+        // 2048 is the max; build a URL longer than that.
+        let long = format!("https://x/{}", "a".repeat(MAX_IMAGE_URL_LEN));
+        assert!(long.len() > MAX_IMAGE_URL_LEN);
+        r.image_url = Some(long);
+        assert!(validate_payload(&r).is_err());
     }
 }
