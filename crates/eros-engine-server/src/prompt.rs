@@ -589,13 +589,16 @@ pub fn build_prompt(
 pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
 companion_insights schema (all fields optional, only include if confident):
 {
-  "city": "string — user's city",
+  "city": "string — 常住城市（用户长期居住的城市）",
+  "location": "string — 目前所在地（用户此刻所在的城市/地点，如出差、旅游）",
+  "hometown": "string — 老家（用户的籍贯 / 出生成长地）",
+  "nationality": "string — 国籍",
   "occupation": "string — job/career",
   "mbti_guess": "string — e.g. INFP",
   "love_values": "string — attitude toward love & relationships",
   "interests": ["list", "of", "hobbies"],
   "emotional_needs": "string — what emotional support they need",
-  "life_rhythm": "string — e.g. 夜貓子, 早睡早起",
+  "life_rhythm": "string — e.g. 夜猫子, 早睡早起",
   "matching_preferences": {
     "preferred_gender": "string",
     "age_range": [min_int, max_int],
@@ -603,6 +606,7 @@ companion_insights schema (all fields optional, only include if confident):
   },
   "personality_traits": ["list", "of", "traits"]
 }
+地理字段示例：一个在深圳工作的香港新界人到台北旅游 → city=深圳, location=台北, hometown=新界, nationality=中国香港
 Return ONLY a JSON object with the fields you are confident about.
 Do not invent or guess anything not clearly supported by the facts.
 "#;
@@ -672,13 +676,14 @@ pub fn extract_structured_insights_prompt(
         .unwrap_or_else(|| "{}".into());
 
     format!(
-        "以下是從對話中提取的用戶事實：\n\
+        "以下是从对话中提取的【用户】事实：\n\
          {facts_str}\n\n\
-         現有的 companion_insights（供參考，不要重複已知信息）：\n\
+         现有的用户画像（companion_insights，供参考，不要重复已知信息）：\n\
          {existing_str}\n\n\
-         請根據上方的事實，填充以下 schema 中你有信心的字段：\n\
+         请根据上方的【用户事实】，填充以下 schema 中你有信心的字段。\
+         schema 描述的是【真人用户】本人——occupation、city、location 等都指用户，绝不是 AI 伴侣：\n\
          {COMPANION_INSIGHTS_SCHEMA}\n\n\
-         僅輸出 JSON，不要任何解釋。",
+         仅输出 JSON，不要任何解释。",
     )
 }
 
