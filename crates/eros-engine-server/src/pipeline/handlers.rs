@@ -86,6 +86,62 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
     }
 }
 
+/// Build the `[用户发送了一张图片]` preamble from a stored `metadata.vision`
+/// object. Returns `None` when `description` is absent/blank (not a usable
+/// describe). Blank optional fields are omitted line-by-line.
+fn build_image_preamble(vision: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| {
+        vision
+            .get(k)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let description = field("description")?;
+    let mut lines = vec![
+        "[用户发送了一张图片]".to_string(),
+        format!("画面：{description}"),
+    ];
+    if let Some(t) = field("ocr_text") {
+        lines.push(format!("文字：{t}"));
+    }
+    if let Some(p) = field("people") {
+        lines.push(format!("人物：{p}"));
+    }
+    if let Some(s) = field("scene") {
+        lines.push(format!("场景：{s}"));
+    }
+    Some(lines.join("\n"))
+}
+
+/// What the MAIN chat model should see for a user row: an optional image
+/// preamble (from `metadata.vision`, or a neutral placeholder when an image was
+/// sent but not described) folded onto `effective_user_text(msg)`. A plain text
+/// turn (no `vision`, no `image_url`) returns the effective text unchanged.
+pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
+    let base = effective_user_text(msg);
+    let meta = msg.metadata.as_ref();
+    let preamble = meta
+        .and_then(|m| m.get("vision"))
+        .and_then(|v| build_image_preamble(v))
+        .or_else(|| {
+            // Image sent but not described (vision failed) → neutral placeholder.
+            meta.and_then(|m| m.get("image_url"))
+                .map(|_| "[用户发送了一张图片，但内容无法识别]".to_string())
+        });
+    match preamble {
+        Some(p) => {
+            let body = if base.trim().is_empty() {
+                "[用户未附文字]"
+            } else {
+                base
+            };
+            format!("{p}\n\n{body}")
+        }
+        None => base.to_string(),
+    }
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -101,11 +157,12 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        // User rows feed the EFFECTIVE text (input-filter rewrite when present);
-        // assistant rows always feed `content` (their pre_filter_content is the
-        // pre-output-filter original and must never re-enter the prompt).
+        // User rows feed the MODEL-FACING text (image preamble folded onto the
+        // effective text when an image was attached); assistant rows always feed
+        // `content` (their pre_filter_content is the pre-output-filter original
+        // and must never re-enter the prompt).
         let content = match msg.role.as_str() {
-            "user" => effective_user_text(&msg).to_string(),
+            "user" => model_facing_user_text(&msg),
             "assistant" => msg.content,
             _ => continue,
         };
@@ -1394,6 +1451,57 @@ mod tests {
         assert_eq!(effective_user_text(&row), "有意义的问题");
         row.pre_filter_content = Some("   ".into()); // blank → fall back to content
         assert_eq!(effective_user_text(&row), "1111");
+    }
+
+    fn user_row_meta(
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> eros_engine_store::chat::ChatMessage {
+        let mut r = user_row(content, None);
+        r.metadata = Some(metadata);
+        r
+    }
+
+    #[test]
+    fn model_facing_text_folds_vision_preamble() {
+        let row = user_row_meta(
+            "看看这个",
+            serde_json::json!({
+                "image_url": "https://x/y.png",
+                "vision": { "description": "一只猫", "ocr_text": "", "people": "", "scene": "客厅" }
+            }),
+        );
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("[用户发送了一张图片]"));
+        assert!(t.contains("画面：一只猫"));
+        assert!(t.contains("场景：客厅"));
+        assert!(!t.contains("文字：")); // blank ocr dropped
+        assert!(t.ends_with("看看这个"));
+    }
+
+    #[test]
+    fn model_facing_text_image_only_uses_placeholder_body() {
+        let row = user_row_meta(
+            "",
+            serde_json::json!({ "image_url": "https://x/y.png", "vision": { "description": "日落" } }),
+        );
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("画面：日落"));
+        assert!(t.ends_with("[用户未附文字]"));
+    }
+
+    #[test]
+    fn model_facing_text_undescribed_image_placeholder() {
+        let row = user_row_meta("hi", serde_json::json!({ "image_url": "https://x/y.png" }));
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("无法识别"));
+        assert!(t.ends_with("hi"));
+    }
+
+    #[test]
+    fn model_facing_text_plain_turn_unchanged() {
+        let row = user_row("普通消息", None);
+        assert_eq!(model_facing_user_text(&row), "普通消息");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`
