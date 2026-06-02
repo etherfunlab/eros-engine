@@ -101,6 +101,27 @@ pub struct StreamPreErrorBody {
     pub original_user_message_id: Option<String>,
 }
 
+/// True when `url` is an absolute http(s) URL with a non-empty, whitespace-free
+/// host and within the length cap. Dependency-free: we never dereference the URL
+/// (it is forwarded to the vision model), so we only require a plausible host —
+/// not full RFC-3986 parsing.
+fn image_url_is_valid(url: &str) -> bool {
+    if url.is_empty() || url.len() > MAX_IMAGE_URL_LEN {
+        return false;
+    }
+    let rest = match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    // Host = everything up to the first '/', '?' or '#'. Reject empty or
+    // whitespace-containing hosts ("https://", "http:// ", "http:// x").
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty() && !host.chars().any(char::is_whitespace)
+}
+
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
     // Content may be empty only when a tip or an image is attached.
     if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
@@ -173,13 +194,11 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
         }
     }
     if let Some(url) = req.image_url.as_deref() {
-        let ok = url.len() <= MAX_IMAGE_URL_LEN
-            && (url.starts_with("https://") || url.starts_with("http://"));
-        if !ok {
+        if !image_url_is_valid(url) {
             return Err(AppError::StreamPre(StreamPreError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unprocessable",
-                message: format!("image_url must be http(s) and <= {MAX_IMAGE_URL_LEN} chars"),
+                message: format!("image_url must be an absolute http(s) URL with a host and <= {MAX_IMAGE_URL_LEN} chars"),
                 user_message: "图片链接无效".into(),
                 original_user_message_id: None,
             }));
@@ -874,5 +893,30 @@ mod validate_payload_tests {
         assert!(long.len() > MAX_IMAGE_URL_LEN);
         r.image_url = Some(long);
         assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_no_host_rejected() {
+        let mut r = base();
+        r.content = String::new();
+        r.image_url = Some("https://".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_whitespace_host_rejected() {
+        let mut r = base();
+        r.image_url = Some("https:// example.com/y.png".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_is_valid_unit() {
+        assert!(image_url_is_valid("https://x/y.png"));
+        assert!(image_url_is_valid("http://example.com/a.jpg"));
+        assert!(!image_url_is_valid("https://"));
+        assert!(!image_url_is_valid("http:// "));
+        assert!(!image_url_is_valid("ftp://x/y.png"));
+        assert!(!image_url_is_valid(""));
     }
 }
