@@ -178,7 +178,8 @@ Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 
 | `DATABASE_URL` | 是 | 帶 `pgvector` 的 Postgres；表建在 `engine.*`。 |
 | `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml` 路由。 |
 | `OPENROUTER_APP_REFERER` | 否 | 設了之後每次出站 OpenRouter 調用都帶 `HTTP-Referer`。會出現在 OpenRouter 的 app 分析面板上。 |
-| `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
+| `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-OpenRouter-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
+| `OPENROUTER_APP_CATEGORIES` | 否 | 设了之后带 `X-OpenRouter-Categories` —— 逗号分隔的 OpenRouter marketplace 分类（如 `roleplay,general-chat`）。原样透传；OpenRouter 对无法识别的值静默忽略，且只有在同时设了 `OPENROUTER_APP_REFERER` 时才生效。 |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | 否 | 逗号分隔的顶层 key 列表，从 `usage` 对象里剔除 —— 在 SSE 流式 `done` 帧上生效。常用于把批发 `cost` / `cost_details` 隐藏起来不外泄给下游客户。完整 usage 仍会落库并写入服务器端 tracing。 |
 | `VOYAGE_API_KEY` | 是 | Embeddings。空 key 會拒絕啟動。 |
 | `SUPABASE_URL` | 否 | Supabase project URL。保留在 `.env.example` 裡方便 client / deploy 約定；目前 server 不讀取它。 |

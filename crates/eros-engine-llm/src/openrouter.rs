@@ -17,7 +17,8 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// names become legacy and (if a transition window applies) get added as
 /// a parallel alias below.
 const HEADER_REFERER: &str = "HTTP-Referer";
-const HEADER_TITLE: &str = "X-Title";
+const HEADER_TITLE: &str = "X-OpenRouter-Title";
+const HEADER_CATEGORIES: &str = "X-OpenRouter-Categories";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -241,8 +242,15 @@ struct WireStreamFrame {
 pub struct AppAttribution {
     /// Sent as `HTTP-Referer`. Identifies the deploying app to OpenRouter.
     pub referer: Option<String>,
-    /// Sent as `X-Title`. Display name in OpenRouter's app analytics.
+    /// Sent as `X-OpenRouter-Title`. Display name in OpenRouter's app
+    /// analytics. (OpenRouter also accepts the legacy `X-Title` alias; we
+    /// send the current canonical name.)
     pub title: Option<String>,
+    /// Sent as `X-OpenRouter-Categories`. Comma-separated marketplace
+    /// categories for OpenRouter's app directory. Passed through verbatim;
+    /// OpenRouter silently ignores unrecognised values, so the engine does
+    /// no validation. Only takes effect when paired with `referer`.
+    pub categories: Option<String>,
 }
 
 #[derive(Clone)]
@@ -286,6 +294,18 @@ impl OpenRouterClient {
                 Err(e) => tracing::warn!(
                     error = %e,
                     header = HEADER_TITLE,
+                    "openrouter: dropping invalid attribution value"
+                ),
+            }
+        }
+        if let Some(ref categories) = attribution.categories {
+            match reqwest::header::HeaderValue::from_str(categories) {
+                Ok(v) => {
+                    headers.insert(HEADER_CATEGORIES, v);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    header = HEADER_CATEGORIES,
                     "openrouter: dropping invalid attribution value"
                 ),
             }
@@ -615,7 +635,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .and(header("HTTP-Referer", "https://eros.example"))
-            .and(header("X-Title", "Eros"))
+            .and(header("X-OpenRouter-Title", "Eros"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
@@ -626,6 +646,7 @@ mod tests {
             AppAttribution {
                 referer: Some("https://eros.example".into()),
                 title: Some("Eros".into()),
+                categories: Some("roleplay,general-chat".into()),
             },
             format!("{}/api/v1/chat/completions", server.uri()),
         );
@@ -643,6 +664,20 @@ mod tests {
             })
             .await
             .expect("call succeeds");
+
+        // Categories is checked on the raw received value rather than via
+        // wiremock's `header` matcher: that matcher splits the received value
+        // on commas, so a comma-joined string would never compare equal. We
+        // want to prove the verbatim comma-separated string reaches the wire.
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let categories = reqs
+            .iter()
+            .find_map(|r| r.headers.get("x-openrouter-categories"))
+            .expect("X-OpenRouter-Categories header present");
+        assert_eq!(
+            categories.to_str().expect("header is valid utf-8"),
+            "roleplay,general-chat"
+        );
     }
 
     #[tokio::test]
@@ -680,8 +715,12 @@ mod tests {
                 "HTTP-Referer must be absent when unset"
             );
             assert!(
-                req.headers.get("x-title").is_none(),
-                "X-Title must be absent when unset"
+                req.headers.get("x-openrouter-title").is_none(),
+                "X-OpenRouter-Title must be absent when unset"
+            );
+            assert!(
+                req.headers.get("x-openrouter-categories").is_none(),
+                "X-OpenRouter-Categories must be absent when unset"
             );
         }
     }
@@ -700,6 +739,7 @@ mod tests {
             AppAttribution {
                 referer: Some("bad\nvalue".into()),
                 title: Some("also\rbad".into()),
+                categories: Some("still\nbad".into()),
             },
             format!("{}/api/v1/chat/completions", server.uri()),
         );
@@ -724,8 +764,12 @@ mod tests {
                 "HTTP-Referer must be dropped"
             );
             assert!(
-                req.headers.get("x-title").is_none(),
-                "X-Title must be dropped"
+                req.headers.get("x-openrouter-title").is_none(),
+                "X-OpenRouter-Title must be dropped"
+            );
+            assert!(
+                req.headers.get("x-openrouter-categories").is_none(),
+                "X-OpenRouter-Categories must be dropped"
             );
         }
     }

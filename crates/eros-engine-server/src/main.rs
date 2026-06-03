@@ -208,6 +208,9 @@ async fn run_server() -> Result<()> {
         title: std::env::var("OPENROUTER_APP_TITLE")
             .ok()
             .filter(|s| !s.is_empty()),
+        categories: std::env::var("OPENROUTER_APP_CATEGORIES")
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
     let openrouter = Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
         openrouter_key,
