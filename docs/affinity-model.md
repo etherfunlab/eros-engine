@@ -91,7 +91,7 @@ One row per chat session in `engine.companion_affinity` (1:1 via `session_id UNI
 |--------------|------|
 | `message` | Reply succeeded; deltas evaluated by LLM |
 | `ghost` | Ghost decision; ghost_streak/total_ghosts incremented (no deltas) |
-| `gift` | Gift event delivered; deltas from request body |
+| `gift` | Legacy — the standalone gift-event endpoint was removed; tips now flow through a normal turn and record as `message`. Still a valid filter value for historical rows. |
 | `time_decay` | Reserved (currently unused — decay is applied lazily on load) |
 
 Events are append-only and never edited. Full history is queryable for analysis, audit, or reconstructing how a relationship evolved.

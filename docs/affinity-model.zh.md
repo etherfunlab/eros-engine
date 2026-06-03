@@ -92,7 +92,7 @@ tension  = clamp(tension  − 0.005 × days_elapsed,  0.0, 1.0)
 |--------------|------|
 | `message` | Reply 成功；deltas 由 LLM 評估 |
 | `ghost` | Ghost 判定命中；ghost_streak / total_ghosts 加一（無 deltas） |
-| `gift` | 禮物事件落地；deltas 來自請求體 |
+| `gift` | 旧版遗留——独立的礼物事件端点已移除；打赏现在走普通对话轮，记为 `message`。仍是查询历史行的有效过滤值。 |
 | `time_decay` | 預留（目前未用——衰退在加載時懶算） |
 
 事件表只追加、永不修改。完整歷史可查、可審計、可重建一段關係的演變過程。

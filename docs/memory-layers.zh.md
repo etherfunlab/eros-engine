@@ -93,11 +93,21 @@ post-process 在每輪的後台階段插入記憶。兩條路徑：
 
 原始對話消息存在 `engine.chat_messages` 裡（完整逐字記錄、純文本）。它們 **不被** embed。記憶表存的是 *摘要* 跟 *事實*，不是完整消息日誌。想拿真實對話內容直接查 `chat_messages`——那才是「說了甚麼」的真相之源。
 
-## 懶式檢索
+## 检索与注入
 
-pipeline 在每輪對話之前 **不會** 主動拉記憶。system prompt 只用人格基因 + 好感度向量 + 關係標籤構建。記憶會在 LLM（在 insight 或 chat 任務裡）通過將來的 tool-use API 主動要的時候才浮上來——v0.1 還沒接，計劃在後續階段做。
+每轮对话都会把记忆读回 prompt，由每次请求的 `memory_scope` 控制（取值与默认值
+见 [api-reference.md](api-reference.md)；默认 `neutral_and_relationship`）。回复
+handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文块：
 
-目前記憶是寫多讀少：引擎累積一份結構化的關係記錄，把它再餵回 LLM 是另一條工作流。前端的 `/comp/user/{user_id}/profile` 端點返回結構化的 `companion_insights` JSONB，那是已收集內容的人類可讀視圖。
+- **画像层** —— 结构化的 `companion_insights` JSONB，渲染成画像 bullet。
+  `memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带中性
+  子集（`neutral_*`）。
+- **关系层** —— `companion_memories` 行，按对当前轮的语义（embedding）相似度
+  检索拉取，在 scope 保留关系记忆时纳入（`full` / `neutral_and_relationship` /
+  `relationship_only`）。
+
+`memory_scope = none` 完全跳过记忆注入。前端的 `/comp/user/{user_id}/profile`
+端点返回同一份 `companion_insights` JSONB，作为已收集内容的人类可读视图。
 
 ## 源碼
 

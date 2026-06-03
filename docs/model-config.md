@@ -226,7 +226,7 @@ input filter has no triggers, timing, or tiers).
 
 | Name | Consumed by | Status |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers::ReplyHandler` and `GiftHandler` (chat completions) | live |
+| `chat_companion` | `pipeline::handlers::ReplyHandler` (chat completions; tip turns ride the same reply path) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | reserved — current PDE is rule-based and does not call an LLM | reserved |

@@ -34,13 +34,12 @@
        │
        ▼
 PDE 決策                eros_engine_core::pde::decide(&input) → ActionPlan
-                        （規則型：Reply / Ghost / Proactive / GiftReaction）
+                        （規則型：Reply / Ghost / Proactive）
        │
        ▼
 handler 分派            Reply  → ReplyHandler  構建 ChatRequest
                         Ghost  → GhostHandler  返回 None（不調 LLM）
                         Proact → ProactiveHandler
-                        Gift   → GiftHandler   用 event 帶來的 deltas
        │
        ▼
 chat 執行               若有 ChatRequest：state.openrouter.execute(req).await?
@@ -53,7 +52,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         - insight  （LLM 抽事實 → companion_insights 合併）
 ```
 
-**Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive / GiftReaction 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
+**Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
 ## Auth
 
