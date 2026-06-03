@@ -2043,4 +2043,75 @@ mod tests {
         assert_eq!(meta["vision_generation_id"], "gen-1");
         assert_eq!(rows[0].content, ""); // untouched
     }
+
+    /// 0027 cleanup: legacy non-tip gift_user rows (no tips_amount_usd metadata)
+    /// are deleted; tips (gift_user with tips_amount_usd) and user rows survive.
+    /// Mirrors the 0018 backfill-test pattern: #[sqlx::test] runs 0027 on the
+    /// empty DB (a no-op), then we seed rows and re-run the embedded DELETE
+    /// (valid because DELETE is idempotent).
+    const CLEANUP_SQL_0027: &str =
+        include_str!("../migrations/0027_drop_legacy_gift_user_rows.sql");
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0027_drops_legacy_non_tip_gift_user_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+                 ($1, 'user', 'hi', NULL), \
+                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb), \
+                 ($1, 'gift_user', 'rose', NULL), \
+                 ($1, 'gift_user', 'rose', '{\"label\": \"rose\"}'::jsonb)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Run the embedded cleanup migration.
+        sqlx::query(CLEANUP_SQL_0027).execute(&pool).await.unwrap();
+
+        // Only the tip gift_user row survives.
+        let gift_user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'gift_user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(gift_user_count, 1, "only the tip gift_user row survives");
+
+        // The survivor is the tip (carries tips_amount_usd).
+        let surviving_tip: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'gift_user' \
+               AND metadata ? 'tips_amount_usd'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(surviving_tip, 1, "the surviving gift_user row is the tip");
+
+        // user rows are untouched.
+        let user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_count, 1, "user rows are untouched");
+    }
 }
