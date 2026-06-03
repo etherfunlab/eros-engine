@@ -32,7 +32,6 @@ pub enum StreamErrorCode {
 pub enum FrameActionType {
     Reply,
     Ghost,
-    GiftReaction,
 }
 
 /// One wire frame in the SSE protocol.
@@ -129,7 +128,7 @@ fn drive_chat_burst(
     session_id: Uuid,
     user_message_id: Uuid,
     frame_action: FrameActionType,
-    persist_action: &'static str, // "reply" | "gift_reaction"
+    persist_action: &'static str, // "reply"
     plan_action: ActionType,
     req: eros_engine_llm::openrouter::ChatRequest,
     display_override: Option<eros_engine_llm::model_config::DisplayOverride>,
@@ -1215,7 +1214,7 @@ pub struct PersistedUserMessage {
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
 /// generator owns its `AppState` clone so it stays `'static` and survives
 /// `Sse`'s body lifetime. Task 10 implements the Ghost branch; T11/T12
-/// fill in Reply / GiftReaction.
+/// fill in Reply.
 pub fn run_stream(
     state: Arc<AppState>,
     user_msg: PersistedUserMessage,
@@ -1312,7 +1311,7 @@ pub fn run_stream(
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
-            ActionType::Reply | ActionType::GiftReaction => {
+            ActionType::Reply => {
                 // ── Image describe (chat_vision) — Reply turns with an image ──
                 // Runs before the input filter; both may fire (orthogonal). The
                 // describe result is merged into metadata.vision; the prompt
@@ -1400,7 +1399,7 @@ pub fn run_stream(
                         yield ProtocolFrame::Error {
                             code: StreamErrorCode::Internal,
                             retryable: false,
-                            message: format!("build_*_request failed: {e}"),
+                            message: format!("build_reply_request failed: {e}"),
                             user_message: "服务出现问题，请稍后再试".into(),
                         };
                         return;
@@ -1601,10 +1600,7 @@ pub fn replay_stream(
             for row in &rows {
                 let msg_ulid = Ulid::from(row.id);
                 let prev_ulid = row.continues_from_message_id.map(Ulid::from);
-                let action = match row.assistant_action_type.as_deref() {
-                    Some("gift_reaction") => FrameActionType::GiftReaction,
-                    _ => FrameActionType::Reply,
-                };
+                let action = FrameActionType::Reply;
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,

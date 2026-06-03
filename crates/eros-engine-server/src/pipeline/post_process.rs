@@ -9,12 +9,10 @@
 //!   `MemoryRepo`, `InsightRepo`, `ChatRepo`) instead of inline `sqlx::query`.
 //! - `companion_insights` lives in its own table, not on `user_profiles`.
 //!   `InsightRepo::merge` handles the JSONB merge + training-level update.
-//! - Ghost-streak reset on Reply/Proactive/GiftReaction happens in the
-//!   orchestrator (`pipeline::run`) before this function is spawned, since
-//!   the store crate's `AffinityRepo::persist_with_event` deliberately
-//!   does not touch `ghost_streak`.
-//! - `gift_records.affinity_applied` flip is dropped — there is no gift
-//!   ledger table in OSS.
+//! - Ghost-streak reset on Reply/Proactive happens in the orchestrator
+//!   (`pipeline::run`) before this function is spawned, since the store
+//!   crate's `AffinityRepo::persist_with_event` deliberately does not
+//!   touch `ghost_streak`.
 
 use uuid::Uuid;
 
@@ -116,7 +114,7 @@ pub async fn run(
 
         // Semantic eval: Reply turns only, with a non-trivial user message
         // and a non-empty produced assistant message. Other actions
-        // (Proactive / GiftReaction / Ghost) keep rule-only deltas in v1.
+        // (Proactive / Ghost) keep rule-only deltas in v1.
         let run_eval = plan.action_type == ActionType::Reply
             && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
             && !assistant_msg.trim().is_empty();
@@ -177,10 +175,7 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = matches!(
-        plan.action_type,
-        ActionType::Reply | ActionType::GiftReaction | ActionType::Proactive,
-    );
+    let should_update_lead = matches!(plan.action_type, ActionType::Reply | ActionType::Proactive,);
     let fut_lead = async {
         if should_update_lead {
             refresh_lead_score(&state, session_id, user_id).await;
@@ -245,9 +240,8 @@ async fn persist_affinity(
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
         }
-        ActionType::Reply | ActionType::GiftReaction | ActionType::Proactive => {
+        ActionType::Reply | ActionType::Proactive => {
             let event_type = match action {
-                ActionType::GiftReaction => "gift",
                 ActionType::Proactive => "proactive",
                 ActionType::Reply => "message",
                 ActionType::Ghost => unreachable!(),
@@ -897,10 +891,7 @@ mod tests {
 
     #[test]
     fn client_id_from_event_none_for_non_user_message() {
-        let event = Event::Gift {
-            gift_id: Uuid::new_v4(),
-            amount: 100,
-        };
+        let event = Event::ProactiveTrigger;
         assert_eq!(client_id_from_event(&event), None);
     }
 
