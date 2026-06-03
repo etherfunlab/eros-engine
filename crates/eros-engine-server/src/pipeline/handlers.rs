@@ -6,9 +6,11 @@
 //! model / fallback / allow_traits are resolved via `state.model_config`
 //! (task + per-request tier).
 
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+#[cfg(test)]
+use serde_json::Value;
 
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
@@ -16,11 +18,10 @@ use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
-use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::MemoryRepo;
 
 use crate::error::AppError;
-use crate::prompt::{build_prompt, PendingGift};
+use crate::prompt::build_prompt;
 use crate::state::AppState;
 
 /// Memory recall fan-out sizes — mirror the gateway's Mem0 era defaults
@@ -163,15 +164,6 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
         .unwrap_or_default()
 }
 
-/// A `gift_user` row is a TIP (not a legacy in-app Gift Event) iff its metadata
-/// carries `tips_amount_usd`. Mirrors the `signals_count` gate in `pipeline/mod.rs`
-/// so tips and legacy gifts are classified identically across the pipeline.
-fn is_tip_row(msg: &eros_engine_store::chat::ChatMessage) -> bool {
-    msg.metadata
-        .as_ref()
-        .is_some_and(|m| m.get("tips_amount_usd").is_some())
-}
-
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -187,19 +179,15 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        // User + TIP gift_user rows feed the MODEL-FACING text and are emitted
-        // under the "user" role — a tip turn IS a user turn to the model (OpenRouter
-        // only knows system/user/assistant). Dropping the tip turn here made it
-        // invisible, so the model parroted history. The gate matches the
-        // `signals_count` convention (mod.rs): only `gift_user` rows carrying
-        // `tips_amount_usd` are tips; legacy in-app Gift Event rows (a bare gift
-        // label, no tip metadata) stay dropped — see the open issue on splitting
-        // `gift_user` / legacy Gift Events. Assistant rows always feed `content`
-        // (their pre_filter_content is the pre-output-filter original and must
-        // never re-enter the prompt).
+        // User and TIP gift_user rows feed the MODEL-FACING text under the "user"
+        // role — a tip turn IS a user turn to the model (OpenRouter only knows
+        // system/user/assistant). gift_user is tip-only now (the legacy in-app
+        // Gift Event endpoint was removed), so no tip/legacy gate is needed.
+        // Assistant rows always feed `content` (their pre_filter_content is the
+        // pre-output-filter original and must never re-enter the prompt).
         let (role, content) = match msg.role.as_str() {
             "user" => ("user", model_facing_user_text(&msg)),
-            "gift_user" if is_tip_row(&msg) => ("user", model_facing_user_text(&msg)),
+            "gift_user" => ("user", model_facing_user_text(&msg)),
             "assistant" => ("assistant", msg.content),
             _ => continue,
         };
@@ -393,28 +381,16 @@ fn build_profile_groups(
     vec![]
 }
 
-/// Load `companion_insights` for the user and render the structured fields
-/// as Chinese-language bullets that fit naturally into the
-/// `[user_profile]` prompt section. Takes `&PgPool` directly
-/// (not `&AppState`) so it's reachable from sqlx integration tests without
-/// constructing the full state.
-async fn load_insight_bullets(pool: &PgPool, user_id: Uuid) -> Vec<String> {
-    let repo = InsightRepo { pool };
-    let row = match repo.load(user_id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return vec![],
-        Err(e) => {
-            tracing::warn!("insight load failed: {e}");
-            return vec![];
-        }
-    };
-    insights_to_bullets(&row.insights)
-}
-
 /// Render the `companion_insights` JSONB blob as bullet strings. Skips
 /// empty / missing fields. `matching_preferences` is intentionally omitted
 /// — it's a structured sub-object that doesn't fit a single-line bullet
 /// and isn't useful in chat tone anyway.
+///
+/// Test-only parity reference: the live path renders the flat human_insights
+/// mirror via human_insights_to_bullets; this renders companion_insights JSONB
+/// directly and the parity tests pin the two together. No production caller
+/// remains (the gift path that used it was removed).
+#[cfg(test)]
 fn insights_to_bullets(insights: &Value) -> Vec<String> {
     let Some(obj) = insights.as_object() else {
         return vec![];
@@ -590,15 +566,6 @@ pub(super) async fn build_reply_request(
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
 
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
-    let pending_gifts: Vec<PendingGift> = vec![];
-
     let tier = match &input.event {
         Event::UserMessage { tier, .. } => tier.as_deref(),
         _ => None,
@@ -627,8 +594,6 @@ pub(super) async fn build_reply_request(
         &profile_groups,
         &relationship_facts,
         Some(&input.affinity),
-        &pending_gifts,
-        tip_personality,
         plan.reply_style,
         &plan.context_hints,
         &kept_traits,
@@ -641,8 +606,8 @@ pub(super) async fn build_reply_request(
         ..
     } = &input.event
     {
-        // Raw Option (not the "normal"-defaulted local above): tips_reaction_context
-        // renders Some vs None as different prose, so the distinction must survive.
+        // Raw Option from the genome: tips_reaction_context renders Some vs None as
+        // different prose, so the distinction must survive.
         let tp = input.persona.genome.tip_personality.as_deref();
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }
@@ -688,68 +653,6 @@ async fn fetch_recent_turn_pairs(
             );
             Vec::new()
         })
-}
-
-/// Build a ChatRequest for the GiftReaction action. Called by the streaming
-/// pipeline (`pipeline::stream::run_stream`).
-#[allow(clippy::too_many_arguments)] // mirrors build_reply_request + pending gifts
-pub(super) async fn build_gift_request(
-    state: &AppState,
-    input: &DecisionInput,
-    plan: &ActionPlan,
-    session_id: Uuid,
-    user_id: Uuid,
-    instance_id: Uuid,
-    user_message_id: Uuid,
-    pending: &[PendingGift],
-) -> Result<(ChatRequest, Vec<String>), AppError> {
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
-
-    let query_text = history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
-
-    let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text, true, true).await;
-
-    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
-    if !insight_bullets.is_empty() {
-        profile_groups.insert(0, ("基础画像".into(), insight_bullets));
-    }
-
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
-    let resolved = state.model_config.resolve(CHAT_TASK, None);
-
-    let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
-
-    let system_prompt = build_prompt(
-        &input.persona,
-        &profile_groups,
-        &relationship_facts,
-        Some(&input.affinity),
-        pending,
-        tip_personality,
-        plan.reply_style,
-        &plan.context_hints,
-        &[],
-        eros_engine_core::scope::AffinityScope::full(),
-        &recent_turns,
-    );
-
-    Ok((
-        assemble_chat_request(resolved, system_prompt, history, None),
-        Vec::new(),
-    ))
 }
 
 #[cfg(test)]
@@ -856,16 +759,15 @@ mod tests {
         );
     }
 
-    // ─── Integration tests: recall_memory_with_embedding + load_insight_bullets ───
+    // ─── Integration tests: recall_memory_with_embedding ──────────────────
     //
-    // These exercise the pure-DB halves of the recall pipeline against a
+    // These exercise the pure-DB half of the recall pipeline against a
     // live Postgres (via `#[sqlx::test]`). The Voyage-dependent outer
     // wrapper `recall_memory` is intentionally not tested here — it would
     // either need a live Voyage key or a trait-mock indirection that
     // doesn't justify its weight for a single thin function.
 
     use eros_engine_store::human_insight::HumanInsightRepo;
-    use eros_engine_store::insight::InsightRepo;
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
 
@@ -1245,39 +1147,6 @@ mod tests {
         assert!(!rel3.is_empty(), "relationship should be present when Y on");
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_returns_empty_when_no_row(pool: PgPool) {
-        let bullets = load_insight_bullets(&pool, Uuid::new_v4()).await;
-        assert!(bullets.is_empty());
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_renders_after_merge(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let repo = InsightRepo { pool: &pool };
-
-        repo.merge(
-            user_id,
-            json!({
-                "city": "上海",
-                "mbti_guess": "INFP",
-                "interests": ["登山", "精酿"],
-            }),
-        )
-        .await
-        .unwrap();
-
-        let bullets = load_insight_bullets(&pool, user_id).await;
-        assert_eq!(
-            bullets,
-            vec![
-                "城市：上海".to_string(),
-                "MBTI：INFP".to_string(),
-                "兴趣：登山、精酿".to_string(),
-            ]
-        );
-    }
-
     // ─── human_insights_to_bullets ──────────────────────────────────────
 
     fn sample_human_row() -> HumanInsightsRow {
@@ -1613,17 +1482,15 @@ mod tests {
     }
 
     #[test]
-    fn assemble_includes_tip_gift_but_drops_legacy_gift() {
+    fn assemble_includes_all_gift_user_rows() {
         use eros_engine_llm::model_config::ResolvedModel;
 
-        // TIP gift_user (metadata carries tips_amount_usd) → promoted to a user msg.
+        // gift_user is tip-only now — all gift_user rows are promoted to the
+        // "user" role. The legacy in-app Gift Event endpoint was removed, so
+        // there is no longer a legacy row type to gate out.
         let mut tip = user_row("(打赏 $5)", None);
         tip.role = "gift_user".into();
         tip.metadata = Some(serde_json::json!({ "tips_amount_usd": 5.0 }));
-        // LEGACY in-app Gift Event (bare label, no tip metadata) → stays dropped.
-        let mut legacy = user_row("rose", None);
-        legacy.role = "gift_user".into();
-        legacy.metadata = None;
         let plain = user_row("普通消息", None);
         let mut assistant = user_row("回复", None);
         assistant.role = "assistant".into();
@@ -1637,12 +1504,7 @@ mod tests {
             reasoning: None,
             retry_depth: 0,
         };
-        let req = assemble_chat_request(
-            resolved,
-            "SYS".into(),
-            vec![tip, legacy, plain, assistant],
-            None,
-        );
+        let req = assemble_chat_request(resolved, "SYS".into(), vec![tip, plain, assistant], None);
 
         let user_contents: Vec<&str> = req
             .messages
@@ -1652,13 +1514,9 @@ mod tests {
             .collect();
         assert!(
             user_contents.contains(&"(打赏 $5)"),
-            "tip gift_user must be promoted under the user role: {user_contents:?}"
+            "gift_user must be promoted under the user role: {user_contents:?}"
         );
         assert!(user_contents.contains(&"普通消息"));
-        assert!(
-            !req.messages.iter().any(|m| m.content == "rose"),
-            "legacy (no-tip) gift_user must stay dropped from the prompt"
-        );
         // No `gift_user` role ever reaches the wire (OpenRouter knows only
         // system/user/assistant).
         assert!(req

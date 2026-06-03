@@ -69,10 +69,6 @@ pub enum Event {
         #[serde(default)]
         tips_amount_usd: Option<f64>,
     },
-    Gift {
-        gift_id: Uuid,
-        amount: i64,
-    },
     ProactiveTrigger,
     AppOpen,
 }
@@ -83,7 +79,6 @@ pub enum ActionType {
     Reply,
     Ghost,
     Proactive,
-    GiftReaction,
 }
 
 /// Tone directive for the reply generation.
