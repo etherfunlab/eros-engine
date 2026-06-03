@@ -3,6 +3,7 @@
 
 pub mod affinity;
 pub mod chat;
+pub mod decision;
 pub mod error_handling;
 pub mod human_insight;
 pub mod insight;
