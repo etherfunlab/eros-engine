@@ -59,6 +59,14 @@ pub async fn sweeper(state: AppState) {
         tracing::info!("dreaming sweeper disabled (DREAMING_DISABLED=1 or tick=0)");
         return;
     }
+    // memory_extraction is omittable: a missing [tasks.memory_extraction] section
+    // (or a blank filter_prompt, which would have boot-failed) resolves to None.
+    // Post-boot, None ⟺ the section is absent ⟺ the feature is off — go inert so
+    // we never claim sessions and retry-loop the per-row no-stamp path.
+    if state.model_config.resolve_memory_extract().is_none() {
+        tracing::info!("memory_extraction not configured — dreaming sweeper inert");
+        return;
+    }
     tracing::info!(?interval, ?idle, ?claim_stale, "dreaming sweeper starting");
 
     let mut tick = tokio::time::interval(interval);

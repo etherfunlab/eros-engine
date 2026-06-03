@@ -239,6 +239,26 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 Anything else is either reserved for a future feature (`pde_decision`) or vestigial (`embedding` — Voyage doesn't go through this path).
 
+### Enabling / disabling extraction
+
+`insight_extraction` (per-turn fact mining) and `memory_extraction` (session-end
+dreaming sweeper) are controlled by the **presence of their `[tasks.*_extraction]`
+section**:
+
+- **Section present** → `filter_prompt` is **required**; the server refuses to boot
+  if it is blank or absent.
+- **Section absent** → that extraction is **off**. The engine boots and runs without
+  it (`insight_extraction` is skipped per turn; the dreaming sweeper stays inert).
+
+> **Behavior change (0.6.x):** earlier releases made both sections mandatory (an
+> absent section boot-failed). They are now optional-by-omission. The shipped
+> `examples/model_config.toml` keeps both sections, so the default — both
+> extractions on — is unchanged.
+
+`reasoning` works the same as on every task — omit it to let the model decide,
+`reasoning = { enabled = false }` to force reasoning off, `{ enabled = true }` to
+force it on.
+
 ## Resolution rules
 
 For `model` and `fallback`:

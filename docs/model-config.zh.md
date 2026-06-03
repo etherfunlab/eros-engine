@@ -67,6 +67,22 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 
 其它要么是给未来功能留的位置 (`pde_decision`),要么是 vestigial (`embedding` —— Voyage 完全不走这条路径)。
 
+### 开启 / 关闭抽取任务
+
+`insight_extraction`（逐轮事实抽取）和 `memory_extraction`（会话结束时的 dreaming
+sweeper）由对应 `[tasks.*_extraction]` **段落是否存在**控制：
+
+- **段落存在** → `filter_prompt` 为**必填**；为空或缺失时服务器拒绝启动。
+- **段落缺失** → 对应抽取**关闭**。引擎正常启动并运行（逐轮的 `insight_extraction`
+  被跳过；dreaming sweeper 保持空转不工作）。
+
+> **行为变更（0.6.x）：** 旧版本把这两个段落设为必填（缺段落会启动失败）。现在改为
+> 缺省即关闭。随仓库发布的 `examples/model_config.toml` 仍保留两个段落，所以默认行为
+> （两个抽取都开启）不变。
+
+`reasoning` 与其他任务一致：不写 → 由模型决定；`reasoning = { enabled = false }` →
+强制关闭推理；`{ enabled = true }` → 强制开启。
+
 ## 解析优先级
 
 `model` 和 `fallback`:

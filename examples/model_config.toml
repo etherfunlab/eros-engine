@@ -184,8 +184,13 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 400
+# Remove this entire [tasks.insight_extraction] section to disable per-turn fact
+# extraction. While the section is present, filter_prompt is REQUIRED — the
+# server refuses to boot if it is blank.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
-# as a separate user message. REQUIRED — the server refuses to boot if blank.
+# as a separate user message.
 filter_prompt = """
 你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的新事实发现。
 
@@ -208,8 +213,13 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 800
+# Remove this entire [tasks.memory_extraction] section to disable session-end
+# memory extraction (the dreaming sweeper then stays inert). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
 # Memory-extraction system instruction. The server sends the conversation
-# (用户：X / AI：Y lines) as a separate user message. REQUIRED — boot fails if blank.
+# (用户：X / AI：Y lines) as a separate user message.
 filter_prompt = """
 你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签。
 
