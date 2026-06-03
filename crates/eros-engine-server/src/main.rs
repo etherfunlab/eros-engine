@@ -274,22 +274,14 @@ async fn run_server() -> Result<()> {
             .with_context(|| format!("model_config parse failed: {model_config_path}"))?,
     );
 
-    // Required extraction prompts (Spec B2). Unlike input/output/vision filters
-    // (which silently no-op when unset), the extraction prompts are mandatory:
-    // refuse to boot rather than silently run with no instruction. Mirrors the
-    // VOYAGE_API_KEY loud-fail above. Placed in the serve path only (the
-    // print-openapi / backfill subcommands return before reaching here).
-    if model_config.resolve_insight_extract().is_none() {
-        anyhow::bail!(
-            "insight_extraction filter_prompt is unset — eros-engine refuses to boot \
-             (the insight-extraction prompt is required; see examples/model_config.toml)"
-        );
-    }
-    if model_config.resolve_memory_extract().is_none() {
-        anyhow::bail!(
-            "memory_extraction filter_prompt is unset — eros-engine refuses to boot \
-             (the memory-extraction prompt is required; see examples/model_config.toml)"
-        );
+    // Extraction prompts are required ONLY when the task section exists. A
+    // missing [tasks.*_extraction] section means that extraction is off — the
+    // engine boots and runs without it. A present section with a blank/absent
+    // filter_prompt is a misconfiguration we refuse to boot on. Placed in the
+    // serve path only (the print-openapi / backfill subcommands return before
+    // reaching here).
+    if let Err(msg) = model_config.validate_extraction_prompts() {
+        anyhow::bail!(msg);
     }
 
     let state = AppState {
@@ -341,19 +333,17 @@ async fn run_server() -> Result<()> {
 mod tests {
     use eros_engine_llm::model_config::ModelConfig;
 
-    /// The committed example config is the dev/prod boot default; it MUST satisfy
-    /// the Spec B2 boot gate (both extraction prompts present), or `main` bails.
+    /// The committed example config is the dev/prod boot default; it MUST pass the
+    /// extraction boot gate (both sections present with non-blank filter_prompts),
+    /// or `main` bails.
     #[test]
     fn shipped_model_config_satisfies_extraction_boot_gate() {
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         assert!(
-            cfg.resolve_insight_extract().is_some(),
-            "insight_extraction filter_prompt must be set in examples/model_config.toml"
-        );
-        assert!(
-            cfg.resolve_memory_extract().is_some(),
-            "memory_extraction filter_prompt must be set in examples/model_config.toml"
+            cfg.validate_extraction_prompts().is_ok(),
+            "shipped config must pass the extraction boot gate: {:?}",
+            cfg.validate_extraction_prompts()
         );
     }
 }
