@@ -96,16 +96,21 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 
 ## App-attribution headers
 
-Two optional env vars add headers to every outbound OpenRouter call:
+Three optional env vars add headers to every outbound OpenRouter call:
 
-| Env                       | Header         | Purpose                                          |
-|---------------------------|----------------|--------------------------------------------------|
-| `OPENROUTER_APP_REFERER`  | `HTTP-Referer` | App identifier on OpenRouter dashboards          |
-| `OPENROUTER_APP_TITLE`    | `X-Title`      | Display name in OpenRouter app analytics         |
+| Env                         | Header                    | Purpose                                          |
+|-----------------------------|---------------------------|--------------------------------------------------|
+| `OPENROUTER_APP_REFERER`    | `HTTP-Referer`            | App identifier on OpenRouter dashboards          |
+| `OPENROUTER_APP_TITLE`      | `X-OpenRouter-Title`      | Display name in OpenRouter app analytics         |
+| `OPENROUTER_APP_CATEGORIES` | `X-OpenRouter-Categories` | Comma-separated marketplace categories           |
 
-Both unset → today's behaviour (no attribution headers). They are set
+All unset → today's behaviour (no attribution headers). They are set
 per deployment, not per request — App-Attribution is intended for
 app-level aggregation. Per-user attribution belongs in `audit.user`.
+
+`OPENROUTER_APP_CATEGORIES` is passed through verbatim; OpenRouter
+silently ignores unrecognised values and only honours it when
+`OPENROUTER_APP_REFERER` is also set.
 
 Invalid values (control characters, non-ASCII outside header rules)
 are dropped at construction time with a `tracing::warn!`; the client
