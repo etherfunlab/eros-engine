@@ -860,6 +860,26 @@ impl ModelConfig {
             reasoning: m.reasoning,
         })
     }
+
+    /// Boot-time validation for the two extraction tasks. A task **section that
+    /// is present** must carry a usable `filter_prompt` (else `Err`); an
+    /// **absent section** means that extraction is simply off (`Ok`). Returns a
+    /// ready-to-print message naming the first misconfigured task.
+    ///
+    /// Scoped to `insight_extraction` / `memory_extraction` — the only tasks the
+    /// boot gate makes mandatory-when-present.
+    pub fn validate_extraction_prompts(&self) -> Result<(), String> {
+        for name in ["insight_extraction", "memory_extraction"] {
+            if self.tasks.contains_key(name) && self.resolve_extract(name).is_none() {
+                return Err(format!(
+                    "[tasks.{name}] is present but its filter_prompt is unset — eros-engine \
+                     refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
+                     section to disable {name}."
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2418,5 +2438,67 @@ retry_depth = 0
         let r = cfg.resolve_insight_extract().expect("resolves");
         assert_eq!(r.retry_depth, 2);
         assert_eq!(r.fallback_model, vec!["f1".to_string(), "f2".to_string()]);
+    }
+
+    #[test]
+    fn validate_extraction_absent_sections_ok() {
+        // Neither extraction section present → both features off → Ok.
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn validate_extraction_present_with_prompt_ok() {
+        let toml = r#"
+[tasks.insight_extraction]
+model = "m"
+filter_prompt = "extract facts"
+
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "extract memories"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn validate_extraction_present_without_prompt_errors() {
+        let toml = r#"
+[tasks.insight_extraction]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate_extraction_prompts().unwrap_err();
+        assert!(
+            err.contains("insight_extraction"),
+            "msg names the task: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extraction_present_blank_prompt_errors() {
+        let toml = r#"
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "   "
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate_extraction_prompts().unwrap_err();
+        assert!(
+            err.contains("memory_extraction"),
+            "msg names the task: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_memory_extract_none_when_section_absent() {
+        // Guards the dreaming sweeper's early-return condition (a later task).
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_memory_extract().is_none());
     }
 }
