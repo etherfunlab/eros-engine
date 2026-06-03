@@ -151,13 +151,19 @@ deltas / style / energy cost internally:
 ///   ReplyText/ReplyImage/ReplyTextImage → Neutral, predict_reply_deltas, ENERGY_COST_REPLY,
 ///                                          context_hints = hints (→ [inner_state])
 ///   Ghost                               → Cold, ghost_affinity_deltas, ENERGY_COST_GHOST,
-///                                          hints ignored (ghost emits no prompt)
+///                                          hints ignored (a ghost emits no prompt)
+///   Proactive                           → unreachable!() — never built via plan_for;
+///                                          Proactive comes only from pde::decide. The
+///                                          arm exists solely to keep the match exhaustive.
 pub fn plan_for(input: &DecisionInput, action: ActionType, hints: Vec<String>) -> ActionPlan;
 ```
 
 `stream.rs` calls `pde::plan_for(&input, acted_action, hints)` for both the LLM reply plan
 **and** the LLM-honoured ghost plan — it never touches the private helpers/constants. This
-keeps all plan construction owned by core.
+keeps all plan construction owned by core. Note `plan_for(Ghost, …)` discards `hints`
+(a ghost has no prompt); when a ghost is later **downgraded** to a reply (hard-safety
+guardrail or `ghosting` kill-switch), the caller re-supplies the sanitized `hints` it kept
+in scope (§6), so the forced reply still carries the judge's mood.
 
 **Invariant — image actions never reach post_process.** Because the guardrails (§5) always
 degrade `ReplyImage` / `ReplyTextImage` to `ReplyText` while the executor is unshipped, the
@@ -378,6 +384,7 @@ verdict short-circuits all of them):
 ```text
 build DecisionInput `input`
 transcript = fetch recent history ONCE                         // shared by judge + input-filter
+hints = []                                                     // sanitized LLM inner_state, if any; [] on rule paths
 (plan, run) =
   if tip turn OR resolve_pde() == None:
       (pde::decide(&input), None)                            // rule engine (today's behaviour); no judge
@@ -387,21 +394,26 @@ transcript = fetch recent history ONCE                         // shared by judg
         Ok => {
           action = guardrails(run.verdict.action, &input)    // §5 — ghost_permitted + image degrade
           hints  = sanitize(run.verdict.inner_state)         // §3.3; [] if empty after sanitize
-          pde::plan_for(&input, action, hints)             // §2.3 — Neutral style, heuristic deltas inside
+          pde::plan_for(&input, action, hints)               // §2.3 — Neutral style, heuristic deltas inside
         }
         _  => pde::decide(&input)                            // fail-open to rule engine
       (plan, Some(run))
 
-// Ghosting kill-switch (§4.1) — FINAL gate, every path (LLM / fallback / pure-rule / tip):
+// Ghosting kill-switch (§4.1) — FINAL gate, every path (LLM / fallback / pure-rule / tip).
+// Use the in-scope `hints` (NOT plan.context_hints): a plan_for(Ghost) plan carries no
+// hints, but an LLM ghost still produced an inner_state we keep on the forced reply — same
+// as the hard-safety guardrail downgrade (which keeps hints because guardrails returned
+// ReplyText before plan_for). On rule paths `hints` is [] anyway.
 if !pde_ghosting_enabled() && plan.action_type == Ghost:
-    plan = pde::plan_for(&input, ReplyText, plan.context_hints)   // keep hints
+    plan = pde::plan_for(&input, ReplyText, hints)
 
 // Audit (§8, best-effort) — only when the judge ran; logs the FINAL acted action:
 if let Some(run) = run:
     spawn audit_row(status = run.status,
-                    proposed_action = run.verdict.map(|v| v.action),   // judge's raw proposal; None unless Ok
+                    proposed_action = run.verdict.map(|v| v.action),   // judge's raw proposal; None unless status==Ok
                     action = plan.action_type,                          // post-kill-switch → reply_text if suppressed
-                    payload = run.verdict_or_raw, model/usage/generation_id)
+                    payload = run.verdict.as_json().or(run.raw),        // verdict JSON when Ok, else raw model text
+                    model = run.model, usage = run.usage, generation_id = run.generation_id)
 
 match plan.action_type {
     Ghost                                  => …unchanged ghost arm…,   // skips vision + input-filter
@@ -532,11 +544,12 @@ Register `pub mod decision;` in `eros-engine-store/src/lib.rs`.
 
 ### 8.4 Write placement — inline, fire-and-forget
 
-Write the row **in the PDE path right after the run completes** — for **every** judge run
+Write the row **after the final acted `plan` is computed** (i.e. after the `ghosting`
+kill-switch gate, §6, so `action` is the FINAL acted action) — for **every** judge run
 regardless of `status` (so `Ok`, `Empty`, `ParseError`, `Timeout`, `Error` are all
 captured, including the fail-open-to-rule path) — via `tokio::spawn` (best-effort,
 warn-on-error). The spawned task owns a clone of the data it needs (`run_id`, ids, status,
-acted `action`, `proposed_action`, payload, audit trio) plus the pool.
+final acted `action`, `proposed_action`, payload, audit trio) plus the pool.
 
 - **Why inline, not post_process**: a `Ghost` turn does **not** run post_process (the Ghost
   arm only marks + records + emits frames). Ghost is the most important decision to audit,
@@ -607,10 +620,14 @@ served stream.
     rendered prompt structurally intact.
   - **Invariant test**: a guarded plan never carries an un-degraded image action; the
     `match` never hits the `_` catch-all for a reply.
-  - **`ghosting = false` kill-switch** (§4.1): suppresses ghost on all three paths — LLM
-    `ghost` verdict, LLM-failure rule fallback, and pure-rule engine (LLM off) — each →
-    `ReplyText`; and the audit row (where one exists) shows `proposed_action=ghost`,
-    `action=reply_text`.
+  - **`ghosting = false` kill-switch** (§4.1): suppresses ghost on all three paths, each →
+    `ReplyText`, with the correct audit shape per path:
+    - LLM-Ok `ghost` verdict → row with `status=ok`, `proposed_action=ghost`,
+      `action=reply_text`; **the LLM's sanitized `inner_state` is preserved** on the
+      forced reply (hints not lost).
+    - LLM-failure rule fallback (`status != ok`) yielding a rule ghost → row with
+      `proposed_action=NULL` (no verdict), `action=reply_text`.
+    - Pure-rule engine (LLM off) / tip → ghost suppressed → **no audit row** (no judge ran).
   - One stream E2E: judge → ghost (short-circuits vision/input-filter), and inner_state
     injected into the prompt on a reply turn.
 - **store**: `DecisionEventRepo::record` round-trips a row (run_id, status, payload, audit
