@@ -341,9 +341,11 @@ defaults to 20 (capped at 100).
 }
 ```
 
-`event_type` ∈ `message | gift | proactive | ghost`. For a per-turn frontend
-surface that is **not** debug-gated and returns only the latest event (post-EMA
-only), use the BFF route `GET /bff/v1/comp/affinity/{session_id}/event` below.
+The `event_type` filter accepts `message | gift | proactive | ghost |
+time_decay` (`time_decay` is reserved — not written by current code). For a
+per-turn frontend surface that is **not** debug-gated and returns only the
+latest event (post-EMA only), use the BFF route
+`GET /bff/v1/comp/affinity/{session_id}/event` below.
 
 ## BFF (`/bff/v1/*`)
 

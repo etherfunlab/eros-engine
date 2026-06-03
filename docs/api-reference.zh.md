@@ -325,9 +325,10 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 }
 ```
 
-`event_type` ∈ `message | gift | proactive | ghost`。若要一个**不受**
-debug 开关控制、只返回最新一条（仅 EMA 后）的前端用面板，用下面的 BFF
-路由 `GET /bff/v1/comp/affinity/{session_id}/event`。
+`event_type` 过滤可取 `message | gift | proactive | ghost | time_decay`
+（`time_decay` 为预留，当前代码不写入）。若要一个**不受** debug 开关控制、
+只返回最新一条（仅 EMA 后）的前端用面板，用下面的 BFF 路由
+`GET /bff/v1/comp/affinity/{session_id}/event`。
 
 ## BFF（`/bff/v1/*`）
 
