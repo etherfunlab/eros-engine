@@ -100,6 +100,35 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
     }
 }
 
+/// Build the `ActionPlan` for an LLM-chosen action, reusing the rule heuristic
+/// and energy constants internally. Per action:
+///   ReplyText / ReplyImage / ReplyTextImage → Neutral, predict_reply_deltas,
+///                                              ENERGY_COST_REPLY, context_hints = hints
+///   Ghost                                   → Cold, ghost_affinity_deltas,
+///                                              ENERGY_COST_GHOST, hints discarded
+///   Proactive                               → unreachable! (comes only from decide)
+pub fn plan_for(input: &DecisionInput, action: ActionType, hints: Vec<String>) -> ActionPlan {
+    match action {
+        ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => ActionPlan {
+            action_type: action,
+            reply_style: ReplyStyle::Neutral,
+            affinity_deltas: predict_reply_deltas(input),
+            energy_cost: ENERGY_COST_REPLY,
+            context_hints: hints,
+        },
+        ActionType::Ghost => ActionPlan {
+            action_type: ActionType::Ghost,
+            reply_style: ReplyStyle::Cold,
+            affinity_deltas: ghost_affinity_deltas(),
+            energy_cost: ENERGY_COST_GHOST,
+            context_hints: vec![],
+        },
+        ActionType::Proactive => {
+            unreachable!("plan_for is never called with Proactive; it comes only from pde::decide")
+        }
+    }
+}
+
 /// Predict affinity delta sign based on user message length / signals.
 /// Conservative: small positive/negative heuristics only. Full evaluation
 /// remains deterministic so no LLM JSON parsing is needed here.
@@ -367,5 +396,35 @@ mod tests {
         let plan = decide(&input);
         // short penalty (-0.02) + stale penalty (-0.05) = -0.07
         assert!((plan.affinity_deltas.patience - (-0.07)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plan_for_reply_text_is_neutral_with_hints() {
+        let input = DecisionInput {
+            event: user_msg("hello"),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        let plan = plan_for(&input, ActionType::ReplyText, vec!["有点开心".into()]);
+        assert_eq!(plan.action_type, ActionType::ReplyText);
+        assert_eq!(plan.reply_style, ReplyStyle::Neutral);
+        assert_eq!(plan.context_hints, vec!["有点开心".to_string()]);
+        assert_eq!(plan.energy_cost, ENERGY_COST_REPLY);
+    }
+
+    #[test]
+    fn plan_for_ghost_is_cold_and_drops_hints() {
+        let input = DecisionInput {
+            event: user_msg("hello"),
+            affinity: base_affinity(),
+            persona: base_persona(),
+            signals: base_signals(),
+        };
+        let plan = plan_for(&input, ActionType::Ghost, vec!["想躲".into()]);
+        assert_eq!(plan.action_type, ActionType::Ghost);
+        assert_eq!(plan.reply_style, ReplyStyle::Cold);
+        assert!(plan.context_hints.is_empty());
+        assert_eq!(plan.energy_cost, ENERGY_COST_GHOST);
     }
 }
