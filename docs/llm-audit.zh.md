@@ -90,16 +90,20 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 
 ## App-attribution headers
 
-两个可选环境变量给每次出站 OpenRouter 调用加 header：
+三个可选环境变量给每次出站 OpenRouter 调用加 header：
 
-| Env                       | Header         | 用途                                          |
-|---------------------------|----------------|-----------------------------------------------|
-| `OPENROUTER_APP_REFERER`  | `HTTP-Referer` | OpenRouter 仪表盘上的 app 标识                |
-| `OPENROUTER_APP_TITLE`    | `X-Title`      | OpenRouter app analytics 里显示的名字         |
+| Env                         | Header                    | 用途                                          |
+|-----------------------------|---------------------------|-----------------------------------------------|
+| `OPENROUTER_APP_REFERER`    | `HTTP-Referer`            | OpenRouter 仪表盘上的 app 标识                |
+| `OPENROUTER_APP_TITLE`      | `X-OpenRouter-Title`      | OpenRouter app analytics 里显示的名字         |
+| `OPENROUTER_APP_CATEGORIES` | `X-OpenRouter-Categories` | 逗号分隔的 marketplace 分类                   |
 
-两个都不设 → 维持现状（不发任何 attribution header）。它们是
+都不设 → 维持现状（不发任何 attribution header）。它们是
 deployment 级别的设置，不是 per-request —— App-Attribution 的目的是
 app-level 聚合。Per-user 维度走 `audit.user`。
+
+`OPENROUTER_APP_CATEGORIES` 原样透传；OpenRouter 对无法识别的值静默
+忽略，且只有在同时设了 `OPENROUTER_APP_REFERER` 时才生效。
 
 非法值（控制字符、非 ASCII 之类）在构造时被丢弃并打一条
 `tracing::warn!`，client 仍然可用。

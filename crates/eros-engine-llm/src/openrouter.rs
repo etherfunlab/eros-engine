@@ -17,7 +17,8 @@ const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// names become legacy and (if a transition window applies) get added as
 /// a parallel alias below.
 const HEADER_REFERER: &str = "HTTP-Referer";
-const HEADER_TITLE: &str = "X-Title";
+const HEADER_TITLE: &str = "X-OpenRouter-Title";
+const HEADER_CATEGORIES: &str = "X-OpenRouter-Categories";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -49,6 +50,51 @@ pub struct ChatRequest {
     /// Reasoning config forwarded to OpenRouter. `None` → omit the param;
     /// `Some(cfg)` → send the `reasoning` object verbatim.
     pub reasoning: Option<ReasoningConfig>,
+}
+
+/// One-shot multimodal *describe* request. Used only by the `chat_vision`
+/// pipeline stage. Builds an OpenRouter user message whose `content` is a block
+/// array (text instruction + one image_url). Keeps `ChatMessage` text-only.
+#[derive(Debug, Clone, Default)]
+pub struct VisionRequest {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub system_prompt: String,
+    pub image_url: String,
+    /// User's own caption (becomes the text block when non-blank).
+    pub caption: Option<String>,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Build the OpenRouter wire body for one vision attempt against `model`. Pure
+/// (no I/O) so the block shape is unit-testable. A non-blank `caption` becomes
+/// the text block; otherwise a default describe instruction is used.
+fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
+    let text = match req.caption.as_deref().map(str::trim) {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => "请描述这张图片的内容。".to_string(),
+    };
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": req.system_prompt },
+            { "role": "user", "content": [
+                { "type": "text", "text": text },
+                { "type": "image_url", "image_url": { "url": req.image_url } }
+            ]}
+        ],
+        "temperature": req.temperature,
+        "max_tokens": req.max_tokens,
+        "stream": false,
+    });
+    if let Some(r) = &req.reasoning {
+        if let Ok(v) = serde_json::to_value(r) {
+            body["reasoning"] = v;
+        }
+    }
+    body
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -196,8 +242,15 @@ struct WireStreamFrame {
 pub struct AppAttribution {
     /// Sent as `HTTP-Referer`. Identifies the deploying app to OpenRouter.
     pub referer: Option<String>,
-    /// Sent as `X-Title`. Display name in OpenRouter's app analytics.
+    /// Sent as `X-OpenRouter-Title`. Display name in OpenRouter's app
+    /// analytics. (OpenRouter also accepts the legacy `X-Title` alias; we
+    /// send the current canonical name.)
     pub title: Option<String>,
+    /// Sent as `X-OpenRouter-Categories`. Comma-separated marketplace
+    /// categories for OpenRouter's app directory. Passed through verbatim;
+    /// OpenRouter silently ignores unrecognised values, so the engine does
+    /// no validation. Only takes effect when paired with `referer`.
+    pub categories: Option<String>,
 }
 
 #[derive(Clone)]
@@ -241,6 +294,18 @@ impl OpenRouterClient {
                 Err(e) => tracing::warn!(
                     error = %e,
                     header = HEADER_TITLE,
+                    "openrouter: dropping invalid attribution value"
+                ),
+            }
+        }
+        if let Some(ref categories) = attribution.categories {
+            match reqwest::header::HeaderValue::from_str(categories) {
+                Ok(v) => {
+                    headers.insert(HEADER_CATEGORIES, v);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    header = HEADER_CATEGORIES,
                     "openrouter: dropping invalid attribution value"
                 ),
             }
@@ -322,6 +387,74 @@ impl OpenRouterClient {
         }
 
         Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
+    }
+
+    /// Execute a one-shot vision describe, walking the candidate chain
+    /// (`model` + `fallback_model`) sequentially. First success wins. Mirrors
+    /// `execute`'s chain semantics. Returns the model's text reply (expected
+    /// JSON; parsing is the caller's job).
+    pub async fn execute_vision(&self, req: VisionRequest) -> Result<ChatResponse, LlmError> {
+        let candidates: Vec<&str> = std::iter::once(req.model.as_str())
+            .chain(req.fallback_model.iter().map(String::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Err(LlmError::Config(
+                "openrouter: vision has no models configured".into(),
+            ));
+        }
+        if self.api_key.is_empty() {
+            return Err(LlmError::Config("openrouter: api key not set".into()));
+        }
+
+        let mut last_err: Option<LlmError> = None;
+        for model in &candidates {
+            let body = build_vision_body(&req, model);
+            let resp = match self
+                .http
+                .post(&self.base_url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
+                last_err = Some(LlmError::Status(status, text));
+                continue;
+            }
+            let parsed: WireResponse = match resp.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (decode); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let first_choice = parsed.choices.into_iter().next();
+            let raw = first_choice
+                .as_ref()
+                .and_then(|c| c.message.content.clone())
+                .unwrap_or_default();
+            let finish_reason = first_choice.and_then(|c| c.finish_reason);
+            return Ok(ChatResponse {
+                reply: clean_response(raw.trim()),
+                generation_id: parsed.id,
+                model: parsed.model,
+                usage: parsed.usage,
+                finish_reason,
+            });
+        }
+        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -502,7 +635,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .and(header("HTTP-Referer", "https://eros.example"))
-            .and(header("X-Title", "Eros"))
+            .and(header("X-OpenRouter-Title", "Eros"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
@@ -513,6 +646,7 @@ mod tests {
             AppAttribution {
                 referer: Some("https://eros.example".into()),
                 title: Some("Eros".into()),
+                categories: Some("roleplay,general-chat".into()),
             },
             format!("{}/api/v1/chat/completions", server.uri()),
         );
@@ -530,6 +664,20 @@ mod tests {
             })
             .await
             .expect("call succeeds");
+
+        // Categories is checked on the raw received value rather than via
+        // wiremock's `header` matcher: that matcher splits the received value
+        // on commas, so a comma-joined string would never compare equal. We
+        // want to prove the verbatim comma-separated string reaches the wire.
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let categories = reqs
+            .iter()
+            .find_map(|r| r.headers.get("x-openrouter-categories"))
+            .expect("X-OpenRouter-Categories header present");
+        assert_eq!(
+            categories.to_str().expect("header is valid utf-8"),
+            "roleplay,general-chat"
+        );
     }
 
     #[tokio::test]
@@ -567,8 +715,12 @@ mod tests {
                 "HTTP-Referer must be absent when unset"
             );
             assert!(
-                req.headers.get("x-title").is_none(),
-                "X-Title must be absent when unset"
+                req.headers.get("x-openrouter-title").is_none(),
+                "X-OpenRouter-Title must be absent when unset"
+            );
+            assert!(
+                req.headers.get("x-openrouter-categories").is_none(),
+                "X-OpenRouter-Categories must be absent when unset"
             );
         }
     }
@@ -587,6 +739,7 @@ mod tests {
             AppAttribution {
                 referer: Some("bad\nvalue".into()),
                 title: Some("also\rbad".into()),
+                categories: Some("still\nbad".into()),
             },
             format!("{}/api/v1/chat/completions", server.uri()),
         );
@@ -611,8 +764,12 @@ mod tests {
                 "HTTP-Referer must be dropped"
             );
             assert!(
-                req.headers.get("x-title").is_none(),
-                "X-Title must be dropped"
+                req.headers.get("x-openrouter-title").is_none(),
+                "X-OpenRouter-Title must be dropped"
+            );
+            assert!(
+                req.headers.get("x-openrouter-categories").is_none(),
+                "X-OpenRouter-Categories must be dropped"
             );
         }
     }
@@ -1161,6 +1318,44 @@ data: [DONE]\n\n";
         assert!(
             matches!(err, LlmError::Status(s, _) if s.as_u16() == 429),
             "expected Status(429), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_vision_body_has_text_and_image_blocks() {
+        let req = VisionRequest {
+            model: "ignored".into(),
+            system_prompt: "sys".into(),
+            image_url: "https://x/y.png".into(),
+            caption: Some("看看这个".into()),
+            temperature: 0.2,
+            max_tokens: 400,
+            ..Default::default()
+        };
+        let body = build_vision_body(&req, "vision-model");
+        assert_eq!(body["model"], "vision-model");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "sys");
+        let content = &body["messages"][1]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "看看这个");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://x/y.png");
+    }
+
+    #[test]
+    fn build_vision_body_defaults_text_when_caption_blank() {
+        let req = VisionRequest {
+            image_url: "https://x/y.png".into(),
+            caption: None,
+            max_tokens: 1,
+            ..Default::default()
+        };
+        let body = build_vision_body(&req, "m");
+        assert_eq!(
+            body["messages"][1]["content"][0]["text"],
+            "请描述这张图片的内容。"
         );
     }
 

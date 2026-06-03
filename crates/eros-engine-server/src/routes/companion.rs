@@ -18,15 +18,9 @@
 //!   to the JWT user; otherwise 403 Forbidden.
 //! - All DB I/O routes through the `eros-engine-store` repos
 //!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `InsightRepo`).
-//! - The credit ledger is gone in OSS — the gateway's two legacy
-//!   credit-spending endpoints collapse into a single `event/gift`
-//!   endpoint that takes
-//!   `{ deltas, label, metadata }` from the body and applies them
-//!   directly via `AffinityRepo::persist_with_event`. We deliberately
-//!   bypass `pipeline::run` for the gift route so the HTTP+DB side-effects
-//!   can be tested without a live LLM (the full gift→reply flow remains
-//!   reachable through the streaming `/message/stream` path with whatever
-//!   client-driven semantics the host app prefers).
+//! - The credit ledger is gone in OSS — tipping is handled inline on the
+//!   streaming `/message/stream` path via `tips_amount_usd`, not through a
+//!   separate credit-spending endpoint.
 //! - `lead_score` / CTA-gating fields are computed from the same store
 //!   primitives used by post-process; no inline `companion_insights`
 //!   table read.
@@ -43,7 +37,6 @@ use uuid::Uuid;
 use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
-use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::insight::{compute_training_level, InsightRepo};
 use eros_engine_store::persona::PersonaRepo;
@@ -140,20 +133,6 @@ pub struct ProfileResponse {
     pub agent_training_level: f64,
 }
 
-/// Body for `POST /comp/chat/{session_id}/event/gift`.
-///
-/// Replaces the gateway's `tip` + `gift` endpoints. The OSS engine has
-/// no credit ledger, so the caller supplies the affinity deltas
-/// directly. `label` is the human-readable description (e.g. `"rose"`)
-/// and is also used as the `chat_messages.content` for the gift turn.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct GiftEventBody {
-    pub deltas: AffinityDeltasDto,
-    pub label: Option<String>,
-    #[schema(value_type = Object)]
-    pub metadata: Option<serde_json::Value>,
-}
-
 /// Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`
 /// for OpenAPI emission. Field-for-field conversion both ways.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -227,13 +206,6 @@ pub struct LlmAuditDto {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct GiftEventResponse {
-    pub reply: Option<String>,
-    pub applied_deltas: AffinityDeltasDto,
-    pub relationship_label: Option<String>,
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /// Verify a session exists and is owned by `user_id`. Returns the session
@@ -252,20 +224,6 @@ pub(crate) async fn require_session_for_user(
         return Err(AppError::Forbidden("not your session".into()));
     }
     Ok(session)
-}
-
-fn label_to_string(label: Option<eros_engine_core::affinity::RelationshipLabel>) -> Option<String> {
-    use eros_engine_core::affinity::RelationshipLabel as L;
-    label.map(|l| {
-        match l {
-            L::Stranger => "stranger",
-            L::Romantic => "romantic",
-            L::Friend => "friend",
-            L::Frenemy => "frenemy",
-            L::SlowBurn => "slow_burn",
-        }
-        .to_string()
-    })
 }
 
 /// Validate a caller-supplied list of `PromptTraitDto` and convert to the
@@ -691,77 +649,6 @@ async fn get_profile(
     }))
 }
 
-/// Send a gift event to the session.
-///
-/// Replaces the gateway's `tip` + `gift` endpoints. The OSS engine has
-/// no credit ledger / inventory, so the caller supplies the deltas
-/// (validated by client UX) and the optional human label. The route
-/// inserts a `gift_user` `chat_messages` row and applies the deltas via
-/// `AffinityRepo::persist_with_event` (which logs a `gift` row in
-/// `companion_affinity_events`). It deliberately does NOT call
-/// `pipeline::run` — the LLM-driven gift reaction reply is delegated to
-/// the next user message turn so this route's HTTP+DB side-effects can
-/// be exercised in tests without a live LLM.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/{session_id}/event/gift",
-    tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
-    request_body = GiftEventBody,
-    responses(
-        (status = 200, body = GiftEventResponse),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, description = "not your session"),
-        (status = 404, description = "session not found")
-    ),
-    security(("bearer" = []))
-)]
-async fn event_gift(
-    State(state): State<AppState>,
-    Path(session_id): Path<Uuid>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(body): Json<GiftEventBody>,
-) -> Result<Json<GiftEventResponse>, AppError> {
-    let session = require_session_for_user(&state, session_id, user_id).await?;
-    let instance_id = session
-        .instance_id
-        .ok_or_else(|| AppError::Internal("session has no instance_id".into()))?;
-
-    // 1. Persist the gift turn as a chat message (role = 'gift_user').
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let label_text = body.label.clone().unwrap_or_else(|| "gift".to_string());
-    chat_repo
-        .append_message(session_id, "gift_user", &label_text)
-        .await?;
-
-    // 2. Apply deltas + emit a `gift` row in companion_affinity_events.
-    let affinity_repo = AffinityRepo { pool: &state.pool };
-    let mut affinity = affinity_repo
-        .load_or_create(session_id, user_id, instance_id)
-        .await?;
-    let core_deltas: AffinityDeltas = (&body.deltas).into();
-    let context = body
-        .metadata
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "label": label_text }));
-    affinity_repo
-        .persist_with_event(
-            &mut affinity,
-            &core_deltas,
-            state.config.ema_inertia,
-            "gift",
-            context,
-        )
-        .await?;
-
-    Ok(Json(GiftEventResponse {
-        // Reply text is intentionally None here — see route doc-comment.
-        reply: None,
-        applied_deltas: body.deltas,
-        relationship_label: label_to_string(affinity.relationship_label),
-    }))
-}
-
 // ─── Router ─────────────────────────────────────────────────────────
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -770,7 +657,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
-        .routes(routes!(event_gift))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -826,13 +712,9 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
 //
 // These exercise the route module's HTTP+DB side-effects against a
 // live Postgres instance (via `#[sqlx::test]`). They do NOT exercise
-// the LLM-driven path: the gift route deliberately bypasses
-// `pipeline::run`, and the message routes are not tested here for the
-// same reason (full end-to-end LLM testing is the job of T14's deploy
-// smoke). Per the T11 spec: "directly insert a chat_messages row +
-// call AffinityRepo::persist_with_event in the test, BYPASSING the
-// pipeline" — this is exactly what the gift-event test does, and it
-// matches the route's chosen implementation strategy.
+// the LLM-driven path (full end-to-end LLM testing is the job of the
+// deploy smoke); the message/streaming routes are covered by the
+// pipeline tests instead.
 // ────────────────────────────────────────────────────────────────────
 
 // Test helpers shared with sibling test modules (e.g. routes::bff::companion).
@@ -932,6 +814,7 @@ mod tests {
         body::Body,
         http::{header, Request, StatusCode},
     };
+    use eros_engine_store::affinity::AffinityRepo;
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -1018,112 +901,6 @@ mod tests {
             .uri(format!("/comp/chat/{victim}/sessions"))
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
-            .unwrap();
-        let (status, _body) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-    }
-
-    // ─── Test 5: event/gift appends gift_user message + emits event ──
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn event_gift_appends_message_and_emits_event(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Nova").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let state = test_state(pool.clone());
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let body = serde_json::to_vec(&json!({
-            "deltas": {
-                "warmth": 0.2,
-                "trust": 0.1,
-                "intrigue": 0.0,
-                "intimacy": 0.05,
-                "patience": 0.0,
-                "tension": 0.0
-            },
-            "label": "rose",
-            "metadata": { "source": "test" }
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/event/gift"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let (status, resp) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::OK, "got body: {resp}");
-
-        // chat_messages: a gift_user row was appended with content == label.
-        let gift_msg_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'gift_user' AND content = 'rose'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(gift_msg_count, 1);
-
-        // companion_affinity_events: a gift row was emitted.
-        let gift_event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM engine.companion_affinity_events e \
-             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
-             WHERE a.session_id = $1 AND e.event_type = 'gift'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(gift_event_count, 1);
-
-        // Affinity row exists and warmth was bumped (ema_inertia = 0.0
-        // in test config → 1:1 apply, plus default 0.3 baseline → 0.5).
-        let warmth: f64 = sqlx::query_scalar(
-            "SELECT warmth FROM engine.companion_affinity WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!((warmth - 0.5).abs() < 1e-9, "got warmth={warmth}");
-    }
-
-    // ─── Bonus: cross-user gift event is forbidden ──────────────────
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn event_gift_403_for_foreign_session(pool: PgPool) {
-        let owner = Uuid::new_v4();
-        let attacker = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Mira").await;
-        let instance_id = seed_instance(&pool, genome_id, owner).await;
-        let session_id = seed_session(&pool, owner, instance_id).await;
-
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(attacker);
-
-        let body = serde_json::to_vec(&json!({
-            "deltas": {
-                "warmth": 0.5, "trust": 0.0, "intrigue": 0.0,
-                "intimacy": 0.0, "patience": 0.0, "tension": 0.0
-            },
-            "label": "kiss"
-        }))
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/comp/chat/{session_id}/event/gift"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
             .unwrap();
         let (status, _body) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::FORBIDDEN);

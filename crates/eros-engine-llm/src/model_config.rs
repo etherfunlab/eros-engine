@@ -377,6 +377,12 @@ pub struct TaskConfig {
     pub model_name_display_override: Option<DisplayOverride>,
     #[serde(default)]
     pub output_filter: Option<bool>,
+    /// Global trigger for the user-input rewrite filter (chat_input_filter).
+    /// Read ONLY on [tasks.chat_companion]; task-level, no per-tier override
+    /// (unlike `output_filter`). `false`/absent ⇒ off, `true` ⇒ every turn,
+    /// `0.8` ⇒ 80% of turns. See `InputFilterTrigger`.
+    #[serde(default)]
+    pub input_filter: Option<InputFilterTrigger>,
     /// System instruction sent to the filter LLM; the assistant reply to
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
@@ -447,6 +453,108 @@ pub struct ResolvedOutputFilter {
     /// Reasoning config forwarded from `[tasks.chat_output_filter]`. Task-level
     /// only (no per-tier override), consistent with `chat_companion`'s own
     /// `reasoning` field shape.
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Per-turn trigger for the user-input rewrite filter (`input_filter` on
+/// `[tasks.chat_companion]`). Three TOML forms: `false` (never, probability
+/// 0.0), `true` (always, probability 1.0), or a number in `[0.0, 1.0]` (e.g.
+/// `0.8` ⇒ fire on ~80% of turns). A number outside `[0.0, 1.0]` (or non-finite)
+/// is a hard config error — the load fails loudly rather than silently clamping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputFilterTrigger(pub f64);
+
+impl<'de> Deserialize<'de> for InputFilterTrigger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TriggerVisitor;
+        impl<'de> serde::de::Visitor<'de> for TriggerVisitor {
+            type Value = InputFilterTrigger;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a bool, or a probability number in [0.0, 1.0]")
+            }
+            fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(InputFilterTrigger(if b { 1.0 } else { 0.0 }))
+            }
+            fn visit_f64<E>(self, x: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if x.is_finite() && (0.0..=1.0).contains(&x) {
+                    Ok(InputFilterTrigger(x))
+                } else {
+                    Err(E::custom(format!(
+                        "input_filter probability must be between 0.0 and 1.0, got {x}"
+                    )))
+                }
+            }
+            fn visit_i64<E>(self, x: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_f64(x as f64)
+            }
+            fn visit_u64<E>(self, x: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_f64(x as f64)
+            }
+        }
+        deserializer.deserialize_any(TriggerVisitor)
+    }
+}
+
+/// Resolved user-input rewrite filter (`chat_input_filter`). Mirrors
+/// `ResolvedOutputFilter` minus `trigger`/`timing` (the input filter has no
+/// extract-timing). `fallback_model` is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedInputFilter {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub filter_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    /// Per-turn fire probability in `[0.0, 1.0]` (always > 0.0 here — a 0.0
+    /// trigger resolves to `None`). The stream wiring draws one coin flip per
+    /// turn and runs the filter LLM only when `draw < probability`.
+    pub probability: f64,
+}
+
+/// Resolved image-describe task (`chat_vision`). Mirrors `ResolvedInputFilter`
+/// minus the per-turn probability — the trigger is "image present", decided in
+/// the stream wiring. `fallback_model` is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedVision {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub describe_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
+/// The configured `filter_prompt` is the system instruction; the server assembles
+/// the conversation as a separate user message. Model selection mirrors the generic
+/// `resolve()` exactly (this only adds the prompt), so call-site behaviour is unchanged
+/// apart from the system/user split.
+#[derive(Debug, Clone)]
+pub struct ResolvedExtract {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub extract_prompt: String,
+    pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
 }
 
@@ -643,6 +751,113 @@ impl ModelConfig {
             timing,
             retry_depth,
             reasoning,
+        })
+    }
+
+    /// chat_companion task-level `input_filter` fire probability; no tier
+    /// override. `false`/absent → 0.0, `true` → 1.0, number → that probability.
+    /// The per-turn coin flip happens in the stream wiring.
+    pub fn input_filter_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.input_filter)
+            .map(|t| t.0)
+            .unwrap_or(0.0)
+    }
+
+    /// True when the input filter can ever fire (probability > 0.0).
+    pub fn input_filter_enabled(&self) -> bool {
+        self.input_filter_probability() > 0.0
+    }
+
+    /// Resolve the user-input rewrite filter. `None` (disabled) when:
+    /// chat_companion `input_filter` probability is 0.0 (false/absent), OR
+    /// `[tasks.chat_input_filter]` is absent, OR its resolved `filter_prompt` is
+    /// blank. The carried `probability` gates the per-turn run in the wiring.
+    pub fn resolve_input_filter(&self) -> Option<ResolvedInputFilter> {
+        const FILTER_TASK: &str = "chat_input_filter";
+        let probability = self.input_filter_probability();
+        if probability <= 0.0 {
+            return None;
+        }
+        let task_cfg = self.tasks.get(FILTER_TASK)?;
+        let filter_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if filter_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(FILTER_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedInputFilter {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            filter_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+            probability,
+        })
+    }
+
+    /// Resolve the image-describe task. `None` (feature off) when
+    /// `[tasks.chat_vision]` is absent OR its `filter_prompt` is blank. Reuses
+    /// the generic `TaskConfig.filter_prompt` field and the standard `resolve()`
+    /// model/fallback machinery. No probability gate — image presence is the
+    /// trigger, decided in the stream wiring.
+    pub fn resolve_vision(&self) -> Option<ResolvedVision> {
+        const VISION_TASK: &str = "chat_vision";
+        let task_cfg = self.tasks.get(VISION_TASK)?;
+        let describe_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if describe_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(VISION_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedVision {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            describe_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// Resolve the insight-extraction (facts stage) prompt bundle. `None` when
+    /// `[tasks.insight_extraction]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_insight_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("insight_extraction")
+    }
+
+    /// Resolve the memory-extraction prompt bundle. `None` when
+    /// `[tasks.memory_extraction]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_memory_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("memory_extraction")
+    }
+
+    /// Shared resolver for the config-driven extraction prompts. Mirrors
+    /// `resolve_vision` but takes model/fallback/temp/max_tokens/reasoning/retry_depth
+    /// straight from `resolve()` so the call site keeps today's selection semantics.
+    fn resolve_extract(&self, task: &str) -> Option<ResolvedExtract> {
+        let task_cfg = self.tasks.get(task)?;
+        let extract_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if extract_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve(task, None);
+        Some(ResolvedExtract {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            extract_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
         })
     }
 }
@@ -929,6 +1144,7 @@ temperature  = 0.85
 max_tokens   = 600
 description  = "AI companion chat"
 allow_traits = ["allow_politics"]
+input_filter = true
 
 [tasks.chat_companion.tiers.gold]
 model        = "x-ai/grok-4.20"
@@ -952,6 +1168,15 @@ description  = "reserved — current PDE is rule-based"
 model        = "voyage-3-lite"
 dimensions   = 512
 description  = "reserved — Voyage hard-codes its own model"
+
+[tasks.chat_input_filter]
+model        = "openai/gpt-5.4-nano"
+fallback     = "deepseek/deepseek-chat-v3.2"
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 400
+filter_prompt = "Rewrite per policy."
+reasoning    = { enabled = false }
 "#;
 
     #[test]
@@ -1058,6 +1283,17 @@ description  = "reserved — Voyage hard-codes its own model"
             r.allow_traits,
             Some(vec!["allow_nsfw".to_string(), "allow_politics".to_string()])
         );
+
+        // chat_input_filter schema lock (input-filter feature).
+        assert_eq!(chat.input_filter, Some(InputFilterTrigger(1.0)));
+        let inf = cfg
+            .resolve_input_filter()
+            .expect("input filter resolves from fixture");
+        assert_eq!(inf.model, "openai/gpt-5.4-nano");
+        assert_eq!(inf.retry_depth, 1);
+        assert_eq!(inf.max_tokens, 400);
+        assert_eq!(inf.filter_prompt, "Rewrite per policy.");
+        assert_eq!(inf.probability, 1.0);
     }
 
     #[test]
@@ -1922,5 +2158,265 @@ model = "gold/m"
         assert_eq!(rg.model, "gold/m"); // tier model
         assert_eq!(rg.filter_prompt, "DEFAULT"); // fell back to default block (#5)
         assert_eq!(rg.timing, FilterTiming::AfterExtract); // default timing
+    }
+
+    #[test]
+    fn resolve_input_filter_disabled_when_switch_off() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+[tasks.chat_input_filter]
+model = "f"
+filter_prompt = "REWRITE"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.input_filter_enabled());
+        assert!(cfg.resolve_input_filter().is_none());
+    }
+
+    #[test]
+    fn resolve_input_filter_none_when_table_absent_or_blank_prompt() {
+        // switch on, table absent
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n",
+        )
+        .unwrap();
+        assert!(cfg.input_filter_enabled());
+        assert!(cfg.resolve_input_filter().is_none());
+
+        // switch on, table present, blank prompt
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_input_filter().is_none());
+    }
+
+    #[test]
+    fn resolve_input_filter_some_when_enabled() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+input_filter = true
+[tasks.chat_input_filter]
+model = "fast/in"
+fallback = ["fb1", "fb2"]
+retry_depth = 1
+temperature = 0.3
+max_tokens = 400
+filter_prompt = "REWRITE"
+reasoning = { enabled = false }
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.model, "fast/in");
+        // fallback truncated to retry_depth = 1
+        assert_eq!(f.fallback_model, vec!["fb1".to_string()]);
+        assert_eq!(f.retry_depth, 1);
+        assert_eq!(f.filter_prompt, "REWRITE");
+        assert_eq!(f.temperature, 0.3);
+        assert_eq!(f.max_tokens, 400);
+        assert_eq!(f.probability, 1.0); // `input_filter = true` ⇒ always
+        assert_eq!(
+            f.reasoning,
+            Some(ReasoningConfig {
+                enabled: Some(false),
+                exclude: None
+            })
+        );
+    }
+
+    #[test]
+    fn input_filter_trigger_parses_three_forms() {
+        // false ⇒ probability 0.0 (disabled)
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 0.0);
+        assert!(!cfg.input_filter_enabled());
+
+        // true ⇒ 1.0
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 1.0);
+
+        // number ⇒ that probability
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.8\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 0.8);
+        assert!(cfg.input_filter_enabled());
+
+        // integer bounds 0 and 1 are accepted
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 1\n")
+                .unwrap();
+        assert_eq!(cfg.input_filter_probability(), 1.0);
+    }
+
+    #[test]
+    fn input_filter_out_of_range_is_rejected() {
+        // > 1.0, < 0.0, and non-finite are hard config errors (not clamped).
+        for bad in ["1.5", "-0.2", "2", "nan", "inf"] {
+            let toml = format!("[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = {bad}\n");
+            assert!(
+                ModelConfig::from_toml_str(&toml).is_err(),
+                "input_filter = {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_input_filter_carries_probability_and_zero_disables() {
+        // 0.8 ⇒ Some with probability 0.8
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.8\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"REWRITE\"\n",
+        )
+        .unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.probability, 0.8);
+
+        // 0.0 ⇒ None (disabled), even with a valid filter table present
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ninput_filter = 0.0\n\
+             [tasks.chat_input_filter]\nmodel = \"f\"\nfilter_prompt = \"REWRITE\"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_input_filter().is_none());
+    }
+
+    #[test]
+    fn resolve_input_filter_retry_depth_zero_drops_fallback() {
+        // retry_depth = 0 ⇒ primary only, no fallback (mirrors the output
+        // filter's retry_depth=0 edge case).
+        let cfg = ModelConfig::from_toml_str(
+            r#"
+[tasks.chat_companion]
+model = "m"
+input_filter = true
+[tasks.chat_input_filter]
+model = "fast/in"
+fallback = ["a", "b"]
+filter_prompt = "REWRITE"
+retry_depth = 0
+"#,
+        )
+        .unwrap();
+        let f = cfg.resolve_input_filter().expect("enabled");
+        assert_eq!(f.retry_depth, 0);
+        assert!(f.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_vision_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_vision().is_none());
+    }
+
+    #[test]
+    fn resolve_vision_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\nmodel = \"v\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_vision().is_none());
+    }
+
+    #[test]
+    fn resolve_vision_some_truncates_fallback_to_retry_depth() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\n\
+             model = \"v\"\n\
+             fallback = [\"f1\", \"f2\", \"f3\"]\n\
+             temperature = 0.2\n\
+             max_tokens = 400\n\
+             retry_depth = 1\n\
+             filter_prompt = \"describe as json\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_vision().expect("vision resolves");
+        assert_eq!(r.model, "v");
+        assert_eq!(r.fallback_model, vec!["f1".to_string()]); // truncated to retry_depth=1
+        assert_eq!(r.describe_prompt, "describe as json");
+        assert_eq!(r.max_tokens, 400);
+        assert_eq!(r.retry_depth, 1);
+    }
+
+    #[test]
+    fn resolve_vision_retry_depth_zero_drops_fallback() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\n\
+             model = \"v\"\n\
+             fallback = [\"f1\", \"f2\"]\n\
+             retry_depth = 0\n\
+             filter_prompt = \"describe as json\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_vision().expect("vision resolves");
+        assert_eq!(r.retry_depth, 0);
+        assert!(r.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_insight_extract_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_insight_extract_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_insight_extract_some_carries_prompt_and_model() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfilter_prompt = \"extract user facts\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_insight_extract().expect("resolves");
+        assert_eq!(r.model, "ins/m");
+        assert_eq!(r.extract_prompt, "extract user facts");
+    }
+
+    #[test]
+    fn resolve_memory_extract_some_and_none() {
+        let none =
+            ModelConfig::from_toml_str("[tasks.memory_extraction]\nmodel = \"m\"\n").unwrap();
+        assert!(none.resolve_memory_extract().is_none());
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.memory_extraction]\nmodel = \"mem/m\"\nfilter_prompt = \"extract memories\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_memory_extract().expect("resolves");
+        assert_eq!(r.model, "mem/m");
+        assert_eq!(r.extract_prompt, "extract memories");
+    }
+
+    #[test]
+    fn resolve_extract_keeps_resolve_default_retry_depth() {
+        // Deliberate behavior-preserving choice: extraction tasks are pre-existing
+        // and inherit resolve()'s default retry_depth (2) — they do NOT cap at 1
+        // like the newer chat_vision / chat_input_filter features. This pins that
+        // so a future refactor toward the vision pattern can't silently halve the
+        // extraction fallback chain.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"f1\", \"f2\"]\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_insight_extract().expect("resolves");
+        assert_eq!(r.retry_depth, 2);
+        assert_eq!(r.fallback_model, vec!["f1".to_string(), "f2".to_string()]);
     }
 }

@@ -133,7 +133,7 @@ eros-engine-llm   = "0.4"   # only if you want the OpenRouter + Voyage clients
 `linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag (need arm64? build it yourself from `docker/Dockerfile`):
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.5.2
+docker pull ghcr.io/etherfunlab/eros-engine:0.6.0
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -142,7 +142,7 @@ Minimal run (you bring Postgres + your own `.env`):
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.5.2 serve
+  ghcr.io/etherfunlab/eros-engine:0.6.0 serve
 ```
 
 The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host.
@@ -234,7 +234,8 @@ for frame layout and error semantics.
 | `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
 | `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
 | `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
-| `OPENROUTER_APP_TITLE` | no | When set, sent as `X-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
+| `OPENROUTER_APP_TITLE` | no | When set, sent as `X-OpenRouter-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
+| `OPENROUTER_APP_CATEGORIES` | no | When set, sent as `X-OpenRouter-Categories` — comma-separated OpenRouter marketplace categories (e.g. `roleplay,general-chat`). Passed through verbatim; OpenRouter ignores unrecognised values and only honours it alongside `OPENROUTER_APP_REFERER`. |
 | `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
 | `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
 | `SUPABASE_URL` | no | Supabase project URL. When set, the server derives the JWKS endpoint (`<url>/auth/v1/.well-known/jwks.json`) for asymmetric (RS256/ES256) JWT validation — the post-2025 Supabase default. |

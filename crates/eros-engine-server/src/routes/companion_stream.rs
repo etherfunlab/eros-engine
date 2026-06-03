@@ -29,6 +29,7 @@ use crate::state::AppState;
 
 const MAX_CONTENT_CHARS: usize = 4096;
 const MAX_TIER_LEN: usize = 32;
+const MAX_IMAGE_URL_LEN: usize = 2048;
 const MAX_TIP_USD: f64 = 1_000_000.0;
 const MIN_CLIENT_MSG_ID_LEN: usize = 26;
 const MAX_CLIENT_MSG_ID_LEN: usize = 36;
@@ -85,6 +86,8 @@ pub struct StreamSendRequest {
     pub affinity_scope: Option<AffinityScopeDto>,
     #[serde(default)]
     pub tips_amount_usd: Option<f64>,
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -98,9 +101,34 @@ pub struct StreamPreErrorBody {
     pub original_user_message_id: Option<String>,
 }
 
+/// True when `url` is an absolute http(s) URL with a non-empty host, no
+/// whitespace anywhere, and within the length cap. Dependency-free: we never
+/// dereference the URL (it is forwarded to the vision model), so we only require
+/// a plausible, whitespace-free absolute URL — not full RFC-3986 parsing.
+fn image_url_is_valid(url: &str) -> bool {
+    if url.is_empty() || url.len() > MAX_IMAGE_URL_LEN {
+        return false;
+    }
+    // A URL never contains whitespace — reject it anywhere (host, path, query),
+    // not just the host segment.
+    if url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let rest = match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    // Require a non-empty host (reject "https://").
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty()
+}
+
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip is attached (a tip is a button tap).
-    if req.content.is_empty() && req.tips_amount_usd.is_none() {
+    // Content may be empty only when a tip or an image is attached.
+    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -165,6 +193,26 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                 code: "invalid_payload",
                 message: format!("tier must match [a-z0-9_]{{1,{MAX_TIER_LEN}}}"),
                 user_message: "请求无效".into(),
+                original_user_message_id: None,
+            }));
+        }
+    }
+    if let Some(url) = req.image_url.as_deref() {
+        if req.tips_amount_usd.is_some() {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "image_url cannot be combined with tips_amount_usd".into(),
+                user_message: "图片消息暂不支持同时打赏".into(),
+                original_user_message_id: None,
+            }));
+        }
+        if !image_url_is_valid(url) {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: format!("image_url must be an absolute http(s) URL with a host and <= {MAX_IMAGE_URL_LEN} chars"),
+                user_message: "图片链接无效".into(),
                 original_user_message_id: None,
             }));
         }
@@ -268,7 +316,7 @@ pub async fn send_message_stream(
             })
         })?;
 
-    // Build metadata: conditionally include tips_amount_usd and tier.
+    // Build metadata: conditionally include tips_amount_usd, tier, and image_url.
     // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
     let mut meta_map = serde_json::Map::new();
     if let Some(amount) = req.tips_amount_usd {
@@ -276,6 +324,9 @@ pub async fn send_message_stream(
     }
     if let Some(t) = req.tier.as_deref() {
         meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    if let Some(url) = req.image_url.as_deref() {
+        meta_map.insert("image_url".into(), serde_json::json!(url));
     }
     // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
     // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
@@ -352,6 +403,7 @@ pub async fn send_message_stream(
                     memory_scope,
                     affinity_scope,
                     tips_amount_usd: req.tips_amount_usd,
+                    image_url: req.image_url.clone(),
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -430,6 +482,7 @@ mod tests {
             memory_scope: None,
             affinity_scope: None,
             tips_amount_usd: None,
+            image_url: None,
         }
     }
 
@@ -443,6 +496,7 @@ mod tests {
             memory_scope: None,
             affinity_scope: None,
             tips_amount_usd: amount,
+            image_url: None,
         }
     }
 
@@ -787,5 +841,111 @@ mod tests {
             stored.is_none(),
             "metadata must be NULL when no fields present"
         );
+    }
+}
+
+#[cfg(test)]
+mod validate_payload_tests {
+    use super::*;
+
+    fn base() -> StreamSendRequest {
+        StreamSendRequest {
+            content: "hi".into(),
+            client_msg_id: "01J0000000000000000000000A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: None,
+            memory_scope: None,
+            affinity_scope: None,
+            tips_amount_usd: None,
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn empty_content_ok_with_image() {
+        let mut r = base();
+        r.content = String::new();
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn empty_content_rejected_without_image_or_tip() {
+        let mut r = base();
+        r.content = String::new();
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn bad_image_url_scheme_rejected() {
+        let mut r = base();
+        r.image_url = Some("ftp://x/y.png".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn good_https_image_url_ok() {
+        let mut r = base();
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn http_scheme_image_url_ok() {
+        let mut r = base();
+        r.image_url = Some("http://x/y.png".into());
+        assert!(validate_payload(&r).is_ok());
+    }
+
+    #[test]
+    fn over_length_image_url_rejected() {
+        let mut r = base();
+        // 2048 is the max; build a URL longer than that.
+        let long = format!("https://x/{}", "a".repeat(MAX_IMAGE_URL_LEN));
+        assert!(long.len() > MAX_IMAGE_URL_LEN);
+        r.image_url = Some(long);
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_no_host_rejected() {
+        let mut r = base();
+        r.content = String::new();
+        r.image_url = Some("https://".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_whitespace_host_rejected() {
+        let mut r = base();
+        r.image_url = Some("https:// example.com/y.png".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn image_url_is_valid_unit() {
+        assert!(image_url_is_valid("https://x/y.png"));
+        assert!(image_url_is_valid("http://example.com/a.jpg"));
+        assert!(!image_url_is_valid("https://"));
+        assert!(!image_url_is_valid("http:// "));
+        assert!(!image_url_is_valid("ftp://x/y.png"));
+        assert!(!image_url_is_valid(""));
+        assert!(!image_url_is_valid("https://example.com/a b.png"));
+    }
+
+    #[test]
+    fn image_url_with_space_in_path_rejected() {
+        let mut r = base();
+        r.image_url = Some("https://example.com/a b.png".into());
+        assert!(validate_payload(&r).is_err());
+    }
+
+    #[test]
+    fn tip_plus_image_rejected() {
+        let mut r = base();
+        r.tips_amount_usd = Some(1.0);
+        r.image_url = Some("https://x/y.png".into());
+        assert!(validate_payload(&r).is_err());
     }
 }

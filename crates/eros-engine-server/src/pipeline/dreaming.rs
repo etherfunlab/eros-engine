@@ -165,16 +165,27 @@ async fn classify_session(
         })
         .collect();
 
-    // 2. Single LLM call, structured-JSON output.
-    let prompt = crate::prompt::extract_memories_prompt(&turns);
-    let resolved = state.model_config.resolve(MEMORY_TASK, None);
+    // 2. Single LLM call, structured-JSON output. The instruction is the
+    // configured system prompt; the conversation is a separate user message.
+    let Some(resolved) = state.model_config.resolve_memory_extract() else {
+        // Production configs always set memory_extraction.filter_prompt (enforced by
+        // the boot gate added in this change set — see main.rs). If somehow unset,
+        // skip WITHOUT stamping classified_at so it retries and stays visible.
+        return Err("memory_extraction filter_prompt unset".to_string());
+    };
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: prompt,
-        }],
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.extract_prompt,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: crate::prompt::memories_user_message(&turns),
+            },
+        ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: Some(SYSTEM_AUDIT_USER.into()),
@@ -388,5 +399,68 @@ mod tests {
     #[test]
     fn system_audit_user_is_all_ones_sentinel() {
         assert_eq!(SYSTEM_AUDIT_USER, "11111111-1111-1111-1111-111111111111");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_sends_configured_system_prompt(pool: sqlx::PgPool) {
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Empty memories → no embedding/voyage calls; we only assert the request
+        // carried the configured system prompt (routed by a unique sentinel).
+        let body = serde_json::json!({
+            "id": "gen-mem", "model": "mem/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"memories\":[]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("memory-sys-prompt-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel=\"mem/m\"\nfilter_prompt=\"memory-sys-prompt-sentinel\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let user_id = uuid::Uuid::new_v4();
+        let instance_id = uuid::Uuid::new_v4();
+        let session_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '我在深圳工作'), ($1, 'assistant', '嗯嗯')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let written = classify_session(&state, session_id, user_id, Some(instance_id))
+            .await
+            .expect("classify ok");
+        assert_eq!(written, 0, "empty memories → no rows");
+        // mock.expect(1) is verified on MockServer drop: the request carried the
+        // configured system prompt sentinel.
     }
 }

@@ -20,7 +20,6 @@ const PATIENCE_STALE_PENALTY: f64 = -0.05;
 const TENSION_STALE_BUMP: f64 = 0.03;
 
 const ENERGY_COST_REPLY: f64 = 0.05;
-const ENERGY_COST_GIFT: f64 = 0.05;
 const ENERGY_COST_PROACTIVE: f64 = 0.10;
 const ENERGY_COST_GHOST: f64 = 0.0;
 const ENERGY_COST_APP_OPEN: f64 = 0.0;
@@ -53,18 +52,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         };
     }
 
-    // 1. Gift event — deterministic
-    if matches!(input.event, Event::Gift { .. }) {
-        return ActionPlan {
-            action_type: ActionType::GiftReaction,
-            reply_style: pick_gift_style(input),
-            affinity_deltas: AffinityDeltas::default(),
-            energy_cost: ENERGY_COST_GIFT,
-            context_hints: vec![],
-        };
-    }
-
-    // 2. Ghost judgement (via existing ghost module)
+    // 1. Ghost judgement (via existing ghost module)
     let ghost_signals = GhostSignals {
         message_count: input.signals.message_count,
         hours_since_last_ghost: input.signals.hours_since_last_ghost,
@@ -79,7 +67,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         };
     }
 
-    // 3. Proactive trigger is passed through — Phase 6 defines full behaviour
+    // 2. Proactive trigger is passed through — Phase 6 defines full behaviour
     if matches!(input.event, Event::ProactiveTrigger) {
         return ActionPlan {
             action_type: ActionType::Proactive,
@@ -90,7 +78,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         };
     }
 
-    // 4. AppOpen: user just opened the app — route to Proactive path with no cost.
+    // 3. AppOpen: user just opened the app — route to Proactive path with no cost.
     // Handler / post-process decide whether to actually send anything.
     if matches!(input.event, Event::AppOpen) {
         return ActionPlan {
@@ -102,7 +90,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         };
     }
 
-    // 5. Regular reply
+    // 4. Regular reply
     ActionPlan {
         action_type: ActionType::Reply,
         reply_style: ReplyStyle::Neutral,
@@ -145,17 +133,6 @@ fn ghost_affinity_deltas() -> AffinityDeltas {
         patience: GHOST_DELTA_PATIENCE,
         tension: GHOST_DELTA_TENSION,
         ..Default::default()
-    }
-}
-
-/// Choose reply style for a gift event based on the persona's tip personality.
-fn pick_gift_style(input: &DecisionInput) -> ReplyStyle {
-    match input.persona.genome.tip_personality.as_deref() {
-        Some("gold_digger") => ReplyStyle::Excited,
-        Some("tsundere") => ReplyStyle::Tsundere,
-        Some("zen") => ReplyStyle::Neutral,
-        Some("slow_warm") => ReplyStyle::Warm,
-        _ => ReplyStyle::Warm,
     }
 }
 
@@ -251,22 +228,6 @@ mod tests {
         let mut p = base_persona();
         p.genome.tip_personality = tip.map(String::from);
         p
-    }
-
-    #[test]
-    fn test_gift_event_maps_to_gift_reaction() {
-        let input = DecisionInput {
-            event: Event::Gift {
-                gift_id: Uuid::new_v4(),
-                amount: 50,
-            },
-            affinity: base_affinity(),
-            persona: persona_with_tip(Some("gold_digger")),
-            signals: base_signals(),
-        };
-        let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::GiftReaction);
-        assert_eq!(plan.reply_style, ReplyStyle::Excited);
     }
 
     #[test]
@@ -406,20 +367,5 @@ mod tests {
         let plan = decide(&input);
         // short penalty (-0.02) + stale penalty (-0.05) = -0.07
         assert!((plan.affinity_deltas.patience - (-0.07)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_unknown_tip_personality_falls_back_to_warm() {
-        let input = DecisionInput {
-            event: Event::Gift {
-                gift_id: Uuid::new_v4(),
-                amount: 10,
-            },
-            affinity: base_affinity(),
-            persona: persona_with_tip(None),
-            signals: base_signals(),
-        };
-        let plan = decide(&input);
-        assert_eq!(plan.reply_style, ReplyStyle::Warm);
     }
 }

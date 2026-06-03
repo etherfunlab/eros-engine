@@ -108,11 +108,95 @@ model_name_display_override = true
 # (NOT temperature/max_tokens — those are task-level only, like every other task)
 #filter_prompt = "..."
 
+# ── Optional user-input rewrite filter (OFF by default) ──────────────────────
+# Rewrites a MEANINGLESS user turn (e.g. "1111", "？？？", key-mashing) into one
+# natural, context-appropriate user message before it reaches chat_companion, so
+# the companion answers a real message instead of parroting history. Meaningful
+# turns — including short ones like "嗯"/"好啊"/"在吗" and genuine short
+# questions — are left untouched.
+#
+# Enable with a single global switch on [tasks.chat_companion]. It accepts a
+# bool OR a probability:
+#   [tasks.chat_companion]
+#   input_filter = false   # off (default)
+#   input_filter = true    # run on every user turn (= 1.0)
+#   input_filter = 0.8     # run on ~80% of user turns
+# A number outside [0.0, 1.0] (or non-finite) is rejected at load time.
+#
+# The filter runs only if BOTH input_filter fires (true/probability) AND this
+# table exists with a non-blank filter_prompt; otherwise it is inert. The user's
+# ORIGINAL text is
+# always persisted (content) and shown to the client; the rewrite is stored
+# separately in pre_filter_content and seen only by the model.
+#
+# Pick a fast, cheap model — this runs on every user turn before generation.
+# Recommended: google/gemini-3.1-flash-lite or deepseek/deepseek-v4-flash.
+#[tasks.chat_input_filter]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["deepseek/deepseek-v4-flash"]
+#retry_depth  = 1
+#temperature  = 0.3
+#max_tokens   = 400
+# Reasoning is OFF by default here (the filter only needs a short JSON verdict).
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#You are an input-cleaning filter for a companion chat. You receive the recent
+#conversation and the user's latest input. Decide whether the latest input is a
+#meaningful message.
+#
+#- If it IS meaningful (any real intent, INCLUDING short replies like "嗯",
+#  "好啊", "在吗", or a short question), respond EXACTLY:
+#    {"rewrite": false}
+#- If it is NOT meaningful (random characters, key-mashing, repeated chars,
+#  punctuation-only noise), rewrite it into ONE short, natural user message that
+#  fits the conversation, and give a brief reason. Respond EXACTLY:
+#    {"rewrite": true, "content": "<the rewritten user message>", "reason": "<why it was meaningless>"}
+#
+# Output JSON only. No explanation outside the JSON, no code fences.
+#"""
+
+# ── Image input (chat_vision) ────────────────────────────────────────────────
+# When a chat/stream turn carries an `image_url`, the image is described by a
+# vision model into a fixed JSON schema and the description is folded into the
+# user text the main chat model sees. The main chat model stays text-only.
+#
+# Feature is OFF unless this table exists with a non-blank filter_prompt.
+# The fixed schema is: { "description", "ocr_text", "people", "scene" }.
+# Pick a vision-capable model.
+#[tasks.chat_vision]
+#model        = "google/gemini-3.1-flash-lite"
+#fallback     = ["openai/gpt-5.1-mini"]
+#retry_depth  = 1
+#temperature  = 0.2
+#max_tokens   = 400
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#你是图像识别助手。只输出 JSON，字段：
+#  "description": 画面/主体/正在发生什么（必填）
+#  "ocr_text":    图中文字；没有则空字符串
+#  "people":      是否有人物、表情/情绪；没有则空字符串
+#  "scene":       场景/地点/氛围；没有则空字符串
+#不要输出 JSON 以外的任何内容，不要代码围栏。
+#"""
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 400
+# Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
+# as a separate user message. REQUIRED — the server refuses to boot if blank.
+filter_prompt = """
+你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的新事实发现。
+
+铁律：
+- 只提取关于真人用户的事实。
+- assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、年龄、性格、喜好等，绝不是用户的事实。
+- 仅当用户主动陈述、复述或明确认同某信息时，才算用户事实。
+- 没有新的用户事实时，返回空数组 []。
+
+严格输出 JSON，格式：{"facts": ["事实1", "事实2"]}
+"""
 
 # Session-end memory extraction (dreaming-lite). Pulls a session's
 # chat_messages, emits 0-N {content, category} candidates, and the
@@ -124,6 +208,27 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 800
+# Memory-extraction system instruction. The server sends the conversation
+# (用户：X / AI：Y lines) as a separate user message. REQUIRED — boot fails if blank.
+filter_prompt = """
+你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签。
+
+category（只能用这五种之一）：
+- fact: 客观事实，如住在哪、做什么工作、家庭状况
+- preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味
+- event: 发生的事件，如最近发生了什么、经历过什么
+- emotion: 情绪/心理状态，如对某事的感受、长期心理倾向
+- relation: 与他人的关系，如朋友、家人、同事
+
+铁律：
+- 只记关于真人用户的内容。
+- assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、喜好等绝不是用户的记忆。
+- 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
+- 同一事实合并成一条，不要重复。
+- 没有任何值得记的就返回空数组。
+
+严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact"}]}
+"""
 
 # Reserved — not consumed by current code. The PDE in
 # `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a

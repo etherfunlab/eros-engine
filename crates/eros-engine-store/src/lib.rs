@@ -12,6 +12,16 @@ pub mod pool;
 
 pub use sqlx::PgPool;
 
+/// OpenRouter call metadata captured for the audit columns on event tables
+/// (`companion_insights_events`, `companion_affinity_events`). All optional —
+/// a non-LLM event (e.g. a gift affinity event) carries the default (all None).
+#[derive(Debug, Clone, Default)]
+pub struct OpenRouterCallMeta {
+    pub generation_id: Option<String>,
+    pub model: Option<String>,
+    pub usage: Option<serde_json::Value>,
+}
+
 #[cfg(test)]
 mod migration_tests {
     use sqlx::PgPool;

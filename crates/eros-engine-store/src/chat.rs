@@ -55,6 +55,18 @@ pub struct ChatMessage {
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
+    /// Input-filter rewrite of a `role='user'` row: the model-facing effective
+    /// text when the user's original was rewritten (NULL otherwise). On
+    /// assistant rows this column holds the OPPOSITE direction (the
+    /// pre-OUTPUT-filter original) — see chat_input_filter design.
+    #[serde(default)]
+    pub pre_filter_content: Option<String>,
+    /// Freeform per-row metadata (JSONB). Carries tip amount + raw scopes and,
+    /// for image turns, `image_url` plus the `chat_vision` describe result under
+    /// `vision`. Nullable in the table ⇒ `Option`. Exposed so the pipeline can
+    /// read `metadata.vision` when rendering model-facing user text.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -400,7 +412,7 @@ pub struct FilterAudit {
 pub struct AssistantInsert {
     pub id: Uuid,
     pub content: String,
-    pub assistant_action_type: String, // "reply" | "gift_reaction"
+    pub assistant_action_type: String, // "reply"
     pub continues_from_message_id: Option<Uuid>,
     pub truncated: bool,
     pub model: Option<String>,
@@ -528,6 +540,68 @@ impl<'a> ChatRepo<'a> {
              WHERE id = $1 AND role = 'user' AND ghost_decision = false",
         )
         .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp an input-filter rewrite onto an existing `role='user'` row. The
+    /// original text in `content` is left untouched (the client always sees the
+    /// original); the rewrite lands in `pre_filter_content` (model-facing).
+    /// `reason`, when non-blank, is stored as `filter_triggers = {"reason": …}`.
+    /// `f_client_msg_id` stays NULL — the user row is updated in place rather
+    /// than inserting a separate filter row.
+    pub async fn set_user_input_rewrite(
+        &self,
+        user_message_id: Uuid,
+        pre_filter_content: &str,
+        filter_model: &str,
+        reason: Option<&str>,
+        f_generation_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let filter_triggers: Option<serde_json::Value> = reason
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|r| serde_json::json!({ "reason": r }));
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET pre_filter_content = $2, filter_model = $3, \
+                 filter_triggers = $4, f_generation_id = $5 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(pre_filter_content)
+        .bind(filter_model)
+        .bind(filter_triggers)
+        .bind(f_generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Merge a `chat_vision` describe result into a `role='user'` row's
+    /// metadata. Top-level JSONB merge; `COALESCE` handles a NULL metadata
+    /// column. Leaves `content`, `pre_filter_content`, and existing keys (e.g.
+    /// `image_url`) intact.
+    pub async fn set_user_image_vision(
+        &self,
+        user_message_id: Uuid,
+        vision: &serde_json::Value,
+        vision_model: &str,
+        generation_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let patch = serde_json::json!({
+            "vision": vision,
+            "vision_model": vision_model,
+            "vision_generation_id": generation_id,
+        });
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata, '{}'::jsonb) || $2 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(patch)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -1737,6 +1811,99 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_input_rewrite_stamps_audit_keeps_content(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let umid = match repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "1111",
+                "01J0000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        repo.set_user_input_rewrite(
+            umid,
+            "那你平常都怎么放松呀？",
+            "fast/in",
+            Some("meaningless digits"),
+            Some("gen-x"),
+        )
+        .await
+        .unwrap();
+
+        let (content, pre, model, triggers, fgen): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers, f_generation_id \
+             FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "1111", "original content must be preserved");
+        assert_eq!(pre.as_deref(), Some("那你平常都怎么放松呀？"));
+        assert_eq!(model.as_deref(), Some("fast/in"));
+        assert_eq!(
+            triggers,
+            Some(serde_json::json!({"reason": "meaningless digits"}))
+        );
+        assert_eq!(fgen.as_deref(), Some("gen-x"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_input_rewrite_blank_reason_leaves_triggers_null(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let umid = match repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "????",
+                "01J0000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        repo.set_user_input_rewrite(umid, "你今天过得怎么样？", "fast/in", Some("  "), None)
+            .await
+            .unwrap();
+        let triggers: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT filter_triggers FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            triggers.is_none(),
+            "blank reason → SQL NULL filter_triggers"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_before_message_uses_msg_sent_at_not_now(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let s = repo
@@ -1810,5 +1977,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pairs, vec![("u1".to_string(), "a1".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_row_exposes_metadata_column(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let meta = serde_json::json!({ "image_url": "https://x/y.png" });
+        repo.upsert_user_message_idempotent(
+            s.id,
+            "hi",
+            "01J0000000000000000000000A",
+            "user",
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].metadata.as_ref().unwrap()["image_url"],
+            "https://x/y.png"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_image_vision_merges_and_preserves(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        let seed = serde_json::json!({ "image_url": "https://x/y.png" });
+        let outcome = repo
+            .upsert_user_message_idempotent(
+                s.id,
+                "",
+                "01J000000000000000000VISION",
+                "user",
+                Some(&seed),
+            )
+            .await
+            .unwrap();
+        let uid = match outcome {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let vision = serde_json::json!({
+            "description": "a cat", "ocr_text": "", "people": "", "scene": "indoors"
+        });
+        repo.set_user_image_vision(uid, &vision, "vision-model", Some("gen-1"))
+            .await
+            .unwrap();
+
+        let rows = repo.history(s.id, 10, 0).await.unwrap();
+        let meta = rows[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["image_url"], "https://x/y.png"); // preserved
+        assert_eq!(meta["vision"]["description"], "a cat");
+        assert_eq!(meta["vision_model"], "vision-model");
+        assert_eq!(meta["vision_generation_id"], "gen-1");
+        assert_eq!(rows[0].content, ""); // untouched
+    }
+
+    /// 0027 cleanup: legacy non-tip gift_user rows (no tips_amount_usd metadata)
+    /// are deleted; tips (gift_user with tips_amount_usd) and user rows survive.
+    /// Mirrors the 0018 backfill-test pattern: #[sqlx::test] runs 0027 on the
+    /// empty DB (a no-op), then we seed rows and re-run the embedded DELETE
+    /// (valid because DELETE is idempotent).
+    const CLEANUP_SQL_0027: &str =
+        include_str!("../migrations/0027_drop_legacy_gift_user_rows.sql");
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0027_drops_legacy_non_tip_gift_user_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) VALUES \
+                 ($1, 'user', 'hi', NULL), \
+                 ($1, 'gift_user', '(打赏 $20)', '{\"tips_amount_usd\": 20.0}'::jsonb), \
+                 ($1, 'gift_user', 'rose', NULL), \
+                 ($1, 'gift_user', 'rose', '{\"label\": \"rose\"}'::jsonb)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Run the embedded cleanup migration.
+        sqlx::query(CLEANUP_SQL_0027).execute(&pool).await.unwrap();
+
+        // Only the tip gift_user row survives.
+        let gift_user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'gift_user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(gift_user_count, 1, "only the tip gift_user row survives");
+
+        // The survivor is the tip (carries tips_amount_usd).
+        let surviving_tip: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'gift_user' \
+               AND metadata ? 'tips_amount_usd'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(surviving_tip, 1, "the surviving gift_user row is the tip");
+
+        // user rows are untouched.
+        let user_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(user_count, 1, "user rows are untouched");
     }
 }

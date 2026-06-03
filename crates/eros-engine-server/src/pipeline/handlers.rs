@@ -6,9 +6,11 @@
 //! model / fallback / allow_traits are resolved via `state.model_config`
 //! (task + per-request tier).
 
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+#[cfg(test)]
+use serde_json::Value;
 
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
@@ -16,11 +18,10 @@ use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
-use eros_engine_store::insight::InsightRepo;
 use eros_engine_store::memory::MemoryRepo;
 
 use crate::error::AppError;
-use crate::prompt::{build_prompt, PendingGift};
+use crate::prompt::build_prompt;
 use crate::state::AppState;
 
 /// Memory recall fan-out sizes — mirror the gateway's Mem0 era defaults
@@ -74,6 +75,95 @@ pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> 
     }
 }
 
+/// Effective model-facing text for a user-side history row: the input-filter
+/// rewrite (`pre_filter_content`) when present and non-blank, else the original
+/// `content`. Assistant rows must NOT use this (their `pre_filter_content` is
+/// the pre-OUTPUT-filter original); `assemble_chat_request` routes assistant
+/// rows to `content` directly.
+pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) -> &str {
+    match msg.pre_filter_content.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => &msg.content,
+    }
+}
+
+/// Build the `[用户发送了一张图片]` preamble from a stored `metadata.vision`
+/// object. Returns `None` when `description` is absent/blank (not a usable
+/// describe). Blank optional fields are omitted line-by-line.
+fn build_image_preamble(vision: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| {
+        vision
+            .get(k)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let description = field("description")?;
+    let mut lines = vec![
+        "[用户发送了一张图片]".to_string(),
+        format!("画面：{description}"),
+    ];
+    if let Some(t) = field("ocr_text") {
+        lines.push(format!("文字：{t}"));
+    }
+    if let Some(p) = field("people") {
+        lines.push(format!("人物：{p}"));
+    }
+    if let Some(s) = field("scene") {
+        lines.push(format!("场景：{s}"));
+    }
+    Some(lines.join("\n"))
+}
+
+/// What the MAIN chat model should see for a user row: an optional image
+/// preamble (from `metadata.vision`, or a neutral placeholder when an image was
+/// sent but not described) folded onto `effective_user_text(msg)`. A plain text
+/// turn (no `vision`, no `image_url`) returns the effective text unchanged.
+pub(crate) fn model_facing_user_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
+    let base = effective_user_text(msg);
+    let meta = msg.metadata.as_ref();
+    let preamble = meta
+        .and_then(|m| m.get("vision"))
+        .and_then(build_image_preamble)
+        .or_else(|| {
+            // Image sent but not described (vision failed) → neutral placeholder.
+            meta.and_then(|m| m.get("image_url"))
+                .map(|_| "[用户发送了一张图片，但内容无法识别]".to_string())
+        });
+    match preamble {
+        Some(p) => {
+            let body = if base.trim().is_empty() {
+                "[用户未附文字]"
+            } else {
+                base
+            };
+            format!("{p}\n\n{body}")
+        }
+        None => base.to_string(),
+    }
+}
+
+/// Recall query text for a user row: the caption (`effective_user_text`) when
+/// non-blank, else the vision `description` for an image-only turn so memory
+/// recall can match the photo's content instead of running on empty text. Used
+/// ONLY for the recall/embedding query — the prompt path uses
+/// `model_facing_user_text` (which folds the full preamble).
+pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
+    let caption = effective_user_text(msg);
+    if !caption.trim().is_empty() {
+        return caption.to_string();
+    }
+    msg.metadata
+        .as_ref()
+        .and_then(|m| m.get("vision"))
+        .and_then(|v| v.get("description"))
+        .and_then(|d| d.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
 /// chronological history. `audit` carries the caller's OpenRouter passthrough
 /// when the driving event was a `UserMessage`; gift / proactive pass `None`.
@@ -89,13 +179,22 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
-        match msg.role.as_str() {
-            "user" | "assistant" => messages.push(ChatMessage {
-                role: msg.role,
-                content: msg.content,
-            }),
+        // User and TIP gift_user rows feed the MODEL-FACING text under the "user"
+        // role — a tip turn IS a user turn to the model (OpenRouter only knows
+        // system/user/assistant). gift_user is tip-only now (the legacy in-app
+        // Gift Event endpoint was removed), so no tip/legacy gate is needed.
+        // Assistant rows always feed `content` (their pre_filter_content is the
+        // pre-output-filter original and must never re-enter the prompt).
+        let (role, content) = match msg.role.as_str() {
+            "user" => ("user", model_facing_user_text(&msg)),
+            "gift_user" => ("user", model_facing_user_text(&msg)),
+            "assistant" => ("assistant", msg.content),
             _ => continue,
-        }
+        };
+        messages.push(ChatMessage {
+            role: role.to_string(),
+            content,
+        });
     }
 
     let (audit_user, audit_session, audit_metadata) = audit
@@ -282,28 +381,16 @@ fn build_profile_groups(
     vec![]
 }
 
-/// Load `companion_insights` for the user and render the structured fields
-/// as Chinese-language bullets that fit naturally into the
-/// `[user_profile]` prompt section. Takes `&PgPool` directly
-/// (not `&AppState`) so it's reachable from sqlx integration tests without
-/// constructing the full state.
-async fn load_insight_bullets(pool: &PgPool, user_id: Uuid) -> Vec<String> {
-    let repo = InsightRepo { pool };
-    let row = match repo.load(user_id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return vec![],
-        Err(e) => {
-            tracing::warn!("insight load failed: {e}");
-            return vec![];
-        }
-    };
-    insights_to_bullets(&row.insights)
-}
-
 /// Render the `companion_insights` JSONB blob as bullet strings. Skips
 /// empty / missing fields. `matching_preferences` is intentionally omitted
 /// — it's a structured sub-object that doesn't fit a single-line bullet
 /// and isn't useful in chat tone anyway.
+///
+/// Test-only parity reference: the live path renders the flat human_insights
+/// mirror via human_insights_to_bullets; this renders companion_insights JSONB
+/// directly and the parity tests pin the two together. No production caller
+/// remains (the gift path that used it was removed).
+#[cfg(test)]
 fn insights_to_bullets(insights: &Value) -> Vec<String> {
     let Some(obj) = insights.as_object() else {
         return vec![];
@@ -333,6 +420,9 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
     };
 
     push_str(&mut out, "city", "城市");
+    push_str(&mut out, "location", "所在地");
+    push_str(&mut out, "hometown", "老家");
+    push_str(&mut out, "nationality", "国籍");
     push_str(&mut out, "occupation", "职业");
     push_str(&mut out, "mbti_guess", "MBTI");
     push_str(&mut out, "love_values", "感情观");
@@ -376,6 +466,9 @@ fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<S
     let intimate = matches!(mode, InsightMode::Full);
 
     push_str(&mut out, &row.city, "城市");
+    push_str(&mut out, &row.location, "所在地");
+    push_str(&mut out, &row.hometown, "老家");
+    push_str(&mut out, &row.nationality, "国籍");
     push_str(&mut out, &row.occupation, "职业");
     push_str(&mut out, &row.mbti_guess, "MBTI");
     if intimate {
@@ -424,10 +517,19 @@ pub(super) async fn build_reply_request(
     let chat_repo = ChatRepo { pool: &state.pool };
     let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
 
-    let query_text = match &input.event {
-        Event::UserMessage { content, .. } => content.as_str(),
-        _ => "",
-    };
+    // Recall query for the current user turn: the effective caption, or — for an
+    // image-only turn — the vision description (recall_query_text), so a photo
+    // with no caption still retrieves relevant memories. The MAIN prompt path
+    // separately folds the full image preamble via model_facing_user_text.
+    let query_text: String = history
+        .iter()
+        .rev()
+        .find(|m| m.id == user_message_id && m.role == "user")
+        .map(recall_query_text)
+        .unwrap_or_else(|| match &input.event {
+            Event::UserMessage { content, .. } => content.clone(),
+            _ => String::new(),
+        });
 
     let (memory_scope, affinity_scope) = match &input.event {
         Event::UserMessage {
@@ -457,21 +559,12 @@ pub(super) async fn build_reply_request(
     }
 
     let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text, x_on, y_on).await;
+        recall_memory(state, user_id, instance_id, &query_text, x_on, y_on).await;
 
     let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
     if !insight_bullets.is_empty() {
         profile_groups.insert(0, ("基础画像".into(), insight_bullets));
     }
-
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
-    let pending_gifts: Vec<PendingGift> = vec![];
 
     let tier = match &input.event {
         Event::UserMessage { tier, .. } => tier.as_deref(),
@@ -501,8 +594,6 @@ pub(super) async fn build_reply_request(
         &profile_groups,
         &relationship_facts,
         Some(&input.affinity),
-        &pending_gifts,
-        tip_personality,
         plan.reply_style,
         &plan.context_hints,
         &kept_traits,
@@ -515,8 +606,8 @@ pub(super) async fn build_reply_request(
         ..
     } = &input.event
     {
-        // Raw Option (not the "normal"-defaulted local above): tips_reaction_context
-        // renders Some vs None as different prose, so the distinction must survive.
+        // Raw Option from the genome: tips_reaction_context renders Some vs None as
+        // different prose, so the distinction must survive.
         let tp = input.persona.genome.tip_personality.as_deref();
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }
@@ -562,68 +653,6 @@ async fn fetch_recent_turn_pairs(
             );
             Vec::new()
         })
-}
-
-/// Build a ChatRequest for the GiftReaction action. Called by the streaming
-/// pipeline (`pipeline::stream::run_stream`).
-#[allow(clippy::too_many_arguments)] // mirrors build_reply_request + pending gifts
-pub(super) async fn build_gift_request(
-    state: &AppState,
-    input: &DecisionInput,
-    plan: &ActionPlan,
-    session_id: Uuid,
-    user_id: Uuid,
-    instance_id: Uuid,
-    user_message_id: Uuid,
-    pending: &[PendingGift],
-) -> Result<(ChatRequest, Vec<String>), AppError> {
-    let chat_repo = ChatRepo { pool: &state.pool };
-    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
-
-    let query_text = history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
-
-    let (mut profile_groups, relationship_facts) =
-        recall_memory(state, user_id, instance_id, query_text, true, true).await;
-
-    let insight_bullets = load_insight_bullets(&state.pool, user_id).await;
-    if !insight_bullets.is_empty() {
-        profile_groups.insert(0, ("基础画像".into(), insight_bullets));
-    }
-
-    let tip_personality = input
-        .persona
-        .genome
-        .tip_personality
-        .as_deref()
-        .unwrap_or("normal");
-
-    let resolved = state.model_config.resolve(CHAT_TASK, None);
-
-    let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
-
-    let system_prompt = build_prompt(
-        &input.persona,
-        &profile_groups,
-        &relationship_facts,
-        Some(&input.affinity),
-        pending,
-        tip_personality,
-        plan.reply_style,
-        &plan.context_hints,
-        &[],
-        eros_engine_core::scope::AffinityScope::full(),
-        &recent_turns,
-    );
-
-    Ok((
-        assemble_chat_request(resolved, system_prompt, history, None),
-        Vec::new(),
-    ))
 }
 
 #[cfg(test)]
@@ -730,16 +759,15 @@ mod tests {
         );
     }
 
-    // ─── Integration tests: recall_memory_with_embedding + load_insight_bullets ───
+    // ─── Integration tests: recall_memory_with_embedding ──────────────────
     //
-    // These exercise the pure-DB halves of the recall pipeline against a
+    // These exercise the pure-DB half of the recall pipeline against a
     // live Postgres (via `#[sqlx::test]`). The Voyage-dependent outer
     // wrapper `recall_memory` is intentionally not tested here — it would
     // either need a live Voyage key or a trait-mock indirection that
     // doesn't justify its weight for a single thin function.
 
     use eros_engine_store::human_insight::HumanInsightRepo;
-    use eros_engine_store::insight::InsightRepo;
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
 
@@ -1119,45 +1147,15 @@ mod tests {
         assert!(!rel3.is_empty(), "relationship should be present when Y on");
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_returns_empty_when_no_row(pool: PgPool) {
-        let bullets = load_insight_bullets(&pool, Uuid::new_v4()).await;
-        assert!(bullets.is_empty());
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn load_insight_bullets_renders_after_merge(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let repo = InsightRepo { pool: &pool };
-
-        repo.merge(
-            user_id,
-            json!({
-                "city": "上海",
-                "mbti_guess": "INFP",
-                "interests": ["登山", "精酿"],
-            }),
-        )
-        .await
-        .unwrap();
-
-        let bullets = load_insight_bullets(&pool, user_id).await;
-        assert_eq!(
-            bullets,
-            vec![
-                "城市：上海".to_string(),
-                "MBTI：INFP".to_string(),
-                "兴趣：登山、精酿".to_string(),
-            ]
-        );
-    }
-
     // ─── human_insights_to_bullets ──────────────────────────────────────
 
     fn sample_human_row() -> HumanInsightsRow {
         HumanInsightsRow {
             user_id: Uuid::new_v4(),
             city: Some("上海".into()),
+            location: None,
+            hometown: None,
+            nationality: None,
             occupation: Some("设计师".into()),
             mbti_guess: Some("INFP".into()),
             love_values: Some("慢热".into()),
@@ -1227,6 +1225,68 @@ mod tests {
         });
         assert_eq!(
             human_insights_to_bullets(&row, InsightMode::Full),
+            insights_to_bullets(&equivalent)
+        );
+    }
+
+    fn sample_geo_row() -> HumanInsightsRow {
+        HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: Some("深圳".into()),
+            location: Some("台北".into()),
+            hometown: Some("新界".into()),
+            nationality: Some("中国香港".into()),
+            occupation: None,
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec![],
+            personality_traits: vec![],
+            preferred_gender: None,
+            age_min: None,
+            age_max: None,
+            deal_breakers: vec![],
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn human_insights_renders_geo_cluster_in_both_modes() {
+        for mode in [InsightMode::Full, InsightMode::Neutral] {
+            let bullets = human_insights_to_bullets(&sample_geo_row(), mode);
+            assert_eq!(
+                bullets,
+                vec!["城市：深圳", "所在地：台北", "老家：新界", "国籍：中国香港"]
+            );
+        }
+    }
+
+    #[test]
+    fn insights_to_bullets_renders_geo_after_city() {
+        let v = serde_json::json!({
+            "city": "深圳", "location": "台北", "hometown": "新界",
+            "nationality": "中国香港", "occupation": "工程师"
+        });
+        assert_eq!(
+            insights_to_bullets(&v),
+            vec![
+                "城市：深圳",
+                "所在地：台北",
+                "老家：新界",
+                "国籍：中国香港",
+                "职业：工程师"
+            ]
+        );
+    }
+
+    #[test]
+    fn human_insights_geo_matches_companion_insights_renderer() {
+        let equivalent = serde_json::json!({
+            "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
+        });
+        assert_eq!(
+            human_insights_to_bullets(&sample_geo_row(), InsightMode::Full),
             insights_to_bullets(&equivalent)
         );
     }
@@ -1337,6 +1397,162 @@ mod tests {
         let (kept, dropped) = filter_traits(&traits, Some(&allow));
         assert_eq!(kept.len(), 2);
         assert!(dropped.is_empty());
+    }
+
+    fn user_row(content: &str, pre: Option<&str>) -> eros_engine_store::chat::ChatMessage {
+        eros_engine_store::chat::ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            role: "user".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: None,
+            usage: None,
+            generation_id: None,
+            assistant_action_type: None,
+            pre_filter_content: pre.map(|s| s.to_string()),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn effective_user_text_prefers_nonblank_rewrite() {
+        let mut row = user_row("1111", None);
+        assert_eq!(effective_user_text(&row), "1111");
+        row.pre_filter_content = Some("有意义的问题".into());
+        assert_eq!(effective_user_text(&row), "有意义的问题");
+        row.pre_filter_content = Some("   ".into()); // blank → fall back to content
+        assert_eq!(effective_user_text(&row), "1111");
+    }
+
+    fn user_row_meta(
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> eros_engine_store::chat::ChatMessage {
+        let mut r = user_row(content, None);
+        r.metadata = Some(metadata);
+        r
+    }
+
+    #[test]
+    fn model_facing_text_folds_vision_preamble() {
+        let row = user_row_meta(
+            "看看这个",
+            serde_json::json!({
+                "image_url": "https://x/y.png",
+                "vision": { "description": "一只猫", "ocr_text": "", "people": "", "scene": "客厅" }
+            }),
+        );
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("[用户发送了一张图片]"));
+        assert!(t.contains("画面：一只猫"));
+        assert!(t.contains("场景：客厅"));
+        assert!(!t.contains("文字：")); // blank ocr dropped
+        assert!(t.ends_with("看看这个"));
+    }
+
+    #[test]
+    fn model_facing_text_image_only_uses_placeholder_body() {
+        let row = user_row_meta(
+            "",
+            serde_json::json!({ "image_url": "https://x/y.png", "vision": { "description": "日落" } }),
+        );
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("画面：日落"));
+        assert!(t.ends_with("[用户未附文字]"));
+    }
+
+    #[test]
+    fn model_facing_text_undescribed_image_placeholder() {
+        let row = user_row_meta("hi", serde_json::json!({ "image_url": "https://x/y.png" }));
+        let t = model_facing_user_text(&row);
+        assert!(t.contains("无法识别"));
+        assert!(t.ends_with("hi"));
+    }
+
+    #[test]
+    fn model_facing_text_plain_turn_unchanged() {
+        let row = user_row("普通消息", None);
+        assert_eq!(model_facing_user_text(&row), "普通消息");
+    }
+
+    #[test]
+    fn assemble_includes_all_gift_user_rows() {
+        use eros_engine_llm::model_config::ResolvedModel;
+
+        // gift_user is tip-only now — all gift_user rows are promoted to the
+        // "user" role. The legacy in-app Gift Event endpoint was removed, so
+        // there is no longer a legacy row type to gate out.
+        let mut tip = user_row("(打赏 $5)", None);
+        tip.role = "gift_user".into();
+        tip.metadata = Some(serde_json::json!({ "tips_amount_usd": 5.0 }));
+        let plain = user_row("普通消息", None);
+        let mut assistant = user_row("回复", None);
+        assistant.role = "assistant".into();
+
+        let resolved = ResolvedModel {
+            model: "m".into(),
+            fallback_model: vec![],
+            temperature: 0.7,
+            max_tokens: 100,
+            allow_traits: None,
+            reasoning: None,
+            retry_depth: 0,
+        };
+        let req = assemble_chat_request(resolved, "SYS".into(), vec![tip, plain, assistant], None);
+
+        let user_contents: Vec<&str> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            user_contents.contains(&"(打赏 $5)"),
+            "gift_user must be promoted under the user role: {user_contents:?}"
+        );
+        assert!(user_contents.contains(&"普通消息"));
+        // No `gift_user` role ever reaches the wire (OpenRouter knows only
+        // system/user/assistant).
+        assert!(req
+            .messages
+            .iter()
+            .all(|m| matches!(m.role.as_str(), "system" | "user" | "assistant")));
+    }
+
+    #[test]
+    fn recall_query_prefers_caption() {
+        let row = user_row_meta(
+            "你看这个",
+            serde_json::json!({ "vision": { "description": "一只猫" } }),
+        );
+        assert_eq!(recall_query_text(&row), "你看这个");
+    }
+
+    #[test]
+    fn recall_query_falls_back_to_description_when_caption_blank() {
+        let row = user_row_meta(
+            "",
+            serde_json::json!({ "image_url": "https://x/y.png", "vision": { "description": "一只猫在沙滩" } }),
+        );
+        assert_eq!(recall_query_text(&row), "一只猫在沙滩");
+    }
+
+    #[test]
+    fn recall_query_empty_when_no_caption_no_vision() {
+        let row = user_row("", None);
+        assert_eq!(recall_query_text(&row), "");
+    }
+
+    #[test]
+    fn recall_query_plain_text_turn() {
+        let row = user_row("普通消息", None);
+        assert_eq!(recall_query_text(&row), "普通消息");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`

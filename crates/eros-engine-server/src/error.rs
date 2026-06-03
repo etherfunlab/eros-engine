@@ -22,6 +22,10 @@ pub enum AppError {
     BadRequest(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    // Reserved for handler-level 500s; constructed nowhere right now (its only
+    // user, the legacy event_gift route, was removed). Still mapped to a 500 via
+    // the `_` arm in IntoResponse.
+    #[allow(dead_code)]
     #[error("internal: {0}")]
     Internal(String),
     #[error(transparent)]
