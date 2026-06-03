@@ -55,7 +55,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 
 | 名字 | 谁消费 | 状态 |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers::ReplyHandler` 和 `GiftHandler` (chat completions) | live |
+| `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completions；打赏轮走同一回复路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights` (抽事实 + JSONB merge) | live |
 | `pde_decision` | reserved — 当前 PDE 是纯规则,不调 LLM | reserved |
 | `embedding` | reserved — `VoyageClient` 自己读 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite`,不走这条路径 | reserved |

@@ -34,13 +34,12 @@ load context           load persona via PersonaRepo
        │
        ▼
 PDE decide             eros_engine_core::pde::decide(&input) → ActionPlan
-                       (rules-based: Reply / Ghost / Proactive / GiftReaction)
+                       (rules-based: Reply / Ghost / Proactive)
        │
        ▼
 handler dispatch       Reply  → ReplyHandler  builds ChatRequest
                        Ghost  → GhostHandler  returns None (no chat call)
                        Proact → ProactiveHandler
-                       Gift   → GiftHandler   uses event-supplied deltas
        │
        ▼
 chat exec              if Some(req): state.openrouter.execute(req).await?
@@ -53,7 +52,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        - insight  (LLM extracts facts → companion_insights merge)
 ```
 
-**Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive / GiftReaction the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
+**Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
 ## Auth
 
