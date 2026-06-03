@@ -105,16 +105,25 @@ pub enum ActionType {
     Ghost,            // silent (§0.2, unchanged)
     ReplyImage,       // reserved — image only;        degrades to ReplyText until executor ships
     ReplyTextImage,   // reserved — text + image;       degrades to ReplyText until executor ships
+    Proactive,        // KEPT — pde.rs builds it for ProactiveTrigger/AppOpen; post_process matches it
 }
 ```
 
-**Rename is safe — verified.** `ActionType` is never serde-serialized to the DB or wire
-(no `to_value` / `json!` over it). It is a pure internal enum used at 15 call sites
-(`pde.rs`, `stream.rs`, `post_process.rs`). The DB-persisted action string
-(`assistant_action_type` column) and the wire enum (`FrameActionType`) are **separate**
-`"reply"` / `"ghost"` literals and are **not** renamed. So the change is a mechanical
-`s/ActionType::Reply/ActionType::ReplyText/` with zero migration and zero client-protocol
-impact.
+**`Proactive` must stay.** `pde::decide` constructs `Proactive` for the
+`ProactiveTrigger` / `AppOpen` events (`pde.rs:71,83`) and `post_process.rs:178` matches
+on it. Dropping it would fail to compile. Those paths remain dead-but-present (out of
+scope), exactly as today.
+
+**Rename is safe — verified, with the claim stated precisely.** `ActionType` **does**
+derive `Serialize` / `Deserialize`, but that representation is **used by no DB or SSE wire
+path**: the persisted action string (`assistant_action_type`, a separate `String` literal
+`"reply"` / `"ghost"`) and the wire enum (`FrameActionType`) are independent and are **not**
+renamed. No `to_value` / `json!` ever serializes `ActionType`. So `s/ActionType::Reply/
+ActionType::ReplyText/` is a mechanical internal rename with zero migration and zero
+client-protocol impact. The now-unused `Serialize` / `Deserialize` derive on `ActionType`
+is **removed** in this change (it is dead; dropping it eliminates any future "the serde
+name changed" trap). ~11 non-test call sites across `pde.rs`, `stream.rs`,
+`post_process.rs`.
 
 ### 2.2 `FrameActionType` (wire, `stream.rs`) — unchanged
 
@@ -123,10 +132,35 @@ degraded forms of `ReplyImage` / `ReplyTextImage`) map to the wire `Reply` frame
 maps to `Ghost`. The client protocol does not change in this spec. A `ReplyImage` wire
 frame is added only when the image executor ships (future).
 
-### 2.3 Rule fallback
+### 2.3 Rule fallback + the core constructor
 
-`pde::decide` only ever produces `ReplyText` / `Ghost` (never an image variant). `ReplyStyle`
-stays for the rule path. `pde::decide`'s body is unchanged apart from the enum rename.
+`pde::decide` only ever produces `ReplyText` / `Ghost` / `Proactive` (never an image
+variant). `ReplyStyle` stays for the rule path. `pde::decide`'s body is unchanged apart
+from the enum rename.
+
+**New core API — `pde::reply_plan`.** The LLM path in `stream.rs` must NOT reach into
+`pde.rs` internals: both `predict_reply_deltas` (`pde.rs:106`) and the `ENERGY_COST_*`
+constants are private. Add a public constructor in `eros-engine-core` that builds the
+`ActionPlan` for a chosen action, sourcing the affinity heuristic + energy cost internally:
+
+```rust
+/// Build the ActionPlan for an LLM-chosen text-reply action, reusing the rule
+/// heuristic for affinity_deltas + the standard reply energy cost. `hints`
+/// becomes context_hints (→ [inner_state]); `style` stays Neutral on the LLM path.
+pub fn reply_plan(input: &DecisionInput, action: ActionType, hints: Vec<String>) -> ActionPlan;
+```
+
+`stream.rs` calls `pde::reply_plan(&input, acted_action, hints)` — it never touches
+`predict_reply_deltas` or the constants directly. This keeps the heuristic + cost model
+owned by core.
+
+**Invariant — image actions never reach post_process.** Because the guardrails (§5) always
+degrade `ReplyImage` / `ReplyTextImage` to `ReplyText` while the executor is unshipped, the
+`ActionPlan` that flows downstream is only ever `ReplyText` / `Ghost` / `Proactive`.
+`post_process.rs`'s existing two-arm `match` on `plan.action_type` (`:118,:178,:237`) stays
+valid (no image arm needed). A core helper `ActionType::is_text_reply()` (true for
+`ReplyText`, and later the image variants once they execute) centralizes the check; a test
+asserts no plan carries an un-degraded image action while the executor is absent (§12).
 
 ---
 
@@ -152,26 +186,63 @@ dedicated column anywhere.
 ```rust
 struct PdeVerdict {
     action: PdeAction,            // reply_text | ghost | reply_image | reply_text_image
-    inner_state: String,
+    inner_state: String,          // sanitized before use — see §3.3
     image_prompt: Option<String>,
     reason: Option<String>,
 }
 ```
 
-### 3.2 Runner
+### 3.2 Runner — returns a status-bearing result
 
-`run_pde_decision(state, &ResolvedPde, ctx) -> Option<PdeVerdict>` in `stream.rs`, modelled
-on `run_input_filter`:
+The runner must **not** return a bare `Option`: the audit table's `status` CHECK column
+(§8) needs to distinguish `ok` / `empty` / `parse_error` / `timeout` / `error`, and a bare
+`Option` collapses every failure into `None`. So it returns a run record (mirrors how
+`extract_facts` returns a `CallAudit` rather than a bare value):
+
+```rust
+struct PdeDecisionRun {
+    status: PdeStatus,            // Ok | Empty | ParseError | Timeout | Error
+    verdict: Option<PdeVerdict>,  // Some only when status == Ok
+    raw: Option<String>,          // raw model text — kept on ParseError for the audit payload
+    model: Option<String>,        // winning model id (audit trio)
+    usage: Option<serde_json::Value>,
+    generation_id: Option<String>,
+}
+
+fn run_pde_decision(state, &ResolvedPde, ctx) -> PdeDecisionRun;
+```
 
 - Messages: `[system = decision_prompt, user = ctx]`.
-- `ctx` payload assembled by the engine (operator controls only the system prompt, per
-  the customization goal): recent N-row transcript (reuse the input-filter transcript
-  builder), current affinity six axes, signals (message_count, hours_since_last_message,
-  hours_since_last_ghost, ghost_streak), and the user's latest message.
-- Walk `[model] + fallback_model` with `FILTER_TIMEOUT`; fail-open (timeout / error /
-  empty / unparseable ⇒ `None`).
+- `ctx` payload assembled by the engine (operator controls only the system prompt, per the
+  customization goal): the **shared** recent-history transcript (§6 — one fetch reused by
+  the judge and the input filter), current affinity six axes, signals (message_count,
+  hours_since_last_message, hours_since_last_ghost, ghost_streak), and the user's latest
+  message.
+- Walk `[model] + fallback_model` with `FILTER_TIMEOUT`. A transport failure (timeout /
+  error / empty) walks to the next model; only after the chain is exhausted does the run
+  carry the terminal `status`. A parseable reply ⇒ `Ok` + `verdict`. A non-empty but
+  unparseable reply ⇒ `ParseError` + `raw` (no chain walk past a content-level reply,
+  matching `run_input_filter`'s "definitive keep" semantics).
 - `log_openrouter_usage("pde_decision", None, &resp)`.
-- Returns `None` on any failure → caller uses the rule fallback (§6).
+- Any non-`Ok` status → caller uses the rule fallback (§6) **and** writes an audit row with
+  that status (§8).
+
+### 3.3 `inner_state` sanitization (prompt-injection control)
+
+`inner_state` is free model-authored text folded straight into the system prompt's
+`[inner_state]` section (`prompt.rs:436`). Because the judge sees user-influenced context,
+a hostile or confused judge could emit fake section headers (`[output]`, `[iron_rules]`,
+`---`) or meta-instructions that hijack the prompt. Before use, `inner_state` is sanitized:
+
+- **Length cap** (e.g. ≤ 200 chars; tunable) — truncate beyond it.
+- **Strip structural markers** — drop/escape lines that look like section headers
+  (`^\s*\[.*\]`, leading `---`, `[output]`/`[iron_rules]`/`[now]`-style tokens) and control
+  characters; collapse to a single bullet of plain prose.
+- **Judge system prompt forbids instructions** — the shipped sample `filter_prompt` states
+  `inner_state` must be a short mood description, never instructions or formatting.
+- Sanitization happens once, in the PDE path, before the text reaches `context_hints`.
+- Tests cover hostile `inner_state` (injected `[output]`, overlong, control chars) → the
+  rendered prompt is unaffected (§12).
 
 ---
 
@@ -210,19 +281,38 @@ commented-out sample `filter_prompt`. Default ships **off** (no `filter_prompt`)
 
 ## 5. Guardrails (`eros-engine-core`)
 
-Extract a pure predicate from `ghost.rs` so the rule engine and the LLM-guard path share
-the same hard protections:
+**Design decision — the LLM owns the ghost decision; the rules keep only the hard-safety
+vetoes.** Today `ghost::decide` has four protection layers plus a score-threshold test.
+The score-threshold layer (the `(1-intrigue)*0.4 + …` formula vs `0.65` / `0.85`) is the
+crude "when to ghost" heuristic this spec replaces — it is **deliberately ceded to the
+LLM**. The guardrails therefore preserve only the **hard-safety protections** (new
+relationship / anti-streak / cooldown). This means the LLM *can* ghost in cases the old
+score would have replied — that is the intended behaviour (goal #3), not a regression.
+This is **hard-safety only**, not "the LLM can never ghost where the rules would reply."
+
+Extract the hard-safety layers (sans score) from `ghost.rs` as a pure predicate the rule
+engine and the LLM-guard path both call:
 
 ```rust
-/// True when a ghost is permitted (none of the hard protections forbid it).
-/// = ghost.rs `decide`'s protection layers WITHOUT the score test.
+/// True when a ghost is permitted by the HARD-SAFETY protections (the score
+/// layer is intentionally excluded — the LLM decides ghost-worthiness).
 pub fn ghost_permitted(a: &Affinity, s: GhostSignals) -> bool;
-//   false if: message_count < 10, ghost_streak >= 2, or hours_since_last_ghost < 1.0
+//   false if: a.ghost_streak >= 2  (from &Affinity)
+//          OR s.message_count < 10  OR  s.hours_since_last_ghost < 1.0  (from GhostSignals)
 ```
 
-Tip is **not** a parameter here — it is handled at the call site: the rule path
-(`pde::decide`) forces tip → reply before ever touching ghost logic, and on the LLM path
-tip turns skip the judge entirely (§6), so a tipped turn never reaches `ghost_permitted`.
+**Field sourcing (matches `ghost::decide` exactly):** `ghost_streak` is read from
+`&Affinity` (`a.ghost_streak`, `ghost.rs:34`), while `message_count` /
+`hours_since_last_ghost` come from `GhostSignals` (which carries only those two —
+`ghost.rs:9`). Do not move `ghost_streak` onto `GhostSignals`.
+
+`ghost::decide` is refactored to call `ghost_permitted` for its protection layers and then
+apply the score test itself, so the rule fallback keeps its full (protection + score)
+behaviour unchanged while the LLM path uses `ghost_permitted` alone.
+
+Tip is **not** a parameter — handled at the call site: the rule path (`pde::decide`) forces
+tip → reply before ghost logic, and on the LLM path tip turns skip the judge entirely (§6),
+so a tipped turn never reaches `ghost_permitted`.
 
 **Guardrails only downgrade toward `ReplyText`; never upgrade.** Applied to the judge's
 proposed action:
@@ -234,8 +324,9 @@ proposed action:
 | `reply_image` / `reply_text_image` | `tasks.chat_image_generation` not configured/wired (always, today) | `ReplyText` |
 | `reply_text` | — | `ReplyText` |
 
-The judge can never force a ghost the rules would not allow, and can never produce an
-image reply before the executor exists.
+The judge can never ghost past the **hard-safety** vetoes (new relationship / streak /
+cooldown), and can never produce an image reply before the executor exists. Within those
+vetoes the judge — not the score formula — decides ghost-worthiness (§5 design decision).
 
 ---
 
@@ -243,40 +334,54 @@ image reply before the executor exists.
 
 Today: build `input` → `pde::decide(&input)` → `match plan.action_type`.
 
-New (runs **every turn**, before prompt assembly; the judge is a blocking pre-generation
-step, same placement as `input_filter`):
+New (runs **every turn**, **before** vision / input-filter / prompt assembly, so a `ghost`
+verdict short-circuits all of them):
 
 ```text
 build DecisionInput `input`
+transcript = fetch recent history ONCE                         // shared by judge + input-filter
 plan =
   if tip turn OR resolve_pde() == None:
-      pde::decide(&input)                         // rule engine (today's behaviour)
+      pde::decide(&input)                                      // rule engine (today's behaviour)
   else:
-      match run_pde_decision(p, ctx):
-        Some(verdict):
-            action  = guardrails(verdict.action, &input)     // §5 — may downgrade
-            hints   = if verdict.inner_state non-empty { vec![verdict.inner_state] } else { vec![] }
-            ActionPlan {
-              action_type:    action,
-              reply_style:    Neutral,                        // tone now lives in inner_state
-              context_hints:  hints,                          // → [inner_state] in build_prompt
-              affinity_deltas: predict_reply_deltas(&input),  // reuse rule heuristic (§9)
-              energy_cost:    ENERGY_COST_REPLY,
-            }
-            + record audit row (§8, fire-and-forget)
-        None:                                                 // fail-open
-            pde::decide(&input) + record audit row (status=timeout/error/parse_error)
-match plan.action_type { Ghost => …unchanged…, ReplyText/ReplyImage/ReplyTextImage => Reply path }
+      run = run_pde_decision(p, ctx(transcript, input))        // §3.2 — status-bearing
+      record audit row (§8, best-effort)                       // ALWAYS, with run.status
+      match run.status:
+        Ok => {
+          action = guardrails(run.verdict.action, &input)      // §5 — may downgrade
+          hints  = sanitize(run.verdict.inner_state)           // §3.3; [] if empty after sanitize
+          pde::reply_plan(&input, action, hints)               // §2.3 — Neutral style, heuristic deltas inside
+        }
+        _  => pde::decide(&input)                              // fail-open to rule engine
+match plan.action_type {
+    Ghost                                  => …unchanged ghost arm…,   // skips vision + input-filter
+    ReplyText | ReplyImage | ReplyTextImage => Reply path,            // explicit arms — NOT the `_` catch-all
+    Proactive                              => …unchanged…,
+}
 ```
 
-- **Tip turns skip the judge** (the rule path already handles tip → reply +
-  `tip_personality` tone), saving one call — consistent with how `input_filter` / vision
-  skip tipped turns.
-- `context_hints` is the **existing** plumbing; `build_prompt` already renders it as
-  `[inner_state]`. No new prompt parameters — the dormant channel just gets populated.
-- The `match plan.action_type` adds arms for `ReplyImage` / `ReplyTextImage`; because the
-  guardrail degrades them to `ReplyText` today, they route through the existing Reply path.
-  (When the executor ships, these arms branch to image handling.)
+- **Judge runs first.** A `ghost` verdict routes to the (unchanged) Ghost arm, which never
+  reaches `run_vision` / `run_input_filter` (those live inside the Reply arm) — so a ghost
+  pays only the judge call, not vision + input-filter + chat.
+- **One shared history fetch.** The judge's `ctx` and the input filter today each fetch
+  recent history separately. Fetch it **once** up front and pass it to both, removing the
+  duplicate round-trip the input-filter comment already flags.
+- **Latency budget (opted-in reply turn).** judge LLM → input-filter LLM → chat LLM,
+  serial, before first token. The judge adds **one** blocking round-trip over today; vision
+  / input-filter are unchanged. State this explicitly; the user accepted it (every-turn
+  judge) given the short-circuit + shared-fetch mitigations. (A probability/trigger gate
+  remains a config-level option if cost ever bites, but is not enabled by default.)
+- **Tip turns skip the judge** — the rule path handles tip → reply + `tip_personality`
+  tone; matches `input_filter`'s tip-skip (vision also does not run for a valid tip turn,
+  which carries no image).
+- **`context_hints` is existing plumbing** — `build_prompt` already renders it as
+  `[inner_state]`. No new prompt parameters; the dormant channel just gets populated (with
+  sanitized text, §3.3).
+- **Explicit `match` arms.** `ReplyImage` / `ReplyTextImage` get explicit `=> Reply path`
+  arms — they must **not** fall into the `Proactive` `_` catch-all (which would emit a
+  Final-only frame, no reply). Today they are already degraded to `ReplyText` by the
+  guardrail, so the arms are belt-and-suspenders; they become real branches when the
+  executor ships.
 
 ---
 
@@ -290,9 +395,12 @@ match plan.action_type { Ghost => …unchanged…, ReplyText/ReplyImage/ReplyTex
   generation_id).
 
 The PDE verdict (inner_state, proposed action) only shapes the **prompt** at generation
-time; once the assistant text exists (or the ghost flag is set), replay is wire-identical
-without it. `run_stream` only runs on a fresh idempotent insert, so the judge never
-re-runs on a retry.
+time; once the assistant text exists (or the ghost flag is set), the outcome is fully
+**replayable without it**. (Note: replay was never byte-for-byte wire-identical even today
+— ghost replay mints a fresh ULID and the replayed `Final` carries `tier=None` /
+`prompt_injected=None` / `filtered=false` / `retries=0`; that pre-existing behaviour is
+unchanged and unaffected by this spec.) `run_stream` only runs on a fresh idempotent
+insert, so the judge never re-runs on a retry.
 
 **Therefore no verdict persistence is required for correctness.** (This supersedes the
 earlier brainstorming note about writing the verdict to the user row — it is unnecessary.)
@@ -302,9 +410,9 @@ earlier brainstorming note about writing the verdict to the user row — it is u
 
 ## 8. `companion_decision_events` audit table
 
-Modelled on `companion_insights_events` (migration 0025) — append-only, one row per judge
-run, `run_id` join key, `status` CHECK, `payload` JSONB, OpenRouter audit trio, Supabase
-lockdown.
+Modelled on `companion_insights_events` (migration 0025) — append-only, **best-effort
+telemetry** (≈ one row per judge run), `run_id` join key, `status` CHECK, `payload` JSONB,
+OpenRouter audit trio, Supabase lockdown.
 
 ### 8.1 Migration `0028_companion_decision_events.sql`
 
@@ -334,10 +442,12 @@ CREATE INDEX idx_companion_decision_events_run
 
 ### 8.2 Semantics
 
-- **One row per judge run** — only on turns where the judge runs (feature on, non-tip).
-  Feature-off / tip turns make no LLM call and write **no row** (faithful to
-  `companion_insights_events`' "one row per OpenRouter call"). Pure-rule decisions are
-  deterministic and already replayable, so they need no audit.
+- **Best-effort telemetry, ≈ one row per judge run** — only on turns where the judge runs
+  (feature on, non-tip). The write is fire-and-forget (§8.4), so under shutdown / backpressure
+  a row **may be dropped**; this table is telemetry, **not** a guaranteed ledger. Do not
+  build correctness on its completeness. Feature-off / tip turns make no LLM call and write
+  **no row** (faithful to `companion_insights_events`' "one row per OpenRouter call").
+  Pure-rule decisions are deterministic and already replayable, so they need no audit.
 - `status`: `ok` (parseable verdict), `empty` (blank reply), `parse_error`, `timeout`,
   `error` (transport). On any non-`ok` status the engine used the rule fallback; `action`
   records what was actually done.
@@ -372,25 +482,33 @@ Register `pub mod decision;` in `eros-engine-store/src/lib.rs`.
 
 ### 8.4 Write placement — inline, fire-and-forget
 
-Write the row **in the PDE path right after the guarded decision is computed**, via
-`tokio::spawn` (best-effort, warn-on-error).
+Write the row **in the PDE path right after the run completes** — for **every** judge run
+regardless of `status` (so `Ok`, `Empty`, `ParseError`, `Timeout`, `Error` are all
+captured, including the fail-open-to-rule path) — via `tokio::spawn` (best-effort,
+warn-on-error). The spawned task owns a clone of the data it needs (`run_id`, ids, status,
+acted `action`, `proposed_action`, payload, audit trio) plus the pool.
 
 - **Why inline, not post_process**: a `Ghost` turn does **not** run post_process (the Ghost
   arm only marks + records + emits frames). Ghost is the most important decision to audit,
   so the write must sit where both `Ghost` and reply paths pass — i.e. the decision site.
 - **Why fire-and-forget**: the PDE runs before generation (blocking); an awaited INSERT
-  would add to pre-first-token latency. Audit is best-effort, like other warn-on-error
-  persists.
+  would add to pre-first-token latency. The cost is that a row can be lost on shutdown /
+  backpressure — acceptable for telemetry (§8.2), and consistent with the warn-on-error
+  insight-event writes.
 
 ---
 
 ## 9. `affinity_deltas` / `energy_cost`
 
-- `affinity_deltas`: on the LLM path, keep sourcing them from the existing
-  `predict_reply_deltas(&input)` heuristic (deterministic, cheap, orthogonal to tone). The
-  judge does **not** produce affinity deltas — that overlaps `affinity_evaluation`. So
-  `merge_deltas(plan.affinity_deltas, llm_deltas)` in post_process is unaffected.
-- `energy_cost`: vestigial; set from the existing rule constants. Out of scope to remove.
+- `affinity_deltas`: on the LLM path they come from the same `predict_reply_deltas`
+  heuristic — but the LLM path calls it **via `pde::reply_plan`** (§2.3), never directly
+  (the function and the `ENERGY_COST_*` constants stay private to `pde.rs`). The judge does
+  **not** produce affinity deltas — that overlaps `affinity_evaluation`. So
+  `merge_deltas(plan.affinity_deltas, llm_deltas)` in `post_process.rs:158` is unaffected,
+  and `post_process`'s `run_eval` gate (`plan.action_type == ReplyText`, post-rename) still
+  fires correctly because guarded image actions are degraded to `ReplyText` (§2.3 invariant).
+- `energy_cost`: vestigial; `pde::reply_plan` sets it from the existing rule constant. Out
+  of scope to remove.
 
 ---
 
@@ -419,15 +537,29 @@ served stream.
 ## 12. Testing
 
 - **core**: `ghost_permitted` unit tests (msg<10 / streak / cooldown → false; clear case →
-  true); existing `pde::decide` tests stay green after the `ReplyText` rename.
+  true), reading `ghost_streak` from `Affinity`; `ghost::decide` still applies the score
+  layer after the refactor (its existing tests stay green); `pde::reply_plan` builds the
+  expected `ActionPlan` (Neutral style, heuristic deltas, hints → context_hints); existing
+  `pde::decide` tests stay green after the `ReplyText` rename; `ActionType::is_text_reply`
+  truth table.
 - **model_config**: `resolve_pde` (task absent → None; blank `filter_prompt` → None; set →
   `Some`); compat fixture asserts the new `filter_prompt`.
-- **server**: `parse_pde_verdict` (all four actions, missing/extra fields, junk → None);
-  guardrail application (tip → ReplyText; msg<10 vetoes ghost; ghost honoured when
-  permitted; `reply_image`/`reply_text_image` → ReplyText today; fail-open → rule). One
-  stream E2E: judge → ghost (and inner_state injected into the prompt on a reply turn).
+- **server**:
+  - `parse_pde_verdict` (all four actions, missing/extra fields, junk → None).
+  - `run_pde_decision` status mapping: `Ok` / `Empty` / `ParseError` (raw kept) /
+    `Timeout` / `Error` each produce the right `PdeDecisionRun.status`.
+  - Guardrail application: tip → ReplyText; msg<10 vetoes ghost; ghost honoured when
+    permitted; `reply_image`/`reply_text_image` → ReplyText today; fail-open → rule.
+  - **`inner_state` sanitization** (§3.3): hostile inputs — injected `[output]` /
+    `[iron_rules]` / `---` section markers, overlong text, control chars — leave the
+    rendered prompt structurally intact.
+  - **Invariant test**: a guarded plan never carries an un-degraded image action; the
+    `match` never hits the `_` catch-all for a reply.
+  - One stream E2E: judge → ghost (short-circuits vision/input-filter), and inner_state
+    injected into the prompt on a reply turn.
 - **store**: `DecisionEventRepo::record` round-trips a row (run_id, status, payload, audit
-  trio), mirroring the insight-event test.
+  trio) and a `parse_error` row (raw text payload, NULL `proposed_action`), mirroring the
+  insight-event test.
 
 ---
 
@@ -447,14 +579,14 @@ served stream.
 
 | File | Change |
 | --- | --- |
-| `crates/eros-engine-core/src/types.rs` | `ActionType`: `Reply`→`ReplyText`, add `ReplyImage`, `ReplyTextImage`. |
-| `crates/eros-engine-core/src/ghost.rs` | Extract `ghost_permitted(a, s, is_tip) -> bool`; `decide` reuses it. |
-| `crates/eros-engine-core/src/pde.rs` | Rename `Reply`→`ReplyText` (no logic change). |
+| `crates/eros-engine-core/src/types.rs` | `ActionType`: `Reply`→`ReplyText`; add `ReplyImage`, `ReplyTextImage`; **keep `Proactive`**; **drop the unused `Serialize`/`Deserialize` derive**; add `ActionType::is_text_reply()`. |
+| `crates/eros-engine-core/src/ghost.rs` | Extract `ghost_permitted(a: &Affinity, s: GhostSignals) -> bool` (hard-safety layers only, no score; `ghost_streak` from `a`); `decide` calls it then applies the score test. |
+| `crates/eros-engine-core/src/pde.rs` | Rename `Reply`→`ReplyText`; add `pub fn reply_plan(input, action, hints) -> ActionPlan` (keeps `predict_reply_deltas` + `ENERGY_COST_*` private). |
 | `crates/eros-engine-llm/src/model_config.rs` | `ResolvedPde` + `resolve_pde()`; add `filter_prompt` to `COMPAT_FIXTURE` + test. |
-| `crates/eros-engine-server/src/pipeline/stream.rs` | `PdeVerdict`, `parse_pde_verdict`, `run_pde_decision`; `run_stream` decision flow; `match` arms for the two image actions (degrade); fire-and-forget audit write; `ActionType::Reply`→`ReplyText`. |
-| `crates/eros-engine-server/src/pipeline/post_process.rs` | `ActionType::Reply`→`ReplyText` (rename only). |
+| `crates/eros-engine-server/src/pipeline/stream.rs` | `PdeVerdict` / `PdeStatus` / `PdeDecisionRun`, `parse_pde_verdict`, `run_pde_decision` (status-bearing); `inner_state` sanitizer (§3.3); `run_stream` decision flow (judge-first, shared history fetch, calls `pde::reply_plan`); **explicit `ReplyText`/`ReplyImage`/`ReplyTextImage` match arms** (not `_`); best-effort `tokio::spawn` audit write for every status; `ActionType::Reply`→`ReplyText`. |
+| `crates/eros-engine-server/src/pipeline/post_process.rs` | `ActionType::Reply`→`ReplyText` (rename only; image variants never reach here per §2.3 invariant). |
 | `crates/eros-engine-store/src/decision.rs` | **New** — `DecisionEventInsert` + `DecisionEventRepo::record`. |
 | `crates/eros-engine-store/src/lib.rs` | `pub mod decision;`. |
 | `crates/eros-engine-store/migrations/0028_companion_decision_events.sql` | **New** — table + indexes + Supabase lockdown. |
-| `examples/model_config.toml` | `[tasks.pde_decision]`: live comment + commented sample `filter_prompt`. |
+| `examples/model_config.toml` | `[tasks.pde_decision]`: live comment + commented sample `filter_prompt` (with the `inner_state`-must-be-mood-not-instructions clause). |
 | `docs/architecture.md` / `.zh`, `docs/model-config.md` / `.zh`, `README.md` / `.zh` | PDE description + schema/flow updates. |
