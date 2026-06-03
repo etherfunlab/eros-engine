@@ -44,7 +44,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             None => ReplyStyle::Tsundere,
         };
         return ActionPlan {
-            action_type: ActionType::Reply,
+            action_type: ActionType::ReplyText,
             reply_style,
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
@@ -92,7 +92,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 
     // 4. Regular reply
     ActionPlan {
-        action_type: ActionType::Reply,
+        action_type: ActionType::ReplyText,
         reply_style: ReplyStyle::Neutral,
         affinity_deltas: predict_reply_deltas(input),
         energy_cost: ENERGY_COST_REPLY,
@@ -246,7 +246,7 @@ mod tests {
         let plan = decide(&input);
         assert_eq!(
             plan.action_type,
-            ActionType::Reply,
+            ActionType::ReplyText,
             "a tip must never be ghosted"
         );
     }
@@ -260,7 +260,7 @@ mod tests {
             signals: base_signals(),
         };
         let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::Reply);
+        assert_eq!(plan.action_type, ActionType::ReplyText);
         assert_eq!(plan.reply_style, ReplyStyle::Neutral);
     }
 
@@ -273,7 +273,7 @@ mod tests {
             signals: base_signals(),
         };
         let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::Reply);
+        assert_eq!(plan.action_type, ActionType::ReplyText);
         assert_eq!(plan.reply_style, ReplyStyle::Tsundere);
     }
 
@@ -311,7 +311,7 @@ mod tests {
             signals,
         };
         let plan = decide(&input);
-        assert_eq!(plan.action_type, ActionType::Reply);
+        assert_eq!(plan.action_type, ActionType::ReplyText);
     }
 
     #[test]

@@ -73,12 +73,28 @@ pub enum Event {
     AppOpen,
 }
 
-/// Action decision produced by the PDE.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Action decision produced by the PDE. NOT serialized to any DB/SSE wire path
+/// (the persisted action string and `FrameActionType` are separate) — so the
+/// rename is internal-only and the serde derive is intentionally absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionType {
-    Reply,
+    ReplyText,
     Ghost,
-    Proactive,
+    ReplyImage,     // reserved — degrades to ReplyText until the image executor ships
+    ReplyTextImage, // reserved — degrades to ReplyText until the image executor ships
+    Proactive,      // KEPT — built by pde::decide for ProactiveTrigger/AppOpen; matched in post_process
+}
+
+impl ActionType {
+    /// True for actions that produce a text reply downstream. Image variants are
+    /// included so they route through the reply path once the executor ships;
+    /// today the PDE guardrails degrade them to `ReplyText` first.
+    pub fn is_text_reply(self) -> bool {
+        matches!(
+            self,
+            ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage
+        )
+    }
 }
 
 /// Tone directive for the reply generation.
@@ -250,5 +266,14 @@ mod tests {
         assert!(r.usage.is_none());
         assert!(r.generation_id.is_none());
         assert!(r.model.is_none());
+    }
+
+    #[test]
+    fn is_text_reply_truth_table() {
+        assert!(ActionType::ReplyText.is_text_reply());
+        assert!(ActionType::ReplyImage.is_text_reply());
+        assert!(ActionType::ReplyTextImage.is_text_reply());
+        assert!(!ActionType::Ghost.is_text_reply());
+        assert!(!ActionType::Proactive.is_text_reply());
     }
 }

@@ -1311,7 +1311,7 @@ pub fn run_stream(
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
-            ActionType::Reply => {
+            ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
                 // ── Image describe (chat_vision) — Reply turns with an image ──
                 // Runs before the input filter; both may fire (orthogonal). The
                 // describe result is merged into metadata.vision; the prompt
@@ -1411,7 +1411,7 @@ pub fn run_stream(
                 let trait_tags: Vec<String> = injected_tags.clone();
                 let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
                 let (frame_action, persist_action, plan_action) =
-                    (FrameActionType::Reply, "reply", ActionType::Reply);
+                    (FrameActionType::Reply, "reply", ActionType::ReplyText);
 
                 let display_override = state.model_config.display_override("chat_companion");
 
