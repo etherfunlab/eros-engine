@@ -412,7 +412,7 @@ pub struct FilterAudit {
 pub struct AssistantInsert {
     pub id: Uuid,
     pub content: String,
-    pub assistant_action_type: String, // "reply" | "gift_reaction"
+    pub assistant_action_type: String, // "reply"
     pub continues_from_message_id: Option<Uuid>,
     pub truncated: bool,
     pub model: Option<String>,
