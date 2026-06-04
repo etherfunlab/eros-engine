@@ -863,6 +863,7 @@ const INNER_STATE_MAX_CHARS: usize = 200;
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
+#[allow(dead_code)]
 fn sanitize_inner_state(raw: &str) -> String {
     let joined = raw
         .lines()
@@ -880,6 +881,217 @@ fn sanitize_inner_state(raw: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     collapsed.chars().take(INNER_STATE_MAX_CHARS).collect()
+}
+
+// ── Task 7: PDE runner + pure helpers ─────────────────────────────────────
+
+/// Terminal status of a PDE judge run — drives the audit `status` column.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdeStatus {
+    Ok,
+    Empty,
+    ParseError,
+    Timeout,
+    Error,
+}
+
+impl PdeStatus {
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            PdeStatus::Ok => "ok",
+            PdeStatus::Empty => "empty",
+            PdeStatus::ParseError => "parse_error",
+            PdeStatus::Timeout => "timeout",
+            PdeStatus::Error => "error",
+        }
+    }
+}
+
+/// Outcome of a PDE judge run. `verdict` is `Some` only on `Ok`; `raw` carries
+/// the model text on `ParseError` for the audit payload; the trio is the
+/// winning call's audit echo.
+#[allow(dead_code)]
+pub(crate) struct PdeDecisionRun {
+    pub(crate) status: PdeStatus,
+    pub(crate) verdict: Option<PdeVerdict>,
+    pub(crate) raw: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) usage: Option<serde_json::Value>,
+    pub(crate) generation_id: Option<String>,
+}
+
+/// Run the PDE judge over the assembled context. Walks `[model] + fallback`
+/// trying the next model on a transport failure (error/timeout/empty); a
+/// content-level reply that won't parse is a definitive `ParseError` (no further
+/// walk), mirroring `run_input_filter`. Fail-open: any non-`Ok` status → the
+/// caller uses the rule fallback. NEVER returns an error — always a run record.
+#[allow(dead_code)]
+async fn run_pde_decision(
+    state: &AppState,
+    p: &eros_engine_llm::model_config::ResolvedPde,
+    ctx: &str,
+) -> PdeDecisionRun {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let chain: Vec<String> = std::iter::once(p.model.clone())
+        .chain(p.fallback_model.iter().cloned())
+        .collect();
+    let mut last = PdeStatus::Error; // chain-exhausted default
+    for model_id in &chain {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: p.decision_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: ctx.to_string(),
+                },
+            ],
+            temperature: p.temperature as f32,
+            max_tokens: p.max_tokens,
+            reasoning: p.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp =
+            match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
+                    last = PdeStatus::Error;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(model = %model_id, "pde: timeout; next");
+                    last = PdeStatus::Timeout;
+                    continue;
+                }
+            };
+        super::log_openrouter_usage("pde_decision", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "pde: empty reply; next");
+            last = PdeStatus::Empty;
+            continue;
+        }
+        // Content-level reply — definitive, no further chain walk.
+        return match parse_pde_verdict(&text) {
+            Some(verdict) => PdeDecisionRun {
+                status: PdeStatus::Ok,
+                verdict: Some(verdict),
+                raw: None,
+                model: resp.model.or_else(|| Some(model_id.clone())),
+                usage: resp.usage,
+                generation_id: resp.generation_id,
+            },
+            None => {
+                tracing::warn!(model = %model_id, "pde: unparseable verdict; fallback to rule");
+                PdeDecisionRun {
+                    status: PdeStatus::ParseError,
+                    verdict: None,
+                    raw: Some(text),
+                    model: resp.model.or_else(|| Some(model_id.clone())),
+                    usage: resp.usage,
+                    generation_id: resp.generation_id,
+                }
+            }
+        };
+    }
+    // chain exhausted on transport failures
+    PdeDecisionRun {
+        status: last,
+        verdict: None,
+        raw: None,
+        model: None,
+        usage: None,
+        generation_id: None,
+    }
+}
+
+/// Map the judge's proposed action to the acted `ActionType`, applying the
+/// hard-safety ghost guardrail (`ghost::ghost_permitted`) and the image-degrade.
+/// Does NOT apply the `ghosting` kill-switch (that is a path-wide final gate).
+/// Pure.
+#[allow(dead_code)]
+fn guard_action(
+    proposed: PdeAction,
+    affinity: &eros_engine_core::affinity::Affinity,
+    signals: &eros_engine_core::types::ConversationSignals,
+) -> ActionType {
+    match proposed {
+        PdeAction::Ghost => {
+            let gs = eros_engine_core::ghost::GhostSignals {
+                message_count: signals.message_count,
+                hours_since_last_ghost: signals.hours_since_last_ghost,
+            };
+            if eros_engine_core::ghost::ghost_permitted(affinity, gs) {
+                ActionType::Ghost
+            } else {
+                ActionType::ReplyText
+            }
+        }
+        // image executor not shipped → always degrade to text
+        PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
+        PdeAction::ReplyText => ActionType::ReplyText,
+    }
+}
+
+/// Path-wide `ghosting` kill-switch: if ghosting is disabled and the plan is a
+/// Ghost, rebuild it as a ReplyText plan carrying `hints` (so a forced reply
+/// keeps the judge's mood). Pure.
+#[allow(dead_code)]
+fn apply_ghosting_killswitch(
+    plan: eros_engine_core::types::ActionPlan,
+    ghosting_enabled: bool,
+    input: &eros_engine_core::types::DecisionInput,
+    hints: Vec<String>,
+) -> eros_engine_core::types::ActionPlan {
+    if !ghosting_enabled && plan.action_type == ActionType::Ghost {
+        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints)
+    } else {
+        plan
+    }
+}
+
+/// Build the judge's user payload from the shared transcript + the decision input.
+#[allow(dead_code)]
+fn build_pde_ctx(
+    transcript: &str,
+    input: &eros_engine_core::types::DecisionInput,
+) -> String {
+    let a = &input.affinity;
+    let s = &input.signals;
+    let latest = match &input.event {
+        eros_engine_core::types::Event::UserMessage { content, .. } => content.as_str(),
+        _ => "",
+    };
+    let transcript = if transcript.trim().is_empty() {
+        "（无）"
+    } else {
+        transcript
+    };
+    format!(
+        "[最近对话]\n{transcript}\n\n\
+         [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
+         [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\n\
+         [用户最新消息]\n{latest}",
+        a.warmth,
+        a.trust,
+        a.intrigue,
+        a.intimacy,
+        a.patience,
+        a.tension,
+        s.message_count,
+        s.hours_since_last_message,
+        s.ghost_streak,
+        s.hours_since_last_ghost
+            .map(|h| format!("{h:.1}"))
+            .unwrap_or_else(|| "none".into()),
+    )
 }
 
 /// Fixed schema the `chat_vision` describe model must emit. `description` is
@@ -1909,6 +2121,136 @@ mod tests {
         assert!(sanitize_inner_state(&long).chars().count() <= 200);
         // empty after sanitize
         assert_eq!(sanitize_inner_state("[only_a_header]"), "");
+    }
+
+    // ── Task-7 pure-helper fixtures ────────────────────────────────────────
+
+    fn pde_test_affinity() -> eros_engine_core::affinity::Affinity {
+        use chrono::Utc;
+        let now = Utc::now();
+        eros_engine_core::affinity::Affinity {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            instance_id: uuid::Uuid::new_v4(),
+            warmth: 0.4,
+            trust: 0.3,
+            intrigue: 0.2,
+            intimacy: 0.2,
+            patience: 0.2,
+            tension: 0.5,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn pde_test_persona() -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let oid = uuid::Uuid::new_v4();
+        CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "Mia".into(),
+                system_prompt: "You are Mia.".into(),
+                tip_personality: Some("normal".into()),
+                art_metadata: serde_json::json!({}),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: oid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    fn pde_test_input() -> eros_engine_core::types::DecisionInput {
+        use eros_engine_core::types::{ConversationSignals, DecisionInput, Event};
+        DecisionInput {
+            event: Event::UserMessage {
+                content: "hi".into(),
+                message_id: uuid::Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: pde_test_affinity(),
+            persona: pde_test_persona(),
+            signals: ConversationSignals {
+                message_count: 50,
+                hours_since_last_message: 1.0,
+                ghost_streak: 0,
+                hours_since_last_ghost: Some(5.0),
+            },
+        }
+    }
+
+    fn sigs(
+        message_count: i64,
+        hours_since_last_ghost: Option<f64>,
+    ) -> eros_engine_core::types::ConversationSignals {
+        eros_engine_core::types::ConversationSignals {
+            message_count,
+            hours_since_last_message: 1.0,
+            ghost_streak: 0,
+            hours_since_last_ghost,
+        }
+    }
+
+    #[test]
+    fn guard_action_degrades_and_honours() {
+        use eros_engine_core::affinity::Affinity;
+        let a = Affinity {
+            ghost_streak: 0,
+            ..pde_test_affinity()
+        };
+        // ghost honoured when permitted
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0))),
+            ActionType::Ghost
+        );
+        // ghost vetoed by new-relationship floor
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None)),
+            ActionType::ReplyText
+        );
+        // image actions degrade to text today
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn killswitch_downgrades_ghost_keeping_hints() {
+        let input = pde_test_input();
+        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![]);
+        // ghosting enabled → unchanged
+        let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
+        assert_eq!(kept.action_type, ActionType::Ghost);
+        // ghosting disabled → downgraded to ReplyText carrying the hints
+        let down =
+            apply_ghosting_killswitch(ghost_plan, false, &input, vec!["想躲".into()]);
+        assert_eq!(down.action_type, ActionType::ReplyText);
+        assert_eq!(down.context_hints, vec!["想躲".to_string()]);
     }
 
     use sqlx::PgPool;
