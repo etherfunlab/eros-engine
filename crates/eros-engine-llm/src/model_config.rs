@@ -396,6 +396,11 @@ pub struct TaskConfig {
     /// defaults this to 1 (primary + first fallback) when unset.
     #[serde(default)]
     pub retry_depth: Option<u32>,
+    /// PDE-only: ghost kill-switch. `false` disables ghosting across the whole
+    /// PDE path; absent/`true` keeps it on. Read only on `[tasks.pde_decision]`
+    /// (other tasks ignore it), like `input_filter`/`dimensions`.
+    #[serde(default)]
+    pub ghosting: Option<bool>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -538,6 +543,21 @@ pub struct ResolvedVision {
     pub temperature: f64,
     pub max_tokens: u32,
     pub describe_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
+/// configured `filter_prompt` is the judge's system instruction; the engine
+/// builds the user payload (transcript + affinity + signals). `fallback_model`
+/// is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedPde {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub decision_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
 }
@@ -826,6 +846,42 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
         })
+    }
+
+    /// Resolve the PDE decision task. `None` (feature off → rule engine) when
+    /// `[tasks.pde_decision]` is absent OR its `filter_prompt` is blank. Reuses
+    /// the generic `resolve()` machinery; task-level only (no tier override),
+    /// like `chat_vision`.
+    pub fn resolve_pde(&self) -> Option<ResolvedPde> {
+        const PDE_TASK: &str = "pde_decision";
+        let task_cfg = self.tasks.get(PDE_TASK)?;
+        let decision_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if decision_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(PDE_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedPde {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            decision_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// PDE ghost kill-switch. `true` (default) ⇒ ghost honoured; `false` ⇒ the
+    /// whole PDE path never produces a Ghost. Read INDEPENDENTLY of
+    /// `filter_prompt`, so it also governs the pure rule engine (LLM PDE off).
+    pub fn pde_ghosting_enabled(&self) -> bool {
+        self.tasks
+            .get("pde_decision")
+            .and_then(|t| t.ghosting)
+            .unwrap_or(true)
     }
 
     /// Resolve the insight-extraction (facts stage) prompt bundle. `None` when
@@ -1179,10 +1235,12 @@ max_tokens   = 400
 description  = "extract user facts from a chat turn"
 
 [tasks.pde_decision]
-model        = "x-ai/grok-4-mini"
-temperature  = 0.5
-max_tokens   = 200
-description  = "reserved — current PDE is rule-based"
+model         = "x-ai/grok-4-mini"
+temperature   = 0.5
+max_tokens    = 200
+description   = "LLM decision layer"
+filter_prompt = "Decide the action and inner_state."
+ghosting      = false
 
 [tasks.embedding]
 model        = "voyage-3-lite"
@@ -1272,6 +1330,13 @@ reasoning    = { enabled = false }
         assert_eq!(pde.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
+        assert_eq!(
+            pde.filter_prompt.as_deref(),
+            Some("Decide the action and inner_state.")
+        );
+        assert_eq!(pde.ghosting, Some(false));
+        assert!(cfg.resolve_pde().is_some());
+        assert!(!cfg.pde_ghosting_enabled());
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
@@ -2500,5 +2565,44 @@ filter_prompt = "   "
         // Guards the dreaming sweeper's early-return condition (a later task).
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
         assert!(cfg.resolve_memory_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_pde_none_when_absent_or_blank() {
+        // absent
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_pde().is_none());
+        // present but blank filter_prompt
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_pde().is_none());
+    }
+
+    #[test]
+    fn resolve_pde_some_when_prompt_set() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"decide\"\n",
+        )
+        .unwrap();
+        let p = cfg.resolve_pde().expect("resolves");
+        assert_eq!(p.model, "m");
+        assert_eq!(p.decision_prompt, "decide");
+    }
+
+    #[test]
+    fn pde_ghosting_enabled_default_true_else_field() {
+        // task missing → true
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.pde_ghosting_enabled());
+        // present, no ghosting → true
+        let cfg = ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.pde_ghosting_enabled());
+        // ghosting = false → false
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\nghosting = false\n")
+                .unwrap();
+        assert!(!cfg.pde_ghosting_enabled());
     }
 }

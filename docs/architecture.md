@@ -34,7 +34,10 @@ load context           load persona via PersonaRepo
        │
        ▼
 PDE decide             eros_engine_core::pde::decide(&input) → ActionPlan
-                       (rules-based: Reply / Ghost / Proactive)
+                       (rules-based by default; opt-in LLM judge via
+                        [tasks.pde_decision].filter_prompt, fail-open to
+                        rule engine; verdict audited to
+                        companion_decision_events)
        │
        ▼
 handler dispatch       Reply  → ReplyHandler  builds ChatRequest
@@ -81,6 +84,7 @@ eros-engine-server :8080
                        companion_memories (vector(512))
                        persona_genomes / persona_instances
                        companion_insights
+                       companion_decision_events
 ```
 
 The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
@@ -89,7 +93,7 @@ The post-process spawn returns `()` and is fire-and-forget by design — the use
 
 Two reasons:
 
-1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 25 tests in `core` are the safety net for everything above.
+1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 25 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
 2. **Embeddability.** Anyone wanting to build a different product on top — journaling agent, language tutor, coaching companion — can pull in `core` without inheriting the HTTP shape, the Postgres schema, or the JWT auth. The 6-dim affinity model is the part most worth lifting; we made that easy.
 
 ## File structure

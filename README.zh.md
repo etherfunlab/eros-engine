@@ -18,7 +18,7 @@
 - **Memory** 放在 Postgres + pgvector，拆成 profile memory 和 relationship memory。
 - **Affinity** 是數值向量，透過 EMA 平滑與真實時間衰退更新。
 - **User insight** 是可查詢的 JSONB 用戶畫像。
-- **Persona behavior** 先由規則型 Persona Decision Engine（PDE）規劃，再交給 LLM 生成。
+- **Persona behavior** 先由 Persona Decision Engine（PDE）规划，再交给 LLM 生成。PDE 默认为规则型；可通过 `[tasks.pde_decision].filter_prompt` 启用可选 LLM 判断器层，每轮判断结果记录到 `companion_decision_events`。
 
 這不是通用 agent framework，而是為「同一個 persona 長期跟同一個用戶互動」設計的引擎：AI 伴侶、日記式陪伴、coaching agent、language tutor、character chat 都屬於這類場景。
 

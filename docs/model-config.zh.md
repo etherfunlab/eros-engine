@@ -57,15 +57,30 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 |---|---|---|
 | `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completions；打赏轮走同一回复路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights` (抽事实 + JSONB merge) | live |
-| `pde_decision` | reserved — 当前 PDE 是纯规则,不调 LLM | reserved |
+| `pde_decision` | `pipeline::stream`（可选 LLM 判断器，通过 `run_pde_decision` 在 `run_stream` 中调用；`filter_prompt` 缺失或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `embedding` | reserved — `VoyageClient` 自己读 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite`,不走这条路径 | reserved |
 
 `[tasks.<name>]` 只有当代码里真有 `model_config.resolve("<name>", ...)` 调用时才有意义。当前调用点:
 
-- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`
+- `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision` 调用（仅当 `filter_prompt` 已设置时）
 
-其它要么是给未来功能留的位置 (`pde_decision`),要么是 vestigial (`embedding` —— Voyage 完全不走这条路径)。
+`embedding` 是 vestigial —— Voyage 完全不走这条路径。
+
+### `[tasks.pde_decision]` —— 可选 LLM PDE 判断器
+
+默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块设置 `filter_prompt` 即可启用 LLM 判断器：
+
+- LLM 收到最近对话、关系状态和对话信号，返回 JSON 判断结果，字段包括：
+  - `action`：`"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"`（image 变体降级为 `reply_text`，OSS 不内置图片执行器）
+  - `inner_state`：一句话内心状态/语气描述，会折叠进回复 prompt
+  - `image_prompt`、`reason`：选填
+- **Fail-open：** LLM 超时或出错时回退到规则引擎 —— LLM 判断器永远不会阻塞聊天响应。
+- **硬安全防护**（在 LLM 判断之后、规则引擎 fallback 之前强制执行）：前 10 条消息不 ghost；不连续 ghost 两次；ghost 后有 1 小时 cooldown。
+- 每次判断调用都会记录到 `companion_decision_events` 表，供审计使用。
+
+**`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设为 `false` 可在整个 PDE 路径（LLM 判断、规则 fallback、纯规则引擎）上全面禁用 ghosting，使伴侣永远不会沉默。适用于不希望出现沉默轮的产品。
 
 ### 开启 / 关闭抽取任务
 
@@ -142,7 +157,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # 加权随机
 1. **不删字段。** `[defaults]` 和 `[tasks.<name>]` 现有的字段名不会消失。
 2. **不改字段名。** `fallback` 不会变成 `fallback_model`。`model` 不会变成 `primary_model`。
 3. **不加新的必填字段。** 后续加的字段一律可选,带合理默认。
-4. **以下任务名不会被删除:** `chat_companion`,`insight_extraction`。Reserved 名 (`pde_decision`,`embedding`) 在真实现落地后可能有 semantic 变化,但会在 changelog 里明确写。
+4. **以下任务名不会被删除:** `chat_companion`、`insight_extraction`、`pde_decision`。Reserved 名（`embedding`）在真实现落地后可能有 semantic 变化,但会在 changelog 里明确写。
 5. **解析优先级顺序固定。** `model`/`fallback`/`allow_traits` 走 `匹配 tier > 任务默认块 > [defaults] > 内置兜底`;`temperature`/`max_tokens` 只在任务级设置。
 6. **`model` 接受字符串、数组（轮转）或表（加权）。** 纯字符串写法永久有效；数组/表形式是向后兼容的扩展。
 
@@ -160,7 +175,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # 加权随机
 ## 这份 config 不管的事
 
 - **Voyage embedding** —— `VoyageClient` hard-code `voyage-3-lite`,直接读 `VOYAGE_API_KEY`。`[tasks.embedding]` 是给未来通用化留的位置。
-- **PDE 决策** —— 当前 PDE 是 `eros-engine-core/src/pde.rs` 里的纯规则逻辑。`[tasks.pde_decision]` 是给未来可选 LLM 决策层留的位置,目前没接。
+- **PDE 决策（默认路径）** —— 没有设置 `filter_prompt` 时，规则引擎（`eros-engine-core/src/pde.rs`）无条件运行。设置 `[tasks.pde_decision].filter_prompt` 即可启用可选 LLM 判断器；规则引擎此时作为 fallback + 硬安全防护。
 - **OpenRouter API key** —— 直接读 `OPENROUTER_API_KEY`,不走配置文件。
 - **Per-call streaming / response format flag** —— 在 `OpenRouterClient` 里写死。
 

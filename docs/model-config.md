@@ -229,15 +229,30 @@ input filter has no triggers, timing, or tiers).
 | `chat_companion` | `pipeline::handlers::ReplyHandler` (chat completions; tip turns ride the same reply path) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
-| `pde_decision` | reserved — current PDE is rule-based and does not call an LLM | reserved |
+| `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set)
 
-Anything else is either reserved for a future feature (`pde_decision`) or vestigial (`embedding` — Voyage doesn't go through this path).
+`embedding` is vestigial — Voyage doesn't go through this path.
+
+### `[tasks.pde_decision]` — opt-in LLM PDE judge
+
+By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
+
+- The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants degrade to `reply_text` — no image executor ships in OSS)
+  - `inner_state`: a short mood/tone description folded into the reply prompt
+  - `image_prompt`, `reason`: optional
+- **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
+- **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost twice in a row, one-hour ghost cooldown.
+- Every judge call is audited to `companion_decision_events`.
+
+**`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
 ### Enabling / disabling extraction
 
@@ -318,7 +333,7 @@ For the duration of `0.x`, the OSS engine commits to:
 1. **No removed fields.** Existing field names in `[defaults]` and `[tasks.<name>]` will not disappear.
 2. **No renamed fields.** `fallback` will not become `fallback_model`. `model` will not become `primary_model`. Etc.
 3. **No newly required fields.** Anything added is optional with a sensible default.
-4. **No removed task names from this list:** `chat_companion`, `insight_extraction`. Reserved task names (`pde_decision`, `embedding`) may shift if a real implementation lands and supersedes their current placeholder semantics; that change will be called out in the changelog.
+4. **No removed task names from this list:** `chat_companion`, `insight_extraction`, `pde_decision`. Reserved task names (`embedding`) may shift if a real implementation lands and supersedes their current placeholder semantics; that change will be called out in the changelog.
 5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only.
 6. **`model` accepts a string, array (round-robin), or table (weighted).** A plain string remains valid forever; the array/table forms are an additive widening.
 
@@ -346,7 +361,7 @@ What may still change without notice:
 ## What this config does NOT control
 
 - **Voyage embedding** — `VoyageClient` hard-codes `voyage-3-lite` and reads `VOYAGE_API_KEY` directly. The `[tasks.embedding]` block is reserved for a future generalisation.
-- **PDE decisions** — current PDE is pure rule-based logic in `eros-engine-core/src/pde.rs`. The `[tasks.pde_decision]` block is reserved for an optional LLM decision layer that has not landed yet.
+- **PDE decisions (default path)** — the rule engine in `eros-engine-core/src/pde.rs` runs unconditionally when no `filter_prompt` is set. Set `[tasks.pde_decision].filter_prompt` to activate the opt-in LLM judge; the rule engine then serves as fallback + hard-safety guardrails.
 - **OpenRouter API key** — read directly from `OPENROUTER_API_KEY`, not the config file.
 - **Per-call streaming / response format flags** — fixed in `OpenRouterClient`.
 
