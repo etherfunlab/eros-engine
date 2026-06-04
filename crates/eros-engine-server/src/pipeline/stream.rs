@@ -5107,5 +5107,14 @@ data: [DONE]\n\n";
             deltas.contains("REPLY"),
             "unparseable judge verdict must fall back to a normal reply; got {frames:?}",
         );
+
+        // Prove the judge was actually called (not silently skipped by resolve_pde
+        // returning None). At least one upstream request body must carry "pde/judge".
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge")),
+            "the PDE judge must have been called before failing open; no request body contained 'pde/judge'",
+        );
     }
 }
