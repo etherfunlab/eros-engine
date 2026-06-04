@@ -948,20 +948,19 @@ async fn run_pde_decision(
             reasoning: p.reasoning.clone(),
             ..Default::default()
         };
-        let resp =
-            match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
-                    last = PdeStatus::Error;
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(model = %model_id, "pde: timeout; next");
-                    last = PdeStatus::Timeout;
-                    continue;
-                }
-            };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
+                last = PdeStatus::Error;
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "pde: timeout; next");
+                last = PdeStatus::Timeout;
+                continue;
+            }
+        };
         super::log_openrouter_usage("pde_decision", None, &resp);
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
@@ -1047,10 +1046,7 @@ fn apply_ghosting_killswitch(
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
-fn build_pde_ctx(
-    transcript: &str,
-    input: &eros_engine_core::types::DecisionInput,
-) -> String {
+fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInput) -> String {
     let a = &input.affinity;
     let s = &input.signals;
     let latest = match &input.event {
@@ -2205,7 +2201,8 @@ mod tests {
             assert_eq!(parse_pde_verdict(&j).unwrap().action, want);
         }
         // embedded in prose
-        let v = parse_pde_verdict("noise {\"action\":\"ghost\",\"inner_state\":\"x\"} tail").unwrap();
+        let v =
+            parse_pde_verdict("noise {\"action\":\"ghost\",\"inner_state\":\"x\"} tail").unwrap();
         assert_eq!(v.action, PdeAction::Ghost);
         // junk → None
         assert!(parse_pde_verdict("not json").is_none());
@@ -2355,8 +2352,7 @@ mod tests {
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
         assert_eq!(kept.action_type, ActionType::Ghost);
         // ghosting disabled → downgraded to ReplyText carrying the hints
-        let down =
-            apply_ghosting_killswitch(ghost_plan, false, &input, vec!["想躲".into()]);
+        let down = apply_ghosting_killswitch(ghost_plan, false, &input, vec!["想躲".into()]);
         assert_eq!(down.action_type, ActionType::ReplyText);
         assert_eq!(down.context_hints, vec!["想躲".to_string()]);
     }

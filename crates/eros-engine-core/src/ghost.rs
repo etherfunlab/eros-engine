@@ -163,28 +163,40 @@ mod tests {
     #[test]
     fn ghost_permitted_false_when_message_count_below_10() {
         let a = aff(0.1, 0.1, 0.5, 0);
-        let s = GhostSignals { message_count: 5, hours_since_last_ghost: None };
+        let s = GhostSignals {
+            message_count: 5,
+            hours_since_last_ghost: None,
+        };
         assert!(!ghost_permitted(&a, s));
     }
 
     #[test]
     fn ghost_permitted_false_on_streak() {
         let a = aff(0.1, 0.1, 0.5, 2); // ghost_streak read from &Affinity
-        let s = GhostSignals { message_count: 50, hours_since_last_ghost: Some(5.0) };
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(5.0),
+        };
         assert!(!ghost_permitted(&a, s));
     }
 
     #[test]
     fn ghost_permitted_false_within_cooldown() {
         let a = aff(0.1, 0.1, 0.5, 0);
-        let s = GhostSignals { message_count: 50, hours_since_last_ghost: Some(0.5) };
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(0.5),
+        };
         assert!(!ghost_permitted(&a, s));
     }
 
     #[test]
     fn ghost_permitted_true_when_clear() {
         let a = aff(0.1, 0.1, 0.5, 0);
-        let s = GhostSignals { message_count: 50, hours_since_last_ghost: Some(5.0) };
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(5.0),
+        };
         assert!(ghost_permitted(&a, s));
     }
 }

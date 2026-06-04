@@ -1330,7 +1330,10 @@ reasoning    = { enabled = false }
         assert_eq!(pde.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
-        assert_eq!(pde.filter_prompt.as_deref(), Some("Decide the action and inner_state."));
+        assert_eq!(
+            pde.filter_prompt.as_deref(),
+            Some("Decide the action and inner_state.")
+        );
         assert_eq!(pde.ghosting, Some(false));
         assert!(cfg.resolve_pde().is_some());
         assert!(!cfg.pde_ghosting_enabled());

@@ -82,7 +82,7 @@ pub enum ActionType {
     Ghost,
     ReplyImage,     // reserved — degrades to ReplyText until the image executor ships
     ReplyTextImage, // reserved — degrades to ReplyText until the image executor ships
-    Proactive,      // KEPT — built by pde::decide for ProactiveTrigger/AppOpen; matched in post_process
+    Proactive, // KEPT — built by pde::decide for ProactiveTrigger/AppOpen; matched in post_process
 }
 
 impl ActionType {

@@ -175,7 +175,10 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = matches!(plan.action_type, ActionType::ReplyText | ActionType::Proactive,);
+    let should_update_lead = matches!(
+        plan.action_type,
+        ActionType::ReplyText | ActionType::Proactive,
+    );
     let fut_lead = async {
         if should_update_lead {
             refresh_lead_score(&state, session_id, user_id).await;
@@ -246,7 +249,9 @@ async fn persist_affinity(
         | ActionType::Proactive => {
             let event_type = match action {
                 ActionType::Proactive => "proactive",
-                ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => "message",
+                ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
+                    "message"
+                }
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo
