@@ -4700,4 +4700,412 @@ data: [DONE]\n\n";
             "vision describe must be merged into the user row metadata"
         );
     }
+
+    // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
+    // These two tests exercise the opt-in LLM Persona Decision Engine wired into
+    // `run_stream`: the judge runs (NON-streaming `execute()`) BEFORE the chat
+    // call. The judge call and the chat call hit the SAME `/api/v1/chat/completions`
+    // path on the one mock server, so they are routed by body content — the judge
+    // body carries its own model id (`pde/judge`) and the `build_pde_ctx` context
+    // (`[关系状态]`); the chat body carries the chat model id (`deepseek/x`). Those
+    // two `body_string_contains` predicates are mutually exclusive.
+    //
+    // The `companion_decision_events` audit row is written fire-and-forget
+    // (`tokio::spawn`) by design (best-effort telemetry), so it is intentionally
+    // NOT asserted here — doing so would be racy/flaky.
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_ghost_short_circuits(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): NON-streaming JSON completion whose content is the
+        // verdict. A `ghost` verdict, with a fresh affinity (ghost_streak=0,
+        // last_ghost_at=None) and message_count >= 10, satisfies
+        // `ghost::ghost_permitted`, so the guard keeps it a Ghost.
+        let verdict =
+            serde_json::json!({ "action": "ghost", "inner_state": "想一个人静静" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): MUST NOT be called — a ghost short-circuits the
+        // chat generation entirely. `.expect(0)` makes the test fail on any hit.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Seed >= 10 prior user rows so message_count clears the ghost floor (the
+        // hard-safety veto in `ghost::ghost_permitted` requires message_count >= 10).
+        for i in 0..12 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, 'user', $2)",
+            )
+            .bind(session_id)
+            .bind(format!("prior {i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON: a non-blank filter_prompt on [tasks.pde_decision] flips
+        // `resolve_pde()` to Some; `model = "pde/judge"` routes the judge call to
+        // the mock. Ghosting is left at default (enabled).
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "在吗",
+                "01JPDEGHOST00000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Judge → ghost: a Meta{action_type: Ghost} + a Done, and NO Delta
+        // content frame (the chat generation never ran).
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected, got {frames:?}",
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Ghost,
+                    ..
+                }
+            )),
+            "must emit a Meta with action_type=Ghost, got {frames:?}",
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Done { .. })),
+            "must emit a Done, got {frames:?}",
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "ghost short-circuit must emit NO Delta content frame, got {frames:?}",
+        );
+
+        // The chat mock's `.expect(0)` already proves the chat call never fired;
+        // belt-and-suspenders: the only request the mock saw was the judge call.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "exactly one upstream call (the judge) — chat must be skipped; got {} calls",
+            reqs.len(),
+        );
+        let judge_sent = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            judge_sent.contains("pde/judge") && judge_sent.contains("[关系状态]"),
+            "the single call must be the PDE judge (carries build_pde_ctx); got {judge_sent}",
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_reply_injects_inner_state(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `reply_text` verdict carrying an inner_state.
+        // `有点开心` is plain prose (no headers/brackets) so it survives
+        // `sanitize_inner_state` unchanged and lands in the prompt's
+        // `[inner_state]` section via `pde::plan_for` → `build_prompt`.
+        let verdict =
+            serde_json::json!({ "action": "reply_text", "inner_state": "有点开心" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): normal SSE reply. The mock matches the chat call;
+        // we capture its request body afterward to assert the injected inner_state.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "你今天怎么样",
+                "01JPDEREPLY00000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "你今天怎么样".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "a reply_text verdict must produce a normal reply; got {frames:?}",
+        );
+
+        // The chat call's system prompt must carry the injected inner_state.
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| {
+                let b = String::from_utf8_lossy(&r.body);
+                b.contains("deepseek/x")
+            })
+            .expect("the chat call must have fired");
+        let chat_sent = String::from_utf8_lossy(&chat_req.body);
+        // The body is a serialized ChatRequest; `[inner_state]` lives in the system
+        // message. JSON-escaping never alters the bare CJK run, so a substring
+        // check on the raw body is sufficient.
+        assert!(
+            chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
+            "the judge's inner_state must be injected into the chat system prompt; got {chat_sent}",
+        );
+    }
+
+    // Optional (spec §12): a junk (non-JSON) judge reply must fail OPEN — the turn
+    // falls back to the pure rule engine and still produces a normal reply.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_unparseable_falls_back(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): unparseable prose — no JSON verdict at all.
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "I think we should keep chatting, it's nice."}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): normal SSE reply — fail-open keeps the turn going.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "随便聊聊",
+                "01JPDEJUNK000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "随便聊聊".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Fail-open: a normal reply still reaches the client (no Error frame).
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "unparseable judge verdict must fail open (no error frame); got {frames:?}",
+        );
+        assert!(
+            deltas.contains("REPLY"),
+            "unparseable judge verdict must fall back to a normal reply; got {frames:?}",
+        );
+    }
 }
