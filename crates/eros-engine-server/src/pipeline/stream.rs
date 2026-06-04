@@ -1593,10 +1593,18 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
-        let resolved_pde = state.model_config.resolve_pde();
+        // Skip resolution on tip turns: the judge won't run, and resolve_pde()
+        // advances the round-robin model cursor as a side effect — resolving on a
+        // skipped turn would skew which model later (non-tip) judge calls pick.
+        let resolved_pde = if is_tip {
+            None
+        } else {
+            state.model_config.resolve_pde()
+        };
         // Shared history transcript: built once, reused by the judge here AND the
-        // input filter below (which previously fetched its own).
-        let pde_transcript: String = if !is_tip && resolved_pde.is_some() {
+        // input filter below (which previously fetched its own). `resolved_pde` is
+        // already None on tip turns, so this only fires for a real judge turn.
+        let pde_transcript: String = if resolved_pde.is_some() {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
             String::new()
