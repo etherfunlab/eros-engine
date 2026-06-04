@@ -229,14 +229,14 @@ input filter has no triggers, timing, or tiers).
 | `chat_companion` | `pipeline::handlers::ReplyHandler` (chat completions; tip turns ride the same reply path) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
-| `pde_decision` | `pipeline::orchestrator` (opt-in LLM judge; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
+| `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
-- `crates/eros-engine-server/src/pipeline/orchestrator.rs` → `pde_decision` (only when `filter_prompt` is set)
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set)
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 

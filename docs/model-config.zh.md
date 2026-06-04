@@ -57,14 +57,14 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 |---|---|---|
 | `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completions；打赏轮走同一回复路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights` (抽事实 + JSONB merge) | live |
-| `pde_decision` | `pipeline::orchestrator`（可选 LLM 判断器；`filter_prompt` 缺失或 LLM 调用失败时使用规则引擎） | live（opt-in） |
+| `pde_decision` | `pipeline::stream`（可选 LLM 判断器，通过 `run_pde_decision` 在 `run_stream` 中调用；`filter_prompt` 缺失或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `embedding` | reserved — `VoyageClient` 自己读 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite`,不走这条路径 | reserved |
 
 `[tasks.<name>]` 只有当代码里真有 `model_config.resolve("<name>", ...)` 调用时才有意义。当前调用点:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
-- `crates/eros-engine-server/src/pipeline/orchestrator.rs` → `pde_decision`（仅当 `filter_prompt` 已设置时）
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision` 调用（仅当 `filter_prompt` 已设置时）
 
 `embedding` 是 vestigial —— Voyage 完全不走这条路径。
 
