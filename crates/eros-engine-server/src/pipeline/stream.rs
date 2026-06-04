@@ -820,7 +820,6 @@ pub(crate) enum PdeAction {
 }
 
 impl PdeAction {
-    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             PdeAction::ReplyText => "reply_text",
@@ -836,13 +835,10 @@ impl PdeAction {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PdeVerdict {
     action: PdeAction,
-    #[allow(dead_code)]
     #[serde(default)]
     inner_state: String,
-    #[allow(dead_code)]
     #[serde(default)]
     image_prompt: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     reason: Option<String>,
 }
@@ -863,7 +859,6 @@ const INNER_STATE_MAX_CHARS: usize = 200;
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
-#[allow(dead_code)]
 fn sanitize_inner_state(raw: &str) -> String {
     let joined = raw
         .lines()
@@ -886,7 +881,6 @@ fn sanitize_inner_state(raw: &str) -> String {
 // ── Task 7: PDE runner + pure helpers ─────────────────────────────────────
 
 /// Terminal status of a PDE judge run — drives the audit `status` column.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PdeStatus {
     Ok,
@@ -897,7 +891,6 @@ pub(crate) enum PdeStatus {
 }
 
 impl PdeStatus {
-    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             PdeStatus::Ok => "ok",
@@ -912,7 +905,6 @@ impl PdeStatus {
 /// Outcome of a PDE judge run. `verdict` is `Some` only on `Ok`; `raw` carries
 /// the model text on `ParseError` for the audit payload; the trio is the
 /// winning call's audit echo.
-#[allow(dead_code)]
 pub(crate) struct PdeDecisionRun {
     pub(crate) status: PdeStatus,
     pub(crate) verdict: Option<PdeVerdict>,
@@ -927,7 +919,6 @@ pub(crate) struct PdeDecisionRun {
 /// content-level reply that won't parse is a definitive `ParseError` (no further
 /// walk), mirroring `run_input_filter`. Fail-open: any non-`Ok` status → the
 /// caller uses the rule fallback. NEVER returns an error — always a run record.
-#[allow(dead_code)]
 async fn run_pde_decision(
     state: &AppState,
     p: &eros_engine_llm::model_config::ResolvedPde,
@@ -1016,7 +1007,6 @@ async fn run_pde_decision(
 /// hard-safety ghost guardrail (`ghost::ghost_permitted`) and the image-degrade.
 /// Does NOT apply the `ghosting` kill-switch (that is a path-wide final gate).
 /// Pure.
-#[allow(dead_code)]
 fn guard_action(
     proposed: PdeAction,
     affinity: &eros_engine_core::affinity::Affinity,
@@ -1043,7 +1033,6 @@ fn guard_action(
 /// Path-wide `ghosting` kill-switch: if ghosting is disabled and the plan is a
 /// Ghost, rebuild it as a ReplyText plan carrying `hints` (so a forced reply
 /// keeps the judge's mood). Pure.
-#[allow(dead_code)]
 fn apply_ghosting_killswitch(
     plan: eros_engine_core::types::ActionPlan,
     ghosting_enabled: bool,
@@ -1058,7 +1047,6 @@ fn apply_ghosting_killswitch(
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
-#[allow(dead_code)]
 fn build_pde_ctx(
     transcript: &str,
     input: &eros_engine_core::types::DecisionInput,
@@ -1092,6 +1080,39 @@ fn build_pde_ctx(
             .map(|h| format!("{h:.1}"))
             .unwrap_or_else(|| "none".into()),
     )
+}
+
+/// Serializable view of a verdict for the audit `payload` column.
+#[derive(serde::Serialize)]
+struct VerdictAudit<'a> {
+    action: &'a str,
+    inner_state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_prompt: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
+    fn from(v: &'a PdeVerdict) -> Self {
+        VerdictAudit {
+            action: v.action.as_str(),
+            inner_state: &v.inner_state,
+            image_prompt: v.image_prompt.as_deref(),
+            reason: v.reason.as_deref(),
+        }
+    }
+}
+
+/// The DB audit string for an acted `ActionType` (matches `assistant_action_type` style).
+fn action_type_audit_str(a: ActionType) -> &'static str {
+    match a {
+        ActionType::ReplyText => "reply_text",
+        ActionType::Ghost => "ghost",
+        ActionType::ReplyImage => "reply_image",
+        ActionType::ReplyTextImage => "reply_text_image",
+        ActionType::Proactive => "proactive",
+    }
 }
 
 /// Fixed schema the `chat_vision` describe model must emit. `description` is
@@ -1571,7 +1592,88 @@ pub fn run_stream(
             persona,
             signals,
         };
-        let plan = pde::decide(&input);
+        // ── PDE decision (judge-first) ────────────────────────────────────────
+        // The judge runs before vision/input-filter/chat so a `ghost` verdict
+        // short-circuits all of them. Tip turns and feature-off skip the judge
+        // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
+        let is_tip = user_msg.tips_amount_usd.is_some();
+        let resolved_pde = state.model_config.resolve_pde();
+        // Shared history transcript: built once, reused by the judge here AND the
+        // input filter below (which previously fetched its own).
+        let pde_transcript: String = if !is_tip && resolved_pde.is_some() {
+            build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
+        } else {
+            String::new()
+        };
+        let mut killswitch_hints: Vec<String> = Vec::new();
+        let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
+            match (is_tip, resolved_pde.as_ref()) {
+                (false, Some(p)) => {
+                    let ctx = build_pde_ctx(&pde_transcript, &input);
+                    let run = run_pde_decision(&state, p, &ctx).await;
+                    let plan = match (&run.status, &run.verdict) {
+                        (PdeStatus::Ok, Some(v)) => {
+                            let action = guard_action(v.action, &input.affinity, &input.signals);
+                            let hints = {
+                                let s = sanitize_inner_state(&v.inner_state);
+                                if s.is_empty() { Vec::new() } else { vec![s] }
+                            };
+                            killswitch_hints = hints.clone();
+                            pde::plan_for(&input, action, hints)
+                        }
+                        _ => pde::decide(&input), // fail-open
+                    };
+                    (plan, Some(run))
+                }
+                _ => (pde::decide(&input), None), // tip OR feature off
+            };
+
+        // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
+        // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
+        plan = apply_ghosting_killswitch(
+            plan,
+            state.model_config.pde_ghosting_enabled(),
+            &input,
+            std::mem::take(&mut killswitch_hints),
+        );
+
+        // Best-effort audit — only when the judge ran; logs the FINAL acted action.
+        if let Some(run) = pde_run {
+            let pool = state.pool.clone();
+            let run_id = uuid::Uuid::new_v4(); // fresh per-run id (spec §8.2)
+            let ev_user = user_msg.user_id;
+            let ev_session = user_msg.session_id;
+            let ev_msg = user_msg.user_message_id;
+            let status = run.status.as_str();
+            let acted = plan.action_type;
+            tokio::spawn(async move {
+                let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
+                let payload: Option<serde_json::Value> = match &run.verdict {
+                    Some(v) => serde_json::to_value(VerdictAudit::from(v)).ok(),
+                    None => run.raw.clone().map(serde_json::Value::String),
+                };
+                let action_str = action_type_audit_str(acted);
+                let repo = eros_engine_store::decision::DecisionEventRepo { pool: &pool };
+                if let Err(e) = repo
+                    .record(eros_engine_store::decision::DecisionEventInsert {
+                        run_id,
+                        user_id: ev_user,
+                        session_id: Some(ev_session),
+                        message_id: Some(ev_msg),
+                        status,
+                        action: Some(action_str),
+                        proposed_action: proposed,
+                        payload,
+                        model: run.model.as_deref(),
+                        usage: run.usage.clone(),
+                        generation_id: run.generation_id.as_deref(),
+                    })
+                    .await
+                {
+                    tracing::warn!("pde: decision-event audit write failed: {e}");
+                }
+            });
+        }
 
         match plan.action_type {
             ActionType::Ghost => {
@@ -1652,12 +1754,18 @@ pub fn run_stream(
                         // Note: this issues its own small (8-row) history fetch;
                         // build_reply_request below fetches history again (20 rows).
                         // Two round-trips per reply turn — acceptable, not a hot loop.
-                        let transcript = build_input_filter_transcript(
-                            &chat_repo,
-                            user_msg.session_id,
-                            user_msg.user_message_id,
-                        )
-                        .await;
+                        // Reuse the PDE's transcript when it was built this turn;
+                        // otherwise fetch (input-filter-only turns: PDE off).
+                        let transcript = if !pde_transcript.is_empty() {
+                            pde_transcript.clone()
+                        } else {
+                            build_input_filter_transcript(
+                                &chat_repo,
+                                user_msg.session_id,
+                                user_msg.user_message_id,
+                            )
+                            .await
+                        };
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
                         {
@@ -2251,6 +2359,23 @@ mod tests {
             apply_ghosting_killswitch(ghost_plan, false, &input, vec!["想躲".into()]);
         assert_eq!(down.action_type, ActionType::ReplyText);
         assert_eq!(down.context_hints, vec!["想躲".to_string()]);
+    }
+
+    #[test]
+    fn ghost_then_killswitch_yields_reply_with_hints() {
+        let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
+        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals);
+        assert_eq!(acted, ActionType::Ghost); // permitted
+
+        let hints = vec![sanitize_inner_state("有点想躲")];
+        let plan = pde::plan_for(&input, acted, hints.clone());
+        // ghosting disabled → suppressed to reply, hints preserved
+        let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
+        assert_eq!(final_plan.action_type, ActionType::ReplyText);
+        assert_eq!(final_plan.context_hints, hints);
+        // audit would log proposed=ghost, action=reply_text:
+        assert_eq!(PdeAction::Ghost.as_str(), "ghost");
+        assert_eq!(action_type_audit_str(final_plan.action_type), "reply_text");
     }
 
     use sqlx::PgPool;
