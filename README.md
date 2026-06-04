@@ -22,7 +22,7 @@ Most AI character apps treat memory as a prompt append and relationship as a par
 - **Memory** lives in Postgres + pgvector, split into profile memory and relationship memory.
 - **Affinity** is a numeric vector updated with EMA smoothing and real-time decay.
 - **User insight** is a structured JSONB profile that downstream products can query.
-- **Persona behavior** is planned through a rules-based Persona Decision Engine (PDE), then rendered by an LLM.
+- **Persona behavior** is planned through a Persona Decision Engine (PDE) — rules-based by default, with an opt-in LLM judge layer configurable via `[tasks.pde_decision].filter_prompt` — then rendered by an LLM. Per-turn judge calls are audited to `companion_decision_events`.
 
 The result is not a generic agent framework. It is a focused engine for products where a persona talks to the same user across many sessions: AI companions, journaling companions, coaching agents, language tutors, and character chat.
 
