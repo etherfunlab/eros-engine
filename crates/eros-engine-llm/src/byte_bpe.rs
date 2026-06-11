@@ -52,7 +52,9 @@ mod tests {
 
     #[test]
     fn clean_cjk_reply_is_not_garbled() {
-        assert!(!looks_byte_garbled("嗯，今天过得怎么样？我一直在想你说的那件事。"));
+        assert!(!looks_byte_garbled(
+            "嗯，今天过得怎么样？我一直在想你说的那件事。"
+        ));
     }
 
     #[test]
@@ -101,7 +103,8 @@ mod tests {
         let repaired = repair_byte_bpe(garbled);
         assert!(!looks_byte_garbled(&repaired));
         // Repaired text parses as JSON.
-        let v: serde_json::Value = serde_json::from_str(&repaired).expect("valid JSON after repair");
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("valid JSON after repair");
         assert_eq!(v["reply"], "Hello there.");
     }
 }

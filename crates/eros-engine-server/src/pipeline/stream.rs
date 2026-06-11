@@ -5273,8 +5273,7 @@ data: [DONE]\n\n";
         .expect("persisted assistant row must exist");
 
         assert_eq!(
-            persisted,
-            "Hi there\nbye",
+            persisted, "Hi there\nbye",
             "persisted content must be repaired text (Ġ→space, Ċ→newline); got {persisted:?}",
         );
         assert!(

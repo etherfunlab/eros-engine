@@ -2620,7 +2620,10 @@ filter_prompt = "   "
             model = "x/y"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
-        assert_eq!(cfg.defaults.ignore_providers, vec!["BadHost", "AnotherHost"]);
+        assert_eq!(
+            cfg.defaults.ignore_providers,
+            vec!["BadHost", "AnotherHost"]
+        );
     }
 
     #[test]

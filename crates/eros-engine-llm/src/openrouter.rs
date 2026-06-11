@@ -505,7 +505,10 @@ impl OpenRouterClient {
                 .unwrap_or_default();
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
-                last_err = Some(LlmError::Garbled { model: model.to_string(), raw });
+                last_err = Some(LlmError::Garbled {
+                    model: model.to_string(),
+                    raw,
+                });
                 continue;
             }
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
@@ -1541,7 +1544,10 @@ data: [DONE]\n\n";
             provider: None,
         };
         let body = serde_json::to_value(&wire).unwrap();
-        assert!(body.get("provider").is_none(), "provider key must be omitted when None");
+        assert!(
+            body.get("provider").is_none(),
+            "provider key must be omitted when None"
+        );
     }
 
     #[test]
@@ -1673,7 +1679,10 @@ data: [DONE]\n\n";
         // repair_byte_bpe("HiĠthereĊbye") → "Hi there\nbye"; clean_response trims but
         // does not alter interior spaces/newlines → "Hi there\nbye".
         assert_eq!(resp.reply, "Hi there\nbye");
-        assert!(resp.generation_id.is_none(), "no generation_id when repaired");
+        assert!(
+            resp.generation_id.is_none(),
+            "no generation_id when repaired"
+        );
         assert!(resp.usage.is_none(), "no usage when repaired");
         // model carried from the last Garbled error — which is "f1" (the last candidate).
         assert_eq!(resp.model.as_deref(), Some("f1"));
