@@ -118,6 +118,14 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// OpenRouter provider routing preferences. Only `ignore` is used today;
+/// `allow_fallbacks` is omitted so OpenRouter applies its default (true),
+/// i.e. the model is still served by a healthy provider.
+#[derive(Debug, Serialize)]
+struct ProviderPrefs<'a> {
+    ignore: &'a [String],
+}
+
 #[derive(Debug, Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
@@ -134,6 +142,8 @@ struct WireRequest<'a> {
     metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<&'a ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderPrefs<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +268,9 @@ pub struct OpenRouterClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// OpenRouter provider slugs sent as `provider.ignore` on every call.
+    /// Empty by default; set at boot via [`OpenRouterClient::with_ignore_providers`].
+    ignore_providers: Vec<String>,
 }
 
 impl OpenRouterClient {
@@ -318,6 +331,27 @@ impl OpenRouterClient {
             http,
             api_key,
             base_url,
+            ignore_providers: Vec::new(),
+        }
+    }
+
+    /// Set the global provider-exclusion list (issue #84). Consuming builder so
+    /// boot can chain it: `OpenRouterClient::new(key, attr).with_ignore_providers(list)`.
+    /// Sent as `provider.ignore` on every outbound call.
+    pub fn with_ignore_providers(mut self, providers: Vec<String>) -> Self {
+        self.ignore_providers = providers;
+        self
+    }
+
+    /// Build the `ProviderPrefs` for a wire body, or `None` when the exclusion
+    /// list is empty (so the `provider` key is omitted entirely).
+    fn provider_prefs(&self) -> Option<ProviderPrefs<'_>> {
+        if self.ignore_providers.is_empty() {
+            None
+        } else {
+            Some(ProviderPrefs {
+                ignore: &self.ignore_providers,
+            })
         }
     }
 
@@ -409,7 +443,12 @@ impl OpenRouterClient {
 
         let mut last_err: Option<LlmError> = None;
         for model in &candidates {
-            let body = build_vision_body(&req, model);
+            let mut body = build_vision_body(&req, model);
+            if let Some(prefs) = self.provider_prefs() {
+                if let Ok(v) = serde_json::to_value(&prefs) {
+                    body["provider"] = v;
+                }
+            }
             let resp = match self
                 .http
                 .post(&self.base_url)
@@ -483,6 +522,7 @@ impl OpenRouterClient {
             session_id: req_session_id,
             metadata: req_metadata,
             reasoning: req_reasoning,
+            provider: self.provider_prefs(),
         };
 
         let resp = self
@@ -544,6 +584,7 @@ impl OpenRouterClient {
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: req.reasoning.as_ref(),
+            provider: self.provider_prefs(),
         };
 
         let resp = self
@@ -819,6 +860,7 @@ mod tests {
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: None,
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
@@ -859,6 +901,7 @@ mod tests {
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: None,
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(s.contains("\"user\":\"u_abc\""), "{s}");
@@ -1380,6 +1423,7 @@ data: [DONE]\n\n";
             session_id: None,
             metadata: None,
             reasoning: Some(&cfg),
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(
@@ -1398,6 +1442,7 @@ data: [DONE]\n\n";
             session_id: None,
             metadata: None,
             reasoning: None,
+            provider: None,
         };
         let s_none = serde_json::to_string(&wire_none).unwrap();
         assert!(
@@ -1444,5 +1489,54 @@ data: [DONE]\n\n";
             matches!(item, Err(LlmError::StreamParse(_))),
             "expected StreamParse error, got {item:?}"
         );
+    }
+
+    #[test]
+    fn wire_request_omits_provider_when_no_ignore_list() {
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert!(body.get("provider").is_none(), "provider key must be omitted when None");
+    }
+
+    #[test]
+    fn wire_request_emits_provider_ignore_when_set() {
+        let ignore = vec!["BadHost".to_string()];
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: Some(ProviderPrefs { ignore: &ignore }),
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert_eq!(body["provider"]["ignore"][0], "BadHost");
+    }
+
+    #[test]
+    fn with_ignore_providers_sets_prefs() {
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_ignore_providers(vec!["BadHost".into()]);
+        let prefs = c.provider_prefs().expect("prefs present");
+        assert_eq!(prefs.ignore, ["BadHost"]);
     }
 }
