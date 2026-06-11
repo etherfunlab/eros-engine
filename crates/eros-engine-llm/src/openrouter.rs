@@ -420,7 +420,26 @@ impl OpenRouterClient {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
+        match last_err {
+            // Whole chain exhausted on garble: repair the last attempt so the
+            // caller gets clean (if imperfect) text rather than a hard failure
+            // or raw glyphs. generation_id/usage are unavailable here.
+            Some(LlmError::Garbled { model, raw }) => {
+                tracing::error!(
+                    %model,
+                    "openrouter: all candidates garbled; returning repaired last attempt"
+                );
+                Ok(ChatResponse {
+                    reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
+                    generation_id: None,
+                    model: Some(model),
+                    usage: None,
+                    finish_reason: None,
+                })
+            }
+            Some(e) => Err(e),
+            None => Err(LlmError::Config("openrouter: no models configured".into())),
+        }
     }
 
     /// Execute a one-shot vision describe, walking the candidate chain
@@ -484,6 +503,11 @@ impl OpenRouterClient {
                 .as_ref()
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
+            if crate::byte_bpe::looks_byte_garbled(&raw) {
+                tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
+                last_err = Some(LlmError::Garbled { model: model.to_string(), raw });
+                continue;
+            }
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
             return Ok(ChatResponse {
                 reply: clean_response(raw.trim()),
@@ -545,6 +569,17 @@ impl OpenRouterClient {
             .as_ref()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        if crate::byte_bpe::looks_byte_garbled(&raw) {
+            tracing::error!(
+                model,
+                generation_id = ?parsed.id,
+                "openrouter: byte-BPE garbled completion; advancing candidate chain"
+            );
+            return Err(LlmError::Garbled {
+                model: model.to_string(),
+                raw,
+            });
+        }
         let finish_reason = first_choice.and_then(|c| c.finish_reason);
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
@@ -1538,5 +1573,109 @@ data: [DONE]\n\n";
         .with_ignore_providers(vec!["BadHost".into()]);
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
+    }
+
+    /// Garbled string used in garble-guard tests. `Ġ`/`Ċ` density is 2/12 ≈ 16.7 % >> 3 % threshold.
+    fn garbled_content() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{ "message": { "content": "Hi\u{0120}there\u{010A}bye" } }]
+        })
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_past_a_garbled_primary() {
+        let server = MockServer::start().await;
+        // Primary "p" returns garbled content; fallback "f1" returns clean.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "f1",
+                "choices": [{ "message": { "content": "hi there" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback past garbled primary succeeds");
+        assert_eq!(resp.reply, "hi there");
+        // The served model field comes from the fallback wire response.
+        assert_eq!(resp.model.as_deref(), Some("f1"));
+    }
+
+    #[tokio::test]
+    async fn execute_repairs_when_all_candidates_garbled() {
+        let server = MockServer::start().await;
+        // Both primary "p" and fallback "f1" return garbled content.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("all-garbled chain returns repaired Ok rather than Err");
+        // repair_byte_bpe("HiĠthereĊbye") → "Hi there\nbye"; clean_response trims but
+        // does not alter interior spaces/newlines → "Hi there\nbye".
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert!(resp.generation_id.is_none(), "no generation_id when repaired");
+        assert!(resp.usage.is_none(), "no usage when repaired");
+        // model carried from the last Garbled error — which is "f1" (the last candidate).
+        assert_eq!(resp.model.as_deref(), Some("f1"));
     }
 }
