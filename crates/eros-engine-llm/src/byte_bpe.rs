@@ -69,6 +69,16 @@ mod tests {
     }
 
     #[test]
+    fn detector_threshold_is_exactly_three_percent() {
+        // Pins the documented 3% contract. 3 markers in 100 chars = 3% → garbled;
+        // 2 markers in 100 chars = 2% → clean.
+        let at = "a".repeat(97) + "ĠĠĠ";
+        assert!(looks_byte_garbled(&at), "3% must count as garbled");
+        let below = "a".repeat(98) + "ĠĠ";
+        assert!(!looks_byte_garbled(&below), "2% must count as clean");
+    }
+
+    #[test]
     fn repair_substitutes_space_and_newline() {
         assert_eq!(repair_byte_bpe("HelloĠthere.ĊBye"), "Hello there.\nBye");
     }
