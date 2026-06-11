@@ -252,6 +252,18 @@ fn drive_chat_burst(
                     }
                 }
 
+                // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
+                // provider returned undecoded byte-level-BPE. Always repair before
+                // persist so the row never re-enters history as garble; when a
+                // fallback remains, mark truncated to advance the chain.
+                if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                    tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
+                    acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                    if idx + 1 < chain.len() {
+                        truncated = true;
+                    }
+                }
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -383,6 +395,14 @@ fn drive_chat_burst(
                     if !truncated && acc.is_empty() { truncated = true; }
                 }
                 Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+            }
+
+            if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                tracing::error!("stream(filtered): byte-BPE garbled completion (issue #84)");
+                acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                if idx + 1 < chain.len() {
+                    truncated = true;
+                }
             }
 
             if truncated {
@@ -5123,6 +5143,142 @@ data: [DONE]\n\n";
             reqs.iter()
                 .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge")),
             "the PDE judge must have been called before failing open; no request body contained 'pde/judge'",
+        );
+    }
+
+    /// Issue #84 — byte-BPE garble guard: garbled completion is repaired before
+    /// persist so the DB row never re-enters history as raw glyphs.
+    ///
+    /// Strategy: use `tips_amount_usd: Some(1.0)` so PDE's tip-path always
+    /// picks `ActionType::ReplyText` (never Ghost), making the live-burst path
+    /// deterministic without seeding affinity state. The mock returns an SSE
+    /// body whose accumulated text is `"HiĠthereĊbye"` (~16% Ġ/Ċ density,
+    /// well above the 3% threshold). After the stream completes, we query the
+    /// persisted assistant row and assert it contains the repaired form
+    /// `"Hi there\nbye"` with no residual Ġ or Ċ characters.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_completion_persists_repaired_text(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Accumulated deltas: "Hi" + "Ġthere" + "Ċbye" = "HiĠthereĊbye"
+        // Ġ = U+0120, Ċ = U+010A. 2 garble chars in 12 total → 16.7% > 3%.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"}}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        // Single-model chain (no fallback): garble guard repairs in-place without
+        // advancing the chain (since idx+1 == chain.len() the truncated flag stays
+        // unchanged, and the row is persisted as the final cleaned reply).
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                // Tip turn: forces PDE to pick ReplyText unconditionally (never
+                // Ghost), so the live-burst path is guaranteed to run.
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected after garble repair; got {frames:?}",
+        );
+
+        // The live-burst path always runs for a tip turn → a Delta frame must appear.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "expected Delta frames from the live-burst path; got {frames:?}",
+        );
+
+        // Verify the persisted row holds the *repaired* text.
+        let persisted: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("persisted assistant row must exist");
+
+        assert_eq!(
+            persisted,
+            "Hi there\nbye",
+            "persisted content must be repaired text (Ġ→space, Ċ→newline); got {persisted:?}",
+        );
+        assert!(
+            !persisted.contains('\u{0120}'),
+            "repaired text must not contain Ġ (U+0120); got {persisted:?}",
+        );
+        assert!(
+            !persisted.contains('\u{010A}'),
+            "repaired text must not contain Ċ (U+010A); got {persisted:?}",
         );
     }
 }
