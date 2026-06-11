@@ -341,6 +341,11 @@ pub struct DefaultConfig {
     pub fallback_temperature: Option<f64>,
     #[serde(default)]
     pub fallback_max_tokens: Option<u32>,
+    /// OpenRouter provider slugs to exclude from routing on EVERY task
+    /// (issue #84). Sent as `provider.ignore` on every outbound call; the
+    /// client reads this once at boot. Empty = no exclusion.
+    #[serde(default)]
+    pub ignore_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2604,5 +2609,27 @@ filter_prompt = "   "
             ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\nghosting = false\n")
                 .unwrap();
         assert!(!cfg.pde_ghosting_enabled());
+    }
+
+    #[test]
+    fn defaults_ignore_providers_parses() {
+        let toml = r#"
+            [defaults]
+            ignore_providers = ["BadHost", "AnotherHost"]
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
+        assert_eq!(cfg.defaults.ignore_providers, vec!["BadHost", "AnotherHost"]);
+    }
+
+    #[test]
+    fn defaults_ignore_providers_absent_is_empty() {
+        let toml = r#"
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
+        assert!(cfg.defaults.ignore_providers.is_empty());
     }
 }
