@@ -256,6 +256,11 @@ fn drive_chat_burst(
                 // provider returned undecoded byte-level-BPE. Always repair before
                 // persist so the row never re-enters history as garble; when a
                 // fallback remains, mark truncated to advance the chain.
+                // NOTE: in live mode the raw Delta frames were already emitted to
+                // the client and cannot be retracted — this guard's scope is the
+                // persisted row + post-process pipeline (produced.full_text), which
+                // both see only the repaired text. The fallback/replace machinery
+                // then supersedes the garbled attempt for the user.
                 if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
                     tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
                     acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
@@ -398,7 +403,7 @@ fn drive_chat_burst(
             }
 
             if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
-                tracing::error!("stream(filtered): byte-BPE garbled completion (issue #84)");
+                tracing::error!(model = %model_id, "stream(filtered): byte-BPE garbled completion (issue #84)");
                 acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
                 if idx + 1 < chain.len() {
                     truncated = true;
