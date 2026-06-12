@@ -1553,6 +1553,10 @@ async fn build_stream_failure_pseudo_ghost(
 /// substitutes the repaired completion for the DB fallback phrase, so the client
 /// (which already received the raw garbled deltas) finishes on clean text via the
 /// continues_from replacement mechanism.
+///
+/// NOTE: keep the persist/frame/metadata shape in sync with
+/// `build_stream_failure_pseudo_ghost` — the only intended divergences are the
+/// content (repaired completion vs DB phrase) and `fallback_reason`.
 #[allow(clippy::too_many_arguments)]
 async fn build_garble_repaired_replacement(
     pool: &sqlx::PgPool,
@@ -1576,7 +1580,10 @@ async fn build_garble_repaired_replacement(
     let msg_uuid: Uuid = msg_ulid.into();
 
     let mut meta_map = serde_json::Map::new();
-    meta_map.insert("fallback_reason".into(), serde_json::json!("garble_repaired"));
+    meta_map.insert(
+        "fallback_reason".into(),
+        serde_json::json!("garble_repaired"),
+    );
     meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
     meta_map.insert(
         "memory_scope".into(),
@@ -1599,6 +1606,10 @@ async fn build_garble_repaired_replacement(
         assistant_action_type: persist_action.into(),
         continues_from_message_id: continues_from_ulid.map(Uuid::from),
         truncated: false,
+        // model: None — same idempotency reason as the pseudo-ghost: replay
+        // applies display_override only to Some(...) values, so a sentinel here
+        // would surface differently on replay than on the live stream. The
+        // metadata.fallback_reason ("garble_repaired") carries the audit signal.
         model: None,
         usage: None,
         generation_id: None,
