@@ -28,11 +28,21 @@ pub fn looks_byte_garbled(s: &str) -> bool {
     if total == 0 {
         return false;
     }
-    let bad = s
-        .chars()
-        .filter(|c| *c == GLYPH_SPACE || *c == GLYPH_NEWLINE)
-        .count();
-    bad * 100 >= total * GARBLE_PCT_THRESHOLD
+    let mut markers = 0usize;
+    let mut real_ws = 0usize;
+    for c in s.chars() {
+        match c {
+            GLYPH_SPACE | GLYPH_NEWLINE => markers += 1,
+            ' ' | '\n' | '\t' | '\r' => real_ws += 1,
+            _ => {}
+        }
+    }
+    // Genuine byte-BPE garble converts EVERY whitespace byte into a marker, so a
+    // garbled string carries many Ġ/Ċ and ZERO real whitespace (verified against
+    // all observed production rows). Requiring `real_ws == 0` excludes languages
+    // where Ġ/Ċ are ordinary letters (e.g. Maltese "Ġurnata tajba"), which always
+    // keep real spaces between words — density alone would misflag them.
+    real_ws == 0 && markers * 100 >= total * GARBLE_PCT_THRESHOLD
 }
 
 /// Safe, idempotent repair: `Ġ`→space, `Ċ`→newline. No-op on clean text.
@@ -62,6 +72,15 @@ mod tests {
         // `ā` (U+0101) sits in the byte-marker range but is NOT Ġ/Ċ, so the
         // detector must leave it alone — no false positive.
         assert!(!looks_byte_garbled("你的名字读作 māo 吗？真可爱。"));
+    }
+
+    #[test]
+    fn maltese_letters_with_real_spaces_are_not_garbled() {
+        // Ġ/Ċ are ordinary letters in Maltese; real text keeps real spaces between
+        // words, so even a high marker density must NOT be flagged (the presence of
+        // real whitespace proves the detokenizer did not mangle whitespace).
+        assert!(!looks_byte_garbled("Ġurnata tajba, kif inti?"));
+        assert!(!looks_byte_garbled("Ċaqlaq il-karozza Ġiet lura."));
     }
 
     #[test]
