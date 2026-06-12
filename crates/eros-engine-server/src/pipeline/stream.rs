@@ -261,11 +261,20 @@ fn drive_chat_burst(
                 // replacement bubble below (the live deltas already sent are not
                 // retractable, so the persisted row + the replacement bubble are
                 // what end up clean).
+                //
+                // `was_garbled` (which promotes the repaired text to a clean
+                // replacement) is set ONLY when the stream OTHERWISE completed: if
+                // the response was already truncated by length / a chunk-transport
+                // error, the accumulated text is incomplete, so it stays on the safe
+                // pseudo-ghost path rather than being presented as a complete reply.
+                let truncated_before_garble = truncated;
                 if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
                     tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
                     acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
                     truncated = true;
-                    was_garbled = true;
+                    if !truncated_before_garble {
+                        was_garbled = true;
+                    }
                 }
 
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
@@ -5445,6 +5454,127 @@ data: [DONE]\n\n";
         assert!(
             non_truncated_repaired,
             "at least one non-truncated row must carry the repaired text {repaired_text:?}; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 2): a response that is BOTH garbled AND already truncated
+    /// (finish_reason="length") is INCOMPLETE — it must NOT be promoted to a clean
+    /// `truncated=false` reply via the repaired-replacement path. The repaired text
+    /// is still persisted (glyph-free), but only on the truncated attempt; it stays
+    /// on the safe pseudo-ghost path rather than being presented as complete.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_but_length_truncated_is_not_promoted(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Same garbled accumulation as the promote test, but the final frame carries
+        // finish_reason="length" → truncated is set BEFORE the garble guard runs.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"},\"finish_reason\":\"length\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble-len\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let repaired_text = "Hi there\nbye";
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .expect("persisted assistant rows must exist");
+
+        // Repair still applied (no raw glyphs persisted anywhere).
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}') && !content.contains('\u{010A}'),
+                "persisted row must not contain Ġ/Ċ; got {content:?}",
+            );
+        }
+        // The fix: the incomplete (length-truncated) garble must NOT be promoted to
+        // a non-truncated "successful" reply.
+        let promoted = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
+        assert!(
+            !promoted,
+            "length-truncated garble must NOT be promoted to a clean reply; rows: {all_rows:?}",
+        );
+        // The garbled attempt is still persisted — as TRUNCATED — with repaired text.
+        assert!(
+            all_rows
+                .iter()
+                .any(|(content, truncated)| *truncated && content == repaired_text),
+            "garbled+length-truncated attempt must persist as truncated with repaired text; rows: {all_rows:?}",
         );
     }
 }
