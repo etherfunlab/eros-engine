@@ -520,7 +520,27 @@ impl OpenRouterClient {
                 finish_reason,
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
+        match last_err {
+            // Whole chain exhausted on garble: repair the last attempt and return
+            // it so the caller (`run_vision`) can still parse a recoverable
+            // describe JSON (Ġ/Ċ-only garble round-trips to valid JSON) instead of
+            // dropping to the text-only path. Mirrors `execute`'s last-resort.
+            Some(LlmError::Garbled { model, raw }) => {
+                tracing::error!(
+                    %model,
+                    "openrouter: all vision candidates garbled; returning repaired last attempt"
+                );
+                Ok(ChatResponse {
+                    reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
+                    generation_id: None,
+                    model: Some(model),
+                    usage: None,
+                    finish_reason: None,
+                })
+            }
+            Some(e) => Err(e),
+            None => Err(LlmError::Config("openrouter: vision no models".into())),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1686,5 +1706,55 @@ data: [DONE]\n\n";
         assert!(resp.usage.is_none(), "no usage when repaired");
         // model carried from the last Garbled error — which is "f1" (the last candidate).
         assert_eq!(resp.model.as_deref(), Some("f1"));
+    }
+
+    #[tokio::test]
+    async fn execute_vision_repairs_when_all_candidates_garbled() {
+        let server = MockServer::start().await;
+        // Single vision candidate returns a GARBLED describe JSON. The last-resort
+        // guard must repair it (Ġ/Ċ → space/newline) so the recoverable JSON is
+        // returned as Ok rather than dropped to the text-only path — mirrors
+        // execute()'s last-resort for chat (issue #84, Codex P2).
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vp"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": {
+                    "content": "{\u{010A}\u{0120}\u{0120}\"description\":\u{0120}\"a\u{0120}cat\"\u{010A}}"
+                }}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vp".into(),
+                fallback_model: vec![],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+            })
+            .await
+            .expect("garbled vision is repaired into Ok, not dropped");
+        // The repaired reply must parse as valid JSON with the recovered field —
+        // proving the salvage that the pre-fix code discarded.
+        let v: serde_json::Value =
+            serde_json::from_str(&resp.reply).expect("repaired describe parses as JSON");
+        assert_eq!(v["description"], "a cat");
+        assert!(
+            resp.generation_id.is_none(),
+            "no generation_id when repaired"
+        );
+        assert_eq!(resp.model.as_deref(), Some("vp"));
     }
 }
