@@ -5408,8 +5408,7 @@ data: [DONE]\n\n";
                 f,
                 ProtocolFrame::Delta { content, .. } if content == repaired_text
             )),
-            "replacement bubble must emit a Delta carrying the repaired text {:?}; got {frames:?}",
-            repaired_text,
+            "replacement bubble must emit a Delta carrying the repaired text {repaired_text:?}; got {frames:?}",
         );
 
         // Verify ALL persisted assistant rows are glyph-free and at least one
@@ -5445,8 +5444,7 @@ data: [DONE]\n\n";
             .any(|(content, truncated)| !truncated && content == repaired_text);
         assert!(
             non_truncated_repaired,
-            "at least one non-truncated row must carry the repaired text {:?}; rows: {all_rows:?}",
-            repaired_text,
+            "at least one non-truncated row must carry the repaired text {repaired_text:?}; rows: {all_rows:?}",
         );
     }
 }
