@@ -204,6 +204,7 @@ fn drive_chat_burst(
                 let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
                 let mut last_gen_id: Option<String> = None;
                 let mut truncated = false;
+                let mut was_garbled = false;
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
@@ -253,20 +254,18 @@ fn drive_chat_burst(
                 }
 
                 // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
-                // provider returned undecoded byte-level-BPE. Always repair before
-                // persist so the row never re-enters history as garble; when a
-                // fallback remains, mark truncated to advance the chain.
-                // NOTE: in live mode the raw Delta frames were already emitted to
-                // the client and cannot be retracted — this guard's scope is the
-                // persisted row + post-process pipeline (produced.full_text), which
-                // both see only the repaired text. The fallback/replace machinery
-                // then supersedes the garbled attempt for the user.
+                // provider returned undecoded byte-level-BPE. Repair before persist
+                // so the row never re-enters history as garble, and mark the bubble
+                // truncated so the client replaces it: a non-last candidate advances
+                // to the next model; the last candidate emits a repaired-text
+                // replacement bubble below (the live deltas already sent are not
+                // retractable, so the persisted row + the replacement bubble are
+                // what end up clean).
                 if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
                     tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
                     acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
-                    if idx + 1 < chain.len() {
-                        truncated = true;
-                    }
+                    truncated = true;
+                    was_garbled = true;
                 }
 
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
@@ -315,6 +314,33 @@ fn drive_chat_burst(
                     // matching its 0-based semantics elsewhere (0 = primary served).
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
                     outcome.lock().unwrap().retries_chat = fallback_retries;
+                    if was_garbled {
+                        // Whole chain ended on garble: replace the garbled bubble the
+                        // client already saw with the repaired text (issue #84, P1).
+                        let (frames, produced) = build_garble_repaired_replacement(
+                            &state.pool,
+                            session_id,
+                            user_message_id,
+                            frame_action,
+                            persist_action,
+                            plan_action,
+                            &trait_tags,
+                            &tier,
+                            memory_scope,
+                            affinity_scope,
+                            fallback_retries,
+                            Some(msg_ulid),
+                            acc.clone(),
+                        )
+                        .await;
+                        {
+                            let mut o = outcome.lock().unwrap();
+                            o.produced.clear();
+                            o.produced.push(produced);
+                        }
+                        for f in frames { yield f; }
+                        return;
+                    }
                     match build_stream_failure_pseudo_ghost(
                         &state.pool,
                         session_id,
@@ -1520,6 +1546,96 @@ async fn build_stream_failure_pseudo_ghost(
         action: plan_action,
     };
     Some((frames, produced))
+}
+
+/// Emit a replacement bubble carrying the REPAIRED text after the chain ended on
+/// byte-BPE garble (issue #84). Mirrors `build_stream_failure_pseudo_ghost` but
+/// substitutes the repaired completion for the DB fallback phrase, so the client
+/// (which already received the raw garbled deltas) finishes on clean text via the
+/// continues_from replacement mechanism.
+#[allow(clippy::too_many_arguments)]
+async fn build_garble_repaired_replacement(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &str,
+    plan_action: ActionType,
+    trait_tags: &[String],
+    tier: &Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    fallback_retries: u32,
+    continues_from_ulid: Option<Ulid>,
+    repaired: String,
+) -> (
+    Vec<ProtocolFrame>,
+    crate::pipeline::post_process::ProducedMessage,
+) {
+    let msg_ulid = Ulid::new();
+    let msg_uuid: Uuid = msg_ulid.into();
+
+    let mut meta_map = serde_json::Map::new();
+    meta_map.insert("fallback_reason".into(), serde_json::json!("garble_repaired"));
+    meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert(
+        "memory_scope".into(),
+        serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+    );
+    meta_map.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+    );
+    meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
+    if let Some(t) = tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let metadata = Some(serde_json::Value::Object(meta_map));
+
+    let chat_repo = ChatRepo { pool };
+    let row = eros_engine_store::chat::AssistantInsert {
+        id: msg_uuid,
+        content: repaired.clone(),
+        assistant_action_type: persist_action.into(),
+        continues_from_message_id: continues_from_ulid.map(Uuid::from),
+        truncated: false,
+        model: None,
+        usage: None,
+        generation_id: None,
+        filter_audit: None,
+        metadata,
+    };
+    if let Err(e) = chat_repo
+        .insert_assistant_batch(session_id, user_message_id, &[row])
+        .await
+    {
+        tracing::warn!("stream: garble-repaired replacement persist failed: {e}");
+    }
+
+    let frames = vec![
+        ProtocolFrame::Meta {
+            message_id: ulid_string(msg_ulid),
+            action_type: frame_action,
+            model: None,
+            continues_from: continues_from_ulid.map(ulid_string),
+        },
+        ProtocolFrame::Delta {
+            message_id: ulid_string(msg_ulid),
+            content: repaired.clone(),
+        },
+        ProtocolFrame::Done {
+            message_id: ulid_string(msg_ulid),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+    ];
+    let produced = crate::pipeline::post_process::ProducedMessage {
+        message_id: msg_uuid,
+        full_text: repaired,
+        action: plan_action,
+    };
+    (frames, produced)
 }
 
 /// All persisted bits needed to drive a streaming burst.
@@ -5158,9 +5274,18 @@ data: [DONE]\n\n";
     /// picks `ActionType::ReplyText` (never Ghost), making the live-burst path
     /// deterministic without seeding affinity state. The mock returns an SSE
     /// body whose accumulated text is `"HiĠthereĊbye"` (~16% Ġ/Ċ density,
-    /// well above the 3% threshold). After the stream completes, we query the
-    /// persisted assistant row and assert it contains the repaired form
-    /// `"Hi there\nbye"` with no residual Ġ or Ċ characters.
+    /// well above the 3% threshold).
+    ///
+    /// P1 fix (Codex review): when the last/only candidate is garbled, the
+    /// garbled attempt is persisted as truncated and a replacement bubble
+    /// carrying the repaired text is emitted via `continues_from`. This means
+    /// a single-model garble now produces TWO persisted rows and a replacement
+    /// Meta/Delta/Done triple in the frame stream. The test asserts:
+    /// - No Error frame is emitted.
+    /// - A Delta frame carrying the exact repaired text `"Hi there\nbye"` appears
+    ///   (the replacement bubble — distinct from the raw garbled deltas).
+    /// - ALL persisted assistant rows for the session are glyph-free.
+    /// - At least one non-truncated row carries the repaired text.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn live_stream_garbled_completion_persists_repaired_text(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -5189,9 +5314,11 @@ data: [DONE]\n\n";
             .await;
 
         let user_id = Uuid::new_v4();
-        // Single-model chain (no fallback): garble guard repairs in-place without
-        // advancing the chain (since idx+1 == chain.len() the truncated flag stays
-        // unchanged, and the row is persisted as the final cleaned reply).
+        // Single-model chain (no fallback): garble guard always sets truncated=true
+        // and was_garbled=true. Because idx+1 == chain.len(), the last-candidate
+        // garble path fires: the garbled attempt is persisted as truncated, then a
+        // replacement bubble (continues_from → garbled attempt) carrying repaired
+        // text is persisted and emitted as Meta/Delta/Done frames.
         let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
@@ -5261,28 +5388,54 @@ data: [DONE]\n\n";
             "expected Delta frames from the live-burst path; got {frames:?}",
         );
 
-        // Verify the persisted row holds the *repaired* text.
-        let persisted: String = sqlx::query_scalar(
-            "SELECT content FROM engine.chat_messages \
+        // P1 fix: the replacement bubble must carry a Delta with the exact repaired
+        // text. The garbled deltas ("Hi", "Ġthere", "Ċbye") were emitted first;
+        // then the replacement bubble emits a single Delta with the full repaired string.
+        let repaired_text = "Hi there\nbye";
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Delta { content, .. } if content == repaired_text
+            )),
+            "replacement bubble must emit a Delta carrying the repaired text {:?}; got {frames:?}",
+            repaired_text,
+        );
+
+        // Verify ALL persisted assistant rows are glyph-free and at least one
+        // non-truncated row carries the repaired text (the replacement bubble).
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
-             ORDER BY sent_at DESC LIMIT 1",
+             ORDER BY sent_at ASC",
         )
         .bind(session_id)
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
-        .expect("persisted assistant row must exist");
+        .expect("persisted assistant rows must exist");
 
-        assert_eq!(
-            persisted, "Hi there\nbye",
-            "persisted content must be repaired text (Ġ→space, Ċ→newline); got {persisted:?}",
-        );
         assert!(
-            !persisted.contains('\u{0120}'),
-            "repaired text must not contain Ġ (U+0120); got {persisted:?}",
+            !all_rows.is_empty(),
+            "at least one assistant row must be persisted; got none",
         );
+
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}'),
+                "persisted row must not contain Ġ (U+0120); got {content:?}",
+            );
+            assert!(
+                !content.contains('\u{010A}'),
+                "persisted row must not contain Ċ (U+010A); got {content:?}",
+            );
+        }
+
+        let non_truncated_repaired = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
         assert!(
-            !persisted.contains('\u{010A}'),
-            "repaired text must not contain Ċ (U+010A); got {persisted:?}",
+            non_truncated_repaired,
+            "at least one non-truncated row must carry the repaired text {:?}; rows: {all_rows:?}",
+            repaired_text,
         );
     }
 }
