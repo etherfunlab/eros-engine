@@ -38,10 +38,16 @@ pub enum LlmError {
     Stream(String),
 
     /// A completion came back as byte-level-BPE garble (issue #84). Carries the
-    /// model id and the raw text so the candidate-walk can repair it as a last
-    /// resort once the whole chain is exhausted.
+    /// model id, the raw text (so the candidate-walk can repair it as a last
+    /// resort once the whole chain is exhausted), and the upstream
+    /// `finish_reason` so a safety signal (e.g. `"content_filter"`) survives the
+    /// salvage and is not stripped before downstream validity gates see it.
     #[error("openrouter: model {model} returned byte-BPE garbled output")]
-    Garbled { model: String, raw: String },
+    Garbled {
+        model: String,
+        raw: String,
+        finish_reason: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -62,6 +68,7 @@ mod tests {
         let e = LlmError::Garbled {
             model: "thedrummer/cydonia-24b-v4.1".into(),
             raw: "HelloĠthere".into(),
+            finish_reason: None,
         };
         assert_eq!(
             e.to_string(),

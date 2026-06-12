@@ -376,8 +376,9 @@ impl OpenRouterClient {
         let mut last_err: Option<LlmError> = None;
         // Latest recoverable byte-BPE garble seen while walking the chain, kept
         // separately from `last_err` so a LATER non-garble failure (transport /
-        // status / decode) can't discard a repairable earlier garble.
-        let mut last_garbled: Option<(String, String)> = None;
+        // status / decode) can't discard a repairable earlier garble. Tuple:
+        // (model, raw, finish_reason).
+        let mut last_garbled: Option<(String, String, Option<String>)> = None;
         for (i, model) in candidates.iter().enumerate() {
             match self
                 .call_once(
@@ -394,8 +395,13 @@ impl OpenRouterClient {
             {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if let LlmError::Garbled { model, raw } = &e {
-                        last_garbled = Some((model.clone(), raw.clone()));
+                    if let LlmError::Garbled {
+                        model,
+                        raw,
+                        finish_reason,
+                    } = &e
+                    {
+                        last_garbled = Some((model.clone(), raw.clone(), finish_reason.clone()));
                     }
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
@@ -431,7 +437,7 @@ impl OpenRouterClient {
         // recoverable garble, repair it and return clean (if imperfect) text
         // rather than surfacing a hard failure or raw glyphs — even when a later
         // candidate failed differently. generation_id/usage are unavailable here.
-        if let Some((model, raw)) = last_garbled {
+        if let Some((model, raw, finish_reason)) = last_garbled {
             tracing::error!(
                 %model,
                 "openrouter: all candidates failed; returning repaired last garbled attempt"
@@ -441,7 +447,9 @@ impl OpenRouterClient {
                 generation_id: None,
                 model: Some(model),
                 usage: None,
-                finish_reason: None,
+                // Preserve the upstream finish_reason (e.g. "content_filter") so
+                // downstream validity gates still see the safety signal.
+                finish_reason,
             });
         }
         Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
@@ -467,8 +475,9 @@ impl OpenRouterClient {
 
         let mut last_err: Option<LlmError> = None;
         // Latest recoverable garble, kept separate so a later non-garble failure
-        // can't discard a repairable earlier garble (mirrors `execute`).
-        let mut last_garbled: Option<(String, String)> = None;
+        // can't discard a repairable earlier garble (mirrors `execute`). Tuple:
+        // (model, raw, finish_reason).
+        let mut last_garbled: Option<(String, String, Option<String>)> = None;
         for model in &candidates {
             let mut body = build_vision_body(&req, model);
             if let Some(prefs) = self.provider_prefs() {
@@ -511,12 +520,12 @@ impl OpenRouterClient {
                 .as_ref()
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
+            let finish_reason = first_choice.and_then(|c| c.finish_reason);
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
-                last_garbled = Some((model.to_string(), raw));
+                last_garbled = Some((model.to_string(), raw, finish_reason));
                 continue;
             }
-            let finish_reason = first_choice.and_then(|c| c.finish_reason);
             return Ok(ChatResponse {
                 reply: clean_response(raw.trim()),
                 generation_id: parsed.id,
@@ -529,7 +538,7 @@ impl OpenRouterClient {
         // garble, repair it so `run_vision` can still parse a describe JSON
         // (Ġ/Ċ-only garble round-trips to valid JSON) instead of dropping to the
         // text-only path — even when a later candidate failed differently.
-        if let Some((model, raw)) = last_garbled {
+        if let Some((model, raw, finish_reason)) = last_garbled {
             tracing::error!(
                 %model,
                 "openrouter: all vision candidates failed; returning repaired last garbled attempt"
@@ -539,7 +548,9 @@ impl OpenRouterClient {
                 generation_id: None,
                 model: Some(model),
                 usage: None,
-                finish_reason: None,
+                // Preserve the upstream finish_reason (e.g. "content_filter") so
+                // run_vision's validity gate still sees the safety signal.
+                finish_reason,
             });
         }
         Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
@@ -594,6 +605,7 @@ impl OpenRouterClient {
             .as_ref()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        let finish_reason = first_choice.and_then(|c| c.finish_reason);
         if crate::byte_bpe::looks_byte_garbled(&raw) {
             tracing::error!(
                 model,
@@ -603,9 +615,9 @@ impl OpenRouterClient {
             return Err(LlmError::Garbled {
                 model: model.to_string(),
                 raw,
+                finish_reason,
             });
         }
-        let finish_reason = first_choice.and_then(|c| c.finish_reason);
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
             generation_id: parsed.id,
@@ -1755,6 +1767,50 @@ data: [DONE]\n\n";
         assert_eq!(resp.reply, "Hi there\nbye");
         // The repaired text comes from the FIRST (garbled) candidate "p".
         assert_eq!(resp.model.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn execute_preserves_finish_reason_when_salvaging_garble() {
+        let server = MockServer::start().await;
+        // A garbled completion whose upstream finish_reason is "content_filter".
+        // The salvage must carry that safety signal through (issue #84, Codex P1
+        // round 4) so downstream validity gates can still reject filtered content.
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "content": "Hi\u{0120}there\u{010A}bye" },
+                    "finish_reason": "content_filter"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec![],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("garbled response is salvaged");
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert_eq!(
+            resp.finish_reason.as_deref(),
+            Some("content_filter"),
+            "the upstream safety finish_reason must survive the garble salvage"
+        );
     }
 
     #[tokio::test]
