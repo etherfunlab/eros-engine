@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Binary crate — distributed as the GHCR image, NOT a crates.io library.
+# `cargo publish` (workspace or `-p eros-engine-server`) refuses it outright.
+publish = false
 
 [[bin]]
 name = "eros-engine"
