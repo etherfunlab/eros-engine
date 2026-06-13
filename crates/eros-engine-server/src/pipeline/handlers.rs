@@ -602,6 +602,8 @@ pub(super) async fn build_reply_request(
         &kept_traits,
         affinity_scope,
         &recent_turns,
+        &[], // avoid_patterns — wired in a later task
+        &[], // emotional_context — wired in a later task
     );
 
     if let Event::UserMessage {
