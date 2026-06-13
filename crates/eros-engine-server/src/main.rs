@@ -212,11 +212,6 @@ async fn run_server() -> Result<()> {
             .ok()
             .filter(|s| !s.is_empty()),
     };
-    let openrouter = Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
-        openrouter_key,
-        attribution,
-    ));
-
     let voyage_key = std::env::var("VOYAGE_API_KEY").context("VOYAGE_API_KEY is required")?;
     if voyage_key.trim().is_empty() {
         // Loud-fail vs gateway's silent-skip. The gateway has a known
@@ -283,6 +278,13 @@ async fn run_server() -> Result<()> {
     if let Err(msg) = model_config.validate_extraction_prompts() {
         anyhow::bail!(msg);
     }
+
+    // OpenRouter client is constructed after model_config so we can wire in
+    // the global provider exclusion list from [defaults].ignore_providers.
+    let openrouter = Arc::new(
+        eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key, attribution)
+            .with_ignore_providers(model_config.defaults.ignore_providers.clone()),
+    );
 
     let state = AppState {
         pool,

@@ -197,6 +197,11 @@ fn drive_chat_burst(
         if !filtered_mode {
             // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
             let mut continues_from: Option<Ulid> = None;
+            // Repaired text of the latest COMPLETE garbled attempt seen across the
+            // whole chain. Used as the last-resort replacement when the chain
+            // exhausts, so a complete garble isn't discarded just because a LATER
+            // fallback failed differently (mirrors OpenRouterClient::execute).
+            let mut last_complete_garble: Option<String> = None;
             for (idx, model_id) in chain.iter().enumerate() {
                 let msg_ulid = Ulid::new();
                 let msg_uuid: Uuid = msg_ulid.into();
@@ -252,6 +257,31 @@ fn drive_chat_burst(
                     }
                 }
 
+                // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
+                // provider returned undecoded byte-level-BPE. Repair before persist
+                // so the row never re-enters history as garble, and mark the bubble
+                // truncated so the client replaces it: a non-last candidate advances
+                // to the next model; the last candidate emits a repaired-text
+                // replacement bubble below (the live deltas already sent are not
+                // retractable, so the persisted row + the replacement bubble are
+                // what end up clean).
+                //
+                // A garble is retained for last-resort replacement ONLY when the
+                // stream OTHERWISE completed: if it was already truncated by length
+                // / a chunk-transport error, the text is incomplete, so it stays on
+                // the safe pseudo-ghost path rather than being presented as complete.
+                // `last_complete_garble` persists across iterations so a complete
+                // garble survives a later differently-failing fallback.
+                let truncated_before_garble = truncated;
+                if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                    tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
+                    acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                    truncated = true;
+                    if !truncated_before_garble {
+                        last_complete_garble = Some(acc.clone());
+                    }
+                }
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -290,7 +320,14 @@ fn drive_chat_burst(
                 };
 
                 if !truncated {
-                    outcome.lock().unwrap().retries_chat = idx as u32;
+                    let mut o = outcome.lock().unwrap();
+                    // Only the accepted reply feeds post-process (memory / insight /
+                    // affinity). Drop any superseded earlier attempts (truncated, or
+                    // garbled-then-repaired) that were pushed while walking the chain
+                    // — otherwise rejected provider output would corrupt derived user
+                    // state alongside the reply the user actually saw.
+                    o.produced.retain(|m| m.message_id == msg_uuid);
+                    o.retries_chat = idx as u32;
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -298,6 +335,35 @@ fn drive_chat_burst(
                     // matching its 0-based semantics elsewhere (0 = primary served).
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
                     outcome.lock().unwrap().retries_chat = fallback_retries;
+                    if let Some(repaired) = last_complete_garble.take() {
+                        // Chain ended with a complete garble somewhere in it: replace
+                        // the last (failed) bubble the client saw with that repaired
+                        // text (issue #84, P1) — even if the FINAL attempt failed
+                        // differently (e.g. transport), so the salvage isn't lost.
+                        let (frames, produced) = build_garble_repaired_replacement(
+                            &state.pool,
+                            session_id,
+                            user_message_id,
+                            frame_action,
+                            persist_action,
+                            plan_action,
+                            &trait_tags,
+                            &tier,
+                            memory_scope,
+                            affinity_scope,
+                            fallback_retries,
+                            Some(msg_ulid),
+                            repaired,
+                        )
+                        .await;
+                        {
+                            let mut o = outcome.lock().unwrap();
+                            o.produced.clear();
+                            o.produced.push(produced);
+                        }
+                        for f in frames { yield f; }
+                        return;
+                    }
                     match build_stream_failure_pseudo_ghost(
                         &state.pool,
                         session_id,
@@ -383,6 +449,17 @@ fn drive_chat_burst(
                     if !truncated && acc.is_empty() { truncated = true; }
                 }
                 Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+            }
+
+            if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                tracing::error!(model = %model_id, "stream(filtered): byte-BPE garbled completion (issue #84)");
+                acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                // Nothing has been streamed to the client yet, so a COMPLETE garble
+                // is salvaged immediately: the repaired (clean) text flows through
+                // the output filter + persist below. We deliberately do NOT force a
+                // fallback — doing so would discard a recoverable complete garble if
+                // the later attempt failed. An INCOMPLETE garble is already
+                // `truncated` (length / transport) and handled by the block below.
             }
 
             if truncated {
@@ -1495,6 +1572,107 @@ async fn build_stream_failure_pseudo_ghost(
         action: plan_action,
     };
     Some((frames, produced))
+}
+
+/// Emit a replacement bubble carrying the REPAIRED text after the chain ended on
+/// byte-BPE garble (issue #84). Mirrors `build_stream_failure_pseudo_ghost` but
+/// substitutes the repaired completion for the DB fallback phrase, so the client
+/// (which already received the raw garbled deltas) finishes on clean text via the
+/// continues_from replacement mechanism.
+///
+/// NOTE: keep the persist/frame/metadata shape in sync with
+/// `build_stream_failure_pseudo_ghost` — the only intended divergences are the
+/// content (repaired completion vs DB phrase) and `fallback_reason`.
+#[allow(clippy::too_many_arguments)]
+async fn build_garble_repaired_replacement(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &str,
+    plan_action: ActionType,
+    trait_tags: &[String],
+    tier: &Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    fallback_retries: u32,
+    continues_from_ulid: Option<Ulid>,
+    repaired: String,
+) -> (
+    Vec<ProtocolFrame>,
+    crate::pipeline::post_process::ProducedMessage,
+) {
+    let msg_ulid = Ulid::new();
+    let msg_uuid: Uuid = msg_ulid.into();
+
+    let mut meta_map = serde_json::Map::new();
+    meta_map.insert(
+        "fallback_reason".into(),
+        serde_json::json!("garble_repaired"),
+    );
+    meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert(
+        "memory_scope".into(),
+        serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+    );
+    meta_map.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+    );
+    meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
+    if let Some(t) = tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let metadata = Some(serde_json::Value::Object(meta_map));
+
+    let chat_repo = ChatRepo { pool };
+    let row = eros_engine_store::chat::AssistantInsert {
+        id: msg_uuid,
+        content: repaired.clone(),
+        assistant_action_type: persist_action.into(),
+        continues_from_message_id: continues_from_ulid.map(Uuid::from),
+        truncated: false,
+        // model: None — same idempotency reason as the pseudo-ghost: replay
+        // applies display_override only to Some(...) values, so a sentinel here
+        // would surface differently on replay than on the live stream. The
+        // metadata.fallback_reason ("garble_repaired") carries the audit signal.
+        model: None,
+        usage: None,
+        generation_id: None,
+        filter_audit: None,
+        metadata,
+    };
+    if let Err(e) = chat_repo
+        .insert_assistant_batch(session_id, user_message_id, &[row])
+        .await
+    {
+        tracing::warn!("stream: garble-repaired replacement persist failed: {e}");
+    }
+
+    let frames = vec![
+        ProtocolFrame::Meta {
+            message_id: ulid_string(msg_ulid),
+            action_type: frame_action,
+            model: None,
+            continues_from: continues_from_ulid.map(ulid_string),
+        },
+        ProtocolFrame::Delta {
+            message_id: ulid_string(msg_ulid),
+            content: repaired.clone(),
+        },
+        ProtocolFrame::Done {
+            message_id: ulid_string(msg_ulid),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+    ];
+    let produced = crate::pipeline::post_process::ProducedMessage {
+        message_id: msg_uuid,
+        full_text: repaired,
+        action: plan_action,
+    };
+    (frames, produced)
 }
 
 /// All persisted bits needed to drive a streaming burst.
@@ -5123,6 +5301,519 @@ data: [DONE]\n\n";
             reqs.iter()
                 .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge")),
             "the PDE judge must have been called before failing open; no request body contained 'pde/judge'",
+        );
+    }
+
+    /// Issue #84 — byte-BPE garble guard: garbled completion is repaired before
+    /// persist so the DB row never re-enters history as raw glyphs.
+    ///
+    /// Strategy: use `tips_amount_usd: Some(1.0)` so PDE's tip-path always
+    /// picks `ActionType::ReplyText` (never Ghost), making the live-burst path
+    /// deterministic without seeding affinity state. The mock returns an SSE
+    /// body whose accumulated text is `"HiĠthereĊbye"` (~16% Ġ/Ċ density,
+    /// well above the 3% threshold).
+    ///
+    /// P1 fix (Codex review): when the last/only candidate is garbled, the
+    /// garbled attempt is persisted as truncated and a replacement bubble
+    /// carrying the repaired text is emitted via `continues_from`. This means
+    /// a single-model garble now produces TWO persisted rows and a replacement
+    /// Meta/Delta/Done triple in the frame stream. The test asserts:
+    /// - No Error frame is emitted.
+    /// - A Delta frame carrying the exact repaired text `"Hi there\nbye"` appears
+    ///   (the replacement bubble — distinct from the raw garbled deltas).
+    /// - ALL persisted assistant rows for the session are glyph-free.
+    /// - At least one non-truncated row carries the repaired text.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_completion_persists_repaired_text(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Accumulated deltas: "Hi" + "Ġthere" + "Ċbye" = "HiĠthereĊbye"
+        // Ġ = U+0120, Ċ = U+010A. 2 garble chars in 12 total → 16.7% > 3%.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"}}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        // Single-model chain (no fallback): the complete garble sets truncated=true
+        // and records last_complete_garble. Because idx+1 == chain.len(), the
+        // last-resort path fires: the garbled attempt is persisted as truncated, then
+        // a replacement bubble (continues_from → garbled attempt) carrying repaired
+        // text is persisted and emitted as Meta/Delta/Done frames.
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                // Tip turn: forces PDE to pick ReplyText unconditionally (never
+                // Ghost), so the live-burst path is guaranteed to run.
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected after garble repair; got {frames:?}",
+        );
+
+        // The live-burst path always runs for a tip turn → a Delta frame must appear.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "expected Delta frames from the live-burst path; got {frames:?}",
+        );
+
+        // P1 fix: the replacement bubble must carry a Delta with the exact repaired
+        // text. The garbled deltas ("Hi", "Ġthere", "Ċbye") were emitted first;
+        // then the replacement bubble emits a single Delta with the full repaired string.
+        let repaired_text = "Hi there\nbye";
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Delta { content, .. } if content == repaired_text
+            )),
+            "replacement bubble must emit a Delta carrying the repaired text {repaired_text:?}; got {frames:?}",
+        );
+
+        // Verify ALL persisted assistant rows are glyph-free and at least one
+        // non-truncated row carries the repaired text (the replacement bubble).
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .expect("persisted assistant rows must exist");
+
+        assert!(
+            !all_rows.is_empty(),
+            "at least one assistant row must be persisted; got none",
+        );
+
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}'),
+                "persisted row must not contain Ġ (U+0120); got {content:?}",
+            );
+            assert!(
+                !content.contains('\u{010A}'),
+                "persisted row must not contain Ċ (U+010A); got {content:?}",
+            );
+        }
+
+        let non_truncated_repaired = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
+        assert!(
+            non_truncated_repaired,
+            "at least one non-truncated row must carry the repaired text {repaired_text:?}; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 2): a response that is BOTH garbled AND already truncated
+    /// (finish_reason="length") is INCOMPLETE — it must NOT be promoted to a clean
+    /// `truncated=false` reply via the repaired-replacement path. The repaired text
+    /// is still persisted (glyph-free), but only on the truncated attempt; it stays
+    /// on the safe pseudo-ghost path rather than being presented as complete.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_but_length_truncated_is_not_promoted(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Same garbled accumulation as the promote test, but the final frame carries
+        // finish_reason="length" → truncated is set BEFORE the garble guard runs.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"},\"finish_reason\":\"length\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble-len\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let repaired_text = "Hi there\nbye";
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .expect("persisted assistant rows must exist");
+
+        // Repair still applied (no raw glyphs persisted anywhere).
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}') && !content.contains('\u{010A}'),
+                "persisted row must not contain Ġ/Ċ; got {content:?}",
+            );
+        }
+        // The fix: the incomplete (length-truncated) garble must NOT be promoted to
+        // a non-truncated "successful" reply.
+        let promoted = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
+        assert!(
+            !promoted,
+            "length-truncated garble must NOT be promoted to a clean reply; rows: {all_rows:?}",
+        );
+        // The garbled attempt is still persisted — as TRUNCATED — with repaired text.
+        assert!(
+            all_rows
+                .iter()
+                .any(|(content, truncated)| *truncated && content == repaired_text),
+            "garbled+length-truncated attempt must persist as truncated with repaired text; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 5): a garbled non-final attempt superseded by a successful
+    /// fallback must NOT remain in `produced` (which feeds memory/insight/affinity
+    /// post-processing). Drives the burst directly to inspect the produced set.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn garbled_then_successful_fallback_excludes_garble_from_produced(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "g/x" streams garbled; fallback "f/x" streams clean.
+        let garbled = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\u{0120}there\u{010A}bye\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"g/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "g/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(garbled, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLEPRODUCED00000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "g/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let _frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback should remain in produced; got {produced:?}",
+        );
+        assert_eq!(
+            produced[0].full_text, "hi there",
+            "produced must carry the clean fallback, not the superseded garbled attempt",
+        );
+    }
+
+    /// Codex P2 (round 6): a COMPLETE garbled primary followed by a failing fallback
+    /// must still be salvaged — the repaired primary text is retained across the
+    /// chain and emitted as the replacement, not discarded for a pseudo-ghost.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn complete_garble_survives_later_fallback_failure(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "g/x" streams a COMPLETE garble; fallback "f/x" fails (HTTP 500).
+        let garbled = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\u{0120}there\u{010A}bye\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"g/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "g/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(garbled, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLESURVIVE000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "g/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        // No Error frame: the salvage fired instead of a (phrase-less) pseudo-ghost.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "complete garble must be salvaged, not fail to an Error frame; got {frames:?}",
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "exactly the salvaged replacement should be produced; got {produced:?}",
+        );
+        assert_eq!(
+            produced[0].full_text, "Hi there\nbye",
+            "the retained primary garble must be repaired and salvaged despite the failed fallback",
         );
     }
 }

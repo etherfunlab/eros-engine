@@ -5,6 +5,27 @@
 # Weighted-table keys must be quoted (model ids contain "/" and ".").
 # If the selected primary also appears in `fallback`, it is auto-skipped.
 
+# ── Global defaults (optional) ───────────────────────────────────────────────
+# Cross-task settings. `ignore_providers` excludes OpenRouter provider slugs
+# from routing on EVERY task (issue #84: one provider returned undecoded
+# byte-level-BPE text for thedrummer/cydonia-24b-v4.1). Sent as provider.ignore
+# on every call; allow_fallbacks stays true so the model is still served by a
+# healthy provider. Find the offending slug via OpenRouter's generation API.
+# Empty/unset = no exclusion.
+#[defaults]
+#ignore_providers = ["some-bad-provider-slug"]
+#
+# One-off repair of rows already persisted with byte-BPE garble (run manually,
+# NOT a migration — the engine refuses to own downstream prod data). Repairs the
+# two unambiguous whitespace glyphs only (Ġ→space, Ċ→newline), idempotent,
+# touches only rows that still contain a glyph:
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET content = replace(replace(content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE content ~ '[ĠĊ]';"
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET pre_filter_content = replace(replace(pre_filter_content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE pre_filter_content ~ '[ĠĊ]';"
+
 [tasks.chat_companion]
 # Example chat primary. deepseek-v4-flash is a cheap, fast, permissive
 # default — swap in whatever suits your product. The first fallback (Cydonia)
