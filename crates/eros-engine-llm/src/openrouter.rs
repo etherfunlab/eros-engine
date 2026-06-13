@@ -401,7 +401,13 @@ impl OpenRouterClient {
                         finish_reason,
                     } = &e
                     {
-                        last_garbled = Some((model.clone(), raw.clone(), finish_reason.clone()));
+                        // Retain only a COMPLETE garble for last-resort salvage. A
+                        // length-truncated garble is incomplete; repairing it would
+                        // hand partial content to a structured caller as if complete.
+                        if finish_reason.as_deref() != Some("length") {
+                            last_garbled =
+                                Some((model.clone(), raw.clone(), finish_reason.clone()));
+                        }
                     }
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
@@ -523,7 +529,18 @@ impl OpenRouterClient {
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
-                last_garbled = Some((model.to_string(), raw, finish_reason));
+                // Retain only a COMPLETE garble for last-resort salvage; a
+                // length-truncated garble is incomplete, so route it to last_err
+                // (the caller fails open) rather than salvaging partial JSON.
+                if finish_reason.as_deref() == Some("length") {
+                    last_err = Some(LlmError::Garbled {
+                        model: model.to_string(),
+                        raw,
+                        finish_reason,
+                    });
+                } else {
+                    last_garbled = Some((model.to_string(), raw, finish_reason));
+                }
                 continue;
             }
             return Ok(ChatResponse {
@@ -1810,6 +1827,48 @@ data: [DONE]\n\n";
             resp.finish_reason.as_deref(),
             Some("content_filter"),
             "the upstream safety finish_reason must survive the garble salvage"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_salvage_length_truncated_garble() {
+        let server = MockServer::start().await;
+        // A garbled completion that is ALSO length-truncated (incomplete). It must
+        // NOT be salvaged — repairing partial content and returning it as a success
+        // would mislead structured callers (issue #84, Codex round-6 P2).
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "content": "Hi\u{0120}there\u{010A}bye" },
+                    "finish_reason": "length"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec![],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("length-truncated garble must NOT be salvaged");
+        assert!(
+            matches!(err, LlmError::Garbled { .. }),
+            "expected the Garbled error to surface (caller fails open), got {err:?}"
         );
     }
 
