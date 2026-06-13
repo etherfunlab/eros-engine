@@ -5,9 +5,6 @@ mod middleware;
 mod openapi;
 mod pipeline;
 mod prompt;
-// `overused_openings` is wired into the chat pipeline in a later task; until
-// then it has no non-test caller. Remove this allow when the call site lands.
-#[allow(dead_code)]
 mod repetition;
 mod routes;
 mod state;
