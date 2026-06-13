@@ -17,15 +17,29 @@
 /// because every space/newline becomes a marker.
 const GARBLE_PCT_THRESHOLD: usize = 3;
 
+/// Minimum marker count and length for the garble verdict. Genuine garble from
+/// the affected providers is substantial (every observed production row was
+/// ≥98 chars with dozens of markers), whereas a SHORT whitespace-free string
+/// carrying one or two `Ġ`/`Ċ` is far more likely to be legitimate Maltese,
+/// where `Ġ`/`Ċ` are ordinary letters (e.g. "Ġgant", "Ċaw!"). Requiring several
+/// markers AND a minimum length — on top of zero real whitespace and the density
+/// floor — keeps those out. This is a heuristic: a glyph-only detector cannot be
+/// perfectly Maltese-proof, but for a non-Maltese deployment a false positive on
+/// real output is effectively impossible. (A missed SHORT genuine garble at worst
+/// shows a couple of stray glyphs — far cheaper than corrupting valid text.)
+const GARBLE_MIN_MARKERS: usize = 2;
+const GARBLE_MIN_LEN: usize = 8;
+
 /// `Ġ` U+0120 — byte-level-BPE rendering of a space.
 const GLYPH_SPACE: char = '\u{0120}';
 /// `Ċ` U+010A — byte-level-BPE rendering of a newline.
 const GLYPH_NEWLINE: char = '\u{010A}';
 
-/// True when `s` carries a `Ġ`/`Ċ` density at or above [`GARBLE_PCT_THRESHOLD`].
+/// True when `s` looks like byte-level-BPE garble — see the const docs for the
+/// discriminators and their rationale.
 pub fn looks_byte_garbled(s: &str) -> bool {
     let total = s.chars().count();
-    if total == 0 {
+    if total < GARBLE_MIN_LEN {
         return false;
     }
     let mut markers = 0usize;
@@ -39,10 +53,10 @@ pub fn looks_byte_garbled(s: &str) -> bool {
     }
     // Genuine byte-BPE garble converts EVERY whitespace byte into a marker, so a
     // garbled string carries many Ġ/Ċ and ZERO real whitespace (verified against
-    // all observed production rows). Requiring `real_ws == 0` excludes languages
-    // where Ġ/Ċ are ordinary letters (e.g. Maltese "Ġurnata tajba"), which always
-    // keep real spaces between words — density alone would misflag them.
-    real_ws == 0 && markers * 100 >= total * GARBLE_PCT_THRESHOLD
+    // all observed production rows). `real_ws == 0` excludes multi-word text in
+    // languages where Ġ/Ċ are letters (Maltese keeps real spaces); the marker-count
+    // and length floors exclude SHORT whitespace-free Maltese words like "Ġgant".
+    real_ws == 0 && markers >= GARBLE_MIN_MARKERS && markers * 100 >= total * GARBLE_PCT_THRESHOLD
 }
 
 /// Safe, idempotent repair: `Ġ`→space, `Ċ`→newline. No-op on clean text.
@@ -81,6 +95,15 @@ mod tests {
         // real whitespace proves the detokenizer did not mangle whitespace).
         assert!(!looks_byte_garbled("Ġurnata tajba, kif inti?"));
         assert!(!looks_byte_garbled("Ċaqlaq il-karozza Ġiet lura."));
+    }
+
+    #[test]
+    fn short_whitespace_free_maltese_words_are_not_garbled() {
+        // Single-word Maltese with no whitespace: one marker / short length stays
+        // under the marker-count + length floors, so it is not flagged or repaired.
+        assert!(!looks_byte_garbled("Ġgant"));
+        assert!(!looks_byte_garbled("Ċaw!"));
+        assert!(!looks_byte_garbled("Ġgantija")); // longer single word, one marker
     }
 
     #[test]
