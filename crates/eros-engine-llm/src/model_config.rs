@@ -1638,6 +1638,21 @@ reasoning = { exclude = true }
     }
 
     #[test]
+    fn committed_example_chat_companion_sets_sampling_defaults() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.frequency_penalty, Some(0.4));
+        assert_eq!(r.presence_penalty, Some(0.2));
+        // Extraction stays deterministic — no sampling knobs.
+        let e = cfg.resolve("insight_extraction", None);
+        assert_eq!(e.top_p, None);
+        assert_eq!(e.frequency_penalty, None);
+        assert_eq!(e.presence_penalty, None);
+    }
+
+    #[test]
     fn fallback_drops_selected_primary() {
         let toml = r#"
 [tasks.t]
