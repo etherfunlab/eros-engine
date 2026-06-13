@@ -180,6 +180,45 @@ impl<'a> AffinityRepo<'a> {
         .await
     }
 
+    /// Most-recent `affinity_reason` strings (newest-first) from `message` /
+    /// `gift` events for this session, strictly before the current turn's user
+    /// row (`before_message_id`), skipping rows whose `context` has no non-empty
+    /// `affinity_reason`. The `e.created_at < (sent_at of before_message_id)`
+    /// cutoff is resolved via subquery — same race-safety as
+    /// `ChatRepo::recent_assistant_contents`: under concurrent same-session
+    /// streams, a later turn's affinity event (written after this message
+    /// arrived) cannot leak into this turn's prompt as a "future" reason.
+    /// Session-scoped via the same affinity join as `list_events`
+    /// (companion_affinity.session_id is UNIQUE — no cross-session leakage).
+    /// A nonexistent `before_message_id` → NULL cutoff → empty Vec. Used to
+    /// inject the `[emotional_context]` block; the caller reverses to
+    /// oldest→newest for the prompt.
+    pub async fn recent_emotional_reasons(
+        &self,
+        session_id: Uuid,
+        before_message_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT e.context->>'affinity_reason' \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 \
+               AND e.created_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
+               AND e.event_type IN ('message', 'gift') \
+               AND e.context->>'affinity_reason' IS NOT NULL \
+               AND length(trim(e.context->>'affinity_reason')) > 0 \
+             ORDER BY e.created_at DESC, e.id DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(before_message_id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|(r,)| r).collect())
+    }
+
     /// Apply EMA-smoothed deltas in core, persist updated row, log event —
     /// all in a single transaction. The current vector is re-read **inside**
     /// the tx under `SELECT ... FOR UPDATE`, so overlapping same-session
@@ -724,6 +763,153 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.latest_turn_event(session_id).await.unwrap().is_none());
+    }
+
+    async fn seed_event_ctx(
+        pool: &PgPool,
+        affinity_id: Uuid,
+        event_type: &str,
+        context: serde_json::Value,
+        secs_ago: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, context, created_at) \
+             VALUES ($1, $2, '{}'::jsonb, '{}'::jsonb, $3, now() - make_interval(secs => $4))",
+        )
+        .bind(affinity_id)
+        .bind(event_type)
+        .bind(context)
+        .bind(secs_ago as f64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Insert a chat row (sent_at = now()) to serve as the turn boundary for
+    /// the `recent_emotional_reasons` cutoff, and return its id.
+    async fn insert_cutoff_msg(pool: &PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'cutoff') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_emotional_reasons_newest_first_skips_empty_and_scoped(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // oldest → newest. One message with a reason, one gift with a reason,
+        // one message with an EMPTY context (no reason → skipped), and a
+        // time_decay row (wrong type → skipped).
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "他主动分享了心事" }),
+            40,
+        )
+        .await;
+        seed_event_ctx(&pool, a.id, "message", serde_json::json!({}), 30).await; // no reason → skip
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "gift",
+            serde_json::json!({ "affinity_reason": "送了礼物很开心" }),
+            20,
+        )
+        .await;
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "time_decay",
+            serde_json::json!({ "affinity_reason": "应被忽略" }),
+            10,
+        )
+        .await; // wrong type → skip
+
+        // Another session must not leak in.
+        let other_session = make_session(&pool, Uuid::new_v4(), Uuid::new_v4()).await;
+        let b = repo
+            .load_or_create(other_session, Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        seed_event_ctx(
+            &pool,
+            b.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "别的会话" }),
+            5,
+        )
+        .await;
+
+        // Cutoff = a chat row sent now(); all seeded events above are in the
+        // past, so they are all before it.
+        let before = insert_cutoff_msg(&pool, session_id).await;
+        let got = repo
+            .recent_emotional_reasons(session_id, before, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec!["送了礼物很开心".to_string(), "他主动分享了心事".to_string()],
+            "newest-first, empty + wrong-type + other-session rows excluded"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_emotional_reasons_excludes_events_after_cutoff(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // A prior turn (before the cutoff) and a concurrent later turn whose
+        // affinity event landed AFTER this message (negative secs_ago → a
+        // future created_at). The cutoff must exclude the future one so a
+        // racing concurrent stream cannot leak its reason into this prompt.
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "上一轮" }),
+            30,
+        )
+        .await;
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "未来并发轮" }),
+            -60,
+        )
+        .await;
+
+        let before = insert_cutoff_msg(&pool, session_id).await;
+        let got = repo
+            .recent_emotional_reasons(session_id, before, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec!["上一轮".to_string()],
+            "an affinity event created after the cutoff message must be excluded"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

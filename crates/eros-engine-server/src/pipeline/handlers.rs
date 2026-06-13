@@ -16,6 +16,7 @@ use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::ResolvedModel;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{HumanInsightRepo, HumanInsightsRow};
 use eros_engine_store::memory::MemoryRepo;
@@ -206,6 +207,9 @@ fn assemble_chat_request(
         fallback_model: resolved.fallback_model,
         messages,
         temperature: resolved.temperature as f32,
+        top_p: resolved.top_p,
+        frequency_penalty: resolved.frequency_penalty,
+        presence_penalty: resolved.presence_penalty,
         max_tokens: resolved.max_tokens,
         user: audit_user,
         session_id: audit_session,
@@ -589,6 +593,36 @@ pub(super) async fn build_reply_request(
 
     let recent_turns = fetch_recent_turn_pairs(&state.pool, session_id, user_message_id).await;
 
+    // Mine over-used openings from the persona's own recent assistant turns
+    // (non-fatal: a DB hiccup just omits the [avoid_repetition] block).
+    let recent_assistant = ChatRepo { pool: &state.pool }
+        .recent_assistant_contents(session_id, user_message_id, 6)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "recent_assistant_contents fetch failed; [avoid_repetition] omitted"
+            );
+            Vec::new()
+        });
+    let avoid_patterns = crate::repetition::overused_openings(&recent_assistant);
+
+    // Recent affinity reasons for the emotional trajectory. The store returns
+    // newest-first; reverse to oldest→newest for a readable [emotional_context].
+    let mut emotional_context = AffinityRepo { pool: &state.pool }
+        .recent_emotional_reasons(session_id, user_message_id, 5)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                "recent_emotional_reasons fetch failed; [emotional_context] omitted"
+            );
+            Vec::new()
+        });
+    emotional_context.reverse();
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -599,6 +633,8 @@ pub(super) async fn build_reply_request(
         &kept_traits,
         affinity_scope,
         &recent_turns,
+        &avoid_patterns,
+        &emotional_context,
     );
 
     if let Event::UserMessage {
@@ -1499,12 +1535,20 @@ mod tests {
             model: "m".into(),
             fallback_model: vec![],
             temperature: 0.7,
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.4),
+            presence_penalty: Some(0.2),
             max_tokens: 100,
             allow_traits: None,
             reasoning: None,
             retry_depth: 0,
         };
         let req = assemble_chat_request(resolved, "SYS".into(), vec![tip, plain, assistant], None);
+
+        // Sampling knobs flow from ResolvedModel onto the ChatRequest.
+        assert_eq!(req.top_p, Some(0.9));
+        assert_eq!(req.frequency_penalty, Some(0.4));
+        assert_eq!(req.presence_penalty, Some(0.2));
 
         let user_contents: Vec<&str> = req
             .messages

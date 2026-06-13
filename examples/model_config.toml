@@ -41,6 +41,14 @@
 model = "deepseek/deepseek-v4-flash"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8
+# Sampling knobs (chat task only — extraction/vision/affinity want determinism
+# and leave these unset). These ship as the OSS default; a deployment opts out
+# by removing them. top_p trims the long tail; the two penalties are the
+# portable repetition levers (we deliberately do NOT use repetition_penalty —
+# it is provider-inconsistent and distorts CJK at the useful range).
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
 max_tokens = 1600
 # Companion replies only render `content`; the reasoning channel is ignored,
 # so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
@@ -213,13 +221,17 @@ max_tokens = 400
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
 # as a separate user message.
 filter_prompt = """
-你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的新事实发现。
+你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的、具体且有据可循的新事实。
+
+要的是具体、可落地、贴着用户原话的事实，不要含糊的概括。
+- 好：用户在深圳做后端工程师，最近在准备跳槽
+- 差：用户工作压力大（太笼统，没有抓手）
 
 铁律：
 - 只提取关于真人用户的事实。
 - assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、年龄、性格、喜好等，绝不是用户的事实。
 - 仅当用户主动陈述、复述或明确认同某信息时，才算用户事实。
-- 没有新的用户事实时，返回空数组 []。
+- 没有新的、具体的用户事实时，返回空数组 []。
 
 严格输出 JSON，格式：{"facts": ["事实1", "事实2"]}
 """
@@ -244,6 +256,10 @@ max_tokens = 800
 filter_prompt = """
 你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签。
 
+每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，不要写空泛的概括。
+- 好：用户讨厌被反复要求解释已经说过的话
+- 差：用户压力大
+
 category（只能用这五种之一）：
 - fact: 客观事实，如住在哪、做什么工作、家庭状况
 - preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味
@@ -256,7 +272,7 @@ category（只能用这五种之一）：
 - assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、喜好等绝不是用户的记忆。
 - 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
 - 同一事实合并成一条，不要重复。
-- 没有任何值得记的就返回空数组。
+- 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
 
 严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact"}]}
 """
