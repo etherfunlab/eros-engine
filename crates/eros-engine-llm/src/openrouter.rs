@@ -36,6 +36,11 @@ pub struct ChatRequest {
     pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
+    /// Optional sampling knobs. `None` ⇒ the wire param is omitted, so a
+    /// deployment that sets none produces a byte-identical body to today.
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: u32,
     /// Opaque OpenRouter wire passthrough — `user` field. Engine never
     /// inspects this; callers are responsible for hashing PII out.
@@ -131,6 +136,12 @@ struct WireRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
@@ -386,6 +397,9 @@ impl OpenRouterClient {
                     &req.messages,
                     req.temperature,
                     req.max_tokens,
+                    req.top_p,
+                    req.frequency_penalty,
+                    req.presence_penalty,
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
@@ -580,6 +594,9 @@ impl OpenRouterClient {
         messages: &[ChatMessage],
         temperature: f32,
         max_tokens: u32,
+        top_p: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -593,6 +610,9 @@ impl OpenRouterClient {
             model,
             messages,
             temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
             max_tokens,
             stream: false,
             user: req_user,
@@ -667,6 +687,9 @@ impl OpenRouterClient {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: req.top_p,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
             max_tokens: req.max_tokens,
             stream: true,
             user: req.user.as_deref(),
@@ -943,6 +966,9 @@ mod tests {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -984,6 +1010,9 @@ mod tests {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -1506,6 +1535,9 @@ data: [DONE]\n\n";
             model: "m",
             messages: &messages,
             temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -1525,6 +1557,9 @@ data: [DONE]\n\n";
             model: "m",
             messages: &messages,
             temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -1586,6 +1621,9 @@ data: [DONE]\n\n";
             model: "x/y",
             messages: &[],
             temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 100,
             stream: false,
             user: None,
@@ -1608,6 +1646,9 @@ data: [DONE]\n\n";
             model: "x/y",
             messages: &[],
             temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 100,
             stream: false,
             user: None,
@@ -1920,5 +1961,59 @@ data: [DONE]\n\n";
             "no generation_id when repaired"
         );
         assert_eq!(resp.model.as_deref(), Some("vp"));
+    }
+
+    #[test]
+    fn wire_request_serializes_sampling_params_when_set() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.4),
+            presence_penalty: Some(0.2),
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(s.contains("\"top_p\":0.9"), "{s}");
+        assert!(s.contains("\"frequency_penalty\":0.4"), "{s}");
+        assert!(s.contains("\"presence_penalty\":0.2"), "{s}");
+    }
+
+    #[test]
+    fn wire_request_omits_sampling_params_when_none() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(!s.contains("top_p"), "unset top_p must be omitted: {s}");
+        assert!(!s.contains("frequency_penalty"), "unset frequency_penalty must be omitted: {s}");
+        assert!(!s.contains("presence_penalty"), "unset presence_penalty must be omitted: {s}");
     }
 }
