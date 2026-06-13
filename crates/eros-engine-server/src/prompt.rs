@@ -1204,7 +1204,9 @@ mod tests {
         assert!(s.contains("[avoid_repetition]"), "{s}");
         assert!(s.contains("我看着你"), "{s}");
         assert!(s.contains("我盯着你"), "{s}");
-        assert!(s.find("[turn_style]") < s.find("[avoid_repetition]"));
+        let turn = s.find("[turn_style]").expect("[turn_style] must be present");
+        let avoid = s.find("[avoid_repetition]").expect("[avoid_repetition] must be present");
+        assert!(turn < avoid, "[avoid_repetition] must appear after [turn_style]");
     }
 
     #[test]
@@ -1249,7 +1251,9 @@ mod tests {
         let oldest = s.find("刚认识有点拘谨").expect("oldest present");
         let newest = s.find("他主动示好").expect("newest present");
         assert!(oldest < newest, "emotional_context must render in slice order");
-        assert!(s.find("[turn_style]") < s.find("[emotional_context]"));
+        let turn = s.find("[turn_style]").expect("[turn_style] must be present");
+        let emo = s.find("[emotional_context]").expect("[emotional_context] must be present");
+        assert!(turn < emo, "[emotional_context] must appear after [turn_style]");
     }
 
     #[test]
