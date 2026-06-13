@@ -611,7 +611,7 @@ pub(super) async fn build_reply_request(
     // Recent affinity reasons for the emotional trajectory. The store returns
     // newest-first; reverse to oldest→newest for a readable [emotional_context].
     let mut emotional_context = AffinityRepo { pool: &state.pool }
-        .recent_emotional_reasons(session_id, 5)
+        .recent_emotional_reasons(session_id, user_message_id, 5)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(
