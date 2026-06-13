@@ -826,15 +826,29 @@ mod tests {
         let mut p = fixture_persona();
         p.genome.system_prompt = "AUTHORED HEAD".into();
         let s = build_prompt(
-            &p, &[], &[], None, ReplyStyle::Neutral, &[], &[],
-            AffinityScope::full(), &[], &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+            &[],
+            &[],
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
         let head_end = "AUTHORED HEAD\n\n".len();
-        let guard = s.find("Always speak solely as this character").expect("guard");
+        let guard = s
+            .find("Always speak solely as this character")
+            .expect("guard");
         let identity = s.find("你是 ").expect("identity");
-        assert!(head_end <= guard && guard < identity, "head < guard < identity: {s}");
+        assert!(
+            head_end <= guard && guard < identity,
+            "head < guard < identity: {s}"
+        );
     }
 
     #[test]
@@ -842,12 +856,26 @@ mod tests {
         let mut p = fixture_persona();
         p.genome.system_prompt = "   ".into();
         let s = build_prompt(
-            &p, &[], &[], None, ReplyStyle::Neutral, &[], &[],
-            AffinityScope::full(), &[], &[], &[],
+            &p,
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+            &[],
+            &[],
         );
         // No head → starts with the guard, which still precedes identity.
-        assert!(s.starts_with("Always speak solely as this character"), "{s}");
-        let guard = s.find("Always speak solely as this character").expect("guard present");
+        assert!(
+            s.starts_with("Always speak solely as this character"),
+            "{s}"
+        );
+        let guard = s
+            .find("Always speak solely as this character")
+            .expect("guard present");
         let identity = s.find("你是 ").expect("identity present");
         assert!(guard < identity, "guard must precede identity: {s}");
     }
@@ -855,13 +883,27 @@ mod tests {
     #[test]
     fn build_prompt_guard_renders_and_does_not_contradict_iron_rule_seven() {
         let s = build_prompt(
-            &fixture_persona(), &[], &[], None, ReplyStyle::Neutral, &[], &[],
-            AffinityScope::full(), &[], &[], &[],
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            &[],
+            AffinityScope::full(),
+            &[],
+            &[],
+            &[],
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
-        assert!(s.contains("within all other hard constraints in this prompt"), "{s}");
-        let guard = s.find("Always speak solely as this character").expect("guard present");
+        assert!(
+            s.contains("within all other hard constraints in this prompt"),
+            "{s}"
+        );
+        let guard = s
+            .find("Always speak solely as this character")
+            .expect("guard present");
         let identity = s.find("你是 ").expect("identity present");
         assert!(guard < identity, "guard must precede identity: {s}");
         // ⑦ still renders verbatim — the guard must not replace/contradict it.
@@ -1233,9 +1275,16 @@ mod tests {
         assert!(s.contains("[avoid_repetition]"), "{s}");
         assert!(s.contains("我看着你"), "{s}");
         assert!(s.contains("我盯着你"), "{s}");
-        let turn = s.find("[turn_style]").expect("[turn_style] must be present");
-        let avoid = s.find("[avoid_repetition]").expect("[avoid_repetition] must be present");
-        assert!(turn < avoid, "[avoid_repetition] must appear after [turn_style]");
+        let turn = s
+            .find("[turn_style]")
+            .expect("[turn_style] must be present");
+        let avoid = s
+            .find("[avoid_repetition]")
+            .expect("[avoid_repetition] must be present");
+        assert!(
+            turn < avoid,
+            "[avoid_repetition] must appear after [turn_style]"
+        );
     }
 
     #[test]
@@ -1279,10 +1328,20 @@ mod tests {
         assert!(s.contains("[emotional_context]"), "{s}");
         let oldest = s.find("刚认识有点拘谨").expect("oldest present");
         let newest = s.find("他主动示好").expect("newest present");
-        assert!(oldest < newest, "emotional_context must render in slice order");
-        let turn = s.find("[turn_style]").expect("[turn_style] must be present");
-        let emo = s.find("[emotional_context]").expect("[emotional_context] must be present");
-        assert!(turn < emo, "[emotional_context] must appear after [turn_style]");
+        assert!(
+            oldest < newest,
+            "emotional_context must render in slice order"
+        );
+        let turn = s
+            .find("[turn_style]")
+            .expect("[turn_style] must be present");
+        let emo = s
+            .find("[emotional_context]")
+            .expect("[emotional_context] must be present");
+        assert!(
+            turn < emo,
+            "[emotional_context] must appear after [turn_style]"
+        );
     }
 
     #[test]
@@ -1599,7 +1658,10 @@ mod tests {
             &[],
             &[],
         );
-        assert!(s.contains("别开口就自述动作或凝视"), "anti-self-narration: {s}");
+        assert!(
+            s.contains("别开口就自述动作或凝视"),
+            "anti-self-narration: {s}"
+        );
         assert!(s.contains("少用省略号"), "ellipsis restraint: {s}");
         assert!(
             s.contains("不要连续两句都以「我」开头"),
@@ -1609,7 +1671,10 @@ mod tests {
         let iron = s.find("[iron_rules").expect("[iron_rules] present");
         let directive = s.find("别开口就自述动作或凝视").expect("directive present");
         let output = s.find("[output]").expect("[output] present");
-        assert!(iron < directive, "directive must be inside the iron-rules block");
+        assert!(
+            iron < directive,
+            "directive must be inside the iron-rules block"
+        );
         assert!(directive < output, "directive must come before [output]");
     }
 }

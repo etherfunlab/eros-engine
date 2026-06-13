@@ -37,7 +37,10 @@ fn opening_of(turn: &str) -> Option<String> {
 /// order, capped at [`MAX_OUTPUT`]. Empty when nothing recurs or there is too
 /// little history (< 2 usable openings).
 pub fn overused_openings(recent_assistant: &[String]) -> Vec<String> {
-    let openings: Vec<String> = recent_assistant.iter().filter_map(|t| opening_of(t)).collect();
+    let openings: Vec<String> = recent_assistant
+        .iter()
+        .filter_map(|t| opening_of(t))
+        .collect();
     if openings.len() < 2 {
         return Vec::new();
     }
@@ -69,7 +72,11 @@ mod tests {
     #[test]
     fn recurring_opening_is_surfaced() {
         // First 4 chars of the first sentence: "我看着你" recurs; "今天天气" once.
-        let turns = v(&["我看着你，轻轻笑了。", "我看着你的眼睛说。", "今天天气真好啊！"]);
+        let turns = v(&[
+            "我看着你，轻轻笑了。",
+            "我看着你的眼睛说。",
+            "今天天气真好啊！",
+        ]);
         let out = overused_openings(&turns);
         assert_eq!(out, vec!["我看着你".to_string()]);
     }
@@ -101,7 +108,14 @@ mod tests {
     fn output_capped_at_five() {
         // Six distinct openings, each appearing twice → recurring count is 6,
         // but the cap clips it to 5.
-        let bases = ["甲一二三", "乙一二三", "丙一二三", "丁一二三", "戊一二三", "己一二三"];
+        let bases = [
+            "甲一二三",
+            "乙一二三",
+            "丙一二三",
+            "丁一二三",
+            "戊一二三",
+            "己一二三",
+        ];
         let mut turns: Vec<String> = Vec::new();
         for b in bases {
             turns.push(format!("{b}。"));

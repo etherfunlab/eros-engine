@@ -2013,7 +2013,13 @@ data: [DONE]\n\n";
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("top_p"), "unset top_p must be omitted: {s}");
-        assert!(!s.contains("frequency_penalty"), "unset frequency_penalty must be omitted: {s}");
-        assert!(!s.contains("presence_penalty"), "unset presence_penalty must be omitted: {s}");
+        assert!(
+            !s.contains("frequency_penalty"),
+            "unset frequency_penalty must be omitted: {s}"
+        );
+        assert!(
+            !s.contains("presence_penalty"),
+            "unset presence_penalty must be omitted: {s}"
+        );
     }
 }

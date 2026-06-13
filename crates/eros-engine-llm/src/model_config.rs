@@ -2719,11 +2719,17 @@ temperature = 0.8
         }
         // JSON output contract preserved + new specificity anchor present.
         assert!(mem.extract_prompt.contains("\"memories\""), "json contract");
-        assert!(mem.extract_prompt.contains("用户压力大"), "bad-example anchor");
+        assert!(
+            mem.extract_prompt.contains("用户压力大"),
+            "bad-example anchor"
+        );
 
         let ins = cfg
             .resolve_insight_extract()
             .expect("insight_extraction resolves from the committed config");
-        assert!(ins.extract_prompt.contains("\"facts\""), "facts json contract");
+        assert!(
+            ins.extract_prompt.contains("\"facts\""),
+            "facts json contract"
+        );
     }
 }

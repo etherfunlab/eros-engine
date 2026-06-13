@@ -790,10 +790,31 @@ mod tests {
         // oldest → newest. One message with a reason, one gift with a reason,
         // one message with an EMPTY context (no reason → skipped), and a
         // time_decay row (wrong type → skipped).
-        seed_event_ctx(&pool, a.id, "message", serde_json::json!({ "affinity_reason": "他主动分享了心事" }), 40).await;
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "他主动分享了心事" }),
+            40,
+        )
+        .await;
         seed_event_ctx(&pool, a.id, "message", serde_json::json!({}), 30).await; // no reason → skip
-        seed_event_ctx(&pool, a.id, "gift", serde_json::json!({ "affinity_reason": "送了礼物很开心" }), 20).await;
-        seed_event_ctx(&pool, a.id, "time_decay", serde_json::json!({ "affinity_reason": "应被忽略" }), 10).await; // wrong type → skip
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "gift",
+            serde_json::json!({ "affinity_reason": "送了礼物很开心" }),
+            20,
+        )
+        .await;
+        seed_event_ctx(
+            &pool,
+            a.id,
+            "time_decay",
+            serde_json::json!({ "affinity_reason": "应被忽略" }),
+            10,
+        )
+        .await; // wrong type → skip
 
         // Another session must not leak in.
         let other_session = make_session(&pool, Uuid::new_v4(), Uuid::new_v4()).await;
@@ -801,7 +822,14 @@ mod tests {
             .load_or_create(other_session, Uuid::new_v4(), Uuid::new_v4())
             .await
             .unwrap();
-        seed_event_ctx(&pool, b.id, "message", serde_json::json!({ "affinity_reason": "别的会话" }), 5).await;
+        seed_event_ctx(
+            &pool,
+            b.id,
+            "message",
+            serde_json::json!({ "affinity_reason": "别的会话" }),
+            5,
+        )
+        .await;
 
         let got = repo.recent_emotional_reasons(session_id, 5).await.unwrap();
         assert_eq!(
