@@ -206,6 +206,9 @@ fn assemble_chat_request(
         fallback_model: resolved.fallback_model,
         messages,
         temperature: resolved.temperature as f32,
+        top_p: resolved.top_p,
+        frequency_penalty: resolved.frequency_penalty,
+        presence_penalty: resolved.presence_penalty,
         max_tokens: resolved.max_tokens,
         user: audit_user,
         session_id: audit_session,
@@ -1499,15 +1502,20 @@ mod tests {
             model: "m".into(),
             fallback_model: vec![],
             temperature: 0.7,
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.4),
+            presence_penalty: Some(0.2),
             max_tokens: 100,
             allow_traits: None,
             reasoning: None,
             retry_depth: 0,
         };
         let req = assemble_chat_request(resolved, "SYS".into(), vec![tip, plain, assistant], None);
+
+        // Sampling knobs flow from ResolvedModel onto the ChatRequest.
+        assert_eq!(req.top_p, Some(0.9));
+        assert_eq!(req.frequency_penalty, Some(0.4));
+        assert_eq!(req.presence_penalty, Some(0.2));
 
         let user_contents: Vec<&str> = req
             .messages
