@@ -315,7 +315,14 @@ fn drive_chat_burst(
                 };
 
                 if !truncated {
-                    outcome.lock().unwrap().retries_chat = idx as u32;
+                    let mut o = outcome.lock().unwrap();
+                    // Only the accepted reply feeds post-process (memory / insight /
+                    // affinity). Drop any superseded earlier attempts (truncated, or
+                    // garbled-then-repaired) that were pushed while walking the chain
+                    // — otherwise rejected provider output would corrupt derived user
+                    // state alongside the reply the user actually saw.
+                    o.produced.retain(|m| m.message_id == msg_uuid);
+                    o.retries_chat = idx as u32;
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -5575,6 +5582,118 @@ data: [DONE]\n\n";
                 .iter()
                 .any(|(content, truncated)| *truncated && content == repaired_text),
             "garbled+length-truncated attempt must persist as truncated with repaired text; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 5): a garbled non-final attempt superseded by a successful
+    /// fallback must NOT remain in `produced` (which feeds memory/insight/affinity
+    /// post-processing). Drives the burst directly to inspect the produced set.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn garbled_then_successful_fallback_excludes_garble_from_produced(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "g/x" streams garbled; fallback "f/x" streams clean.
+        let garbled = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\u{0120}there\u{010A}bye\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"g/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "g/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(garbled, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLEPRODUCED00000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "g/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let _frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback should remain in produced; got {produced:?}",
+        );
+        assert_eq!(
+            produced[0].full_text, "hi there",
+            "produced must carry the clean fallback, not the superseded garbled attempt",
         );
     }
 }
