@@ -353,6 +353,16 @@ pub struct TaskConfig {
     pub model: ModelSpec,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// Nucleus-sampling probability mass. Chat task only; task-level (tiers
+    /// inherit, like `temperature`); no `[defaults]` fallback. `None` ⇒ omit.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// OpenAI-style frequency penalty. Same scoping rules as `top_p`.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-style presence penalty. Same scoping rules as `top_p`.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -430,6 +440,11 @@ pub struct ResolvedModel {
     pub model: String,
     pub fallback_model: Vec<String>,
     pub temperature: f64,
+    /// Optional sampling knobs resolved from the task block (chat task only).
+    /// `None` ⇒ the corresponding wire param is omitted.
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: u32,
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
@@ -674,6 +689,11 @@ impl ModelConfig {
             .or(self.defaults.fallback_max_tokens)
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
+        // Task-level only (tiers inherit; no `[defaults]` fallback). None ⇒ omit.
+        let top_p = task_cfg.and_then(|t| t.top_p);
+        let frequency_penalty = task_cfg.and_then(|t| t.frequency_penalty);
+        let presence_penalty = task_cfg.and_then(|t| t.presence_penalty);
+
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
         let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
 
@@ -689,6 +709,9 @@ impl ModelConfig {
             model,
             fallback_model,
             temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
             max_tokens,
             allow_traits,
             reasoning,
@@ -2634,5 +2657,36 @@ filter_prompt = "   "
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert!(cfg.defaults.ignore_providers.is_empty());
+    }
+
+    #[test]
+    fn sampling_params_deserialize_and_resolve() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+temperature = 0.8
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.frequency_penalty, Some(0.4));
+        assert_eq!(r.presence_penalty, Some(0.2));
+    }
+
+    #[test]
+    fn sampling_params_absent_resolve_to_none() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+temperature = 0.8
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, None);
+        assert_eq!(r.frequency_penalty, None);
+        assert_eq!(r.presence_penalty, None);
     }
 }
