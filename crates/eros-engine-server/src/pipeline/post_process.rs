@@ -115,7 +115,7 @@ pub async fn run(
         // Semantic eval: Reply turns only, with a non-trivial user message
         // and a non-empty produced assistant message. Other actions
         // (Proactive / Ghost) keep rule-only deltas in v1.
-        let run_eval = plan.action_type == ActionType::Reply
+        let run_eval = plan.action_type == ActionType::ReplyText
             && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
             && !assistant_msg.trim().is_empty();
 
@@ -175,7 +175,10 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = matches!(plan.action_type, ActionType::Reply | ActionType::Proactive,);
+    let should_update_lead = matches!(
+        plan.action_type,
+        ActionType::ReplyText | ActionType::Proactive,
+    );
     let fut_lead = async {
         if should_update_lead {
             refresh_lead_score(&state, session_id, user_id).await;
@@ -240,10 +243,15 @@ async fn persist_affinity(
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
         }
-        ActionType::Reply | ActionType::Proactive => {
+        ActionType::ReplyText
+        | ActionType::ReplyImage
+        | ActionType::ReplyTextImage
+        | ActionType::Proactive => {
             let event_type = match action {
                 ActionType::Proactive => "proactive",
-                ActionType::Reply => "message",
+                ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
+                    "message"
+                }
                 ActionType::Ghost => unreachable!(),
             };
             if let Err(e) = repo

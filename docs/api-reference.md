@@ -26,10 +26,12 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.3.1",
+  "version": "0.6.0",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
+
+`version` is the running build's crate version (compiled in from `CARGO_PKG_VERSION`), so it tracks the deployed release.
 
 ## Chat lifecycle
 
@@ -82,8 +84,14 @@ data: {"type":"delta","message_id":"01J...","content":"你好"}
 
 data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
 
-data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18}
+data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18,"filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
+
+Frame fields worth noting:
+
+- **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain).
+- **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; may be omitted), `generation_id` (optional OpenRouter id).
+- **`final`** — turn summary: `lead_score`, `should_show_cta`, `agent_training_level`, plus `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served).
 
 Concurrent active streams per user are capped at 3. The keep-alive heartbeat
 (`: ping`) is emitted every 15 s so reverse-proxies don't time out the
@@ -204,6 +212,45 @@ Caps: `audit.user` and `audit.session_id` ≤ 256 chars; `audit.metadata`
 ≤ 16 keys, key matches `[A-Za-z0-9_.-]{1,64}`, value is a string ≤ 512
 chars. Violations return `400 BadRequest` as a pre-stream error.
 
+**Optional: tip.** The body may include `tips_amount_usd` (a finite number,
+`> 0` and `≤ 1_000_000`) to mark this turn as a tip. The turn is persisted with
+`role = gift_user`: if `content` is empty the stored content becomes
+`(打赏 $<amount>)`, otherwise your `content` is kept. The tip amount rides to the
+model so the persona can react in its reply, and it is echoed back on the BFF
+history row (`tips_amount_usd`). A tip and an image cannot be sent on the same
+turn. Replaces the old `POST /comp/chat/{session_id}/event/gift` route, which has
+been removed.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "",
+        "client_msg_id": "01J3333333333333333333333A",
+        "tips_amount_usd": 9.99
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: image input (vision).** The body may include `image_url` — an
+absolute `http(s)` URL with a host, no embedded whitespace, ≤ 2048 chars. When
+present, the engine runs a vision *describe* pre-stage (the `chat_vision` task)
+and feeds the description into the reply. `image_url` and `tips_amount_usd` are
+mutually exclusive on a single turn. A malformed URL returns `400 BadRequest` as
+a pre-stream error. Vision is active only if `[tasks.chat_vision]` is configured
+with a non-blank `filter_prompt` (see [model-config.md](model-config.md)).
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "what is in this picture?",
+        "client_msg_id": "01J3333333333333333333333A",
+        "image_url": "https://example.com/cat.jpg"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
 Paginated message history, newest first.
@@ -217,7 +264,8 @@ Paginated message history, newest first.
 }
 ```
 
-`role` ∈ `user | assistant | gift_user | system_error`.
+`role` ∈ `user | assistant | gift_user | system_error`. `gift_user` is a tip
+turn (sent via `tips_amount_usd` on the stream route, above).
 
 ## Profile
 
@@ -243,27 +291,10 @@ Current `companion_insights` JSONB plus a weighted `training_level`. Same `user_
 
 `training_level` is a weighted score across nine fields (city 0.05, occupation 0.05, interests 0.10, mbti_guess 0.15, love_values 0.15, emotional_needs 0.15, life_rhythm 0.10, personality_traits 0.15, matching_preferences 0.10). Weights sum to 1.0.
 
-## Gift events
-
-### `POST /comp/chat/{session_id}/event/gift`
-
-Apply affinity deltas from an out-of-band event (a virtual gift, a reaction, anything you want to model as "this user did something nice"). The route writes a `chat_messages` row with `role='gift_user'` and applies the deltas via the affinity persistence path.
-
-```bash
-curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{
-        "deltas": {"warmth": 0.05, "intimacy": 0.03, "tension": -0.02},
-        "label": "rose",
-        "metadata": {"source": "frontend-shop", "amount": 100}
-      }' \
-  http://localhost:8080/comp/chat/<session_id>/event/gift
-```
-
-The gift route does **not** invoke an LLM reaction in v0.1 (`reply` is `null`). The persona acknowledges the gift on the next user turn, where the new affinity state shapes the reply. A synchronous-reaction variant is a future enhancement.
-
-### `GET /comp/chat/{session_id}/gifts`
-
-List all gift events on this session, paginated.
+> **Tips replaced gift events.** The standalone gift routes
+> (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)
+> were removed. A tip is now part of a normal stream turn — set
+> `tips_amount_usd` on `POST /comp/chat/{session_id}/message/stream` (see above).
 
 ## Debug
 
@@ -287,6 +318,34 @@ Live 6-dim vector + ghost stats + relationship label. Gated by `EXPOSE_AFFINITY_
 ```
 
 Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). Turn it on if your frontend wants to render a live radar of the vector.
+
+### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
+
+Paginated affinity **event log** for the session, newest first. Same
+`EXPOSE_AFFINITY_DEBUG=true` gate as the vector route (404 when disabled). Each
+entry carries both the raw per-turn `deltas` (pre-EMA) and the applied
+`effective_deltas` (post-EMA). Optional `event_type` filters the log; `limit`
+defaults to 20 (capped at 100).
+
+```json
+{
+  "events": [
+    {
+      "event_id": "…",
+      "event_type": "message",
+      "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
+      "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
+      "created_at": "…"
+    }
+  ]
+}
+```
+
+The `event_type` filter accepts `message | gift | proactive | ghost |
+time_decay` (`time_decay` is reserved — not written by current code). For a
+per-turn frontend surface that is **not** debug-gated and returns only the
+latest event (post-EMA only), use the BFF route
+`GET /bff/v1/comp/affinity/{session_id}/event` below.
 
 ## BFF (`/bff/v1/*`)
 
@@ -329,7 +388,8 @@ independent of `EXPOSE_AFFINITY_DEBUG`.
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
 Slim history projection for the chat screen: `id` / `client_msg_id` /
-`role` / `content` / `sent_at` (no `extracted_facts`). `id` is the
+`role` / `content` / `sent_at` (no `extracted_facts`), plus `tips_amount_usd`
+on tip rows (present only when `role = gift_user`; omitted otherwise). `id` is the
 `chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
 sent during streaming (`null` for rows that never carried one, e.g.
 assistant turns). Same auth, ownership check, and
@@ -393,9 +453,10 @@ All errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`:
 
 ## Source
 
-- `crates/eros-engine-server/src/routes/companion.rs` — handler implementations
+- `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
+- `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
-- `crates/eros-engine-server/src/routes/debug.rs` — affinity debug route
+- `crates/eros-engine-server/src/routes/debug.rs` — affinity debug routes (vector + event log)
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

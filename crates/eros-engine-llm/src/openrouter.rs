@@ -36,6 +36,11 @@ pub struct ChatRequest {
     pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
+    /// Optional sampling knobs. `None` ⇒ the wire param is omitted, so a
+    /// deployment that sets none produces a byte-identical body to today.
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: u32,
     /// Opaque OpenRouter wire passthrough — `user` field. Engine never
     /// inspects this; callers are responsible for hashing PII out.
@@ -118,11 +123,25 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// OpenRouter provider routing preferences. Only `ignore` is used today;
+/// `allow_fallbacks` is omitted so OpenRouter applies its default (true),
+/// i.e. the model is still served by a healthy provider.
+#[derive(Debug, Serialize)]
+struct ProviderPrefs<'a> {
+    ignore: &'a [String],
+}
+
 #[derive(Debug, Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
@@ -134,6 +153,8 @@ struct WireRequest<'a> {
     metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<&'a ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderPrefs<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +279,9 @@ pub struct OpenRouterClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// OpenRouter provider slugs sent as `provider.ignore` on every call.
+    /// Empty by default; set at boot via [`OpenRouterClient::with_ignore_providers`].
+    ignore_providers: Vec<String>,
 }
 
 impl OpenRouterClient {
@@ -318,6 +342,27 @@ impl OpenRouterClient {
             http,
             api_key,
             base_url,
+            ignore_providers: Vec::new(),
+        }
+    }
+
+    /// Set the global provider-exclusion list (issue #84). Consuming builder so
+    /// boot can chain it: `OpenRouterClient::new(key, attr).with_ignore_providers(list)`.
+    /// Sent as `provider.ignore` on every outbound call.
+    pub fn with_ignore_providers(mut self, providers: Vec<String>) -> Self {
+        self.ignore_providers = providers;
+        self
+    }
+
+    /// Build the `ProviderPrefs` for a wire body, or `None` when the exclusion
+    /// list is empty (so the `provider` key is omitted entirely).
+    fn provider_prefs(&self) -> Option<ProviderPrefs<'_>> {
+        if self.ignore_providers.is_empty() {
+            None
+        } else {
+            Some(ProviderPrefs {
+                ignore: &self.ignore_providers,
+            })
         }
     }
 
@@ -340,6 +385,11 @@ impl OpenRouterClient {
         }
 
         let mut last_err: Option<LlmError> = None;
+        // Latest recoverable byte-BPE garble seen while walking the chain, kept
+        // separately from `last_err` so a LATER non-garble failure (transport /
+        // status / decode) can't discard a repairable earlier garble. Tuple:
+        // (model, raw, finish_reason).
+        let mut last_garbled: Option<(String, String, Option<String>)> = None;
         for (i, model) in candidates.iter().enumerate() {
             match self
                 .call_once(
@@ -347,6 +397,9 @@ impl OpenRouterClient {
                     &req.messages,
                     req.temperature,
                     req.max_tokens,
+                    req.top_p,
+                    req.frequency_penalty,
+                    req.presence_penalty,
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
@@ -356,6 +409,20 @@ impl OpenRouterClient {
             {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
+                    if let LlmError::Garbled {
+                        model,
+                        raw,
+                        finish_reason,
+                    } = &e
+                    {
+                        // Retain only a COMPLETE garble for last-resort salvage. A
+                        // length-truncated garble is incomplete; repairing it would
+                        // hand partial content to a structured caller as if complete.
+                        if finish_reason.as_deref() != Some("length") {
+                            last_garbled =
+                                Some((model.clone(), raw.clone(), finish_reason.clone()));
+                        }
+                    }
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
                         "openrouter: all candidates exhausted"
@@ -386,6 +453,25 @@ impl OpenRouterClient {
             }
         }
 
+        // Chain exhausted with no clean success. If ANY candidate returned
+        // recoverable garble, repair it and return clean (if imperfect) text
+        // rather than surfacing a hard failure or raw glyphs — even when a later
+        // candidate failed differently. generation_id/usage are unavailable here.
+        if let Some((model, raw, finish_reason)) = last_garbled {
+            tracing::error!(
+                %model,
+                "openrouter: all candidates failed; returning repaired last garbled attempt"
+            );
+            return Ok(ChatResponse {
+                reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
+                generation_id: None,
+                model: Some(model),
+                usage: None,
+                // Preserve the upstream finish_reason (e.g. "content_filter") so
+                // downstream validity gates still see the safety signal.
+                finish_reason,
+            });
+        }
         Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
     }
 
@@ -408,8 +494,17 @@ impl OpenRouterClient {
         }
 
         let mut last_err: Option<LlmError> = None;
+        // Latest recoverable garble, kept separate so a later non-garble failure
+        // can't discard a repairable earlier garble (mirrors `execute`). Tuple:
+        // (model, raw, finish_reason).
+        let mut last_garbled: Option<(String, String, Option<String>)> = None;
         for model in &candidates {
-            let body = build_vision_body(&req, model);
+            let mut body = build_vision_body(&req, model);
+            if let Some(prefs) = self.provider_prefs() {
+                if let Ok(v) = serde_json::to_value(&prefs) {
+                    body["provider"] = v;
+                }
+            }
             let resp = match self
                 .http
                 .post(&self.base_url)
@@ -446,11 +541,46 @@ impl OpenRouterClient {
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
+            if crate::byte_bpe::looks_byte_garbled(&raw) {
+                tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
+                // Retain only a COMPLETE garble for last-resort salvage; a
+                // length-truncated garble is incomplete, so route it to last_err
+                // (the caller fails open) rather than salvaging partial JSON.
+                if finish_reason.as_deref() == Some("length") {
+                    last_err = Some(LlmError::Garbled {
+                        model: model.to_string(),
+                        raw,
+                        finish_reason,
+                    });
+                } else {
+                    last_garbled = Some((model.to_string(), raw, finish_reason));
+                }
+                continue;
+            }
             return Ok(ChatResponse {
                 reply: clean_response(raw.trim()),
                 generation_id: parsed.id,
                 model: parsed.model,
                 usage: parsed.usage,
+                finish_reason,
+            });
+        }
+        // Exhausted with no clean describe. If any candidate returned recoverable
+        // garble, repair it so `run_vision` can still parse a describe JSON
+        // (Ġ/Ċ-only garble round-trips to valid JSON) instead of dropping to the
+        // text-only path — even when a later candidate failed differently.
+        if let Some((model, raw, finish_reason)) = last_garbled {
+            tracing::error!(
+                %model,
+                "openrouter: all vision candidates failed; returning repaired last garbled attempt"
+            );
+            return Ok(ChatResponse {
+                reply: clean_response(crate::byte_bpe::repair_byte_bpe(&raw).trim()),
+                generation_id: None,
+                model: Some(model),
+                usage: None,
+                // Preserve the upstream finish_reason (e.g. "content_filter") so
+                // run_vision's validity gate still sees the safety signal.
                 finish_reason,
             });
         }
@@ -464,6 +594,9 @@ impl OpenRouterClient {
         messages: &[ChatMessage],
         temperature: f32,
         max_tokens: u32,
+        top_p: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -477,12 +610,16 @@ impl OpenRouterClient {
             model,
             messages,
             temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
             max_tokens,
             stream: false,
             user: req_user,
             session_id: req_session_id,
             metadata: req_metadata,
             reasoning: req_reasoning,
+            provider: self.provider_prefs(),
         };
 
         let resp = self
@@ -506,6 +643,18 @@ impl OpenRouterClient {
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
         let finish_reason = first_choice.and_then(|c| c.finish_reason);
+        if crate::byte_bpe::looks_byte_garbled(&raw) {
+            tracing::error!(
+                model,
+                generation_id = ?parsed.id,
+                "openrouter: byte-BPE garbled completion; advancing candidate chain"
+            );
+            return Err(LlmError::Garbled {
+                model: model.to_string(),
+                raw,
+                finish_reason,
+            });
+        }
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
             generation_id: parsed.id,
@@ -538,12 +687,16 @@ impl OpenRouterClient {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: req.top_p,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
             max_tokens: req.max_tokens,
             stream: true,
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: req.reasoning.as_ref(),
+            provider: self.provider_prefs(),
         };
 
         let resp = self
@@ -813,12 +966,16 @@ mod tests {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: None,
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
@@ -853,12 +1010,16 @@ mod tests {
             model: &req.model,
             messages: &req.messages,
             temperature: req.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
             session_id: req.session_id.as_deref(),
             metadata: req.metadata.as_ref(),
             reasoning: None,
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(s.contains("\"user\":\"u_abc\""), "{s}");
@@ -1374,12 +1535,16 @@ data: [DONE]\n\n";
             model: "m",
             messages: &messages,
             temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
             session_id: None,
             metadata: None,
             reasoning: Some(&cfg),
+            provider: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(
@@ -1392,12 +1557,16 @@ data: [DONE]\n\n";
             model: "m",
             messages: &messages,
             temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
             session_id: None,
             metadata: None,
             reasoning: None,
+            provider: None,
         };
         let s_none = serde_json::to_string(&wire_none).unwrap();
         assert!(
@@ -1443,6 +1612,414 @@ data: [DONE]\n\n";
         assert!(
             matches!(item, Err(LlmError::StreamParse(_))),
             "expected StreamParse error, got {item:?}"
+        );
+    }
+
+    #[test]
+    fn wire_request_omits_provider_when_no_ignore_list() {
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert!(
+            body.get("provider").is_none(),
+            "provider key must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn wire_request_emits_provider_ignore_when_set() {
+        let ignore = vec!["BadHost".to_string()];
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: Some(ProviderPrefs { ignore: &ignore }),
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert_eq!(body["provider"]["ignore"][0], "BadHost");
+    }
+
+    #[test]
+    fn with_ignore_providers_sets_prefs() {
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_ignore_providers(vec!["BadHost".into()]);
+        let prefs = c.provider_prefs().expect("prefs present");
+        assert_eq!(prefs.ignore, ["BadHost"]);
+    }
+
+    /// Garbled string used in garble-guard tests. `Ġ`/`Ċ` density is 2/12 ≈ 16.7 % >> 3 % threshold.
+    fn garbled_content() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{ "message": { "content": "Hi\u{0120}there\u{010A}bye" } }]
+        })
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_past_a_garbled_primary() {
+        let server = MockServer::start().await;
+        // Primary "p" returns garbled content; fallback "f1" returns clean.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "f1",
+                "choices": [{ "message": { "content": "hi there" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback past garbled primary succeeds");
+        assert_eq!(resp.reply, "hi there");
+        // The served model field comes from the fallback wire response.
+        assert_eq!(resp.model.as_deref(), Some("f1"));
+    }
+
+    #[tokio::test]
+    async fn execute_repairs_when_all_candidates_garbled() {
+        let server = MockServer::start().await;
+        // Both primary "p" and fallback "f1" return garbled content.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("all-garbled chain returns repaired Ok rather than Err");
+        // repair_byte_bpe("HiĠthereĊbye") → "Hi there\nbye"; clean_response trims but
+        // does not alter interior spaces/newlines → "Hi there\nbye".
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert!(
+            resp.generation_id.is_none(),
+            "no generation_id when repaired"
+        );
+        assert!(resp.usage.is_none(), "no usage when repaired");
+        // model carried from the last Garbled error — which is "f1" (the last candidate).
+        assert_eq!(resp.model.as_deref(), Some("f1"));
+    }
+
+    #[tokio::test]
+    async fn execute_returns_repaired_garble_even_when_later_candidate_fails() {
+        let server = MockServer::start().await;
+        // Primary "p" returns recoverable garble; fallback "f1" then fails with a
+        // non-garble status error. The salvage must still return p's repaired text
+        // (issue #84, Codex P2b) rather than surfacing f1's error.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f1"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f1".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("earlier garble salvaged despite later non-garble failure");
+        assert_eq!(resp.reply, "Hi there\nbye");
+        // The repaired text comes from the FIRST (garbled) candidate "p".
+        assert_eq!(resp.model.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn execute_preserves_finish_reason_when_salvaging_garble() {
+        let server = MockServer::start().await;
+        // A garbled completion whose upstream finish_reason is "content_filter".
+        // The salvage must carry that safety signal through (issue #84, Codex P1
+        // round 4) so downstream validity gates can still reject filtered content.
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "content": "Hi\u{0120}there\u{010A}bye" },
+                    "finish_reason": "content_filter"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec![],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("garbled response is salvaged");
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert_eq!(
+            resp.finish_reason.as_deref(),
+            Some("content_filter"),
+            "the upstream safety finish_reason must survive the garble salvage"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_salvage_length_truncated_garble() {
+        let server = MockServer::start().await;
+        // A garbled completion that is ALSO length-truncated (incomplete). It must
+        // NOT be salvaged — repairing partial content and returning it as a success
+        // would mislead structured callers (issue #84, Codex round-6 P2).
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "content": "Hi\u{0120}there\u{010A}bye" },
+                    "finish_reason": "length"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec![],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("length-truncated garble must NOT be salvaged");
+        assert!(
+            matches!(err, LlmError::Garbled { .. }),
+            "expected the Garbled error to surface (caller fails open), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_vision_repairs_when_all_candidates_garbled() {
+        let server = MockServer::start().await;
+        // Single vision candidate returns a GARBLED describe JSON. The last-resort
+        // guard must repair it (Ġ/Ċ → space/newline) so the recoverable JSON is
+        // returned as Ok rather than dropped to the text-only path — mirrors
+        // execute()'s last-resort for chat (issue #84, Codex P2).
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vp"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": {
+                    "content": "{\u{010A}\u{0120}\u{0120}\"description\":\u{0120}\"a\u{0120}cat\"\u{010A}}"
+                }}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vp".into(),
+                fallback_model: vec![],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+            })
+            .await
+            .expect("garbled vision is repaired into Ok, not dropped");
+        // The repaired reply must parse as valid JSON with the recovered field —
+        // proving the salvage that the pre-fix code discarded.
+        let v: serde_json::Value =
+            serde_json::from_str(&resp.reply).expect("repaired describe parses as JSON");
+        assert_eq!(v["description"], "a cat");
+        assert!(
+            resp.generation_id.is_none(),
+            "no generation_id when repaired"
+        );
+        assert_eq!(resp.model.as_deref(), Some("vp"));
+    }
+
+    #[test]
+    fn wire_request_serializes_sampling_params_when_set() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.4),
+            presence_penalty: Some(0.2),
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(s.contains("\"top_p\":0.9"), "{s}");
+        assert!(s.contains("\"frequency_penalty\":0.4"), "{s}");
+        assert!(s.contains("\"presence_penalty\":0.2"), "{s}");
+    }
+
+    #[test]
+    fn wire_request_omits_sampling_params_when_none() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(!s.contains("top_p"), "unset top_p must be omitted: {s}");
+        assert!(
+            !s.contains("frequency_penalty"),
+            "unset frequency_penalty must be omitted: {s}"
+        );
+        assert!(
+            !s.contains("presence_penalty"),
+            "unset presence_penalty must be omitted: {s}"
         );
     }
 }

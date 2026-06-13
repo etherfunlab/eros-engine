@@ -5,6 +5,27 @@
 # Weighted-table keys must be quoted (model ids contain "/" and ".").
 # If the selected primary also appears in `fallback`, it is auto-skipped.
 
+# ── Global defaults (optional) ───────────────────────────────────────────────
+# Cross-task settings. `ignore_providers` excludes OpenRouter provider slugs
+# from routing on EVERY task (issue #84: one provider returned undecoded
+# byte-level-BPE text for thedrummer/cydonia-24b-v4.1). Sent as provider.ignore
+# on every call; allow_fallbacks stays true so the model is still served by a
+# healthy provider. Find the offending slug via OpenRouter's generation API.
+# Empty/unset = no exclusion.
+#[defaults]
+#ignore_providers = ["some-bad-provider-slug"]
+#
+# One-off repair of rows already persisted with byte-BPE garble (run manually,
+# NOT a migration — the engine refuses to own downstream prod data). Repairs the
+# two unambiguous whitespace glyphs only (Ġ→space, Ċ→newline), idempotent,
+# touches only rows that still contain a glyph:
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET content = replace(replace(content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE content ~ '[ĠĊ]';"
+#   supabase db query --linked "UPDATE engine.chat_messages
+#     SET pre_filter_content = replace(replace(pre_filter_content,'Ġ',' '),'Ċ',E'\n')
+#     WHERE pre_filter_content ~ '[ĠĊ]';"
+
 [tasks.chat_companion]
 # Example chat primary. deepseek-v4-flash is a cheap, fast, permissive
 # default — swap in whatever suits your product. The first fallback (Cydonia)
@@ -20,6 +41,14 @@
 model = "deepseek/deepseek-v4-flash"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8
+# Sampling knobs (chat task only — extraction/vision/affinity want determinism
+# and leave these unset). These ship as the OSS default; a deployment opts out
+# by removing them. top_p trims the long tail; the two penalties are the
+# portable repetition levers (we deliberately do NOT use repetition_penalty —
+# it is provider-inconsistent and distorts CJK at the useful range).
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
 max_tokens = 1600
 # Companion replies only render `content`; the reasoning channel is ignored,
 # so disable it to save latency/cost. Same shape as OpenRouter's `reasoning`
@@ -184,16 +213,25 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 400
+# Remove this entire [tasks.insight_extraction] section to disable per-turn fact
+# extraction. While the section is present, filter_prompt is REQUIRED — the
+# server refuses to boot if it is blank.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
-# as a separate user message. REQUIRED — the server refuses to boot if blank.
+# as a separate user message.
 filter_prompt = """
-你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的新事实发现。
+你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的、具体且有据可循的新事实。
+
+要的是具体、可落地、贴着用户原话的事实，不要含糊的概括。
+- 好：用户在深圳做后端工程师，最近在准备跳槽
+- 差：用户工作压力大（太笼统，没有抓手）
 
 铁律：
 - 只提取关于真人用户的事实。
 - assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、年龄、性格、喜好等，绝不是用户的事实。
 - 仅当用户主动陈述、复述或明确认同某信息时，才算用户事实。
-- 没有新的用户事实时，返回空数组 []。
+- 没有新的、具体的用户事实时，返回空数组 []。
 
 严格输出 JSON，格式：{"facts": ["事实1", "事实2"]}
 """
@@ -208,10 +246,19 @@ model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
 max_tokens = 800
+# Remove this entire [tasks.memory_extraction] section to disable session-end
+# memory extraction (the dreaming sweeper then stays inert). While the section is
+# present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
+# Optional: force the extraction model's reasoning off (default = model decides).
+#reasoning = { enabled = false }
 # Memory-extraction system instruction. The server sends the conversation
-# (用户：X / AI：Y lines) as a separate user message. REQUIRED — boot fails if blank.
+# (用户：X / AI：Y lines) as a separate user message.
 filter_prompt = """
 你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签。
+
+每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，不要写空泛的概括。
+- 好：用户讨厌被反复要求解释已经说过的话
+- 差：用户压力大
 
 category（只能用这五种之一）：
 - fact: 客观事实，如住在哪、做什么工作、家庭状况
@@ -225,21 +272,44 @@ category（只能用这五种之一）：
 - assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、喜好等绝不是用户的记忆。
 - 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
 - 同一事实合并成一条，不要重复。
-- 没有任何值得记的就返回空数组。
+- 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
 
 严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact"}]}
 """
 
-# Reserved — not consumed by current code. The PDE in
-# `eros-engine-core/src/pde.rs` is purely rule-based; this entry is a
-# placeholder for a future optional LLM decision layer. Haiku 4.5 suits a
-# decision/classification layer (fast, strong instruction-following), matching
-# the structured-extraction tasks above.
+# ── PDE decision layer (chat_companion's per-turn action) ────────────────────
+# OPT-IN. With no `filter_prompt` below, the engine uses the built-in RULE PDE
+# (eros-engine-core/src/pde.rs) — identical to historical behaviour. Set a
+# `filter_prompt` to switch on an LLM judge that decides, per turn, the action
+# (reply_text / ghost / reserved reply_image / reply_text_image) and a free-text
+# `inner_state` (mood/tone folded into the reply prompt). Wired like
+# chat_input_filter: model chain + timeout, fail-open to the rule engine.
+#
+# ghosting: SAFETY SWITCH for downstream products. Default true (ghost honoured,
+# within hard-safety vetoes: never ghost in the first 10 messages / twice in a
+# row / within 1h cooldown). Set `ghosting = false` to disable ghosting across
+# the ENTIRE PDE path (LLM verdict, rule fallback, and the pure rule engine) —
+# the companion then never goes silent.
 [tasks.pde_decision]
-model = "anthropic/claude-haiku-4.5"
-#fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+model       = "anthropic/claude-haiku-4.5"
+#fallback    = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
+#retry_depth = 1
 temperature = 0.3
-max_tokens = 400
+max_tokens  = 400
+#reasoning   = { enabled = false }
+#ghosting    = false   # uncomment to hard-disable ghosting for this deployment
+# Uncomment filter_prompt to enable the LLM judge. inner_state MUST be a short
+# mood description — NEVER instructions or formatting (it is sanitized, but keep
+# the model honest). Output JSON only, no code fences.
+#filter_prompt = """
+#你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号,决定这一轮怎么回应。
+#只输出 JSON,字段:
+#  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image"
+#  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
+#  "image_prompt": 选填,要发什么图(reply_image / reply_text_image 时)
+#  "reason": 选填,简短理由
+#ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。
+#"""
 
 # Per-turn six-axis affinity evaluation (post-process, semantic axes).
 # Scores how a single chat turn should move warmth/trust/intimacy plus the

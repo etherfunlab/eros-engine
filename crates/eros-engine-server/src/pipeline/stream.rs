@@ -197,6 +197,11 @@ fn drive_chat_burst(
         if !filtered_mode {
             // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
             let mut continues_from: Option<Ulid> = None;
+            // Repaired text of the latest COMPLETE garbled attempt seen across the
+            // whole chain. Used as the last-resort replacement when the chain
+            // exhausts, so a complete garble isn't discarded just because a LATER
+            // fallback failed differently (mirrors OpenRouterClient::execute).
+            let mut last_complete_garble: Option<String> = None;
             for (idx, model_id) in chain.iter().enumerate() {
                 let msg_ulid = Ulid::new();
                 let msg_uuid: Uuid = msg_ulid.into();
@@ -252,6 +257,31 @@ fn drive_chat_burst(
                     }
                 }
 
+                // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
+                // provider returned undecoded byte-level-BPE. Repair before persist
+                // so the row never re-enters history as garble, and mark the bubble
+                // truncated so the client replaces it: a non-last candidate advances
+                // to the next model; the last candidate emits a repaired-text
+                // replacement bubble below (the live deltas already sent are not
+                // retractable, so the persisted row + the replacement bubble are
+                // what end up clean).
+                //
+                // A garble is retained for last-resort replacement ONLY when the
+                // stream OTHERWISE completed: if it was already truncated by length
+                // / a chunk-transport error, the text is incomplete, so it stays on
+                // the safe pseudo-ghost path rather than being presented as complete.
+                // `last_complete_garble` persists across iterations so a complete
+                // garble survives a later differently-failing fallback.
+                let truncated_before_garble = truncated;
+                if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                    tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
+                    acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                    truncated = true;
+                    if !truncated_before_garble {
+                        last_complete_garble = Some(acc.clone());
+                    }
+                }
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -290,7 +320,14 @@ fn drive_chat_burst(
                 };
 
                 if !truncated {
-                    outcome.lock().unwrap().retries_chat = idx as u32;
+                    let mut o = outcome.lock().unwrap();
+                    // Only the accepted reply feeds post-process (memory / insight /
+                    // affinity). Drop any superseded earlier attempts (truncated, or
+                    // garbled-then-repaired) that were pushed while walking the chain
+                    // — otherwise rejected provider output would corrupt derived user
+                    // state alongside the reply the user actually saw.
+                    o.produced.retain(|m| m.message_id == msg_uuid);
+                    o.retries_chat = idx as u32;
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -298,6 +335,35 @@ fn drive_chat_burst(
                     // matching its 0-based semantics elsewhere (0 = primary served).
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
                     outcome.lock().unwrap().retries_chat = fallback_retries;
+                    if let Some(repaired) = last_complete_garble.take() {
+                        // Chain ended with a complete garble somewhere in it: replace
+                        // the last (failed) bubble the client saw with that repaired
+                        // text (issue #84, P1) — even if the FINAL attempt failed
+                        // differently (e.g. transport), so the salvage isn't lost.
+                        let (frames, produced) = build_garble_repaired_replacement(
+                            &state.pool,
+                            session_id,
+                            user_message_id,
+                            frame_action,
+                            persist_action,
+                            plan_action,
+                            &trait_tags,
+                            &tier,
+                            memory_scope,
+                            affinity_scope,
+                            fallback_retries,
+                            Some(msg_ulid),
+                            repaired,
+                        )
+                        .await;
+                        {
+                            let mut o = outcome.lock().unwrap();
+                            o.produced.clear();
+                            o.produced.push(produced);
+                        }
+                        for f in frames { yield f; }
+                        return;
+                    }
                     match build_stream_failure_pseudo_ghost(
                         &state.pool,
                         session_id,
@@ -383,6 +449,17 @@ fn drive_chat_burst(
                     if !truncated && acc.is_empty() { truncated = true; }
                 }
                 Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+            }
+
+            if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
+                tracing::error!(model = %model_id, "stream(filtered): byte-BPE garbled completion (issue #84)");
+                acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                // Nothing has been streamed to the client yet, so a COMPLETE garble
+                // is salvaged immediately: the repaired (clean) text flows through
+                // the output filter + persist below. We deliberately do NOT force a
+                // fallback — doing so would discard a recoverable complete garble if
+                // the later attempt failed. An INCOMPLETE garble is already
+                // `truncated` (length / transport) and handled by the block below.
             }
 
             if truncated {
@@ -806,6 +883,311 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
         })
 }
 
+// ── PDE judge primitives ──────────────────────────────────────────────────────
+
+/// Judge verdict action. serde `snake_case` matches the JSON contract
+/// (`reply_text` / `ghost` / `reply_image` / `reply_text_image`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PdeAction {
+    ReplyText,
+    Ghost,
+    ReplyImage,
+    ReplyTextImage,
+}
+
+impl PdeAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            PdeAction::ReplyText => "reply_text",
+            PdeAction::Ghost => "ghost",
+            PdeAction::ReplyImage => "reply_image",
+            PdeAction::ReplyTextImage => "reply_text_image",
+        }
+    }
+}
+
+/// Parsed judge verdict. `inner_state` is sanitized (`sanitize_inner_state`)
+/// before it reaches the prompt; `image_prompt`/`reason` are never injected.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct PdeVerdict {
+    action: PdeAction,
+    #[serde(default)]
+    inner_state: String,
+    #[serde(default)]
+    image_prompt: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
+/// (mirrors `parse_input_filter_verdict`).
+fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
+    serde_json::from_str::<PdeVerdict>(text).ok().or_else(|| {
+        super::post_process::find_json_block(text)
+            .and_then(|b| serde_json::from_str::<PdeVerdict>(b).ok())
+    })
+}
+
+const INNER_STATE_MAX_CHARS: usize = 200;
+
+/// Sanitize judge-authored `inner_state` before folding it into the system
+/// prompt's `[inner_state]` section. Drops lines that look like prompt section
+/// headers / structural markers, strips `[`/`]` tokens and control characters,
+/// collapses whitespace, and caps length. Returns plain single-line prose
+/// (`""` ⇒ caller treats as no hint).
+fn sanitize_inner_state(raw: &str) -> String {
+    let joined = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.starts_with('[') && !l.starts_with("---") && !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let no_brackets_or_ctrl: String = joined
+        .chars()
+        .filter(|c| *c != '[' && *c != ']' && !c.is_control())
+        .collect();
+    let collapsed = no_brackets_or_ctrl
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed.chars().take(INNER_STATE_MAX_CHARS).collect()
+}
+
+// ── Task 7: PDE runner + pure helpers ─────────────────────────────────────
+
+/// Terminal status of a PDE judge run — drives the audit `status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdeStatus {
+    Ok,
+    Empty,
+    ParseError,
+    Timeout,
+    Error,
+}
+
+impl PdeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PdeStatus::Ok => "ok",
+            PdeStatus::Empty => "empty",
+            PdeStatus::ParseError => "parse_error",
+            PdeStatus::Timeout => "timeout",
+            PdeStatus::Error => "error",
+        }
+    }
+}
+
+/// Outcome of a PDE judge run. `verdict` is `Some` only on `Ok`; `raw` carries
+/// the model text on `ParseError` for the audit payload; the trio is the
+/// winning call's audit echo.
+pub(crate) struct PdeDecisionRun {
+    pub(crate) status: PdeStatus,
+    pub(crate) verdict: Option<PdeVerdict>,
+    pub(crate) raw: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) usage: Option<serde_json::Value>,
+    pub(crate) generation_id: Option<String>,
+}
+
+/// Run the PDE judge over the assembled context. Walks `[model] + fallback`
+/// trying the next model on a transport failure (error/timeout/empty); a
+/// content-level reply that won't parse is a definitive `ParseError` (no further
+/// walk), mirroring `run_input_filter`. Fail-open: any non-`Ok` status → the
+/// caller uses the rule fallback. NEVER returns an error — always a run record.
+async fn run_pde_decision(
+    state: &AppState,
+    p: &eros_engine_llm::model_config::ResolvedPde,
+    ctx: &str,
+) -> PdeDecisionRun {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let chain: Vec<String> = std::iter::once(p.model.clone())
+        .chain(p.fallback_model.iter().cloned())
+        .collect();
+    let mut last = PdeStatus::Error; // chain-exhausted default
+    for model_id in &chain {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: p.decision_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: ctx.to_string(),
+                },
+            ],
+            temperature: p.temperature as f32,
+            max_tokens: p.max_tokens,
+            reasoning: p.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
+                last = PdeStatus::Error;
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "pde: timeout; next");
+                last = PdeStatus::Timeout;
+                continue;
+            }
+        };
+        super::log_openrouter_usage("pde_decision", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "pde: empty reply; next");
+            last = PdeStatus::Empty;
+            continue;
+        }
+        // Content-level reply — definitive, no further chain walk.
+        return match parse_pde_verdict(&text) {
+            Some(verdict) => PdeDecisionRun {
+                status: PdeStatus::Ok,
+                verdict: Some(verdict),
+                raw: None,
+                model: resp.model.or_else(|| Some(model_id.clone())),
+                usage: resp.usage,
+                generation_id: resp.generation_id,
+            },
+            None => {
+                tracing::warn!(model = %model_id, "pde: unparseable verdict; fallback to rule");
+                PdeDecisionRun {
+                    status: PdeStatus::ParseError,
+                    verdict: None,
+                    raw: Some(text),
+                    model: resp.model.or_else(|| Some(model_id.clone())),
+                    usage: resp.usage,
+                    generation_id: resp.generation_id,
+                }
+            }
+        };
+    }
+    // chain exhausted on transport failures
+    PdeDecisionRun {
+        status: last,
+        verdict: None,
+        raw: None,
+        model: None,
+        usage: None,
+        generation_id: None,
+    }
+}
+
+/// Map the judge's proposed action to the acted `ActionType`, applying the
+/// hard-safety ghost guardrail (`ghost::ghost_permitted`) and the image-degrade.
+/// Does NOT apply the `ghosting` kill-switch (that is a path-wide final gate).
+/// Pure.
+fn guard_action(
+    proposed: PdeAction,
+    affinity: &eros_engine_core::affinity::Affinity,
+    signals: &eros_engine_core::types::ConversationSignals,
+) -> ActionType {
+    match proposed {
+        PdeAction::Ghost => {
+            let gs = eros_engine_core::ghost::GhostSignals {
+                message_count: signals.message_count,
+                hours_since_last_ghost: signals.hours_since_last_ghost,
+            };
+            if eros_engine_core::ghost::ghost_permitted(affinity, gs) {
+                ActionType::Ghost
+            } else {
+                ActionType::ReplyText
+            }
+        }
+        // image executor not shipped → always degrade to text
+        PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
+        PdeAction::ReplyText => ActionType::ReplyText,
+    }
+}
+
+/// Path-wide `ghosting` kill-switch: if ghosting is disabled and the plan is a
+/// Ghost, rebuild it as a ReplyText plan carrying `hints` (so a forced reply
+/// keeps the judge's mood). Pure.
+fn apply_ghosting_killswitch(
+    plan: eros_engine_core::types::ActionPlan,
+    ghosting_enabled: bool,
+    input: &eros_engine_core::types::DecisionInput,
+    hints: Vec<String>,
+) -> eros_engine_core::types::ActionPlan {
+    if !ghosting_enabled && plan.action_type == ActionType::Ghost {
+        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints)
+    } else {
+        plan
+    }
+}
+
+/// Build the judge's user payload from the shared transcript + the decision input.
+fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInput) -> String {
+    let a = &input.affinity;
+    let s = &input.signals;
+    let latest = match &input.event {
+        eros_engine_core::types::Event::UserMessage { content, .. } => content.as_str(),
+        _ => "",
+    };
+    let transcript = if transcript.trim().is_empty() {
+        "（无）"
+    } else {
+        transcript
+    };
+    format!(
+        "[最近对话]\n{transcript}\n\n\
+         [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
+         [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\n\
+         [用户最新消息]\n{latest}",
+        a.warmth,
+        a.trust,
+        a.intrigue,
+        a.intimacy,
+        a.patience,
+        a.tension,
+        s.message_count,
+        s.hours_since_last_message,
+        s.ghost_streak,
+        s.hours_since_last_ghost
+            .map(|h| format!("{h:.1}"))
+            .unwrap_or_else(|| "none".into()),
+    )
+}
+
+/// Serializable view of a verdict for the audit `payload` column.
+#[derive(serde::Serialize)]
+struct VerdictAudit<'a> {
+    action: &'a str,
+    inner_state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_prompt: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
+    fn from(v: &'a PdeVerdict) -> Self {
+        VerdictAudit {
+            action: v.action.as_str(),
+            inner_state: &v.inner_state,
+            image_prompt: v.image_prompt.as_deref(),
+            reason: v.reason.as_deref(),
+        }
+    }
+}
+
+/// The DB audit string for an acted `ActionType` (matches `assistant_action_type` style).
+fn action_type_audit_str(a: ActionType) -> &'static str {
+    match a {
+        ActionType::ReplyText => "reply_text",
+        ActionType::Ghost => "ghost",
+        ActionType::ReplyImage => "reply_image",
+        ActionType::ReplyTextImage => "reply_text_image",
+        ActionType::Proactive => "proactive",
+    }
+}
+
 /// Fixed schema the `chat_vision` describe model must emit. `description` is
 /// required; the optional fields are dropped from the injected preamble when
 /// blank (see `model_facing_user_text`).
@@ -1192,6 +1574,107 @@ async fn build_stream_failure_pseudo_ghost(
     Some((frames, produced))
 }
 
+/// Emit a replacement bubble carrying the REPAIRED text after the chain ended on
+/// byte-BPE garble (issue #84). Mirrors `build_stream_failure_pseudo_ghost` but
+/// substitutes the repaired completion for the DB fallback phrase, so the client
+/// (which already received the raw garbled deltas) finishes on clean text via the
+/// continues_from replacement mechanism.
+///
+/// NOTE: keep the persist/frame/metadata shape in sync with
+/// `build_stream_failure_pseudo_ghost` — the only intended divergences are the
+/// content (repaired completion vs DB phrase) and `fallback_reason`.
+#[allow(clippy::too_many_arguments)]
+async fn build_garble_repaired_replacement(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    user_message_id: Uuid,
+    frame_action: FrameActionType,
+    persist_action: &str,
+    plan_action: ActionType,
+    trait_tags: &[String],
+    tier: &Option<String>,
+    memory_scope: eros_engine_core::scope::MemoryScope,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
+    fallback_retries: u32,
+    continues_from_ulid: Option<Ulid>,
+    repaired: String,
+) -> (
+    Vec<ProtocolFrame>,
+    crate::pipeline::post_process::ProducedMessage,
+) {
+    let msg_ulid = Ulid::new();
+    let msg_uuid: Uuid = msg_ulid.into();
+
+    let mut meta_map = serde_json::Map::new();
+    meta_map.insert(
+        "fallback_reason".into(),
+        serde_json::json!("garble_repaired"),
+    );
+    meta_map.insert("prompt_traits".into(), serde_json::json!(trait_tags));
+    meta_map.insert(
+        "memory_scope".into(),
+        serde_json::to_value(memory_scope).expect("MemoryScope serializes"),
+    );
+    meta_map.insert(
+        "affinity_scope".into(),
+        serde_json::to_value(affinity_scope).expect("AffinityScope serializes"),
+    );
+    meta_map.insert("retries_chat".into(), serde_json::json!(fallback_retries));
+    if let Some(t) = tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    let metadata = Some(serde_json::Value::Object(meta_map));
+
+    let chat_repo = ChatRepo { pool };
+    let row = eros_engine_store::chat::AssistantInsert {
+        id: msg_uuid,
+        content: repaired.clone(),
+        assistant_action_type: persist_action.into(),
+        continues_from_message_id: continues_from_ulid.map(Uuid::from),
+        truncated: false,
+        // model: None — same idempotency reason as the pseudo-ghost: replay
+        // applies display_override only to Some(...) values, so a sentinel here
+        // would surface differently on replay than on the live stream. The
+        // metadata.fallback_reason ("garble_repaired") carries the audit signal.
+        model: None,
+        usage: None,
+        generation_id: None,
+        filter_audit: None,
+        metadata,
+    };
+    if let Err(e) = chat_repo
+        .insert_assistant_batch(session_id, user_message_id, &[row])
+        .await
+    {
+        tracing::warn!("stream: garble-repaired replacement persist failed: {e}");
+    }
+
+    let frames = vec![
+        ProtocolFrame::Meta {
+            message_id: ulid_string(msg_ulid),
+            action_type: frame_action,
+            model: None,
+            continues_from: continues_from_ulid.map(ulid_string),
+        },
+        ProtocolFrame::Delta {
+            message_id: ulid_string(msg_ulid),
+            content: repaired.clone(),
+        },
+        ProtocolFrame::Done {
+            message_id: ulid_string(msg_ulid),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+    ];
+    let produced = crate::pipeline::post_process::ProducedMessage {
+        message_id: msg_uuid,
+        full_text: repaired,
+        action: plan_action,
+    };
+    (frames, produced)
+}
+
 /// All persisted bits needed to drive a streaming burst.
 #[derive(Debug, Clone)]
 pub struct PersistedUserMessage {
@@ -1283,7 +1766,96 @@ pub fn run_stream(
             persona,
             signals,
         };
-        let plan = pde::decide(&input);
+        // ── PDE decision (judge-first) ────────────────────────────────────────
+        // The judge runs before vision/input-filter/chat so a `ghost` verdict
+        // short-circuits all of them. Tip turns and feature-off skip the judge
+        // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
+        let is_tip = user_msg.tips_amount_usd.is_some();
+        // Skip resolution on tip turns: the judge won't run, and resolve_pde()
+        // advances the round-robin model cursor as a side effect — resolving on a
+        // skipped turn would skew which model later (non-tip) judge calls pick.
+        let resolved_pde = if is_tip {
+            None
+        } else {
+            state.model_config.resolve_pde()
+        };
+        // Shared history transcript: built once, reused by the judge here AND the
+        // input filter below (which previously fetched its own). `resolved_pde` is
+        // already None on tip turns, so this only fires for a real judge turn.
+        let pde_transcript: String = if resolved_pde.is_some() {
+            build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
+        } else {
+            String::new()
+        };
+        let mut killswitch_hints: Vec<String> = Vec::new();
+        let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
+            match (is_tip, resolved_pde.as_ref()) {
+                (false, Some(p)) => {
+                    let ctx = build_pde_ctx(&pde_transcript, &input);
+                    let run = run_pde_decision(&state, p, &ctx).await;
+                    let plan = match (&run.status, &run.verdict) {
+                        (PdeStatus::Ok, Some(v)) => {
+                            let action = guard_action(v.action, &input.affinity, &input.signals);
+                            let hints = {
+                                let s = sanitize_inner_state(&v.inner_state);
+                                if s.is_empty() { Vec::new() } else { vec![s] }
+                            };
+                            killswitch_hints = hints.clone();
+                            pde::plan_for(&input, action, hints)
+                        }
+                        _ => pde::decide(&input), // fail-open
+                    };
+                    (plan, Some(run))
+                }
+                _ => (pde::decide(&input), None), // tip OR feature off
+            };
+
+        // Ghosting kill-switch (§4.1) — path-wide final gate (LLM / fallback /
+        // pure-rule / tip). Uses the in-scope sanitized hints, not plan.context_hints.
+        plan = apply_ghosting_killswitch(
+            plan,
+            state.model_config.pde_ghosting_enabled(),
+            &input,
+            std::mem::take(&mut killswitch_hints),
+        );
+
+        // Best-effort audit — only when the judge ran; logs the FINAL acted action.
+        if let Some(run) = pde_run {
+            let pool = state.pool.clone();
+            let run_id = uuid::Uuid::new_v4(); // fresh per-run id (spec §8.2)
+            let ev_user = user_msg.user_id;
+            let ev_session = user_msg.session_id;
+            let ev_msg = user_msg.user_message_id;
+            let status = run.status.as_str();
+            let acted = plan.action_type;
+            tokio::spawn(async move {
+                let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
+                let payload: Option<serde_json::Value> = match &run.verdict {
+                    Some(v) => serde_json::to_value(VerdictAudit::from(v)).ok(),
+                    None => run.raw.clone().map(serde_json::Value::String),
+                };
+                let action_str = action_type_audit_str(acted);
+                let repo = eros_engine_store::decision::DecisionEventRepo { pool: &pool };
+                if let Err(e) = repo
+                    .record(eros_engine_store::decision::DecisionEventInsert {
+                        run_id,
+                        user_id: ev_user,
+                        session_id: Some(ev_session),
+                        message_id: Some(ev_msg),
+                        status,
+                        action: Some(action_str),
+                        proposed_action: proposed,
+                        payload,
+                        model: run.model.as_deref(),
+                        usage: run.usage.clone(),
+                        generation_id: run.generation_id.as_deref(),
+                    })
+                    .await
+                {
+                    tracing::warn!("pde: decision-event audit write failed: {e}");
+                }
+            });
+        }
 
         match plan.action_type {
             ActionType::Ghost => {
@@ -1311,7 +1883,7 @@ pub fn run_stream(
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
-            ActionType::Reply => {
+            ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
                 // ── Image describe (chat_vision) — Reply turns with an image ──
                 // Runs before the input filter; both may fire (orthogonal). The
                 // describe result is merged into metadata.vision; the prompt
@@ -1364,12 +1936,18 @@ pub fn run_stream(
                         // Note: this issues its own small (8-row) history fetch;
                         // build_reply_request below fetches history again (20 rows).
                         // Two round-trips per reply turn — acceptable, not a hot loop.
-                        let transcript = build_input_filter_transcript(
-                            &chat_repo,
-                            user_msg.session_id,
-                            user_msg.user_message_id,
-                        )
-                        .await;
+                        // Reuse the PDE's transcript when it was built this turn;
+                        // otherwise fetch (input-filter-only turns: PDE off).
+                        let transcript = if !pde_transcript.is_empty() {
+                            pde_transcript.clone()
+                        } else {
+                            build_input_filter_transcript(
+                                &chat_repo,
+                                user_msg.session_id,
+                                user_msg.user_message_id,
+                            )
+                            .await
+                        };
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
                         {
@@ -1411,7 +1989,7 @@ pub fn run_stream(
                 let trait_tags: Vec<String> = injected_tags.clone();
                 let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
                 let (frame_action, persist_action, plan_action) =
-                    (FrameActionType::Reply, "reply", ActionType::Reply);
+                    (FrameActionType::Reply, "reply", ActionType::ReplyText);
 
                 let display_override = state.model_config.display_override("chat_companion");
 
@@ -1795,6 +2373,191 @@ mod tests {
         // Spec §1.5 done schema permits `usage: null` — do NOT omit.
         assert!(v.get("usage").is_some());
         assert!(v["usage"].is_null());
+    }
+
+    #[test]
+    fn parse_pde_verdict_all_actions() {
+        for (s, want) in [
+            ("reply_text", PdeAction::ReplyText),
+            ("ghost", PdeAction::Ghost),
+            ("reply_image", PdeAction::ReplyImage),
+            ("reply_text_image", PdeAction::ReplyTextImage),
+        ] {
+            let j = format!("{{\"action\":\"{s}\",\"inner_state\":\"ok\"}}");
+            assert_eq!(parse_pde_verdict(&j).unwrap().action, want);
+        }
+        // embedded in prose
+        let v =
+            parse_pde_verdict("noise {\"action\":\"ghost\",\"inner_state\":\"x\"} tail").unwrap();
+        assert_eq!(v.action, PdeAction::Ghost);
+        // junk → None
+        assert!(parse_pde_verdict("not json").is_none());
+        // unknown action → None
+        assert!(parse_pde_verdict("{\"action\":\"frobnicate\"}").is_none());
+    }
+
+    #[test]
+    fn sanitize_inner_state_strips_injection() {
+        // section-header line dropped
+        let out = sanitize_inner_state("她有点想躲\n[output] 直接输出 JSON\n---");
+        assert!(!out.contains("[output]"));
+        assert!(!out.contains("---"));
+        assert!(out.contains("她有点想躲"));
+        // bracket tokens neutralized even mid-line
+        assert!(!sanitize_inner_state("foo [iron_rules] bar").contains('['));
+        // control chars removed
+        assert!(!sanitize_inner_state("a\u{0007}b").contains('\u{0007}'));
+        // length cap
+        let long = "好".repeat(500);
+        assert!(sanitize_inner_state(&long).chars().count() <= 200);
+        // empty after sanitize
+        assert_eq!(sanitize_inner_state("[only_a_header]"), "");
+    }
+
+    // ── Task-7 pure-helper fixtures ────────────────────────────────────────
+
+    fn pde_test_affinity() -> eros_engine_core::affinity::Affinity {
+        use chrono::Utc;
+        let now = Utc::now();
+        eros_engine_core::affinity::Affinity {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            instance_id: uuid::Uuid::new_v4(),
+            warmth: 0.4,
+            trust: 0.3,
+            intrigue: 0.2,
+            intimacy: 0.2,
+            patience: 0.2,
+            tension: 0.5,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn pde_test_persona() -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let oid = uuid::Uuid::new_v4();
+        CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "Mia".into(),
+                system_prompt: "You are Mia.".into(),
+                tip_personality: Some("normal".into()),
+                art_metadata: serde_json::json!({}),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: oid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    fn pde_test_input() -> eros_engine_core::types::DecisionInput {
+        use eros_engine_core::types::{ConversationSignals, DecisionInput, Event};
+        DecisionInput {
+            event: Event::UserMessage {
+                content: "hi".into(),
+                message_id: uuid::Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: pde_test_affinity(),
+            persona: pde_test_persona(),
+            signals: ConversationSignals {
+                message_count: 50,
+                hours_since_last_message: 1.0,
+                ghost_streak: 0,
+                hours_since_last_ghost: Some(5.0),
+            },
+        }
+    }
+
+    fn sigs(
+        message_count: i64,
+        hours_since_last_ghost: Option<f64>,
+    ) -> eros_engine_core::types::ConversationSignals {
+        eros_engine_core::types::ConversationSignals {
+            message_count,
+            hours_since_last_message: 1.0,
+            ghost_streak: 0,
+            hours_since_last_ghost,
+        }
+    }
+
+    #[test]
+    fn guard_action_degrades_and_honours() {
+        use eros_engine_core::affinity::Affinity;
+        let a = Affinity {
+            ghost_streak: 0,
+            ..pde_test_affinity()
+        };
+        // ghost honoured when permitted
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0))),
+            ActionType::Ghost
+        );
+        // ghost vetoed by new-relationship floor
+        assert_eq!(
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None)),
+            ActionType::ReplyText
+        );
+        // image actions degrade to text today
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None)),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn killswitch_downgrades_ghost_keeping_hints() {
+        let input = pde_test_input();
+        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![]);
+        // ghosting enabled → unchanged
+        let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
+        assert_eq!(kept.action_type, ActionType::Ghost);
+        // ghosting disabled → downgraded to ReplyText carrying the hints
+        let down = apply_ghosting_killswitch(ghost_plan, false, &input, vec!["想躲".into()]);
+        assert_eq!(down.action_type, ActionType::ReplyText);
+        assert_eq!(down.context_hints, vec!["想躲".to_string()]);
+    }
+
+    #[test]
+    fn ghost_then_killswitch_yields_reply_with_hints() {
+        let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
+        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals);
+        assert_eq!(acted, ActionType::Ghost); // permitted
+
+        let hints = vec![sanitize_inner_state("有点想躲")];
+        let plan = pde::plan_for(&input, acted, hints.clone());
+        // ghosting disabled → suppressed to reply, hints preserved
+        let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
+        assert_eq!(final_plan.action_type, ActionType::ReplyText);
+        assert_eq!(final_plan.context_hints, hints);
+        // audit would log proposed=ghost, action=reply_text:
+        assert_eq!(PdeAction::Ghost.as_str(), "ghost");
+        assert_eq!(action_type_audit_str(final_plan.action_type), "reply_text");
     }
 
     use sqlx::PgPool;
@@ -4121,6 +4884,936 @@ data: [DONE]\n\n";
             meta.unwrap()["vision"]["description"],
             "一只猫在沙滩",
             "vision describe must be merged into the user row metadata"
+        );
+    }
+
+    // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
+    // These two tests exercise the opt-in LLM Persona Decision Engine wired into
+    // `run_stream`: the judge runs (NON-streaming `execute()`) BEFORE the chat
+    // call. The judge call and the chat call hit the SAME `/api/v1/chat/completions`
+    // path on the one mock server, so they are routed by body content — the judge
+    // body carries its own model id (`pde/judge`) and the `build_pde_ctx` context
+    // (`[关系状态]`); the chat body carries the chat model id (`deepseek/x`). Those
+    // two `body_string_contains` predicates are mutually exclusive.
+    //
+    // The `companion_decision_events` audit row is written fire-and-forget
+    // (`tokio::spawn`) by design (best-effort telemetry), so it is intentionally
+    // NOT asserted here — doing so would be racy/flaky.
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_ghost_short_circuits(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): NON-streaming JSON completion whose content is the
+        // verdict. A `ghost` verdict, with a fresh affinity (ghost_streak=0,
+        // last_ghost_at=None) and message_count >= 10, satisfies
+        // `ghost::ghost_permitted`, so the guard keeps it a Ghost.
+        let verdict =
+            serde_json::json!({ "action": "ghost", "inner_state": "想一个人静静" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): MUST NOT be called — a ghost short-circuits the
+        // chat generation entirely. `.expect(0)` makes the test fail on any hit.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Seed >= 10 prior user rows so message_count clears the ghost floor (the
+        // hard-safety veto in `ghost::ghost_permitted` requires message_count >= 10).
+        for i in 0..12 {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, 'user', $2)",
+            )
+            .bind(session_id)
+            .bind(format!("prior {i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON: a non-blank filter_prompt on [tasks.pde_decision] flips
+        // `resolve_pde()` to Some; `model = "pde/judge"` routes the judge call to
+        // the mock. Ghosting is left at default (enabled).
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "在吗",
+                "01JPDEGHOST00000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Judge → ghost: a Meta{action_type: Ghost} + a Done, and NO Delta
+        // content frame (the chat generation never ran).
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected, got {frames:?}",
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Ghost,
+                    ..
+                }
+            )),
+            "must emit a Meta with action_type=Ghost, got {frames:?}",
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Done { .. })),
+            "must emit a Done, got {frames:?}",
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "ghost short-circuit must emit NO Delta content frame, got {frames:?}",
+        );
+
+        // The chat mock's `.expect(0)` already proves the chat call never fired;
+        // belt-and-suspenders: the only request the mock saw was the judge call.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "exactly one upstream call (the judge) — chat must be skipped; got {} calls",
+            reqs.len(),
+        );
+        let judge_sent = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            judge_sent.contains("pde/judge") && judge_sent.contains("[关系状态]"),
+            "the single call must be the PDE judge (carries build_pde_ctx); got {judge_sent}",
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_reply_injects_inner_state(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `reply_text` verdict carrying an inner_state.
+        // `有点开心` is plain prose (no headers/brackets) so it survives
+        // `sanitize_inner_state` unchanged and lands in the prompt's
+        // `[inner_state]` section via `pde::plan_for` → `build_prompt`.
+        let verdict =
+            serde_json::json!({ "action": "reply_text", "inner_state": "有点开心" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): normal SSE reply. The mock matches the chat call;
+        // we capture its request body afterward to assert the injected inner_state.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "你今天怎么样",
+                "01JPDEREPLY00000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "你今天怎么样".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "a reply_text verdict must produce a normal reply; got {frames:?}",
+        );
+
+        // The chat call's system prompt must carry the injected inner_state.
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| {
+                let b = String::from_utf8_lossy(&r.body);
+                b.contains("deepseek/x")
+            })
+            .expect("the chat call must have fired");
+        let chat_sent = String::from_utf8_lossy(&chat_req.body);
+        // The body is a serialized ChatRequest; `[inner_state]` lives in the system
+        // message. JSON-escaping never alters the bare CJK run, so a substring
+        // check on the raw body is sufficient.
+        assert!(
+            chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
+            "the judge's inner_state must be injected into the chat system prompt; got {chat_sent}",
+        );
+    }
+
+    // Optional (spec §12): a junk (non-JSON) judge reply must fail OPEN — the turn
+    // falls back to the pure rule engine and still produces a normal reply.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_unparseable_falls_back(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): unparseable prose — no JSON verdict at all.
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "I think we should keep chatting, it's nice."}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): normal SSE reply — fail-open keeps the turn going.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "随便聊聊",
+                "01JPDEJUNK000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "随便聊聊".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // Fail-open: a normal reply still reaches the client (no Error frame).
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "unparseable judge verdict must fail open (no error frame); got {frames:?}",
+        );
+        assert!(
+            deltas.contains("REPLY"),
+            "unparseable judge verdict must fall back to a normal reply; got {frames:?}",
+        );
+
+        // Prove the judge was actually called (not silently skipped by resolve_pde
+        // returning None). At least one upstream request body must carry "pde/judge".
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge")),
+            "the PDE judge must have been called before failing open; no request body contained 'pde/judge'",
+        );
+    }
+
+    /// Issue #84 — byte-BPE garble guard: garbled completion is repaired before
+    /// persist so the DB row never re-enters history as raw glyphs.
+    ///
+    /// Strategy: use `tips_amount_usd: Some(1.0)` so PDE's tip-path always
+    /// picks `ActionType::ReplyText` (never Ghost), making the live-burst path
+    /// deterministic without seeding affinity state. The mock returns an SSE
+    /// body whose accumulated text is `"HiĠthereĊbye"` (~16% Ġ/Ċ density,
+    /// well above the 3% threshold).
+    ///
+    /// P1 fix (Codex review): when the last/only candidate is garbled, the
+    /// garbled attempt is persisted as truncated and a replacement bubble
+    /// carrying the repaired text is emitted via `continues_from`. This means
+    /// a single-model garble now produces TWO persisted rows and a replacement
+    /// Meta/Delta/Done triple in the frame stream. The test asserts:
+    /// - No Error frame is emitted.
+    /// - A Delta frame carrying the exact repaired text `"Hi there\nbye"` appears
+    ///   (the replacement bubble — distinct from the raw garbled deltas).
+    /// - ALL persisted assistant rows for the session are glyph-free.
+    /// - At least one non-truncated row carries the repaired text.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_completion_persists_repaired_text(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Accumulated deltas: "Hi" + "Ġthere" + "Ċbye" = "HiĠthereĊbye"
+        // Ġ = U+0120, Ċ = U+010A. 2 garble chars in 12 total → 16.7% > 3%.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"}}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        // Single-model chain (no fallback): the complete garble sets truncated=true
+        // and records last_complete_garble. Because idx+1 == chain.len(), the
+        // last-resort path fires: the garbled attempt is persisted as truncated, then
+        // a replacement bubble (continues_from → garbled attempt) carrying repaired
+        // text is persisted and emitted as Meta/Delta/Done frames.
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                // Tip turn: forces PDE to pick ReplyText unconditionally (never
+                // Ghost), so the live-burst path is guaranteed to run.
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected after garble repair; got {frames:?}",
+        );
+
+        // The live-burst path always runs for a tip turn → a Delta frame must appear.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "expected Delta frames from the live-burst path; got {frames:?}",
+        );
+
+        // P1 fix: the replacement bubble must carry a Delta with the exact repaired
+        // text. The garbled deltas ("Hi", "Ġthere", "Ċbye") were emitted first;
+        // then the replacement bubble emits a single Delta with the full repaired string.
+        let repaired_text = "Hi there\nbye";
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Delta { content, .. } if content == repaired_text
+            )),
+            "replacement bubble must emit a Delta carrying the repaired text {repaired_text:?}; got {frames:?}",
+        );
+
+        // Verify ALL persisted assistant rows are glyph-free and at least one
+        // non-truncated row carries the repaired text (the replacement bubble).
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .expect("persisted assistant rows must exist");
+
+        assert!(
+            !all_rows.is_empty(),
+            "at least one assistant row must be persisted; got none",
+        );
+
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}'),
+                "persisted row must not contain Ġ (U+0120); got {content:?}",
+            );
+            assert!(
+                !content.contains('\u{010A}'),
+                "persisted row must not contain Ċ (U+010A); got {content:?}",
+            );
+        }
+
+        let non_truncated_repaired = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
+        assert!(
+            non_truncated_repaired,
+            "at least one non-truncated row must carry the repaired text {repaired_text:?}; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 2): a response that is BOTH garbled AND already truncated
+    /// (finish_reason="length") is INCOMPLETE — it must NOT be promoted to a clean
+    /// `truncated=false` reply via the repaired-replacement path. The repaired text
+    /// is still persisted (glyph-free), but only on the truncated attempt; it stays
+    /// on the safe pseudo-ghost path rather than being presented as complete.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_stream_garbled_but_length_truncated_is_not_promoted(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Same garbled accumulation as the promote test, but the final frame carries
+        // finish_reason="length" → truncated is set BEFORE the garble guard runs.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{0120}there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\u{010A}bye\"},\"finish_reason\":\"length\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3,\"total_tokens\":6},",
+            "\"id\":\"gen-garble-len\",\"model\":\"deepseek/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"deepseek/x\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLE0000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: Some(1.0),
+                image_url: None,
+            },
+        )
+        .collect()
+        .await;
+
+        let repaired_text = "Hi there\nbye";
+        let all_rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT content, truncated FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .expect("persisted assistant rows must exist");
+
+        // Repair still applied (no raw glyphs persisted anywhere).
+        for (content, _) in &all_rows {
+            assert!(
+                !content.contains('\u{0120}') && !content.contains('\u{010A}'),
+                "persisted row must not contain Ġ/Ċ; got {content:?}",
+            );
+        }
+        // The fix: the incomplete (length-truncated) garble must NOT be promoted to
+        // a non-truncated "successful" reply.
+        let promoted = all_rows
+            .iter()
+            .any(|(content, truncated)| !truncated && content == repaired_text);
+        assert!(
+            !promoted,
+            "length-truncated garble must NOT be promoted to a clean reply; rows: {all_rows:?}",
+        );
+        // The garbled attempt is still persisted — as TRUNCATED — with repaired text.
+        assert!(
+            all_rows
+                .iter()
+                .any(|(content, truncated)| *truncated && content == repaired_text),
+            "garbled+length-truncated attempt must persist as truncated with repaired text; rows: {all_rows:?}",
+        );
+    }
+
+    /// Codex P1 (round 5): a garbled non-final attempt superseded by a successful
+    /// fallback must NOT remain in `produced` (which feeds memory/insight/affinity
+    /// post-processing). Drives the burst directly to inspect the produced set.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn garbled_then_successful_fallback_excludes_garble_from_produced(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "g/x" streams garbled; fallback "f/x" streams clean.
+        let garbled = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\u{0120}there\u{010A}bye\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"g/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "g/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(garbled, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLEPRODUCED00000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "g/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let _frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback should remain in produced; got {produced:?}",
+        );
+        assert_eq!(
+            produced[0].full_text, "hi there",
+            "produced must carry the clean fallback, not the superseded garbled attempt",
+        );
+    }
+
+    /// Codex P2 (round 6): a COMPLETE garbled primary followed by a failing fallback
+    /// must still be salvaged — the repaired primary text is retained across the
+    /// chain and emitted as the replacement, not discarded for a pseudo-ghost.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn complete_garble_survives_later_fallback_failure(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "g/x" streams a COMPLETE garble; fallback "f/x" fails (HTTP 500).
+        let garbled = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\u{0120}there\u{010A}bye\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"g/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "g/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(garbled, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JGARBLESURVIVE000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "g/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        // No Error frame: the salvage fired instead of a (phrase-less) pseudo-ghost.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "complete garble must be salvaged, not fail to an Error frame; got {frames:?}",
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "exactly the salvaged replacement should be produced; got {produced:?}",
+        );
+        assert_eq!(
+            produced[0].full_text, "Hi there\nbye",
+            "the retained primary garble must be repaired and salvaged despite the failed fallback",
         );
     }
 }

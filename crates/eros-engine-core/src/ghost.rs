@@ -22,19 +22,28 @@ pub fn score(a: &Affinity) -> f64 {
     (1.0 - a.intrigue) * 0.4 + (1.0 - a.patience) * 0.4 + a.tension * 0.2
 }
 
-/// Decide whether to ghost, with 4 protection layers:
-///   1. message_count < 10        → never ghost (relationship still nascent)
-///   2. ghost_streak >= 2         → don't ghost twice in a row
-///   3. last ghost < 1h ago       → cooldown
-///   4. recent ghost (any time)   → threshold rises to 0.85; otherwise 0.65
-pub fn decide(a: &Affinity, s: GhostSignals) -> GhostDecision {
+/// True when a ghost is permitted by the HARD-SAFETY protections only
+/// (message-count floor, anti-streak, cooldown). The score-threshold layer is
+/// intentionally excluded — the LLM PDE decides ghost-worthiness, while these
+/// vetoes always hold. `ghost_streak` is read from `a`; `message_count` /
+/// `hours_since_last_ghost` from `s` (the same sources `decide` uses).
+pub fn ghost_permitted(a: &Affinity, s: GhostSignals) -> bool {
     if s.message_count < 10 {
-        return GhostDecision::Reply;
+        return false;
     }
     if a.ghost_streak >= 2 {
-        return GhostDecision::Reply;
+        return false;
     }
     if matches!(s.hours_since_last_ghost, Some(h) if h < 1.0) {
+        return false;
+    }
+    true
+}
+
+/// Decide whether to ghost: hard-safety protections (via `ghost_permitted`),
+/// then the score threshold (rises to 0.85 after a recent ghost, else 0.65).
+pub fn decide(a: &Affinity, s: GhostSignals) -> GhostDecision {
+    if !ghost_permitted(a, s) {
         return GhostDecision::Reply;
     }
     let threshold = if s.hours_since_last_ghost.is_some() {
@@ -149,5 +158,45 @@ mod tests {
         let a = aff(0.4, 0.6, 0.5, 0);
         let expected = (1.0 - 0.4) * 0.4 + (1.0 - 0.6) * 0.4 + 0.5 * 0.2;
         assert!((score(&a) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ghost_permitted_false_when_message_count_below_10() {
+        let a = aff(0.1, 0.1, 0.5, 0);
+        let s = GhostSignals {
+            message_count: 5,
+            hours_since_last_ghost: None,
+        };
+        assert!(!ghost_permitted(&a, s));
+    }
+
+    #[test]
+    fn ghost_permitted_false_on_streak() {
+        let a = aff(0.1, 0.1, 0.5, 2); // ghost_streak read from &Affinity
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(5.0),
+        };
+        assert!(!ghost_permitted(&a, s));
+    }
+
+    #[test]
+    fn ghost_permitted_false_within_cooldown() {
+        let a = aff(0.1, 0.1, 0.5, 0);
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(0.5),
+        };
+        assert!(!ghost_permitted(&a, s));
+    }
+
+    #[test]
+    fn ghost_permitted_true_when_clear() {
+        let a = aff(0.1, 0.1, 0.5, 0);
+        let s = GhostSignals {
+            message_count: 50,
+            hours_since_last_ghost: Some(5.0),
+        };
+        assert!(ghost_permitted(&a, s));
     }
 }

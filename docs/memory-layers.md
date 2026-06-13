@@ -93,11 +93,24 @@ Embeddings are NOT generated for every message — only the ones the insight ext
 
 Raw chat messages live in `engine.chat_messages` (full transcript, plain text). They are **not** embedded. The memory tables hold *summaries* and *facts*, not the full message log. If you want to retrieve the actual transcript, query `chat_messages` directly — that's the source of truth for what was said.
 
-## Lazy retrieval
+## Retrieval and injection
 
-The pipeline does NOT proactively look up memories before each chat turn. The system prompt is built from the persona genome + affinity vector + relationship label only. Memories surface when the LLM (in the insight or chat task) asks for them via a future tool-use API — not yet wired in v0.1, planned for a later phase.
+Memory is read back into the prompt on each chat turn, gated by the per-request
+`memory_scope` (values and default in [api-reference.md](api-reference.md);
+default `neutral_and_relationship`). The reply handler (`pipeline::handlers`)
+builds a profile/relationship context block from two sources:
 
-For now, memory is write-mostly: the engine accumulates a structured record of the relationship, and serving it back into the LLM is a separate workstream. The frontend's `/comp/user/{user_id}/profile` endpoint returns the structured `companion_insights` JSONB which is the human-readable view of what's been collected.
+- **Profile layer** — the structured `companion_insights` JSONB, rendered as
+  profile bullets. `memory_scope` decides whether intimate fields are included
+  (`full` / `insights_only`) or only the neutral subset (`neutral_*`).
+- **Relationship layer** — `companion_memories` rows pulled by semantic
+  (embedding) similarity search against the current turn, included when the
+  scope keeps relationship memory (`full` / `neutral_and_relationship` /
+  `relationship_only`).
+
+`memory_scope = none` skips memory injection entirely. The frontend's
+`/comp/user/{user_id}/profile` endpoint returns the same `companion_insights`
+JSONB as a human-readable view of what's been collected.
 
 ## Source
 

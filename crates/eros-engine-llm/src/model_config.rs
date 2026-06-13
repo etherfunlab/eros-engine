@@ -341,6 +341,11 @@ pub struct DefaultConfig {
     pub fallback_temperature: Option<f64>,
     #[serde(default)]
     pub fallback_max_tokens: Option<u32>,
+    /// OpenRouter provider slugs to exclude from routing on EVERY task
+    /// (issue #84). Sent as `provider.ignore` on every outbound call; the
+    /// client reads this once at boot. Empty = no exclusion.
+    #[serde(default)]
+    pub ignore_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -348,6 +353,16 @@ pub struct TaskConfig {
     pub model: ModelSpec,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// Nucleus-sampling probability mass. Chat task only; task-level (tiers
+    /// inherit, like `temperature`); no `[defaults]` fallback. `None` ⇒ omit.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// OpenAI-style frequency penalty. Same scoping rules as `top_p`.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-style presence penalty. Same scoping rules as `top_p`.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -396,6 +411,11 @@ pub struct TaskConfig {
     /// defaults this to 1 (primary + first fallback) when unset.
     #[serde(default)]
     pub retry_depth: Option<u32>,
+    /// PDE-only: ghost kill-switch. `false` disables ghosting across the whole
+    /// PDE path; absent/`true` keeps it on. Read only on `[tasks.pde_decision]`
+    /// (other tasks ignore it), like `input_filter`/`dimensions`.
+    #[serde(default)]
+    pub ghosting: Option<bool>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -420,6 +440,11 @@ pub struct ResolvedModel {
     pub model: String,
     pub fallback_model: Vec<String>,
     pub temperature: f64,
+    /// Optional sampling knobs resolved from the task block (chat task only).
+    /// `None` ⇒ the corresponding wire param is omitted.
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub max_tokens: u32,
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
@@ -542,6 +567,21 @@ pub struct ResolvedVision {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
+/// configured `filter_prompt` is the judge's system instruction; the engine
+/// builds the user payload (transcript + affinity + signals). `fallback_model`
+/// is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedPde {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub decision_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
 /// The configured `filter_prompt` is the system instruction; the server assembles
 /// the conversation as a separate user message. Model selection mirrors the generic
@@ -649,6 +689,11 @@ impl ModelConfig {
             .or(self.defaults.fallback_max_tokens)
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
+        // Task-level only (tiers inherit; no `[defaults]` fallback). None ⇒ omit.
+        let top_p = task_cfg.and_then(|t| t.top_p);
+        let frequency_penalty = task_cfg.and_then(|t| t.frequency_penalty);
+        let presence_penalty = task_cfg.and_then(|t| t.presence_penalty);
+
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
         let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
 
@@ -664,6 +709,9 @@ impl ModelConfig {
             model,
             fallback_model,
             temperature,
+            top_p,
+            frequency_penalty,
+            presence_penalty,
             max_tokens,
             allow_traits,
             reasoning,
@@ -828,6 +876,42 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the PDE decision task. `None` (feature off → rule engine) when
+    /// `[tasks.pde_decision]` is absent OR its `filter_prompt` is blank. Reuses
+    /// the generic `resolve()` machinery; task-level only (no tier override),
+    /// like `chat_vision`.
+    pub fn resolve_pde(&self) -> Option<ResolvedPde> {
+        const PDE_TASK: &str = "pde_decision";
+        let task_cfg = self.tasks.get(PDE_TASK)?;
+        let decision_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if decision_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(PDE_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedPde {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            decision_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// PDE ghost kill-switch. `true` (default) ⇒ ghost honoured; `false` ⇒ the
+    /// whole PDE path never produces a Ghost. Read INDEPENDENTLY of
+    /// `filter_prompt`, so it also governs the pure rule engine (LLM PDE off).
+    pub fn pde_ghosting_enabled(&self) -> bool {
+        self.tasks
+            .get("pde_decision")
+            .and_then(|t| t.ghosting)
+            .unwrap_or(true)
+    }
+
     /// Resolve the insight-extraction (facts stage) prompt bundle. `None` when
     /// `[tasks.insight_extraction]` is absent OR its `filter_prompt` is blank.
     pub fn resolve_insight_extract(&self) -> Option<ResolvedExtract> {
@@ -859,6 +943,26 @@ impl ModelConfig {
             retry_depth: m.retry_depth,
             reasoning: m.reasoning,
         })
+    }
+
+    /// Boot-time validation for the two extraction tasks. A task **section that
+    /// is present** must carry a usable `filter_prompt` (else `Err`); an
+    /// **absent section** means that extraction is simply off (`Ok`). Returns a
+    /// ready-to-print message naming the first misconfigured task.
+    ///
+    /// Scoped to `insight_extraction` / `memory_extraction` — the only tasks the
+    /// boot gate makes mandatory-when-present.
+    pub fn validate_extraction_prompts(&self) -> Result<(), String> {
+        for name in ["insight_extraction", "memory_extraction"] {
+            if self.tasks.contains_key(name) && self.resolve_extract(name).is_none() {
+                return Err(format!(
+                    "[tasks.{name}] is present but its filter_prompt is unset — eros-engine \
+                     refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
+                     section to disable {name}."
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1159,10 +1263,12 @@ max_tokens   = 400
 description  = "extract user facts from a chat turn"
 
 [tasks.pde_decision]
-model        = "x-ai/grok-4-mini"
-temperature  = 0.5
-max_tokens   = 200
-description  = "reserved — current PDE is rule-based"
+model         = "x-ai/grok-4-mini"
+temperature   = 0.5
+max_tokens    = 200
+description   = "LLM decision layer"
+filter_prompt = "Decide the action and inner_state."
+ghosting      = false
 
 [tasks.embedding]
 model        = "voyage-3-lite"
@@ -1252,6 +1358,13 @@ reasoning    = { enabled = false }
         assert_eq!(pde.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
+        assert_eq!(
+            pde.filter_prompt.as_deref(),
+            Some("Decide the action and inner_state.")
+        );
+        assert_eq!(pde.ghosting, Some(false));
+        assert!(cfg.resolve_pde().is_some());
+        assert!(!cfg.pde_ghosting_enabled());
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
@@ -1522,6 +1635,21 @@ reasoning = { exclude = true }
         );
         // Untouched tasks stay at model default.
         assert_eq!(cfg.resolve("insight_extraction", None).reasoning, None);
+    }
+
+    #[test]
+    fn committed_example_chat_companion_sets_sampling_defaults() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.frequency_penalty, Some(0.4));
+        assert_eq!(r.presence_penalty, Some(0.2));
+        // Extraction stays deterministic — no sampling knobs.
+        let e = cfg.resolve("insight_extraction", None);
+        assert_eq!(e.top_p, None);
+        assert_eq!(e.frequency_penalty, None);
+        assert_eq!(e.presence_penalty, None);
     }
 
     #[test]
@@ -2418,5 +2546,190 @@ retry_depth = 0
         let r = cfg.resolve_insight_extract().expect("resolves");
         assert_eq!(r.retry_depth, 2);
         assert_eq!(r.fallback_model, vec!["f1".to_string(), "f2".to_string()]);
+    }
+
+    #[test]
+    fn validate_extraction_absent_sections_ok() {
+        // Neither extraction section present → both features off → Ok.
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn validate_extraction_present_with_prompt_ok() {
+        let toml = r#"
+[tasks.insight_extraction]
+model = "m"
+filter_prompt = "extract facts"
+
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "extract memories"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn validate_extraction_present_without_prompt_errors() {
+        let toml = r#"
+[tasks.insight_extraction]
+model = "m"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate_extraction_prompts().unwrap_err();
+        assert!(
+            err.contains("insight_extraction"),
+            "msg names the task: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extraction_present_blank_prompt_errors() {
+        let toml = r#"
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "   "
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate_extraction_prompts().unwrap_err();
+        assert!(
+            err.contains("memory_extraction"),
+            "msg names the task: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_memory_extract_none_when_section_absent() {
+        // Guards the dreaming sweeper's early-return condition (a later task).
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_memory_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_pde_none_when_absent_or_blank() {
+        // absent
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_pde().is_none());
+        // present but blank filter_prompt
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_pde().is_none());
+    }
+
+    #[test]
+    fn resolve_pde_some_when_prompt_set() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"decide\"\n",
+        )
+        .unwrap();
+        let p = cfg.resolve_pde().expect("resolves");
+        assert_eq!(p.model, "m");
+        assert_eq!(p.decision_prompt, "decide");
+    }
+
+    #[test]
+    fn pde_ghosting_enabled_default_true_else_field() {
+        // task missing → true
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.pde_ghosting_enabled());
+        // present, no ghosting → true
+        let cfg = ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.pde_ghosting_enabled());
+        // ghosting = false → false
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\nghosting = false\n")
+                .unwrap();
+        assert!(!cfg.pde_ghosting_enabled());
+    }
+
+    #[test]
+    fn defaults_ignore_providers_parses() {
+        let toml = r#"
+            [defaults]
+            ignore_providers = ["BadHost", "AnotherHost"]
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
+        assert_eq!(
+            cfg.defaults.ignore_providers,
+            vec!["BadHost", "AnotherHost"]
+        );
+    }
+
+    #[test]
+    fn defaults_ignore_providers_absent_is_empty() {
+        let toml = r#"
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
+        assert!(cfg.defaults.ignore_providers.is_empty());
+    }
+
+    #[test]
+    fn sampling_params_deserialize_and_resolve() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+temperature = 0.8
+top_p = 0.9
+frequency_penalty = 0.4
+presence_penalty = 0.2
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.frequency_penalty, Some(0.4));
+        assert_eq!(r.presence_penalty, Some(0.2));
+    }
+
+    #[test]
+    fn sampling_params_absent_resolve_to_none() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+temperature = 0.8
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.top_p, None);
+        assert_eq!(r.frequency_penalty, None);
+        assert_eq!(r.presence_penalty, None);
+    }
+
+    #[test]
+    fn committed_example_extraction_prompts_keep_contracts() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+
+        let mem = cfg
+            .resolve_memory_extract()
+            .expect("memory_extraction resolves from the committed config");
+        // Five-category vocabulary preserved.
+        for cat in ["fact", "preference", "event", "emotion", "relation"] {
+            assert!(mem.extract_prompt.contains(cat), "missing category `{cat}`");
+        }
+        // JSON output contract preserved + new specificity anchor present.
+        assert!(mem.extract_prompt.contains("\"memories\""), "json contract");
+        assert!(
+            mem.extract_prompt.contains("用户压力大"),
+            "bad-example anchor"
+        );
+
+        let ins = cfg
+            .resolve_insight_extract()
+            .expect("insight_extraction resolves from the committed config");
+        assert!(
+            ins.extract_prompt.contains("\"facts\""),
+            "facts json contract"
+        );
     }
 }
