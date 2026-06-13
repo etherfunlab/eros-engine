@@ -2704,4 +2704,26 @@ temperature = 0.8
         assert_eq!(r.frequency_penalty, None);
         assert_eq!(r.presence_penalty, None);
     }
+
+    #[test]
+    fn committed_example_extraction_prompts_keep_contracts() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+
+        let mem = cfg
+            .resolve_memory_extract()
+            .expect("memory_extraction resolves from the committed config");
+        // Five-category vocabulary preserved.
+        for cat in ["fact", "preference", "event", "emotion", "relation"] {
+            assert!(mem.extract_prompt.contains(cat), "missing category `{cat}`");
+        }
+        // JSON output contract preserved + new specificity anchor present.
+        assert!(mem.extract_prompt.contains("\"memories\""), "json contract");
+        assert!(mem.extract_prompt.contains("用户压力大"), "bad-example anchor");
+
+        let ins = cfg
+            .resolve_insight_extract()
+            .expect("insight_extraction resolves from the committed config");
+        assert!(ins.extract_prompt.contains("\"facts\""), "facts json contract");
+    }
 }
