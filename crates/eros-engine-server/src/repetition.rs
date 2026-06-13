@@ -118,4 +118,12 @@ mod tests {
         let long = "我看着你".repeat(500);
         assert!(overused_openings(&[long]).is_empty());
     }
+
+    #[test]
+    fn whitespace_and_delimiter_only_turns_yield_no_opening() {
+        // A whitespace-only turn and a delimiter-only turn both produce no
+        // usable opening, so nothing recurs → empty.
+        let turns = v(&["   ", "。。。！", "我看着你笑了。"]);
+        assert!(overused_openings(&turns).is_empty());
+    }
 }
