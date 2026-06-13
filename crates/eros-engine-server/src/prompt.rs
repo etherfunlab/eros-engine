@@ -847,7 +847,9 @@ mod tests {
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(s.starts_with("Always speak solely as this character"), "{s}");
-        assert!(s.find("Always speak solely as this character") < s.find("你是 "));
+        let guard = s.find("Always speak solely as this character").expect("guard present");
+        let identity = s.find("你是 ").expect("identity present");
+        assert!(guard < identity, "guard must precede identity: {s}");
     }
 
     #[test]
@@ -859,7 +861,9 @@ mod tests {
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
         assert!(s.contains("within all other hard constraints in this prompt"), "{s}");
-        assert!(s.find("Always speak solely as this character") < s.find("你是 "));
+        let guard = s.find("Always speak solely as this character").expect("guard present");
+        let identity = s.find("你是 ").expect("identity present");
+        assert!(guard < identity, "guard must precede identity: {s}");
         // ⑦ still renders verbatim — the guard must not replace/contradict it.
         assert!(
             s.contains("any sexual content involving minors"),
