@@ -1122,6 +1122,56 @@ fn apply_ghosting_killswitch(
     }
 }
 
+/// Build a compact persona disposition block for the PDE judge from EXISTING
+/// genome fields. Blank fields are omitted; an all-empty persona yields "".
+/// Deliberately excludes `system_prompt` (long; would re-import the chat prompt's
+/// framing into the judge) and `topics` (irrelevant to disposition).
+fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) -> String {
+    use crate::prompt::{meta_i32, meta_str, meta_string_array_joined};
+    let name = persona.genome.name.trim();
+
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(g) = meta_str(persona, "gender").map(str::trim).filter(|s| !s.is_empty()) {
+        bits.push(g.to_string());
+    }
+    if let Some(a) = meta_i32(persona, "age") {
+        bits.push(format!("{a}岁"));
+    }
+    if let Some(m) = meta_str(persona, "mbti").map(str::trim).filter(|s| !s.is_empty()) {
+        bits.push(m.to_string());
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let head = match (name.is_empty(), bits.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("[角色人格] {}", bits.join("，")),
+        (false, true) => format!("[角色人格] {name}"),
+        (false, false) => format!("[角色人格] {name}，{}", bits.join("，")),
+    };
+    if !head.is_empty() {
+        lines.push(head);
+    }
+    if let Some(ss) = meta_str(persona, "speech_style").map(str::trim).filter(|s| !s.is_empty()) {
+        lines.push(format!("说话风格：{ss}"));
+    }
+    if let Some(q) = meta_string_array_joined(persona, "quirks")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("口癖：{q}"));
+    }
+    if let Some(tp) = persona
+        .genome
+        .tip_personality
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("打赏人格：{tp}"));
+    }
+    lines.join("\n")
+}
+
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInput) -> String {
     let a = &input.affinity;
@@ -1135,8 +1185,14 @@ fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInpu
     } else {
         transcript
     };
+    let brief = build_persona_brief(&input.persona);
+    let persona_block = if brief.is_empty() {
+        String::new()
+    } else {
+        format!("{brief}\n\n")
+    };
     format!(
-        "[最近对话]\n{transcript}\n\n\
+        "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\n\
          [用户最新消息]\n{latest}",
@@ -5815,5 +5871,111 @@ data: [DONE]\n\n";
             produced[0].full_text, "Hi there\nbye",
             "the retained primary garble must be repaired and salvaged despite the failed fallback",
         );
+    }
+
+    // ── Task-1: compact persona brief in PDE ctx ───────────────────────────
+
+    fn test_persona() -> eros_engine_core::persona::CompanionPersona {
+        pde_test_persona()
+    }
+
+    fn test_affinity() -> eros_engine_core::affinity::Affinity {
+        pde_test_affinity()
+    }
+
+    fn test_signals() -> eros_engine_core::types::ConversationSignals {
+        eros_engine_core::types::ConversationSignals {
+            message_count: 10,
+            hours_since_last_message: 1.0,
+            ghost_streak: 0,
+            hours_since_last_ghost: None,
+        }
+    }
+
+    #[test]
+    fn persona_brief_renders_all_fields() {
+        let mut p = test_persona(); // name = "Mia"
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "女", "age": 22, "mbti": "INFP",
+            "speech_style": "软糯爱撒娇", "quirks": ["摸头杀", "突然沉默"]
+        });
+        p.genome.tip_personality = Some("傲娇".into());
+        let b = build_persona_brief(&p);
+        assert!(b.starts_with("[角色人格] Mia，女，22岁，INFP"), "{b}");
+        assert!(b.contains("说话风格：软糯爱撒娇"), "{b}");
+        assert!(b.contains("口癖：摸头杀、突然沉默"), "{b}");
+        assert!(b.contains("打赏人格：傲娇"), "{b}");
+    }
+
+    #[test]
+    fn persona_brief_omits_blank_fields() {
+        let mut p = test_persona(); // name = "Mia"
+        p.genome.art_metadata = serde_json::json!({}); // no gender/age/mbti/...
+        p.genome.tip_personality = None;
+        let b = build_persona_brief(&p);
+        assert_eq!(b, "[角色人格] Mia", "only name renders: {b}");
+    }
+
+    #[test]
+    fn persona_brief_empty_when_no_signal() {
+        let mut p = test_persona();
+        p.genome.name = "".into();
+        p.genome.art_metadata = serde_json::json!({});
+        p.genome.tip_personality = None;
+        assert_eq!(build_persona_brief(&p), "");
+    }
+
+    #[test]
+    fn pde_ctx_renders_persona_block_at_top() {
+        use eros_engine_core::types::{DecisionInput, Event};
+        let mut p = test_persona();
+        p.genome.art_metadata = serde_json::json!({"mbti": "INFP"});
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "在吗".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: test_affinity(),
+            persona: p,
+            signals: test_signals(),
+        };
+        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input);
+        let persona_at = ctx.find("[角色人格]").expect("persona block present");
+        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        assert!(persona_at < rel_at, "persona must precede relationship: {ctx}");
+        assert!(ctx.starts_with("[角色人格]"), "persona block at top: {ctx}");
+    }
+
+    #[test]
+    fn pde_ctx_omits_persona_block_when_empty() {
+        use eros_engine_core::types::{DecisionInput, Event};
+        let mut p = test_persona();
+        p.genome.name = "".into();
+        p.genome.art_metadata = serde_json::json!({});
+        p.genome.tip_personality = None;
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "x".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: test_affinity(),
+            persona: p,
+            signals: test_signals(),
+        };
+        let ctx = build_pde_ctx("", &input);
+        assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
+        assert!(ctx.starts_with("[最近对话]"), "ctx starts with transcript block: {ctx}");
     }
 }
