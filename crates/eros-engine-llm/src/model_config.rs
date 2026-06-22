@@ -2647,7 +2647,8 @@ filter_prompt = "   "
         // absent → true
         let cfg = ModelConfig::from_toml_str(
             "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(cfg.resolve_pde().unwrap().structured_output);
         // explicit false → false
         let cfg = ModelConfig::from_toml_str(

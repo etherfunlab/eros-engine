@@ -1633,24 +1633,48 @@ data: [DONE]\n\n";
         let messages: Vec<ChatMessage> = vec![];
         let rf = serde_json::json!({"type": "json_schema"});
         let wire = WireRequest {
-            model: "m", messages: &messages, temperature: 0.0,
-            top_p: None, frequency_penalty: None, presence_penalty: None,
-            max_tokens: 16, stream: false, user: None, session_id: None,
-            metadata: None, reasoning: None, provider: None,
+            model: "m",
+            messages: &messages,
+            temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
             response_format: Some(&rf),
         };
         let s = serde_json::to_string(&wire).unwrap();
-        assert!(s.contains("\"response_format\":{\"type\":\"json_schema\"}"), "{s}");
+        assert!(
+            s.contains("\"response_format\":{\"type\":\"json_schema\"}"),
+            "{s}"
+        );
 
         let wire_none = WireRequest {
-            model: "m", messages: &messages, temperature: 0.0,
-            top_p: None, frequency_penalty: None, presence_penalty: None,
-            max_tokens: 16, stream: false, user: None, session_id: None,
-            metadata: None, reasoning: None, provider: None,
+            model: "m",
+            messages: &messages,
+            temperature: 0.0,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: None,
             response_format: None,
         };
         let s_none = serde_json::to_string(&wire_none).unwrap();
-        assert!(!s_none.contains("response_format"), "absent ⇒ omitted: {s_none}");
+        assert!(
+            !s_none.contains("response_format"),
+            "absent ⇒ omitted: {s_none}"
+        );
     }
 
     #[test]

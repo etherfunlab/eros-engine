@@ -1016,6 +1016,15 @@ fn pde_response_format() -> serde_json::Value {
     })
 }
 
+/// The last parse-error attempt's text + audit echo, kept so a chain-exhausted
+/// ParseError return preserves the raw model text and audit trio.
+struct LastParseAttempt {
+    raw: String,
+    model: Option<String>,
+    usage: Option<serde_json::Value>,
+    generation_id: Option<String>,
+}
+
 /// Run the PDE judge over the assembled context. Walks `[model] + fallback`
 /// trying the next model on a transport failure (error/timeout/empty) or a
 /// parse error; a chain-exhausted ParseError preserves the last attempt's raw
@@ -1031,9 +1040,9 @@ async fn run_pde_decision(
         .chain(p.fallback_model.iter().cloned())
         .collect();
     let mut last = PdeStatus::Error; // chain-exhausted default
-    // On a content-level reply that won't parse, keep the LAST attempt's text +
-    // audit trio so the chain-exhausted ParseError return stays faithful.
-    let mut last_parse: Option<(String, Option<String>, Option<serde_json::Value>, Option<String>)> = None;
+                                     // On a content-level reply that won't parse, keep the LAST attempt's text +
+                                     // audit trio so the chain-exhausted ParseError return stays faithful.
+    let mut last_parse: Option<LastParseAttempt> = None;
     let response_format = p.structured_output.then(pde_response_format);
     for model_id in &chain {
         let req = ChatRequest {
@@ -1089,12 +1098,12 @@ async fn run_pde_decision(
             None => {
                 tracing::warn!(model = %model_id, "pde: unparseable verdict; trying next model");
                 last = PdeStatus::ParseError;
-                last_parse = Some((
-                    text,
-                    resp.model.or_else(|| Some(model_id.clone())),
-                    resp.usage,
-                    resp.generation_id,
-                ));
+                last_parse = Some(LastParseAttempt {
+                    raw: text,
+                    model: resp.model.or_else(|| Some(model_id.clone())),
+                    usage: resp.usage,
+                    generation_id: resp.generation_id,
+                });
                 continue;
             }
         }
@@ -1102,15 +1111,14 @@ async fn run_pde_decision(
     // chain exhausted
     match last {
         PdeStatus::ParseError => {
-            let (raw, model, usage, generation_id) =
-                last_parse.expect("ParseError ⇒ last_parse is set");
+            let lp = last_parse.expect("ParseError ⇒ last_parse is set");
             PdeDecisionRun {
                 status: PdeStatus::ParseError,
                 verdict: None,
-                raw: Some(raw),
-                model,
-                usage,
-                generation_id,
+                raw: Some(lp.raw),
+                model: lp.model,
+                usage: lp.usage,
+                generation_id: lp.generation_id,
             }
         }
         other => PdeDecisionRun {
@@ -1176,13 +1184,19 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
     let name = persona.genome.name.trim();
 
     let mut bits: Vec<String> = Vec::new();
-    if let Some(g) = meta_str(persona, "gender").map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(g) = meta_str(persona, "gender")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         bits.push(g.to_string());
     }
     if let Some(a) = meta_i32(persona, "age") {
         bits.push(format!("{a}岁"));
     }
-    if let Some(m) = meta_str(persona, "mbti").map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(m) = meta_str(persona, "mbti")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         bits.push(m.to_string());
     }
 
@@ -1196,7 +1210,10 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
     if !head.is_empty() {
         lines.push(head);
     }
-    if let Some(ss) = meta_str(persona, "speech_style").map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(ss) = meta_str(persona, "speech_style")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         lines.push(format!("说话风格：{ss}"));
     }
     if let Some(q) = meta_string_array_joined(persona, "quirks")
@@ -5993,7 +6010,10 @@ data: [DONE]\n\n";
         let ctx = build_pde_ctx("用户：hi\nMia：hey", &input);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
-        assert!(persona_at < rel_at, "persona must precede relationship: {ctx}");
+        assert!(
+            persona_at < rel_at,
+            "persona must precede relationship: {ctx}"
+        );
         assert!(ctx.starts_with("[角色人格]"), "persona block at top: {ctx}");
     }
 
@@ -6021,7 +6041,10 @@ data: [DONE]\n\n";
         };
         let ctx = build_pde_ctx("", &input);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
-        assert!(ctx.starts_with("[最近对话]"), "ctx starts with transcript block: {ctx}");
+        assert!(
+            ctx.starts_with("[最近对话]"),
+            "ctx starts with transcript block: {ctx}"
+        );
     }
 
     // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
@@ -6035,7 +6058,8 @@ data: [DONE]\n\n";
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
         assert_eq!(req.len(), 4, "all four properties required: {v}");
         let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
-            .as_array().unwrap();
+            .as_array()
+            .unwrap();
         assert_eq!(actions.len(), 4, "four actions: {v}");
     }
 
@@ -6069,7 +6093,8 @@ data: [DONE]\n\n";
                 "choices": [{"message": {"content": "totally not json"}}],
                 "id": "gen-a", "model": "model-a"
             })))
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
         // fallback "model-b" → valid verdict
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("model-b"))
@@ -6101,7 +6126,8 @@ data: [DONE]\n\n";
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"content": "nope"}}], "id": "g", "model": "m"
             })))
-            .mount(&mock).await;
+            .mount(&mock)
+            .await;
 
         let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
             "k".into(),
