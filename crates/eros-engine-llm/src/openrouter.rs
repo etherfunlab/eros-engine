@@ -55,6 +55,9 @@ pub struct ChatRequest {
     /// Reasoning config forwarded to OpenRouter. `None` → omit the param;
     /// `Some(cfg)` → send the `reasoning` object verbatim.
     pub reasoning: Option<ReasoningConfig>,
+    /// PDE-only: OpenRouter `response_format` (e.g. a json_schema object).
+    /// `None` ⇒ omitted. Opaque passthrough; the caller builds the schema.
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// One-shot multimodal *describe* request. Used only by the `chat_vision`
@@ -155,6 +158,8 @@ struct WireRequest<'a> {
     reasoning: Option<&'a ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderPrefs<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +409,7 @@ impl OpenRouterClient {
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
                     req.reasoning.as_ref(),
+                    req.response_format.as_ref(),
                 )
                 .await
             {
@@ -601,6 +607,7 @@ impl OpenRouterClient {
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
         req_reasoning: Option<&ReasoningConfig>,
+        req_response_format: Option<&serde_json::Value>,
     ) -> Result<ChatResponse, LlmError> {
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
@@ -620,6 +627,7 @@ impl OpenRouterClient {
             metadata: req_metadata,
             reasoning: req_reasoning,
             provider: self.provider_prefs(),
+            response_format: req_response_format,
         };
 
         let resp = self
@@ -697,6 +705,7 @@ impl OpenRouterClient {
             metadata: req.metadata.as_ref(),
             reasoning: req.reasoning.as_ref(),
             provider: self.provider_prefs(),
+            response_format: None,
         };
 
         let resp = self
@@ -976,6 +985,7 @@ mod tests {
             metadata: req.metadata.as_ref(),
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("\"user\":"), "user key must be absent: {s}");
@@ -1020,6 +1030,7 @@ mod tests {
             metadata: req.metadata.as_ref(),
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(s.contains("\"user\":\"u_abc\""), "{s}");
@@ -1545,6 +1556,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: Some(&cfg),
             provider: None,
+            response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(
@@ -1567,6 +1579,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let s_none = serde_json::to_string(&wire_none).unwrap();
         assert!(
@@ -1616,6 +1629,31 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn wire_request_serializes_response_format_only_when_present() {
+        let messages: Vec<ChatMessage> = vec![];
+        let rf = serde_json::json!({"type": "json_schema"});
+        let wire = WireRequest {
+            model: "m", messages: &messages, temperature: 0.0,
+            top_p: None, frequency_penalty: None, presence_penalty: None,
+            max_tokens: 16, stream: false, user: None, session_id: None,
+            metadata: None, reasoning: None, provider: None,
+            response_format: Some(&rf),
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(s.contains("\"response_format\":{\"type\":\"json_schema\"}"), "{s}");
+
+        let wire_none = WireRequest {
+            model: "m", messages: &messages, temperature: 0.0,
+            top_p: None, frequency_penalty: None, presence_penalty: None,
+            max_tokens: 16, stream: false, user: None, session_id: None,
+            metadata: None, reasoning: None, provider: None,
+            response_format: None,
+        };
+        let s_none = serde_json::to_string(&wire_none).unwrap();
+        assert!(!s_none.contains("response_format"), "absent ⇒ omitted: {s_none}");
+    }
+
+    #[test]
     fn wire_request_omits_provider_when_no_ignore_list() {
         let wire = WireRequest {
             model: "x/y",
@@ -1631,6 +1669,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let body = serde_json::to_value(&wire).unwrap();
         assert!(
@@ -1656,6 +1695,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: None,
             provider: Some(ProviderPrefs { ignore: &ignore }),
+            response_format: None,
         };
         let body = serde_json::to_value(&wire).unwrap();
         assert_eq!(body["provider"]["ignore"][0], "BadHost");
@@ -1983,6 +2023,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(s.contains("\"top_p\":0.9"), "{s}");
@@ -2010,6 +2051,7 @@ data: [DONE]\n\n";
             metadata: None,
             reasoning: None,
             provider: None,
+            response_format: None,
         };
         let s = serde_json::to_string(&wire).unwrap();
         assert!(!s.contains("top_p"), "unset top_p must be omitted: {s}");
