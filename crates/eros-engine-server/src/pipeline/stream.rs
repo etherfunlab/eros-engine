@@ -991,13 +991,38 @@ pub(crate) struct PdeDecisionRun {
     pub(crate) generation_id: Option<String>,
 }
 
+/// OpenRouter `response_format` for the PDE verdict (json_schema, strict). The
+/// optional verdict fields are nullable so a strict provider returns `null`,
+/// which deserializes to `PdeVerdict`'s `Option` fields as `None`.
+fn pde_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "pde_verdict",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action", "inner_state", "image_prompt", "reason"],
+                "properties": {
+                    "action": { "type": "string",
+                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
+                    "inner_state": { "type": "string" },
+                    "image_prompt": { "type": ["string", "null"] },
+                    "reason": { "type": ["string", "null"] }
+                }
+            }
+        }
+    })
+}
+
 /// Run the PDE judge over the assembled context. Walks `[model] + fallback`
-/// trying the next model on a transport failure (error/timeout/empty); a
-/// content-level reply that won't parse is a definitive `ParseError` (no further
-/// walk), mirroring `run_input_filter`. Fail-open: any non-`Ok` status → the
-/// caller uses the rule fallback. NEVER returns an error — always a run record.
+/// trying the next model on a transport failure (error/timeout/empty) or a
+/// parse error; a chain-exhausted ParseError preserves the last attempt's raw
+/// text + audit trio. Fail-open: any non-`Ok` status → the caller uses the
+/// rule fallback. NEVER returns an error — always a run record.
 async fn run_pde_decision(
-    state: &AppState,
+    client: &eros_engine_llm::openrouter::OpenRouterClient,
     p: &eros_engine_llm::model_config::ResolvedPde,
     ctx: &str,
 ) -> PdeDecisionRun {
@@ -1006,6 +1031,10 @@ async fn run_pde_decision(
         .chain(p.fallback_model.iter().cloned())
         .collect();
     let mut last = PdeStatus::Error; // chain-exhausted default
+    // On a content-level reply that won't parse, keep the LAST attempt's text +
+    // audit trio so the chain-exhausted ParseError return stays faithful.
+    let mut last_parse: Option<(String, Option<String>, Option<serde_json::Value>, Option<String>)> = None;
+    let response_format = p.structured_output.then(pde_response_format);
     for model_id in &chain {
         let req = ChatRequest {
             model: model_id.clone(),
@@ -1023,9 +1052,10 @@ async fn run_pde_decision(
             temperature: p.temperature as f32,
             max_tokens: p.max_tokens,
             reasoning: p.reasoning.clone(),
+            response_format: response_format.clone(),
             ..Default::default()
         };
-        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, client.execute(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
@@ -1045,37 +1075,52 @@ async fn run_pde_decision(
             last = PdeStatus::Empty;
             continue;
         }
-        // Content-level reply — definitive, no further chain walk.
-        return match parse_pde_verdict(&text) {
-            Some(verdict) => PdeDecisionRun {
-                status: PdeStatus::Ok,
-                verdict: Some(verdict),
-                raw: None,
-                model: resp.model.or_else(|| Some(model_id.clone())),
-                usage: resp.usage,
-                generation_id: resp.generation_id,
-            },
-            None => {
-                tracing::warn!(model = %model_id, "pde: unparseable verdict; fallback to rule");
-                PdeDecisionRun {
-                    status: PdeStatus::ParseError,
-                    verdict: None,
-                    raw: Some(text),
+        match parse_pde_verdict(&text) {
+            Some(verdict) => {
+                return PdeDecisionRun {
+                    status: PdeStatus::Ok,
+                    verdict: Some(verdict),
+                    raw: None,
                     model: resp.model.or_else(|| Some(model_id.clone())),
                     usage: resp.usage,
                     generation_id: resp.generation_id,
-                }
+                };
             }
-        };
+            None => {
+                tracing::warn!(model = %model_id, "pde: unparseable verdict; trying next model");
+                last = PdeStatus::ParseError;
+                last_parse = Some((
+                    text,
+                    resp.model.or_else(|| Some(model_id.clone())),
+                    resp.usage,
+                    resp.generation_id,
+                ));
+                continue;
+            }
+        }
     }
-    // chain exhausted on transport failures
-    PdeDecisionRun {
-        status: last,
-        verdict: None,
-        raw: None,
-        model: None,
-        usage: None,
-        generation_id: None,
+    // chain exhausted
+    match last {
+        PdeStatus::ParseError => {
+            let (raw, model, usage, generation_id) =
+                last_parse.expect("ParseError ⇒ last_parse is set");
+            PdeDecisionRun {
+                status: PdeStatus::ParseError,
+                verdict: None,
+                raw: Some(raw),
+                model,
+                usage,
+                generation_id,
+            }
+        }
+        other => PdeDecisionRun {
+            status: other,
+            verdict: None,
+            raw: None,
+            model: None,
+            usage: None,
+            generation_id: None,
+        },
     }
 }
 
@@ -1848,7 +1893,7 @@ pub fn run_stream(
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
                     let ctx = build_pde_ctx(&pde_transcript, &input);
-                    let run = run_pde_decision(&state, p, &ctx).await;
+                    let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
                             let action = guard_action(v.action, &input.affinity, &input.signals);
@@ -5977,5 +6022,96 @@ data: [DONE]\n\n";
         let ctx = build_pde_ctx("", &input);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(ctx.starts_with("[最近对话]"), "ctx starts with transcript block: {ctx}");
+    }
+
+    // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
+
+    #[test]
+    fn pde_response_format_schema_shape() {
+        let v = pde_response_format();
+        assert_eq!(v["type"], "json_schema");
+        assert_eq!(v["json_schema"]["name"], "pde_verdict");
+        assert_eq!(v["json_schema"]["strict"], true);
+        let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
+        assert_eq!(req.len(), 4, "all four properties required: {v}");
+        let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
+            .as_array().unwrap();
+        assert_eq!(actions.len(), 4, "four actions: {v}");
+    }
+
+    fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {
+        let (model, fallback_model) = {
+            let mut it = models.into_iter();
+            (it.next().unwrap(), it.collect::<Vec<_>>())
+        };
+        eros_engine_llm::model_config::ResolvedPde {
+            model,
+            fallback_model,
+            temperature: 0.2,
+            max_tokens: 180,
+            decision_prompt: "decide".into(),
+            retry_depth: 2,
+            reasoning: None,
+            structured_output: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn pde_parse_error_walks_to_next_model() {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // primary "model-a" → unparseable text
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("model-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "totally not json"}}],
+                "id": "gen-a", "model": "model-a"
+            })))
+            .mount(&mock).await;
+        // fallback "model-b" → valid verdict
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("model-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"想接话\"}"}}],
+                "id": "gen-b", "model": "model-b"
+            })))
+            .mount(&mock).await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::Ok);
+        assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
+        assert_eq!(run.model.as_deref(), Some("model-b"));
+    }
+
+    #[tokio::test]
+    async fn pde_whole_chain_parse_error_preserves_last_raw() {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "nope"}}], "id": "g", "model": "m"
+            })))
+            .mount(&mock).await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::ParseError);
+        assert_eq!(run.raw.as_deref(), Some("nope"));
+        assert!(run.verdict.is_none());
     }
 }
