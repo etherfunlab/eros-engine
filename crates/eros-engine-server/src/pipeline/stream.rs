@@ -32,6 +32,8 @@ pub enum StreamErrorCode {
 pub enum FrameActionType {
     Reply,
     Ghost,
+    ReplyImage,
+    ReplyTextImage,
 }
 
 /// One wire frame in the SSE protocol.
@@ -78,11 +80,34 @@ pub enum ProtocolFrame {
         message: String,
         user_message: String,
     },
+    Image {
+        message_id: String,
+        data_url: String,
+        mime: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_prompt: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        generation_id: Option<String>,
+    },
 }
 
 /// Render a 128-bit id as a Crockford Base32 ULID string (26 chars).
 pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
+}
+
+/// Map an `ActionType` to the `FrameActionType` used in SSE Meta/Image frames.
+// consumed by the image execution arm (Task 10)
+#[allow(dead_code)]
+fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
+    match a {
+        eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
+        eros_engine_core::types::ActionType::ReplyTextImage => FrameActionType::ReplyTextImage,
+        eros_engine_core::types::ActionType::Ghost => FrameActionType::Ghost,
+        _ => FrameActionType::Reply,
+    }
 }
 
 use std::sync::Arc;
@@ -2401,6 +2426,22 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "meta");
         assert!(v.get("model").is_none(), "model must be omitted when None");
+    }
+
+    #[test]
+    fn image_frame_serializes_with_type_tag() {
+        let f = ProtocolFrame::Image {
+            message_id: "m1".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+            mime: "image/png".into(),
+            image_prompt: Some("a cat".into()),
+            model: Some("img-a".into()),
+            generation_id: Some("gen_1".into()),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["data_url"], "data:image/png;base64,AAAA");
+        assert_eq!(v["image_prompt"], "a cat");
     }
 
     #[test]
