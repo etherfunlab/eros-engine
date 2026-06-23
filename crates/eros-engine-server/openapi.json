@@ -1068,6 +1068,60 @@
           }
         }
       },
+      "ImageMode": {
+        "type": "string",
+        "enum": [
+          "text_image",
+          "image_only"
+        ]
+      },
+      "ImageReplyParams": {
+        "type": "object",
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "face_ref_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "force": {
+            "type": "boolean"
+          },
+          "image_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ImageMode"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "ListSessionsResponse": {
         "type": "object",
         "required": [
@@ -1301,6 +1355,16 @@
           },
           "content": {
             "type": "string"
+          },
+          "image": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageReplyParams"
+              }
+            ]
           },
           "image_url": {
             "type": [
