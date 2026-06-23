@@ -11,17 +11,17 @@
 [![Crates.io: llm](https://img.shields.io/crates/v/eros-engine-llm.svg?label=eros-engine-llm)](https://crates.io/crates/eros-engine-llm)
 [![GHCR: eros-engine](https://img.shields.io/badge/ghcr.io-etherfunlab%2Feros--engine-blue)](https://github.com/etherfunlab/eros-engine/pkgs/container/eros-engine)
 
-English · [中文](README.zh.md)
+**English** · [中文](README.zh.md) · [日本語](README.ja.md)
 
 ## Why this exists
 
-Most AI character apps treat memory as a prompt append and relationship as a paragraph of instructions. That works for a demo, but it drifts over long sessions, breaks character, and is hard to debug. `eros-engine` moves those concerns into explicit, inspectable state, so a companion feels like **a real person** — it remembers you and reacts to where the relationship is — and **stays in character** turn after turn, because behavior is *decided*, not improvised.
+Most AI character apps treat memory as text appended to a prompt and relationship as a paragraph of instructions. That can work in a demo, but behavior drifts over long sessions, breaks character, and becomes hard to debug. `eros-engine` moves those concerns into explicit, inspectable state, so a companion feels like **a real person** — remembering you and responding to the state of the relationship — and **stays in character** turn after turn, because behavior is *decided*, not improvised.
 
-Five pillars carry that:
+Five pillars support this:
 
 - **Two-layer memory** — profile memory (stable user facts) and relationship memory (shared moments, callbacks, open threads) in Postgres + pgvector, so the companion remembers you across sessions and personas. → [Memory layers](docs/memory-layers.md)
 - **Six-axis affinity + ghost mechanics** — a numeric relationship vector (warmth, trust, intimacy, intrigue, patience, tension) updated with EMA smoothing and real-time decay; it reshapes tone, depth, and behavior over time, and can even decide *not* to reply. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
-- **Persona Decision Engine (PDE)** — picks each turn's action (reply, ghost, or send a photo) and inner state — rules-based by default, with an opt-in LLM judge. This is what keeps replies human and in-character instead of a generic assistant voice; judge calls are audited to `companion_decision_events`. → [Model config](docs/model-config.md)
+- **Persona Decision Engine (PDE)** — selects each turn's action (reply, ghost, or send a photo) and inner state — rules-based by default, with an opt-in LLM judge. This keeps replies human and in character instead of sounding like a generic assistant; judge calls are audited to `companion_decision_events`. → [Model config](docs/model-config.md)
 - **Structured user insight** — a JSONB profile (city, occupation, interests, MBTI signals, emotional needs, life rhythm, matching preferences) with a weighted `training_level`, queryable by downstream products for matchmaking, onboarding, analytics, or gating. → [API reference](docs/api-reference.md)
 - **Built for fluent companion chat** — token-by-token SSE streaming; image understanding (the user can send a photo) and companion-sent image generation (`reply_image` / `reply_text_image`); per-request prompt traits and tiers; OpenRouter-backed routing with per-task model selection (fixed / round-robin / weighted, plus a fallback chain) and full call auditing. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
@@ -75,7 +75,7 @@ eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
 
 ## Run as a Docker image
 
-`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag (need arm64? build it yourself from `docker/Dockerfile`):
+`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:0.6.2
@@ -106,7 +106,7 @@ The `docker/Dockerfile` is the same artifact used to build this image. Deploy it
 
 ## Quickstart
 
-Prerequisites: a Rust toolchain (`rust-toolchain.toml`), Postgres 16+ with `pgvector`, an OpenRouter API key, a Voyage API key, and a Supabase JWT secret (or your own `AuthValidator`).
+Prerequisites: a Rust toolchain (`rust-toolchain.toml`), Postgres 16+ with `pgvector`, an OpenRouter API key, a Voyage API key, and one auth source — Supabase JWKS (`SUPABASE_URL`) or a legacy `SUPABASE_JWT_SECRET` (or your own `AuthValidator`).
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
@@ -118,7 +118,7 @@ cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-The server listens on `0.0.0.0:8080` by default. Scalar API docs are at `/docs`; the OpenAPI JSON is at `/api-docs/openapi.json`. The official Eros Chat web client is closed-source — bring your own UI or embed the crates in another service.
+The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`; the OpenAPI JSON is at `/api-docs/openapi.json`. The official Eros Chat web client is closed-source — bring your own UI or embed the crates in another service.
 
 ## API surface
 
@@ -130,11 +130,11 @@ All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default (
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — history, session list, and the structured insight profile.
 - `GET /comp/affinity/{session_id}` — debug-only live affinity vector (`EXPOSE_AFFINITY_DEBUG=true`).
 
-The blocking synchronous `/message` endpoint was removed in 0.3 — SSE is the only chat path. For the full request schema, SSE frame layout (incl. `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
+The blocking synchronous `/message` endpoint was removed in 0.3 — SSE is the only chat path. For the full request schema, SSE frame layout (including `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
 
 ## Configuration
 
-Required env vars: `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and **one** auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS, the post-2025 Supabase default) **or** `SUPABASE_JWT_SECRET` (legacy HS256). The server fails closed to boot if no auth source is set.
+Required env vars: `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and **one** auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS, the post-2025 Supabase default) **or** `SUPABASE_JWT_SECRET` (legacy HS256). The server refuses to boot if no auth source is set.
 
 Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
 
@@ -161,7 +161,7 @@ If you are building a different product, the reusable part is the affinity + mem
 
 The example personas under `examples/personas/` are written as adult character-chat examples. They can flirt and express desire when the relationship state reaches that point, while still refusing disrespectful or boundary-crossing behavior. If your product needs a SFW default, replace those persona files before deploying.
 
-Per-request behaviour can be further modulated via the [`prompt_traits`](docs/prompt-traits.md) field on the message routes — the engine treats the supplied text as opaque, so the policy of what those traits encode lives entirely in your frontend / middleware.
+Per-request behavior can be further adjusted via the [`prompt_traits`](docs/prompt-traits.md) field on the message routes — the engine treats the supplied text as opaque, so the policy defining what those traits encode lives entirely in your frontend / middleware.
 
 ## Contributing
 
