@@ -129,8 +129,6 @@ pub struct ImageGenRequest {
 pub struct ImageGenResponse {
     /// Base64 data-URLs extracted from `message.images[]`.
     pub images: Vec<String>,
-    /// Optional text accompanying the images (from `message.content`).
-    pub text: Option<String>,
     /// OpenRouter response `id` — opaque generation handle.
     pub generation_id: Option<String>,
     /// Model actually served (may differ from request when fallback hit).
@@ -743,11 +741,9 @@ impl OpenRouterClient {
                 continue;
             }
             let first = parsed.choices.into_iter().next();
-            let text = first.as_ref().and_then(|c| c.message.content.clone());
             let finish_reason = first.and_then(|c| c.finish_reason);
             return Ok(ImageGenResponse {
                 images,
-                text,
                 generation_id: parsed.id,
                 model: parsed.model,
                 usage: parsed.usage,
