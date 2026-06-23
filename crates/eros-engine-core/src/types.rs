@@ -115,6 +115,9 @@ pub struct ActionPlan {
     pub affinity_deltas: AffinityDeltas,
     pub energy_cost: f64,
     pub context_hints: Vec<String>,
+    /// Subject for the image executor (`reply_image`/`reply_text_image`); `None`
+    /// for text/ghost/proactive. Carried from the PDE verdict or a forced turn.
+    pub image_prompt: Option<String>,
 }
 
 /// Conversation signals computed from chat history.

@@ -270,7 +270,7 @@ pub fn tips_reaction_context(amount_usd: f64, tip_personality: Option<&str>) -> 
 }
 
 /// Pluck a string field out of `art_metadata`.
-fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&'a str> {
+pub(crate) fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&'a str> {
     persona
         .genome
         .art_metadata
@@ -279,7 +279,7 @@ fn meta_str<'a>(persona: &'a CompanionPersona, key: &str) -> Option<&'a str> {
 }
 
 /// Pluck an i32 field out of `art_metadata`.
-fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
+pub(crate) fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
     persona
         .genome
         .art_metadata
@@ -289,7 +289,7 @@ fn meta_i32(persona: &CompanionPersona, key: &str) -> Option<i32> {
 }
 
 /// Pluck a string-array field out of `art_metadata`, joined with `、`.
-fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<String> {
+pub(crate) fn meta_string_array_joined(persona: &CompanionPersona, key: &str) -> Option<String> {
     persona
         .genome
         .art_metadata

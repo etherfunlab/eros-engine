@@ -32,6 +32,8 @@ pub enum StreamErrorCode {
 pub enum FrameActionType {
     Reply,
     Ghost,
+    ReplyImage,
+    ReplyTextImage,
 }
 
 /// One wire frame in the SSE protocol.
@@ -78,11 +80,92 @@ pub enum ProtocolFrame {
         message: String,
         user_message: String,
     },
+    Image {
+        message_id: String,
+        data_url: String,
+        mime: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_prompt: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        generation_id: Option<String>,
+    },
 }
 
 /// Render a 128-bit id as a Crockford Base32 ULID string (26 chars).
 pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
+}
+
+/// Map an `ActionType` to the `FrameActionType` used in SSE Meta/Image frames.
+/// Consumed by the image execution arm (Task 10).
+fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
+    match a {
+        eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
+        eros_engine_core::types::ActionType::ReplyTextImage => FrameActionType::ReplyTextImage,
+        eros_engine_core::types::ActionType::Ghost => FrameActionType::Ghost,
+        _ => FrameActionType::Reply,
+    }
+}
+
+/// Assemble an `ImageGenRequest` from the per-turn image executor chain, the
+/// resolved `chat_image_generation` defaults, the persona, and the optional
+/// per-turn `ImageReplyParams`. Pure (no I/O). Per-turn overrides win over the
+/// resolved defaults; `plan_image_prompt` (the judge's / forced prompt) wins as
+/// the subject, then the per-turn `image_prompt`, then `fallback_subject`.
+#[allow(clippy::too_many_arguments)]
+fn build_image_gen_request(
+    primary: String,
+    chain: Vec<String>,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    plan_image_prompt: Option<&str>,
+    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    resolved: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
+    fallback_subject: &str,
+) -> eros_engine_llm::openrouter::ImageGenRequest {
+    use eros_engine_llm::model_config::StyleKey;
+    let style: StyleKey = req_image
+        .and_then(|i| i.style)
+        .or_else(|| resolved.map(|r| r.default_style))
+        .unwrap_or_default();
+    let subject = plan_image_prompt
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            req_image
+                .and_then(|i| i.image_prompt.as_deref())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(fallback_subject);
+    let prompt = crate::pipeline::handlers::compose_image_prompt(style, persona, subject);
+    let aspect_ratio = req_image
+        .and_then(|i| i.aspect_ratio.clone())
+        .or_else(|| resolved.map(|r| r.default_aspect_ratio.clone()));
+    let resolution = req_image
+        .and_then(|i| i.resolution.clone())
+        .or_else(|| resolved.and_then(|r| r.default_resolution.clone()));
+    eros_engine_llm::openrouter::ImageGenRequest {
+        model: primary,
+        fallback_model: chain,
+        prompt,
+        face_ref_url: req_image.and_then(|i| i.face_ref_url.clone()),
+        aspect_ratio,
+        resolution,
+        max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
+    }
+}
+
+/// Parse the MIME type out of a `data:` URL prefix (e.g.
+/// `data:image/png;base64,AAAA` → `"image/png"`). Defaults to `"image/png"`
+/// when the input is not a recognizable `data:<mime>;` URL.
+fn data_url_mime(data_url: &str) -> String {
+    data_url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split(';').next())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("image/png")
+        .to_string()
 }
 
 use std::sync::Arc;
@@ -991,13 +1074,50 @@ pub(crate) struct PdeDecisionRun {
     pub(crate) generation_id: Option<String>,
 }
 
+/// OpenRouter `response_format` for the PDE verdict (json_schema, strict). The
+/// optional verdict fields are nullable so a strict provider returns `null`,
+/// which deserializes to `PdeVerdict`'s `Option` fields as `None`.
+fn pde_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "pde_verdict",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action", "inner_state", "image_prompt", "reason"],
+                "properties": {
+                    "action": { "type": "string",
+                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
+                    "inner_state": { "type": "string" },
+                    "image_prompt": { "type": ["string", "null"] },
+                    "reason": { "type": ["string", "null"] }
+                }
+            }
+        }
+    })
+}
+
+/// The last parse-error attempt's text + audit echo, kept so a chain-exhausted
+/// ParseError return preserves the raw model text and audit trio.
+struct LastParseAttempt {
+    raw: String,
+    model: Option<String>,
+    usage: Option<serde_json::Value>,
+    generation_id: Option<String>,
+}
+
 /// Run the PDE judge over the assembled context. Walks `[model] + fallback`
-/// trying the next model on a transport failure (error/timeout/empty); a
-/// content-level reply that won't parse is a definitive `ParseError` (no further
-/// walk), mirroring `run_input_filter`. Fail-open: any non-`Ok` status → the
-/// caller uses the rule fallback. NEVER returns an error — always a run record.
+/// trying the next model on a transport failure (error/timeout/empty) or a
+/// parse error; a chain-exhausted ParseError preserves the last attempt's raw
+/// text + audit trio. Fail-open: any non-`Ok` status → the caller uses the
+/// rule fallback. NEVER returns an error — always a run record.
+///
+/// Unlike `run_input_filter`, a content-level reply that won't parse here walks
+/// the rest of the chain before the caller falls back to the rule engine.
 async fn run_pde_decision(
-    state: &AppState,
+    client: &eros_engine_llm::openrouter::OpenRouterClient,
     p: &eros_engine_llm::model_config::ResolvedPde,
     ctx: &str,
 ) -> PdeDecisionRun {
@@ -1006,6 +1126,10 @@ async fn run_pde_decision(
         .chain(p.fallback_model.iter().cloned())
         .collect();
     let mut last = PdeStatus::Error; // chain-exhausted default
+                                     // On a content-level reply that won't parse, keep the LAST attempt's text +
+                                     // audit trio so the chain-exhausted ParseError return stays faithful.
+    let mut last_parse: Option<LastParseAttempt> = None;
+    let response_format = p.structured_output.then(pde_response_format);
     for model_id in &chain {
         let req = ChatRequest {
             model: model_id.clone(),
@@ -1023,9 +1147,10 @@ async fn run_pde_decision(
             temperature: p.temperature as f32,
             max_tokens: p.max_tokens,
             reasoning: p.reasoning.clone(),
+            response_format: response_format.clone(),
             ..Default::default()
         };
-        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, client.execute(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
@@ -1045,37 +1170,51 @@ async fn run_pde_decision(
             last = PdeStatus::Empty;
             continue;
         }
-        // Content-level reply — definitive, no further chain walk.
-        return match parse_pde_verdict(&text) {
-            Some(verdict) => PdeDecisionRun {
-                status: PdeStatus::Ok,
-                verdict: Some(verdict),
-                raw: None,
-                model: resp.model.or_else(|| Some(model_id.clone())),
-                usage: resp.usage,
-                generation_id: resp.generation_id,
-            },
-            None => {
-                tracing::warn!(model = %model_id, "pde: unparseable verdict; fallback to rule");
-                PdeDecisionRun {
-                    status: PdeStatus::ParseError,
-                    verdict: None,
-                    raw: Some(text),
+        match parse_pde_verdict(&text) {
+            Some(verdict) => {
+                return PdeDecisionRun {
+                    status: PdeStatus::Ok,
+                    verdict: Some(verdict),
+                    raw: None,
                     model: resp.model.or_else(|| Some(model_id.clone())),
                     usage: resp.usage,
                     generation_id: resp.generation_id,
-                }
+                };
             }
-        };
+            None => {
+                tracing::warn!(model = %model_id, "pde: unparseable verdict; trying next model");
+                last = PdeStatus::ParseError;
+                last_parse = Some(LastParseAttempt {
+                    raw: text,
+                    model: resp.model.or_else(|| Some(model_id.clone())),
+                    usage: resp.usage,
+                    generation_id: resp.generation_id,
+                });
+                continue;
+            }
+        }
     }
-    // chain exhausted on transport failures
-    PdeDecisionRun {
-        status: last,
-        verdict: None,
-        raw: None,
-        model: None,
-        usage: None,
-        generation_id: None,
+    // chain exhausted
+    match last {
+        PdeStatus::ParseError => {
+            let lp = last_parse.expect("ParseError ⇒ last_parse is set");
+            PdeDecisionRun {
+                status: PdeStatus::ParseError,
+                verdict: None,
+                raw: Some(lp.raw),
+                model: lp.model,
+                usage: lp.usage,
+                generation_id: lp.generation_id,
+            }
+        }
+        other => PdeDecisionRun {
+            status: other,
+            verdict: None,
+            raw: None,
+            model: None,
+            usage: None,
+            generation_id: None,
+        },
     }
 }
 
@@ -1087,6 +1226,7 @@ fn guard_action(
     proposed: PdeAction,
     affinity: &eros_engine_core::affinity::Affinity,
     signals: &eros_engine_core::types::ConversationSignals,
+    image_executor_available: bool,
 ) -> ActionType {
     match proposed {
         PdeAction::Ghost => {
@@ -1100,7 +1240,10 @@ fn guard_action(
                 ActionType::ReplyText
             }
         }
-        // image executor not shipped → always degrade to text
+        // Keep the image action when an executor chain exists this turn;
+        // otherwise degrade to text (today's behaviour).
+        PdeAction::ReplyImage if image_executor_available => ActionType::ReplyImage,
+        PdeAction::ReplyTextImage if image_executor_available => ActionType::ReplyTextImage,
         PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
         PdeAction::ReplyText => ActionType::ReplyText,
     }
@@ -1116,10 +1259,69 @@ fn apply_ghosting_killswitch(
     hints: Vec<String>,
 ) -> eros_engine_core::types::ActionPlan {
     if !ghosting_enabled && plan.action_type == ActionType::Ghost {
-        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints)
+        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints, None)
     } else {
         plan
     }
+}
+
+/// Build a compact persona disposition block for the PDE judge from EXISTING
+/// genome fields. Blank fields are omitted; an all-empty persona yields "".
+/// Deliberately excludes `system_prompt` (long; would re-import the chat prompt's
+/// framing into the judge) and `topics` (irrelevant to disposition).
+fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) -> String {
+    use crate::prompt::{meta_i32, meta_str, meta_string_array_joined};
+    let name = persona.genome.name.trim();
+
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(g) = meta_str(persona, "gender")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        bits.push(g.to_string());
+    }
+    if let Some(a) = meta_i32(persona, "age") {
+        bits.push(format!("{a}岁"));
+    }
+    if let Some(m) = meta_str(persona, "mbti")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        bits.push(m.to_string());
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let head = match (name.is_empty(), bits.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("[角色人格] {}", bits.join("，")),
+        (false, true) => format!("[角色人格] {name}"),
+        (false, false) => format!("[角色人格] {name}，{}", bits.join("，")),
+    };
+    if !head.is_empty() {
+        lines.push(head);
+    }
+    if let Some(ss) = meta_str(persona, "speech_style")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("说话风格：{ss}"));
+    }
+    if let Some(q) = meta_string_array_joined(persona, "quirks")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("口癖：{q}"));
+    }
+    if let Some(tp) = persona
+        .genome
+        .tip_personality
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(format!("打赏人格：{tp}"));
+    }
+    lines.join("\n")
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
@@ -1135,8 +1337,14 @@ fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInpu
     } else {
         transcript
     };
+    let brief = build_persona_brief(&input.persona);
+    let persona_block = if brief.is_empty() {
+        String::new()
+    } else {
+        format!("{brief}\n\n")
+    };
     format!(
-        "[最近对话]\n{transcript}\n\n\
+        "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\n\
          [用户最新消息]\n{latest}",
@@ -1692,6 +1900,8 @@ pub struct PersistedUserMessage {
     /// The image URL the client attached to this turn (`https`/`http`), or
     /// `None` for a text/tip-only turn. Drives the `chat_vision` pre-stage.
     pub image_url: Option<String>,
+    /// Image reply parameters supplied by the client, forwarded from the request.
+    pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -1771,6 +1981,19 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
+        // Per-turn image executor resolution. `effective_image_chain` is None ⇒
+        // no model anywhere ⇒ the turn cannot generate, so image actions degrade
+        // to text (guard_action) and a forced image request is ignored.
+        let resolved_image_gen = state.model_config.resolve_image_gen();
+        let req_image = user_msg.image.as_ref();
+        let image_chain = eros_engine_llm::model_config::effective_image_chain(
+            req_image.and_then(|i| i.model.as_deref()),
+            resolved_image_gen.as_ref(),
+        );
+        let image_executor_available = image_chain.is_some();
+        // Forced image: the client asked for it, an executor chain exists this
+        // turn, and it is not a tip turn (tips skip the judge / image path).
+        let force_image = req_image.is_some_and(|i| i.force) && image_executor_available && !is_tip;
         // Skip resolution on tip turns: the judge won't run, and resolve_pde()
         // advances the round-robin model cursor as a side effect — resolving on a
         // skipped turn would skew which model later (non-tip) judge calls pick.
@@ -1792,16 +2015,32 @@ pub fn run_stream(
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
                     let ctx = build_pde_ctx(&pde_transcript, &input);
-                    let run = run_pde_decision(&state, p, &ctx).await;
+                    let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
-                            let action = guard_action(v.action, &input.affinity, &input.signals);
+                            let action = guard_action(
+                                v.action,
+                                &input.affinity,
+                                &input.signals,
+                                image_executor_available,
+                            );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
-                            pde::plan_for(&input, action, hints)
+                            // Capture the judge's image prompt while `v` is still
+                            // borrowed here (the run/verdict is moved into the
+                            // audit task below). Only image actions carry it.
+                            let img_prompt = if matches!(
+                                action,
+                                ActionType::ReplyImage | ActionType::ReplyTextImage
+                            ) {
+                                v.image_prompt.clone()
+                            } else {
+                                None
+                            };
+                            pde::plan_for(&input, action, hints, img_prompt)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -1818,6 +2057,25 @@ pub fn run_stream(
             &input,
             std::mem::take(&mut killswitch_hints),
         );
+
+        // Forced-image override — wins over the PDE/ghost result. Applied AFTER
+        // the kill-switch so a client-forced image is never suppressed to ghost.
+        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. Carries
+        // the client-supplied image prompt (not the judge's).
+        if force_image {
+            let action = match req_image.map(|i| &i.mode) {
+                Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
+                    ActionType::ReplyImage
+                }
+                _ => ActionType::ReplyTextImage,
+            };
+            plan = pde::plan_for(
+                &input,
+                action,
+                plan.context_hints.clone(),
+                req_image.and_then(|i| i.image_prompt.clone()),
+            );
+        }
 
         // Best-effort audit — only when the judge ran; logs the FINAL acted action.
         if let Some(run) = pde_run {
@@ -1884,6 +2142,222 @@ pub fn run_stream(
                 yield final_frame;
             }
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
+                // ── Image-reply executor wiring (Task 10) ─────────────────────
+                // `image_chain` / `resolved_image_gen` / `req_image` were already
+                // resolved in the decision block above and are REUSED here — do
+                // NOT recompute `effective_image_chain` (it advances a round-robin
+                // cursor). The chain is guaranteed `Some` whenever the plan is
+                // ReplyImage / ReplyTextImage (guard_action / force only kept the
+                // image action when the executor was available). Persona comes
+                // from `input.persona` (the local `persona` binding was moved into
+                // `input` above).
+                //
+                // For ReplyImage we generate FIRST and, on success, emit the
+                // image-only trio and skip the text path entirely. On failure (or
+                // zero images) we fall through to the normal text path so the turn
+                // is never empty — no premature `meta` is emitted before the
+                // generation outcome is known. For ReplyTextImage the text reply
+                // runs as usual and the Image frame is appended after the text
+                // `done`.
+                let mut image_only_done = false;
+                let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
+                    Vec::new();
+
+                if matches!(plan.action_type, ActionType::ReplyImage) {
+                    if let Some((primary, fallback)) = image_chain.clone() {
+                        let subject = plan
+                            .image_prompt
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| {
+                                req_image
+                                    .and_then(|i| i.image_prompt.as_deref())
+                                    .filter(|s| !s.trim().is_empty())
+                            })
+                            .unwrap_or("")
+                            .to_string();
+                        let style: eros_engine_llm::model_config::StyleKey = req_image
+                            .and_then(|i| i.style)
+                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
+                            .unwrap_or_default();
+                        let face_used = req_image
+                            .and_then(|i| i.face_ref_url.as_deref())
+                            .is_some_and(|s| !s.is_empty());
+                        let req = build_image_gen_request(
+                            primary,
+                            fallback,
+                            &input.persona,
+                            plan.image_prompt.as_deref(),
+                            req_image,
+                            resolved_image_gen.as_ref(),
+                            "",
+                        );
+                        let ar = req.aspect_ratio.clone();
+                        let res = req.resolution.clone();
+                        match state.openrouter.execute_image(req).await {
+                            Ok(resp) if !resp.images.is_empty() => {
+                                // Usage logging via the ChatResponse adapter.
+                                let cr = eros_engine_llm::openrouter::ChatResponse {
+                                    reply: String::new(),
+                                    generation_id: resp.generation_id.clone(),
+                                    model: resp.model.clone(),
+                                    usage: resp.usage.clone(),
+                                    finish_reason: resp.finish_reason.clone(),
+                                };
+                                // Mirror the other in-stream task log sites
+                                // (vision / filters / pde): session_id = None.
+                                super::log_openrouter_usage("chat_image_generation", None, &cr);
+                                let style_str = serde_json::to_value(style)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_else(|| "realistic".to_string());
+                                let image_meta = serde_json::json!({
+                                    "prompt": subject,
+                                    "style": style_str,
+                                    "model": resp.model,
+                                    "aspect_ratio": ar,
+                                    "resolution": res,
+                                    "generation_id": resp.generation_id,
+                                    "face_ref_used": face_used,
+                                });
+                                let mime = data_url_mime(&resp.images[0]);
+                                let msg_ulid = Ulid::new();
+                                let msg_uuid: Uuid = msg_ulid.into();
+                                let row = eros_engine_store::chat::AssistantInsert {
+                                    id: msg_uuid,
+                                    content: String::new(),
+                                    assistant_action_type: "reply".into(),
+                                    continues_from_message_id: None,
+                                    truncated: false,
+                                    model: resp.model.clone(),
+                                    usage: resp.usage.clone(),
+                                    generation_id: resp.generation_id.clone(),
+                                    filter_audit: None,
+                                    metadata: Some(serde_json::json!({ "image": image_meta })),
+                                };
+                                if let Err(e) = chat_repo
+                                    .insert_assistant_batch(
+                                        user_msg.session_id,
+                                        user_msg.user_message_id,
+                                        std::slice::from_ref(&row),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("stream(image): persist failed: {e}");
+                                }
+                                // full_text="" so insight/memory extraction skips
+                                // this row; affinity uses plan.image_prompt as the
+                                // proxy (Task 12).
+                                image_only_produced.push(
+                                    crate::pipeline::post_process::ProducedMessage {
+                                        message_id: msg_uuid,
+                                        full_text: String::new(),
+                                        action: ActionType::ReplyImage,
+                                    },
+                                );
+                                let mut wire_usage = resp.usage.clone();
+                                filter_usage_keys(
+                                    &mut wire_usage,
+                                    &state.config.openrouter_usage_hidden_keys,
+                                );
+                                // Frame order: meta → image → done → final.
+                                yield ProtocolFrame::Meta {
+                                    message_id: ulid_string(msg_ulid),
+                                    action_type: FrameActionType::ReplyImage,
+                                    model: resp.model.clone(),
+                                    continues_from: None,
+                                };
+                                yield ProtocolFrame::Image {
+                                    message_id: ulid_string(msg_ulid),
+                                    data_url: resp.images[0].clone(),
+                                    mime,
+                                    image_prompt: Some(subject.clone()),
+                                    model: resp.model.clone(),
+                                    generation_id: resp.generation_id.clone(),
+                                };
+                                yield ProtocolFrame::Done {
+                                    message_id: ulid_string(msg_ulid),
+                                    truncated: false,
+                                    usage: wire_usage,
+                                    generation_id: resp.generation_id.clone(),
+                                };
+                                image_only_done = true;
+                            }
+                            Ok(_) => {
+                                tracing::warn!(
+                                    "stream(image): execute_image returned zero images; \
+                                     falling through to text"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "stream(image): execute_image failed: {e}; \
+                                     falling through to text"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Image-only success: reset ghost streak, emit the computed
+                // `final` frame, spawn post-process with the image-only produced
+                // message, and skip the text path entirely (returning ends the
+                // stream cleanly — there is nothing after the match arm).
+                if image_only_done {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
+                         WHERE session_id = $1 AND ghost_streak <> 0",
+                    )
+                    .bind(user_msg.session_id)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::warn!("stream: ghost streak reset failed: {e}");
+                    }
+                    let final_frame = compute_final_frame(
+                        &state,
+                        user_msg.session_id,
+                        user_msg.user_id,
+                        false,
+                        None,
+                        user_msg.tier.clone(),
+                        0,
+                        0,
+                    )
+                    .await;
+                    yield final_frame;
+
+                    let state_bg = (*state).clone();
+                    let plan_bg = plan.clone();
+                    let event_bg = Event::UserMessage {
+                        content: user_msg.content.clone(),
+                        message_id: user_msg.user_message_id,
+                        prompt_traits: user_msg.prompt_traits.clone(),
+                        audit: user_msg.audit.clone(),
+                        tier: user_msg.tier.clone(),
+                        memory_scope: user_msg.memory_scope,
+                        affinity_scope: user_msg.affinity_scope,
+                        tips_amount_usd: user_msg.tips_amount_usd,
+                    };
+                    let user_id_bg = user_msg.user_id;
+                    let instance_id_bg = user_msg.instance_id;
+                    let session_id_bg = user_msg.session_id;
+                    let produced = image_only_produced;
+                    tokio::spawn(async move {
+                        crate::pipeline::post_process::run(
+                            state_bg,
+                            session_id_bg,
+                            user_id_bg,
+                            instance_id_bg,
+                            event_bg,
+                            plan_bg,
+                            produced,
+                        )
+                        .await;
+                    });
+                    return;
+                }
+
                 // ── Image describe (chat_vision) — Reply turns with an image ──
                 // Runs before the input filter; both may fire (orthogonal). The
                 // describe result is merged into metadata.vision; the prompt
@@ -1988,8 +2462,21 @@ pub fn run_stream(
                 // tier that drops a requested trait can't trigger filtering on it.
                 let trait_tags: Vec<String> = injected_tags.clone();
                 let prompt_injected = if injected_tags.is_empty() { None } else { Some(injected_tags) };
+                // Effective text-path action. ReplyText stays ReplyText;
+                // ReplyTextImage stays (the trailing Image frame is appended after
+                // the text `done` below). A FALLEN-THROUGH ReplyImage (image-gen
+                // failed) is downgraded to ReplyText so the text reply is wire-
+                // identical to a plain reply (meta.action_type = reply) and no
+                // trailing Image frame is attempted.
+                let text_action = match plan.action_type {
+                    ActionType::ReplyTextImage => ActionType::ReplyTextImage,
+                    _ => ActionType::ReplyText,
+                };
+                // frame_action_for(ReplyText) = Reply; frame_action_for(
+                // ReplyTextImage) = ReplyTextImage. `persist_action` stays "reply"
+                // for all.
                 let (frame_action, persist_action, plan_action) =
-                    (FrameActionType::Reply, "reply", ActionType::ReplyText);
+                    (frame_action_for(text_action), "reply", text_action);
 
                 let display_override = state.model_config.display_override("chat_companion");
 
@@ -2050,6 +2537,112 @@ pub fn run_stream(
                     tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
+                // ── ReplyTextImage: append the generated image AFTER the text ──
+                // The text reply has already streamed (meta → delta* → done). Now
+                // generate the image, merge metadata.image onto the LAST produced
+                // assistant row, and yield the Image frame BEFORE `final`. Frame
+                // order: meta → delta* → done → image → final. On image failure
+                // (or zero images / empty produced) we emit NO Image frame — the
+                // text reply already reached the client, so the turn is complete.
+                if matches!(plan.action_type, ActionType::ReplyTextImage) {
+                    if let (Some(last), Some((primary, fallback))) =
+                        (produced.last(), image_chain.clone())
+                    {
+                        let msg_uuid = last.message_id;
+                        let subject = plan
+                            .image_prompt
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| {
+                                req_image
+                                    .and_then(|i| i.image_prompt.as_deref())
+                                    .filter(|s| !s.trim().is_empty())
+                            })
+                            .unwrap_or("")
+                            .to_string();
+                        let style: eros_engine_llm::model_config::StyleKey = req_image
+                            .and_then(|i| i.style)
+                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
+                            .unwrap_or_default();
+                        let face_used = req_image
+                            .and_then(|i| i.face_ref_url.as_deref())
+                            .is_some_and(|s| !s.is_empty());
+                        let req = build_image_gen_request(
+                            primary,
+                            fallback,
+                            &input.persona,
+                            plan.image_prompt.as_deref(),
+                            req_image,
+                            resolved_image_gen.as_ref(),
+                            "",
+                        );
+                        let ar = req.aspect_ratio.clone();
+                        let res = req.resolution.clone();
+                        match state.openrouter.execute_image(req).await {
+                            Ok(resp) if !resp.images.is_empty() => {
+                                let cr = eros_engine_llm::openrouter::ChatResponse {
+                                    reply: String::new(),
+                                    generation_id: resp.generation_id.clone(),
+                                    model: resp.model.clone(),
+                                    usage: resp.usage.clone(),
+                                    finish_reason: resp.finish_reason.clone(),
+                                };
+                                // Mirror the other in-stream task log sites
+                                // (vision / filters / pde): session_id = None.
+                                super::log_openrouter_usage("chat_image_generation", None, &cr);
+                                let style_str = serde_json::to_value(style)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_else(|| "realistic".to_string());
+                                let image_meta = serde_json::json!({
+                                    "prompt": subject,
+                                    "style": style_str,
+                                    "model": resp.model,
+                                    "aspect_ratio": ar,
+                                    "resolution": res,
+                                    "generation_id": resp.generation_id,
+                                    "face_ref_used": face_used,
+                                });
+                                let mime = data_url_mime(&resp.images[0]);
+                                // merge_assistant_image_meta wraps under {"image":..}
+                                // itself — pass the raw image_meta.
+                                if let Err(e) = chat_repo
+                                    .merge_assistant_image_meta(
+                                        user_msg.session_id,
+                                        msg_uuid,
+                                        &image_meta,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "stream(text_image): merge image meta failed: {e}"
+                                    );
+                                }
+                                yield ProtocolFrame::Image {
+                                    message_id: ulid_string(Ulid::from(msg_uuid)),
+                                    data_url: resp.images[0].clone(),
+                                    mime,
+                                    image_prompt: Some(subject.clone()),
+                                    model: resp.model.clone(),
+                                    generation_id: resp.generation_id.clone(),
+                                };
+                            }
+                            Ok(_) => {
+                                tracing::warn!(
+                                    "stream(text_image): execute_image returned zero images; \
+                                     no Image frame (text already delivered)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "stream(text_image): execute_image failed: {e}; \
+                                     no Image frame (text already delivered)"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let final_frame = compute_final_frame(
                     &state,
                     user_msg.session_id,
@@ -2065,7 +2658,14 @@ pub fn run_stream(
 
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
-                let plan_bg = plan.clone();
+                let mut plan_bg = plan.clone();
+                // A `reply_image` only reaches the text path by falling through on image-gen
+                // failure (the success path returns earlier via image_only_done). The turn
+                // became a real text reply, so post-process (lead refresh, affinity, insight,
+                // memory) must treat it as ReplyText — not ReplyImage, which would skip lead.
+                if plan_bg.action_type == ActionType::ReplyImage {
+                    plan_bg.action_type = ActionType::ReplyText;
+                }
                 let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,
@@ -2277,6 +2877,87 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "meta");
         assert!(v.get("model").is_none(), "model must be omitted when None");
+    }
+
+    fn test_persona_with_meta(
+        pairs: &[(&str, &str)],
+    ) -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let oid = uuid::Uuid::new_v4();
+        let meta: serde_json::Map<String, serde_json::Value> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "TestPersona".into(),
+                system_prompt: "You are TestPersona.".into(),
+                tip_personality: None,
+                art_metadata: serde_json::Value::Object(meta),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: oid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn build_image_gen_request_uses_subject_chain_and_style() {
+        let persona = test_persona_with_meta(&[]);
+        let plan_prompt = Some("a selfie".to_string());
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\ndefault_aspect_ratio=\"3:4\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        let (primary, chain) = ("img".to_string(), vec![]);
+        let req = build_image_gen_request(
+            primary,
+            chain,
+            &persona,
+            plan_prompt.as_deref(),
+            None, /* req_image */
+            resolved.as_ref(),
+            "fallback subject",
+        );
+        assert_eq!(req.model, "img");
+        assert!(req.prompt.starts_with("Photorealistic"));
+        assert!(req.prompt.contains("a selfie")); // plan image_prompt wins over fallback subject
+        assert_eq!(req.aspect_ratio.as_deref(), Some("3:4"));
+    }
+
+    #[test]
+    fn data_url_mime_parses_prefix_and_defaults() {
+        assert_eq!(data_url_mime("data:image/png;base64,AAAA"), "image/png");
+        assert_eq!(data_url_mime("data:image/jpeg;base64,ZZ"), "image/jpeg");
+        // No data: prefix → default.
+        assert_eq!(data_url_mime("https://x/y.png"), "image/png");
+        // Malformed/empty mime → default.
+        assert_eq!(data_url_mime("data:;base64,AAAA"), "image/png");
+    }
+
+    #[test]
+    fn image_frame_serializes_with_type_tag() {
+        let f = ProtocolFrame::Image {
+            message_id: "m1".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+            mime: "image/png".into(),
+            image_prompt: Some("a cat".into()),
+            model: Some("img-a".into()),
+            generation_id: Some("gen_1".into()),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["data_url"], "data:image/png;base64,AAAA");
+        assert_eq!(v["image_prompt"], "a cat");
     }
 
     #[test]
@@ -2507,25 +3188,48 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0))),
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None)),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false),
             ActionType::ReplyText
         );
-        // image actions degrade to text today
+        // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None)),
-            ActionType::ReplyText
-        );
-        assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None)),
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None)),
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn guard_action_keeps_image_when_executor_available() {
+        let aff = test_affinity();
+        let sig = test_signals();
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true),
+            ActionType::ReplyImage
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true),
+            ActionType::ReplyTextImage
+        );
+        // executor unavailable → degrade (today's behaviour)
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false),
             ActionType::ReplyText
         );
     }
@@ -2533,7 +3237,7 @@ mod tests {
     #[test]
     fn killswitch_downgrades_ghost_keeping_hints() {
         let input = pde_test_input();
-        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![]);
+        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![], None);
         // ghosting enabled → unchanged
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
         assert_eq!(kept.action_type, ActionType::Ghost);
@@ -2546,11 +3250,11 @@ mod tests {
     #[test]
     fn ghost_then_killswitch_yields_reply_with_hints() {
         let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
-        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals);
+        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals, false);
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
-        let plan = pde::plan_for(&input, acted, hints.clone());
+        let plan = pde::plan_for(&input, acted, hints.clone(), None);
         // ghosting disabled → suppressed to reply, hints preserved
         let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
         assert_eq!(final_plan.action_type, ActionType::ReplyText);
@@ -2633,6 +3337,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -2767,6 +3472,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -2851,6 +3557,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -2951,6 +3658,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3266,6 +3974,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3389,6 +4098,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3525,6 +4235,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3676,6 +4387,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3789,6 +4501,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3883,6 +4596,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(20.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3989,6 +4703,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4097,6 +4812,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4224,6 +4940,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4424,6 +5141,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4567,6 +5285,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4676,6 +5395,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(0.5),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4850,6 +5570,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
+                image: None,
             },
         )
         .collect()
@@ -5008,6 +5729,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5149,6 +5871,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5270,6 +5993,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5405,6 +6129,7 @@ data: [DONE]\n\n";
                 // Ghost), so the live-burst path is guaranteed to run.
                 tips_amount_usd: Some(1.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5554,6 +6279,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(1.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5814,6 +6540,216 @@ data: [DONE]\n\n";
         assert_eq!(
             produced[0].full_text, "Hi there\nbye",
             "the retained primary garble must be repaired and salvaged despite the failed fallback",
+        );
+    }
+
+    // ── Task-1: compact persona brief in PDE ctx ───────────────────────────
+
+    fn test_persona() -> eros_engine_core::persona::CompanionPersona {
+        pde_test_persona()
+    }
+
+    fn test_affinity() -> eros_engine_core::affinity::Affinity {
+        pde_test_affinity()
+    }
+
+    fn test_signals() -> eros_engine_core::types::ConversationSignals {
+        eros_engine_core::types::ConversationSignals {
+            message_count: 10,
+            hours_since_last_message: 1.0,
+            ghost_streak: 0,
+            hours_since_last_ghost: None,
+        }
+    }
+
+    #[test]
+    fn persona_brief_renders_all_fields() {
+        let mut p = test_persona(); // name = "Mia"
+        p.genome.art_metadata = serde_json::json!({
+            "gender": "女", "age": 22, "mbti": "INFP",
+            "speech_style": "软糯爱撒娇", "quirks": ["摸头杀", "突然沉默"]
+        });
+        p.genome.tip_personality = Some("傲娇".into());
+        let b = build_persona_brief(&p);
+        assert!(b.starts_with("[角色人格] Mia，女，22岁，INFP"), "{b}");
+        assert!(b.contains("说话风格：软糯爱撒娇"), "{b}");
+        assert!(b.contains("口癖：摸头杀、突然沉默"), "{b}");
+        assert!(b.contains("打赏人格：傲娇"), "{b}");
+    }
+
+    #[test]
+    fn persona_brief_omits_blank_fields() {
+        let mut p = test_persona(); // name = "Mia"
+        p.genome.art_metadata = serde_json::json!({}); // no gender/age/mbti/...
+        p.genome.tip_personality = None;
+        let b = build_persona_brief(&p);
+        assert_eq!(b, "[角色人格] Mia", "only name renders: {b}");
+    }
+
+    #[test]
+    fn persona_brief_empty_when_no_signal() {
+        let mut p = test_persona();
+        p.genome.name = "".into();
+        p.genome.art_metadata = serde_json::json!({});
+        p.genome.tip_personality = None;
+        assert_eq!(build_persona_brief(&p), "");
+    }
+
+    #[test]
+    fn pde_ctx_renders_persona_block_at_top() {
+        use eros_engine_core::types::{DecisionInput, Event};
+        let mut p = test_persona();
+        p.genome.art_metadata = serde_json::json!({"mbti": "INFP"});
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "在吗".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: test_affinity(),
+            persona: p,
+            signals: test_signals(),
+        };
+        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input);
+        let persona_at = ctx.find("[角色人格]").expect("persona block present");
+        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        assert!(
+            persona_at < rel_at,
+            "persona must precede relationship: {ctx}"
+        );
+        assert!(ctx.starts_with("[角色人格]"), "persona block at top: {ctx}");
+    }
+
+    #[test]
+    fn pde_ctx_omits_persona_block_when_empty() {
+        use eros_engine_core::types::{DecisionInput, Event};
+        let mut p = test_persona();
+        p.genome.name = "".into();
+        p.genome.art_metadata = serde_json::json!({});
+        p.genome.tip_personality = None;
+        let input = DecisionInput {
+            event: Event::UserMessage {
+                content: "x".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+            },
+            affinity: test_affinity(),
+            persona: p,
+            signals: test_signals(),
+        };
+        let ctx = build_pde_ctx("", &input);
+        assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
+        assert!(
+            ctx.starts_with("[最近对话]"),
+            "ctx starts with transcript block: {ctx}"
+        );
+    }
+
+    // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
+
+    #[test]
+    fn pde_response_format_schema_shape() {
+        let v = pde_response_format();
+        assert_eq!(v["type"], "json_schema");
+        assert_eq!(v["json_schema"]["name"], "pde_verdict");
+        assert_eq!(v["json_schema"]["strict"], true);
+        let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
+        assert_eq!(req.len(), 4, "all four properties required: {v}");
+        let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions.len(), 4, "four actions: {v}");
+    }
+
+    fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {
+        let (model, fallback_model) = {
+            let mut it = models.into_iter();
+            (it.next().unwrap(), it.collect::<Vec<_>>())
+        };
+        eros_engine_llm::model_config::ResolvedPde {
+            model,
+            fallback_model,
+            temperature: 0.2,
+            max_tokens: 180,
+            decision_prompt: "decide".into(),
+            retry_depth: 2,
+            reasoning: None,
+            structured_output: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn pde_parse_error_walks_to_next_model() {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // primary "model-a" → unparseable text
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("model-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "totally not json"}}],
+                "id": "gen-a", "model": "model-a"
+            })))
+            .mount(&mock)
+            .await;
+        // fallback "model-b" → valid verdict
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("model-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"想接话\"}"}}],
+                "id": "gen-b", "model": "model-b"
+            })))
+            .mount(&mock).await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::Ok);
+        assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
+        assert_eq!(run.model.as_deref(), Some("model-b"));
+    }
+
+    #[tokio::test]
+    async fn pde_whole_chain_parse_error_preserves_last_raw() {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "nope"}}], "id": "g", "model": "m"
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            eros_engine_llm::openrouter::AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::ParseError);
+        assert_eq!(run.raw.as_deref(), Some("nope"));
+        assert!(run.verdict.is_none());
+        assert!(
+            run.model.is_some(),
+            "chain-exhausted ParseError must preserve the last attempt's model"
         );
     }
 }

@@ -4,15 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Binary crate — distributed as the GHCR image, NOT a crates.io library.
+# `cargo publish` (workspace or `-p eros-engine-server`) refuses it outright.
+publish = false
 
 [[bin]]
 name = "eros-engine"
 path = "src/main.rs"
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.6.1" }
-eros-engine-llm  = { path = "../eros-engine-llm", version = "0.6.1" }
-eros-engine-store = { path = "../eros-engine-store", version = "0.6.1" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.6.2" }
+eros-engine-llm  = { path = "../eros-engine-llm", version = "0.6.2" }
+eros-engine-store = { path = "../eros-engine-store", version = "0.6.2" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

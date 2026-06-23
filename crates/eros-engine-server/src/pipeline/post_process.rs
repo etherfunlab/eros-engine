@@ -112,14 +112,30 @@ pub async fn run(
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Semantic eval: Reply turns only, with a non-trivial user message
-        // and a non-empty produced assistant message. Other actions
-        // (Proactive / Ghost) keep rule-only deltas in v1.
-        let run_eval = plan.action_type == ActionType::ReplyText
-            && user_msg.chars().count() >= AFFINITY_EVAL_MIN_CHARS
-            && !assistant_msg.trim().is_empty();
+        // For reply_image the assistant text is empty; use the plan's image_prompt
+        // as the assistant-content proxy so the photo-send still moves affinity.
+        // Subjectless image turns (blank image_prompt) fall back to a generic
+        // photo marker so they are still evaluated rather than tripping the
+        // `empty_assistant` gate.
+        let eval_text = affinity_eval_text(
+            plan.action_type,
+            &assistant_msg,
+            plan.image_prompt.as_deref(),
+        );
 
-        let (llm_deltas, reason, affinity_meta) = if run_eval {
+        // Semantic eval gate: Reply turns only, with a non-trivial user message
+        // and a non-empty produced assistant message (or image_prompt proxy for
+        // reply_image). Other actions (Proactive / Ghost) keep rule-only deltas
+        // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
+        // attempted; otherwise it carries the reason the trio will be NULL
+        // (stamped into `context`).
+        let pre_skip = eval_skip_reason(
+            plan.action_type,
+            user_msg.chars().count(),
+            eval_text.trim().is_empty(),
+        );
+
+        let (llm_deltas, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
             let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
             let persona_name = match persona_repo.load_companion(instance_id).await {
@@ -136,7 +152,7 @@ pub async fn run(
                         &persona_name,
                         &current,
                         &user_msg,
-                        &assistant_msg,
+                        &eval_text,
                         client_id.as_deref(),
                     )
                     .await
@@ -145,6 +161,7 @@ pub async fn run(
                     eros_engine_core::affinity::AffinityDeltas::default(),
                     String::new(),
                     None,
+                    Some("no_persona_or_affinity"),
                 ),
             }
         } else {
@@ -152,15 +169,12 @@ pub async fn run(
                 eros_engine_core::affinity::AffinityDeltas::default(),
                 String::new(),
                 None,
+                pre_skip,
             )
         };
 
         let combined = merge_deltas(&plan.affinity_deltas, &llm_deltas);
-        let context = if reason.is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::json!({ "affinity_reason": reason })
-        };
+        let context = build_affinity_context(&reason, skip_reason);
 
         persist_affinity(
             &state,
@@ -175,10 +189,7 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = matches!(
-        plan.action_type,
-        ActionType::ReplyText | ActionType::Proactive,
-    );
+    let should_update_lead = lead_refresh_applies(plan.action_type);
     let fut_lead = async {
         if should_update_lead {
             refresh_lead_score(&state, session_id, user_id).await;
@@ -472,6 +483,111 @@ const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 /// rule-only deltas (the spec §4.5 "timeout → default" path).
 const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The companion-reply text the affinity evaluator scores. Non-empty produced
+/// text wins. For an image turn with no produced text, use the judge's subject
+/// (`image_prompt`); if that is also blank, use a generic photo marker so a
+/// subjectless generated image is still evaluated rather than tripping the
+/// `empty_assistant` gate. Non-image turns with empty text yield "" (still skip).
+fn affinity_eval_text(
+    action: ActionType,
+    assistant_msg: &str,
+    image_prompt: Option<&str>,
+) -> String {
+    if !assistant_msg.trim().is_empty() {
+        return assistant_msg.to_string();
+    }
+    if matches!(action, ActionType::ReplyImage | ActionType::ReplyTextImage) {
+        let subject = image_prompt.map(str::trim).unwrap_or("");
+        if subject.is_empty() {
+            return "[发送了一张照片]".to_string(); // consistent with the engine's Chinese image markers
+        }
+        return subject.to_string();
+    }
+    String::new()
+}
+
+/// Lead-score refresh applies to text-bearing reply turns and proactive turns.
+/// `reply_image` carries no assistant text (like the insight/memory gating), so
+/// it is excluded; `reply_text_image` IS text-bearing and refreshes lead.
+fn lead_refresh_applies(action: ActionType) -> bool {
+    matches!(
+        action,
+        ActionType::ReplyText | ActionType::ReplyTextImage | ActionType::Proactive
+    )
+}
+
+/// Stable marker explaining why a `message`/`proactive` affinity event carries
+/// no OpenRouter audit trio (`model`/`usage`/`generation_id` all NULL). The trio
+/// is populated only from a *successful* `affinity_evaluation` call; whenever
+/// that call is never made (gating below) the trio is legitimately NULL, and
+/// this reason is stamped into the event `context` so the NULL is always
+/// explainable ("no eval call was made", not "data lost"). `None` ⇒ the gate
+/// passes and a call is attempted.
+///
+/// The reasons here are the *pre-attempt* ones, mirroring the old `run_eval`
+/// gate exactly. Reasons only knowable after attempting
+/// (`no_persona_or_affinity`, `eval_error`, `eval_timeout`) are decided at the
+/// call site / in `evaluate_affinity`.
+fn eval_skip_reason(
+    action: ActionType,
+    user_msg_chars: usize,
+    assistant_empty: bool,
+) -> Option<&'static str> {
+    match action {
+        // Proactive turns keep rule-only deltas in v1 (no semantic eval).
+        ActionType::Proactive => Some("proactive"),
+        // Ghost takes the `record_ghost` path, which ignores `context` entirely —
+        // this arm exists only for match exhaustiveness and is never persisted.
+        ActionType::Ghost => Some("ghost"),
+        // Image variants route through the same gate as ReplyText. For reply_image
+        // the caller passes `image_prompt` as the assistant-content proxy so an
+        // image-send still moves affinity (assistant_empty=false when prompt is set).
+        ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
+            if user_msg_chars < AFFINITY_EVAL_MIN_CHARS {
+                Some("short_user_msg")
+            } else if assistant_empty {
+                Some("empty_assistant")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Marker for a *successful* eval whose response still carried no OpenRouter
+/// `generation_id` — the join key to the OpenRouter log. The salvaged-garble
+/// fallback in `OpenRouterClient::execute` returns `Ok` with `generation_id:
+/// None` (and `usage: None`), so "the call returned `Ok`" does not by itself
+/// guarantee an audit trail. Without the id the row can't be tied to an
+/// OpenRouter record, so it still needs an explanation. `None` ⇒ a usable id is
+/// present.
+fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'static str> {
+    meta.generation_id
+        .is_none()
+        .then_some("eval_no_generation_id")
+}
+
+/// Build the affinity event `context` JSON: the model's `affinity_reason` when a
+/// successful eval produced one, and/or an `eval_skip_reason` marker when the
+/// audit trio has no usable join key. By construction a row with a NULL
+/// `generation_id` always gets a marker, so it is never silently unexplained.
+fn build_affinity_context(reason: &str, skip_reason: Option<&str>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if !reason.is_empty() {
+        map.insert(
+            "affinity_reason".into(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    if let Some(s) = skip_reason {
+        map.insert(
+            "eval_skip_reason".into(),
+            serde_json::Value::String(s.to_string()),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Run the haiku affinity evaluator for one Reply turn. Returns the clamped
 /// per-axis LLM deltas + the model's reason. Any failure (LLM error,
 /// non-JSON) yields all-zero deltas + empty reason so the rule deltas still
@@ -488,6 +604,7 @@ async fn evaluate_affinity(
     eros_engine_core::affinity::AffinityDeltas,
     String,
     Option<eros_engine_store::OpenRouterCallMeta>,
+    Option<&'static str>,
 ) {
     use eros_engine_core::affinity::AffinityDeltas;
 
@@ -521,19 +638,32 @@ async fn evaluate_affinity(
             }
             Ok(Err(e)) => {
                 tracing::warn!("affinity eval LLM call failed: {e}");
-                return (AffinityDeltas::default(), String::new(), None);
+                return (
+                    AffinityDeltas::default(),
+                    String::new(),
+                    None,
+                    Some("eval_error"),
+                );
             }
             Err(_elapsed) => {
                 tracing::warn!(
                 "affinity eval timed out after {AFFINITY_EVAL_TIMEOUT:?}; using rule-only deltas"
             );
-                return (AffinityDeltas::default(), String::new(), None);
+                return (
+                    AffinityDeltas::default(),
+                    String::new(),
+                    None,
+                    Some("eval_timeout"),
+                );
             }
         };
 
     let (deltas, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
-    (deltas, reason, meta)
+    // Eval ran, but a salvaged response can still lack a generation_id — mark it
+    // so a NULL audit join key is never left unexplained.
+    let skip = meta.as_ref().and_then(meta_skip_reason);
+    (deltas, reason, meta, skip)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -1005,6 +1135,127 @@ mod tests {
         assert_eq!(c.intimacy, 0.0);
     }
 
+    #[test]
+    fn eval_skip_reason_none_only_for_substantive_text_reply() {
+        // The one path that DOES run the eval (→ trio populated).
+        assert_eq!(eval_skip_reason(ActionType::ReplyText, 10, false), None);
+    }
+
+    #[test]
+    fn eval_skip_reason_text_reply_gates() {
+        // Short user message (< AFFINITY_EVAL_MIN_CHARS) skips the eval.
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, AFFINITY_EVAL_MIN_CHARS - 1, false),
+            Some("short_user_msg")
+        );
+        // Boundary: exactly the threshold runs.
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, AFFINITY_EVAL_MIN_CHARS, false),
+            None
+        );
+        // Empty assistant text skips even with a long user message.
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyText, 50, true),
+            Some("empty_assistant")
+        );
+    }
+
+    #[test]
+    fn eval_runs_on_image_reply_with_text_or_prompt() {
+        // reply_text_image with real text + adequate user msg → not skipped
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyTextImage, 10, false),
+            None
+        );
+        // reply_image with empty assistant text but the caller supplies a non-empty
+        // proxy (assistant_empty=false because image_prompt is used) → not skipped
+        assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, false), None);
+        // image reply with empty proxy → empty_assistant
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyImage, 10, true),
+            Some("empty_assistant")
+        );
+        // still gated by short user msg
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyTextImage, 2, false),
+            Some("short_user_msg")
+        );
+        // Proactive and Ghost keep their dedicated skip reasons.
+        assert_eq!(
+            eval_skip_reason(ActionType::Proactive, 50, false),
+            Some("proactive")
+        );
+        assert_eq!(
+            eval_skip_reason(ActionType::Ghost, 50, false),
+            Some("ghost")
+        );
+    }
+
+    #[test]
+    fn affinity_eval_text_prefers_text_then_subject_then_marker() {
+        // produced text always wins
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyTextImage, "hi there", Some("a cat")),
+            "hi there"
+        );
+        // image turn, no text, with subject → subject
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", Some("a selfie")),
+            "a selfie"
+        );
+        // image turn, no text, no subject → generic marker (still evaluated)
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", None),
+            "[发送了一张照片]"
+        );
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", Some("  ")),
+            "[发送了一张照片]"
+        );
+        // non-image empty text → empty (genuine empty reply still skips)
+        assert_eq!(affinity_eval_text(ActionType::ReplyText, "", None), "");
+    }
+
+    #[test]
+    fn meta_skip_reason_flags_missing_generation_id() {
+        // Salvaged-garble fallback: Ok response, but no generation_id ⇒ marked,
+        // even though model is present.
+        let salvaged = eros_engine_store::OpenRouterCallMeta {
+            generation_id: None,
+            model: Some("m".into()),
+            usage: None,
+        };
+        assert_eq!(meta_skip_reason(&salvaged), Some("eval_no_generation_id"));
+        // Clean response with a join key ⇒ no marker.
+        let clean = eros_engine_store::OpenRouterCallMeta {
+            generation_id: Some("gen-1".into()),
+            model: Some("m".into()),
+            usage: Some(serde_json::json!({"total_tokens": 9})),
+        };
+        assert_eq!(meta_skip_reason(&clean), None);
+    }
+
+    #[test]
+    fn build_affinity_context_shapes() {
+        // Successful eval: reason only, no skip marker.
+        assert_eq!(
+            build_affinity_context("他主动分享", None),
+            serde_json::json!({ "affinity_reason": "他主动分享" })
+        );
+        // Skipped/failed eval (NULL trio): marker only, always explainable.
+        assert_eq!(
+            build_affinity_context("", Some("short_user_msg")),
+            serde_json::json!({ "eval_skip_reason": "short_user_msg" })
+        );
+        // Empty reason + no skip → {} (only when an eval ran but returned no reason).
+        assert_eq!(build_affinity_context("", None), serde_json::json!({}));
+        // Defensive: both present coexist.
+        assert_eq!(
+            build_affinity_context("r", Some("eval_timeout")),
+            serde_json::json!({ "affinity_reason": "r", "eval_skip_reason": "eval_timeout" })
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn insight_extraction_writes_two_events_sharing_run_id(pool: sqlx::PgPool) {
         use wiremock::matchers::{body_string_contains, method, path as wm_path};
@@ -1151,6 +1402,15 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "empty");
+    }
+
+    #[test]
+    fn lead_refresh_applies_to_text_bearing_and_proactive_only() {
+        assert!(lead_refresh_applies(ActionType::ReplyText));
+        assert!(lead_refresh_applies(ActionType::ReplyTextImage));
+        assert!(lead_refresh_applies(ActionType::Proactive));
+        assert!(!lead_refresh_applies(ActionType::ReplyImage)); // no assistant text
+        assert!(!lead_refresh_applies(ActionType::Ghost));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
