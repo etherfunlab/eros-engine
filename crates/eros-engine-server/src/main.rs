@@ -232,29 +232,29 @@ async fn run_server() -> Result<()> {
     // - SUPABASE_JWKS_URL: explicit override.
     // - SUPABASE_URL: derive `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
     // - SUPABASE_JWT_SECRET: legacy HS256 shared secret (optional).
-    let mut validator = SupabaseJwtValidator::new();
     let jwks_url = std::env::var("SUPABASE_JWKS_URL").ok().or_else(|| {
         std::env::var("SUPABASE_URL")
             .ok()
             .map(|u| format!("{}/auth/v1/.well-known/jwks.json", u.trim_end_matches('/')))
     });
+    // Resolve+validate the sources before wiring anything: an empty
+    // SUPABASE_JWT_SECRET counts as absent, so `SUPABASE_JWT_SECRET=""` with no
+    // JWKS source fails fast here instead of booting a validator that silently
+    // rejects every request.
+    let legacy_secret = resolve_legacy_secret(
+        jwks_url.is_some(),
+        std::env::var("SUPABASE_JWT_SECRET").ok(),
+    )?;
+
+    let mut validator = SupabaseJwtValidator::new();
     if let Some(url) = jwks_url.as_deref() {
         validator = validator
             .with_jwks_url(url)
             .await
             .with_context(|| format!("failed to load Supabase JWKS from {url}"))?;
     }
-    if let Ok(secret) = std::env::var("SUPABASE_JWT_SECRET") {
-        if !secret.is_empty() {
-            validator = validator.with_legacy_secret(secret);
-        }
-    }
-    if jwks_url.is_none() && std::env::var("SUPABASE_JWT_SECRET").ok().is_none() {
-        anyhow::bail!(
-            "no JWT validation source configured: set SUPABASE_URL (preferred) \
-             or SUPABASE_JWKS_URL for asymmetric JWT validation, and/or \
-             SUPABASE_JWT_SECRET for the legacy HS256 path"
-        );
+    if let Some(secret) = legacy_secret {
+        validator = validator.with_legacy_secret(secret);
     }
     let auth: Arc<dyn AuthValidator> = Arc::new(validator);
 
@@ -332,8 +332,27 @@ async fn run_server() -> Result<()> {
     Ok(())
 }
 
+/// Validates the configured JWT sources and returns the legacy HS256 secret to
+/// wire, if any. A *non-empty* `SUPABASE_JWT_SECRET` is the only thing that
+/// counts as the legacy source — an empty one is treated as absent, so the boot
+/// guard agrees with what actually gets wired. Returns an error (fail-fast at
+/// boot) when neither a JWKS source nor a non-empty legacy secret is present;
+/// otherwise the server would boot a validator that rejects every token.
+fn resolve_legacy_secret(has_jwks: bool, jwt_secret: Option<String>) -> Result<Option<String>> {
+    let legacy_secret = jwt_secret.filter(|s| !s.is_empty());
+    if !has_jwks && legacy_secret.is_none() {
+        anyhow::bail!(
+            "no JWT validation source configured: set SUPABASE_URL (preferred) \
+             or SUPABASE_JWKS_URL for asymmetric JWT validation, and/or \
+             SUPABASE_JWT_SECRET for the legacy HS256 path"
+        );
+    }
+    Ok(legacy_secret)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::resolve_legacy_secret;
     use eros_engine_llm::model_config::ModelConfig;
 
     /// The committed example config is the dev/prod boot default; it MUST pass the
@@ -348,5 +367,40 @@ mod tests {
             "shipped config must pass the extraction boot gate: {:?}",
             cfg.validate_extraction_prompts()
         );
+    }
+
+    #[test]
+    fn no_source_bails() {
+        assert!(resolve_legacy_secret(false, None).is_err());
+    }
+
+    #[test]
+    fn empty_secret_without_jwks_bails() {
+        // The regression: a present-but-empty SUPABASE_JWT_SECRET with no JWKS
+        // source must fail fast, not boot an all-reject validator.
+        assert!(resolve_legacy_secret(false, Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn jwks_alone_is_enough_and_wires_no_legacy_secret() {
+        let secret = resolve_legacy_secret(true, None).expect("jwks source is sufficient");
+        assert_eq!(secret, None);
+    }
+
+    #[test]
+    fn empty_secret_with_jwks_is_ok_but_not_wired() {
+        let secret =
+            resolve_legacy_secret(true, Some(String::new())).expect("jwks source is sufficient");
+        assert_eq!(
+            secret, None,
+            "empty secret must not be wired as legacy source"
+        );
+    }
+
+    #[test]
+    fn nonempty_secret_alone_is_enough_and_is_returned() {
+        let secret = resolve_legacy_secret(false, Some("shh".to_string()))
+            .expect("a non-empty legacy secret is a valid source");
+        assert_eq!(secret.as_deref(), Some("shh"));
     }
 }

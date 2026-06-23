@@ -251,7 +251,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants execute when `[tasks.chat_image_generation]` is configured and a model is resolvable; they degrade to `reply_text` only when the task block is absent or no model is resolvable for the turn)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants execute when `[tasks.chat_image_generation]` is configured, a model is resolvable, **and the request includes an `image` block**; otherwise they degrade to `reply_text` — task block absent, no model resolvable, or no `image` block on the request)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `image_prompt`, `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
@@ -263,10 +263,14 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 ### `[tasks.chat_image_generation]` — companion image replies (opt-in)
 
 The companion image executor is **off by default**. It activates when this task
-block exists in the config. When active, the engine executes `reply_image` and
-`reply_text_image` actions instead of degrading them to `reply_text`. Degradation
-to `reply_text` still occurs when the block is absent or when no model is
-resolvable for a given turn.
+block exists in the config **and** the per-turn request carries an `image` block
+(omitting `image` turns generation off for that turn, mirroring how `chat_vision`
+runs only when `image_url` is present). When active, the engine executes
+`reply_image` and `reply_text_image` actions instead of degrading them to
+`reply_text`. Degradation to `reply_text` still occurs when the block is absent,
+no model is resolvable for the turn, or the request omits `image`.
+
+Any OpenRouter image model works here, including **image-only** models (e.g. `bytedance-seed/seedream-4.5`): the engine requests `modalities: ["image"]` and never asks the image model for text. The caption on a `reply_text_image` turn always comes from `chat_companion`, never the image model.
 
 ```toml
 [tasks.chat_image_generation]
