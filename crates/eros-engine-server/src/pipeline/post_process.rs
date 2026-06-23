@@ -513,10 +513,23 @@ fn eval_skip_reason(
     }
 }
 
+/// Marker for a *successful* eval whose response still carried no OpenRouter
+/// `generation_id` — the join key to the OpenRouter log. The salvaged-garble
+/// fallback in `OpenRouterClient::execute` returns `Ok` with `generation_id:
+/// None` (and `usage: None`), so "the call returned `Ok`" does not by itself
+/// guarantee an audit trail. Without the id the row can't be tied to an
+/// OpenRouter record, so it still needs an explanation. `None` ⇒ a usable id is
+/// present.
+fn meta_skip_reason(meta: &eros_engine_store::OpenRouterCallMeta) -> Option<&'static str> {
+    meta.generation_id
+        .is_none()
+        .then_some("eval_no_generation_id")
+}
+
 /// Build the affinity event `context` JSON: the model's `affinity_reason` when a
 /// successful eval produced one, and/or an `eval_skip_reason` marker when the
-/// audit trio is NULL. By construction a NULL-trio row always gets a marker, so
-/// a NULL `model`/`generation_id` is never silently unexplained.
+/// audit trio has no usable join key. By construction a row with a NULL
+/// `generation_id` always gets a marker, so it is never silently unexplained.
 fn build_affinity_context(reason: &str, skip_reason: Option<&str>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     if !reason.is_empty() {
@@ -606,7 +619,10 @@ async fn evaluate_affinity(
 
     let (deltas, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
-    (deltas, reason, meta, None)
+    // Eval ran, but a salvaged response can still lack a generation_id — mark it
+    // so a NULL audit join key is never left unexplained.
+    let skip = meta.as_ref().and_then(meta_skip_reason);
+    (deltas, reason, meta, skip)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -1122,6 +1138,25 @@ mod tests {
             eval_skip_reason(ActionType::Ghost, 50, false),
             Some("ghost")
         );
+    }
+
+    #[test]
+    fn meta_skip_reason_flags_missing_generation_id() {
+        // Salvaged-garble fallback: Ok response, but no generation_id ⇒ marked,
+        // even though model is present.
+        let salvaged = eros_engine_store::OpenRouterCallMeta {
+            generation_id: None,
+            model: Some("m".into()),
+            usage: None,
+        };
+        assert_eq!(meta_skip_reason(&salvaged), Some("eval_no_generation_id"));
+        // Clean response with a join key ⇒ no marker.
+        let clean = eros_engine_store::OpenRouterCallMeta {
+            generation_id: Some("gen-1".into()),
+            model: Some("m".into()),
+            usage: Some(serde_json::json!({"total_tokens": 9})),
+        };
+        assert_eq!(meta_skip_reason(&clean), None);
     }
 
     #[test]
