@@ -1981,15 +1981,25 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
-        // Per-turn image executor resolution. `effective_image_chain` is None ⇒
-        // no model anywhere ⇒ the turn cannot generate, so image actions degrade
-        // to text (guard_action) and a forced image request is ignored.
+        // Per-turn image executor resolution. The executor counts as available
+        // only when the caller opted in (an `image` block is present) AND a model
+        // resolves this turn. Omitting `image` turns image generation OFF for the
+        // turn even when a config `fallback` model exists — mirroring chat_vision,
+        // which runs only when `image_url` is present. With no executor, image
+        // actions degrade to text (guard_action) and a forced request is ignored.
+        //
+        // Resolve the chain ONLY when opted in: `effective_image_chain` advances
+        // the image ModelSpec round-robin cursor (`ModelSpec::select`), so calling
+        // it on opted-out / text turns would consume image-model slots and skew
+        // the sequencing of later opted-in image turns.
         let resolved_image_gen = state.model_config.resolve_image_gen();
         let req_image = user_msg.image.as_ref();
-        let image_chain = eros_engine_llm::model_config::effective_image_chain(
-            req_image.and_then(|i| i.model.as_deref()),
-            resolved_image_gen.as_ref(),
-        );
+        let image_chain = req_image.and_then(|i| {
+            eros_engine_llm::model_config::effective_image_chain(
+                i.model.as_deref(),
+                resolved_image_gen.as_ref(),
+            )
+        });
         let image_executor_available = image_chain.is_some();
         // Forced image: the client asked for it, an executor chain exists this
         // turn, and it is not a tip turn (tips skip the judge / image path).

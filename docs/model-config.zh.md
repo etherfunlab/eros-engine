@@ -221,7 +221,7 @@ chat SSE stream 结束时发出的 `final` event 包含几个新字段。无论 
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：
 
 - LLM 接收最近的对话、关系状态和对话信号，并返回 JSON verdict，其中包含：
-  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"`（配置 `[tasks.chat_image_generation]` 且当前轮次可解析出模型时执行图片变体；仅当任务块缺失或当前轮次无法解析出模型时，才降级为 `reply_text`）
+  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"`（配置 `[tasks.chat_image_generation]`、当前轮次可解析出模型、**且请求包含 `image` 块**时才执行图片变体；否则降级为 `reply_text`——任务块缺失、无法解析出模型、或请求未带 `image` 块）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `image_prompt`、`reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
@@ -232,7 +232,9 @@ chat SSE stream 结束时发出的 `final` event 包含几个新字段。无论 
 
 ### `[tasks.chat_image_generation]` — companion 图片回复（opt-in）
 
-Companion 图片执行器**默认关闭**。配置中存在此任务块时，它会激活。激活后，引擎会执行 `reply_image` 和 `reply_text_image` 动作，而不是将其降级为 `reply_text`。任务块缺失或某一轮次无法解析出模型时，仍会降级为 `reply_text`。
+Companion 图片执行器**默认关闭**。当配置中存在此任务块**且**当前轮次的请求带有 `image` 块时才会激活（省略 `image` 即可关闭该轮的图片生成，类似 `chat_vision` 仅在带 `image_url` 时运行）。激活后，引擎会执行 `reply_image` 和 `reply_text_image` 动作，而不是将其降级为 `reply_text`。任务块缺失、当前轮次无法解析出模型、或请求未带 `image` 块时，仍会降级为 `reply_text`。
+
+这里可以用任意 OpenRouter 图片模型，包括**只输出图片**的模型（如 `bytedance-seed/seedream-4.5`）：引擎只请求 `modalities: ["image"]`，从不向图片模型要文本。`reply_text_image` 轮次的文字始终来自 `chat_companion`，而非图片模型。
 
 ```toml
 [tasks.chat_image_generation]
