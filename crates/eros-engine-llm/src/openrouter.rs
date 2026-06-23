@@ -171,7 +171,11 @@ fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
     }
     serde_json::json!({
         "model": model,
-        "modalities": ["image", "text"],
+        // #101: image-only output. Image-only models reject ["image","text"]
+        // with 404; text-capable models still return the image for ["image"].
+        // The engine never consumes the image model's text (reply_image writes
+        // empty content; reply_text_image's caption comes from chat_companion).
+        "modalities": ["image"],
         "messages": [ { "role": "user", "content": content } ],
         "max_tokens": req.max_tokens,
         "stream": false,
@@ -2261,7 +2265,10 @@ data: [DONE]\n\n";
             max_tokens: 4096,
         };
         let body = build_image_body(&req, "m");
-        assert_eq!(body["modalities"], serde_json::json!(["image", "text"]));
+        // #101: image-gen requests image-only output so image-only OpenRouter
+        // models (e.g. bytedance-seed/seedream-4.5) don't 404. The engine never
+        // uses the image model's text, so we never ask for the text modality.
+        assert_eq!(body["modalities"], serde_json::json!(["image"]));
         let content = &body["messages"][0]["content"];
         // text-only content block when no face ref
         assert_eq!(content.as_array().unwrap().len(), 1);
