@@ -1168,6 +1168,7 @@ fn guard_action(
     proposed: PdeAction,
     affinity: &eros_engine_core::affinity::Affinity,
     signals: &eros_engine_core::types::ConversationSignals,
+    image_executor_available: bool,
 ) -> ActionType {
     match proposed {
         PdeAction::Ghost => {
@@ -1181,7 +1182,10 @@ fn guard_action(
                 ActionType::ReplyText
             }
         }
-        // image executor not shipped → always degrade to text
+        // Keep the image action when an executor chain exists this turn;
+        // otherwise degrade to text (today's behaviour).
+        PdeAction::ReplyImage if image_executor_available => ActionType::ReplyImage,
+        PdeAction::ReplyTextImage if image_executor_available => ActionType::ReplyTextImage,
         PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
         PdeAction::ReplyText => ActionType::ReplyText,
     }
@@ -1919,6 +1923,19 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
+        // Per-turn image executor resolution. `effective_image_chain` is None ⇒
+        // no model anywhere ⇒ the turn cannot generate, so image actions degrade
+        // to text (guard_action) and a forced image request is ignored.
+        let resolved_image_gen = state.model_config.resolve_image_gen();
+        let req_image = user_msg.image.as_ref();
+        let image_chain = eros_engine_llm::model_config::effective_image_chain(
+            req_image.and_then(|i| i.model.as_deref()),
+            resolved_image_gen.as_ref(),
+        );
+        let image_executor_available = image_chain.is_some();
+        // Forced image: the client asked for it, an executor chain exists this
+        // turn, and it is not a tip turn (tips skip the judge / image path).
+        let force_image = req_image.is_some_and(|i| i.force) && image_executor_available && !is_tip;
         // Skip resolution on tip turns: the judge won't run, and resolve_pde()
         // advances the round-robin model cursor as a side effect — resolving on a
         // skipped turn would skew which model later (non-tip) judge calls pick.
@@ -1943,14 +1960,29 @@ pub fn run_stream(
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
-                            let action = guard_action(v.action, &input.affinity, &input.signals);
+                            let action = guard_action(
+                                v.action,
+                                &input.affinity,
+                                &input.signals,
+                                image_executor_available,
+                            );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
-                            // TODO(Task 9): replace None with captured v.image_prompt
-                            pde::plan_for(&input, action, hints, None)
+                            // Capture the judge's image prompt while `v` is still
+                            // borrowed here (the run/verdict is moved into the
+                            // audit task below). Only image actions carry it.
+                            let img_prompt = if matches!(
+                                action,
+                                ActionType::ReplyImage | ActionType::ReplyTextImage
+                            ) {
+                                v.image_prompt.clone()
+                            } else {
+                                None
+                            };
+                            pde::plan_for(&input, action, hints, img_prompt)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -1967,6 +1999,25 @@ pub fn run_stream(
             &input,
             std::mem::take(&mut killswitch_hints),
         );
+
+        // Forced-image override — wins over the PDE/ghost result. Applied AFTER
+        // the kill-switch so a client-forced image is never suppressed to ghost.
+        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. Carries
+        // the client-supplied image prompt (not the judge's).
+        if force_image {
+            let action = match req_image.map(|i| &i.mode) {
+                Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
+                    ActionType::ReplyImage
+                }
+                _ => ActionType::ReplyTextImage,
+            };
+            plan = pde::plan_for(
+                &input,
+                action,
+                plan.context_hints.clone(),
+                req_image.and_then(|i| i.image_prompt.clone()),
+            );
+        }
 
         // Best-effort audit — only when the judge ran; logs the FINAL acted action.
         if let Some(run) = pde_run {
@@ -2672,25 +2723,48 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0))),
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None)),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false),
             ActionType::ReplyText
         );
-        // image actions degrade to text today
+        // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None)),
-            ActionType::ReplyText
-        );
-        assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None)),
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None)),
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn guard_action_keeps_image_when_executor_available() {
+        let aff = test_affinity();
+        let sig = test_signals();
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true),
+            ActionType::ReplyImage
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true),
+            ActionType::ReplyTextImage
+        );
+        // executor unavailable → degrade (today's behaviour)
+        assert_eq!(
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false),
+            ActionType::ReplyText
+        );
+        assert_eq!(
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false),
             ActionType::ReplyText
         );
     }
@@ -2711,7 +2785,7 @@ mod tests {
     #[test]
     fn ghost_then_killswitch_yields_reply_with_hints() {
         let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
-        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals);
+        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals, false);
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
