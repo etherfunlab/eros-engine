@@ -236,6 +236,83 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+**可选：伴侣图片回复。** 请求体可附加 `image` 对象（`ImageReplyParams`），请求或强制本轮生成一张伴侣发送的图片。需要配置 `[tasks.chat_image_generation]`（见 [model-config.zh.md](model-config.zh.md)）；执行器默认关闭。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "给我看个笑脸",
+        "client_msg_id": "01J3333333333333333333333A",
+        "image": {
+          "force": true,
+          "mode": "text_image",
+          "style": "realistic",
+          "model": "google/gemini-2.5-flash-image",
+          "image_prompt": "温暖随拍自拍，室内柔光",
+          "aspect_ratio": "3:4",
+          "resolution": "1024x1365",
+          "face_ref_url": "https://cdn.example/aria_avatar.png"
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+`ImageReplyParams` 字段（全部可选）：
+
+| 字段 | 类型 | 默认值 | 备注 |
+|---|---|---|---|
+| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策。`false` 时由 PDE 决定。 |
+| `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = 文字 + 图片；`image_only` = 仅图片（允许空 `content`）。 |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | 任务 `default_style` | 引擎内置三种风格预设之一。 |
+| `model` | `String` | 配置值 | 覆盖配置 `ModelSpec` 的单轮 id。优先于配置 `model`，仍可回退到配置 `fallback`。 |
+| `image_prompt` | `String` | PDE 判断 / 用户文本 | 强制路径的图片主题。PDE 路径使用判断器自己的 `image_prompt`。 |
+| `aspect_ratio` | `String` | 任务 `default_aspect_ratio` | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。非法时返回 `422`。 |
+| `resolution` | `String` | 任务 `default_resolution` | 模型相关的分辨率提示（如 `"1024x1365"`）。仅做形状校验，透传给模型。 |
+| `face_ref_url` | `String` | 缺失 | 图生图面部参考图（绝对 `http(s)` URL，≤ 2048 字符）。格式非法时返回 `422`。 |
+
+校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`face_ref_url` 格式错误、`aspect_ratio` 不在允许集、`resolution` 形状错误，均作为 pre-stream 错误返回 `422 BadRequest`。
+
+**`image` SSE 帧** — 图片生成成功时，在文字的 `done` 帧之后发出：
+
+```text
+data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,...","mime":"image/png","image_prompt":"温暖随拍自拍，室内柔光","model":"google/gemini-2.5-flash-image","generation_id":"gen-xyz"}
+```
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `type` | `"image"` | 帧类型标识符。 |
+| `message_id` | `String` | 与 `meta` 帧的 `message_id` 相同。 |
+| `data_url` | `String` | 生成图片的 base64 data-URL（`"data:image/png;base64,..."`）。 |
+| `mime` | `String` | 图片 MIME 类型（如 `"image/png"`）。 |
+| `image_prompt` | `String` \| `null` | 生成时使用的主题（也会持久化）。 |
+| `model` | `String` \| `null` | 实际服务的图片模型。 |
+| `generation_id` | `String` \| `null` | OpenRouter 生成 id。 |
+
+**完整 SSE 帧序列：**
+
+- `reply_text_image`：`meta(action_type=reply_text_image) → delta* → done → image → final`
+- `reply_image`：`meta(action_type=reply_image) → image → done → final`
+
+**图片失败客户端约定** — 图片失败时不会发出额外的 error 帧。客户端通过 `meta` 帧的 `action_type` 判断预期形状：
+
+- **`reply_text_image`** — `image` 帧在 `done` 之后到达。若流已到达 `final` 但仍未收到 `image` 帧，则图片生成失败（fail-open）；文字已正常投递，渲染即可。
+- **`reply_image`** — `image` 帧在 `done` 之前到达。`reply_image` 类型的 `meta` 只在图片确定可投递时才会下发，因此收到该 `meta` 后 `image` 帧必然随后出现。若图片失败，整轮会降级：客户端收到的是 `meta.action_type=reply_text`（而非 `reply_image`）加上普通文字流——降级从 `meta` 帧起即可见，不会出现空的 `reply_image`。
+
+**写回端点** — 收到 `image` 帧后，客户端应将 `data_url` 上传到自有存储，然后把结果 URL 写回引擎：
+
+### `POST /comp/chat/{session_id}/message/{message_id}/image`
+
+存储伴侣生成图片的 CDN URL。由客户端将 `data_url` 上传到自有存储后调用。
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"url":"https://cdn.example/gen/abc.png"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/<message_id>/image
+```
+
+成功返回 `204 No Content`。`url` 必须是绝对 `http(s)` URL（≤ 2048 字符）。URL 格式错误返回 `422`，`message_id` 不是本 session 的 assistant 行返回 `404`，session 不属于 JWT 用户返回 `403`。该调用幂等——重复 POST 会覆盖同一个键。
+
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
 分頁讀消息歷史，最新在前。

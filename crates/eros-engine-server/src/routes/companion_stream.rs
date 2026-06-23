@@ -16,6 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_core::scope::{AffinityAxis, AffinityScope, MemoryScope};
+use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -69,6 +70,35 @@ impl AffinityScopeDto {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageMode {
+    #[default]
+    TextImage,
+    ImageOnly,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+pub struct ImageReplyParams {
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub mode: ImageMode,
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub style: Option<StyleKey>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub image_prompt: Option<String>,
+    #[serde(default)]
+    pub aspect_ratio: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub face_ref_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
@@ -88,6 +118,8 @@ pub struct StreamSendRequest {
     pub tips_amount_usd: Option<f64>,
     #[serde(default)]
     pub image_url: Option<String>,
+    #[serde(default)]
+    pub image: Option<ImageReplyParams>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -127,8 +159,16 @@ fn image_url_is_valid(url: &str) -> bool {
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip or an image is attached.
-    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
+    // Content may be empty only when a tip, an image_url, or a forced ImageOnly turn is attached.
+    let image_only = req
+        .image
+        .as_ref()
+        .is_some_and(|i| i.force && i.mode == ImageMode::ImageOnly);
+    if req.content.is_empty()
+        && req.tips_amount_usd.is_none()
+        && req.image_url.is_none()
+        && !image_only
+    {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -215,6 +255,57 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                 user_message: "图片链接无效".into(),
                 original_user_message_id: None,
             }));
+        }
+    }
+    if let Some(img) = req.image.as_ref() {
+        if img.force && req.tips_amount_usd.is_some() {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "forced image cannot be combined with tips_amount_usd".into(),
+                user_message: "打赏消息暂不支持图片回复".into(),
+                original_user_message_id: None,
+            }));
+        }
+        if let Some(url) = img.face_ref_url.as_deref() {
+            if !image_url_is_valid(url) {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    message: "face_ref_url must be an absolute http(s) URL".into(),
+                    user_message: "脸部参考图链接无效".into(),
+                    original_user_message_id: None,
+                }));
+            }
+        }
+        if let Some(ar) = img.aspect_ratio.as_deref() {
+            if !matches!(ar, "1:1" | "3:4" | "4:3" | "9:16" | "16:9") {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    message: "unsupported aspect_ratio".into(),
+                    user_message: "不支持的画幅比例".into(),
+                    original_user_message_id: None,
+                }));
+            }
+        }
+        if let Some(res) = img.resolution.as_deref() {
+            let ok = res.len() <= 16
+                && res.split_once('x').is_some_and(|(w, h)| {
+                    !w.is_empty()
+                        && !h.is_empty()
+                        && w.bytes().all(|b| b.is_ascii_digit())
+                        && h.bytes().all(|b| b.is_ascii_digit())
+                });
+            if !ok {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    message: "resolution must look like WxH".into(),
+                    user_message: "分辨率格式无效".into(),
+                    original_user_message_id: None,
+                }));
+            }
         }
     }
     Ok(())
@@ -404,6 +495,7 @@ pub async fn send_message_stream(
                     affinity_scope,
                     tips_amount_usd: req.tips_amount_usd,
                     image_url: req.image_url.clone(),
+                    image: req.image.clone(),
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -457,8 +549,83 @@ pub async fn send_message_stream(
     ))
 }
 
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetImageUrlRequest {
+    pub url: String,
+}
+
+/// Write back a generated image URL to an existing assistant message.
+#[utoipa::path(
+    post,
+    path = "/comp/chat/{session_id}/message/{message_id}/image",
+    tag = "companion",
+    params(
+        ("session_id" = Uuid, Path, description = "Chat session id"),
+        ("message_id" = Uuid, Path, description = "Assistant message id"),
+    ),
+    request_body = SetImageUrlRequest,
+    responses(
+        (status = 204, description = "stored"),
+        (status = 403, body = StreamPreErrorBody),
+        (status = 404, body = StreamPreErrorBody),
+        (status = 422, body = StreamPreErrorBody),
+    ),
+    security(("bearer" = []))
+)]
+pub async fn set_generated_image_url(
+    State(state): State<AppState>,
+    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<SetImageUrlRequest>,
+) -> Result<StatusCode, AppError> {
+    if !image_url_is_valid(&req.url) {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message: "url must be an absolute http(s) URL".into(),
+            user_message: "图片链接无效".into(),
+            original_user_message_id: None,
+        }));
+    }
+    let chat_repo = ChatRepo { pool: &state.pool };
+    // Ownership gate — mirrors send_message_stream exactly.
+    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_FOUND,
+            code: "session_not_found",
+            message: "session not found".into(),
+            user_message: "会话不存在".into(),
+            original_user_message_id: None,
+        })
+    })?;
+    if session.user_id != user_id {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::FORBIDDEN,
+            code: "session_forbidden",
+            message: "session not owned by JWT user".into(),
+            user_message: "无权访问该会话".into(),
+            original_user_message_id: None,
+        }));
+    }
+    let rows = chat_repo
+        .set_assistant_image_url(session_id, message_id, &req.url)
+        .await?;
+    if rows == 0 {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_FOUND,
+            code: "message_not_found",
+            message: "assistant message not found in session".into(),
+            user_message: "消息不存在".into(),
+            original_user_message_id: None,
+        }));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(send_message_stream))
+    OpenApiRouter::new()
+        .routes(routes!(send_message_stream))
+        .routes(routes!(set_generated_image_url))
 }
 
 #[cfg(test)]
@@ -483,6 +650,7 @@ mod tests {
             affinity_scope: None,
             tips_amount_usd: None,
             image_url: None,
+            image: None,
         }
     }
 
@@ -497,6 +665,7 @@ mod tests {
             affinity_scope: None,
             tips_amount_usd: amount,
             image_url: None,
+            image: None,
         }
     }
 
@@ -859,6 +1028,7 @@ mod validate_payload_tests {
             affinity_scope: None,
             tips_amount_usd: None,
             image_url: None,
+            image: None,
         }
     }
 
@@ -941,11 +1111,86 @@ mod validate_payload_tests {
         assert!(validate_payload(&r).is_err());
     }
 
+    // --- SetImageUrlRequest / writeback validation ---
+
+    #[test]
+    fn writeback_rejects_bad_url() {
+        assert!(!image_url_is_valid("not-a-url"));
+        assert!(image_url_is_valid("https://cdn.example/x.png"));
+    }
+
+    #[test]
+    fn set_image_url_request_deserializes() {
+        let v: SetImageUrlRequest =
+            serde_json::from_str(r#"{"url":"https://cdn.example/x.png"}"#).unwrap();
+        assert_eq!(v.url, "https://cdn.example/x.png");
+    }
+
+    #[test]
+    fn set_image_url_request_rejects_missing_url_field() {
+        // url is required (no default); missing field → deserialization error.
+        assert!(serde_json::from_str::<SetImageUrlRequest>(r#"{}"#).is_err());
+    }
+
     #[test]
     fn tip_plus_image_rejected() {
         let mut r = base();
         r.tips_amount_usd = Some(1.0);
         r.image_url = Some("https://x/y.png".into());
         assert!(validate_payload(&r).is_err());
+    }
+
+    fn minimal_req() -> StreamSendRequest {
+        StreamSendRequest {
+            content: "hi".into(),
+            client_msg_id: "01J0000000000000000000000A".into(),
+            prompt_traits: None,
+            audit: None,
+            tier: None,
+            memory_scope: None,
+            affinity_scope: None,
+            tips_amount_usd: None,
+            image_url: None,
+            image: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_force_image_with_tip() {
+        let mut req = minimal_req();
+        req.tips_amount_usd = Some(5.0);
+        req.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
+        assert!(validate_payload(&req).is_err());
+    }
+
+    #[test]
+    fn validate_allows_image_only_empty_content() {
+        let mut req = minimal_req();
+        req.content = String::new();
+        req.image = Some(ImageReplyParams {
+            force: true,
+            mode: ImageMode::ImageOnly,
+            ..Default::default()
+        });
+        assert!(validate_payload(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_face_ref_and_aspect() {
+        let mut req = minimal_req();
+        req.image = Some(ImageReplyParams {
+            face_ref_url: Some("ftp://x".into()),
+            ..Default::default()
+        });
+        assert!(validate_payload(&req).is_err());
+        let mut req2 = minimal_req();
+        req2.image = Some(ImageReplyParams {
+            aspect_ratio: Some("2:5".into()),
+            ..Default::default()
+        });
+        assert!(validate_payload(&req2).is_err());
     }
 }

@@ -296,6 +296,29 @@ pub enum TraitWhen {
     Absent,
 }
 
+/// Image-generation style preset key. Selected per turn by the frontend; the
+/// engine owns the preset strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StyleKey {
+    #[default]
+    Realistic,
+    SemiRealistic,
+    Anime,
+}
+
+pub const STYLE_REALISTIC: &str = "Photorealistic candid lifestyle photography, natural skin texture, believable anatomy, soft natural lighting, authentic smartphone photo aesthetic.";
+pub const STYLE_SEMI_REALISTIC: &str = "Semi-realistic digital character illustration, believable anatomy, softly painted skin, subtly stylized facial features, detailed cinematic lighting.";
+pub const STYLE_ANIME: &str = "High-quality Japanese anime illustration, clean expressive line art, detailed eyes, polished cel shading, coherent anatomy and detailed background.";
+
+pub fn style_preset(key: StyleKey) -> &'static str {
+    match key {
+        StyleKey::Realistic => STYLE_REALISTIC,
+        StyleKey::SemiRealistic => STYLE_SEMI_REALISTIC,
+        StyleKey::Anime => STYLE_ANIME,
+    }
+}
+
 /// When the output filter runs relative to the post-process extraction pipeline
 /// (insight/memory/affinity). `AfterExtract` (default): extraction reads the
 /// original reply, only the client output is filtered. `BeforeExtract`:
@@ -348,8 +371,13 @@ pub struct DefaultConfig {
     pub ignore_providers: Vec<String>,
 }
 
+fn default_model_spec() -> ModelSpec {
+    ModelSpec::Fixed(String::new())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
+    #[serde(default = "default_model_spec")]
     pub model: ModelSpec,
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -424,6 +452,15 @@ pub struct TaskConfig {
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
+    /// chat_image_generation-only: default style when the frontend omits one.
+    #[serde(default)]
+    pub default_style: Option<StyleKey>,
+    /// chat_image_generation-only: default aspect ratio (e.g. "3:4").
+    #[serde(default)]
+    pub default_aspect_ratio: Option<String>,
+    /// chat_image_generation-only: default resolution (e.g. "1024x1365").
+    #[serde(default)]
+    pub default_resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -602,6 +639,30 @@ pub struct ResolvedExtract {
     pub extract_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved image-generation task (`chat_image_generation`). `model` is optional:
+/// `None` means defer entirely to the per-turn frontend model. The per-turn
+/// chain is built by `effective_image_chain`.
+#[derive(Debug, Clone)]
+pub struct ResolvedImageGen {
+    pub model: Option<ModelSpec>,
+    pub fallback_model: Vec<String>,
+    pub default_style: StyleKey,
+    pub default_aspect_ratio: String,
+    pub default_resolution: Option<String>,
+    pub max_tokens: u32,
+}
+
+impl TaskConfig {
+    /// Image-gen view of `model`: an empty Fixed string ⇒ None (model deferred
+    /// to the per-turn frontend).
+    pub(crate) fn model_image_opt(&self) -> Option<ModelSpec> {
+        match &self.model {
+            ModelSpec::Fixed(s) if s.is_empty() => None,
+            other => Some(other.clone()),
+        }
+    }
 }
 
 impl ModelConfig {
@@ -909,6 +970,68 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the image-generation task. `None` (feature off) when
+    /// `[tasks.chat_image_generation]` is absent. `Some(_)` means ENABLED — a
+    /// usable model is resolved per-turn by `effective_image_chain`.
+    pub fn resolve_image_gen(&self) -> Option<ResolvedImageGen> {
+        const IMG_TASK: &str = "chat_image_generation";
+        let task_cfg = self.tasks.get(IMG_TASK)?;
+        let retry_depth = task_cfg.retry_depth.unwrap_or(2);
+        let mut fallback_model = task_cfg
+            .fallback
+            .clone()
+            .map(FallbackSpec::into_vec)
+            .unwrap_or_default();
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedImageGen {
+            model: task_cfg.model_image_opt(),
+            fallback_model,
+            default_style: task_cfg.default_style.unwrap_or_default(),
+            default_aspect_ratio: task_cfg
+                .default_aspect_ratio
+                .clone()
+                .unwrap_or_else(|| "1:1".to_string()),
+            default_resolution: task_cfg.default_resolution.clone(),
+            max_tokens: task_cfg.max_tokens.unwrap_or(4096),
+        })
+    }
+}
+
+/// Drop later duplicates, preserving first-seen order.
+fn dedup_keep_first(v: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
+/// the turn cannot generate (caller degrades to text). `Some((primary, chain))`
+/// otherwise. Order: per-turn override → config `ModelSpec` → config fallback.
+///
+/// The `[tasks.chat_image_generation]` task block is the feature switch: when
+/// `resolved` is `None` (no task block) the feature is OFF, so a per-turn
+/// `req_model` override is IGNORED and this returns `None`. Otherwise the
+/// per-turn override takes precedence over the config model/fallback.
+pub fn effective_image_chain(
+    req_model: Option<&str>,
+    resolved: Option<&ResolvedImageGen>,
+) -> Option<(String, Vec<String>)> {
+    // Gate on the task block first: no `[tasks.chat_image_generation]` ⇒
+    // image-gen is opt-OUT, so a client-supplied `req_model` must not enable it.
+    let r = resolved?;
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(m) = req_model.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(m.to_owned());
+    }
+    if let Some(m) = r.model.as_ref().and_then(ModelSpec::select) {
+        candidates.push(m);
+    }
+    candidates.extend(r.fallback_model.iter().cloned());
+    dedup_keep_first(&mut candidates);
+    let mut it = candidates.into_iter();
+    it.next().map(|primary| (primary, it.collect()))
+}
+
+impl ModelConfig {
     /// PDE ghost kill-switch. `true` (default) ⇒ ghost honoured; `false` ⇒ the
     /// whole PDE path never produces a Ghost. Read INDEPENDENTLY of
     /// `filter_prompt`, so it also governs the pure rule engine (LLM PDE off).
@@ -2754,5 +2877,111 @@ temperature = 0.8
             ins.extract_prompt.contains("\"facts\""),
             "facts json contract"
         );
+    }
+
+    // ─── Task 2: StyleKey presets + ResolvedImageGen + resolve_image_gen ──────
+
+    #[test]
+    fn resolve_image_gen_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\n").unwrap();
+        assert!(cfg.resolve_image_gen().is_none());
+    }
+
+    #[test]
+    fn resolve_image_gen_some_with_optional_model() {
+        // Block present, NO model key → Some, with model: None.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nfallback=[\"fb-img\"]\ndefault_style=\"anime\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_image_gen().expect("block present ⇒ Some");
+        assert!(r.model.is_none());
+        assert_eq!(r.fallback_model, vec!["fb-img".to_string()]);
+        assert_eq!(r.default_style, StyleKey::Anime);
+    }
+
+    #[test]
+    fn resolve_image_gen_carries_model_spec() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img-a\"\n").unwrap();
+        let r = cfg.resolve_image_gen().unwrap();
+        assert!(matches!(r.model, Some(ModelSpec::Fixed(ref s)) if s == "img-a"));
+        assert_eq!(r.default_style, StyleKey::Realistic); // serde default
+    }
+
+    #[test]
+    fn style_preset_maps_keys() {
+        assert!(style_preset(StyleKey::Realistic).starts_with("Photorealistic"));
+        assert!(style_preset(StyleKey::SemiRealistic).starts_with("Semi-realistic"));
+        assert!(style_preset(StyleKey::Anime).starts_with("High-quality Japanese anime"));
+    }
+
+    #[test]
+    fn regression_existing_task_model_still_resolves_fixed() {
+        // Adding default_model_spec() must NOT affect tasks that explicitly set model.
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"x\"\n").unwrap();
+        let task = cfg.tasks.get("chat_companion").unwrap();
+        assert!(matches!(&task.model, ModelSpec::Fixed(s) if s == "x"));
+        let r = cfg.resolve("chat_companion", None);
+        assert_eq!(r.model, "x");
+    }
+
+    // ─── Task 3: effective_image_chain + dedup_keep_first ─────────────────────
+
+    #[test]
+    fn effective_chain_per_turn_wins_and_dedups() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"X\",\"Y\"]\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_image_gen();
+        // per-turn "X" + config "cfg" + fallback ["X","Y"] → [X, cfg, Y] (dedup X)
+        assert_eq!(
+            effective_image_chain(Some("X"), r.as_ref()),
+            Some(("X".to_string(), vec!["cfg".to_string(), "Y".to_string()]))
+        );
+    }
+
+    #[test]
+    fn effective_chain_fallback_only_is_primary() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nfallback=[\"Z\",\"W\"]\n")
+                .unwrap();
+        let r = cfg.resolve_image_gen();
+        assert_eq!(
+            effective_image_chain(None, r.as_ref()),
+            Some(("Z".to_string(), vec!["W".to_string()]))
+        );
+    }
+
+    #[test]
+    fn effective_chain_empty_is_none() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_image_generation]\n").unwrap();
+        assert_eq!(
+            effective_image_chain(None, cfg.resolve_image_gen().as_ref()),
+            None
+        );
+        assert_eq!(effective_image_chain(None, None), None);
+    }
+
+    #[test]
+    fn effective_chain_config_model_when_no_per_turn() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"F\"]\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_image_gen();
+        assert_eq!(
+            effective_image_chain(None, r.as_ref()),
+            Some(("cfg".to_string(), vec!["F".to_string()]))
+        );
+    }
+
+    #[test]
+    fn effective_chain_no_task_block_ignores_per_turn_model() {
+        // The [tasks.chat_image_generation] block is the feature switch. With it
+        // absent (`resolved = None`), a client-supplied per-turn `model` must NOT
+        // enable billable image generation — opt-in only.
+        assert_eq!(effective_image_chain(Some("X"), None), None);
     }
 }

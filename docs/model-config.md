@@ -230,13 +230,14 @@ input filter has no triggers, timing, or tiers).
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
+| `chat_image_generation` | `pipeline::stream` (opt-in image reply executor; activated when this task block is present) | live (opt-in) |
 | `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set)
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in)
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 
@@ -245,7 +246,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants degrade to `reply_text` — no image executor ships in OSS)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants execute when `[tasks.chat_image_generation]` is configured and a model is resolvable; they degrade to `reply_text` only when the task block is absent or no model is resolvable for the turn)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `image_prompt`, `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
@@ -253,6 +254,68 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 - Every judge call is audited to `companion_decision_events`.
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
+
+### `[tasks.chat_image_generation]` — companion image replies (opt-in)
+
+The companion image executor is **off by default**. It activates when this task
+block exists in the config. When active, the engine executes `reply_image` and
+`reply_text_image` actions instead of degrading them to `reply_text`. Degradation
+to `reply_text` still occurs when the block is absent or when no model is
+resolvable for a given turn.
+
+```toml
+[tasks.chat_image_generation]
+# `model` is OPTIONAL. Omit to defer model selection to the per-turn frontend
+# param (req.image.model). When set, reuses ModelSpec: "" fixed / [] round-robin
+# / {} weighted (the same three shapes as chat_companion.model).
+model = "google/gemini-2.5-flash-image"   # OPTIONAL
+# `fallback` is a FallbackSpec: a single id string OR an ordered array tried
+# SEQUENTIALLY (first success wins — NOT round-robin). Note: under `model`,
+# [...] = round-robin; under `fallback`, [...] = ordered retry chain.
+fallback = ["google/gemini-2.5-flash-image"]
+default_style = "realistic"          # realistic | semi_realistic | anime
+default_aspect_ratio = "3:4"
+default_resolution = "1024x1365"
+max_tokens = 4096
+```
+
+**Per-turn model resolution** — one unified candidate list, head = primary, tail = retry chain:
+
+1. `req.image.model` — per-turn single-id override from the frontend
+2. Config `model` — the `ModelSpec` resolved to one id for this call
+3. Config `fallback` — ordered retry chain entries
+
+Later duplicates are removed (keep-first). An empty list means no model is
+resolvable and the turn degrades to `reply_text`.
+
+**`fallback` alone is sufficient:** with no `model` set and no per-turn override,
+the head of `fallback` becomes the primary. A `model`-only config (no `fallback`)
+leaves no safety net on failure.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `model` | `ModelSpec` (string \| array \| table) | absent | **Optional.** Absent ⇒ executor enabled but frontend must supply a model per turn. |
+| `fallback` | `String` \| `Array<String>` | `[]` | Sequential retry chain (FallbackSpec). |
+| `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | Per-turn style key (overridable via `req.image.style`). |
+| `default_aspect_ratio` | `String` | `"3:4"` | Per-turn aspect ratio (overridable via `req.image.aspect_ratio`). Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
+| `default_resolution` | `String` | absent | Per-turn resolution hint (overridable via `req.image.resolution`). Model-specific (e.g. `"1024x1365"`). |
+| `max_tokens` | `u32` | compiled-in default | Token cap for the image-gen call. |
+
+**Style presets** are engine-owned constants injected into the generation prompt:
+
+| Key | Description |
+|---|---|
+| `realistic` | Photorealistic candid lifestyle photography, natural skin texture, believable anatomy, soft natural lighting, authentic smartphone photo aesthetic. |
+| `semi_realistic` | Semi-realistic digital character illustration, believable anatomy, softly painted skin, subtly stylized facial features, detailed cinematic lighting. |
+| `anime` | High-quality Japanese anime illustration, clean expressive line art, detailed eyes, polished cel shading, coherent anatomy and detailed background. |
+
+**Persona appearance** — if the persona's `art_metadata` has an `appearance` key,
+it is injected into the generation prompt between the style preset and the subject.
+The `appearance` field is optional and additive — existing personas without it are
+unaffected.
+
+Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
+`resolve_image_gen()` in `model_config.rs`.
 
 ### Enabling / disabling extraction
 

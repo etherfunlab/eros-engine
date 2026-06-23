@@ -58,13 +58,14 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 | `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completions；打赏轮走同一回复路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights` (抽事实 + JSONB merge) | live |
 | `pde_decision` | `pipeline::stream`（可选 LLM 判断器，通过 `run_pde_decision` 在 `run_stream` 中调用；`filter_prompt` 缺失或 LLM 调用失败时使用规则引擎） | live（opt-in） |
+| `chat_image_generation` | `pipeline::stream`（可选图片回复执行器；任务块存在时激活） | live（opt-in） |
 | `embedding` | reserved — `VoyageClient` 自己读 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite`,不走这条路径 | reserved |
 
 `[tasks.<name>]` 只有当代码里真有 `model_config.resolve("<name>", ...)` 调用时才有意义。当前调用点:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision` 调用（仅当 `filter_prompt` 已设置时）
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision` 调用（仅当 `filter_prompt` 已设置时）；`chat_image_generation`，通过 `resolve_image_gen()` 调用（图片执行器，opt-in）
 
 `embedding` 是 vestigial —— Voyage 完全不走这条路径。
 
@@ -73,7 +74,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块设置 `filter_prompt` 即可启用 LLM 判断器：
 
 - LLM 收到最近对话、关系状态和对话信号，返回 JSON 判断结果，字段包括：
-  - `action`：`"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"`（image 变体降级为 `reply_text`，OSS 不内置图片执行器）
+  - `action`：`"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"`（配置了 `[tasks.chat_image_generation]` 且当轮有可用模型时，image 变体正常执行；仅在任务块缺失或当轮无可用模型时才降级为 `reply_text`）
   - `inner_state`：一句话内心状态/语气描述，会折叠进回复 prompt
   - `image_prompt`、`reason`：选填
 - **Fail-open：** LLM 超时或出错时回退到规则引擎 —— LLM 判断器永远不会阻塞聊天响应。
@@ -81,6 +82,55 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 - 每次判断调用都会记录到 `companion_decision_events` 表，供审计使用。
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设为 `false` 可在整个 PDE 路径（LLM 判断、规则 fallback、纯规则引擎）上全面禁用 ghosting，使伴侣永远不会沉默。适用于不希望出现沉默轮的产品。
+
+### `[tasks.chat_image_generation]` — 伴侣图片回复（opt-in）
+
+图片执行器**默认关闭**。在配置中添加此任务块即可启用。启用后，引擎会真正执行 `reply_image` 和 `reply_text_image` 动作，而不是将其降级为 `reply_text`。仅在以下情况下才降级：任务块缺失，或当轮无可用模型。
+
+```toml
+[tasks.chat_image_generation]
+# `model` 可选。省略则把模型选择完全交给前端每轮传入的 req.image.model。
+# 设置时复用 ModelSpec：字符串固定 / 数组轮转 / 表加权（与 chat_companion.model 三种写法相同）。
+model = "google/gemini-2.5-flash-image"   # 可选
+# `fallback` 是 FallbackSpec：单个 id 字符串，或按顺序依次尝试的数组（非轮转）。
+# 注意：model 下 [...] = 轮转；fallback 下 [...] = 按序重试链。
+fallback = ["google/gemini-2.5-flash-image"]
+default_style = "realistic"          # realistic | semi_realistic | anime
+default_aspect_ratio = "3:4"
+default_resolution = "1024x1365"
+max_tokens = 4096
+```
+
+**每轮模型解析**——单一候选列表，头部为主模型，尾部为重试链：
+
+1. `req.image.model` —— 前端每轮传入的单 id 覆盖
+2. 配置 `model` —— 本次调用从 ModelSpec 解析出的一个 id
+3. 配置 `fallback` —— 按序重试链条目
+
+去重（保留首次出现）。候选列表为空 → 当轮降级为 `reply_text`。
+
+**仅配置 `fallback` 也可用：** 没有 `model` 也没有前端覆盖时，`fallback` 头部即为主模型。
+
+| 字段 | 类型 | 默认值 | 备注 |
+|---|---|---|---|
+| `model` | `ModelSpec`（字符串 \| 数组 \| 表） | 缺失 | **可选。** 缺失 = 执行器已启用，但前端每轮必须传模型。 |
+| `fallback` | `String` \| `Array<String>` | `[]` | 顺序重试链（FallbackSpec）。 |
+| `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 默认风格（可通过 `req.image.style` 覆盖）。 |
+| `default_aspect_ratio` | `String` | `"3:4"` | 默认画幅比例（可覆盖）。允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。 |
+| `default_resolution` | `String` | 缺失 | 默认分辨率（可覆盖）。模型相关，如 `"1024x1365"`。 |
+| `max_tokens` | `u32` | 代码内置 | 图片生成调用的 token 上限。 |
+
+**风格预设**（引擎内置常量，注入生成 prompt）：
+
+| Key | 描述 |
+|---|---|
+| `realistic` | 写实风格生活摄影，自然肤质，合理解剖结构，柔和自然光，真实手机照片质感。 |
+| `semi_realistic` | 半写实数字角色插画，合理解剖，柔和绘制皮肤，轻度风格化面孔，细腻电影灯光。 |
+| `anime` | 高品质日式动漫插画，干净表情线稿，精细眼睛，精良赛璐珞阴影，连贯解剖与背景。 |
+
+**人格外观描述** — 若人格 `art_metadata` 含 `appearance` 字段，该描述会插入生成 prompt（位于风格预设之后、主题之前）。该字段可选且向后兼容，无此字段的现有人格不受影响。
+
+调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 的 `resolve_image_gen()` 调用。
 
 ### 开启 / 关闭抽取任务
 

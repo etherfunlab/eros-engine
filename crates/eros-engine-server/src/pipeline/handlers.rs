@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
-use eros_engine_llm::model_config::ResolvedModel;
+use eros_engine_llm::model_config::{style_preset, ResolvedModel, StyleKey};
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
@@ -86,6 +86,30 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
         Some(s) if !s.trim().is_empty() => s,
         _ => &msg.content,
     }
+}
+
+/// Model-facing text for an assistant history row: the stored `content`, with a
+/// `[你给对方发送了一张照片：{prompt}]` marker appended when `metadata.image.prompt`
+/// is present. Used by `assemble_chat_request` so the model knows it previously
+/// sent an image in that turn.
+pub(crate) fn model_facing_assistant_text(msg: eros_engine_store::chat::ChatMessage) -> String {
+    let mut text = msg.content;
+    if let Some(prompt) = msg
+        .metadata
+        .as_ref()
+        .and_then(|md| md.get("image"))
+        .and_then(|img| img.get("prompt"))
+        .and_then(|p| p.as_str())
+    {
+        let marker = format!("[你给对方发送了一张照片：{prompt}]");
+        if text.trim().is_empty() {
+            text = marker;
+        } else {
+            text.push_str("\n\n");
+            text.push_str(&marker);
+        }
+    }
+    text
 }
 
 /// Build the `[用户发送了一张图片]` preamble from a stored `metadata.vision`
@@ -189,7 +213,7 @@ fn assemble_chat_request(
         let (role, content) = match msg.role.as_str() {
             "user" => ("user", model_facing_user_text(&msg)),
             "gift_user" => ("user", model_facing_user_text(&msg)),
-            "assistant" => ("assistant", msg.content),
+            "assistant" => ("assistant", model_facing_assistant_text(msg)),
             _ => continue,
         };
         messages.push(ChatMessage {
@@ -217,6 +241,27 @@ fn assemble_chat_request(
         reasoning: resolved.reasoning,
         ..Default::default()
     }
+}
+
+/// Compose the final image-gen prompt: style preset + optional persona
+/// appearance + subject. Pure.
+pub(crate) fn compose_image_prompt(
+    style: StyleKey,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    subject: &str,
+) -> String {
+    let mut parts: Vec<String> = vec![style_preset(style).to_string()];
+    if let Some(a) = crate::prompt::meta_str(persona, "appearance")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(a.to_string());
+    }
+    let subject = subject.trim();
+    if !subject.is_empty() {
+        parts.push(subject.to_string());
+    }
+    parts.join("\n")
 }
 
 // ─── Memory recall + insight injection helpers ────────────────────
@@ -1598,6 +1643,120 @@ mod tests {
     fn recall_query_plain_text_turn() {
         let row = user_row("普通消息", None);
         assert_eq!(recall_query_text(&row), "普通消息");
+    }
+
+    // ─── compose_image_prompt ───────────────────────────────────────────
+
+    /// Build a `CompanionPersona` with arbitrary `art_metadata` key-value pairs,
+    /// matching the construction pattern from `pde_test_persona` in stream.rs.
+    fn test_persona_with_meta(
+        pairs: &[(&str, &str)],
+    ) -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let oid = uuid::Uuid::new_v4();
+        let meta: serde_json::Map<String, serde_json::Value> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "TestPersona".into(),
+                system_prompt: "You are TestPersona.".into(),
+                tip_personality: None,
+                art_metadata: serde_json::Value::Object(meta),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: oid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn compose_image_prompt_layers_style_appearance_subject() {
+        let persona = test_persona_with_meta(&[("appearance", "auburn hair, green eyes")]);
+        let out = compose_image_prompt(StyleKey::Anime, &persona, "smiling in a cafe");
+        assert!(out.starts_with("High-quality Japanese anime"));
+        assert!(out.contains("auburn hair, green eyes"));
+        assert!(out.contains("smiling in a cafe"));
+    }
+
+    #[test]
+    fn compose_image_prompt_omits_absent_appearance() {
+        let persona = test_persona_with_meta(&[]);
+        let out = compose_image_prompt(StyleKey::Realistic, &persona, "a cat");
+        assert!(out.starts_with("Photorealistic"));
+        assert!(out.contains("a cat"));
+    }
+
+    // ─── model_facing_assistant_text / history fold ──────────────────────
+
+    fn assistant_row(
+        content: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> eros_engine_store::chat::ChatMessage {
+        eros_engine_store::chat::ChatMessage {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            role: "assistant".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: None,
+            usage: None,
+            generation_id: None,
+            assistant_action_type: None,
+            pre_filter_content: None,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn assistant_row_with_image_prompt_appends_marker() {
+        let row = assistant_row(
+            "这是我的回复",
+            Some(serde_json::json!({ "image": { "prompt": "smiling in a cafe" } })),
+        );
+        let out = model_facing_assistant_text(row);
+        assert!(out.contains("这是我的回复"));
+        assert!(out.contains("[你给对方发送了一张照片：smiling in a cafe]"));
+        // marker is appended after two newlines
+        assert!(out.contains("这是我的回复\n\n[你给对方发送了一张照片：smiling in a cafe]"));
+    }
+
+    #[test]
+    fn assistant_row_empty_content_with_image_prompt_uses_marker_only() {
+        let row = assistant_row(
+            "",
+            Some(serde_json::json!({ "image": { "prompt": "sunset on the beach" } })),
+        );
+        let out = model_facing_assistant_text(row);
+        assert_eq!(out, "[你给对方发送了一张照片：sunset on the beach]");
+    }
+
+    #[test]
+    fn assistant_row_without_image_metadata_unchanged() {
+        let row = assistant_row("普通回复", None);
+        assert_eq!(model_facing_assistant_text(row), "普通回复");
+    }
+
+    #[test]
+    fn assistant_row_image_metadata_without_prompt_unchanged() {
+        let row = assistant_row(
+            "普通回复",
+            Some(serde_json::json!({ "image": { "url": "https://x/y.png" } })),
+        );
+        assert_eq!(model_facing_assistant_text(row), "普通回复");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`

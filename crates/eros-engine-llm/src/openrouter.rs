@@ -105,6 +105,79 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
     body
 }
 
+/// One-shot image-generation request. The model is expected to return
+/// generated images in `message.images[]` on the wire response.
+#[derive(Debug, Clone, Default)]
+pub struct ImageGenRequest {
+    pub model: String,
+    /// Ordered fallback chain (empty = no fallback).
+    pub fallback_model: Vec<String>,
+    pub prompt: String,
+    /// Optional face/style reference image URL (image2image hint).
+    pub face_ref_url: Option<String>,
+    /// Model-specific aspect ratio hint (e.g. `"3:4"`). Folded into the
+    /// text instruction when present.
+    pub aspect_ratio: Option<String>,
+    /// Model-specific resolution hint (e.g. `"1024x1024"`). Folded into
+    /// the text instruction when present.
+    pub resolution: Option<String>,
+    pub max_tokens: u32,
+}
+
+/// Response from a successful image-generation call.
+#[derive(Debug, Clone, Default)]
+pub struct ImageGenResponse {
+    /// Base64 data-URLs extracted from `message.images[]`.
+    pub images: Vec<String>,
+    /// Optional text accompanying the images (from `message.content`).
+    pub text: Option<String>,
+    /// OpenRouter response `id` — opaque generation handle.
+    pub generation_id: Option<String>,
+    /// Model actually served (may differ from request when fallback hit).
+    pub model: Option<String>,
+    /// OpenRouter `usage` block — tokens / cost. Opaque to engine.
+    pub usage: Option<serde_json::Value>,
+    /// `finish_reason` from the first choice in the wire response.
+    pub finish_reason: Option<String>,
+}
+
+/// Pull all image URLs out of the first choice's `message.images[]`.
+fn images_from_wire(parsed: &WireResponse) -> Vec<String> {
+    parsed
+        .choices
+        .first()
+        .and_then(|c| c.message.images.as_ref())
+        .map(|imgs| imgs.iter().map(|i| i.image_url.url.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Build the OpenRouter wire body for one image-gen attempt. Pure (no I/O).
+fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
+    // Aspect ratio / resolution are model-specific; fold them into the text
+    // instruction as a best-effort hint (works across image models).
+    let mut text = req.prompt.clone();
+    if let Some(ar) = req.aspect_ratio.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(&format!("\n(aspect ratio: {ar})"));
+    }
+    if let Some(res) = req.resolution.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(&format!("\n(resolution: {res})"));
+    }
+    let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
+    if let Some(face) = req.face_ref_url.as_deref().filter(|s| !s.is_empty()) {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": face }
+        }));
+    }
+    serde_json::json!({
+        "model": model,
+        "modalities": ["image", "text"],
+        "messages": [ { "role": "user", "content": content } ],
+        "max_tokens": req.max_tokens,
+        "stream": false,
+    })
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatResponse {
     pub reply: String,
@@ -163,9 +236,21 @@ struct WireRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct WireImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireImage {
+    image_url: WireImageUrl,
+}
+
+#[derive(Debug, Deserialize)]
 struct WireMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    images: Option<Vec<WireImage>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,6 +676,81 @@ impl OpenRouterClient {
             });
         }
         Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
+    }
+
+    /// One-shot image-generation call. Walks `[model] + fallback_model` on
+    /// transport failure OR a zero-image success. Returns the first attempt that
+    /// yields ≥1 image. Non-streaming.
+    pub async fn execute_image(&self, req: ImageGenRequest) -> Result<ImageGenResponse, LlmError> {
+        let candidates: Vec<&str> = std::iter::once(req.model.as_str())
+            .chain(req.fallback_model.iter().map(String::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Err(LlmError::Config(
+                "openrouter: image-gen has no models".into(),
+            ));
+        }
+        if self.api_key.is_empty() {
+            return Err(LlmError::Config("openrouter: api key not set".into()));
+        }
+        let mut last_err: Option<LlmError> = None;
+        for model in &candidates {
+            let mut body = build_image_body(&req, model);
+            if let Some(prefs) = self.provider_prefs() {
+                if let Ok(v) = serde_json::to_value(&prefs) {
+                    body["provider"] = v;
+                }
+            }
+            let resp = match self
+                .http
+                .post(&self.base_url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: image attempt failed (transport); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!(model = %model, %status, "openrouter: image attempt failed (status); next");
+                last_err = Some(LlmError::Status(status, text));
+                continue;
+            }
+            let parsed: WireResponse = match resp.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: image attempt failed (decode); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let images = images_from_wire(&parsed);
+            if images.is_empty() {
+                tracing::warn!(model = %model, "openrouter: image attempt returned zero images; next");
+                last_err = Some(LlmError::Provider("image-gen returned no images".into()));
+                continue;
+            }
+            let first = parsed.choices.into_iter().next();
+            let text = first.as_ref().and_then(|c| c.message.content.clone());
+            let finish_reason = first.and_then(|c| c.finish_reason);
+            return Ok(ImageGenResponse {
+                images,
+                text,
+                generation_id: parsed.id,
+                model: parsed.model,
+                usage: parsed.usage,
+                finish_reason,
+            });
+        }
+        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: image-gen no models".into())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2087,5 +2247,54 @@ data: [DONE]\n\n";
             !s.contains("presence_penalty"),
             "unset presence_penalty must be omitted: {s}"
         );
+    }
+
+    #[test]
+    fn image_body_has_modalities_and_optional_face_ref() {
+        let req = ImageGenRequest {
+            model: "m".into(),
+            fallback_model: vec![],
+            prompt: "a cat".into(),
+            face_ref_url: None,
+            aspect_ratio: Some("3:4".into()),
+            resolution: None,
+            max_tokens: 4096,
+        };
+        let body = build_image_body(&req, "m");
+        assert_eq!(body["modalities"], serde_json::json!(["image", "text"]));
+        let content = &body["messages"][0]["content"];
+        // text-only content block when no face ref
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert!(content[0]["text"].as_str().unwrap().contains("a cat"));
+        assert!(content[0]["text"].as_str().unwrap().contains("3:4"));
+
+        let req2 = ImageGenRequest {
+            face_ref_url: Some("https://x/a.png".into()),
+            ..req
+        };
+        let body2 = build_image_body(&req2, "m");
+        let content2 = &body2["messages"][0]["content"];
+        assert_eq!(content2.as_array().unwrap().len(), 2);
+        assert_eq!(content2[1]["type"], "image_url");
+        assert_eq!(content2[1]["image_url"]["url"], "https://x/a.png");
+    }
+
+    #[test]
+    fn image_response_parses_data_url_from_images_array() {
+        let wire = serde_json::json!({
+            "id": "gen_1",
+            "model": "served-model",
+            "usage": {"total_tokens": 1},
+            "choices": [{
+                "message": {
+                    "content": "here you go",
+                    "images": [{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed: WireResponse = serde_json::from_value(wire).unwrap();
+        let imgs = images_from_wire(&parsed);
+        assert_eq!(imgs, vec!["data:image/png;base64,AAAA".to_string()]);
     }
 }

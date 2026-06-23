@@ -208,6 +208,35 @@ model_name_display_override = true
 #不要输出 JSON 以外的任何内容，不要代码围栏。
 #"""
 
+# ── Companion image generation (chat_image_generation) ──────────────────────
+# OPT-IN. Feature is OFF unless this block exists. When present, the engine
+# executes `reply_image` / `reply_text_image` actions instead of degrading to
+# `reply_text`. Degrades to reply_text only when unconfigured OR when no model
+# is resolvable for a turn (config has none and the frontend passed none).
+#
+# `model` is OPTIONAL. Omit it to defer model selection entirely to the per-turn
+# frontend param (req.image.model). A task block with no `model` enables the
+# executor but still requires the client to pass a model each turn.
+# When set, `model` reuses ModelSpec: "" fixed / [] round-robin / {} weighted
+# (the same three shapes as chat_companion.model).
+#
+# `fallback` is a FallbackSpec: a single id string OR an ordered array tried
+# SEQUENTIALLY (first success wins — NOT round-robin, NOT weighted).
+# Note: under `model`, [...] = round-robin; under `fallback`, [...] = retry chain.
+#
+# Per-turn candidate resolution order (head = primary, tail = retry chain):
+#   1. req.image.model   (per-turn single-id override from the frontend)
+#   2. config model      (ModelSpec resolved to one id for this call)
+#   3. config fallback   (ordered retry chain entries)
+# Duplicates are removed (keep-first). Empty list → degrade to reply_text.
+[tasks.chat_image_generation]
+model = "google/gemini-2.5-flash-image"
+fallback = ["google/gemini-2.5-flash-image"]
+default_style = "realistic"          # realistic | semi_realistic | anime
+default_aspect_ratio = "3:4"
+default_resolution = "1024x1365"
+max_tokens = 4096
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
