@@ -416,6 +416,11 @@ pub struct TaskConfig {
     /// (other tasks ignore it), like `input_filter`/`dimensions`.
     #[serde(default)]
     pub ghosting: Option<bool>,
+    /// PDE-only: send `response_format = json_schema` on the judge request to
+    /// raise JSON adherence. Absent/`true` ⇒ on; `false` ⇒ off (escape hatch for
+    /// a provider that rejects the param). Read only on `[tasks.pde_decision]`.
+    #[serde(default)]
+    pub structured_output: Option<bool>,
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
@@ -580,6 +585,7 @@ pub struct ResolvedPde {
     pub decision_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    pub structured_output: bool,
 }
 
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
@@ -899,6 +905,7 @@ impl ModelConfig {
             decision_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            structured_output: task_cfg.structured_output.unwrap_or(true),
         })
     }
 
@@ -1267,8 +1274,9 @@ model         = "x-ai/grok-4-mini"
 temperature   = 0.5
 max_tokens    = 200
 description   = "LLM decision layer"
-filter_prompt = "Decide the action and inner_state."
-ghosting      = false
+filter_prompt    = "Decide the action and inner_state."
+ghosting         = false
+structured_output = true
 
 [tasks.embedding]
 model        = "voyage-3-lite"
@@ -2632,6 +2640,21 @@ filter_prompt = "   "
         let p = cfg.resolve_pde().expect("resolves");
         assert_eq!(p.model, "m");
         assert_eq!(p.decision_prompt, "decide");
+    }
+
+    #[test]
+    fn resolve_pde_structured_output_default_true_else_field() {
+        // absent → true
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_pde().unwrap().structured_output);
+        // explicit false → false
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\nstructured_output = false\n",
+        ).unwrap();
+        assert!(!cfg.resolve_pde().unwrap().structured_output);
     }
 
     #[test]

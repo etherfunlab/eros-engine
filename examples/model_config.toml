@@ -298,6 +298,7 @@ temperature = 0.3
 max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
+#structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
 # Uncomment filter_prompt to enable the LLM judge. inner_state MUST be a short
 # mood description — NEVER instructions or formatting (it is sanitized, but keep
 # the model honest). Output JSON only, no code fences.
