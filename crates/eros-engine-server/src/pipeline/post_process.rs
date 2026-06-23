@@ -186,10 +186,7 @@ pub async fn run(
         .await;
     };
 
-    let should_update_lead = matches!(
-        plan.action_type,
-        ActionType::ReplyText | ActionType::Proactive,
-    );
+    let should_update_lead = lead_refresh_applies(plan.action_type);
     let fut_lead = async {
         if should_update_lead {
             refresh_lead_score(&state, session_id, user_id).await;
@@ -482,6 +479,16 @@ const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 /// delay or lose the turn's affinity event. On elapse we fall back to
 /// rule-only deltas (the spec §4.5 "timeout → default" path).
 const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Lead-score refresh applies to text-bearing reply turns and proactive turns.
+/// `reply_image` carries no assistant text (like the insight/memory gating), so
+/// it is excluded; `reply_text_image` IS text-bearing and refreshes lead.
+fn lead_refresh_applies(action: ActionType) -> bool {
+    matches!(
+        action,
+        ActionType::ReplyText | ActionType::ReplyTextImage | ActionType::Proactive
+    )
+}
 
 /// Stable marker explaining why a `message`/`proactive` affinity event carries
 /// no OpenRouter audit trio (`model`/`usage`/`generation_id` all NULL). The trio
@@ -1344,6 +1351,15 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "empty");
+    }
+
+    #[test]
+    fn lead_refresh_applies_to_text_bearing_and_proactive_only() {
+        assert!(lead_refresh_applies(ActionType::ReplyText));
+        assert!(lead_refresh_applies(ActionType::ReplyTextImage));
+        assert!(lead_refresh_applies(ActionType::Proactive));
+        assert!(!lead_refresh_applies(ActionType::ReplyImage)); // no assistant text
+        assert!(!lead_refresh_applies(ActionType::Ghost));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
