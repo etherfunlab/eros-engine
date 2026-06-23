@@ -2658,7 +2658,14 @@ pub fn run_stream(
 
                 // Spawn post-process; do not await.
                 let state_bg = (*state).clone();
-                let plan_bg = plan.clone();
+                let mut plan_bg = plan.clone();
+                // A `reply_image` only reaches the text path by falling through on image-gen
+                // failure (the success path returns earlier via image_only_done). The turn
+                // became a real text reply, so post-process (lead refresh, affinity, insight,
+                // memory) must treat it as ReplyText — not ReplyImage, which would skip lead.
+                if plan_bg.action_type == ActionType::ReplyImage {
+                    plan_bg.action_type = ActionType::ReplyText;
+                }
                 let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,

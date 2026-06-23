@@ -478,7 +478,10 @@ after the existing `chat_vision` / input-filter pre-stages.
   succeeds as a text reply.
 - `reply_image`, image-gen fails → **fall through to a normal `ReplyText`
   generation** (run the chat-companion path now) so the turn is never empty.
-  (Costs one extra round-trip on the rare failure — accepted.)
+  (Costs one extra round-trip on the rare failure — accepted.) At the
+  post-process spawn, the plan's `action_type` is reclassified from `ReplyImage`
+  to `ReplyText` so lead-score refresh, affinity, insight, and memory all treat
+  it as a real text reply.
 
 ---
 
@@ -585,11 +588,12 @@ turns are evaluated:
 - **`ReplyTextImage`**: routed through the same gate as `ReplyText`
   (`user_msg_chars >= AFFINITY_EVAL_MIN_CHARS` and `!assistant_empty`),
   evaluating on the **assistant text** as normal.
-- **`ReplyImage`** (no text): the caller supplies the **`image_prompt` as the
-  assistant-content proxy** for the evaluator, and computes `assistant_empty`
-  from it. So "user said X, companion responded by sending a photo of Y" still
-  moves affinity. A blank `image_prompt` ⇒ `empty_assistant` skip (as for an
-  empty text reply).
+- **`ReplyImage`** (no text): the call site uses the helper `affinity_eval_text`
+  which prefers `image_prompt` as the assistant-content proxy; if `image_prompt`
+  is also blank (judge returned null / forced ImageOnly without a subject), it
+  falls back to a generic photo marker `"[发送了一张照片]"` so the turn is still
+  affinity-evaluated rather than tripping the `empty_assistant` gate. Only a
+  non-image turn with empty text genuinely yields `empty_assistant`.
 
 Implementation: `eval_skip_reason` drops the `ReplyImage | ReplyTextImage` arm
 and lets both fall through the `ReplyText` arm; the **call site** passes the

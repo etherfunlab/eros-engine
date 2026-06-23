@@ -114,11 +114,14 @@ pub async fn run(
 
         // For reply_image the assistant text is empty; use the plan's image_prompt
         // as the assistant-content proxy so the photo-send still moves affinity.
-        let eval_text: String = if assistant_msg.trim().is_empty() {
-            plan.image_prompt.clone().unwrap_or_default()
-        } else {
-            assistant_msg.clone()
-        };
+        // Subjectless image turns (blank image_prompt) fall back to a generic
+        // photo marker so they are still evaluated rather than tripping the
+        // `empty_assistant` gate.
+        let eval_text = affinity_eval_text(
+            plan.action_type,
+            &assistant_msg,
+            plan.image_prompt.as_deref(),
+        );
 
         // Semantic eval gate: Reply turns only, with a non-trivial user message
         // and a non-empty produced assistant message (or image_prompt proxy for
@@ -479,6 +482,29 @@ const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 /// delay or lose the turn's affinity event. On elapse we fall back to
 /// rule-only deltas (the spec §4.5 "timeout → default" path).
 const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The companion-reply text the affinity evaluator scores. Non-empty produced
+/// text wins. For an image turn with no produced text, use the judge's subject
+/// (`image_prompt`); if that is also blank, use a generic photo marker so a
+/// subjectless generated image is still evaluated rather than tripping the
+/// `empty_assistant` gate. Non-image turns with empty text yield "" (still skip).
+fn affinity_eval_text(
+    action: ActionType,
+    assistant_msg: &str,
+    image_prompt: Option<&str>,
+) -> String {
+    if !assistant_msg.trim().is_empty() {
+        return assistant_msg.to_string();
+    }
+    if matches!(action, ActionType::ReplyImage | ActionType::ReplyTextImage) {
+        let subject = image_prompt.map(str::trim).unwrap_or("");
+        if subject.is_empty() {
+            return "[发送了一张照片]".to_string(); // consistent with the engine's Chinese image markers
+        }
+        return subject.to_string();
+    }
+    String::new()
+}
 
 /// Lead-score refresh applies to text-bearing reply turns and proactive turns.
 /// `reply_image` carries no assistant text (like the insight/memory gating), so
@@ -1163,6 +1189,31 @@ mod tests {
             eval_skip_reason(ActionType::Ghost, 50, false),
             Some("ghost")
         );
+    }
+
+    #[test]
+    fn affinity_eval_text_prefers_text_then_subject_then_marker() {
+        // produced text always wins
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyTextImage, "hi there", Some("a cat")),
+            "hi there"
+        );
+        // image turn, no text, with subject → subject
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", Some("a selfie")),
+            "a selfie"
+        );
+        // image turn, no text, no subject → generic marker (still evaluated)
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", None),
+            "[发送了一张照片]"
+        );
+        assert_eq!(
+            affinity_eval_text(ActionType::ReplyImage, "", Some("  ")),
+            "[发送了一张照片]"
+        );
+        // non-image empty text → empty (genuine empty reply still skips)
+        assert_eq!(affinity_eval_text(ActionType::ReplyText, "", None), "");
     }
 
     #[test]
