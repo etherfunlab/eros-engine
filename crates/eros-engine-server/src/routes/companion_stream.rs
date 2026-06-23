@@ -607,9 +607,18 @@ pub async fn set_generated_image_url(
             original_user_message_id: None,
         }));
     }
-    chat_repo
-        .set_assistant_image_url(message_id, &req.url)
+    let rows = chat_repo
+        .set_assistant_image_url(session_id, message_id, &req.url)
         .await?;
+    if rows == 0 {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_FOUND,
+            code: "message_not_found",
+            message: "assistant message not found in session".into(),
+            user_message: "消息不存在".into(),
+            original_user_message_id: None,
+        }));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

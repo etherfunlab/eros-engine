@@ -1006,20 +1006,26 @@ fn dedup_keep_first(v: &mut Vec<String>) {
 /// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
 /// the turn cannot generate (caller degrades to text). `Some((primary, chain))`
 /// otherwise. Order: per-turn override → config `ModelSpec` → config fallback.
+///
+/// The `[tasks.chat_image_generation]` task block is the feature switch: when
+/// `resolved` is `None` (no task block) the feature is OFF, so a per-turn
+/// `req_model` override is IGNORED and this returns `None`. Otherwise the
+/// per-turn override takes precedence over the config model/fallback.
 pub fn effective_image_chain(
     req_model: Option<&str>,
     resolved: Option<&ResolvedImageGen>,
 ) -> Option<(String, Vec<String>)> {
+    // Gate on the task block first: no `[tasks.chat_image_generation]` ⇒
+    // image-gen is opt-OUT, so a client-supplied `req_model` must not enable it.
+    let r = resolved?;
     let mut candidates: Vec<String> = Vec::new();
     if let Some(m) = req_model.map(str::trim).filter(|s| !s.is_empty()) {
         candidates.push(m.to_owned());
     }
-    if let Some(r) = resolved {
-        if let Some(m) = r.model.as_ref().and_then(ModelSpec::select) {
-            candidates.push(m);
-        }
-        candidates.extend(r.fallback_model.iter().cloned());
+    if let Some(m) = r.model.as_ref().and_then(ModelSpec::select) {
+        candidates.push(m);
     }
+    candidates.extend(r.fallback_model.iter().cloned());
     dedup_keep_first(&mut candidates);
     let mut it = candidates.into_iter();
     it.next().map(|primary| (primary, it.collect()))
@@ -2969,5 +2975,13 @@ temperature = 0.8
             effective_image_chain(None, r.as_ref()),
             Some(("cfg".to_string(), vec!["F".to_string()]))
         );
+    }
+
+    #[test]
+    fn effective_chain_no_task_block_ignores_per_turn_model() {
+        // The [tasks.chat_image_generation] block is the feature switch. With it
+        // absent (`resolved = None`), a client-supplied per-turn `model` must NOT
+        // enable billable image generation — opt-in only.
+        assert_eq!(effective_image_chain(Some("X"), None), None);
     }
 }

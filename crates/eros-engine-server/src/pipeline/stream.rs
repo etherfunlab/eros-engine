@@ -2607,7 +2607,11 @@ pub fn run_stream(
                                 // merge_assistant_image_meta wraps under {"image":..}
                                 // itself — pass the raw image_meta.
                                 if let Err(e) = chat_repo
-                                    .merge_assistant_image_meta(msg_uuid, &image_meta)
+                                    .merge_assistant_image_meta(
+                                        user_msg.session_id,
+                                        msg_uuid,
+                                        &image_meta,
+                                    )
                                     .await
                                 {
                                     tracing::warn!(
