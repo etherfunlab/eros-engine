@@ -49,6 +49,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
+            image_prompt: None,
         };
     }
 
@@ -64,6 +65,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
+            image_prompt: None,
         };
     }
 
@@ -75,6 +77,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
+            image_prompt: None,
         };
     }
 
@@ -87,6 +90,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
+            image_prompt: None,
         };
     }
 
@@ -97,6 +101,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         affinity_deltas: predict_reply_deltas(input),
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
+        image_prompt: None,
     }
 }
 
@@ -107,7 +112,12 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
 ///                                              ENERGY_COST_GHOST, hints discarded
 ///   Proactive                               → unreachable! (comes only from decide)
-pub fn plan_for(input: &DecisionInput, action: ActionType, hints: Vec<String>) -> ActionPlan {
+pub fn plan_for(
+    input: &DecisionInput,
+    action: ActionType,
+    hints: Vec<String>,
+    image_prompt: Option<String>,
+) -> ActionPlan {
     match action {
         ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => ActionPlan {
             action_type: action,
@@ -115,6 +125,7 @@ pub fn plan_for(input: &DecisionInput, action: ActionType, hints: Vec<String>) -
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
+            image_prompt,
         },
         ActionType::Ghost => ActionPlan {
             action_type: ActionType::Ghost,
@@ -122,6 +133,7 @@ pub fn plan_for(input: &DecisionInput, action: ActionType, hints: Vec<String>) -
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
+            image_prompt: None,
         },
         ActionType::Proactive => {
             unreachable!("plan_for is never called with Proactive; it comes only from pde::decide")
@@ -398,15 +410,19 @@ mod tests {
         assert!((plan.affinity_deltas.patience - (-0.07)).abs() < 1e-9);
     }
 
-    #[test]
-    fn plan_for_reply_text_is_neutral_with_hints() {
-        let input = DecisionInput {
+    fn test_decision_input() -> DecisionInput {
+        DecisionInput {
             event: user_msg("hello"),
             affinity: base_affinity(),
             persona: base_persona(),
             signals: base_signals(),
-        };
-        let plan = plan_for(&input, ActionType::ReplyText, vec!["有点开心".into()]);
+        }
+    }
+
+    #[test]
+    fn plan_for_reply_text_is_neutral_with_hints() {
+        let input = test_decision_input();
+        let plan = plan_for(&input, ActionType::ReplyText, vec!["有点开心".into()], None);
         assert_eq!(plan.action_type, ActionType::ReplyText);
         assert_eq!(plan.reply_style, ReplyStyle::Neutral);
         assert_eq!(plan.context_hints, vec!["有点开心".to_string()]);
@@ -415,16 +431,27 @@ mod tests {
 
     #[test]
     fn plan_for_ghost_is_cold_and_drops_hints() {
-        let input = DecisionInput {
-            event: user_msg("hello"),
-            affinity: base_affinity(),
-            persona: base_persona(),
-            signals: base_signals(),
-        };
-        let plan = plan_for(&input, ActionType::Ghost, vec!["想躲".into()]);
+        let input = test_decision_input();
+        let plan = plan_for(&input, ActionType::Ghost, vec!["想躲".into()], None);
         assert_eq!(plan.action_type, ActionType::Ghost);
         assert_eq!(plan.reply_style, ReplyStyle::Cold);
         assert!(plan.context_hints.is_empty());
         assert_eq!(plan.energy_cost, ENERGY_COST_GHOST);
+    }
+
+    #[test]
+    fn plan_for_threads_image_prompt() {
+        let input = test_decision_input();
+        let plan = plan_for(
+            &input,
+            ActionType::ReplyTextImage,
+            vec![],
+            Some("a selfie in a cafe".to_string()),
+        );
+        assert_eq!(plan.action_type, ActionType::ReplyTextImage);
+        assert_eq!(plan.image_prompt.as_deref(), Some("a selfie in a cafe"));
+
+        let ghost = plan_for(&input, ActionType::Ghost, vec![], Some("ignored".into()));
+        assert_eq!(ghost.image_prompt, None, "ghost carries no image prompt");
     }
 }
