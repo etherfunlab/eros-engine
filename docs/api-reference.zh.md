@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.6.0",
+  "version": "0.6.x",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
@@ -293,6 +293,7 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 
 - `reply_text_image`：`meta(action_type=reply_text_image) → delta* → done → image → final`
 - `reply_image`：`meta(action_type=reply_image) → image → done → final`
+- `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
 
 **图片失败客户端约定** — 图片失败时不会发出额外的 error 帧。客户端通过 `meta` 帧的 `action_type` 判断预期形状：
 

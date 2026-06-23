@@ -42,6 +42,7 @@ Field details:
 | `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
+| `defaults.ignore_providers` | `Array<String>` | no | OpenRouter provider slugs to exclude from routing on **every** task. Sent as `provider.ignore` on each outbound call; `allow_fallbacks` remains `true` so the model is still served by any healthy provider. Use this when a specific provider returns garbled output for a model (e.g. undecoded byte-BPE text — issue #84). Find the offending slug via the OpenRouter generation API. Empty or absent means no exclusion. |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | yes | Primary model. String = fixed; array = round-robin; table = weighted random. See "Primary model selection". |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
@@ -231,13 +232,17 @@ input filter has no triggers, timing, or tiers).
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_generation` | `pipeline::stream` (opt-in image reply executor; activated when this task block is present) | live (opt-in) |
+| `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
+| `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
+| `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
+| `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in)
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 
@@ -316,6 +321,22 @@ unaffected.
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_gen()` in `model_config.rs`.
+
+### `[tasks.chat_vision]` — image input (vision pre-stage, opt-in)
+
+When a chat turn carries an `image_url`, the engine runs `resolve_vision()` to
+obtain a vision-capable model and `filter_prompt`, calls that model to describe
+the image into a fixed JSON schema (`description`, `ocr_text`, `people`, `scene`),
+and folds the result into the user-facing prompt before the main chat call. The
+main `chat_companion` model stays text-only.
+
+The feature is **off by default** and activates only when this task block exists
+with a non-blank `filter_prompt`. `retry_depth` defaults to `1` (primary +
+first fallback). Pick a vision-capable model; the example uses
+`google/gemini-3.1-flash-lite`.
+
+Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
+`resolve_vision()` in `model_config.rs`.
 
 ### Enabling / disabling extraction
 

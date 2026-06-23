@@ -25,7 +25,7 @@
 
 ## Pipeline
 
-`pipeline::run(state, session_id, event)` 編排單輪對話：
+`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage)` 編排單輪對話，返回 SSE 帧流：
 
 ```
 加載上下文              用 PersonaRepo 加載人格
@@ -73,7 +73,7 @@ eros-engine-server :8080
     │
     ├─► auth 中間件 → 從 JWT claims 提取 user_id
     │
-    ├─► pipeline::run(session_id, event)
+    ├─► pipeline::stream::run_stream(state, user_msg)
     │       │
     │       └─► spawn post_process(state.clone(), …)
     │              │
@@ -113,7 +113,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0005_insights
+│   ├── migrations/           # 0000_schema → 0028_companion_decision_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -129,7 +129,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # mod（編排器）/ handlers / post_process
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / debug / mod
+        ├── routes/           # health / companion / companion_stream / debug / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 
@@ -138,5 +138,5 @@ crates/
 - [好感度模型](affinity-model.zh.md)——6 個維度、EMA、時間衰退、關係標籤
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
-- [部署](deploying.zh.md)——Docker、Fly.io、自帶 Postgres / IdP
+- [部署](deploying.zh.md)——Docker、自带 Postgres / IdP
 - [API 參考](api-reference.zh.md)——每個 `/comp/*` 端點

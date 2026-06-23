@@ -168,7 +168,7 @@ SELECT grantee, table_name, privilege_type
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。OpenAPI JSON 在 `/api-docs/openapi.json`。
 - **Affinity debug：** `GET /comp/affinity/{session_id}` 受 `EXPOSE_AFFINITY_DEBUG=true` 控制。生產部署一般關掉；如果你的前端要實時畫好感度雷達圖，再打開。
 - **日誌：** `RUST_LOG=info` 是默認。`RUST_LOG=debug,sqlx=warn` 看到除 SQLx 查詢噪音以外的一切。
-- **成本：** OSS 部署默認 chat 用 grok-4-fast（便宜）、insight 抽取用 grok-4-mini。一輪典型對話花費 ≪ $0.001 美元 token 成本，加上一個 Voyage embedding 調用（每個值得記住的事實大約 $0.000003）。10000 輪對話花個位數美元。
+- **成本：** OSS 部署默认 chat 使用一个快速廉价的模型、insight 抽取使用一个高质量抽取模型（当前默认值见 `examples/model_config.toml`）。一轮典型对话花费 ≪ $0.001 美元 token 成本，加上一个 Voyage embedding 调用（每个值得记住的事实约 $0.000003）。10000 轮对话花个位数美元。
 
 ## 源碼
 
