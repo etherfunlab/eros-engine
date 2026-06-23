@@ -1983,18 +1983,24 @@ pub fn run_stream(
         let is_tip = user_msg.tips_amount_usd.is_some();
         // Per-turn image executor resolution. The executor counts as available
         // only when the caller opted in (an `image` block is present) AND a model
-        // resolves this turn (`effective_image_chain` is Some). Omitting `image`
-        // turns image generation OFF for the turn even when a config `fallback`
-        // model exists — mirroring chat_vision, which runs only when `image_url`
-        // is present. With no executor, image actions degrade to text
-        // (guard_action) and a forced image request is ignored.
+        // resolves this turn. Omitting `image` turns image generation OFF for the
+        // turn even when a config `fallback` model exists — mirroring chat_vision,
+        // which runs only when `image_url` is present. With no executor, image
+        // actions degrade to text (guard_action) and a forced request is ignored.
+        //
+        // Resolve the chain ONLY when opted in: `effective_image_chain` advances
+        // the image ModelSpec round-robin cursor (`ModelSpec::select`), so calling
+        // it on opted-out / text turns would consume image-model slots and skew
+        // the sequencing of later opted-in image turns.
         let resolved_image_gen = state.model_config.resolve_image_gen();
         let req_image = user_msg.image.as_ref();
-        let image_chain = eros_engine_llm::model_config::effective_image_chain(
-            req_image.and_then(|i| i.model.as_deref()),
-            resolved_image_gen.as_ref(),
-        );
-        let image_executor_available = req_image.is_some() && image_chain.is_some();
+        let image_chain = req_image.and_then(|i| {
+            eros_engine_llm::model_config::effective_image_chain(
+                i.model.as_deref(),
+                resolved_image_gen.as_ref(),
+            )
+        });
+        let image_executor_available = image_chain.is_some();
         // Forced image: the client asked for it, an executor chain exists this
         // turn, and it is not a tip turn (tips skip the judge / image path).
         let force_image = req_image.is_some_and(|i| i.force) && image_executor_available && !is_tip;
