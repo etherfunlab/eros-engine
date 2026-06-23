@@ -1,8 +1,8 @@
 # eros-engine
 
-> **An open-source Rust engine for AI companions with memory, relationship state, and structured user insight.**
+> **An open-source Rust engine for AI companions that feel real: persistent memory, an evolving relationship model, and a decision engine that keeps a persona in character across thousands of turns.**
 >
-> `eros-engine` is the companion-chat core behind [Eros Chat](https://chat.etherfun.xyz), extracted into a standalone service. It turns conversation into three durable signals: a structured user profile, two-layer long-term memory, and a six-dimensional affinity model that changes how a persona behaves over time.
+> `eros-engine` is the companion-chat core behind [Eros Chat](https://chat.etherfun.xyz), extracted into a standalone service. It turns conversation into durable state — a structured user profile, two-layer long-term memory, and a six-dimensional affinity model — so a persona behaves like the same person each time a user comes back.
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -11,76 +11,21 @@
 [![Crates.io: llm](https://img.shields.io/crates/v/eros-engine-llm.svg?label=eros-engine-llm)](https://crates.io/crates/eros-engine-llm)
 [![GHCR: eros-engine](https://img.shields.io/badge/ghcr.io-etherfunlab%2Feros--engine-blue)](https://github.com/etherfunlab/eros-engine/pkgs/container/eros-engine)
 
-English · [中文](README.zh.md)
+**English** · [中文](README.zh.md) · [日本語](README.ja.md)
 
 ## Why this exists
 
-Most AI character apps treat memory as a prompt append and relationship as a paragraph of instructions. That works for a demo, but it drifts in long sessions and is hard to debug.
+Most AI character apps treat memory as text appended to a prompt and relationship as a paragraph of instructions. That can work in a demo, but behavior drifts over long sessions, breaks character, and becomes hard to debug. `eros-engine` moves those concerns into explicit, inspectable state, so a companion feels like **a real person** — remembering you and responding to the state of the relationship — and **stays in character** turn after turn, because behavior is *decided*, not improvised.
 
-`eros-engine` moves those concerns into explicit state:
+Five pillars support this:
 
-- **Memory** lives in Postgres + pgvector, split into profile memory and relationship memory.
-- **Affinity** is a numeric vector updated with EMA smoothing and real-time decay.
-- **User insight** is a structured JSONB profile that downstream products can query.
-- **Persona behavior** is planned through a Persona Decision Engine (PDE) — rules-based by default, with an opt-in LLM judge layer configurable via `[tasks.pde_decision].filter_prompt` — then rendered by an LLM. Per-turn judge calls are audited to `companion_decision_events`.
+- **Two-layer memory** — profile memory (stable user facts) and relationship memory (shared moments, callbacks, open threads) in Postgres + pgvector, so the companion remembers you across sessions and personas. → [Memory layers](docs/memory-layers.md)
+- **Six-axis affinity + ghost mechanics** — a numeric relationship vector (warmth, trust, intimacy, intrigue, patience, tension) updated with EMA smoothing and real-time decay; it reshapes tone, depth, and behavior over time, and can even decide *not* to reply. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- **Persona Decision Engine (PDE)** — selects each turn's action (reply, ghost, or send a photo) and inner state — rules-based by default, with an opt-in LLM judge. This keeps replies human and in character instead of sounding like a generic assistant; judge calls are audited to `companion_decision_events`. → [Model config](docs/model-config.md)
+- **Structured user insight** — a JSONB profile (city, occupation, interests, MBTI signals, emotional needs, life rhythm, matching preferences) with a weighted `training_level`, queryable by downstream products for matchmaking, onboarding, analytics, or gating. → [API reference](docs/api-reference.md)
+- **Built for fluent companion chat** — token-by-token SSE streaming; image understanding (the user can send a photo) and companion-sent image generation (`reply_image` / `reply_text_image`); per-request prompt traits and tiers; OpenRouter-backed routing with per-task model selection (fixed / round-robin / weighted, plus a fallback chain) and full call auditing. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
-The result is not a generic agent framework. It is a focused engine for products where a persona talks to the same user across many sessions: AI companions, journaling companions, coaching agents, language tutors, and character chat.
-
-## Key features
-
-### Two-layer memory
-
-`eros-engine` stores memory in two semantic scopes:
-
-| Layer | Scope | Purpose |
-|---|---|---|
-| Profile memory | `user_id`, with `instance_id IS NULL` | Stable user facts shared across sessions and personas. |
-| Relationship memory | `user_id + persona instance` | Callbacks, shared moments, unresolved threads, and relationship-specific context. |
-
-Embeddings use Voyage `voyage-3-lite` with 512-dimensional vectors. Retrieval runs through pgvector IVFFlat cosine search.
-
-### Six-dimensional affinity
-
-Each chat session carries a six-dimensional relationship vector. The six axes — the dimensions of the vector — are:
-
-| Axis | Range | Controls |
-|---|---:|---|
-| `warmth` | -1.0 to 1.0 | Tone and address, from distant to affectionate. |
-| `trust` | 0.0 to 1.0 | Topic depth and willingness to disclose. |
-| `intimacy` | 0.0 to 1.0 | Nicknames, inside jokes, and callbacks. |
-| `intrigue` | 0.0 to 1.0 | Curiosity and follow-up behavior. |
-| `patience` | 0.0 to 1.0 | Tolerance for low-effort or repeated messages. |
-| `tension` | 0.0 to 1.0 | Push-pull, friction, and playful resistance. |
-
-Two **composite scores** summarize this vector for prompt-shaping — each is the mean of a disjoint triplet of axes (`warmth` is rescaled to 0-1 first):
-
-- **bond** (how close it feels) = mean(`warmth`, `intimacy`, `tension`)
-- **chemistry** (how charged it feels) = mean(`trust`, `intrigue`, `patience`)
-
-Updates are smoothed with exponential moving average (EMA), so the persona does not jump between emotional states. `intrigue`, `patience`, and `tension` also decay or recover with real time. The smoothing strength is set by `EMA_INERTIA` (default `0.8`): each turn applies only `1 − inertia` of the evaluated delta, so a higher value makes the relationship build (and cool) more slowly — in effect a difficulty dial — while `0` applies every delta in full.
-
-A per-request `affinity_scope` flag selects which composite shapes the prompt: `bond` (default), `chemistry`, `bond_and_chemistry` (≡ `full`, all six axes), `none`, or an explicit axis subset like `["warmth", "trust"]`. It gates prompt injection only — all six axes are always persisted and updated regardless.
-
-Relationship labels such as `stranger`, `slow_burn`, `friend`, `frenemy`, and `romantic` emerge from threshold rules. They are internal state, not user-facing badges.
-
-### Deterministic ghost mechanics
-
-The same affinity vector drives a deterministic ghost decision. When patience and intrigue drop far enough, the persona can choose not to reply.
-
-Four protection rules keep this from feeling arbitrary:
-
-- no ghosting before message 10;
-- no two ghosts in a row;
-- one-hour cooldown after a ghost;
-- a higher threshold after a recent ghost.
-
-This is implemented as domain logic in Rust, not as a prompt suggestion.
-
-### Structured user insight
-
-The `companion_insights` table stores a JSONB profile per user: city, occupation, interests, MBTI signals, relationship values, emotional needs, life rhythm, personality traits, and matching preferences.
-
-Each field contributes to a weighted `training_level`. That makes the profile useful outside the chat loop: matchmaking, onboarding completion, coaching logic, analytics, and product gating can all query structured fields instead of parsing free text.
+This is not a generic agent framework. It is a focused engine for products where one persona talks to the same user across many sessions: AI companions, journaling companions, coaching agents, language tutors, and character chat.
 
 ## Architecture
 
@@ -109,7 +54,7 @@ The workspace is split into four crates:
 | `eros-engine-store` | Postgres + pgvector persistence, with all tables under the `engine` schema. |
 | `eros-engine-server` | Axum HTTP service, Supabase JWT middleware, OpenAPI docs, and pipeline wiring. |
 
-You can run `eros-engine-server` as an HTTP API, or embed `core + llm + store` directly in your own Rust service.
+You can run `eros-engine-server` as an HTTP API, or embed `core + llm + store` directly in your own Rust service. See [Architecture](docs/architecture.md) for crate boundaries, pipeline phases, and data flow.
 
 ## Use as a library
 
@@ -121,16 +66,16 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.4"
-eros-engine-store = "0.4"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.4"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.6"
+eros-engine-store = "0.6"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
 ```
 
-`eros-engine-server` is intentionally not published to crates.io. See the next section to run it as a Docker image.
+`eros-engine-server` is intentionally not published to crates.io — run it as a Docker image (below).
 
 ## Run as a Docker image
 
-`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry on every `v*` tag (need arm64? build it yourself from `docker/Dockerfile`):
+`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:0.6.2
@@ -145,7 +90,7 @@ docker run --rm -p 8080:8080 --env-file .env \
   ghcr.io/etherfunlab/eros-engine:0.6.2 serve
 ```
 
-The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host.
+The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host. See [Deploying](docs/deploying.md).
 
 ## Documentation
 
@@ -153,107 +98,54 @@ The `docker/Dockerfile` is the same artifact used to build this image. Deploy it
 - [Affinity model](docs/affinity-model.md) — six dimensions, EMA, time decay, relationship labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
 - [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
-- [Model config](docs/model-config.md) — `model_config.toml` schema, task names, resolution rules, 0.x stability commitments.
-- [Deploying](docs/deploying.md) — Docker, bring-your-own Postgres / IdP.
-- [API reference](docs/api-reference.md) — every `/comp/*` endpoint.
+- [Model config](docs/model-config.md) — `model_config.toml` schema, every task (chat, vision, image generation, PDE, filters, extraction), model selection, 0.x stability commitments.
+- [Prompt traits](docs/prompt-traits.md) — per-request system-prompt injection and tier allow-lists.
+- [LLM / OpenRouter audit](docs/llm-audit.md) — per-user / per-session attribution passthrough.
+- [Deploying](docs/deploying.md) — Docker, bring-your-own Postgres / IdP, operational env vars.
+- [API reference](docs/api-reference.md) — every `/comp/*` endpoint, request fields, and SSE frame layout.
 
 ## Quickstart
 
-Prerequisites:
-
-- Rust toolchain from `rust-toolchain.toml`.
-- Postgres 16+ with the `pgvector` extension.
-- OpenRouter API key.
-- Voyage API key.
-- Supabase JWT secret, or your own `AuthValidator` implementation.
+Prerequisites: a Rust toolchain (`rust-toolchain.toml`), Postgres 16+ with `pgvector`, an OpenRouter API key, a Voyage API key, and one auth source — Supabase JWKS (`SUPABASE_URL`) or a legacy `SUPABASE_JWT_SECRET` (or your own `AuthValidator`).
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env
-```
+cp .env.example .env   # fill in DATABASE_URL, OPENROUTER_API_KEY, VOYAGE_API_KEY, and one auth source
 
-Fill in `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and `SUPABASE_JWT_SECRET`, then run:
-
-```bash
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`, and the OpenAPI JSON is available at `/api-docs/openapi.json`.
-
-The official Eros Chat web client is closed-source. `eros-engine` is designed to run standalone; bring your own UI or embed the crates in another service.
+The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`; the OpenAPI JSON is at `/api-docs/openapi.json`. The official Eros Chat web client is closed-source — bring your own UI or embed the crates in another service.
 
 ## API surface
 
-All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default.
-
-Highlights:
+All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default (the `AuthValidator` trait is pluggable for other identity providers). Key endpoints:
 
 - `POST /comp/chat/start` — open a chat session against a persona.
-- `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events (SSE) streaming. (The old blocking synchronous `/message` endpoint was removed in 0.3 — SSE is now the only chat path.)
-- `GET  /comp/chat/{session_id}/history` — paginated chat history.
-- `GET  /comp/chat/{user_id}/sessions` — list a user's sessions.
-- `GET  /comp/user/{user_id}/profile` — current `companion_insights` and `training_level`.
-- `POST /comp/chat/{session_id}/event/gift` — apply an out-of-band gift event and affinity delta.
-- `GET  /comp/chat/{session_id}/gifts` — list gift events for a session.
-- `/message/stream` accepts several optional caller-supplied fields:
-  - `tier` — selects a per-tier chat model and `prompt_traits` allow-list
-    from `model_config.toml`; unknown/absent falls back to the task default.
-    See [docs/model-config.md](docs/model-config.md).
-  - `prompt_traits` — per-request system-prompt injection, gated by the
-    resolved tier's allow-list, see [docs/prompt-traits.md](docs/prompt-traits.md).
-  - `audit` — opaque OpenRouter passthrough (`user` / `session_id` /
-    `metadata`) for per-user / per-session attribution on OpenRouter
-    dashboards. See [docs/llm-audit.md](docs/llm-audit.md).
-- `GET  /comp/affinity/{session_id}` — debug-only live affinity vector, enabled by `EXPOSE_AFFINITY_DEBUG=true`.
+- `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events. Optional per-turn fields include `tier`, `prompt_traits`, `audit`, `tips_amount_usd` (tip the companion), `image_url` (send the companion a photo), and `image` (request a companion-generated image — style / model / aspect ratio / face reference).
+- `POST /comp/chat/{session_id}/message/{message_id}/image` — write back the storage URL of a companion-generated image.
+- `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — history, session list, and the structured insight profile.
+- `GET /comp/affinity/{session_id}` — debug-only live affinity vector (`EXPOSE_AFFINITY_DEBUG=true`).
 
-The `AuthValidator` trait is pluggable if you use a different identity provider.
-
-### Streaming chat
-
-Chat is streaming-only: replies arrive token-by-token over SSE so clients can render as the model generates, instead of blocking on a full synchronous response. (The legacy blocking `/message` endpoint was removed in 0.3.)
-
-```bash
-curl -N -X POST \
-  -H "Authorization: Bearer $JWT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
-  http://localhost:8080/comp/chat/<session_id>/message/stream
-```
-
-See [docs/api-reference.md](docs/api-reference.md#post-compchatsession_idmessagestream)
-for frame layout and error semantics.
+The blocking synchronous `/message` endpoint was removed in 0.3 — SSE is the only chat path. For the full request schema, SSE frame layout (including `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
 
 ## Configuration
 
-| Env var | Required | Notes |
-|---|---|---|
-| `DATABASE_URL` | yes | Postgres with `pgvector`; tables are created under `engine.*`. |
-| `OPENROUTER_API_KEY` | yes | Chat completions, routed by `examples/model_config.toml` unless overridden. |
-| `OPENROUTER_APP_REFERER` | no | When set, sent as `HTTP-Referer` on every outbound OpenRouter call. Shows up on OpenRouter's app analytics dashboard. |
-| `OPENROUTER_APP_TITLE` | no | When set, sent as `X-OpenRouter-Title`. Display name in OpenRouter app analytics. Pairs with `OPENROUTER_APP_REFERER`; both optional. |
-| `OPENROUTER_APP_CATEGORIES` | no | When set, sent as `X-OpenRouter-Categories` — comma-separated OpenRouter marketplace categories (e.g. `roleplay,general-chat`). Passed through verbatim; OpenRouter ignores unrecognised values and only honours it alongside `OPENROUTER_APP_REFERER`. |
-| `OPENROUTER_USAGE_HIDDEN_KEYS` | no | Comma-separated list of top-level keys to strip from the `usage` object on the SSE streaming `done` frame. Useful for hiding wholesale `cost` / `cost_details` from downstream customers. The full usage is still persisted and traced server-side. |
-| `VOYAGE_API_KEY` | yes | Embeddings. Empty keys fail server boot. |
-| `SUPABASE_URL` | no | Supabase project URL. When set, the server derives the JWKS endpoint (`<url>/auth/v1/.well-known/jwks.json`) for asymmetric (RS256/ES256) JWT validation — the post-2025 Supabase default. |
-| `SUPABASE_JWKS_URL` | no | Explicit JWKS endpoint; takes precedence over deriving it from `SUPABASE_URL`. |
-| `SUPABASE_JWT_SECRET` | no | Legacy HS256 shared secret. At least one auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS) or `SUPABASE_JWT_SECRET` (HS256) — must be set, or the server refuses to boot (fail-closed). |
-| `BIND_ADDR` | no | Defaults to `0.0.0.0:8080`. |
-| `EXPOSE_AFFINITY_DEBUG` | no | Set `true` to enable `/comp/affinity/{session_id}`. |
-| `EMA_INERTIA` | no | EMA smoothing for affinity updates, in `[0, 1]`; defaults to `0.8`. Each turn applies `1 − inertia` of the evaluated delta, so a higher value moves the affinity vector less per turn (slower to build or lose) — a relationship-difficulty dial; `0` applies every delta in full. |
-| `DEMO_EMA_INERTIA` | no | EMA inertia applied only to sessions opened with `is_demo: true`; defaults to `0.3` so meters move visibly across a short demo. Falls back to `EMA_INERTIA` semantics otherwise. |
-| `DREAMING_DISABLED` | no | Set `1` to skip spawning the dreaming-lite sweeper (session-end memory extraction). |
-| `DREAMING_TICK_SECS` | no | How often the dreaming-lite sweeper wakes; defaults to `300`. |
-| `DREAMING_IDLE_SECS` | no | Minimum idle time before a session is eligible for classification; defaults to `1800`. |
-| `DREAMING_CLAIM_STALE_SECS` | no | How long a classification claim stays fresh before a crashed worker's row is re-claimed; defaults to `600`. |
-| `SNAPSHOT_DISABLED` | no | Set `1` to skip spawning the `companion_insights_snapshot` sweeper. |
-| `SNAPSHOT_CRON` | no | 6-field cron (`sec min hr dom mon dow`) for the snapshot sweeper; defaults to `0 0 23 * * *` (daily 23:00). |
-| `SNAPSHOT_TZ` | no | IANA timezone the snapshot cron is evaluated in; defaults to `Asia/Singapore`. |
-| `MODEL_CONFIG_PATH` | no | Defaults to `examples/model_config.toml`. |
-| `RUST_LOG` | no | Defaults to `info`. |
+Required env vars: `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and **one** auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS, the post-2025 Supabase default) **or** `SUPABASE_JWT_SECRET` (legacy HS256). The server refuses to boot if no auth source is set.
+
+Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
+
+## Roadmap
+
+Not part of the engine today, but on the radar:
+
+- **Agents playground** — multiple AI personas interacting with each other (and the user) in one session.
+- **Voice messages** — companion-sent and user-sent audio turns.
+- **Real-time voice conversation** — low-latency spoken back-and-forth.
+- **Video generation** — short companion-sent video clips, extending the image executor.
 
 ## What is deliberately out of scope
 
@@ -267,16 +159,9 @@ If you are building a different product, the reusable part is the affinity + mem
 
 ## Content note
 
-The example personas under `examples/personas/` are written as adult
-character-chat examples. They can flirt and express desire when the
-relationship state reaches that point, while still refusing disrespectful or
-boundary-crossing behavior. If your product needs a SFW default, replace
-those persona files before deploying.
+The example personas under `examples/personas/` are written as adult character-chat examples. They can flirt and express desire when the relationship state reaches that point, while still refusing disrespectful or boundary-crossing behavior. If your product needs a SFW default, replace those persona files before deploying.
 
-Per-request behaviour can be further modulated via the
-[`prompt_traits`](docs/prompt-traits.md) field on the message routes —
-the engine treats the supplied text as opaque, so the policy of what
-those traits encode lives entirely in your frontend / middleware.
+Per-request behavior can be further adjusted via the [`prompt_traits`](docs/prompt-traits.md) field on the message routes — the engine treats the supplied text as opaque, so the policy defining what those traits encode lives entirely in your frontend / middleware.
 
 ## Contributing
 

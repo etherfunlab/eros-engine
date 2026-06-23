@@ -42,6 +42,7 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 | `defaults.fallback_model` | `String` | 否 | 任务没给 model 时的兜底。还是缺,走代码内置的 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 同样优先级链;代码内置默认 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 同样;代码内置默认 `200`。 |
+| `defaults.ignore_providers` | `Array<String>` | 否 | 对**所有**任务排除的 OpenRouter provider slug 列表。作为 `provider.ignore` 随每次对外调用发送；`allow_fallbacks` 保持 `true`，模型仍可由其他健康 provider 提供服务。用于某 provider 对特定模型返回乱码时（如未解码的 byte-BPE 文本——issue #84）。可通过 OpenRouter generation API 找到有问题的 slug。空或缺失表示不排除任何 provider。 |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。String = 固定；数组 = 轮转（round-robin）；表 = 加权随机。见「主模型选择」。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主模型调用挂掉时,`OpenRouterClient` 用的备选。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 任务级 sampling temperature。无 per-tier 覆盖。 |
@@ -59,7 +60,13 @@ allow_traits = ["tag_a"]                    # 可选,该 tier 覆盖任务级 al
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights` (抽事实 + JSONB merge) | live |
 | `pde_decision` | `pipeline::stream`（可选 LLM 判断器，通过 `run_pde_decision` 在 `run_stream` 中调用；`filter_prompt` 缺失或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_generation` | `pipeline::stream`（可选图片回复执行器；任务块存在时激活） | live（opt-in） |
+| `chat_vision` | `pipeline::stream` 经 `resolve_vision()`（视觉预处理阶段：将 `image_url` 附件描述为 JSON 后注入回复 prompt；任务块缺失或 `filter_prompt` 为空时关闭） | live（opt-in） |
+| `affinity_evaluation` | `pipeline::post_process`（逐轮六轴好感度 delta 评估；每次 Reply 轮后 fire-and-forget 运行） | live |
+| `memory_extraction` | dreaming sweeper（会话结束时的记忆整合；任务块缺失时关闭） | live（opt-in） |
+| `chat_input_filter` | `pipeline::stream`（用户输入改写过滤器；由 `[tasks.chat_companion]` 的 `input_filter` 字段及本任务块共同启用；默认关闭） | live（opt-in） |
 | `embedding` | reserved — `VoyageClient` 自己读 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite`,不走这条路径 | reserved |
+
+<!-- TODO: sync with model-config.md (output_filter/input_filter/chat_vision/ignore_providers sections) -->
 
 `[tasks.<name>]` 只有当代码里真有 `model_config.resolve("<name>", ...)` 调用时才有意义。当前调用点:
 

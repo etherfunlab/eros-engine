@@ -113,7 +113,7 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 
 ## Ghost 不是甚麼
 
-- **不是** 錯誤響應。HTTP 路由仍返 200。響應體 `reply: null`（或引擎選定的「無回覆」形狀）。
+- **不是** 错误响应。HTTP 路由仍返 200。由于引擎采用 SSE 流式传输，ghost 轮会发出三帧后关闭流：`meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`。不会发出 `delta` 帧，也不会调用任何 LLM。
 - **不是** LLM 調用失敗。決策純 Rust，從不問 LLM。
 - **不是** 永遠沉默。時間衰退會恢復 `patience`、軟化 `tension`；最終人格會回應下一條消息。
 

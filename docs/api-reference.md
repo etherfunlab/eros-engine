@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.6.0",
+  "version": "0.6.x",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
@@ -314,6 +314,7 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 
 - `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image → final`
 - `reply_image`: `meta(action_type=reply_image) → image → done → final`
+- `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 
 **Failed-image client contract** — no new error frame is emitted on image failure.
 The `meta` frame's `action_type` declares the intended shape:
