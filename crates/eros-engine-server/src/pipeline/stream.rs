@@ -1172,7 +1172,7 @@ fn apply_ghosting_killswitch(
     hints: Vec<String>,
 ) -> eros_engine_core::types::ActionPlan {
     if !ghosting_enabled && plan.action_type == ActionType::Ghost {
-        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints)
+        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints, None)
     } else {
         plan
     }
@@ -1813,6 +1813,8 @@ pub struct PersistedUserMessage {
     /// The image URL the client attached to this turn (`https`/`http`), or
     /// `None` for a text/tip-only turn. Drives the `chat_vision` pre-stage.
     pub image_url: Option<String>,
+    /// Image reply parameters supplied by the client, forwarded from the request.
+    pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -1922,7 +1924,8 @@ pub fn run_stream(
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
-                            pde::plan_for(&input, action, hints)
+                            // TODO(Task 9): replace None with captured v.image_prompt
+                            pde::plan_for(&input, action, hints, None)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2654,7 +2657,7 @@ mod tests {
     #[test]
     fn killswitch_downgrades_ghost_keeping_hints() {
         let input = pde_test_input();
-        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![]);
+        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![], None);
         // ghosting enabled → unchanged
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
         assert_eq!(kept.action_type, ActionType::Ghost);
@@ -2671,7 +2674,7 @@ mod tests {
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
-        let plan = pde::plan_for(&input, acted, hints.clone());
+        let plan = pde::plan_for(&input, acted, hints.clone(), None);
         // ghosting disabled → suppressed to reply, hints preserved
         let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
         assert_eq!(final_plan.action_type, ActionType::ReplyText);
@@ -2754,6 +2757,7 @@ mod tests {
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -2888,6 +2892,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -2972,6 +2977,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3072,6 +3078,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3387,6 +3394,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3510,6 +3518,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3646,6 +3655,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3797,6 +3807,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -3910,6 +3921,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4004,6 +4016,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(20.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4110,6 +4123,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4218,6 +4232,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4345,6 +4360,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4545,6 +4561,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4688,6 +4705,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4797,6 +4815,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(0.5),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -4971,6 +4990,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
+                image: None,
             },
         )
         .collect()
@@ -5129,6 +5149,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5270,6 +5291,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5391,6 +5413,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5526,6 +5549,7 @@ data: [DONE]\n\n";
                 // Ghost), so the live-burst path is guaranteed to run.
                 tips_amount_usd: Some(1.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()
@@ -5675,6 +5699,7 @@ data: [DONE]\n\n";
                 affinity_scope: Default::default(),
                 tips_amount_usd: Some(1.0),
                 image_url: None,
+                image: None,
             },
         )
         .collect()

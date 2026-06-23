@@ -1,0 +1,1465 @@
+warning: field `image` is never read
+    --> crates/eros-engine-server/src/pipeline/stream.rs:1817:9
+     |
+1801 | pub struct PersistedUserMessage {
+     |            -------------------- field in this struct
+...
+1817 |     pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
+     |         ^^^^^
+     |
+     = note: `PersistedUserMessage` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+     = note: `#[warn(dead_code)]` on by default
+
+warning: fields `style`, `model`, and `image_prompt` are never read
+  --> crates/eros-engine-server/src/routes/companion_stream.rs:89:9
+   |
+82 | pub struct ImageReplyParams {
+   |            ---------------- fields in this struct
+...
+89 |     pub style: Option<StyleKey>,
+   |         ^^^^^
+90 |     #[serde(default)]
+91 |     pub model: Option<String>,
+   |         ^^^^^
+92 |     #[serde(default)]
+93 |     pub image_prompt: Option<String>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `ImageReplyParams` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `eros-engine-server` (bin "eros-engine") generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running `target/debug/eros-engine print-openapi`
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "eros-engine API",
+    "description": "Open-source AI companion engine — chat + 6-dim affinity + memory. Source of truth: src/routes/.",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
+    },
+    "version": "0.6.2-dev"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local dev"
+    }
+  ],
+  "paths": {
+    "/bff/v1/comp/affinity/{session_id}/event": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Latest user-turn affinity delta (post-EMA). For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked.",
+        "operationId": "bff_get_affinity_delta",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffAffinityDeltaResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/bff/v1/comp/chat/start": {
+      "post": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Cold-mount bundle: resolves (or creates) the session and returns its slim\nhistory in one round-trip (collapses the FE's start + history calls).",
+        "description": "Affinity is intentionally NOT bundled here: the FE reads affinity on its\nown (full values via its DB middleware; per-turn deltas via\n`/bff/v1/comp/affinity/{sid}/event`). This keeps bootstrap independent of\n`EXPOSE_AFFINITY_DEBUG` — turning that gate off does not change this shape.",
+        "operationId": "bff_start_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BffStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffStartResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "missing genome_id and no existing instance"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your instance"
+          },
+          "404": {
+            "description": "instance/genome not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/bff/v1/comp/chat/{session_id}/history": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Slim chat history for the chat-screen mount. Same auth, same ownership\ncheck, same `limit ∈ [1, 50]` clamp as `/comp/.../history`. **Intentional\ndivergence:** default `limit=50` (canonical defaults to 20). Reason:\nBFF exists for cold-mount where the FE wants a full backscroll in one\nround-trip.",
+        "operationId": "bff_get_history",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 50, capped at 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffHistoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/affinity/{session_id}": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Inspect the live affinity vector for a session. The session must be\nowned by the JWT user; otherwise 403.",
+        "operationId": "get_affinity",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AffinitySnapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session has no affinity"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/affinity/{session_id}/event": {
+      "get": {
+        "tags": [
+          "debug"
+        ],
+        "summary": "Paginated affinity-event log for a session — pre-EMA + post-EMA deltas.\nDebug-gated (same router as get_affinity).",
+        "operationId": "get_affinity_events",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 20, capped at 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "event_type",
+            "in": "query",
+            "description": "Filter: message|ghost|gift|proactive|time_decay",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AffinityEventsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid event_type"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/start": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Start (or resume) a chat session for the JWT user.",
+        "description": "Resolution rules:\n  * `instance_id` provided → must belong to the JWT user.\n  * else `genome_id` provided → look up (or auto-create) the user's\n    active instance of that genome.\n  * else (neither provided) → 400 Bad Request.",
+        "operationId": "start_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartChatResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "missing genome_id and no existing instance"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance not owned by this user"
+          },
+          "404": {
+            "description": "instance/genome not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/history": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Paginated chat history (oldest-first) for the given session.",
+        "operationId": "get_history",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows (default 20, capped at 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Page offset, default 0",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{session_id}/message/stream": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "send_message_stream",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE event stream (text/event-stream)",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/chat/{user_id}/sessions": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "All sessions for the JWT user. The `{user_id}` path parameter MUST\nmatch the JWT's user_id; mismatch returns 403.",
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/user/{user_id}/profile": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Companion insights + computed training level for the JWT user. The\npath `user_id` MUST match the JWT's user_id; mismatch returns 403.",
+        "operationId": "get_profile",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness probe.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AffinityDeltasDto": {
+        "type": "object",
+        "description": "Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`\nfor OpenAPI emission. Field-for-field conversion both ways.",
+        "properties": {
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "AffinityEventEntry": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "deltas",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto",
+            "description": "Pre-EMA raw delta the pipeline decided."
+          },
+          "effective_deltas": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityDeltasDto",
+                "description": "Post-EMA effective change (after − before). None for pre-0014 rows."
+              }
+            ]
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable unique id of this event (FE freshness/dedup key)."
+          },
+          "event_type": {
+            "type": "string"
+          }
+        }
+      },
+      "AffinityEventsResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "events",
+          "total"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AffinityEventEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "description": "Count returned in this page (== events.len()), NOT the grand total.",
+            "minimum": 0
+          }
+        }
+      },
+      "AffinityScopeDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AffinityScopeName"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "AffinityScopeName": {
+        "type": "string",
+        "enum": [
+          "full",
+          "bond_and_chemistry",
+          "bond",
+          "chemistry",
+          "none"
+        ]
+      },
+      "AffinitySnapshot": {
+        "type": "object",
+        "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
+        "required": [
+          "warmth",
+          "trust",
+          "intrigue",
+          "intimacy",
+          "patience",
+          "tension",
+          "ghost_streak",
+          "total_ghosts",
+          "updated_at"
+        ],
+        "properties": {
+          "ghost_streak": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "intimacy": {
+            "type": "number",
+            "format": "double"
+          },
+          "intrigue": {
+            "type": "number",
+            "format": "double"
+          },
+          "patience": {
+            "type": "number",
+            "format": "double"
+          },
+          "relationship_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tension": {
+            "type": "number",
+            "format": "double"
+          },
+          "total_ghosts": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "trust": {
+            "type": "number",
+            "format": "double"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "warmth": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "BffAffinityDelta": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "effective_deltas",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "effective_deltas": {
+            "$ref": "#/components/schemas/AffinityDeltasDto",
+            "description": "Post-EMA effective change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable unique id of this event — the FE freshness/dedup key."
+          },
+          "event_type": {
+            "type": "string"
+          }
+        }
+      },
+      "BffAffinityDeltaResponse": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BffAffinityDelta",
+                "description": "None when no user-turn event yet (brand-new, or only time_decay), or\nwhen the latest user-turn event predates migration 0014."
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "BffHistoryEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "role",
+          "content",
+          "sent_at"
+        ],
+        "properties": {
+          "client_msg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client-supplied message id forwarded during streaming (the\n`client_msg_id` the FE sent on send). NULL for rows that never carried\none, e.g. assistant turns. Lets the FE reconcile an optimistic local\nmessage with its persisted row."
+          },
+          "content": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable message id — the `engine.chat_messages` row primary key (UUID)."
+          },
+          "role": {
+            "type": "string",
+            "description": "\"user\" | \"assistant\" | \"gift_user\" | \"system_error\""
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "tips_amount_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Structured tip amount for `role='gift_user'` rows. Omitted from\nresponse when None (`skip_serializing_if`). Lets clients render tips\nat the right point in the timeline without parsing the `(打赏 $X)`\ncontent marker. Spec:\ndocs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4."
+          }
+        }
+      },
+      "BffHistoryResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "total"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "description": "Count of `messages` in this response (== `messages.len()`). NOT the\ntotal row count for the session — pagination doesn't know how many\nrows remain. Mirrors `HistoryResponse::total`.",
+            "minimum": 0
+          }
+        }
+      },
+      "BffStartRequest": {
+        "type": "object",
+        "properties": {
+          "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "history_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "History page size for the bundled history. Default 50, capped at 50.\nBFF-only field; not present in the canonical /comp/chat/start body."
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "is_demo": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "BffStartResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "instance_id",
+          "persona_name",
+          "is_new",
+          "history"
+        ],
+        "properties": {
+          "history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BffHistoryEntry"
+            },
+            "description": "Most-recent N messages, oldest-first. Empty for brand-new sessions."
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_new": {
+            "type": "boolean"
+          },
+          "persona_name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ChatHistoryEntry": {
+        "type": "object",
+        "required": [
+          "role",
+          "content",
+          "sent_at",
+          "extracted_facts"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "extracted_facts": {
+            "type": "object"
+          },
+          "role": {
+            "type": "string"
+          },
+          "sent_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "Health check response.",
+        "required": [
+          "status",
+          "service",
+          "version",
+          "timestamp"
+        ],
+        "properties": {
+          "service": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "HistoryResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "total"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatHistoryEntry"
+            }
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ImageMode": {
+        "type": "string",
+        "enum": [
+          "text_image",
+          "image_only"
+        ]
+      },
+      "ImageReplyParams": {
+        "type": "object",
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "face_ref_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "force": {
+            "type": "boolean"
+          },
+          "image_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ImageMode"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ListSessionsResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionListEntry"
+            }
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "LlmAuditDto": {
+        "type": "object",
+        "description": "Caller-supplied OpenRouter audit passthrough. All three fields are\noptional; engine never inspects content. See `docs/llm-audit.md`.",
+        "properties": {
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Up to 16 string-valued key/value pairs. Key regex\n`^[A-Za-z0-9_.-]{1,64}$`, value `chars ≤ 512`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Caller-defined session / conversation grouping. Distinct from the\nURL path's `session_id`. `chars ≤ 256`. Forwarded as wire\n`session_id`."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form caller identifier (recommended: hash of internal user id).\n`chars ≤ 256`. Forwarded as OpenRouter wire `user`."
+          }
+        }
+      },
+      "ProfileResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "companion_insights",
+          "agent_training_level"
+        ],
+        "properties": {
+          "agent_training_level": {
+            "type": "number",
+            "format": "double"
+          },
+          "companion_insights": {
+            "type": "object"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "PromptTraitDto": {
+        "type": "object",
+        "description": "Caller-supplied prompt-injection fragment. See `docs/prompt-traits.md`.",
+        "required": [
+          "tag",
+          "text"
+        ],
+        "properties": {
+          "tag": {
+            "type": "string",
+            "description": "ASCII identifier, regex `^[a-z0-9_]{1,32}$`. Used for logging."
+          },
+          "text": {
+            "type": "string",
+            "description": "Verbatim text inserted under `[additional_guidance]` in the system prompt.\n1 ≤ chars ≤ 2000 after trim."
+          }
+        }
+      },
+      "SessionListEntry": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "lead_score",
+          "is_converted",
+          "last_active_at"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "is_converted": {
+            "type": "boolean"
+          },
+          "last_active_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lead_score": {
+            "type": "number",
+            "format": "double"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "StartChatRequest": {
+        "type": "object",
+        "properties": {
+          "genome_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Optional genome id. Required when `instance_id` is absent."
+          },
+          "instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Optional explicit instance id. If absent, the server picks (or\nauto-creates) the user's instance for the supplied genome."
+          },
+          "is_demo": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Mark the new session as a demo. Persisted to `metadata.is_demo` and\nread by the affinity pipeline to apply `demo_ema_inertia` instead\nof the global value, so meters move visibly within the turn budget.\nIgnored when resuming an existing session."
+          }
+        }
+      },
+      "StartChatResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "instance_id",
+          "persona_name",
+          "is_new"
+        ],
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_new": {
+            "type": "boolean"
+          },
+          "persona_name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "StreamPreErrorBody": {
+        "type": "object",
+        "description": "Pre-stream error body per spec §1.3. Schema-only struct for utoipa;\nruntime renders the same shape via StreamPreError.",
+        "required": [
+          "code",
+          "message",
+          "user_message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "original_user_message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_message": {
+            "type": "string"
+          }
+        }
+      },
+      "StreamSendRequest": {
+        "type": "object",
+        "required": [
+          "content",
+          "client_msg_id"
+        ],
+        "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto"
+              }
+            ]
+          },
+          "audit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmAuditDto"
+              }
+            ]
+          },
+          "client_msg_id": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "image": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageReplyParams"
+              }
+            ]
+          },
+          "image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_traits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PromptTraitDto"
+            }
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tips_amount_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Supabase JWT bearer token"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness probe"
+    },
+    {
+      "name": "companion",
+      "description": "Chat sessions, messages, affinity, profile"
+    },
+    {
+      "name": "bff-companion",
+      "description": "Frontend-shaped mirror of /comp/* for first-party clients; shape may diverge from canonical without notice"
+    },
+    {
+      "name": "debug",
+      "description": "Env-gated introspection (affinity vector exposure)"
+    }
+  ]
+}
