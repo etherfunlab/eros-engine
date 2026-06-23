@@ -506,11 +506,16 @@ Image {
 - `reply_image`: `meta → image → done → final`.
 
 **Client contract for a failed image** (no new error frame): the `meta` frame's
-`action_type` declares the intended shape. If `action_type` is
-`reply_text_image`/`reply_image` but **no `Image` frame arrives before `done`**,
-the image failed (§7 fail-open) — the client renders whatever text it received.
-On the `reply_image` fall-through to text, `meta.action_type` is `reply_text`
-(the degrade is visible up front), so the client never expects an image.
+`action_type` declares the intended shape.
+
+- **`reply_text_image`** — `Image` arrives *after* `done`. If the stream reaches
+  `final` with no `Image` frame, the image failed (§7 fail-open); the text was
+  still delivered — the client renders whatever text it received.
+- **`reply_image`** — `Image` arrives *before* `done`. A `reply_image` meta is
+  only emitted when the image is already in-flight, so an `Image` frame will
+  always follow. A failed image degrades the entire turn: `meta.action_type` is
+  `reply_text` (never `reply_image`), and the client sees a normal text stream.
+  The degrade is visible up front — there is never an empty `reply_image`.
 
 ---
 

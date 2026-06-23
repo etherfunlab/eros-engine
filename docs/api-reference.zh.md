@@ -296,8 +296,8 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 
 **图片失败客户端约定** — 图片失败时不会发出额外的 error 帧。客户端通过 `meta` 帧的 `action_type` 判断预期形状：
 
-- 若 `action_type` 为 `reply_text_image` 或 `reply_image`，但 **`done` 帧之前没有收到 `image` 帧**，则图片生成失败（fail-open）—— 渲染已收到的文字即可。
-- `reply_image` 降级为文字回复时（图片失败，引擎改跑普通文字回复），`meta.action_type` 为 `reply_text`——客户端从头就不会期待图片。
+- **`reply_text_image`** — `image` 帧在 `done` 之后到达。若流已到达 `final` 但仍未收到 `image` 帧，则图片生成失败（fail-open）；文字已正常投递，渲染即可。
+- **`reply_image`** — `image` 帧在 `done` 之前到达。`reply_image` 类型的 `meta` 只在图片确定可投递时才会下发，因此收到该 `meta` 后 `image` 帧必然随后出现。若图片失败，整轮会降级：客户端收到的是 `meta.action_type=reply_text`（而非 `reply_image`）加上普通文字流——降级从 `meta` 帧起即可见，不会出现空的 `reply_image`。
 
 **写回端点** — 收到 `image` 帧后，客户端应将 `data_url` 上传到自有存储，然后把结果 URL 写回引擎：
 

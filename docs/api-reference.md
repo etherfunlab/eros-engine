@@ -318,12 +318,14 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 **Failed-image client contract** — no new error frame is emitted on image failure.
 The `meta` frame's `action_type` declares the intended shape:
 
-- If `action_type` is `reply_text_image` or `reply_image` but **no `image` frame
-  arrives before `done`**, the image generation failed (fail-open) — render whatever
-  text was received.
-- On `reply_image` fall-through (image failed, engine ran a normal text reply
-  instead), `meta.action_type` is `reply_text` — the client never expects an image
-  because the degrade is visible up front.
+- **`reply_text_image`** — the `image` frame arrives *after* `done`. If the stream
+  reaches `final` with no `image` frame, the image generation failed (fail-open);
+  the text was still delivered — render it.
+- **`reply_image`** — the `image` frame arrives *before* `done`. A `reply_image`
+  meta is only ever emitted when the image is already in-flight, so an `image`
+  frame will always follow. A failed image instead degrades the whole turn: the
+  client sees `meta.action_type=reply_text` (never `reply_image`) and a normal
+  text stream — the degrade is visible up front.
 
 **Write-back endpoint** — after receiving the `image` frame, the client should
 upload the `data_url` to its own storage and post the resulting URL back:
