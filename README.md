@@ -78,7 +78,7 @@ eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
 `linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.6.3
+docker pull ghcr.io/etherfunlab/eros-engine:0.6.2
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ Minimal run (you bring Postgres + your own `.env`):
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.6.3 serve
+  ghcr.io/etherfunlab/eros-engine:0.6.2 serve
 ```
 
 The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host. See [Deploying](docs/deploying.md).

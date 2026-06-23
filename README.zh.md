@@ -78,7 +78,7 @@ eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
 每个 `v*` tag 都会将 `eros-engine-server` 的 `linux/amd64` 镜像发布到 GitHub Container Registry（需要 arm64？请使用 `docker/Dockerfile` 自行构建）：
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.6.3
+docker pull ghcr.io/etherfunlab/eros-engine:0.6.2
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ docker pull ghcr.io/etherfunlab/eros-engine:latest
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.6.3 serve
+  ghcr.io/etherfunlab/eros-engine:0.6.2 serve
 ```
 
 构建此镜像使用的正是 `docker/Dockerfile`，可将其部署到任意容器托管平台。请参阅[部署](docs/deploying.zh.md)。
