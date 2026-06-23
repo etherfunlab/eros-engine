@@ -996,6 +996,37 @@ impl ModelConfig {
         })
     }
 
+}
+
+/// Drop later duplicates, preserving first-seen order.
+fn dedup_keep_first(v: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
+/// the turn cannot generate (caller degrades to text). `Some((primary, chain))`
+/// otherwise. Order: per-turn override → config `ModelSpec` → config fallback.
+pub fn effective_image_chain(
+    req_model: Option<&str>,
+    resolved: Option<&ResolvedImageGen>,
+) -> Option<(String, Vec<String>)> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(m) = req_model.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(m.to_owned());
+    }
+    if let Some(r) = resolved {
+        if let Some(m) = r.model.as_ref().and_then(ModelSpec::select) {
+            candidates.push(m);
+        }
+        candidates.extend(r.fallback_model.iter().cloned());
+    }
+    dedup_keep_first(&mut candidates);
+    let mut it = candidates.into_iter();
+    it.next().map(|primary| (primary, it.collect()))
+}
+
+impl ModelConfig {
     /// PDE ghost kill-switch. `true` (default) ⇒ ghost honoured; `false` ⇒ the
     /// whole PDE path never produces a Ghost. Read INDEPENDENTLY of
     /// `filter_prompt`, so it also governs the pure rule engine (LLM PDE off).
@@ -2893,5 +2924,51 @@ temperature = 0.8
         assert!(matches!(&task.model, ModelSpec::Fixed(s) if s == "x"));
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.model, "x");
+    }
+
+    // ─── Task 3: effective_image_chain + dedup_keep_first ─────────────────────
+
+    #[test]
+    fn effective_chain_per_turn_wins_and_dedups() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"X\",\"Y\"]\n",
+        ).unwrap();
+        let r = cfg.resolve_image_gen();
+        // per-turn "X" + config "cfg" + fallback ["X","Y"] → [X, cfg, Y] (dedup X)
+        assert_eq!(
+            effective_image_chain(Some("X"), r.as_ref()),
+            Some(("X".to_string(), vec!["cfg".to_string(), "Y".to_string()]))
+        );
+    }
+
+    #[test]
+    fn effective_chain_fallback_only_is_primary() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nfallback=[\"Z\",\"W\"]\n",
+        ).unwrap();
+        let r = cfg.resolve_image_gen();
+        assert_eq!(
+            effective_image_chain(None, r.as_ref()),
+            Some(("Z".to_string(), vec!["W".to_string()]))
+        );
+    }
+
+    #[test]
+    fn effective_chain_empty_is_none() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_image_generation]\n").unwrap();
+        assert_eq!(effective_image_chain(None, cfg.resolve_image_gen().as_ref()), None);
+        assert_eq!(effective_image_chain(None, None), None);
+    }
+
+    #[test]
+    fn effective_chain_config_model_when_no_per_turn() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"F\"]\n",
+        ).unwrap();
+        let r = cfg.resolve_image_gen();
+        assert_eq!(
+            effective_image_chain(None, r.as_ref()),
+            Some(("cfg".to_string(), vec!["F".to_string()]))
+        );
     }
 }
