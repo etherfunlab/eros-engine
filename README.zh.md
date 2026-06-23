@@ -1,218 +1,172 @@
 # eros-engine
 
-> **一個用 Rust 寫的開源 AI 伴侶引擎：記憶、關係狀態、結構化用戶洞察。**
+> **一个开源的 Rust AI 伴侣引擎：让角色"像真人"——持久记忆、会演变的关系模型，以及一个让人设在成千上万轮对话里保持稳定的决策引擎。**
 >
-> `eros-engine` 是 [Eros Chat](https://chat.etherfun.xyz) 背後的 companion-chat 核心，現在抽成可獨立部署的服務。它把每輪對話轉成三種可持久化的信號：結構化用戶畫像、雙層長期記憶，以及會持續影響 persona 行為的六維好感度模型。
+> `eros-engine` 是 [Eros Chat](https://chat.etherfun.xyz) 背后的伴侣对话核心，抽取成了独立服务。它把对话沉淀为可持久的状态——结构化用户画像、双层长期记忆、六维亲密度模型——让角色在用户每次回来时都表现得像同一个人。
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Crates.io: core](https://img.shields.io/crates/v/eros-engine-core.svg?label=eros-engine-core)](https://crates.io/crates/eros-engine-core)
+[![Crates.io: store](https://img.shields.io/crates/v/eros-engine-store.svg?label=eros-engine-store)](https://crates.io/crates/eros-engine-store)
+[![Crates.io: llm](https://img.shields.io/crates/v/eros-engine-llm.svg?label=eros-engine-llm)](https://crates.io/crates/eros-engine-llm)
+[![GHCR: eros-engine](https://img.shields.io/badge/ghcr.io-etherfunlab%2Feros--engine-blue)](https://github.com/etherfunlab/eros-engine/pkgs/container/eros-engine)
 
 [English](README.md) · 中文
 
-## 為甚麼需要它
+## 为什么做这个
 
-很多 AI character app 把記憶當成 prompt append，把關係當成一段 system prompt 描述。Demo 階段可以運作，但長 session 很容易漂移，也很難調試。
+大多数 AI 角色应用把记忆当成往 prompt 里追加文本，把关系写成一段指令。这能撑起一个 demo，但在长会话里会漂移、会崩人设，也很难调试。`eros-engine` 把这些都搬进显式、可检视的状态里——所以角色会"像真人"（记得你、并对关系所处的位置作出反应），并且"人设稳定"（行为是被*决策*出来的，而不是即兴发挥）。
 
-`eros-engine` 把這些能力變成明確狀態：
+五大支柱支撑这一点：
 
-- **Memory** 放在 Postgres + pgvector，拆成 profile memory 和 relationship memory。
-- **Affinity** 是數值向量，透過 EMA 平滑與真實時間衰退更新。
-- **User insight** 是可查詢的 JSONB 用戶畫像。
-- **Persona behavior** 先由 Persona Decision Engine（PDE）规划，再交给 LLM 生成。PDE 默认为规则型；可通过 `[tasks.pde_decision].filter_prompt` 启用可选 LLM 判断器层，每轮判断结果记录到 `companion_decision_events`。
+- **双层记忆**——画像记忆（稳定的用户事实）与关系记忆（共同时刻、回扣、未了的话头），都存在 Postgres + pgvector 里，让角色跨会话、跨人设地记得你。→ [记忆分层](docs/memory-layers.zh.md)
+- **六维亲密度 + ghost 机制**——一个数值化的关系向量（warmth、trust、intimacy、intrigue、patience、tension），用 EMA 平滑、随真实时间衰减；它会随时间重塑语气、深度与行为，甚至可以决定*不回复*。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
+- **人设决策引擎（PDE）**——为每一轮挑选行为（回复 / ghost / 发一张照片）和内在状态——默认基于规则，可选开启 LLM 裁判层。这正是让回复"像真人"且不崩人设、而不是变成通用助手腔的关键；裁判调用会审计到 `companion_decision_events`。→ [模型配置](docs/model-config.zh.md)
+- **结构化用户画像**——每个用户一份 JSONB 画像（城市、职业、兴趣、MBTI 信号、情感需求、生活节奏、匹配偏好），带一个加权的 `training_level`，下游产品可直接查询用于匹配、引导、分析或灰度。→ [API 参考](docs/api-reference.zh.md)
+- **为流畅的伴侣对话而生**——逐 token 的 SSE 流式输出；图像理解（用户可以发照片）与角色主动生成图片（`reply_image` / `reply_text_image`）；按请求注入的 prompt traits 与 tier；OpenRouter 路由，按任务选模型（固定 / 轮询 / 加权，外加 fallback 链）并全程审计调用。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md)
 
-這不是通用 agent framework，而是為「同一個 persona 長期跟同一個用戶互動」設計的引擎：AI 伴侶、日記式陪伴、coaching agent、language tutor、character chat 都屬於這類場景。
+这不是一个通用 agent 框架。它是一个聚焦的引擎，专为"同一个角色跨多次会话与同一个用户对话"的产品而做：AI 伴侣、日记陪伴、教练 agent、语言陪练、角色聊天。
 
-## 核心特性
-
-### 雙層記憶
-
-`eros-engine` 用兩種語義 scope 存記憶：
-
-| 層級 | Scope | 用途 |
-|---|---|---|
-| Profile memory | `user_id`，且 `instance_id IS NULL` | 跨 session、跨 persona 共享的穩定用戶事實。 |
-| Relationship memory | `user_id + persona instance` | 共同經歷、回頭呼應、未解決話題，以及只屬於這段關係的上下文。 |
-
-Embedding 使用 Voyage `voyage-3-lite`，512 維向量。檢索走 pgvector IVFFlat cosine search。
-
-### 六維好感度
-
-每個 chat session 都有一條六維關係向量。六個維度（向量的各軸）如下：
-
-| 維度 | 範圍 | 控制 |
-|---|---:|---|
-| `warmth` | -1.0 到 1.0 | 語氣與稱呼，從疏離到親近。 |
-| `trust` | 0.0 到 1.0 | 話題深度，以及 persona 是否願意透露自己。 |
-| `intimacy` | 0.0 到 1.0 | 暱稱、內部梗、對過往細節的呼應。 |
-| `intrigue` | 0.0 到 1.0 | 好奇心與追問傾向。 |
-| `patience` | 0.0 到 1.0 | 對低 effort 或重複消息的容忍度。 |
-| `tension` | 0.0 到 1.0 | 推拉、摩擦、玩鬧式抵抗。 |
-
-兩個**复合指标**把這條向量壓成便於 prompt 塑形的摘要——各是一組互斥三維的平均（`warmth` 先線性縮放到 0–1）：
-
-- **bond**（朋友感，關係有多近）= mean(`warmth`、`intimacy`、`tension`)
-- **chemistry**（来电感，張力有多強）= mean(`trust`、`intrigue`、`patience`)
-
-更新使用指數移動平均（EMA），避免 persona 在情緒狀態間突然跳變。`intrigue`、`patience`、`tension` 也會隨真實時間自然衰退或恢復。平滑强度由 `EMA_INERTIA`（默认 `0.8`）控制：每轮只施加 `1 − inertia` 比例的评估增量，所以值越高、关系升温（与降温）越慢——相当于一个难度旋钮；设为 `0` 则每次增量全额生效。
-
-每個 request 可帶 `affinity_scope` flag，決定哪一個复合指标參與 prompt 注入：`bond`（默認）、`chemistry`、`bond_and_chemistry`（≡ `full`，全部六維）、`none`，或像 `["warmth", "trust"]` 這樣的顯式維度子集。它只 gate prompt 注入——六個維度始終照常持久化與更新。
-
-`stranger`、`slow_burn`、`friend`、`frenemy`、`romantic` 這些關係標籤由閾值規則從向量中推導出來。它們是內部狀態，不是展示給用戶看的 badge。
-
-### 確定性的 ghost 機制
-
-同一條 affinity vector 也驅動 ghost decision。當 patience 和 intrigue 下降到一定程度，persona 可以選擇不回覆。
-
-四條保護規則避免它變得隨機：
-
-- 前 10 條消息不 ghost；
-- 不連續 ghost 兩次；
-- ghost 後有 1 小時 cooldown；
-- 最近 ghost 過時提高下一次 ghost 閾值。
-
-這是 Rust 裡的 domain logic，不是 prompt 裡的一句建議。
-
-### 結構化用戶洞察
-
-`companion_insights` 表為每個用戶保存一份 JSONB profile：城市、職業、興趣、MBTI 信號、感情價值觀、情緒需求、生活節奏、性格特質、配對偏好。
-
-每個字段會貢獻一部分加權 `training_level`。因此這份 profile 不只服務聊天，也能被 matchmaking、onboarding、coaching logic、analytics 或產品 gating 直接查詢。
-
-## 架構
+## 架构
 
 ```txt
 ┌─────────────────────────────────────────────────────────┐
-│ /comp/* HTTP routes  ←  Supabase JWT middleware          │
+│ /comp/* HTTP 路由  ←  Supabase JWT 中间件                │
 │         │                                                │
 │         ▼                                                │
-│ pipeline orchestrator: load → PDE → handler → chat → post│
+│ pipeline 编排：load → PDE → handler → chat → post        │
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
-│  │ post-process，在回覆後背景執行                 │     │
-│  │   • affinity: 寫入 6D delta + EMA              │     │
-│  │   • memory:   Voyage embed → pgvector upsert   │     │
-│  │   • insight:  抽取 facts → JSONB merge         │     │
+│  │ post-process，回复后异步 spawn                  │     │
+│  │   • 亲密度：持久化 6 维 delta + EMA            │     │
+│  │   • 记忆：  Voyage embed → pgvector upsert     │     │
+│  │   • 画像：  抽取事实 → JSONB 合并              │     │
 │  └────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Workspace 拆成四個 crate：
+工作区拆成四个 crate：
 
-| Crate | 職責 |
+| Crate | 职责 |
 |---|---|
-| `eros-engine-core` | 純 domain logic：affinity math、ghost decision、PDE、persona types。零 I/O。 |
-| `eros-engine-llm` | OpenRouter chat client、Voyage embedding client、TOML model-config loader。 |
-| `eros-engine-store` | Postgres + pgvector 持久層，所有表都在 `engine` schema 下。 |
-| `eros-engine-server` | Axum HTTP service、Supabase JWT middleware、OpenAPI docs、pipeline wiring。 |
+| `eros-engine-core` | 纯领域逻辑：亲密度计算、ghost 决策、PDE、人设类型。零 I/O。 |
+| `eros-engine-llm` | OpenRouter 聊天客户端、Voyage 向量客户端、TOML 模型配置加载。 |
+| `eros-engine-store` | Postgres + pgvector 持久层，所有表都在 `engine` schema 下。 |
+| `eros-engine-server` | Axum HTTP 服务、Supabase JWT 中间件、OpenAPI 文档、pipeline 接线。 |
 
-你可以直接跑 `eros-engine-server` 當 HTTP API，也可以把 `core + llm + store` 嵌入自己的 Rust service。
+你可以把 `eros-engine-server` 当 HTTP API 跑，也可以把 `core + llm + store` 直接嵌进你自己的 Rust 服务。crate 边界、pipeline 阶段、数据流见 [架构](docs/architecture.zh.md)。
 
-## 文檔
+## 作为库使用
 
-- [架構](docs/architecture.zh.md)——crate 邊界、pipeline 階段、data flow。
-- [好感度模型](docs/affinity-model.zh.md)——六個維度、EMA、時間衰退、關係標籤。
-- [Ghost 機制](docs/ghost-mechanics.zh.md)——score formula、保護規則、示例。
-- [記憶層](docs/memory-layers.zh.md)——profile vs relationship memory、Voyage、pgvector retrieval。
-- [模型配置](docs/model-config.zh.md)——`model_config.toml` schema、任務名、解析優先級、0.x 穩定性承諾。
-- [部署](docs/deploying.zh.md)——Docker、自帶 Postgres / IdP。
-- [API 參考](docs/api-reference.zh.md)——每個 `/comp/*` endpoint。
+三个库 crate 已发布到 crates.io（[core](https://crates.io/crates/eros-engine-core) · [store](https://crates.io/crates/eros-engine-store) · [llm](https://crates.io/crates/eros-engine-llm)）：
 
-## 快速開始
+```bash
+cargo add eros-engine-core eros-engine-store eros-engine-llm
+```
 
-前置需求：
+```toml
+[dependencies]
+eros-engine-core  = "0.6"
+eros-engine-store = "0.6"   # 需要 Postgres + pgvector 层时
+eros-engine-llm   = "0.6"   # 需要 OpenRouter + Voyage 客户端时
+```
 
-- `rust-toolchain.toml` 指定的 Rust toolchain。
-- Postgres 16+，並啟用 `pgvector` extension。
-- OpenRouter API key。
-- Voyage API key。
-- Supabase JWT secret，或你自己的 `AuthValidator` 實現。
+`eros-engine-server` 刻意不发布到 crates.io——它以 Docker 镜像方式运行（见下）。
+
+## 作为 Docker 镜像运行
+
+每个 `v*` tag 都会把 `eros-engine-server` 的 `linux/amd64` 镜像发布到 GitHub Container Registry（需要 arm64？用 `docker/Dockerfile` 自己构建）：
+
+```bash
+docker pull ghcr.io/etherfunlab/eros-engine:0.6.2
+# 或跟踪最新 release
+docker pull ghcr.io/etherfunlab/eros-engine:latest
+```
+
+最小运行（自带 Postgres 与 `.env`）：
+
+```bash
+docker run --rm -p 8080:8080 --env-file .env \
+  ghcr.io/etherfunlab/eros-engine:0.6.2 serve
+```
+
+`docker/Dockerfile` 就是构建该镜像的同一份产物，可部署到任意容器平台。见 [部署](docs/deploying.zh.md)。
+
+## 文档
+
+- [架构](docs/architecture.zh.md)——crate 边界、pipeline 阶段、数据流。
+- [亲密度模型](docs/affinity-model.zh.md)——六个维度、EMA、时间衰减、关系标签。
+- [ghost 机制](docs/ghost-mechanics.zh.md)——评分公式、保护规则、示例。
+- [记忆分层](docs/memory-layers.zh.md)——画像记忆 vs 关系记忆、Voyage、pgvector 检索。
+- [模型配置](docs/model-config.zh.md)——`model_config.toml` schema、各任务（chat、vision、图像生成、PDE、过滤器、抽取）、选模型规则、0.x 稳定性承诺。
+- [Prompt traits](docs/prompt-traits.zh.md)——按请求注入系统 prompt 与 tier 白名单。
+- [LLM / OpenRouter 审计](docs/llm-audit.zh.md)——按用户 / 按会话的归因透传。
+- [部署](docs/deploying.zh.md)——Docker、自带 Postgres / IdP、运行期环境变量。
+- [API 参考](docs/api-reference.zh.md)——每个 `/comp/*` 端点、请求字段、SSE 帧布局。
+
+## 快速开始
+
+前置：`rust-toolchain.toml` 指定的 Rust 工具链、带 `pgvector` 的 Postgres 16+、一个 OpenRouter API key、一个 Voyage API key，以及一个 Supabase JWT secret（或你自己的 `AuthValidator`）。
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env
-```
+cp .env.example .env   # 填入 DATABASE_URL、OPENROUTER_API_KEY、VOYAGE_API_KEY，以及一个鉴权来源
 
-填好 `DATABASE_URL`、`OPENROUTER_API_KEY`、`VOYAGE_API_KEY`、`SUPABASE_JWT_SECRET` 之後執行：
-
-```bash
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-Server 默認監聽 `0.0.0.0:8080`。Scalar API docs 在 `/docs`，OpenAPI JSON 在 `/api-docs/openapi.json`。
+服务默认监听 `0.0.0.0:8080`。Scalar API 文档在 `/docs`，OpenAPI JSON 在 `/api-docs/openapi.json`。官方 Eros Chat 网页客户端是闭源的——自带 UI，或把这些 crate 嵌进别的服务。
 
-官方 Eros Chat web client 是閉源產品。`eros-engine` 本身可以獨立運行；你可以自帶 UI，也可以把 crates 嵌進另一個 service。
+## API 一览
 
-## API 表面
+默认所有 `/comp/*` 路由都需要 `Authorization: Bearer <Supabase JWT>`（`AuthValidator` trait 可替换成其他身份提供方）。核心端点：
 
-默認情況下，所有 `/comp/*` route 都需要 `Authorization: Bearer <Supabase JWT>`。
+- `POST /comp/chat/start`——对某个人设开一个会话。
+- `POST /comp/chat/{session_id}/message/stream`——**核心**对话端点：逐 token 的 Server-Sent Events。每轮可选字段：`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（给角色打赏）、`image_url`（给角色发一张照片）、`image`（请求角色生成一张图片——风格 / 模型 / 画幅 / 脸部参考）。
+- `POST /comp/chat/{session_id}/message/{message_id}/image`——回写角色所生成图片在你存储里的 URL。
+- `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile`——历史、会话列表、结构化画像。
+- `GET /comp/affinity/{session_id}`——仅调试用的实时亲密度向量（`EXPOSE_AFFINITY_DEBUG=true`）。
 
-重點 endpoint：
-
-- `POST /comp/chat/start`——對指定 persona 開啟 chat session。
-- `POST /comp/chat/{session_id}/message/stream`——**唯一**的聊天輪 endpoint：逐 token 的 Server-Sent Events (SSE) 串流。（舊的阻塞式同步 `/message` endpoint 已在 0.3 移除——SSE 現在是唯一的聊天路徑。）
-- `GET  /comp/chat/{session_id}/history`——分頁讀聊天歷史。
-- `GET  /comp/chat/{user_id}/sessions`——列出用戶 sessions。
-- `GET  /comp/user/{user_id}/profile`——讀取目前的 `companion_insights` 和 `training_level`。
-- `POST /comp/chat/{session_id}/event/gift`——套用外部 gift event 與 affinity delta。
-- `GET  /comp/chat/{session_id}/gifts`——列出某個 session 的 gift events。
-- `/message/stream` 接受幾個可選的 caller-supplied 欄位：
-  - `tier` —— 從 `model_config.toml` 選出該 tier 的 chat model 和
-    `prompt_traits` allow-list；未知或缺省會 fallback 到 task 默認 block。
-    詳見 [docs/model-config.zh.md](docs/model-config.zh.md)。
-  - `prompt_traits` —— per-request system-prompt 注入，會被解析出的 tier
-    allow-list gating，詳見 [docs/prompt-traits.md](docs/prompt-traits.md)。
-  - `audit` —— 不透明的 OpenRouter passthrough（`user` / `session_id` /
-    `metadata`），用於在 OpenRouter dashboard 上做 per-user / per-session
-    attribution。詳見 [docs/llm-audit.zh.md](docs/llm-audit.zh.md)。
-- `GET  /comp/affinity/{session_id}`——debug-only 即時 affinity vector，由 `EXPOSE_AFFINITY_DEBUG=true` 開啟。
-
-如果你不用 Supabase，可以實現 `AuthValidator` trait 接自己的 identity provider。
+阻塞式同步 `/message` 端点已在 0.3 移除——SSE 是唯一的对话路径。完整请求 schema、SSE 帧布局（含 `delta`、`image`、ghost、error 帧）与逐字段语义见 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 
-| 環境變量 | 必要 | 說明 |
-|---|---|---|
-| `DATABASE_URL` | 是 | 帶 `pgvector` 的 Postgres；表建在 `engine.*`。 |
-| `OPENROUTER_API_KEY` | 是 | Chat completions；默認由 `examples/model_config.toml` 路由。 |
-| `OPENROUTER_APP_REFERER` | 否 | 設了之後每次出站 OpenRouter 調用都帶 `HTTP-Referer`。會出現在 OpenRouter 的 app 分析面板上。 |
-| `OPENROUTER_APP_TITLE` | 否 | 設了之後帶 `X-OpenRouter-Title`。OpenRouter app analytics 顯示名稱。和 `OPENROUTER_APP_REFERER` 一對；兩個都可選。 |
-| `OPENROUTER_APP_CATEGORIES` | 否 | 设了之后带 `X-OpenRouter-Categories` —— 逗号分隔的 OpenRouter marketplace 分类（如 `roleplay,general-chat`）。原样透传；OpenRouter 对无法识别的值静默忽略，且只有在同时设了 `OPENROUTER_APP_REFERER` 时才生效。 |
-| `OPENROUTER_USAGE_HIDDEN_KEYS` | 否 | 逗号分隔的顶层 key 列表，从 `usage` 对象里剔除 —— 在 SSE 流式 `done` 帧上生效。常用于把批发 `cost` / `cost_details` 隐藏起来不外泄给下游客户。完整 usage 仍会落库并写入服务器端 tracing。 |
-| `VOYAGE_API_KEY` | 是 | Embeddings。空 key 會拒絕啟動。 |
-| `SUPABASE_URL` | 否 | Supabase project URL。保留在 `.env.example` 裡方便 client / deploy 約定；目前 server 不讀取它。 |
-| `SUPABASE_JWT_SECRET` | 是 | 默認 auth 使用的 JWT signing secret。 |
-| `BIND_ADDR` | 否 | 默認 `0.0.0.0:8080`。 |
-| `EXPOSE_AFFINITY_DEBUG` | 否 | 設為 `true` 會開啟 `/comp/affinity/{session_id}`。 |
-| `EMA_INERTIA` | 否 | affinity 更新的 EMA 平滑系数，范围 `[0, 1]`，默认 `0.8`。每轮只施加 `1 − inertia` 比例的增量，值越高则关系向量每轮移动越小（升温/降温都更慢）——相当于关系难度旋钮；`0` 表示每次增量全额生效。 |
-| `MODEL_CONFIG_PATH` | 否 | 默認 `examples/model_config.toml`。 |
-| `RUST_LOG` | 否 | 默認 `info`。 |
+必填环境变量：`DATABASE_URL`、`OPENROUTER_API_KEY`、`VOYAGE_API_KEY`，以及**一个**鉴权来源——`SUPABASE_URL` / `SUPABASE_JWKS_URL`（JWKS，2025 年后 Supabase 默认）**或** `SUPABASE_JWT_SECRET`（旧版 HS256）。一个都不设，服务会 fail-closed 拒绝启动。
 
-## 刻意不包含的東西
+其余都有合理默认值：模型路由（`MODEL_CONFIG_PATH` → `model_config.toml`）、OpenRouter 归因头、dreaming-lite / snapshot 后台任务、`EMA_INERTIA`（关系难度旋钮）、调试开关等。完整带注释的清单见 [`.env.example`](.env.example)；运行期指引见 [部署](docs/deploying.zh.md)，模型路由见 [模型配置](docs/model-config.zh.md)。
 
-這個 repo 是 conversation、memory、relationship-state core。它不包含：
+## Roadmap
 
-- **Matchmaking**——多階段 filter、soft scoring、agent-to-agent matching simulation 留在閉源產品裡。
-- **完整社交產品 UX**——onboarding、video、voice、billing、photos、moderation UI、mobile clients。
-- **Persona provenance / marketplace logic**——這是商業產品代碼，不屬於 engine。
+目前不在引擎里，但在计划中：
 
-如果你要做另一個產品，最值得重用的是 affinity + memory + insight pipeline。
+- **Agents playground**——多个 AI 人设在同一会话里互相（以及与用户）互动。
+- **语音消息**——角色发出与用户发出的音频轮次。
+- **实时语音对话**——低延迟的语音来回。
+- **视频生成**——角色主动发送的短视频片段，延续图像执行器。
 
-## 內容說明
+## 明确不在范围内
 
-`examples/personas/` 裡的人格是成人 character-chat 示例。當 relationship state 走到相應位置，它們可以調情、表達慾望；同時仍會拒絕不尊重或越界的要求。如果你的產品需要 SFW default，部署前請替換這些 persona files。
+本仓库是对话、记忆、关系状态的核心，不包含：
 
-每一輪的行為還可以透過 message routes 上的
-[`prompt_traits`](docs/prompt-traits.md) 欄位再調整——engine 把傳入的文字
-當成 opaque string 處理，這些 traits 實際代表什麼策略，完全交給你的
-frontend / middleware 決定。
+- **匹配**——多阶段过滤、软打分、agent 对 agent 的匹配模拟，仍在闭源产品里。
+- **完整社交 UX**——引导、视频、语音、计费、相册、审核 UI、移动端。
+- **人设来源 / 市场逻辑**——属于商业产品代码，不是引擎的一部分。
 
-## 貢獻
+如果你在做不同的产品，可复用的部分是亲密度 + 记忆 + 画像这条 pipeline。
 
-請先閱讀 [`CONTRIBUTING.md`](CONTRIBUTING.md)。所有貢獻者首次提 PR 時都需要透過 cla-assistant.io 接受 [`CLA`](CLA.md)。
+## 内容提示
 
-## 授權
+`examples/personas/` 下的示例人设是面向成人的角色聊天示例。当关系状态到位时，它们可以调情、表达欲望，同时仍会拒绝不尊重或越界的行为。如果你的产品需要默认 SFW，请在部署前替换这些人设文件。
 
-`eros-engine` 使用 AGPL-3.0-only 授權。如果 AGPL 不符合你的分發方式，可以洽談商業授權：`henrylin@etherfun.xyz`。
+每轮行为还可以通过消息路由上的 [`prompt_traits`](docs/prompt-traits.zh.md) 字段进一步调节——引擎把传入文本当作不透明内容，所以"这些 trait 编码了什么策略"完全由你的前端 / 中间层决定。
+
+## 贡献
+
+阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。所有贡献者在首次 PR 时须通过 cla-assistant.io 接受 [`CLA`](CLA.md)。
+
+## 许可
+
+`eros-engine` 以 AGPL-3.0-only 授权。如果 AGPL 不适合你的分发模式，可提供商业授权：`henrylin@etherfun.xyz`。

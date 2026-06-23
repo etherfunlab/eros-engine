@@ -25,7 +25,7 @@ The dependency graph is strictly downward — `core` doesn't know about `llm`, `
 
 ## Pipeline
 
-`pipeline::run(state, session_id, event)` orchestrates a single chat turn:
+`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage)` orchestrates a single chat turn, returning an SSE frame stream:
 
 ```
 load context           load persona via PersonaRepo
@@ -73,7 +73,7 @@ eros-engine-server :8080
     │
     ├─► auth middleware → user_id from JWT claims
     │
-    ├─► pipeline::run(session_id, event)
+    ├─► pipeline::stream::run_stream(state, user_msg)
     │       │
     │       └─► spawn post_process(state.clone(), …)
     │              │
@@ -113,7 +113,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0005_insights
+│   ├── migrations/           # 0000_schema → 0028_companion_decision_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -129,7 +129,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # mod (orchestrator) / handlers / post_process
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / debug / mod
+        ├── routes/           # health / companion / companion_stream / debug / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 
@@ -138,5 +138,5 @@ crates/
 - [Affinity model](affinity-model.md) — 6 dimensions, EMA, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
-- [Deploying](deploying.md) — Docker, Fly.io, bring-your-own-Postgres / IdP
+- [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
 - [API reference](api-reference.md) — every `/comp/*` endpoint

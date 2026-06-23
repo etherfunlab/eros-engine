@@ -113,7 +113,7 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 
 ## What ghosting is not
 
-- It's **not** an error response. The HTTP route still returns 200. The body has `reply: null` (or the engine's chosen "no reply" shape).
+- It's **not** an error response. The HTTP route still returns 200. Because the engine is SSE-streaming, a ghost turn emits three frames and then closes the stream: `meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`. No `delta` frame is emitted and no LLM is called.
 - It's **not** an LLM call gone wrong. The decision is pure Rust; the LLM never gets asked.
 - It's **not** silent forever. Time-decay restores `patience` and softens `tension`; eventually the persona will reply again to the next message.
 
