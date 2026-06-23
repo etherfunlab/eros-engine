@@ -19,11 +19,11 @@
 
 这建立在五大支柱之上：
 
-- **双层记忆**——画像记忆（稳定的用户事实）与关系记忆（共同经历、前情呼应、未完话题）均存储在 Postgres + pgvector 中，让伴侣能够跨会话、跨人设记住你。→ [记忆分层](docs/memory-layers.zh.md)
-- **六维亲密度 + ghost 机制**——以数值关系向量（warmth、trust、intimacy、intrigue、patience、tension）结合 EMA 平滑与实时衰减；它会逐渐改变语气、深度和行为，甚至可以决定*不回复*。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
-- **人设决策引擎（PDE）**——为每轮对话选择行为（回复、ghost 或发送照片）与内在状态——默认基于规则，也可选择启用 LLM judge。它让回复自然、符合人设，而非流于通用助手的腔调；judge 调用会审计到 `companion_decision_events`。→ [模型配置](docs/model-config.zh.md)
-- **结构化用户洞察**——以 JSONB 画像记录城市、职业、兴趣、MBTI 信号、情感需求、生活节奏和匹配偏好，并附带加权的 `training_level`；下游产品可查询这些数据，用于匹配、用户引导、分析或 gating。→ [API 参考](docs/api-reference.zh.md)
-- **专为流畅的伴侣对话打造**——逐 token 的 SSE 流式输出；图像理解（用户可发送照片）和伴侣端图像生成（`reply_image` / `reply_text_image`）；按请求指定 `prompt_traits` 与 tier；基于 OpenRouter 的路由，支持按任务选择模型（固定 / 轮询 / 加权，并配有 fallback chain）和完整的调用审计。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md)
+- 🧠 **双层记忆**——画像记忆（稳定的用户事实）与关系记忆（共同经历、前情呼应、未完话题）均存储在 Postgres + pgvector 中，让伴侣能够跨会话、跨人设记住你。→ [记忆分层](docs/memory-layers.zh.md)
+- 💞 **六维亲密度 + ghost 机制**——以数值关系向量（warmth、trust、intimacy、intrigue、patience、tension）结合 EMA 平滑与实时衰减；它会逐渐改变语气、深度和行为，甚至可以决定*不回复*。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
+- 🎭 **人设决策引擎（PDE）**——为每轮对话选择行为（回复、ghost 或发送照片）与内在状态——默认基于规则，也可选择启用 LLM judge。它让回复自然、符合人设，而非流于通用助手的腔调；judge 调用会审计到 `companion_decision_events`。→ [模型配置](docs/model-config.zh.md)
+- 🧩 **结构化用户洞察**——以 JSONB 画像记录城市、职业、兴趣、MBTI 信号、情感需求、生活节奏和匹配偏好，并附带加权的 `training_level`；下游产品可查询这些数据，用于匹配、用户引导、分析或 gating。→ [API 参考](docs/api-reference.zh.md)
+- ⚡ **专为流畅的伴侣对话打造**——逐 token 的 SSE 流式输出；图像理解（用户可发送照片）和伴侣端图像生成（`reply_image` / `reply_text_image`）；按请求指定 `prompt_traits` 与 tier；基于 OpenRouter 的路由，支持按任务选择模型（固定 / 轮询 / 加权，并配有 fallback chain）和完整的调用审计。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md)
 
 这不是通用 agent 框架，而是一个专注于同一人设跨多个会话与同一用户持续交流的引擎，适用于 AI 伴侣、日记伴侣、教练 agent、语言导师和角色聊天。
 
@@ -142,10 +142,10 @@ cargo run -p eros-engine-server -- serve
 
 目前不在引擎里，但在计划中：
 
-- **Agents playground**——多个 AI 人设在同一会话里互相（以及与用户）互动。
-- **语音消息**——角色发出与用户发出的音频轮次。
-- **实时语音对话**——低延迟的语音来回。
-- **视频生成**——角色主动发送的短视频片段，延续图像执行器。
+- [ ] **Agents playground**——多个 AI 人设在同一会话里互相（以及与用户）互动。
+- [ ] **语音消息**——角色发出与用户发出的音频轮次。
+- [ ] **实时语音对话**——低延迟的语音来回。
+- [ ] **视频生成**——角色主动发送的短视频片段，延续图像执行器。
 
 ## 明确不在范围内
 
