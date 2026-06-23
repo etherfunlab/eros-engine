@@ -570,6 +570,16 @@
           "204": {
             "description": "stored"
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {

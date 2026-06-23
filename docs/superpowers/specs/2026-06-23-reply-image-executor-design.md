@@ -502,7 +502,7 @@ Image {
 },
 ```
 
-- `reply_text_image`: `meta → delta* → image → done → final`.
+- `reply_text_image`: `meta → delta* → done → image → final`. *(implemented order: image emitted after done, not before — deviation from draft; final stays last)*
 - `reply_image`: `meta → image → done → final`.
 
 **Client contract for a failed image** (no new error frame): the `meta` frame's

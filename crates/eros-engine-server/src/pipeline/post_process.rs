@@ -1130,14 +1130,23 @@ mod tests {
     #[test]
     fn eval_runs_on_image_reply_with_text_or_prompt() {
         // reply_text_image with real text + adequate user msg → not skipped
-        assert_eq!(eval_skip_reason(ActionType::ReplyTextImage, 10, false), None);
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyTextImage, 10, false),
+            None
+        );
         // reply_image with empty assistant text but the caller supplies a non-empty
         // proxy (assistant_empty=false because image_prompt is used) → not skipped
         assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, false), None);
         // image reply with empty proxy → empty_assistant
-        assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, true), Some("empty_assistant"));
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyImage, 10, true),
+            Some("empty_assistant")
+        );
         // still gated by short user msg
-        assert_eq!(eval_skip_reason(ActionType::ReplyTextImage, 2, false), Some("short_user_msg"));
+        assert_eq!(
+            eval_skip_reason(ActionType::ReplyTextImage, 2, false),
+            Some("short_user_msg")
+        );
         // Proactive and Ghost keep their dedicated skip reasons.
         assert_eq!(
             eval_skip_reason(ActionType::Proactive, 50, false),

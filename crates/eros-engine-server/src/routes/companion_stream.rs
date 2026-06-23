@@ -160,8 +160,15 @@ fn image_url_is_valid(url: &str) -> bool {
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
     // Content may be empty only when a tip, an image_url, or a forced ImageOnly turn is attached.
-    let image_only = req.image.as_ref().is_some_and(|i| i.force && i.mode == ImageMode::ImageOnly);
-    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() && !image_only {
+    let image_only = req
+        .image
+        .as_ref()
+        .is_some_and(|i| i.force && i.mode == ImageMode::ImageOnly);
+    if req.content.is_empty()
+        && req.tips_amount_usd.is_none()
+        && req.image_url.is_none()
+        && !image_only
+    {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -559,6 +566,7 @@ pub struct SetImageUrlRequest {
     request_body = SetImageUrlRequest,
     responses(
         (status = 204, description = "stored"),
+        (status = 403, body = StreamPreErrorBody),
         (status = 404, body = StreamPreErrorBody),
         (status = 422, body = StreamPreErrorBody),
     ),
@@ -599,7 +607,9 @@ pub async fn set_generated_image_url(
             original_user_message_id: None,
         }));
     }
-    chat_repo.set_assistant_image_url(message_id, &req.url).await?;
+    chat_repo
+        .set_assistant_image_url(message_id, &req.url)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1140,7 +1150,10 @@ mod validate_payload_tests {
     fn validate_rejects_force_image_with_tip() {
         let mut req = minimal_req();
         req.tips_amount_usd = Some(5.0);
-        req.image = Some(ImageReplyParams { force: true, ..Default::default() });
+        req.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
         assert!(validate_payload(&req).is_err());
     }
 
@@ -1148,17 +1161,27 @@ mod validate_payload_tests {
     fn validate_allows_image_only_empty_content() {
         let mut req = minimal_req();
         req.content = String::new();
-        req.image = Some(ImageReplyParams { force: true, mode: ImageMode::ImageOnly, ..Default::default() });
+        req.image = Some(ImageReplyParams {
+            force: true,
+            mode: ImageMode::ImageOnly,
+            ..Default::default()
+        });
         assert!(validate_payload(&req).is_ok());
     }
 
     #[test]
     fn validate_rejects_bad_face_ref_and_aspect() {
         let mut req = minimal_req();
-        req.image = Some(ImageReplyParams { face_ref_url: Some("ftp://x".into()), ..Default::default() });
+        req.image = Some(ImageReplyParams {
+            face_ref_url: Some("ftp://x".into()),
+            ..Default::default()
+        });
         assert!(validate_payload(&req).is_err());
         let mut req2 = minimal_req();
-        req2.image = Some(ImageReplyParams { aspect_ratio: Some("2:5".into()), ..Default::default() });
+        req2.image = Some(ImageReplyParams {
+            aspect_ratio: Some("2:5".into()),
+            ..Default::default()
+        });
         assert!(validate_payload(&req2).is_err());
     }
 }

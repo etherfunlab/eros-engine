@@ -995,7 +995,6 @@ impl ModelConfig {
             max_tokens: task_cfg.max_tokens.unwrap_or(4096),
         })
     }
-
 }
 
 /// Drop later duplicates, preserving first-seen order.
@@ -2897,10 +2896,8 @@ temperature = 0.8
 
     #[test]
     fn resolve_image_gen_carries_model_spec() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img-a\"\n",
-        )
-        .unwrap();
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img-a\"\n").unwrap();
         let r = cfg.resolve_image_gen().unwrap();
         assert!(matches!(r.model, Some(ModelSpec::Fixed(ref s)) if s == "img-a"));
         assert_eq!(r.default_style, StyleKey::Realistic); // serde default
@@ -2916,10 +2913,7 @@ temperature = 0.8
     #[test]
     fn regression_existing_task_model_still_resolves_fixed() {
         // Adding default_model_spec() must NOT affect tasks that explicitly set model.
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_companion]\nmodel=\"x\"\n",
-        )
-        .unwrap();
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"x\"\n").unwrap();
         let task = cfg.tasks.get("chat_companion").unwrap();
         assert!(matches!(&task.model, ModelSpec::Fixed(s) if s == "x"));
         let r = cfg.resolve("chat_companion", None);
@@ -2932,7 +2926,8 @@ temperature = 0.8
     fn effective_chain_per_turn_wins_and_dedups() {
         let cfg = ModelConfig::from_toml_str(
             "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"X\",\"Y\"]\n",
-        ).unwrap();
+        )
+        .unwrap();
         let r = cfg.resolve_image_gen();
         // per-turn "X" + config "cfg" + fallback ["X","Y"] → [X, cfg, Y] (dedup X)
         assert_eq!(
@@ -2943,9 +2938,9 @@ temperature = 0.8
 
     #[test]
     fn effective_chain_fallback_only_is_primary() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nfallback=[\"Z\",\"W\"]\n",
-        ).unwrap();
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nfallback=[\"Z\",\"W\"]\n")
+                .unwrap();
         let r = cfg.resolve_image_gen();
         assert_eq!(
             effective_image_chain(None, r.as_ref()),
@@ -2956,7 +2951,10 @@ temperature = 0.8
     #[test]
     fn effective_chain_empty_is_none() {
         let cfg = ModelConfig::from_toml_str("[tasks.chat_image_generation]\n").unwrap();
-        assert_eq!(effective_image_chain(None, cfg.resolve_image_gen().as_ref()), None);
+        assert_eq!(
+            effective_image_chain(None, cfg.resolve_image_gen().as_ref()),
+            None
+        );
         assert_eq!(effective_image_chain(None, None), None);
     }
 
@@ -2964,7 +2962,8 @@ temperature = 0.8
     fn effective_chain_config_model_when_no_per_turn() {
         let cfg = ModelConfig::from_toml_str(
             "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"F\"]\n",
-        ).unwrap();
+        )
+        .unwrap();
         let r = cfg.resolve_image_gen();
         assert_eq!(
             effective_image_chain(None, r.as_ref()),

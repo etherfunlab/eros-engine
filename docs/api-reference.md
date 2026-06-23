@@ -251,6 +251,99 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
+**Optional: companion image reply.** The body may include an `image` object —
+`ImageReplyParams` — to request or force a companion-generated image this turn.
+Requires `[tasks.chat_image_generation]` to be configured (see
+[model-config.md](model-config.md)); the executor is off by default.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "give me a smile",
+        "client_msg_id": "01J3333333333333333333333A",
+        "image": {
+          "force": true,
+          "mode": "text_image",
+          "style": "realistic",
+          "model": "google/gemini-2.5-flash-image",
+          "image_prompt": "warm candid selfie, soft indoor light",
+          "aspect_ratio": "3:4",
+          "resolution": "1024x1365",
+          "face_ref_url": "https://cdn.example/aria_avatar.png"
+        }
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+`ImageReplyParams` fields (all optional):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
+| `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | task `default_style` | One of the three engine-owned style presets. |
+| `model` | `String` | config | Per-turn single-id override of the config `ModelSpec`. Wins over config `model` but falls back to config `fallback`. |
+| `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
+| `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
+| `resolution` | `String` | task `default_resolution` | Model-specific hint (e.g. `"1024x1365"`). Shape-validated only — opaque beyond that. |
+| `face_ref_url` | `String` | absent | image2image face/appearance reference (absolute `http(s)`, ≤ 2048 chars). Returns `422` if malformed. |
+
+Validation: `force` + `tips_amount_usd` on the same turn → `422`. A malformed
+`face_ref_url`, unsupported `aspect_ratio`, or invalid `resolution` shape returns
+`422 BadRequest` as a pre-stream error.
+
+**`image` SSE frame** — emitted after the text's `done` frame when image generation
+succeeds:
+
+```text
+data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,...","mime":"image/png","image_prompt":"warm candid selfie, soft indoor light","model":"google/gemini-2.5-flash-image","generation_id":"gen-xyz"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image"` | Frame type discriminator. |
+| `message_id` | `String` | Matches the `meta` frame's `message_id`. |
+| `data_url` | `String` | Base64 data-URL of the generated image (`"data:image/png;base64,..."`). |
+| `mime` | `String` | MIME type of the image (e.g. `"image/png"`). |
+| `image_prompt` | `String` \| `null` | The subject used for generation (also persisted). |
+| `model` | `String` \| `null` | Image model actually served. |
+| `generation_id` | `String` \| `null` | OpenRouter generation id. |
+
+**Full SSE frame sequences:**
+
+- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image → final`
+- `reply_image`: `meta(action_type=reply_image) → image → done → final`
+
+**Failed-image client contract** — no new error frame is emitted on image failure.
+The `meta` frame's `action_type` declares the intended shape:
+
+- If `action_type` is `reply_text_image` or `reply_image` but **no `image` frame
+  arrives before `done`**, the image generation failed (fail-open) — render whatever
+  text was received.
+- On `reply_image` fall-through (image failed, engine ran a normal text reply
+  instead), `meta.action_type` is `reply_text` — the client never expects an image
+  because the degrade is visible up front.
+
+**Write-back endpoint** — after receiving the `image` frame, the client should
+upload the `data_url` to its own storage and post the resulting URL back:
+
+### `POST /comp/chat/{session_id}/message/{message_id}/image`
+
+Stores the CDN URL of a companion-generated image. Called by the client after
+uploading the received `data_url` to its own storage.
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"url":"https://cdn.example/gen/abc.png"}' \
+  http://localhost:8080/comp/chat/<session_id>/message/<message_id>/image
+```
+
+Returns `204 No Content` on success. `url` must be an absolute `http(s)` URL
+(≤ 2048 chars). Returns `422` on a malformed URL, `404` if `message_id` is not an
+assistant row in this session, `403` if the session is not owned by the JWT user.
+The call is idempotent — re-posting overwrites the same key.
+
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
 Paginated message history, newest first.

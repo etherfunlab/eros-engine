@@ -92,9 +92,7 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// `[你给对方发送了一张照片：{prompt}]` marker appended when `metadata.image.prompt`
 /// is present. Used by `assemble_chat_request` so the model knows it previously
 /// sent an image in that turn.
-pub(crate) fn model_facing_assistant_text(
-    msg: eros_engine_store::chat::ChatMessage,
-) -> String {
+pub(crate) fn model_facing_assistant_text(msg: eros_engine_store::chat::ChatMessage) -> String {
     let mut text = msg.content;
     if let Some(prompt) = msg
         .metadata
@@ -1651,7 +1649,9 @@ mod tests {
 
     /// Build a `CompanionPersona` with arbitrary `art_metadata` key-value pairs,
     /// matching the construction pattern from `pde_test_persona` in stream.rs.
-    fn test_persona_with_meta(pairs: &[(&str, &str)]) -> eros_engine_core::persona::CompanionPersona {
+    fn test_persona_with_meta(
+        pairs: &[(&str, &str)],
+    ) -> eros_engine_core::persona::CompanionPersona {
         use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
         let iid = uuid::Uuid::new_v4();
         let gid = uuid::Uuid::new_v4();
@@ -1697,7 +1697,10 @@ mod tests {
 
     // ─── model_facing_assistant_text / history fold ──────────────────────
 
-    fn assistant_row(content: &str, metadata: Option<serde_json::Value>) -> eros_engine_store::chat::ChatMessage {
+    fn assistant_row(
+        content: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> eros_engine_store::chat::ChatMessage {
         eros_engine_store::chat::ChatMessage {
             id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),

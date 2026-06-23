@@ -687,7 +687,9 @@ impl OpenRouterClient {
             .filter(|s| !s.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err(LlmError::Config("openrouter: image-gen has no models".into()));
+            return Err(LlmError::Config(
+                "openrouter: image-gen has no models".into(),
+            ));
         }
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
@@ -2266,7 +2268,10 @@ data: [DONE]\n\n";
         assert!(content[0]["text"].as_str().unwrap().contains("a cat"));
         assert!(content[0]["text"].as_str().unwrap().contains("3:4"));
 
-        let req2 = ImageGenRequest { face_ref_url: Some("https://x/a.png".into()), ..req };
+        let req2 = ImageGenRequest {
+            face_ref_url: Some("https://x/a.png".into()),
+            ..req
+        };
         let body2 = build_image_body(&req2, "m");
         let content2 = &body2["messages"][0]["content"];
         assert_eq!(content2.as_array().unwrap().len(), 2);

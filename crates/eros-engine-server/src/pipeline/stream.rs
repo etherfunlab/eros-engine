@@ -2942,7 +2942,8 @@ mod tests {
             model: Some("img-a".into()),
             generation_id: Some("gen_1".into()),
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["type"], "image");
         assert_eq!(v["data_url"], "data:image/png;base64,AAAA");
         assert_eq!(v["image_prompt"], "a cat");

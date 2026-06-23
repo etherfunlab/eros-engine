@@ -2193,24 +2193,51 @@ mod tests {
         let instance_id = Uuid::new_v4();
         let s = repo.create_session(user_id, instance_id).await.unwrap();
         let u = match repo
-            .upsert_user_message_idempotent(s.id, "hi", "client-msg-id-abcdefghij012345", "user", None)
+            .upsert_user_message_idempotent(
+                s.id,
+                "hi",
+                "client-msg-id-abcdefghij012345",
+                "user",
+                None,
+            )
             .await
             .unwrap()
-        { UpsertUserOutcome::Inserted { message_id } => message_id, _ => panic!() };
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => panic!(),
+        };
         let aid = Uuid::new_v4();
-        repo.insert_assistant_batch(s.id, u, &[AssistantInsert {
-            id: aid, content: String::new(), assistant_action_type: "reply".into(),
-            continues_from_message_id: None, truncated: false, model: None, usage: None,
-            generation_id: None, filter_audit: None, metadata: None,
-        }]).await.unwrap();
+        repo.insert_assistant_batch(
+            s.id,
+            u,
+            &[AssistantInsert {
+                id: aid,
+                content: String::new(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: None,
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
 
         let image = serde_json::json!({"prompt":"a cat","style":"realistic","model":"img-a"});
         repo.merge_assistant_image_meta(aid, &image).await.unwrap();
-        repo.set_assistant_image_url(aid, "https://cdn/x.png").await.unwrap();
+        repo.set_assistant_image_url(aid, "https://cdn/x.png")
+            .await
+            .unwrap();
 
-        let meta: serde_json::Value = sqlx::query_scalar(
-            "SELECT metadata FROM engine.chat_messages WHERE id = $1",
-        ).bind(aid).fetch_one(&pool).await.unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(aid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(meta["image"]["prompt"], "a cat");
         assert_eq!(meta["image"]["url"], "https://cdn/x.png");
     }
