@@ -234,6 +234,8 @@ chat SSE stream 结束时发出的 `final` event 包含几个新字段。无论 
 
 Companion 图片执行器**默认关闭**。配置中存在此任务块时，它会激活。激活后，引擎会执行 `reply_image` 和 `reply_text_image` 动作，而不是将其降级为 `reply_text`。任务块缺失或某一轮次无法解析出模型时，仍会降级为 `reply_text`。
 
+这里可以用任意 OpenRouter 图片模型，包括**只输出图片**的模型（如 `bytedance-seed/seedream-4.5`）：引擎只请求 `modalities: ["image"]`，从不向图片模型要文本。`reply_text_image` 轮次的文字始终来自 `chat_companion`，而非图片模型。
+
 ```toml
 [tasks.chat_image_generation]
 # `model` is OPTIONAL. Omit to defer model selection to the per-turn frontend

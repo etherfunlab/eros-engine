@@ -268,6 +268,8 @@ block exists in the config. When active, the engine executes `reply_image` and
 to `reply_text` still occurs when the block is absent or when no model is
 resolvable for a given turn.
 
+Any OpenRouter image model works here, including **image-only** models (e.g. `bytedance-seed/seedream-4.5`): the engine requests `modalities: ["image"]` and never asks the image model for text. The caption on a `reply_text_image` turn always comes from `chat_companion`, never the image model.
+
 ```toml
 [tasks.chat_image_generation]
 # `model` is OPTIONAL. Omit to defer model selection to the per-turn frontend
