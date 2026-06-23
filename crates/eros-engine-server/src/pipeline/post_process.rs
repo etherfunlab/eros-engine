@@ -112,15 +112,24 @@ pub async fn run(
             .collect::<Vec<_>>()
             .join("\n");
 
+        // For reply_image the assistant text is empty; use the plan's image_prompt
+        // as the assistant-content proxy so the photo-send still moves affinity.
+        let eval_text: String = if assistant_msg.trim().is_empty() {
+            plan.image_prompt.clone().unwrap_or_default()
+        } else {
+            assistant_msg.clone()
+        };
+
         // Semantic eval gate: Reply turns only, with a non-trivial user message
-        // and a non-empty produced assistant message. Other actions
-        // (Proactive / Ghost) keep rule-only deltas in v1. `pre_skip == None`
-        // ⇒ the gate passes and an eval call is attempted; otherwise it carries
-        // the reason the trio will be NULL (stamped into `context`).
+        // and a non-empty produced assistant message (or image_prompt proxy for
+        // reply_image). Other actions (Proactive / Ghost) keep rule-only deltas
+        // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
+        // attempted; otherwise it carries the reason the trio will be NULL
+        // (stamped into `context`).
         let pre_skip = eval_skip_reason(
             plan.action_type,
             user_msg.chars().count(),
-            assistant_msg.trim().is_empty(),
+            eval_text.trim().is_empty(),
         );
 
         let (llm_deltas, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
@@ -140,7 +149,7 @@ pub async fn run(
                         &persona_name,
                         &current,
                         &user_msg,
-                        &assistant_msg,
+                        &eval_text,
                         client_id.as_deref(),
                     )
                     .await
@@ -492,16 +501,15 @@ fn eval_skip_reason(
     assistant_empty: bool,
 ) -> Option<&'static str> {
     match action {
-        // Reserved image variants: PDE degrades them to ReplyText today
-        // (`stream::guard_action`), so these arms are forward-looking — they only
-        // fire once the image executor ships.
-        ActionType::ReplyImage | ActionType::ReplyTextImage => Some("image_reply"),
         // Proactive turns keep rule-only deltas in v1 (no semantic eval).
         ActionType::Proactive => Some("proactive"),
         // Ghost takes the `record_ghost` path, which ignores `context` entirely —
         // this arm exists only for match exhaustiveness and is never persisted.
         ActionType::Ghost => Some("ghost"),
-        ActionType::ReplyText => {
+        // Image variants route through the same gate as ReplyText. For reply_image
+        // the caller passes `image_prompt` as the assistant-content proxy so an
+        // image-send still moves affinity (assistant_empty=false when prompt is set).
+        ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
             if user_msg_chars < AFFINITY_EVAL_MIN_CHARS {
                 Some("short_user_msg")
             } else if assistant_empty {
@@ -1120,16 +1128,17 @@ mod tests {
     }
 
     #[test]
-    fn eval_skip_reason_non_text_reply_actions() {
-        // Image variants are forward-looking (degraded to ReplyText today).
-        assert_eq!(
-            eval_skip_reason(ActionType::ReplyImage, 50, false),
-            Some("image_reply")
-        );
-        assert_eq!(
-            eval_skip_reason(ActionType::ReplyTextImage, 50, false),
-            Some("image_reply")
-        );
+    fn eval_runs_on_image_reply_with_text_or_prompt() {
+        // reply_text_image with real text + adequate user msg → not skipped
+        assert_eq!(eval_skip_reason(ActionType::ReplyTextImage, 10, false), None);
+        // reply_image with empty assistant text but the caller supplies a non-empty
+        // proxy (assistant_empty=false because image_prompt is used) → not skipped
+        assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, false), None);
+        // image reply with empty proxy → empty_assistant
+        assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, true), Some("empty_assistant"));
+        // still gated by short user msg
+        assert_eq!(eval_skip_reason(ActionType::ReplyTextImage, 2, false), Some("short_user_msg"));
+        // Proactive and Ghost keep their dedicated skip reasons.
         assert_eq!(
             eval_skip_reason(ActionType::Proactive, 50, false),
             Some("proactive")
