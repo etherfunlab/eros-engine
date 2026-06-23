@@ -61,6 +61,8 @@ volumes:
 
 `docker compose -f docker/docker-compose.yml up` 跑起來。第一次 boot 會走 `migrate` 子命令入口跑遷移；之後重啟跳過已應用的遷移。
 
+这份 compose 只接了旧版的 `SUPABASE_JWT_SECRET`，所以 `up` 之前要先导出一个非空值。空或未设置、又没有 JWKS 来源时，引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。若想改用非对称 JWKS 校验，在 `environment:` 块里加上 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`）。
+
 前面放個真正的 Caddy / Traefik / Cloudflare 做 HTTPS 終止。
 
 ## 路徑 2：作為庫嵌入

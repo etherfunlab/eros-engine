@@ -61,6 +61,8 @@ volumes:
 
 Run with `docker compose -f docker/docker-compose.yml up`. The first boot will run migrations via the `migrate` subcommand entry; subsequent reboots skip already-applied migrations.
 
+This compose file wires only the legacy `SUPABASE_JWT_SECRET`, so export a non-empty value before `up`. An empty or unset secret with no JWKS source makes the engine refuse to boot — by design, so a misconfigured deploy fails loudly instead of silently rejecting every request. For asymmetric JWKS validation instead, add `SUPABASE_URL` (or `SUPABASE_JWKS_URL`) to the `environment:` block.
+
 Place a real Caddy / Traefik / Cloudflare in front for HTTPS termination.
 
 ## Path 2: Embed as a library
