@@ -179,6 +179,21 @@ writes so both rows of the run share it.
 the **existing** `INSERT INTO engine.companion_affinity_events (...)` (@ ~L255-266). The
 trio rides the insert affinity already performs — no new statement, no new failure point.
 
+> **Follow-up (2026-06-23, PR #91).** The trio is populated only from a *successful*
+> `affinity_evaluation` call, which runs only on a substantive text reply (`action ==
+> ReplyText`, user message ≥ `AFFINITY_EVAL_MIN_CHARS`, non-empty assistant reply). Every
+> other turn still writes a `message` event with the trio left `NULL` — semantically
+> correct (no eval call was made, so there is no `generation_id` to record), but in the
+> audit indistinguishable from data loss. To keep every `NULL` join key explainable at zero
+> extra LLM cost, the affinity event `context` now carries an `eval_skip_reason` marker
+> whenever the trio is `NULL`: `short_user_msg`, `empty_assistant`, `image_reply` (forward-
+> looking — image variants degrade to `ReplyText` today), `proactive`,
+> `no_persona_or_affinity`, `eval_error`, `eval_timeout`, or `eval_no_generation_id` (a
+> salvaged-garble response that returned `Ok` but carried no `generation_id`). No backfill;
+> `context` is free-form jsonb, so no migration or API change. `eval_timeout` /
+> `eval_no_generation_id` are the only "possibly billed but unrecorded" cases and are now
+> greppable.
+
 ### 3c. Insights (`companion_insights_events`)
 
 After each `execute` in `extract_facts` (@ ~L578-618) and `extract_structured_insights`
