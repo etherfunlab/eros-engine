@@ -1030,6 +1030,9 @@ struct LastParseAttempt {
 /// parse error; a chain-exhausted ParseError preserves the last attempt's raw
 /// text + audit trio. Fail-open: any non-`Ok` status → the caller uses the
 /// rule fallback. NEVER returns an error — always a run record.
+///
+/// Unlike `run_input_filter`, a content-level reply that won't parse here walks
+/// the rest of the chain before the caller falls back to the rule engine.
 async fn run_pde_decision(
     client: &eros_engine_llm::openrouter::OpenRouterClient,
     p: &eros_engine_llm::model_config::ResolvedPde,
@@ -6139,5 +6142,9 @@ data: [DONE]\n\n";
         assert_eq!(run.status, PdeStatus::ParseError);
         assert_eq!(run.raw.as_deref(), Some("nope"));
         assert!(run.verdict.is_none());
+        assert!(
+            run.model.is_some(),
+            "chain-exhausted ParseError must preserve the last attempt's model"
+        );
     }
 }
