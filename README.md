@@ -19,11 +19,11 @@ Most AI character apps treat memory as text appended to a prompt and relationshi
 
 Five pillars support this:
 
-- **Two-layer memory** — profile memory (stable user facts) and relationship memory (shared moments, callbacks, open threads) in Postgres + pgvector, so the companion remembers you across sessions and personas. → [Memory layers](docs/memory-layers.md)
-- **Six-axis affinity + ghost mechanics** — a numeric relationship vector (warmth, trust, intimacy, intrigue, patience, tension) updated with EMA smoothing and real-time decay; it reshapes tone, depth, and behavior over time, and can even decide *not* to reply. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
-- **Persona Decision Engine (PDE)** — selects each turn's action (reply, ghost, or send a photo) and inner state — rules-based by default, with an opt-in LLM judge. This keeps replies human and in character instead of sounding like a generic assistant; judge calls are audited to `companion_decision_events`. → [Model config](docs/model-config.md)
-- **Structured user insight** — a JSONB profile (city, occupation, interests, MBTI signals, emotional needs, life rhythm, matching preferences) with a weighted `training_level`, queryable by downstream products for matchmaking, onboarding, analytics, or gating. → [API reference](docs/api-reference.md)
-- **Built for fluent companion chat** — token-by-token SSE streaming; image understanding (the user can send a photo) and companion-sent image generation (`reply_image` / `reply_text_image`); per-request prompt traits and tiers; OpenRouter-backed routing with per-task model selection (fixed / round-robin / weighted, plus a fallback chain) and full call auditing. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- 🧠 **Two-layer memory** — profile memory (stable user facts) and relationship memory (shared moments, callbacks, open threads) in Postgres + pgvector, so the companion remembers you across sessions and personas. → [Memory layers](docs/memory-layers.md)
+- 💞 **Six-axis affinity + ghost mechanics** — a numeric relationship vector (warmth, trust, intimacy, intrigue, patience, tension) updated with EMA smoothing and real-time decay; it reshapes tone, depth, and behavior over time, and can even decide *not* to reply. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- 🎭 **Persona Decision Engine (PDE)** — selects each turn's action (reply, ghost, or send a photo) and inner state — rules-based by default, with an opt-in LLM judge. This keeps replies human and in character instead of sounding like a generic assistant; judge calls are audited to `companion_decision_events`. → [Model config](docs/model-config.md)
+- 🧩 **Structured user insight** — a JSONB profile (city, occupation, interests, MBTI signals, emotional needs, life rhythm, matching preferences) with a weighted `training_level`, queryable by downstream products for matchmaking, onboarding, analytics, or gating. → [API reference](docs/api-reference.md)
+- ⚡ **Built for fluent companion chat** — token-by-token SSE streaming; image understanding (the user can send a photo) and companion-sent image generation (`reply_image` / `reply_text_image`); per-request prompt traits and tiers; OpenRouter-backed routing with per-task model selection (fixed / round-robin / weighted, plus a fallback chain) and full call auditing. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
 This is not a generic agent framework. It is a focused engine for products where one persona talks to the same user across many sessions: AI companions, journaling companions, coaching agents, language tutors, and character chat.
 
@@ -142,10 +142,10 @@ Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model
 
 Not part of the engine today, but on the radar:
 
-- **Agents playground** — multiple AI personas interacting with each other (and the user) in one session.
-- **Voice messages** — companion-sent and user-sent audio turns.
-- **Real-time voice conversation** — low-latency spoken back-and-forth.
-- **Video generation** — short companion-sent video clips, extending the image executor.
+- [ ] **Agents playground** — multiple AI personas interacting with each other (and the user) in one session.
+- [ ] **Voice messages** — companion-sent and user-sent audio turns.
+- [ ] **Real-time voice conversation** — low-latency spoken back-and-forth.
+- [ ] **Video generation** — short companion-sent video clips, extending the image executor.
 
 ## What is deliberately out of scope
 

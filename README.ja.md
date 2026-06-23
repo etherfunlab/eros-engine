@@ -19,11 +19,11 @@
 
 これを支えるのが、次の 5 つの柱です。
 
-- **2 層の記憶** — プロフィール記憶（安定したユーザー情報）と関係記憶（共有した出来事、過去の話題への言及、未完了の話題）を Postgres + pgvector に保存し、セッションやペルソナをまたいでコンパニオンがあなたを記憶できるようにします。→ [Memory layers](docs/memory-layers.md)
-- **6 軸の親密度 + ghost mechanics** — 数値化された関係ベクトル（warmth、trust、intimacy、intrigue、patience、tension）を EMA による平滑化とリアルタイム減衰で更新します。時間とともに口調、会話の深さ、振る舞いを変化させ、*返信しない*という判断さえ可能にします。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
-- **Persona Decision Engine (PDE)** — 各ターンの行動（返信、ghost、写真送信）と内的状態を選択します。デフォルトではルールベースで、任意に LLM judge を有効化できます。汎用アシスタントのような口調ではなく、人間らしくキャラクターに沿った返信を維持する仕組みです。judge の呼び出しは `companion_decision_events` に監査記録されます。→ [Model config](docs/model-config.md)
-- **構造化されたユーザーインサイト** — 都市、職業、興味、MBTI signals、感情的ニーズ、生活リズム、マッチング設定を JSONB プロフィールとして保持し、重み付きの `training_level` を付与します。下流プロダクトからクエリし、マッチメイキング、オンボーディング、分析、gating に利用できます。→ [API reference](docs/api-reference.md)
-- **流暢なコンパニオンチャットのための設計** — トークン単位の SSE ストリーミング、画像理解（ユーザーからの写真送信）、コンパニオンによる画像生成（`reply_image` / `reply_text_image`）、リクエスト単位の `prompt_traits` と tier、OpenRouter ベースのルーティングを備えています。タスクごとのモデル選択（固定 / ラウンドロビン / 加重とフォールバックチェーン）と、すべての呼び出しに対する監査にも対応します。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- 🧠 **2 層の記憶** — プロフィール記憶（安定したユーザー情報）と関係記憶（共有した出来事、過去の話題への言及、未完了の話題）を Postgres + pgvector に保存し、セッションやペルソナをまたいでコンパニオンがあなたを記憶できるようにします。→ [Memory layers](docs/memory-layers.md)
+- 💞 **6 軸の親密度 + ghost mechanics** — 数値化された関係ベクトル（warmth、trust、intimacy、intrigue、patience、tension）を EMA による平滑化とリアルタイム減衰で更新します。時間とともに口調、会話の深さ、振る舞いを変化させ、*返信しない*という判断さえ可能にします。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- 🎭 **Persona Decision Engine (PDE)** — 各ターンの行動（返信、ghost、写真送信）と内的状態を選択します。デフォルトではルールベースで、任意に LLM judge を有効化できます。汎用アシスタントのような口調ではなく、人間らしくキャラクターに沿った返信を維持する仕組みです。judge の呼び出しは `companion_decision_events` に監査記録されます。→ [Model config](docs/model-config.md)
+- 🧩 **構造化されたユーザーインサイト** — 都市、職業、興味、MBTI signals、感情的ニーズ、生活リズム、マッチング設定を JSONB プロフィールとして保持し、重み付きの `training_level` を付与します。下流プロダクトからクエリし、マッチメイキング、オンボーディング、分析、gating に利用できます。→ [API reference](docs/api-reference.md)
+- ⚡ **流暢なコンパニオンチャットのための設計** — トークン単位の SSE ストリーミング、画像理解（ユーザーからの写真送信）、コンパニオンによる画像生成（`reply_image` / `reply_text_image`）、リクエスト単位の `prompt_traits` と tier、OpenRouter ベースのルーティングを備えています。タスクごとのモデル選択（固定 / ラウンドロビン / 加重とフォールバックチェーン）と、すべての呼び出しに対する監査にも対応します。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
 これは汎用エージェントフレームワークではありません。同じペルソナが同じユーザーと複数のセッションにわたって会話するプロダクトに特化したエンジンです。AI コンパニオン、ジャーナリングコンパニオン、コーチングエージェント、語学チューター、キャラクターチャットなどに適しています。
 
@@ -142,10 +142,10 @@ cargo run -p eros-engine-server -- serve
 
 現時点ではエンジンに含まれていませんが、今後の候補となっている項目です。
 
-- **Agents playground** — 複数の AI ペルソナが 1 つのセッションで互いに、そしてユーザーと対話します。
-- **Voice messages** — コンパニオンとユーザーの双方が送信できる音声ターン。
-- **Real-time voice conversation** — 低レイテンシーの音声によるリアルタイムなやり取り。
-- **Video generation** — image executor を拡張し、コンパニオンが短い動画クリップを送信します。
+- [ ] **Agents playground** — 複数の AI ペルソナが 1 つのセッションで互いに、そしてユーザーと対話します。
+- [ ] **Voice messages** — コンパニオンとユーザーの双方が送信できる音声ターン。
+- [ ] **Real-time voice conversation** — 低レイテンシーの音声によるリアルタイムなやり取り。
+- [ ] **Video generation** — image executor を拡張し、コンパニオンが短い動画クリップを送信します。
 
 ## 意図的に対象外としているもの
 
