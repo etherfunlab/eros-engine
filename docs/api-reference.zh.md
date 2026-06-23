@@ -236,7 +236,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**可选：伴侣图片回复。** 请求体可附加 `image` 对象（`ImageReplyParams`），请求或强制本轮生成一张伴侣发送的图片。需要配置 `[tasks.chat_image_generation]`（见 [model-config.zh.md](model-config.zh.md)）；执行器默认关闭。
+**可选：伴侣图片回复。** 请求体可附加 `image` 对象（`ImageReplyParams`），请求或强制本轮生成一张伴侣发送的图片。需要配置 `[tasks.chat_image_generation]`（见 [model-config.zh.md](model-config.zh.md)）；执行器默认关闭。`image` 块同时是本轮的 opt-in 开关：**省略它即可关闭本轮的图片生成**（此时 PDE 只能 `reply_text` / `ghost`），或发送 `image: {}` 用配置里的模型启用。这样调用方可以用自己的 per-turn 策略独立于 PDE 的内容决策来控制是否出图。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \

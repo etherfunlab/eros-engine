@@ -70,6 +70,32 @@ The fix therefore collapses to: **stop asking the image model for text.**
 - Removing the `pub text` field is a minor pre-1.0 API trim to `eros-engine-llm`
   (the field had zero readers).
 
+## Follow-on: per-turn image opt-in (issue #101 comment)
+
+Bundled into the same PR. Once a `fallback` is configured under
+`[tasks.chat_image_generation]`, the executor was **always** available, so a
+caller had no way to turn image generation off for a specific turn — the PDE
+could return `reply_image` / `reply_text_image` on any turn and it executed.
+
+**Fix (one line):** make the per-request `image` block the opt-in. At
+`crates/eros-engine-server/src/pipeline/stream.rs`:
+
+```rust
+let image_executor_available = req_image.is_some() && image_chain.is_some();
+```
+
+- Omit `image` → executor unavailable → image actions degrade to `reply_text`
+  (via `guard_action`); a forced request is ignored. Send `image: {}` → enabled
+  with the config model; `image.model` overrides per request.
+- Mirrors `chat_vision`, which runs only when `image_url` is present.
+- `force_image` and `guard_action` already consume this bool, so nothing else
+  moves. The "unavailable ⇒ degrade" path is already covered by
+  `guard_action_degrades_and_honours`; the new clause is a plain boolean AND.
+- Docs updated alongside: the PDE action contract and the
+  `[tasks.chat_image_generation]` activation prose in `docs/model-config.md` +
+  `docs/model-config.zh.md`, and the `image`-field opt-in semantics in
+  `docs/api-reference.md` + `docs/api-reference.zh.md`.
+
 ## Out of scope (YAGNI)
 
 - No per-model `modalities` configuration.

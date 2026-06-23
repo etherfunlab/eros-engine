@@ -254,7 +254,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 **Optional: companion image reply.** The body may include an `image` object —
 `ImageReplyParams` — to request or force a companion-generated image this turn.
 Requires `[tasks.chat_image_generation]` to be configured (see
-[model-config.md](model-config.md)); the executor is off by default.
+[model-config.md](model-config.md)); the executor is off by default. The `image`
+block is also the per-turn opt-in: **omit it to suppress image generation for the
+turn** (the PDE may then only `reply_text` / `ghost`), or send `image: {}` to
+enable it with the config model. This lets a caller's own per-turn policy gate
+images independently of the PDE's content decision.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
