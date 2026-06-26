@@ -258,6 +258,8 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost twice in a row, one-hour ghost cooldown.
 - Every judge call is audited to `companion_decision_events`.
 
+**Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image executor is resolvable this turn (`[tasks.chat_image_generation]` configured **and** the request carries an `image` block), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
+
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
 ### `[tasks.chat_image_generation]` — companion image replies (opt-in)

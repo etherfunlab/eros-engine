@@ -228,6 +228,8 @@ chat SSE stream 结束时发出的 `final` event 包含几个新字段。无论 
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 两次，ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
 
+**图片能力上下文行。** 判断器上下文每轮必带一行——当本轮可解析出图片执行器（已配置 `[tasks.chat_image_generation]` **且**请求带有 `image` 块）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
+
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
 
 ### `[tasks.chat_image_generation]` — companion 图片回复（opt-in）

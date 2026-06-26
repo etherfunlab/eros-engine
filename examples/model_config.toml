@@ -310,7 +310,8 @@ category（只能用这五种之一）：
 # OPT-IN. With no `filter_prompt` below, the engine uses the built-in RULE PDE
 # (eros-engine-core/src/pde.rs) — identical to historical behaviour. Set a
 # `filter_prompt` to switch on an LLM judge that decides, per turn, the action
-# (reply_text / ghost / reserved reply_image / reply_text_image) and a free-text
+# (reply_text / ghost / reserved reply_image / reply_text_image — the judge ctx
+# carries a per-turn `[图片能力] 本轮可发图=是/否` line to gate image actions) and a free-text
 # `inner_state` (mood/tone folded into the reply prompt). Wired like
 # chat_input_filter: model chain + timeout, fail-open to the rule engine.
 #
@@ -332,13 +333,16 @@ max_tokens  = 400
 # mood description — NEVER instructions or formatting (it is sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
-#你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号,决定这一轮怎么回应。
+#你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号、图片能力,决定这一轮怎么回应。
 #只输出 JSON,字段:
 #  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image"
 #  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
 #  "image_prompt": 选填,要发什么图(reply_image / reply_text_image 时)
 #  "reason": 选填,简短理由
 #ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。
+#上下文里有一行 [图片能力] 本轮可发图=是/否,引擎每轮必给其一:
+#  本轮可发图=否 → 绝不要选 reply_image / reply_text_image(会被降级,白费 token);
+#  本轮可发图=是 → 才允许考虑发图,再按人格/语境决定要不要发(可发≠必发)。
 #"""
 
 # Per-turn six-axis affinity evaluation (post-process, semantic axes).
