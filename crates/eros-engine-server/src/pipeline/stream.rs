@@ -1325,7 +1325,11 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
-fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInput) -> String {
+fn build_pde_ctx(
+    transcript: &str,
+    input: &eros_engine_core::types::DecisionInput,
+    image_available: bool,
+) -> String {
     let a = &input.affinity;
     let s = &input.signals;
     let latest = match &input.event {
@@ -1343,10 +1347,14 @@ fn build_pde_ctx(transcript: &str, input: &eros_engine_core::types::DecisionInpu
     } else {
         format!("{brief}\n\n")
     };
+    // Always emit the image-capability line — the negative is a signal too, so
+    // the judge gets a clear "no images this turn" rather than a missing line.
+    let image_flag = if image_available { "是" } else { "否" };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
-         [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\n\
+         [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
+         [图片能力] 本轮可发图={image_flag}\n\n\
          [用户最新消息]\n{latest}",
         a.warmth,
         a.trust,
@@ -2024,7 +2032,7 @@ pub fn run_stream(
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
-                    let ctx = build_pde_ctx(&pde_transcript, &input);
+                    let ctx = build_pde_ctx(&pde_transcript, &input, image_executor_available);
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
@@ -6625,7 +6633,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input);
+        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
         assert!(
@@ -6633,6 +6641,25 @@ data: [DONE]\n\n";
             "persona must precede relationship: {ctx}"
         );
         assert!(ctx.starts_with("[角色人格]"), "persona block at top: {ctx}");
+        // image_available == true → positive signal, no negative variant.
+        assert!(
+            ctx.contains("[图片能力] 本轮可发图=是"),
+            "image-availability line present and positive: {ctx}"
+        );
+        assert!(
+            !ctx.contains("本轮可发图=否"),
+            "no negative variant when available: {ctx}"
+        );
+        // The line sits strictly between [信号] and [用户最新消息].
+        let signal_at = ctx.find("[信号]").expect("signal block present");
+        let image_at = ctx
+            .find("[图片能力]")
+            .expect("image-capability line present");
+        let latest_at = ctx.find("[用户最新消息]").expect("latest block present");
+        assert!(
+            signal_at < image_at && image_at < latest_at,
+            "image-capability line sits between [信号] and [用户最新消息]: {ctx}"
+        );
     }
 
     #[test]
@@ -6657,11 +6684,20 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("", &input);
+        let ctx = build_pde_ctx("", &input, false);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
             "ctx starts with transcript block: {ctx}"
+        );
+        // image_available == false → explicit negative signal, not a missing line.
+        assert!(
+            ctx.contains("[图片能力] 本轮可发图=否"),
+            "image-availability line present and negative: {ctx}"
+        );
+        assert!(
+            !ctx.contains("本轮可发图=是"),
+            "no positive variant when unavailable: {ctx}"
         );
     }
 
