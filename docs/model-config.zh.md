@@ -197,7 +197,7 @@ output_regex = [
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `models` | `Array<String>` | 是 | 此规则适用的模型 id 列表。与生成回复的模型 id 进行精确字符串匹配（与行上的 `filter_model` 相同）。 |
+| `models` | `Array<String>` | 是 | 此规则适用的模型 id 列表。与生成回复的 chat 模型 id 进行精确字符串匹配——即行上的 `model` 列，而非 `filter_model`（过滤生效时 `filter_model` 被设为 `"<regex>"`）。 |
 | `pattern` | `String` | 是 | Rust `regex` crate 正则表达式。**不支持 lookaround 或反向引用**——请使用 `$`、`^`、`\s*`、字符类等锚定。无效 pattern 会导致服务器启动失败。 |
 | `replacement` | `String` | 否 | 替换每个匹配项的文本。缺失或 `""` = 删除匹配内容。 |
 

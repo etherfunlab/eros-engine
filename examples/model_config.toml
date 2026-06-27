@@ -87,6 +87,7 @@ model_name_display_override = true
 #fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
 #allow_traits = ["nsfw_boost", "politics_open"]
 
+# (belongs to the [tasks.chat_companion] table above)
 # Deterministic per-model regex strips for the assistant reply. Task-level only
 # (no per-tier override). Each rule deletes (or replaces) matches in replies
 # produced by any model in `models`. Applied BEFORE the client sees the reply,

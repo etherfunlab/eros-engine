@@ -212,7 +212,7 @@ output_regex = [
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `models` | `Array<String>` | yes | Model ids whose replies this rule applies to. Exact string match against the model id that produced the reply (same id as `filter_model` on the row). |
+| `models` | `Array<String>` | yes | Model ids whose replies this rule applies to. Exact string match against the chat model id that produced the reply — i.e. the row's `model` column, NOT `filter_model` (which is set to `"<regex>"` when a strip fires). |
 | `pattern` | `String` | yes | Rust `regex` crate pattern. **No lookaround or backreferences** — anchor with `$`, `^`, `\s*`, char classes. An invalid pattern causes server boot to fail. |
 | `replacement` | `String` | no | Text to substitute for each match. Absent or `""` = delete the match. |
 
