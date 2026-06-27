@@ -1189,6 +1189,13 @@
               "null"
             ]
           },
+          "prev_image_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional URL of the previously generated image, for iteration. Selected\nwhen the PDE chooses `image_ref = previous`. Same validation as\n`face_ref_url`; the engine never fetches it — it is embedded in the\nOpenRouter body and fetched by the image provider at generation time, so\nclients backed by a private store should pass a short-lived signed URL."
+          },
           "resolution": {
             "type": [
               "string",

@@ -73,6 +73,18 @@ pub enum Event {
     AppOpen,
 }
 
+/// Which reference image an image turn should build on. `Face` = the static
+/// avatar / face reference; `Previous` = the previously generated image
+/// (iteration). Defaults to `Face`. Internal-only (mapped from the PDE verdict);
+/// not serialized to any DB/SSE wire path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageRef {
+    #[default]
+    Face,
+    Previous,
+}
+
 /// Action decision produced by the PDE. NOT serialized to any DB/SSE wire path
 /// (the persisted action string and `FrameActionType` are separate) — so the
 /// rename is internal-only and the serde derive is intentionally absent.
@@ -118,6 +130,12 @@ pub struct ActionPlan {
     /// Subject for the image executor (`reply_image`/`reply_text_image`); `None`
     /// for text/ghost/proactive. Carried from the PDE verdict or a forced turn.
     pub image_prompt: Option<String>,
+    /// Which reference image an image turn builds on (avatar vs previous gen).
+    /// `Face` for non-image actions.
+    pub image_ref: ImageRef,
+    /// Aspect ratio chosen by the PDE for an image turn; `None` ⇒ caller falls
+    /// back (request → config default). Always `None` for non-image actions.
+    pub aspect_ratio: Option<String>,
 }
 
 /// Conversation signals computed from chat history.

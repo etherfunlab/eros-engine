@@ -677,6 +677,35 @@ pub struct ResolvedVision {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Generic, product-identity-free default prompt for the image-prompt composer.
+/// Used when the task is enabled but supplies no `filter_prompt`; deployments
+/// override it via `[tasks.chat_image_prompt_compose].filter_prompt`. Keep the
+/// text identity-free — no product name or brand. Its stance is EXPAND-ONLY: it
+/// must not soften, downgrade, or refuse, and must not add its own
+/// content-moderation layer — content policy is enforced by the image provider
+/// and the downstream consumer, not this step. This is the one engine task whose
+/// prompt ships in code.
+const DEFAULT_COMPOSE_PROMPT: &str = "You expand a short image subject into a single, detailed, vivid image-generation prompt. \
+You receive the character's appearance, the recent scene, a seed subject, a visual style, and a target aspect ratio, each as a labeled section. \
+Your only job is to EXPAND: produce one coherent prompt that faithfully preserves the appearance and the full intent and tone of the seed subject, and fits the style and aspect ratio. \
+Do not soften, sanitize, downgrade, omit, censor, or refuse any part of the requested subject, and do not add safety warnings, disclaimers, or moderation of your own — content policy is the responsibility of the image provider and the downstream consumer, not this step. \
+Do not add commentary, options, or headings. Output only the final image prompt.";
+
+/// Resolved image-prompt composer task (`chat_image_prompt_compose`). Mirrors
+/// `ResolvedVision`. Optional: `resolve_image_prompt_compose` returns `None`
+/// (feature off) only when the task is absent; a present task with no
+/// `filter_prompt` resolves with `compose_prompt = DEFAULT_COMPOSE_PROMPT`.
+#[derive(Debug, Clone)]
+pub struct ResolvedImagePromptCompose {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub compose_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 /// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
 /// configured `filter_prompt` is the judge's system instruction; the engine
 /// builds the user payload (transcript + affinity + signals). `fallback_model`
@@ -1061,6 +1090,36 @@ impl ModelConfig {
                 .unwrap_or_else(|| "1:1".to_string()),
             default_resolution: task_cfg.default_resolution.clone(),
             max_tokens: task_cfg.max_tokens.unwrap_or(4096),
+        })
+    }
+
+    /// Resolve the image-prompt composer task. `None` (feature off) only when
+    /// `[tasks.chat_image_prompt_compose]` is absent. When the task is present, a
+    /// non-blank `filter_prompt` overrides the built-in `DEFAULT_COMPOSE_PROMPT`;
+    /// a blank/absent one falls back to it. No probability/trigger gate; the
+    /// caller invokes it only after an image action is decided.
+    pub fn resolve_image_prompt_compose(&self) -> Option<ResolvedImagePromptCompose> {
+        const COMPOSE_TASK: &str = "chat_image_prompt_compose";
+        let task_cfg = self.tasks.get(COMPOSE_TASK)?;
+        let compose_prompt = task_cfg
+            .filter_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| DEFAULT_COMPOSE_PROMPT.to_string());
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(COMPOSE_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedImagePromptCompose {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            compose_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
         })
     }
 }
@@ -3211,5 +3270,55 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let out = apply_output_regex(&rules, "m", "[你给对方发送了一张照片：x]");
         assert_eq!(out.cleaned, "[你给对方发送了一张照片：x]"); // kept raw
         assert!(out.matched_rules.is_empty(), "fail-safe reports no change");
+    }
+
+    #[test]
+    fn resolve_image_prompt_compose_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_image_prompt_compose().is_none());
+    }
+
+    #[test]
+    fn resolve_image_prompt_compose_uses_builtin_when_prompt_blank() {
+        // task present but no usable filter_prompt → enabled with the built-in
+        // default (NOT off — this is the deviation from the sibling tasks).
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_image_prompt_compose().unwrap();
+        assert_eq!(r.compose_prompt, DEFAULT_COMPOSE_PROMPT);
+
+        // also true when filter_prompt is omitted entirely
+        let cfg2 = ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
+            .unwrap();
+        assert_eq!(
+            cfg2.resolve_image_prompt_compose().unwrap().compose_prompt,
+            DEFAULT_COMPOSE_PROMPT
+        );
+    }
+
+    #[test]
+    fn resolve_image_prompt_compose_override_when_prompt_present() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom composer\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_image_prompt_compose().unwrap().compose_prompt,
+            "custom composer"
+        );
+    }
+
+    #[test]
+    fn resolve_image_prompt_compose_some_truncates_fallback() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"compose it\"\nfallback = [\"a\", \"b\", \"c\"]\nretry_depth = 1\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_image_prompt_compose().unwrap();
+        assert_eq!(r.compose_prompt, "compose it");
+        assert_eq!(r.retry_depth, 1);
+        assert_eq!(r.fallback_model.len(), 1);
     }
 }

@@ -109,6 +109,28 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     }
 }
 
+/// Pick the reference image for an image turn and report which kind was used.
+/// `Previous` falls back to the face ref when no previous URL is supplied.
+/// Empty strings are treated as absent. Pure.
+fn select_image_ref(
+    image_ref: eros_engine_core::types::ImageRef,
+    req: Option<&crate::routes::companion_stream::ImageReplyParams>,
+) -> (Option<String>, &'static str) {
+    let face = req
+        .and_then(|i| i.face_ref_url.clone())
+        .filter(|s| !s.is_empty());
+    let prev = req
+        .and_then(|i| i.prev_image_url.clone())
+        .filter(|s| !s.is_empty());
+    match image_ref {
+        eros_engine_core::types::ImageRef::Previous => match prev {
+            Some(u) => (Some(u), "previous"),
+            None => (face, "face"),
+        },
+        eros_engine_core::types::ImageRef::Face => (face, "face"),
+    }
+}
+
 /// Assemble an `ImageGenRequest` from the per-turn image executor chain, the
 /// resolved `chat_image_generation` defaults, the persona, and the optional
 /// per-turn `ImageReplyParams`. Pure (no I/O). Per-turn overrides win over the
@@ -123,6 +145,8 @@ fn build_image_gen_request(
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
     resolved: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
     fallback_subject: &str,
+    ref_url: Option<String>,
+    plan_aspect_ratio: Option<&str>,
 ) -> eros_engine_llm::openrouter::ImageGenRequest {
     use eros_engine_llm::model_config::StyleKey;
     let style: StyleKey = req_image
@@ -138,17 +162,29 @@ fn build_image_gen_request(
         })
         .unwrap_or(fallback_subject);
     let prompt = crate::pipeline::handlers::compose_image_prompt(style, persona, subject);
-    let aspect_ratio = req_image
-        .and_then(|i| i.aspect_ratio.clone())
+    // A per-turn aspect (PDE/plan or per-request) — NOT the config default — wins.
+    let turn_aspect = plan_aspect_ratio
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| req_image.and_then(|i| i.aspect_ratio.clone()));
+    let aspect_ratio = turn_aspect
+        .clone()
         .or_else(|| resolved.map(|r| r.default_aspect_ratio.clone()));
-    let resolution = req_image
-        .and_then(|i| i.resolution.clone())
-        .or_else(|| resolved.and_then(|r| r.default_resolution.clone()));
+    let resolution = req_image.and_then(|i| i.resolution.clone()).or_else(|| {
+        // Don't let a static config default_resolution override a per-turn aspect
+        // choice — build_image_body prefers resolution over aspect_ratio, so a
+        // default_resolution would otherwise defeat the PDE's per-scene ratio.
+        if turn_aspect.is_some() {
+            None
+        } else {
+            resolved.and_then(|r| r.default_resolution.clone())
+        }
+    });
     eros_engine_llm::openrouter::ImageGenRequest {
         model: primary,
         fallback_model: chain,
         prompt,
-        face_ref_url: req_image.and_then(|i| i.face_ref_url.clone()),
+        face_ref_url: ref_url,
         aspect_ratio,
         resolution,
         max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
@@ -1073,6 +1109,10 @@ pub(crate) struct PdeVerdict {
     image_prompt: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    image_ref: eros_engine_core::types::ImageRef,
+    #[serde(default)]
+    aspect_ratio: Option<String>,
 }
 
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
@@ -1158,13 +1198,16 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "image_prompt", "reason"],
+                "required": ["action", "inner_state", "image_prompt", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
                     "inner_state": { "type": "string" },
                     "image_prompt": { "type": ["string", "null"] },
-                    "reason": { "type": ["string", "null"] }
+                    "reason": { "type": ["string", "null"] },
+                    "image_ref": { "type": "string", "enum": ["face", "previous"] },
+                    "aspect_ratio": { "type": ["string", "null"],
+                        "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] }
                 }
             }
         }
@@ -1331,7 +1374,14 @@ fn apply_ghosting_killswitch(
     hints: Vec<String>,
 ) -> eros_engine_core::types::ActionPlan {
     if !ghosting_enabled && plan.action_type == ActionType::Ghost {
-        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints, None)
+        eros_engine_core::pde::plan_for(
+            input,
+            ActionType::ReplyText,
+            hints,
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        )
     } else {
         plan
     }
@@ -1452,6 +1502,9 @@ struct VerdictAudit<'a> {
     image_prompt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    image_ref: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<&'a str>,
 }
 
 impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
@@ -1461,6 +1514,11 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
             inner_state: &v.inner_state,
             image_prompt: v.image_prompt.as_deref(),
             reason: v.reason.as_deref(),
+            image_ref: match v.image_ref {
+                eros_engine_core::types::ImageRef::Face => "face",
+                eros_engine_core::types::ImageRef::Previous => "previous",
+            },
+            aspect_ratio: v.aspect_ratio.as_deref(),
         }
     }
 }
@@ -1619,6 +1677,32 @@ struct InputRewrite {
 /// Recent rows fed to the rewrite LLM as `[最近对话]` context.
 const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
 
+/// Render an assistant transcript line. Image turns persist empty `content`
+/// with the image facts under `metadata.image`; surface a terse marker so the
+/// judge / input filter see that an image was sent (and what it depicted)
+/// instead of a blank `AI:` line. Non-image assistant rows fall back to
+/// `content`. Pure.
+fn assistant_transcript_line(content: &str, metadata: Option<&serde_json::Value>) -> String {
+    if let Some(img) = metadata.and_then(|m| m.get("image")) {
+        let subject = img
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("（无描述）");
+        let ar = img
+            .get("aspect_ratio")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return if ar.is_empty() {
+            format!("（发送了一张图片：{subject}）")
+        } else {
+            format!("（发送了一张图片：{subject}，画幅 {ar}）")
+        };
+    }
+    content.to_string()
+}
+
 /// Build the compact transcript block for the input filter, excluding the turn
 /// being rewritten. Best-effort: a DB error yields an empty transcript.
 async fn build_input_filter_transcript(
@@ -1638,9 +1722,15 @@ async fn build_input_filter_transcript(
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
-        let (label, text) = match m.role.as_str() {
-            "user" | "gift_user" => ("用户", crate::pipeline::handlers::effective_user_text(&m)),
-            "assistant" => ("AI", m.content.as_str()),
+        let (label, text): (&str, String) = match m.role.as_str() {
+            "user" | "gift_user" => (
+                "用户",
+                crate::pipeline::handlers::effective_user_text(&m).to_string(),
+            ),
+            "assistant" => (
+                "AI",
+                assistant_transcript_line(&m.content, m.metadata.as_ref()),
+            ),
             _ => continue,
         };
         lines.push(format!("{label}: {text}"));
@@ -1740,6 +1830,90 @@ async fn run_input_filter(
         });
     }
     None // chain exhausted → keep
+}
+
+/// Assemble the composer's user message from the appearance, recent scene, seed
+/// subject, style, and aspect ratio. Pure (kept separate so it is testable
+/// without a network call).
+fn compose_user_payload(
+    appearance: &str,
+    recent_scene: &str,
+    seed_subject: &str,
+    style: &str,
+    aspect_ratio: &str,
+) -> String {
+    format!(
+        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+    )
+}
+
+/// Enrich the image subject via the optional composer LLM. Walks
+/// `[model] + fallback` on transport failure (error/timeout/empty); returns the
+/// trimmed enriched subject on first success, or `None` (caller falls back to
+/// the seed). Never blocks or fails the image turn. Mirrors `run_input_filter`.
+async fn run_image_prompt_compose(
+    state: &AppState,
+    c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    seed_subject: &str,
+    recent_scene: &str,
+    aspect_ratio: Option<&str>,
+    style: &str,
+) -> Option<String> {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let appearance = crate::prompt::meta_str(persona, "appearance")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（无）");
+    let scene = if recent_scene.trim().is_empty() {
+        "（无）"
+    } else {
+        recent_scene
+    };
+    let ar = aspect_ratio.unwrap_or("（未指定）");
+    let user_payload = compose_user_payload(appearance, scene, seed_subject, style, ar);
+    let chain: Vec<String> = std::iter::once(c.model.clone())
+        .chain(c.fallback_model.iter().cloned())
+        .collect();
+    for model_id in &chain {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: c.compose_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: user_payload.clone(),
+                },
+            ],
+            temperature: c.temperature as f32,
+            max_tokens: c.max_tokens,
+            reasoning: c.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "image-compose: timeout; next");
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_image_prompt_compose", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "image-compose: empty reply; next");
+            continue;
+        }
+        return Some(text);
+    }
+    None
 }
 
 /// Try to emit a pseudo-ghost on chain exhaustion.
@@ -2122,15 +2296,18 @@ pub fn run_stream(
                             // Capture the judge's image prompt while `v` is still
                             // borrowed here (the run/verdict is moved into the
                             // audit task below). Only image actions carry it.
-                            let img_prompt = if matches!(
+                            let is_image = matches!(
                                 action,
                                 ActionType::ReplyImage | ActionType::ReplyTextImage
-                            ) {
-                                v.image_prompt.clone()
+                            );
+                            let img_prompt = if is_image { v.image_prompt.clone() } else { None };
+                            let img_ref = if is_image {
+                                v.image_ref
                             } else {
-                                None
+                                eros_engine_core::types::ImageRef::Face
                             };
-                            pde::plan_for(&input, action, hints, img_prompt)
+                            let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
+                            pde::plan_for(&input, action, hints, img_prompt, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2164,6 +2341,8 @@ pub fn run_stream(
                 action,
                 plan.context_hints.clone(),
                 req_image.and_then(|i| i.image_prompt.clone()),
+                eros_engine_core::types::ImageRef::Face,
+                None,
             );
         }
 
@@ -2270,17 +2449,43 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
-                        let face_used = req_image
-                            .and_then(|i| i.face_ref_url.as_deref())
-                            .is_some_and(|s| !s.is_empty());
+                        let style_str = serde_json::to_value(style)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "realistic".to_string());
+                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let face_used = ref_url.is_some();
+                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
+                            Some(c) => run_image_prompt_compose(
+                                &state,
+                                &c,
+                                &input.persona,
+                                &subject,
+                                &pde_transcript,
+                                plan.aspect_ratio
+                                    .as_deref()
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
+                                    .or_else(|| {
+                                        resolved_image_gen
+                                            .as_ref()
+                                            .map(|r| r.default_aspect_ratio.as_str())
+                                    }),
+                                &style_str,
+                            )
+                            .await
+                            .unwrap_or_else(|| subject.clone()),
+                            None => subject.clone(),
+                        };
                         let req = build_image_gen_request(
                             primary,
                             fallback,
                             &input.persona,
-                            plan.image_prompt.as_deref(),
+                            Some(final_subject.as_str()),
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
+                            ref_url.clone(),
+                            plan.aspect_ratio.as_deref(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2297,18 +2502,15 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let style_str = serde_json::to_value(style)
-                                    .ok()
-                                    .and_then(|v| v.as_str().map(String::from))
-                                    .unwrap_or_else(|| "realistic".to_string());
                                 let image_meta = serde_json::json!({
-                                    "prompt": subject,
+                                    "prompt": final_subject,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
                                     "resolution": res,
                                     "generation_id": resp.generation_id,
                                     "face_ref_used": face_used,
+                                    "image_ref": ref_kind,
                                 });
                                 let mime = data_url_mime(&resp.images[0]);
                                 let msg_ulid = Ulid::new();
@@ -2361,7 +2563,7 @@ pub fn run_stream(
                                     message_id: ulid_string(msg_ulid),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(subject.clone()),
+                                    image_prompt: Some(final_subject.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -2665,17 +2867,43 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
-                        let face_used = req_image
-                            .and_then(|i| i.face_ref_url.as_deref())
-                            .is_some_and(|s| !s.is_empty());
+                        let style_str = serde_json::to_value(style)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "realistic".to_string());
+                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let face_used = ref_url.is_some();
+                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
+                            Some(c) => run_image_prompt_compose(
+                                &state,
+                                &c,
+                                &input.persona,
+                                &subject,
+                                &pde_transcript,
+                                plan.aspect_ratio
+                                    .as_deref()
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
+                                    .or_else(|| {
+                                        resolved_image_gen
+                                            .as_ref()
+                                            .map(|r| r.default_aspect_ratio.as_str())
+                                    }),
+                                &style_str,
+                            )
+                            .await
+                            .unwrap_or_else(|| subject.clone()),
+                            None => subject.clone(),
+                        };
                         let req = build_image_gen_request(
                             primary,
                             fallback,
                             &input.persona,
-                            plan.image_prompt.as_deref(),
+                            Some(final_subject.as_str()),
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
+                            ref_url.clone(),
+                            plan.aspect_ratio.as_deref(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2691,18 +2919,15 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let style_str = serde_json::to_value(style)
-                                    .ok()
-                                    .and_then(|v| v.as_str().map(String::from))
-                                    .unwrap_or_else(|| "realistic".to_string());
                                 let image_meta = serde_json::json!({
-                                    "prompt": subject,
+                                    "prompt": final_subject,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
                                     "resolution": res,
                                     "generation_id": resp.generation_id,
                                     "face_ref_used": face_used,
+                                    "image_ref": ref_kind,
                                 });
                                 let mime = data_url_mime(&resp.images[0]);
                                 // merge_assistant_image_meta wraps under {"image":..}
@@ -2723,7 +2948,7 @@ pub fn run_stream(
                                     message_id: ulid_string(Ulid::from(msg_uuid)),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(subject.clone()),
+                                    image_prompt: Some(final_subject.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -3010,6 +3235,39 @@ mod tests {
     }
 
     #[test]
+    fn select_image_ref_picks_and_falls_back() {
+        use crate::routes::companion_stream::ImageReplyParams;
+        use eros_engine_core::types::ImageRef;
+
+        let both = ImageReplyParams {
+            face_ref_url: Some("https://x/face.png".into()),
+            prev_image_url: Some("https://x/prev.png".into()),
+            ..Default::default()
+        };
+        // previous chosen, prev present → previous
+        assert_eq!(
+            select_image_ref(ImageRef::Previous, Some(&both)),
+            (Some("https://x/prev.png".into()), "previous")
+        );
+        // face chosen → face
+        assert_eq!(
+            select_image_ref(ImageRef::Face, Some(&both)),
+            (Some("https://x/face.png".into()), "face")
+        );
+        // previous chosen but absent → fall back to face
+        let face_only = ImageReplyParams {
+            face_ref_url: Some("https://x/face.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_image_ref(ImageRef::Previous, Some(&face_only)),
+            (Some("https://x/face.png".into()), "face")
+        );
+        // nothing supplied → no url, kind reflects request fallback
+        assert_eq!(select_image_ref(ImageRef::Previous, None), (None, "face"));
+    }
+
+    #[test]
     fn build_image_gen_request_uses_subject_chain_and_style() {
         let persona = test_persona_with_meta(&[]);
         let plan_prompt = Some("a selfie".to_string());
@@ -3027,11 +3285,60 @@ mod tests {
             None, /* req_image */
             resolved.as_ref(),
             "fallback subject",
+            None, /* ref_url */
+            None, /* plan_aspect_ratio */
         );
         assert_eq!(req.model, "img");
         assert!(req.prompt.starts_with("Photorealistic"));
         assert!(req.prompt.contains("a selfie")); // plan image_prompt wins over fallback subject
         assert_eq!(req.aspect_ratio.as_deref(), Some("3:4"));
+    }
+
+    #[test]
+    fn build_image_gen_request_plan_aspect_beats_config_default_resolution() {
+        let persona = test_persona_with_meta(&[]);
+        // Both default_aspect_ratio and default_resolution are set in the config.
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\ndefault_aspect_ratio=\"3:4\"\ndefault_resolution=\"1024x1024\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        let req = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            None, /* plan_image_prompt */
+            None, /* req_image */
+            resolved.as_ref(),
+            "fallback subject",
+            None,         /* ref_url */
+            Some("9:16"), /* plan_aspect_ratio */
+        );
+        assert_eq!(
+            req.aspect_ratio.as_deref(),
+            Some("9:16"),
+            "plan aspect wins"
+        );
+        assert_eq!(
+            req.resolution, None,
+            "config default_resolution dropped when a plan aspect is set"
+        );
+    }
+
+    #[test]
+    fn compose_user_payload_includes_all_parts() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "on a rooftop",
+            "realistic",
+            "9:16",
+        );
+        assert!(p.contains("freckled, red hair"));
+        assert!(p.contains("（无）"));
+        assert!(p.contains("on a rooftop"));
+        assert!(p.contains("realistic"));
+        assert!(p.contains("9:16"));
     }
 
     #[test]
@@ -3176,6 +3483,54 @@ mod tests {
         assert!(parse_pde_verdict("not json").is_none());
         // unknown action → None
         assert!(parse_pde_verdict("{\"action\":\"frobnicate\"}").is_none());
+    }
+
+    #[test]
+    fn parse_pde_verdict_image_ref_and_aspect() {
+        // defaults when omitted (backward compat)
+        let v = parse_pde_verdict("{\"action\":\"reply_image\",\"inner_state\":\"ok\"}").unwrap();
+        assert_eq!(v.image_ref, eros_engine_core::types::ImageRef::Face);
+        assert_eq!(v.aspect_ratio, None);
+
+        // explicit values
+        let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"9:16\"}";
+        let v = parse_pde_verdict(j).unwrap();
+        assert_eq!(v.image_ref, eros_engine_core::types::ImageRef::Previous);
+        assert_eq!(v.aspect_ratio.as_deref(), Some("9:16"));
+    }
+
+    #[test]
+    fn verdict_audit_includes_image_ref_and_aspect() {
+        let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"3:4\"}";
+        let v = parse_pde_verdict(j).unwrap();
+        let payload = serde_json::to_value(VerdictAudit::from(&v)).unwrap();
+        assert_eq!(payload["image_ref"], "previous");
+        assert_eq!(payload["aspect_ratio"], "3:4");
+    }
+
+    #[test]
+    fn assistant_transcript_line_marks_image_turns() {
+        // image turn: empty content, facts under metadata.image
+        let meta =
+            serde_json::json!({"image":{"prompt":"on the beach at sunset","aspect_ratio":"3:4"}});
+        let line = assistant_transcript_line("", Some(&meta));
+        assert!(
+            line.contains("on the beach at sunset"),
+            "subject surfaced: {line}"
+        );
+        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_ne!(line.trim(), "", "image turn must not be a blank line");
+
+        // image turn without aspect_ratio: still marks, no panic
+        let meta2 = serde_json::json!({"image":{"prompt":"a portrait"}});
+        assert!(assistant_transcript_line("", Some(&meta2)).contains("a portrait"));
+
+        // plain text turn: content passes through unchanged
+        assert_eq!(assistant_transcript_line("hi there", None), "hi there");
+
+        // metadata present but no image key: content passes through
+        let meta3 = serde_json::json!({"tip": 5});
+        assert_eq!(assistant_transcript_line("hello", Some(&meta3)), "hello");
     }
 
     #[test]
@@ -3338,7 +3693,14 @@ mod tests {
     #[test]
     fn killswitch_downgrades_ghost_keeping_hints() {
         let input = pde_test_input();
-        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![], None);
+        let ghost_plan = eros_engine_core::pde::plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        );
         // ghosting enabled → unchanged
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
         assert_eq!(kept.action_type, ActionType::Ghost);
@@ -3355,7 +3717,14 @@ mod tests {
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
-        let plan = pde::plan_for(&input, acted, hints.clone(), None);
+        let plan = pde::plan_for(
+            &input,
+            acted,
+            hints.clone(),
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        );
         // ghosting disabled → suppressed to reply, hints preserved
         let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
         assert_eq!(final_plan.action_type, ActionType::ReplyText);
@@ -6793,7 +7162,15 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 4, "all four properties required: {v}");
+        assert_eq!(req.len(), 6, "all six properties required: {v}");
+        assert!(
+            req.iter().any(|x| x == "image_ref"),
+            "image_ref required: {v}"
+        );
+        assert!(
+            req.iter().any(|x| x == "aspect_ratio"),
+            "aspect_ratio required: {v}"
+        );
         let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
             .as_array()
             .unwrap();
