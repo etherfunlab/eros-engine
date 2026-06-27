@@ -6859,10 +6859,20 @@ data: [DONE]\n\n";
 
         // ── 3. Build AppState with output_regex targeting "mock/euryale" ───────
         //      Pattern \bNOPE\b will NOT match "hello world".
+        //
+        //      `[tasks.pde_decision].ghosting = false` makes the turn
+        //      DETERMINISTICALLY produce a Reply: the pure rule engine
+        //      (`pde::decide`, since no filter_prompt ⇒ no judge LLM call) can
+        //      otherwise pick Ghost based on persona/affinity, which would make
+        //      the buffered-path assertions vacuous. `pde_ghosting_enabled()`
+        //      reads `ghosting` INDEPENDENTLY of `filter_prompt`, so the
+        //      path-wide kill-switch downgrades any Ghost plan to ReplyText
+        //      WITHOUT enabling the (mock-less) judge call.
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n",
+                "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+                 [tasks.pde_decision]\nghosting=false\n",
             )
             .unwrap(),
         );
@@ -6941,42 +6951,47 @@ data: [DONE]\n\n";
             })
             .collect();
 
-        // If the PDE routed to Reply (not Ghost), we assert buffered behaviour.
-        if !deltas.is_empty() {
-            // Buffered mode emits exactly ONE Delta bubble (the whole reply at once).
-            assert_eq!(
-                deltas.len(),
-                1,
-                "buffered mode must emit exactly one Delta bubble; got {deltas:?}",
-            );
-            // Content is the raw reply, unchanged (no strip yet — Task 6).
-            assert_eq!(
-                deltas[0], "hello world",
-                "unmatched regex must not alter the reply; got {:?}",
-                deltas[0],
-            );
+        // The turn is forced to Reply (ghosting=false), so a Delta MUST appear.
+        // Asserting this unconditionally means a regression to Ghost (or to no
+        // bubble at all) fails LOUDLY rather than passing vacuously.
+        assert!(
+            !deltas.is_empty(),
+            "regex-targeted turn must produce a Reply bubble (ghosting disabled); got {frames:?}",
+        );
+        // Buffered mode emits exactly ONE Delta bubble (the whole reply at once),
+        // proving the turn buffered rather than streaming live per-chunk.
+        assert_eq!(
+            deltas.len(),
+            1,
+            "buffered mode must emit exactly one Delta bubble; got {deltas:?}",
+        );
+        // Content is the raw reply, unchanged (no strip yet — Task 6).
+        assert_eq!(
+            deltas[0], "hello world",
+            "unmatched regex must not alter the reply; got {:?}",
+            deltas[0],
+        );
 
-            // DB row: content == "hello world", pre_filter_content IS NULL.
-            let (content, pre_filter): (String, Option<String>) = sqlx::query_as(
-                "SELECT content, pre_filter_content \
-                 FROM engine.chat_messages \
-                 WHERE session_id = $1 AND role = 'assistant' \
-                 ORDER BY sent_at DESC LIMIT 1",
-            )
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // DB row: content == "hello world", pre_filter_content IS NULL.
+        let (content, pre_filter): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, pre_filter_content \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-            assert_eq!(
-                content, "hello world",
-                "persisted content must be the raw reply; got {content:?}",
-            );
-            assert!(
-                pre_filter.is_none(),
-                "pre_filter_content must be NULL for a regex-only buffered turn (no LLM filter ran); \
-                 got {pre_filter:?}",
-            );
-        }
+        assert_eq!(
+            content, "hello world",
+            "persisted content must be the raw reply; got {content:?}",
+        );
+        assert!(
+            pre_filter.is_none(),
+            "pre_filter_content must be NULL for a regex-only buffered turn (no LLM filter ran); \
+             got {pre_filter:?}",
+        );
     }
 }
