@@ -1619,6 +1619,32 @@ struct InputRewrite {
 /// Recent rows fed to the rewrite LLM as `[最近对话]` context.
 const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
 
+/// Render an assistant transcript line. Image turns persist empty `content`
+/// with the image facts under `metadata.image`; surface a terse marker so the
+/// judge / input filter see that an image was sent (and what it depicted)
+/// instead of a blank `AI:` line. Non-image assistant rows fall back to
+/// `content`. Pure.
+fn assistant_transcript_line(content: &str, metadata: Option<&serde_json::Value>) -> String {
+    if let Some(img) = metadata.and_then(|m| m.get("image")) {
+        let subject = img
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("（无描述）");
+        let ar = img
+            .get("aspect_ratio")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return if ar.is_empty() {
+            format!("（发送了一张图片：{subject}）")
+        } else {
+            format!("（发送了一张图片：{subject}，画幅 {ar}）")
+        };
+    }
+    content.to_string()
+}
+
 /// Build the compact transcript block for the input filter, excluding the turn
 /// being rewritten. Best-effort: a DB error yields an empty transcript.
 async fn build_input_filter_transcript(
@@ -1638,9 +1664,15 @@ async fn build_input_filter_transcript(
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
-        let (label, text) = match m.role.as_str() {
-            "user" | "gift_user" => ("用户", crate::pipeline::handlers::effective_user_text(&m)),
-            "assistant" => ("AI", m.content.as_str()),
+        let (label, text): (&str, String) = match m.role.as_str() {
+            "user" | "gift_user" => (
+                "用户",
+                crate::pipeline::handlers::effective_user_text(&m).to_string(),
+            ),
+            "assistant" => (
+                "AI",
+                assistant_transcript_line(&m.content, m.metadata.as_ref()),
+            ),
             _ => continue,
         };
         lines.push(format!("{label}: {text}"));
@@ -3176,6 +3208,31 @@ mod tests {
         assert!(parse_pde_verdict("not json").is_none());
         // unknown action → None
         assert!(parse_pde_verdict("{\"action\":\"frobnicate\"}").is_none());
+    }
+
+    #[test]
+    fn assistant_transcript_line_marks_image_turns() {
+        // image turn: empty content, facts under metadata.image
+        let meta =
+            serde_json::json!({"image":{"prompt":"on the beach at sunset","aspect_ratio":"3:4"}});
+        let line = assistant_transcript_line("", Some(&meta));
+        assert!(
+            line.contains("on the beach at sunset"),
+            "subject surfaced: {line}"
+        );
+        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_ne!(line.trim(), "", "image turn must not be a blank line");
+
+        // image turn without aspect_ratio: still marks, no panic
+        let meta2 = serde_json::json!({"image":{"prompt":"a portrait"}});
+        assert!(assistant_transcript_line("", Some(&meta2)).contains("a portrait"));
+
+        // plain text turn: content passes through unchanged
+        assert_eq!(assistant_transcript_line("hi there", None), "hi there");
+
+        // metadata present but no image key: content passes through
+        let meta3 = serde_json::json!({"tip": 5});
+        assert_eq!(assistant_transcript_line("hello", Some(&meta3)), "hello");
     }
 
     #[test]
