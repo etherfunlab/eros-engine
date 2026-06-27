@@ -146,6 +146,7 @@ fn build_image_gen_request(
     resolved: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
     fallback_subject: &str,
     ref_url: Option<String>,
+    plan_aspect_ratio: Option<&str>,
 ) -> eros_engine_llm::openrouter::ImageGenRequest {
     use eros_engine_llm::model_config::StyleKey;
     let style: StyleKey = req_image
@@ -161,8 +162,10 @@ fn build_image_gen_request(
         })
         .unwrap_or(fallback_subject);
     let prompt = crate::pipeline::handlers::compose_image_prompt(style, persona, subject);
-    let aspect_ratio = req_image
-        .and_then(|i| i.aspect_ratio.clone())
+    let aspect_ratio = plan_aspect_ratio
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| req_image.and_then(|i| i.aspect_ratio.clone()))
         .or_else(|| resolved.map(|r| r.default_aspect_ratio.clone()));
     let resolution = req_image
         .and_then(|i| i.resolution.clone())
@@ -2363,6 +2366,7 @@ pub fn run_stream(
                             resolved_image_gen.as_ref(),
                             "",
                             ref_url.clone(),
+                            plan.aspect_ratio.as_deref(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2759,6 +2763,7 @@ pub fn run_stream(
                             resolved_image_gen.as_ref(),
                             "",
                             ref_url.clone(),
+                            plan.aspect_ratio.as_deref(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -3145,6 +3150,7 @@ mod tests {
             resolved.as_ref(),
             "fallback subject",
             None, /* ref_url */
+            None, /* plan_aspect_ratio */
         );
         assert_eq!(req.model, "img");
         assert!(req.prompt.starts_with("Photorealistic"));
