@@ -162,14 +162,24 @@ fn build_image_gen_request(
         })
         .unwrap_or(fallback_subject);
     let prompt = crate::pipeline::handlers::compose_image_prompt(style, persona, subject);
-    let aspect_ratio = plan_aspect_ratio
+    // A per-turn aspect (PDE/plan or per-request) — NOT the config default — wins.
+    let turn_aspect = plan_aspect_ratio
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| req_image.and_then(|i| i.aspect_ratio.clone()))
+        .or_else(|| req_image.and_then(|i| i.aspect_ratio.clone()));
+    let aspect_ratio = turn_aspect
+        .clone()
         .or_else(|| resolved.map(|r| r.default_aspect_ratio.clone()));
-    let resolution = req_image
-        .and_then(|i| i.resolution.clone())
-        .or_else(|| resolved.and_then(|r| r.default_resolution.clone()));
+    let resolution = req_image.and_then(|i| i.resolution.clone()).or_else(|| {
+        // Don't let a static config default_resolution override a per-turn aspect
+        // choice — build_image_body prefers resolution over aspect_ratio, so a
+        // default_resolution would otherwise defeat the PDE's per-scene ratio.
+        if turn_aspect.is_some() {
+            None
+        } else {
+            resolved.and_then(|r| r.default_resolution.clone())
+        }
+    });
     eros_engine_llm::openrouter::ImageGenRequest {
         model: primary,
         fallback_model: chain,
@@ -2237,7 +2247,6 @@ pub fn run_stream(
         // it on opted-out / text turns would consume image-model slots and skew
         // the sequencing of later opted-in image turns.
         let resolved_image_gen = state.model_config.resolve_image_gen();
-        let resolved_compose = state.model_config.resolve_image_prompt_compose();
         let req_image = user_msg.image.as_ref();
         let image_chain = req_image.and_then(|i| {
             eros_engine_llm::model_config::effective_image_chain(
@@ -2446,10 +2455,10 @@ pub fn run_stream(
                             .unwrap_or_else(|| "realistic".to_string());
                         let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
                         let face_used = ref_url.is_some();
-                        let final_subject = match resolved_compose.as_ref() {
+                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
                             Some(c) => run_image_prompt_compose(
                                 &state,
-                                c,
+                                &c,
                                 &input.persona,
                                 &subject,
                                 &pde_transcript,
@@ -2864,10 +2873,10 @@ pub fn run_stream(
                             .unwrap_or_else(|| "realistic".to_string());
                         let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
                         let face_used = ref_url.is_some();
-                        let final_subject = match resolved_compose.as_ref() {
+                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
                             Some(c) => run_image_prompt_compose(
                                 &state,
-                                c,
+                                &c,
                                 &input.persona,
                                 &subject,
                                 &pde_transcript,
@@ -3283,6 +3292,37 @@ mod tests {
         assert!(req.prompt.starts_with("Photorealistic"));
         assert!(req.prompt.contains("a selfie")); // plan image_prompt wins over fallback subject
         assert_eq!(req.aspect_ratio.as_deref(), Some("3:4"));
+    }
+
+    #[test]
+    fn build_image_gen_request_plan_aspect_beats_config_default_resolution() {
+        let persona = test_persona_with_meta(&[]);
+        // Both default_aspect_ratio and default_resolution are set in the config.
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\ndefault_aspect_ratio=\"3:4\"\ndefault_resolution=\"1024x1024\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        let req = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            None, /* plan_image_prompt */
+            None, /* req_image */
+            resolved.as_ref(),
+            "fallback subject",
+            None,         /* ref_url */
+            Some("9:16"), /* plan_aspect_ratio */
+        );
+        assert_eq!(
+            req.aspect_ratio.as_deref(),
+            Some("9:16"),
+            "plan aspect wins"
+        );
+        assert_eq!(
+            req.resolution, None,
+            "config default_resolution dropped when a plan aspect is set"
+        );
     }
 
     #[test]
