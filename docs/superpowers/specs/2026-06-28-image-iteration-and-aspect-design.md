@@ -98,9 +98,14 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   product-identity-free built-in default prompt (`DEFAULT_COMPOSE_PROMPT`) and is
   gated on the task being *present* (a model configured). A non-blank `filter_prompt`
   overrides the default; a blank/absent one falls back to it. The built-in text stays
-  generic — no product name, brand aesthetic, or explicit content (the runtime payload
-  carries appearance/scene/subject) — so the OSS repo stays identity-free while
+  generic — no product name or brand — so the OSS repo stays identity-free while
   deployments can layer product flavor via the override.
+- **Built-in default is expand-only.** It faithfully expands the seed subject + appearance
+  into a detailed prompt and does not soften, downgrade, or refuse, and adds no
+  content-moderation layer of its own — moderation is delegated to the image-model
+  provider and the downstream deployment, not this step. (A generic behavioral stance;
+  no explicit content or model name in engine code. The composer model is a config-side
+  choice.)
 - In the pipeline, after an image action is decided and before image generation,
   call the composer with: persona genome (`art_metadata` + `system_prompt`), the PDE
   seed subject (`plan.image_prompt`), recent scene context (transcript), the chosen
