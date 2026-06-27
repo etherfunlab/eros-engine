@@ -5,6 +5,7 @@ mod middleware;
 mod openapi;
 mod pipeline;
 mod prompt;
+mod prompt_log;
 mod repetition;
 mod routes;
 mod state;
