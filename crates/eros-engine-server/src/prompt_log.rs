@@ -78,7 +78,9 @@ fn render(snap: &PromptLogSnapshot) -> String {
     ));
     out.push_str(&format!("# messages: {}\n\n", snap.messages.len()));
     for (i, (role, content)) in snap.messages.iter().enumerate() {
-        out.push_str(&format!("================= [{i:02}] {role} =================\n"));
+        out.push_str(&format!(
+            "================= [{i:02}] {role} =================\n"
+        ));
         out.push_str(content);
         out.push_str("\n\n");
     }

@@ -218,9 +218,7 @@ impl ServerConfig {
                     .as_deref(),
             ),
             snapshot,
-            prompt_log_dir: parse_prompt_log_dir(
-                std::env::var("PROMPT_LOG_DIR").ok().as_deref(),
-            ),
+            prompt_log_dir: parse_prompt_log_dir(std::env::var("PROMPT_LOG_DIR").ok().as_deref()),
         }
     }
 }
