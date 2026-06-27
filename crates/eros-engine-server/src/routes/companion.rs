@@ -696,6 +696,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
                 cron: "0 0 23 * * *".into(),
                 tz: chrono_tz::Asia::Singapore,
             },
+            prompt_log_dir: None,
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),

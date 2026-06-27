@@ -78,7 +78,7 @@ eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
 `eros-engine-server` の `linux/amd64` イメージは、`v*` タグごとに GitHub Container Registry へ公開されます（arm64 が必要な場合は、`docker/Dockerfile` からビルドしてください）。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.6.4
+docker pull ghcr.io/etherfunlab/eros-engine:0.6.5
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ docker pull ghcr.io/etherfunlab/eros-engine:latest
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.6.4 serve
+  ghcr.io/etherfunlab/eros-engine:0.6.5 serve
 ```
 
 このイメージのビルドには、同じ `docker/Dockerfile` が使われています。任意のコンテナホストにデプロイできます。詳細は [Deploying](docs/deploying.md) を参照してください。

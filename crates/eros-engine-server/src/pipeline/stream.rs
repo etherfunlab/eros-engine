@@ -2475,6 +2475,17 @@ pub fn run_stream(
                         return;
                     }
                 };
+                // Optional fire-and-forget raw-prompt disk log (PROMPT_LOG_DIR).
+                // Logged once here — before the fallback-model send loop — so a
+                // turn that retries across models still produces exactly one file.
+                if let Some(dir) = state.config.prompt_log_dir.as_ref() {
+                    crate::prompt_log::spawn_write(
+                        dir.clone(),
+                        &req,
+                        user_msg.session_id,
+                        user_msg.user_message_id,
+                    );
+                }
                 // The filter trigger's `traits` predicate AND `prompt_injected`
                 // both use the KEPT tags (post tier `allow_traits` gating), so a
                 // tier that drops a requested trait can't trigger filtering on it.
