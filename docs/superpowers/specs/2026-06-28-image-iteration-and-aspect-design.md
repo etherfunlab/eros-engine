@@ -88,7 +88,7 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   `/models/{slug}/endpoints` and/or a live test) before relying on it; keep the
   resolution fallback for models without aspect support.
 
-### 5. Prompt composer task (`image_prompt_compose`)
+### 5. Prompt composer task (`chat_image_prompt_compose`)
 - New optional config task parsed alongside the others in
   `crates/eros-engine-llm/src/model_config.rs` (e.g. `ResolvedImagePromptCompose`
   with `model`, `fallback`, `temperature`, `max_tokens`, `filter_prompt`). Feature is
@@ -102,7 +102,7 @@ prompt-composer task definition live in the deployment's `model_config.toml`
 
 ## Backward compatibility
 - New PDE output fields and `ImageReplyParams.prev_image_url` are optional.
-- The `image_prompt_compose` task is optional; absent ⇒ current behavior.
+- The `chat_image_prompt_compose` task is optional; absent ⇒ current behavior.
 - The aspect-parameter change is internal to image-body construction.
 
 ## Out of scope
