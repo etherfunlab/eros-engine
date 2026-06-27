@@ -1073,6 +1073,10 @@ pub(crate) struct PdeVerdict {
     image_prompt: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    image_ref: eros_engine_core::types::ImageRef,
+    #[serde(default)]
+    aspect_ratio: Option<String>,
 }
 
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
@@ -1158,13 +1162,16 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "image_prompt", "reason"],
+                "required": ["action", "inner_state", "image_prompt", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
                     "inner_state": { "type": "string" },
                     "image_prompt": { "type": ["string", "null"] },
-                    "reason": { "type": ["string", "null"] }
+                    "reason": { "type": ["string", "null"] },
+                    "image_ref": { "type": "string", "enum": ["face", "previous"] },
+                    "aspect_ratio": { "type": ["string", "null"],
+                        "enum": ["1:1", "3:4", "4:3", "9:16", "16:9", null] }
                 }
             }
         }
@@ -1459,6 +1466,9 @@ struct VerdictAudit<'a> {
     image_prompt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    image_ref: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<&'a str>,
 }
 
 impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
@@ -1468,6 +1478,11 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
             inner_state: &v.inner_state,
             image_prompt: v.image_prompt.as_deref(),
             reason: v.reason.as_deref(),
+            image_ref: match v.image_ref {
+                eros_engine_core::types::ImageRef::Face => "face",
+                eros_engine_core::types::ImageRef::Previous => "previous",
+            },
+            aspect_ratio: v.aspect_ratio.as_deref(),
         }
     }
 }
@@ -2161,15 +2176,18 @@ pub fn run_stream(
                             // Capture the judge's image prompt while `v` is still
                             // borrowed here (the run/verdict is moved into the
                             // audit task below). Only image actions carry it.
-                            let img_prompt = if matches!(
+                            let is_image = matches!(
                                 action,
                                 ActionType::ReplyImage | ActionType::ReplyTextImage
-                            ) {
-                                v.image_prompt.clone()
+                            );
+                            let img_prompt = if is_image { v.image_prompt.clone() } else { None };
+                            let img_ref = if is_image {
+                                v.image_ref
                             } else {
-                                None
+                                eros_engine_core::types::ImageRef::Face
                             };
-                            pde::plan_for(&input, action, hints, img_prompt, eros_engine_core::types::ImageRef::Face, None)
+                            let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
+                            pde::plan_for(&input, action, hints, img_prompt, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -3217,6 +3235,29 @@ mod tests {
         assert!(parse_pde_verdict("not json").is_none());
         // unknown action → None
         assert!(parse_pde_verdict("{\"action\":\"frobnicate\"}").is_none());
+    }
+
+    #[test]
+    fn parse_pde_verdict_image_ref_and_aspect() {
+        // defaults when omitted (backward compat)
+        let v = parse_pde_verdict("{\"action\":\"reply_image\",\"inner_state\":\"ok\"}").unwrap();
+        assert_eq!(v.image_ref, eros_engine_core::types::ImageRef::Face);
+        assert_eq!(v.aspect_ratio, None);
+
+        // explicit values
+        let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"9:16\"}";
+        let v = parse_pde_verdict(j).unwrap();
+        assert_eq!(v.image_ref, eros_engine_core::types::ImageRef::Previous);
+        assert_eq!(v.aspect_ratio.as_deref(), Some("9:16"));
+    }
+
+    #[test]
+    fn verdict_audit_includes_image_ref_and_aspect() {
+        let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"3:4\"}";
+        let v = parse_pde_verdict(j).unwrap();
+        let payload = serde_json::to_value(VerdictAudit::from(&v)).unwrap();
+        assert_eq!(payload["image_ref"], "previous");
+        assert_eq!(payload["aspect_ratio"], "3:4");
     }
 
     #[test]

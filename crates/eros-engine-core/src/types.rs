@@ -77,7 +77,8 @@ pub enum Event {
 /// avatar / face reference; `Previous` = the previously generated image
 /// (iteration). Defaults to `Face`. Internal-only (mapped from the PDE verdict);
 /// not serialized to any DB/SSE wire path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ImageRef {
     #[default]
     Face,
