@@ -166,6 +166,34 @@ SELECT grantee, table_name, privilege_type
 
 ## 運維注意事項
 
+### Prompt 日志（调试用，可选）
+
+设置 `PROMPT_LOG_DIR` 后，引擎会把每一轮**主回复**组装好的完整 prompt 写成一个
+可读文件（头部元数据 + 按 role 分块）。默认**关闭**，**仅供运营调试**（文件含原始
+聊天内容），写入为后台 fire-and-forget，绝不阻塞或拖垮回复。把它指向你自己挂载的卷：
+
+```yaml
+# docker-compose: 挂载卷并设置 env
+services:
+  engine:
+    environment:
+      PROMPT_LOG_DIR: /data/prompt-logs
+    volumes:
+      - ./prompt-logs:/data/prompt-logs
+```
+
+```toml
+# fly.io: 声明卷和 env（示例）
+[mounts]
+source = "prompt_logs"
+destination = "/data/prompt-logs"
+
+[env]
+PROMPT_LOG_DIR = "/data/prompt-logs"
+```
+
+引擎不内置轮转或保留策略——卷由你自行管理。
+
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。OpenAPI JSON 在 `/api-docs/openapi.json`。
 - **Affinity debug：** `GET /comp/affinity/{session_id}` 受 `EXPOSE_AFFINITY_DEBUG=true` 控制。生產部署一般關掉；如果你的前端要實時畫好感度雷達圖，再打開。
