@@ -1822,6 +1822,90 @@ async fn run_input_filter(
     None // chain exhausted → keep
 }
 
+/// Assemble the composer's user message from the appearance, recent scene, seed
+/// subject, style, and aspect ratio. Pure (kept separate so it is testable
+/// without a network call).
+fn compose_user_payload(
+    appearance: &str,
+    recent_scene: &str,
+    seed_subject: &str,
+    style: &str,
+    aspect_ratio: &str,
+) -> String {
+    format!(
+        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+    )
+}
+
+/// Enrich the image subject via the optional composer LLM. Walks
+/// `[model] + fallback` on transport failure (error/timeout/empty); returns the
+/// trimmed enriched subject on first success, or `None` (caller falls back to
+/// the seed). Never blocks or fails the image turn. Mirrors `run_input_filter`.
+async fn run_image_prompt_compose(
+    state: &AppState,
+    c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    seed_subject: &str,
+    recent_scene: &str,
+    aspect_ratio: Option<&str>,
+    style: &str,
+) -> Option<String> {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let appearance = crate::prompt::meta_str(persona, "appearance")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（无）");
+    let scene = if recent_scene.trim().is_empty() {
+        "（无）"
+    } else {
+        recent_scene
+    };
+    let ar = aspect_ratio.unwrap_or("（未指定）");
+    let user_payload = compose_user_payload(appearance, scene, seed_subject, style, ar);
+    let chain: Vec<String> = std::iter::once(c.model.clone())
+        .chain(c.fallback_model.iter().cloned())
+        .collect();
+    for model_id in &chain {
+        let req = ChatRequest {
+            model: model_id.clone(),
+            fallback_model: vec![],
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: c.compose_prompt.clone(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: user_payload.clone(),
+                },
+            ],
+            temperature: c.temperature as f32,
+            max_tokens: c.max_tokens,
+            reasoning: c.reasoning.clone(),
+            ..Default::default()
+        };
+        let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "image-compose: timeout; next");
+                continue;
+            }
+        };
+        super::log_openrouter_usage("chat_image_prompt_compose", None, &resp);
+        let text = resp.reply.trim().to_string();
+        if text.is_empty() {
+            tracing::warn!(model = %model_id, "image-compose: empty reply; next");
+            continue;
+        }
+        return Some(text);
+    }
+    None
+}
+
 /// Try to emit a pseudo-ghost on chain exhaustion.
 ///
 /// Picks a configured fallback phrase from `engine.error_handling_config`,
@@ -2153,6 +2237,7 @@ pub fn run_stream(
         // it on opted-out / text turns would consume image-model slots and skew
         // the sequencing of later opted-in image turns.
         let resolved_image_gen = state.model_config.resolve_image_gen();
+        let resolved_compose = state.model_config.resolve_image_prompt_compose();
         let req_image = user_msg.image.as_ref();
         let image_chain = req_image.and_then(|i| {
             eros_engine_llm::model_config::effective_image_chain(
@@ -2355,13 +2440,33 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
+                        let style_str = serde_json::to_value(style)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "realistic".to_string());
                         let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
                         let face_used = ref_url.is_some();
+                        let final_subject = match resolved_compose.as_ref() {
+                            Some(c) => run_image_prompt_compose(
+                                &state,
+                                c,
+                                &input.persona,
+                                &subject,
+                                &pde_transcript,
+                                plan.aspect_ratio
+                                    .as_deref()
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref())),
+                                &style_str,
+                            )
+                            .await
+                            .unwrap_or_else(|| subject.clone()),
+                            None => subject.clone(),
+                        };
                         let req = build_image_gen_request(
                             primary,
                             fallback,
                             &input.persona,
-                            plan.image_prompt.as_deref(),
+                            Some(final_subject.as_str()),
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
@@ -2383,12 +2488,8 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let style_str = serde_json::to_value(style)
-                                    .ok()
-                                    .and_then(|v| v.as_str().map(String::from))
-                                    .unwrap_or_else(|| "realistic".to_string());
                                 let image_meta = serde_json::json!({
-                                    "prompt": subject,
+                                    "prompt": final_subject,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -2448,7 +2549,7 @@ pub fn run_stream(
                                     message_id: ulid_string(msg_ulid),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(subject.clone()),
+                                    image_prompt: Some(final_subject.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -2752,13 +2853,33 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
+                        let style_str = serde_json::to_value(style)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "realistic".to_string());
                         let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
                         let face_used = ref_url.is_some();
+                        let final_subject = match resolved_compose.as_ref() {
+                            Some(c) => run_image_prompt_compose(
+                                &state,
+                                c,
+                                &input.persona,
+                                &subject,
+                                &pde_transcript,
+                                plan.aspect_ratio
+                                    .as_deref()
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref())),
+                                &style_str,
+                            )
+                            .await
+                            .unwrap_or_else(|| subject.clone()),
+                            None => subject.clone(),
+                        };
                         let req = build_image_gen_request(
                             primary,
                             fallback,
                             &input.persona,
-                            plan.image_prompt.as_deref(),
+                            Some(final_subject.as_str()),
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
@@ -2779,12 +2900,8 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let style_str = serde_json::to_value(style)
-                                    .ok()
-                                    .and_then(|v| v.as_str().map(String::from))
-                                    .unwrap_or_else(|| "realistic".to_string());
                                 let image_meta = serde_json::json!({
-                                    "prompt": subject,
+                                    "prompt": final_subject,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -2812,7 +2929,7 @@ pub fn run_stream(
                                     message_id: ulid_string(Ulid::from(msg_uuid)),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(subject.clone()),
+                                    image_prompt: Some(final_subject.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -3156,6 +3273,21 @@ mod tests {
         assert!(req.prompt.starts_with("Photorealistic"));
         assert!(req.prompt.contains("a selfie")); // plan image_prompt wins over fallback subject
         assert_eq!(req.aspect_ratio.as_deref(), Some("3:4"));
+    }
+
+    #[test]
+    fn compose_user_payload_includes_all_parts() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "on a rooftop",
+            "realistic",
+            "9:16",
+        );
+        assert!(p.contains("freckled, red hair"));
+        assert!(p.contains("on a rooftop"));
+        assert!(p.contains("realistic"));
+        assert!(p.contains("9:16"));
     }
 
     #[test]
