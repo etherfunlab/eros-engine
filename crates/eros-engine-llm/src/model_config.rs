@@ -427,9 +427,15 @@ pub fn apply_output_regex(
     }
     // Fail-safe: never let a strip produce a blank reply from a non-blank one.
     if !matched_rules.is_empty() && cleaned.trim().is_empty() && !text.trim().is_empty() {
-        return RegexStripOutcome { cleaned: text.to_string(), matched_rules: Vec::new() };
+        return RegexStripOutcome {
+            cleaned: text.to_string(),
+            matched_rules: Vec::new(),
+        };
     }
-    RegexStripOutcome { cleaned, matched_rules }
+    RegexStripOutcome {
+        cleaned,
+        matched_rules,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3130,8 +3136,13 @@ model = "m"
 output_regex = [ { models = ["x/y"], pattern = '[' } ]
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
-        let err = cfg.compile_output_regex().expect_err("invalid pattern must error");
-        assert!(err.contains("output_regex[0]"), "error names the rule index: {err}");
+        let err = cfg
+            .compile_output_regex()
+            .expect_err("invalid pattern must error");
+        assert!(
+            err.contains("output_regex[0]"),
+            "error names the rule index: {err}"
+        );
     }
 
     #[test]
@@ -3156,8 +3167,16 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
 
     #[test]
     fn apply_output_regex_strips_targeted_model() {
-        let rules = compiled(&[("euryale", r#"\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$"#, "")]);
-        let out = apply_output_regex(&rules, "euryale", "晚安宝贝[你给对方发送了一张照片：海边自拍]");
+        let rules = compiled(&[(
+            "euryale",
+            r#"\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$"#,
+            "",
+        )]);
+        let out = apply_output_regex(
+            &rules,
+            "euryale",
+            "晚安宝贝[你给对方发送了一张照片：海边自拍]",
+        );
         assert_eq!(out.cleaned, "晚安宝贝");
         assert_eq!(out.matched_rules, vec![0]);
     }
