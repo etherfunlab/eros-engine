@@ -196,6 +196,15 @@ async fn run_migrations() -> Result<()> {
 async fn run_server() -> Result<()> {
     let cfg = ServerConfig::from_env();
 
+    if let Some(dir) = cfg.prompt_log_dir.as_ref() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(error = %e, dir = %dir.display(),
+                "prompt logging: could not create PROMPT_LOG_DIR; writes may fail");
+        }
+        tracing::info!(dir = %dir.display(),
+            "prompt logging ENABLED — writing raw assembled chat prompts to disk (operator-only)");
+    }
+
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
     let pool = eros_engine_store::pool::build(&database_url)
         .await
