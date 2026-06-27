@@ -87,6 +87,21 @@ model_name_display_override = true
 #fallback     = ["thedrummer/cydonia-24b-v4.1", "x-ai/grok-4.3"]
 #allow_traits = ["nsfw_boost", "politics_open"]
 
+# Deterministic per-model regex strips for the assistant reply. Task-level only
+# (no per-tier override). Each rule deletes (or replaces) matches in replies
+# produced by any model in `models`. Applied BEFORE the client sees the reply,
+# before any LLM output_filter, and before memory/insight/affinity extract — so
+# the matched text reaches neither the client nor the stored history/memory. The
+# raw reply is kept on the row's pre_filter_content (filter_model = "<regex>").
+# Uses the Rust `regex` crate: NO lookaround/backreferences — anchor with $, ^,
+# \s*, char classes. An invalid pattern fails server boot.
+# output_regex = [
+#   # Strip L3.3-Euryale's self-narrated photo line on reply_text_image turns.
+#   { models = ["sao10k/l3.3-euryale-70b"],
+#     pattern = '\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$' },
+#   # { models = ["x/y"], pattern = '...', replacement = "…" },  # replacement default "" = delete
+# ]
+
 # ── Optional output filter (OFF by default) ──────────────────────────────
 # Rewrites the chat reply through a second LLM before the client sees it.
 # Enable per-tier (or globally) with `output_filter` on [tasks.chat_companion]:

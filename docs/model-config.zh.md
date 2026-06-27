@@ -172,11 +172,63 @@ chat SSE stream 结束时发出的 `final` event 包含几个新字段。无论 
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `filtered` | `bool` | 当前轮次 output filter 已运行并改写回复时为 `true`；否则为 `false`。 |
+| `filtered` | `bool` | 当前轮次客户端收到的是非原始输出时为 `true`——由 regex 过滤（`output_regex`）、LLM `output_filter` 或两者同时触发时置为 `true`；否则为 `false`。 |
 | `retries_chat` | `u32` | chat 模型调用消耗的 fallback 重试次数（0 = primary 成功）。 |
 | `retries_filter` | `u32` | filter 模型调用消耗的 fallback 重试次数（0 = primary 成功或 filter 未运行）。 |
 | `prompt_injected` | `Array<String>` \| `null` | 当前轮次注入 prompt 的 trait tag；若无则为 `null`。与 filter 无关。 |
 | `tier` | `String` \| `null` | 原样返回请求中的 `tier` 字段；若未发送则为 `null`。与 filter 无关。 |
+
+### `output_regex` — 确定性 per-model 正则过滤（仅限 chat 任务）
+
+`output_regex` 是 `[tasks.chat_companion]` 上的规则数组（仅限任务级——无 per-tier 覆盖）。每条规则对 `models` 中任意模型生成的助手回复进行正则匹配，删除或替换匹配内容。**默认关闭**（缺失或空数组均表示不过滤）。
+
+```toml
+[tasks.chat_companion]
+output_regex = [
+  # 在 reply_text_image 轮次中，去掉 L3.3-Euryale 自述的发图行。
+  { models = ["sao10k/l3.3-euryale-70b"],
+    pattern = '\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$' },
+  # 替换而非删除（replacement 默认 "" = 删除）：
+  # { models = ["x/y"], pattern = '...', replacement = "…" },
+]
+```
+
+#### 规则结构
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `models` | `Array<String>` | 是 | 此规则适用的模型 id 列表。与生成回复的模型 id 进行精确字符串匹配（与行上的 `filter_model` 相同）。 |
+| `pattern` | `String` | 是 | Rust `regex` crate 正则表达式。**不支持 lookaround 或反向引用**——请使用 `$`、`^`、`\s*`、字符类等锚定。无效 pattern 会导致服务器启动失败。 |
+| `replacement` | `String` | 否 | 替换每个匹配项的文本。缺失或 `""` = 删除匹配内容。 |
+
+规则按声明顺序检查；所有匹配规则依次作用于同一条回复。
+
+#### 执行顺序——第 0 层
+
+Regex 过滤在所有其他处理之前运行：
+
+1. Regex 过滤（第 0 层）——最先执行，客户端看到任何内容之前
+2. LLM `output_filter`（如已启用）——第二轮处理
+3. Memory / insight / affinity 提取——读取已过滤后的文本
+
+因此，匹配到的文本**既不会到达客户端**，**也不会写入 `content`**，**更不会进入提取流水线**——与 `[tasks.chat_output_filter]` 的 `timing` 设置无关。
+
+#### 审计列
+
+| 列 | 过滤生效时的值 |
+|---|---|
+| `pre_filter_content` | 过滤前的原始回复 |
+| `filter_model` | `"<regex>"` |
+
+仅当至少一条规则实际改变了回复时才会设置这些列（与 LLM filter 行为一致——无变更的过滤不会设置这些列）。
+
+#### 空结果 fail-safe
+
+若某次过滤会将非空回复变为空字符串，则该次过滤为**空操作**——原始回复原样交付，审计列不被设置。此机制防止过于宽泛的 pattern 让伴侣陷入沉默。
+
+#### `filtered` 标志
+
+SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出时为 `true`——由 **regex 过滤**、LLM `output_filter` 或两者同时触发均会置为 `true`。
 
 ### `input_filter` — 用户输入改写（仅限 chat 任务）
 
@@ -381,6 +433,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 - `output_filter`（可选 bool，位于 `[tasks.chat_companion]` 和 per-tier 中）：在 0.x 中新增。默认为 `false`。通过 `[tasks.chat_output_filter]` 启用二次回复改写。
 - `[tasks.chat_output_filter]`（新任务）：在 0.x 中新增。默认缺失（filter 不生效）。参见上文“`output_filter` — 二次回复改写”。
 - SSE `final` frame 字段 `filtered`、`retries_chat`、`retries_filter`、`prompt_injected`、`tier`：在 0.x 中新增。
+- `output_regex`（可选数组，位于 `[tasks.chat_companion]`）：在 0.x 中新增。仅限任务级（无 per-tier 覆盖）。在客户端看到回复之前、LLM `output_filter` 之前、提取之前应用的确定性 regex 过滤。regex 过滤或 LLM filter（或两者）产生非原始输出时，`filtered` 标志均为 `true`。参见上文"`output_regex` — 确定性 per-model 正则过滤"。
 
 ## 此配置不控制的内容
 
