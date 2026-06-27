@@ -375,6 +375,19 @@ fn default_model_spec() -> ModelSpec {
     ModelSpec::Fixed(String::new())
 }
 
+/// One deterministic output-strip rule (read only from
+/// `[tasks.chat_companion].output_regex`). Applied to the assistant reply
+/// produced by any model in `models`. `replacement` substitutes for each
+/// match; `None` ⇒ `""` (delete). See
+/// docs/superpowers/specs/2026-06-28-per-model-output-regex-filter-design.md.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OutputRegexRule {
+    pub models: Vec<String>,
+    pub pattern: String,
+    #[serde(default)]
+    pub replacement: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
     #[serde(default = "default_model_spec")]
@@ -426,6 +439,11 @@ pub struct TaskConfig {
     /// `0.8` ⇒ 80% of turns. See `InputFilterTrigger`.
     #[serde(default)]
     pub input_filter: Option<InputFilterTrigger>,
+    /// Deterministic per-model regex strips for the assistant reply. Read ONLY
+    /// on `[tasks.chat_companion]`; task-level, no per-tier override. Empty when
+    /// absent. Compiled at boot via `compile_output_regex` (fail-fast).
+    #[serde(default)]
+    pub output_regex: Vec<OutputRegexRule>,
     /// System instruction sent to the filter LLM; the assistant reply to
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
@@ -2983,5 +3001,35 @@ temperature = 0.8
         // absent (`resolved = None`), a client-supplied per-turn `model` must NOT
         // enable billable image generation — opt-in only.
         assert_eq!(effective_image_chain(Some("X"), None), None);
+    }
+
+    #[test]
+    fn output_regex_parses_on_chat_companion() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "primary/model"
+output_regex = [
+  { models = ["sao10k/l3.3-euryale-70b"], pattern = '\s*\[x[^\]]*\]\s*$' },
+  { models = ["a/b", "a/c"], pattern = '\bfoo\b', replacement = "bar" },
+]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parses");
+        let rules = &cfg.tasks["chat_companion"].output_regex;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].models, vec!["sao10k/l3.3-euryale-70b"]);
+        assert_eq!(rules[0].pattern, r#"\s*\[x[^\]]*\]\s*$"#);
+        assert_eq!(rules[0].replacement, None);
+        assert_eq!(rules[1].models, vec!["a/b", "a/c"]);
+        assert_eq!(rules[1].replacement.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn output_regex_absent_is_empty() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "primary/model"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parses");
+        assert!(cfg.tasks["chat_companion"].output_regex.is_empty());
     }
 }
