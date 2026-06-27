@@ -704,6 +704,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         )),
         voyage: Arc::new(eros_engine_llm::voyage::VoyageClient::new("stub".into())),
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
+        output_regex: std::sync::Arc::new(Vec::new()),
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
     }
 }
