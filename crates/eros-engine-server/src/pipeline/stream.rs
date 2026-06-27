@@ -553,20 +553,6 @@ fn drive_chat_burst(
                 // `truncated` (length / transport) and handled by the block below.
             }
 
-            // Layer 0: deterministic per-model strip, before client emit, the
-            // optional LLM filter, and the extract split. `cleaned == acc` when
-            // no rule matches (then `regex_indices` is empty → no audit).
-            let strip = eros_engine_llm::model_config::apply_output_regex(
-                &state.output_regex,
-                model_id,
-                &acc,
-            );
-            let cleaned = strip.cleaned;
-            let regex_indices = strip.matched_rules;
-            if !regex_indices.is_empty() {
-                outcome.lock().unwrap().filtered = true;
-            }
-
             if truncated {
                 if idx + 1 == chain.len() {
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
@@ -625,6 +611,27 @@ fn drive_chat_burst(
                 model: display_override.as_ref().and_then(|d| d.display(model_id)),
                 continues_from: None,
             };
+
+            // Layer 0: deterministic per-model strip, before client emit, the
+            // optional LLM filter, and the extract split. `cleaned == acc` when
+            // no rule matches (then `regex_indices` is empty → no audit).
+            //
+            // Run this ONLY for the attempt that is actually served — i.e. AFTER
+            // the `if truncated { ... continue }` check above. A truncated
+            // attempt's partial `acc` could otherwise match a rule and set
+            // `outcome.filtered = true`, then be discarded via `continue`,
+            // letting a later fallback serve an UNSTRIPPED reply while the final
+            // frame falsely reports `filtered = true`.
+            let strip = eros_engine_llm::model_config::apply_output_regex(
+                &state.output_regex,
+                model_id,
+                &acc,
+            );
+            let cleaned = strip.cleaned;
+            let regex_indices = strip.matched_rules;
+            if !regex_indices.is_empty() {
+                outcome.lock().unwrap().filtered = true;
+            }
 
             // `filter_failure` carries the per-attempt audit when filter fails.
             // Threaded into AssistantInsert via build_metadata — distinct from
@@ -7451,6 +7458,257 @@ data: [DONE]\n\n";
         assert!(
             filter_triggers.is_none(),
             "filter_triggers must be NULL when no rule matches; got {filter_triggers:?}",
+        );
+    }
+
+    /// Both layers fire on the SAME turn: the per-model output_regex strips the
+    /// artifact (layer 0) AND the LLM output_filter rewrites the reply. The LLM
+    /// filter must run on the regex-CLEANED text (not the raw `acc`); the
+    /// persisted audit must keep the RAW reply on `pre_filter_content`, set
+    /// `filter_model` to the LLM model id (NOT "<regex>"), and fold BOTH the LLM
+    /// predicate keys and the `regex` key into `filter_triggers`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn both_filters_fire_llm_runs_on_cleaned_audit_folds(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let raw_reply = "晚安宝贝[你给对方发送了一张照片：海边自拍]";
+        let cleaned_reply = "晚安宝贝";
+        let artifact = "你给对方发送了一张照片"; // the bracket payload, never in cleaned
+
+        // ── 1. Dual mock: chat model (SSE) + filter model (JSON). ──────────────
+        let mock = MockServer::start().await;
+        // Chat model "mock/euryale" streams the artifact-carrying reply.
+        let chat_body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{raw_reply}\"}}}}],\
+\"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":8,\"total_tokens\":10}},\
+\"id\":\"gen-t6c\",\"model\":\"mock/euryale\"}}\n\n\
+data: [DONE]\n\n"
+        );
+        // Filter model "fast/m" returns a >= MIN_FILTERED_OUTPUT_CHARS (80) rewrite
+        // (a real rewrite is always that long) so it passes the validity gate.
+        let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
+        let filt_body = serde_json::json!({
+            "id": "gf", "model": "fast/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": filt_text}}],
+        });
+        // Mutually-exclusive routing by model id in the request body.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(filt_body))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("mock/euryale"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // ── 2. Seed persona + session ──────────────────────────────────────────
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // ── 3. AppState: output_regex targeting mock/euryale + matching pattern.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/euryale\"]\n\
+             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("artifact pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        // ── 4. Insert the user message ─────────────────────────────────────────
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "晚安",
+                "01JT5REGEX00000000000000D",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        // ── 5. Build a ResolvedOutputFilter whose trigger fires (models=...). ───
+        //      Hand-built (not via PDE) so the burst deterministically filters.
+        let filter = eros_engine_llm::model_config::ResolvedOutputFilter {
+            model: "fast/m".into(),
+            fallback_model: vec![],
+            temperature: 0.0,
+            max_tokens: 256,
+            filter_prompt: "REWRITE".into(),
+            trigger: eros_engine_llm::model_config::OutputFilterTrigger {
+                random: None,
+                models: Some(vec!["mock/euryale".into()]),
+                traits: None,
+            },
+            timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
+            retry_depth: 0,
+            reasoning: None,
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "mock/euryale".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "晚安".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            Some(filter), // LLM output filter that fires (models matches)
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        // ── 6. Assertions ─────────────────────────────────────────────────────
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected; got {frames:?}",
+        );
+        // Client sees the LLM-filtered text (never ORIG artifact).
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("FILT_START"),
+            "client must see the LLM-filtered text; got {deltas:?}",
+        );
+        assert!(
+            !deltas.contains(artifact),
+            "artifact must never reach client; got {deltas:?}",
+        );
+
+        // The LLM filter ran on the regex-CLEANED text: inspect the actual filter
+        // request body via received_requests — it must contain the cleaned reply
+        // but NOT the bracket artifact.
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let filter_req_body = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .find(|b| b.contains("fast/m"))
+            .expect("filter model call must have been made");
+        assert!(
+            filter_req_body.contains(cleaned_reply),
+            "filter must run on cleaned text (contains the cleaned reply); body={filter_req_body:?}",
+        );
+        assert!(
+            !filter_req_body.contains(artifact),
+            "filter must NOT see the raw artifact (proves it ran on cleaned, not acc); \
+             body={filter_req_body:?}",
+        );
+
+        // outcome.filtered true; produced (extract input) is the LLM-filtered text
+        // (AfterExtract timing feeds extract the original = cleaned baseline, but
+        // the burst pushes `extracted` from extract_text(AfterExtract, &cleaned, ..)
+        // which is `cleaned`; the LLM-filtered text is what the CLIENT/DB see).
+        {
+            let o = outcome.lock().unwrap();
+            assert!(
+                o.filtered,
+                "outcome.filtered must be true when filters fired"
+            );
+            assert_eq!(
+                o.produced.len(),
+                1,
+                "one produced message; got {:?}",
+                o.produced
+            );
+        }
+
+        // ── 6a. DB audit: raw on pre_filter_content, LLM model, BOTH trigger keys.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            content.contains("FILT_START"),
+            "persisted content must be the LLM-filtered text; got {content:?}",
+        );
+        assert_eq!(
+            pre_filter.as_deref(),
+            Some(raw_reply),
+            "pre_filter_content must be the RAW reply (with bracket); got {pre_filter:?}",
+        );
+        assert_eq!(
+            filter_model.as_deref(),
+            Some("fast/m"),
+            "filter_model must be the LLM model id, NOT '<regex>'; got {filter_model:?}",
+        );
+        let triggers = filter_triggers.expect("filter_triggers must be present");
+        assert_eq!(
+            triggers.get("models"),
+            Some(&serde_json::json!(["mock/euryale"])),
+            "filter_triggers must carry the LLM predicate (models); got {triggers:?}",
+        );
+        assert_eq!(
+            triggers.get("regex"),
+            Some(&serde_json::json!([0])),
+            "filter_triggers must fold in the regex key; got {triggers:?}",
         );
     }
 }
