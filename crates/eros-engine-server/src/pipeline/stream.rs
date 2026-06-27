@@ -2455,7 +2455,12 @@ pub fn run_stream(
                                 &pde_transcript,
                                 plan.aspect_ratio
                                     .as_deref()
-                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref())),
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
+                                    .or_else(|| {
+                                        resolved_image_gen
+                                            .as_ref()
+                                            .map(|r| r.default_aspect_ratio.as_str())
+                                    }),
                                 &style_str,
                             )
                             .await
@@ -2868,7 +2873,12 @@ pub fn run_stream(
                                 &pde_transcript,
                                 plan.aspect_ratio
                                     .as_deref()
-                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref())),
+                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
+                                    .or_else(|| {
+                                        resolved_image_gen
+                                            .as_ref()
+                                            .map(|r| r.default_aspect_ratio.as_str())
+                                    }),
                                 &style_str,
                             )
                             .await
@@ -3285,6 +3295,7 @@ mod tests {
             "9:16",
         );
         assert!(p.contains("freckled, red hair"));
+        assert!(p.contains("（无）"));
         assert!(p.contains("on a rooftop"));
         assert!(p.contains("realistic"));
         assert!(p.contains("9:16"));
