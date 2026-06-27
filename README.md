@@ -130,7 +130,7 @@ All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default (
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — history, session list, and the structured insight profile.
 - `GET /comp/affinity/{session_id}` — debug-only live affinity vector (`EXPOSE_AFFINITY_DEBUG=true`).
 
-The blocking synchronous `/message` endpoint was removed in 0.3 — SSE is the only chat path. For the full request schema, SSE frame layout (including `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
+For the full request schema, SSE frame layout (including `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
 
 ## Configuration
 

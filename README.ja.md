@@ -130,7 +130,7 @@ cargo run -p eros-engine-server -- serve
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — 履歴、セッション一覧、構造化されたインサイトプロフィールを取得します。
 - `GET /comp/affinity/{session_id}` — debug 専用のリアルタイム親密度ベクトル（`EXPOSE_AFFINITY_DEBUG=true`）。
 
-ブロッキング型の同期 `/message` endpoint は 0.3 で削除され、SSE が唯一のチャット経路になりました。完全なリクエスト schema、SSE frame layout（`delta`、`image`、ghost、error frame を含む）、各フィールドの意味については、[API reference](docs/api-reference.md) を参照してください。
+完全なリクエスト schema、SSE frame layout（`delta`、`image`、ghost、error frame を含む）、各フィールドの意味については、[API reference](docs/api-reference.md) を参照してください。
 
 ## 設定
 
