@@ -97,6 +97,13 @@ pub struct ImageReplyParams {
     pub resolution: Option<String>,
     #[serde(default)]
     pub face_ref_url: Option<String>,
+    /// Optional URL of the previously generated image, for iteration. Selected
+    /// when the PDE chooses `image_ref = previous`. Same validation as
+    /// `face_ref_url`; the engine never fetches it — it is embedded in the
+    /// OpenRouter body and fetched by the image provider at generation time, so
+    /// clients backed by a private store should pass a short-lived signed URL.
+    #[serde(default)]
+    pub prev_image_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -274,6 +281,17 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                     code: "unprocessable",
                     message: "face_ref_url must be an absolute http(s) URL".into(),
                     user_message: "脸部参考图链接无效".into(),
+                    original_user_message_id: None,
+                }));
+            }
+        }
+        if let Some(url) = img.prev_image_url.as_deref() {
+            if !image_url_is_valid(url) {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    message: "prev_image_url must be an absolute http(s) URL".into(),
+                    user_message: "上一张图片链接无效".into(),
                     original_user_message_id: None,
                 }));
             }
@@ -1192,5 +1210,23 @@ mod validate_payload_tests {
             ..Default::default()
         });
         assert!(validate_payload(&req2).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_prev_image_url() {
+        let mut req = minimal_req();
+        req.image = Some(ImageReplyParams {
+            prev_image_url: Some("ftp://nope".into()),
+            ..Default::default()
+        });
+        assert!(validate_payload(&req).is_err());
+
+        // a valid absolute https URL is accepted
+        let mut ok = minimal_req();
+        ok.image = Some(ImageReplyParams {
+            prev_image_url: Some("https://example.test/a.png".into()),
+            ..Default::default()
+        });
+        assert!(validate_payload(&ok).is_ok());
     }
 }
