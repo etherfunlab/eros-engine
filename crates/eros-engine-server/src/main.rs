@@ -290,6 +290,11 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    let output_regex = match model_config.compile_output_regex() {
+        Ok(rules) => Arc::new(rules),
+        Err(msg) => anyhow::bail!(msg),
+    };
+
     // OpenRouter client is constructed after model_config so we can wire in
     // the global provider exclusion list from [defaults].ignore_providers.
     let openrouter = Arc::new(
@@ -304,6 +309,7 @@ async fn run_server() -> Result<()> {
         openrouter,
         voyage,
         model_config,
+        output_regex,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
     };
 
@@ -376,6 +382,17 @@ mod tests {
             cfg.validate_extraction_prompts().is_ok(),
             "shipped config must pass the extraction boot gate: {:?}",
             cfg.validate_extraction_prompts()
+        );
+    }
+
+    #[test]
+    fn example_config_output_regex_compiles() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        assert!(
+            cfg.compile_output_regex().is_ok(),
+            "shipped example output_regex must compile: {:?}",
+            cfg.compile_output_regex().err()
         );
     }
 

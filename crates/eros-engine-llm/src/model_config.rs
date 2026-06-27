@@ -375,6 +375,69 @@ fn default_model_spec() -> ModelSpec {
     ModelSpec::Fixed(String::new())
 }
 
+/// One deterministic output-strip rule (read only from
+/// `[tasks.chat_companion].output_regex`). Applied to the assistant reply
+/// produced by any model in `models`. `replacement` substitutes for each
+/// match; `None` ⇒ `""` (delete). See
+/// docs/superpowers/specs/2026-06-28-per-model-output-regex-filter-design.md.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OutputRegexRule {
+    pub models: Vec<String>,
+    pub pattern: String,
+    #[serde(default)]
+    pub replacement: Option<String>,
+}
+
+/// A compiled `output_regex` rule, ready to apply. Built once at boot by
+/// `ModelConfig::compile_output_regex`; `replacement` is `""` for delete.
+#[derive(Debug, Clone)]
+pub struct CompiledRegexRule {
+    pub models: Vec<String>,
+    pub regex: regex::Regex,
+    pub replacement: String,
+}
+
+/// Result of applying output-regex rules to one reply. `matched_rules` lists
+/// the rule indices that changed the text (empty ⇒ unchanged or fail-safed).
+#[derive(Debug, Clone)]
+pub struct RegexStripOutcome {
+    pub cleaned: String,
+    pub matched_rules: Vec<usize>,
+}
+
+/// Apply every rule whose `models` contains `model_id`, in declaration order.
+/// Pure & deterministic. Fail-safe: if stripping empties a non-empty reply,
+/// the raw text is returned unchanged with no matched rules.
+pub fn apply_output_regex(
+    rules: &[CompiledRegexRule],
+    model_id: &str,
+    text: &str,
+) -> RegexStripOutcome {
+    let mut cleaned = text.to_string();
+    let mut matched_rules = Vec::new();
+    for (i, rule) in rules.iter().enumerate() {
+        if !rule.models.iter().any(|m| m == model_id) {
+            continue;
+        }
+        let next = rule.regex.replace_all(&cleaned, rule.replacement.as_str());
+        if next != cleaned {
+            matched_rules.push(i);
+            cleaned = next.into_owned();
+        }
+    }
+    // Fail-safe: never let a strip produce a blank reply from a non-blank one.
+    if !matched_rules.is_empty() && cleaned.trim().is_empty() && !text.trim().is_empty() {
+        return RegexStripOutcome {
+            cleaned: text.to_string(),
+            matched_rules: Vec::new(),
+        };
+    }
+    RegexStripOutcome {
+        cleaned,
+        matched_rules,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
     #[serde(default = "default_model_spec")]
@@ -426,6 +489,11 @@ pub struct TaskConfig {
     /// `0.8` ⇒ 80% of turns. See `InputFilterTrigger`.
     #[serde(default)]
     pub input_filter: Option<InputFilterTrigger>,
+    /// Deterministic per-model regex strips for the assistant reply. Read ONLY
+    /// on `[tasks.chat_companion]`; task-level, no per-tier override. Empty when
+    /// absent. Compiled at boot via `compile_output_regex` (fail-fast).
+    #[serde(default)]
+    pub output_regex: Vec<OutputRegexRule>,
     /// System instruction sent to the filter LLM; the assistant reply to
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
@@ -1093,6 +1161,30 @@ impl ModelConfig {
             }
         }
         Ok(())
+    }
+
+    /// Compile `[tasks.chat_companion].output_regex` into ready-to-apply rules.
+    /// Boot-time, fail-fast: the first invalid pattern aborts with a message
+    /// naming the rule index. Absent task or empty rules ⇒ `Ok(vec![])`.
+    pub fn compile_output_regex(&self) -> Result<Vec<CompiledRegexRule>, String> {
+        let Some(task) = self.tasks.get("chat_companion") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(task.output_regex.len());
+        for (i, rule) in task.output_regex.iter().enumerate() {
+            let regex = regex::Regex::new(&rule.pattern).map_err(|e| {
+                format!(
+                    "[tasks.chat_companion].output_regex[{i}]: invalid pattern {:?}: {e}",
+                    rule.pattern
+                )
+            })?;
+            out.push(CompiledRegexRule {
+                models: rule.models.clone(),
+                regex,
+                replacement: rule.replacement.clone().unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -2983,5 +3075,141 @@ temperature = 0.8
         // absent (`resolved = None`), a client-supplied per-turn `model` must NOT
         // enable billable image generation — opt-in only.
         assert_eq!(effective_image_chain(Some("X"), None), None);
+    }
+
+    #[test]
+    fn output_regex_parses_on_chat_companion() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "primary/model"
+output_regex = [
+  { models = ["sao10k/l3.3-euryale-70b"], pattern = '\s*\[x[^\]]*\]\s*$' },
+  { models = ["a/b", "a/c"], pattern = '\bfoo\b', replacement = "bar" },
+]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parses");
+        let rules = &cfg.tasks["chat_companion"].output_regex;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].models, vec!["sao10k/l3.3-euryale-70b"]);
+        assert_eq!(rules[0].pattern, r#"\s*\[x[^\]]*\]\s*$"#);
+        assert_eq!(rules[0].replacement, None);
+        assert_eq!(rules[1].models, vec!["a/b", "a/c"]);
+        assert_eq!(rules[1].replacement.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn output_regex_absent_is_empty() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "primary/model"
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).expect("parses");
+        assert!(cfg.tasks["chat_companion"].output_regex.is_empty());
+    }
+
+    // ─── Task 2: compile_output_regex ────────────────────────────────────────
+
+    #[test]
+    fn compile_output_regex_ok_and_defaults_replacement() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+output_regex = [
+  { models = ["x/y"], pattern = '\[z\]$' },
+  { models = ["a/b"], pattern = 'q', replacement = "Q" },
+]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let compiled = cfg.compile_output_regex().expect("compiles");
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(compiled[0].models, vec!["x/y"]);
+        assert!(compiled[0].regex.is_match("hello[z]"));
+        assert_eq!(compiled[0].replacement, ""); // None ⇒ ""
+        assert_eq!(compiled[1].replacement, "Q");
+    }
+
+    #[test]
+    fn compile_output_regex_errors_on_bad_pattern() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+output_regex = [ { models = ["x/y"], pattern = '[' } ]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg
+            .compile_output_regex()
+            .expect_err("invalid pattern must error");
+        assert!(
+            err.contains("output_regex[0]"),
+            "error names the rule index: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_output_regex_absent_is_empty_ok() {
+        let cfg = ModelConfig::from_toml_str("[tasks.other]\nmodel='m'\n").unwrap();
+        assert!(cfg.compile_output_regex().unwrap().is_empty());
+    }
+
+    // ─── Task 3: apply_output_regex ─────────────────────────────────────────
+
+    fn compiled(pairs: &[(&str, &str, &str)]) -> Vec<CompiledRegexRule> {
+        // (model, pattern, replacement)
+        pairs
+            .iter()
+            .map(|(m, p, r)| CompiledRegexRule {
+                models: vec![(*m).to_string()],
+                regex: regex::Regex::new(p).unwrap(),
+                replacement: (*r).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_output_regex_strips_targeted_model() {
+        let rules = compiled(&[(
+            "euryale",
+            r#"\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$"#,
+            "",
+        )]);
+        let out = apply_output_regex(
+            &rules,
+            "euryale",
+            "晚安宝贝[你给对方发送了一张照片：海边自拍]",
+        );
+        assert_eq!(out.cleaned, "晚安宝贝");
+        assert_eq!(out.matched_rules, vec![0]);
+    }
+
+    #[test]
+    fn apply_output_regex_skips_non_targeted_model() {
+        let rules = compiled(&[("euryale", r#"\[.*\]$"#, "")]);
+        let out = apply_output_regex(&rules, "other/model", "hi[x]");
+        assert_eq!(out.cleaned, "hi[x]");
+        assert!(out.matched_rules.is_empty());
+    }
+
+    #[test]
+    fn apply_output_regex_applies_multiple_rules_in_order() {
+        let rules = compiled(&[("m", "foo", "F"), ("m", "bar", "B")]);
+        let out = apply_output_regex(&rules, "m", "foo bar");
+        assert_eq!(out.cleaned, "F B");
+        assert_eq!(out.matched_rules, vec![0, 1]);
+    }
+
+    #[test]
+    fn apply_output_regex_no_match_reports_no_change() {
+        let rules = compiled(&[("m", "zzz", "")]);
+        let out = apply_output_regex(&rules, "m", "hello");
+        assert_eq!(out.cleaned, "hello");
+        assert!(out.matched_rules.is_empty());
+    }
+
+    #[test]
+    fn apply_output_regex_empty_result_failsafes_to_raw() {
+        let rules = compiled(&[("m", r#"^\[.*\]$"#, "")]); // whole reply is the artifact
+        let out = apply_output_regex(&rules, "m", "[你给对方发送了一张照片：x]");
+        assert_eq!(out.cleaned, "[你给对方发送了一张照片：x]"); // kept raw
+        assert!(out.matched_rules.is_empty(), "fail-safe reports no change");
     }
 }
