@@ -93,6 +93,14 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   `crates/eros-engine-llm/src/model_config.rs` (e.g. `ResolvedImagePromptCompose`
   with `model`, `fallback`, `temperature`, `max_tokens`, `filter_prompt`). Feature is
   **off** when the task is absent (mirrors the `chat_vision` gating pattern).
+- **Prompt source — built-in default + config override.** Unlike the other tasks
+  (whose prompt must come from config), the composer ships a generic,
+  product-identity-free built-in default prompt (`DEFAULT_COMPOSE_PROMPT`) and is
+  gated on the task being *present* (a model configured). A non-blank `filter_prompt`
+  overrides the default; a blank/absent one falls back to it. The built-in text stays
+  generic — no product name, brand aesthetic, or explicit content (the runtime payload
+  carries appearance/scene/subject) — so the OSS repo stays identity-free while
+  deployments can layer product flavor via the override.
 - In the pipeline, after an image action is decided and before image generation,
   call the composer with: persona genome (`art_metadata` + `system_prompt`), the PDE
   seed subject (`plan.image_prompt`), recent scene context (transcript), the chosen
