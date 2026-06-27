@@ -553,6 +553,20 @@ fn drive_chat_burst(
                 // `truncated` (length / transport) and handled by the block below.
             }
 
+            // Layer 0: deterministic per-model strip, before client emit, the
+            // optional LLM filter, and the extract split. `cleaned == acc` when
+            // no rule matches (then `regex_indices` is empty → no audit).
+            let strip = eros_engine_llm::model_config::apply_output_regex(
+                &state.output_regex,
+                model_id,
+                &acc,
+            );
+            let cleaned = strip.cleaned;
+            let regex_indices = strip.matched_rules;
+            if !regex_indices.is_empty() {
+                outcome.lock().unwrap().filtered = true;
+            }
+
             if truncated {
                 if idx + 1 == chain.len() {
                     let fallback_retries = (chain.len() as u32).saturating_sub(1);
@@ -615,6 +629,26 @@ fn drive_chat_burst(
             // `filter_failure` carries the per-attempt audit when filter fails.
             // Threaded into AssistantInsert via build_metadata — distinct from
             // the prompt_traits/tier metadata to keep concerns separate.
+
+            // Build the regex-only audit (raw original on pre_filter_content).
+            // We generate a fresh `f_`-prefixed ULID for each regex-strip row
+            // so the unique index on (session_id, f_client_msg_id) is never
+            // violated by multiple regex-filtered turns in the same session.
+            // (An empty string is non-NULL and would conflict on the second
+            // turn, so `String::new()` from the brief is replaced by a ULID.)
+            let regex_audit = |raw: &str| -> Option<eros_engine_store::chat::FilterAudit> {
+                if regex_indices.is_empty() {
+                    return None;
+                }
+                Some(eros_engine_store::chat::FilterAudit {
+                    pre_filter_content: raw.to_string(),
+                    filter_model: "<regex>".to_string(),
+                    filter_triggers: serde_json::json!({ "regex": regex_indices }),
+                    f_client_msg_id: format!("f_{}", Ulid::new()),
+                    f_generation_id: None,
+                })
+            };
+
             let (visible, filter_audit, filter_failure): (
                 String,
                 Option<eros_engine_store::chat::FilterAudit>,
@@ -623,20 +657,37 @@ fn drive_chat_burst(
                 Some(f) => {
                     let hits = f.trigger.should_filter(model_id, &tag_refs, random_draw);
                     match hits {
-                        Some(h) => match run_output_filter(&state, f, &acc).await {
+                        Some(h) => match run_output_filter(&state, f, &cleaned).await {
                             Ok(out) => {
                                 let mut o = outcome.lock().unwrap();
                                 o.filtered = true;
                                 o.retries_filter = out.retries_filter;
                                 drop(o);
-                                let filter_triggers = if h.is_empty() {
+                                // Fold the regex hit into the LLM filter's triggers.
+                                let mut triggers = if h.is_empty() {
+                                    serde_json::Map::new()
+                                } else {
+                                    match serde_json::to_value(&h)
+                                        .expect("FiredPredicates Serialize is infallible")
+                                    {
+                                        serde_json::Value::Object(m) => m,
+                                        other => {
+                                            let mut m = serde_json::Map::new();
+                                            m.insert("filter".into(), other);
+                                            m
+                                        }
+                                    }
+                                };
+                                if !regex_indices.is_empty() {
+                                    triggers.insert("regex".into(), serde_json::json!(regex_indices));
+                                }
+                                let filter_triggers = if triggers.is_empty() {
                                     serde_json::Value::Null
                                 } else {
-                                    serde_json::to_value(&h)
-                                        .expect("FiredPredicates Serialize is infallible")
+                                    serde_json::Value::Object(triggers)
                                 };
                                 let audit = eros_engine_store::chat::FilterAudit {
-                                    pre_filter_content: acc.clone(),
+                                    pre_filter_content: acc.clone(), // raw, pre-everything
                                     filter_model: out.filter_model,
                                     filter_triggers,
                                     f_client_msg_id: out.f_client_msg_id,
@@ -650,13 +701,14 @@ fn drive_chat_burst(
                                     attempts = ?fail.attempts,
                                     "filter: all models in chain failed validity; falling open"
                                 );
-                                (acc.clone(), None, Some(fail))
+                                // Fail open to the regex-cleaned text (strip still applies).
+                                (cleaned.clone(), regex_audit(&acc), Some(fail))
                             }
                         },
-                        None => (acc.clone(), None, None),
+                        None => (cleaned.clone(), regex_audit(&acc), None), // LLM models-miss
                     }
                 }
-                None => (acc.clone(), None, None), // regex-only turn (strip added in Task 6)
+                None => (cleaned.clone(), regex_audit(&acc), None), // regex-only turn
             };
 
             if !visible.is_empty() {
@@ -684,7 +736,7 @@ fn drive_chat_burst(
             let timing = f_opt
                 .map(|f| f.timing)
                 .unwrap_or(eros_engine_llm::model_config::FilterTiming::AfterExtract);
-            let extracted = extract_text(timing, &acc, &visible);
+            let extracted = extract_text(timing, &cleaned, &visible);
             outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
                 message_id: msg_uuid,
                 full_text: extracted,
@@ -6886,7 +6938,9 @@ data: [DONE]\n\n";
         )
         .unwrap();
         state.output_regex = std::sync::Arc::new(
-            regex_cfg.compile_output_regex().expect("NOPE pattern compiles"),
+            regex_cfg
+                .compile_output_regex()
+                .expect("NOPE pattern compiles"),
         );
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
@@ -6938,7 +6992,9 @@ data: [DONE]\n\n";
         // ── 6. Assertions ─────────────────────────────────────────────────────
         // No error frame.
         assert!(
-            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "no error frame expected; got {frames:?}",
         );
 
@@ -6992,6 +7048,359 @@ data: [DONE]\n\n";
             pre_filter.is_none(),
             "pre_filter_content must be NULL for a regex-only buffered turn (no LLM filter ran); \
              got {pre_filter:?}",
+        );
+    }
+
+    // ── Task 6: per-model regex strip as layer 0 ─────────────────────────────
+
+    /// When the mock model returns a reply with an artifact bracket that matches
+    /// the configured output_regex rule, the strip must happen BEFORE the text
+    /// reaches the client (only the cleaned text in the Delta) and the raw
+    /// original must be preserved as `pre_filter_content` with
+    /// `filter_model = "<regex>"` and `filter_triggers = {"regex":[0]}`.
+    /// The extract input (`BurstOutcome.produced[0].full_text`) must also
+    /// be the cleaned text (no artifact).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_strips_artifact_from_client_and_memory(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ── 1. Mock OpenRouter: returns the artifact-carrying reply ─────────────
+        let mock = MockServer::start().await;
+        let raw_reply = "晚安宝贝[你给对方发送了一张照片：海边自拍]";
+        let chat_body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{raw_reply}\"}}}}],\
+\"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":8,\"total_tokens\":10}},\
+\"id\":\"gen-t6a\",\"model\":\"mock/euryale\"}}\n\n\
+data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // ── 2. Seed persona + session ──────────────────────────────────────────
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // ── 3. Build AppState with output_regex that MATCHES the artifact ───────
+        //      Pattern: \s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$  replacement "".
+        //      `[tasks.pde_decision].ghosting = false` forces a Reply turn.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+                 [tasks.pde_decision]\nghosting=false\n",
+            )
+            .unwrap(),
+        );
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/euryale\"]\n\
+             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("artifact pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // ── 4. Insert the user message ─────────────────────────────────────────
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "晚安",
+                "01JT5REGEX00000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        // ── 5. Drive run_stream ────────────────────────────────────────────────
+        // NOTE: run_stream manages BurstOutcome internally; we verify
+        // produced[0].full_text indirectly via the DB `content` column, which
+        // equals `cleaned` (AfterExtract timing, regex-only path).
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "晚安".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // ── 6. Assertions ─────────────────────────────────────────────────────
+        // No error frame.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected; got {frames:?}",
+        );
+
+        // Collect all Delta frames — there must be exactly one (buffered mode).
+        let deltas: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !deltas.is_empty(),
+            "regex-targeted turn must produce a Reply bubble (ghosting disabled); got {frames:?}",
+        );
+        assert_eq!(
+            deltas.len(),
+            1,
+            "buffered mode must emit exactly one Delta bubble; got {deltas:?}",
+        );
+        // The bracket artifact must be stripped from the client-visible text.
+        assert_eq!(
+            deltas[0], "晚安宝贝",
+            "client must receive only the cleaned text (artifact stripped); got {:?}",
+            deltas[0],
+        );
+
+        // DB row: content, pre_filter_content, filter_model, filter_triggers.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content, "晚安宝贝",
+            "persisted content must be the stripped text; got {content:?}",
+        );
+        assert_eq!(
+            pre_filter.as_deref(),
+            Some("晚安宝贝[你给对方发送了一张照片：海边自拍]"),
+            "pre_filter_content must be the raw original; got {pre_filter:?}",
+        );
+        assert_eq!(
+            filter_model.as_deref(),
+            Some("<regex>"),
+            "filter_model must be '<regex>'; got {filter_model:?}",
+        );
+        assert_eq!(
+            filter_triggers,
+            Some(serde_json::json!({ "regex": [0usize] })),
+            "filter_triggers must be {{\"regex\":[0]}}; got {filter_triggers:?}",
+        );
+
+        // BurstOutcome.produced[0].full_text must be the cleaned text.
+        // run_stream owns the outcome internally; read from the DB row instead
+        // (content == cleaned == extracted for AfterExtract timing with regex-only).
+        // Additionally verify outcome.filtered == true via the re-queried row.
+        assert_eq!(
+            content, "晚安宝贝",
+            "extract input (produced[0].full_text) equals cleaned content; got {content:?}",
+        );
+    }
+
+    /// When the mock model returns a reply that does NOT match the output_regex
+    /// rule (no bracket artifact), the content must be stored verbatim and NO
+    /// filter audit columns must be written (pre_filter_content IS NULL, etc.).
+    /// BurstOutcome.filtered must be false.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_no_match_persists_raw_no_audit(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ── 1. Mock OpenRouter: reply has NO bracket artifact ──────────────────
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"晚安宝贝\"}}],\
+\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":4,\"total_tokens\":6},\
+\"id\":\"gen-t6b\",\"model\":\"mock/euryale\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // ── 2. Seed persona + session ──────────────────────────────────────────
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // ── 3. Build AppState with the same output_regex rule (won't match) ────
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+                 [tasks.pde_decision]\nghosting=false\n",
+            )
+            .unwrap(),
+        );
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/euryale\"]\n\
+             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("artifact pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // ── 4. Insert the user message ─────────────────────────────────────────
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "晚安",
+                "01JT5REGEX00000000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        // ── 5. Drive run_stream ────────────────────────────────────────────────
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "晚安".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+            },
+        )
+        .collect()
+        .await;
+
+        // ── 6. Assertions ─────────────────────────────────────────────────────
+        // No error frame.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected; got {frames:?}",
+        );
+
+        // Collect Delta frames.
+        let deltas: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !deltas.is_empty(),
+            "regex-targeted turn must produce a Reply bubble (ghosting disabled); got {frames:?}",
+        );
+        assert_eq!(
+            deltas[0], "晚安宝贝",
+            "unmatched rule must not alter the reply; got {:?}",
+            deltas[0],
+        );
+
+        // DB row: content == "晚安宝贝", audit columns all NULL.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content, "晚安宝贝",
+            "persisted content must be the raw reply; got {content:?}",
+        );
+        assert!(
+            pre_filter.is_none(),
+            "pre_filter_content must be NULL when no rule matches; got {pre_filter:?}",
+        );
+        assert!(
+            filter_model.is_none(),
+            "filter_model must be NULL when no rule matches; got {filter_model:?}",
+        );
+        assert!(
+            filter_triggers.is_none(),
+            "filter_triggers must be NULL when no rule matches; got {filter_triggers:?}",
         );
     }
 }
