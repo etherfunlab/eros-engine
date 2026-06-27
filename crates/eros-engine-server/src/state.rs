@@ -63,6 +63,12 @@ pub(crate) fn parse_snapshot_config(
     SnapshotConfig { disabled, cron, tz }
 }
 
+/// Parse `PROMPT_LOG_DIR`. Empty or unset ⇒ `None` (logging disabled).
+/// Any non-empty value is the destination directory for raw prompt logs.
+pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathBuf> {
+    raw.filter(|s| !s.is_empty()).map(std::path::PathBuf::from)
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -150,6 +156,11 @@ pub struct ServerConfig {
     /// Cron-scheduled companion_insights_snapshot sweeper config. See
     /// `pipeline::snapshot` for the sweep loop.
     pub snapshot: SnapshotConfig,
+    /// Destination directory for raw assembled main-reply prompts. `None`
+    /// (env `PROMPT_LOG_DIR` unset or empty) disables prompt logging. When
+    /// `Some`, each reply turn writes one human-readable file here. Contains
+    /// raw chat content — operator-only; point it at a volume you control.
+    pub prompt_log_dir: Option<std::path::PathBuf>,
 }
 
 impl ServerConfig {
@@ -207,6 +218,9 @@ impl ServerConfig {
                     .as_deref(),
             ),
             snapshot,
+            prompt_log_dir: parse_prompt_log_dir(
+                std::env::var("PROMPT_LOG_DIR").ok().as_deref(),
+            ),
         }
     }
 }
@@ -296,5 +310,19 @@ mod tests {
         // Misspelled tz → default + (caller will warn-log; we just verify fallback)
         let cfg = parse_snapshot_config(None, None, Some("Not/A_Real_Zone"));
         assert_eq!(cfg.tz, chrono_tz::Asia::Singapore);
+    }
+
+    #[test]
+    fn prompt_log_dir_unset_or_empty_is_none() {
+        assert_eq!(parse_prompt_log_dir(None), None);
+        assert_eq!(parse_prompt_log_dir(Some("")), None);
+    }
+
+    #[test]
+    fn prompt_log_dir_set_is_some_path() {
+        assert_eq!(
+            parse_prompt_log_dir(Some("/data/prompt-logs")),
+            Some(std::path::PathBuf::from("/data/prompt-logs")),
+        );
     }
 }
