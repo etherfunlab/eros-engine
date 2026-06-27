@@ -166,6 +166,36 @@ Both queries should return zero rows after the migration applies.
 
 ## Operational notes
 
+### Prompt logging (debug, optional)
+
+Set `PROMPT_LOG_DIR` to capture the fully-assembled main-reply prompt for each
+turn as one human-readable file (header + per-message blocks). It is **off by
+default**, **operator-only** (files contain raw chat content), and writes
+fire-and-forget so it never blocks or fails a reply. Point it at a mounted
+volume you control:
+
+```yaml
+# docker-compose: mount a volume and set the env
+services:
+  engine:
+    environment:
+      PROMPT_LOG_DIR: /data/prompt-logs
+    volumes:
+      - ./prompt-logs:/data/prompt-logs
+```
+
+```toml
+# fly.io: declare a mount + the env (illustrative)
+[mounts]
+source = "prompt_logs"
+destination = "/data/prompt-logs"
+
+[env]
+PROMPT_LOG_DIR = "/data/prompt-logs"
+```
+
+There is no built-in rotation or retention — manage the volume yourself.
+
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The OpenAPI JSON is at `/api-docs/openapi.json`.
 - **Affinity debug:** `GET /comp/affinity/{session_id}` is gated by `EXPOSE_AFFINITY_DEBUG=true`. Production deploys typically leave it off; turn it on if your frontend renders a live radar of the affinity vector.
