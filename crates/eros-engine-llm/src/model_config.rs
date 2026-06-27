@@ -388,6 +388,15 @@ pub struct OutputRegexRule {
     pub replacement: Option<String>,
 }
 
+/// A compiled `output_regex` rule, ready to apply. Built once at boot by
+/// `ModelConfig::compile_output_regex`; `replacement` is `""` for delete.
+#[derive(Debug, Clone)]
+pub struct CompiledRegexRule {
+    pub models: Vec<String>,
+    pub regex: regex::Regex,
+    pub replacement: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfig {
     #[serde(default = "default_model_spec")]
@@ -1111,6 +1120,30 @@ impl ModelConfig {
             }
         }
         Ok(())
+    }
+
+    /// Compile `[tasks.chat_companion].output_regex` into ready-to-apply rules.
+    /// Boot-time, fail-fast: the first invalid pattern aborts with a message
+    /// naming the rule index. Absent task or empty rules ⇒ `Ok(vec![])`.
+    pub fn compile_output_regex(&self) -> Result<Vec<CompiledRegexRule>, String> {
+        let Some(task) = self.tasks.get("chat_companion") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(task.output_regex.len());
+        for (i, rule) in task.output_regex.iter().enumerate() {
+            let regex = regex::Regex::new(&rule.pattern).map_err(|e| {
+                format!(
+                    "[tasks.chat_companion].output_regex[{i}]: invalid pattern {:?}: {e}",
+                    rule.pattern
+                )
+            })?;
+            out.push(CompiledRegexRule {
+                models: rule.models.clone(),
+                regex,
+                replacement: rule.replacement.clone().unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -3031,5 +3064,44 @@ model = "primary/model"
 "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parses");
         assert!(cfg.tasks["chat_companion"].output_regex.is_empty());
+    }
+
+    // ─── Task 2: compile_output_regex ────────────────────────────────────────
+
+    #[test]
+    fn compile_output_regex_ok_and_defaults_replacement() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+output_regex = [
+  { models = ["x/y"], pattern = '\[z\]$' },
+  { models = ["a/b"], pattern = 'q', replacement = "Q" },
+]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let compiled = cfg.compile_output_regex().expect("compiles");
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(compiled[0].models, vec!["x/y"]);
+        assert!(compiled[0].regex.is_match("hello[z]"));
+        assert_eq!(compiled[0].replacement, ""); // None ⇒ ""
+        assert_eq!(compiled[1].replacement, "Q");
+    }
+
+    #[test]
+    fn compile_output_regex_errors_on_bad_pattern() {
+        let toml = r#"
+[tasks.chat_companion]
+model = "m"
+output_regex = [ { models = ["x/y"], pattern = '[' } ]
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let err = cfg.compile_output_regex().expect_err("invalid pattern must error");
+        assert!(err.contains("output_regex[0]"), "error names the rule index: {err}");
+    }
+
+    #[test]
+    fn compile_output_regex_absent_is_empty_ok() {
+        let cfg = ModelConfig::from_toml_str("[tasks.other]\nmodel='m'\n").unwrap();
+        assert!(cfg.compile_output_regex().unwrap().is_empty());
     }
 }
