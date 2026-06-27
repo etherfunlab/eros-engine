@@ -7111,7 +7111,15 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 4, "all four properties required: {v}");
+        assert_eq!(req.len(), 6, "all six properties required: {v}");
+        assert!(
+            req.iter().any(|x| x == "image_ref"),
+            "image_ref required: {v}"
+        );
+        assert!(
+            req.iter().any(|x| x == "aspect_ratio"),
+            "aspect_ratio required: {v}"
+        );
         let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
             .as_array()
             .unwrap();
