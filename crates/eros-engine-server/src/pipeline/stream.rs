@@ -109,6 +109,28 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     }
 }
 
+/// Pick the reference image for an image turn and report which kind was used.
+/// `Previous` falls back to the face ref when no previous URL is supplied.
+/// Empty strings are treated as absent. Pure.
+fn select_image_ref(
+    image_ref: eros_engine_core::types::ImageRef,
+    req: Option<&crate::routes::companion_stream::ImageReplyParams>,
+) -> (Option<String>, &'static str) {
+    let face = req
+        .and_then(|i| i.face_ref_url.clone())
+        .filter(|s| !s.is_empty());
+    let prev = req
+        .and_then(|i| i.prev_image_url.clone())
+        .filter(|s| !s.is_empty());
+    match image_ref {
+        eros_engine_core::types::ImageRef::Previous => match prev {
+            Some(u) => (Some(u), "previous"),
+            None => (face, "face"),
+        },
+        eros_engine_core::types::ImageRef::Face => (face, "face"),
+    }
+}
+
 /// Assemble an `ImageGenRequest` from the per-turn image executor chain, the
 /// resolved `chat_image_generation` defaults, the persona, and the optional
 /// per-turn `ImageReplyParams`. Pure (no I/O). Per-turn overrides win over the
@@ -123,6 +145,7 @@ fn build_image_gen_request(
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
     resolved: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
     fallback_subject: &str,
+    ref_url: Option<String>,
 ) -> eros_engine_llm::openrouter::ImageGenRequest {
     use eros_engine_llm::model_config::StyleKey;
     let style: StyleKey = req_image
@@ -148,7 +171,7 @@ fn build_image_gen_request(
         model: primary,
         fallback_model: chain,
         prompt,
-        face_ref_url: req_image.and_then(|i| i.face_ref_url.clone()),
+        face_ref_url: ref_url,
         aspect_ratio,
         resolution,
         max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
@@ -2329,9 +2352,8 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
-                        let face_used = req_image
-                            .and_then(|i| i.face_ref_url.as_deref())
-                            .is_some_and(|s| !s.is_empty());
+                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let face_used = ref_url.is_some();
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2340,6 +2362,7 @@ pub fn run_stream(
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
+                            ref_url.clone(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2368,6 +2391,7 @@ pub fn run_stream(
                                     "resolution": res,
                                     "generation_id": resp.generation_id,
                                     "face_ref_used": face_used,
+                                    "image_ref": ref_kind,
                                 });
                                 let mime = data_url_mime(&resp.images[0]);
                                 let msg_ulid = Ulid::new();
@@ -2724,9 +2748,8 @@ pub fn run_stream(
                             .and_then(|i| i.style)
                             .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
                             .unwrap_or_default();
-                        let face_used = req_image
-                            .and_then(|i| i.face_ref_url.as_deref())
-                            .is_some_and(|s| !s.is_empty());
+                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let face_used = ref_url.is_some();
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2735,6 +2758,7 @@ pub fn run_stream(
                             req_image,
                             resolved_image_gen.as_ref(),
                             "",
+                            ref_url.clone(),
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2762,6 +2786,7 @@ pub fn run_stream(
                                     "resolution": res,
                                     "generation_id": resp.generation_id,
                                     "face_ref_used": face_used,
+                                    "image_ref": ref_kind,
                                 });
                                 let mime = data_url_mime(&resp.images[0]);
                                 // merge_assistant_image_meta wraps under {"image":..}
@@ -3069,6 +3094,39 @@ mod tests {
     }
 
     #[test]
+    fn select_image_ref_picks_and_falls_back() {
+        use crate::routes::companion_stream::ImageReplyParams;
+        use eros_engine_core::types::ImageRef;
+
+        let both = ImageReplyParams {
+            face_ref_url: Some("https://x/face.png".into()),
+            prev_image_url: Some("https://x/prev.png".into()),
+            ..Default::default()
+        };
+        // previous chosen, prev present → previous
+        assert_eq!(
+            select_image_ref(ImageRef::Previous, Some(&both)),
+            (Some("https://x/prev.png".into()), "previous")
+        );
+        // face chosen → face
+        assert_eq!(
+            select_image_ref(ImageRef::Face, Some(&both)),
+            (Some("https://x/face.png".into()), "face")
+        );
+        // previous chosen but absent → fall back to face
+        let face_only = ImageReplyParams {
+            face_ref_url: Some("https://x/face.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_image_ref(ImageRef::Previous, Some(&face_only)),
+            (Some("https://x/face.png".into()), "face")
+        );
+        // nothing supplied → no url, kind reflects request fallback
+        assert_eq!(select_image_ref(ImageRef::Previous, None), (None, "face"));
+    }
+
+    #[test]
     fn build_image_gen_request_uses_subject_chain_and_style() {
         let persona = test_persona_with_meta(&[]);
         let plan_prompt = Some("a selfie".to_string());
@@ -3086,6 +3144,7 @@ mod tests {
             None, /* req_image */
             resolved.as_ref(),
             "fallback subject",
+            None, /* ref_url */
         );
         assert_eq!(req.model, "img");
         assert!(req.prompt.starts_with("Photorealistic"));
