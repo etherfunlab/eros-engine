@@ -34,15 +34,22 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   `AI:（image sent: <subject summary>, ratio <ar>）` (wording set by implementation;
   keep it terse). This transcript is also consumed by the input filter, where the
   marker is harmless context.
-- **Dependency:** `ChatRepo::history(...)` rows must expose `metadata`. Confirm; if
-  the row struct/query omits it, extend them.
+- **Dependency (already satisfied):** the transcript builder reads
+  `chat_repo.history(...)` (`stream.rs:1630`), which returns `ChatMessage` rows that
+  already carry `metadata` (`crates/eros-engine-store/src/chat.rs:69`, `#[serde(default)]`;
+  covered by the `history_row_exposes_metadata_column` test at `chat.rs:2068`). No
+  struct/query change needed — the impl just reads `m.metadata.image` and renders the
+  marker. (The narrower `history_slim`/`ChatMessageSlim` path drops `metadata`, so do
+  **not** switch the transcript builder to it.)
 
 ### 2. PDE output schema: `image_ref` + `aspect_ratio`
 - Extend `PdeVerdict` (`stream.rs`) and the resulting `ActionPlan`
   (`crates/eros-engine-core/src/pde.rs`, `types.rs`) with:
   - `image_ref`: enum `{ face, previous }`, default `face`.
   - `aspect_ratio`: optional, validated against `{1:1, 3:4, 4:3, 9:16, 16:9}`;
-    unknown/missing → `None` (caller falls back, see §4).
+    unknown/missing → `None` (caller falls back, see §4). This is the **same set**
+    already enforced on the request input at `companion_stream.rs:283`; factor it into
+    one shared constant/helper so the PDE-output and request-input checks can't drift.
 - Update `parse_pde_verdict` and `VerdictAudit` (`stream.rs:1440`) so the new fields
   are parsed and recorded into the decision-event payload.
 - All new fields `#[serde(default)]` so existing prompts that omit them still parse.
@@ -69,6 +76,13 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   `(aspect ratio: …)` / `(resolution: …)` text hints. Send the aspect ratio as a
   **real generation parameter**, with an explicit `width×height` resolution as the
   fallback for models that do not accept an aspect parameter.
+- **Define the aspect → `width×height` mapping.** The resolution fallback needs a
+  concrete pixel size when only an aspect ratio is known. Add a small table mapping
+  each of the five ratios to a `width×height` (e.g. anchor on a fixed long edge per
+  orientation) so the fallback is deterministic. The plumbing already exists
+  (`ImageGenRequest.resolution`, `req_image.resolution`, config `default_resolution`);
+  this only defines how a chosen aspect becomes a resolution when no explicit one is
+  supplied.
 - **Feasibility risk — resolve first:** the accepted parameter differs per image
   model. Verify it for each configured image model (probe the model's
   `/models/{slug}/endpoints` and/or a live test) before relying on it; keep the
@@ -97,8 +111,8 @@ prompt-composer task definition live in the deployment's `model_config.toml`
   `metadata.image` remains the source of truth for "was an image sent."
 
 ## Open items for implementation
-1. Confirm/extend `ChatRepo::history` to expose `metadata` (§1).
-2. Verify the real aspect-ratio parameter accepted by each configured image
+1. Verify the real aspect-ratio parameter accepted by each configured image
    model (§4) — the one feasibility risk.
+2. Settle the aspect → `width×height` mapping for the resolution fallback (§4).
 3. Decide whether the PDE task's `max_tokens` needs raising for richer seed
    subjects (config-side; coordinate with the downstream `model_config.toml`).
