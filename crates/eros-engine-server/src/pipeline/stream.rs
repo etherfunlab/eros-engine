@@ -1331,7 +1331,14 @@ fn apply_ghosting_killswitch(
     hints: Vec<String>,
 ) -> eros_engine_core::types::ActionPlan {
     if !ghosting_enabled && plan.action_type == ActionType::Ghost {
-        eros_engine_core::pde::plan_for(input, ActionType::ReplyText, hints, None)
+        eros_engine_core::pde::plan_for(
+            input,
+            ActionType::ReplyText,
+            hints,
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        )
     } else {
         plan
     }
@@ -2162,7 +2169,7 @@ pub fn run_stream(
                             } else {
                                 None
                             };
-                            pde::plan_for(&input, action, hints, img_prompt)
+                            pde::plan_for(&input, action, hints, img_prompt, eros_engine_core::types::ImageRef::Face, None)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2196,6 +2203,8 @@ pub fn run_stream(
                 action,
                 plan.context_hints.clone(),
                 req_image.and_then(|i| i.image_prompt.clone()),
+                eros_engine_core::types::ImageRef::Face,
+                None,
             );
         }
 
@@ -3395,7 +3404,14 @@ mod tests {
     #[test]
     fn killswitch_downgrades_ghost_keeping_hints() {
         let input = pde_test_input();
-        let ghost_plan = eros_engine_core::pde::plan_for(&input, ActionType::Ghost, vec![], None);
+        let ghost_plan = eros_engine_core::pde::plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        );
         // ghosting enabled → unchanged
         let kept = apply_ghosting_killswitch(ghost_plan.clone(), true, &input, vec!["想躲".into()]);
         assert_eq!(kept.action_type, ActionType::Ghost);
@@ -3412,7 +3428,14 @@ mod tests {
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
-        let plan = pde::plan_for(&input, acted, hints.clone(), None);
+        let plan = pde::plan_for(
+            &input,
+            acted,
+            hints.clone(),
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        );
         // ghosting disabled → suppressed to reply, hints preserved
         let final_plan = apply_ghosting_killswitch(plan, false, &input, hints.clone());
         assert_eq!(final_plan.action_type, ActionType::ReplyText);
