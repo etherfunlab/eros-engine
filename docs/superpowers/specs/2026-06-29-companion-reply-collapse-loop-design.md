@@ -143,12 +143,13 @@ pub fn prune_recalled(
   collapse internal whitespace, trim, lowercase ASCII (CJK unaffected;
   char-boundary-safe, mirroring `repetition.rs`).
 - **Dedup:** across the whole injected set (profile items first, then relationship
-  facts), keep the first occurrence and drop later normalized duplicates
-  (exact-normalized, or contained-in an already-kept item with length
-  ≥ `MIN_MATCH_CHARS = 6`). Main real-world case: the same turn's Relationship
-  `用户：{u}` vs Profile raw `{u}` recalled together. Profile-first ordering means
-  a fact present in both layers is kept in `[user_profile]` and dropped from
-  `[shared_memories]`.
+  facts), keep the first occurrence and drop later items whose normalized form
+  **exactly equals** an already-kept one. Main real-world case: the same turn's
+  Relationship `用户：{u}` vs Profile raw `{u}` recalled together. Profile-first
+  ordering means a fact present in both layers is kept in `[user_profile]` and
+  dropped from `[shared_memories]`. (Equality, **not** containment — a richer
+  memory that merely contains a shorter fact, e.g. `用户：喜欢吃意大利面，但是对海鲜过敏`
+  vs a base `喜欢吃意大利面`, is kept; codex `[P2]`.)
 - **Wire-up** (`handlers.rs`, just before `build_prompt`): pass the recall result
   through `prune_recalled` and shadow `profile_groups`/`relationship_facts` with
   the pruned values. **Pure; no new DB calls.**
@@ -218,8 +219,9 @@ loop and **stay unchanged**.
   filter-before-`LIMIT` still yields up to K rows; the Profile (`None`) path is
   unaffected by the new clause.
 - **`memory_hygiene.rs`** (pure unit tests): dedups exact duplicates and the
-  cross-layer `用户：{u}` / `{u}` pair; respects `MIN_MATCH_CHARS` (a short
-  incidental substring is not deduped); preserves order; handles empty inputs.
+  cross-layer `用户：{u}` / `{u}` pair; does **not** drop a richer memory that
+  merely contains a shorter fact (equality-only dedup); preserves order; handles
+  empty inputs.
 - **`post_process.rs`** (pure unit tests): `should_write_user_turn` returns true
   only when the user message is non-empty and the burst has ≥1 non-empty produced
   message — a single decision per turn (multi-message burst ⇒ one write).
