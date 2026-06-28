@@ -669,6 +669,15 @@ pub(super) async fn build_reply_request(
         });
     emotional_context.reverse();
 
+    // #113: drop recalled memories that echo the persona's own recent prose
+    // (the self-feedback loop) or duplicate each other, before they enter the
+    // prompt. Reuses `recent_assistant` already fetched above; no new DB calls.
+    let (profile_groups, relationship_facts) = crate::memory_hygiene::prune_recalled(
+        profile_groups,
+        relationship_facts,
+        &recent_assistant,
+    );
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
