@@ -93,6 +93,11 @@ cannot self-reinforce the model's output.
   `relationship_memory_content(user_msg)`.
 - Profile-layer write (bare `user_msg`, `post_process.rs:323`) and dreaming-lite
   are unchanged — neither ever stored assistant prose.
+- The user-turn memory is written **once per turn**, not once per produced
+  message: `write_turn` (which no longer takes the assistant text) is called from
+  a single guarded `should_write_user_turn(user_msg, &produced)` check. A
+  multi-message assistant burst would otherwise insert identical duplicate
+  `用户：{u}` rows (caught in review — codex `[P2]`).
 
 **Result:** after this change, **no writer persists assistant prose into
 `companion_memories`.** The long-term channel can no longer carry the model's own
@@ -118,46 +123,42 @@ legacy format non-destructively, at recall time:
   data loss). It soft-quarantines the polluted legacy format; downstream may purge
   later if it wishes (out of scope for the engine, per OSS boundary).
 
-## 3. Change 3 — recall hygiene: dedup + self-output suppression
+## 3. Change 3 — recall hygiene: dedup recalled memories
 
 New pure, unit-testable module `crates/eros-engine-server/src/memory_hygiene.rs`,
-registered in `crates/eros-engine-server/src/lib.rs` (alongside `repetition`):
+registered in `crates/eros-engine-server/src/main.rs` (alongside `repetition`; the
+server crate is a binary, no `lib.rs`):
 
 ```rust
-/// Prune recalled memories before they are injected into the prompt:
-///  (a) drop any recalled item that closely matches the persona's own recent
-///      assistant output ("never recall my own words"); and
-///  (b) drop any recalled item that duplicates another recalled item.
-/// Pure, order-preserving, dependency-free (no embeddings).
+/// Dedup recalled memories before they are injected into the prompt: drop any
+/// recalled item that duplicates another (normalized equality, or length-guarded
+/// containment). Pure, order-preserving, dependency-free (no embeddings).
 pub fn prune_recalled(
     profile_groups: Vec<(String, Vec<String>)>,
     relationship_facts: Vec<String>,
-    recent_assistant: &[String],
 ) -> (Vec<(String, Vec<String>)>, Vec<String>);
 ```
 
-- **Normalize** each candidate (and each recent-assistant line): strip a leading
-  `用户：` / `AI：` speaker label, collapse internal whitespace, trim, lowercase
-  ASCII (CJK unaffected; char-boundary-safe, mirroring `repetition.rs`).
-- **Self-suppression (a):** drop a candidate whose normalized form is contained in
-  — or contains — a normalized recent-assistant line, guarded by
-  `MIN_MATCH_CHARS = 6` on the shorter string to avoid trivial substring hits.
-  Containment (not just equality) catches the gaze template embedded as a *clause*
-  of a longer reply.
-- **Dedup (b):** across the whole injected set (profile items first, then
-  relationship facts), keep the first occurrence and drop later normalized
-  duplicates (exact-normalized, or contained-in an already-kept item with length
-  ≥ `MIN_MATCH_CHARS`). Main real-world case: the same turn's
-  Relationship `用户：{u}` vs Profile raw `{u}` recalled together.
-- **Wire-up** (`handlers.rs`, the per-turn fetch cluster ~`:655–672`): the handler
-  already fetches `recent_assistant_contents(session, before, 6)` for
-  `avoid_patterns`. **Reuse it** — pass it to `prune_recalled` along with the
-  recall result, before `build_prompt`. **No new DB calls.**
+- **Normalize** each candidate: strip a leading `用户：` / `AI：` speaker label,
+  collapse internal whitespace, trim, lowercase ASCII (CJK unaffected;
+  char-boundary-safe, mirroring `repetition.rs`).
+- **Dedup:** across the whole injected set (profile items first, then relationship
+  facts), keep the first occurrence and drop later normalized duplicates
+  (exact-normalized, or contained-in an already-kept item with length
+  ≥ `MIN_MATCH_CHARS = 6`). Main real-world case: the same turn's Relationship
+  `用户：{u}` vs Profile raw `{u}` recalled together. Profile-first ordering means
+  a fact present in both layers is kept in `[user_profile]` and dropped from
+  `[shared_memories]`.
+- **Wire-up** (`handlers.rs`, just before `build_prompt`): pass the recall result
+  through `prune_recalled` and shadow `profile_groups`/`relationship_facts` with
+  the pruned values. **Pure; no new DB calls.**
 
-Note: after Change 1 + Change 2 the practical loop is already cut, so
-self-suppression mostly earns its keep as defense-in-depth (legacy rows that slip
-the SQL filter, and future writers); dedup delivers the everyday cross-layer
-cleanup. Both are in the approved scope.
+Note: self-output suppression (dropping recalled items that echo the persona's
+recent assistant output) was considered and **dropped during review** — Change 1
+\+ Change 2 already ensure no assistant-authored text reaches recall, so
+suppression had no legitimate target and only risked pruning legitimate user
+facts the assistant had echoed (codex `[P2]`). Dedup is the remaining,
+always-safe hygiene.
 
 ## 4. Change 4 — retire the symptom patch in iron-rule ⑨ (`prompt.rs`)
 
@@ -216,13 +217,14 @@ loop and **stay unchanged**.
   `用户：…\nAI：…` row and returns a clean user-only row for the same instance;
   filter-before-`LIMIT` still yields up to K rows; the Profile (`None`) path is
   unaffected by the new clause.
-- **`memory_hygiene.rs`** (pure unit tests): suppresses a recalled item that
-  matches recent assistant output (incl. the contained-as-a-clause case); respects
-  `MIN_MATCH_CHARS` (no trivial-substring suppression); dedups the cross-layer
-  `用户：{u}` / `{u}` pair; preserves order; handles CJK and empty inputs.
-- **`handlers.rs`** (focused integration): a recalled memory matching the persona's
-  recent assistant output is **not** present in the assembled system prompt
-  (`prune_recalled` wired before `build_prompt`).
+- **`memory_hygiene.rs`** (pure unit tests): dedups exact duplicates and the
+  cross-layer `用户：{u}` / `{u}` pair; respects `MIN_MATCH_CHARS` (a short
+  incidental substring is not deduped); preserves order; handles empty inputs.
+- **`post_process.rs`** (pure unit tests): `should_write_user_turn` returns true
+  only when the user message is non-empty and the burst has ≥1 non-empty produced
+  message — a single decision per turn (multi-message burst ⇒ one write).
+- **`handlers.rs`**: the `prune_recalled` wire-up is verified by compile + the full
+  server suite (its dedup logic is unit-tested in `memory_hygiene.rs`).
 - **`prompt.rs`**: existing `build_prompt_renders_anti_templating_directives`
   (`:1646`) stays green (it asserts `别开口就自述动作或凝视`, which is retained);
   add an assertion that the gaze enumeration is gone (e.g. with empty
@@ -236,11 +238,11 @@ loop and **stay unchanged**.
 
 | File | Change |
 | --- | --- |
-| `crates/eros-engine-server/src/pipeline/post_process.rs` | relationship content = user-only via pure `relationship_memory_content` |
+| `crates/eros-engine-server/src/pipeline/post_process.rs` | relationship content = user-only via pure `relationship_memory_content`; write once per turn via `should_write_user_turn` (drop dead `assistant_msg` param) |
 | `crates/eros-engine-store/src/memory.rs` | relationship `search` (`Some(instance_id)`) excludes legacy `\nAI：` rows (+ test) |
-| `crates/eros-engine-server/src/memory_hygiene.rs` | **new** pure module `prune_recalled` (dedup + self-output suppression) + tests |
-| `crates/eros-engine-server/src/lib.rs` | register `memory_hygiene` mod |
-| `crates/eros-engine-server/src/pipeline/handlers.rs` | pass the already-fetched `recent_assistant` + recall result through `prune_recalled` before `build_prompt` |
+| `crates/eros-engine-server/src/memory_hygiene.rs` | **new** pure module `prune_recalled` (dedup) + tests |
+| `crates/eros-engine-server/src/main.rs` | register `memory_hygiene` mod (server is a binary, no `lib.rs`) |
+| `crates/eros-engine-server/src/pipeline/handlers.rs` | pass the recall result through `prune_recalled` before `build_prompt` |
 | `crates/eros-engine-server/src/prompt.rs` | rewrite iron-rule ⑨ — drop the `（如「我看着…」「我盯着…」）` gaze enumeration, keep the engage-first clause (+ test assertion) |
 
 ## 9. Open decisions — all resolved
@@ -251,7 +253,11 @@ loop and **stay unchanged**.
   half. (Not full extraction, not dropping the relationship write entirely.)
 - Legacy rows: **non-destructive recall-time SQL filter** (exclude the
   `用户：…\nAI：…` transcript shape). No migration.
-- Recall hygiene: **dedup + self-output suppression**, pure module, reusing the
-  already-fetched recent-assistant turns; no new DB calls, no embeddings.
+- Recall hygiene: **dedup only**, pure module; no new DB calls, no embeddings.
+  (Self-output suppression was removed during review — redundant once Changes 1+2
+  cut the loop, and it risked pruning user facts the assistant echoed; codex `[P2]`.)
+- Write cadence: the user-turn memory is written **once per turn**
+  (`should_write_user_turn`), not per produced message — avoids duplicate rows on
+  multi-message bursts (codex `[P2]`).
 - Iron-rule ⑨: **rewrite** (drop the gaze enumeration, keep engage-first), not
   delete — the base-model opening-gaze tic is not loop-driven.
