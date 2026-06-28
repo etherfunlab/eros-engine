@@ -253,6 +253,34 @@ default_aspect_ratio = "3:4"
 default_resolution = "1024x1365"
 max_tokens = 4096
 
+# ── Image-prompt composer (chat_image_prompt_compose) ───────────────────────
+# OPTIONAL. When this block is present, after an image action is decided the
+# engine expands the PDE's seed subject into one richer image prompt before
+# generation: it feeds the persona appearance + seed subject + recent scene +
+# chosen aspect ratio + style to this model and uses the result as the image
+# subject. Feature is OFF when the block is absent. Fail-open: on failure /
+# timeout / empty it falls back to the PDE seed, so it never blocks the image
+# turn (and never advances any round-robin cursor on non-image turns).
+#
+# `filter_prompt` is OPTIONAL here (unlike the other tasks): omit it to use the
+# engine's built-in, product-identity-free EXPAND-ONLY default prompt, or set it
+# to override. The built-in expands faithfully and never softens, downgrades, or
+# refuses, and adds no moderation of its own — content policy is the image
+# provider's and the downstream consumer's responsibility, not this step. Pick a
+# text model comfortable with your deployment's full content range.
+#[tasks.chat_image_prompt_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#reasoning    = { enabled = false }
+# filter_prompt is OPTIONAL — omit to use the built-in EXPAND-ONLY default, or
+# set it to override:
+#filter_prompt = """
+#…your override here…
+#"""
+
 [tasks.insight_extraction]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
