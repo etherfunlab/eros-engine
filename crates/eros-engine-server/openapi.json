@@ -1486,6 +1486,14 @@
               "$ref": "#/components/schemas/PromptTraitDto"
             }
           },
+          "reply_to_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Optional id of a `chat_messages` row in this session to anchor context on.\nWhen valid, history rewinds to (and includes) that message; when present\nbut unresolvable, history is dropped for this turn (recorded in metadata)."
+          },
           "tier": {
             "type": [
               "string",
