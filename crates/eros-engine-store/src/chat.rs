@@ -252,11 +252,18 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// History for a quote-anchored turn, chronological.
-    /// `anchor = Some(ts)` (rewind): the ≤`limit` messages with `sent_at <= ts`,
-    /// plus the current message `current_msg_id` (whose `sent_at > ts`) — i.e.
-    /// the window ending at the quoted message with the new message appended;
-    /// messages strictly between are excluded.
+    ///
+    /// `anchor = Some(ts)` (rewind): returns **at most `limit` rows total**,
+    /// chronological. The current message (`current_msg_id`, whose
+    /// `sent_at > ts`) is always included and **counts toward `limit`**; it
+    /// sorts first under `DESC` so `LIMIT` only trims the oldest
+    /// below-anchor rows. Messages with `sent_at` strictly between `ts` and
+    /// the current message's `sent_at` are excluded. This matches the
+    /// `history()` window contract — both use `limit` rows total including
+    /// the newest (current) message.
+    ///
     /// `anchor = None` (drop history): only the `current_msg_id` row.
+    ///
     /// Uses the existing `(session_id, sent_at DESC)` index — no migration.
     pub async fn history_anchored(
         &self,
@@ -2616,6 +2623,50 @@ mod tests {
             got,
             vec!["current"],
             "DropHistory → only the current message"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_anchored_rewind_counts_current_toward_limit(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let base = chrono::Utc::now();
+        // A B M C D E U with strictly increasing sent_at.
+        let labels = ["A", "B", "M", "C", "D", "E", "U"];
+        let mut ids = Vec::new();
+        for (i, label) in labels.iter().enumerate() {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            ids.push(
+                insert_at(
+                    &pool,
+                    s.id,
+                    role,
+                    label,
+                    base + chrono::Duration::seconds(i as i64),
+                )
+                .await,
+            );
+        }
+        let m = ids[2];
+        let u = ids[6];
+        let m_ts = repo
+            .message_sent_at_in_session(s.id, m)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // limit=3: qualifying rows are {A,B,M (sent_at<=ts)} + {U}; DESC = U,M,B,A; LIMIT 3 = U,M,B;
+        // reversed = [B, M, U]. The current message U always survives (highest sent_at sorts first
+        // under DESC); the oldest below-anchor row (A) is trimmed. U counts toward the limit.
+        let rows = repo.history_anchored(s.id, u, Some(m_ts), 3).await.unwrap();
+        let got: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["B", "M", "U"],
+            "limit caps total incl. U; oldest (A) trimmed; U survives"
         );
     }
 }
