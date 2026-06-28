@@ -284,6 +284,15 @@ async fn persist_affinity(
 
 // ─── Memory layer ──────────────────────────────────────────────────
 
+/// Relationship-layer memory content for a turn. Stores only the user's
+/// utterance — never the assistant's prose, which would feed back into the
+/// model's own prompt via recall and collapse replies to a repeated line
+/// (see issue #113). The `用户：` label keeps a recalled line readable as
+/// "what the user said."
+fn relationship_memory_content(user_msg: &str) -> String {
+    format!("用户：{user_msg}")
+}
+
 /// Write a full conversation turn into both pgvector layers.
 async fn write_turn(
     state: &AppState,
@@ -291,12 +300,12 @@ async fn write_turn(
     user_id: Uuid,
     instance_id: Uuid,
     user_msg: &str,
-    assistant_msg: &str,
+    _assistant_msg: &str,
 ) {
     let repo = MemoryRepo { pool: &state.pool };
 
-    // Relationship layer (user × persona).
-    let rel_content = format!("用户：{user_msg}\nAI：{assistant_msg}");
+    // Relationship layer (user × persona): user turn only (see #113).
+    let rel_content = relationship_memory_content(user_msg);
     if let Err(e) = embed_and_upsert(
         &repo,
         &state.voyage,
@@ -1479,5 +1488,15 @@ mod tests {
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "parse_error");
         assert_eq!(rows[0].2, None, "parse_error ⇒ NULL payload");
+    }
+
+    #[test]
+    fn relationship_memory_content_stores_user_turn_only() {
+        let c = relationship_memory_content("今天好累");
+        assert_eq!(c, "用户：今天好累");
+        assert!(
+            !c.contains("AI："),
+            "relationship memory must not carry assistant prose (#113): {c}"
+        );
     }
 }
