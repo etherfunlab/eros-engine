@@ -184,11 +184,73 @@ when the frame is emitted.
 
 | Field | Type | Notes |
 |---|---|---|
-| `filtered` | `bool` | `true` if the output filter ran and rewrote the reply for this turn; `false` otherwise. |
+| `filtered` | `bool` | `true` if the client received non-raw output this turn — set by the regex strip (`output_regex`), the LLM `output_filter`, or both; `false` otherwise. |
 | `retries_chat` | `u32` | Number of fallback retries consumed by the chat model call (0 = primary succeeded). |
 | `retries_filter` | `u32` | Number of fallback retries consumed by the filter model call (0 = primary succeeded or filter did not run). |
 | `prompt_injected` | `Array<String>` \| `null` | Trait tags that were injected into the prompt this turn, or `null` if none. Independent of the filter. |
 | `tier` | `String` \| `null` | Echo of the `tier` field from the request, or `null` if none was sent. Independent of the filter. |
+
+### `output_regex` — deterministic per-model regex strip (chat task only)
+
+`output_regex` is an array of strip rules on `[tasks.chat_companion]` (task-level
+only — no per-tier override). Each rule deletes or replaces regex matches in the
+assistant reply produced by any model in `models`. It is **off by default** (absent
+or empty array means no stripping).
+
+```toml
+[tasks.chat_companion]
+output_regex = [
+  # Strip L3.3-Euryale's self-narrated photo line on reply_text_image turns.
+  { models = ["sao10k/l3.3-euryale-70b"],
+    pattern = '\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$' },
+  # Replace matches instead of deleting (replacement defaults to "" = delete):
+  # { models = ["x/y"], pattern = '...', replacement = "…" },
+]
+```
+
+#### Rule shape
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `models` | `Array<String>` | yes | Model ids whose replies this rule applies to. Exact string match against the chat model id that produced the reply — i.e. the row's `model` column, NOT `filter_model` (which is set to `"<regex>"` when a strip fires). |
+| `pattern` | `String` | yes | Rust `regex` crate pattern. **No lookaround or backreferences** — anchor with `$`, `^`, `\s*`, char classes. An invalid pattern causes server boot to fail. |
+| `replacement` | `String` | no | Text to substitute for each match. Absent or `""` = delete the match. |
+
+Rules are checked in declaration order; all matching rules are applied sequentially
+to the same reply.
+
+#### Execution order — layer 0
+
+The regex strip runs **before** any other processing:
+
+1. Regex strip (layer 0) — applied first, before the client sees anything
+2. LLM `output_filter` (if enabled) — second pass
+3. Memory / insight / affinity extraction — reads the already-stripped text
+
+The matched text therefore reaches **neither** the client **nor** the stored
+`content` **nor** the extract pipeline — regardless of `timing` on
+`[tasks.chat_output_filter]`.
+
+#### Audit columns
+
+| Column | Value when strip fires |
+|---|---|
+| `pre_filter_content` | The raw (pre-strip) reply |
+| `filter_model` | `"<regex>"` |
+
+These columns are set only when at least one rule actually changes the reply (same
+as the LLM filter — a no-op strip leaves them null).
+
+#### Empty-result fail-safe
+
+A strip that would reduce a non-empty reply to an empty string is a **no-op** — the
+original reply is delivered unchanged and the audit columns are not set. This
+prevents an over-broad pattern from silencing the companion.
+
+#### `filtered` flag
+
+The SSE `final`-frame `filtered` field is `true` when the client received non-raw
+output from **either** the regex strip **or** the LLM `output_filter` (or both).
 
 ### `input_filter` — user-input rewrite (chat task only)
 
@@ -447,6 +509,12 @@ What may still change without notice:
   is inert). See "output_filter — second-pass reply rewrite" above.
 - SSE `final`-frame fields `filtered`, `retries_chat`, `retries_filter`,
   `prompt_injected`, `tier`: added in 0.x.
+- `output_regex` (optional array, `[tasks.chat_companion]`): added in 0.x.
+  Task-level only (no per-tier override). Deterministic regex strips applied
+  before the client sees the reply, before the LLM `output_filter`, and before
+  extract. The `filtered` flag is `true` when either the regex strip or the LLM
+  filter (or both) produced non-raw output. See "`output_regex` — deterministic
+  per-model regex strip" above.
 
 ## What this config does NOT control
 

@@ -148,11 +148,13 @@ impl<'a> MemoryRepo<'a> {
                     "SELECT id, session_id, user_id, instance_id, content, category, created_at \
                      FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id = $2 \
-                     ORDER BY embedding <=> $3::vector \
-                     LIMIT $4",
+                       AND content NOT LIKE $3 \
+                     ORDER BY embedding <=> $4::vector \
+                     LIMIT $5",
                 )
                 .bind(user_id)
                 .bind(pid)
+                .bind("%\nAI：%") // #113: exclude legacy "用户：…\nAI：…" transcript rows
                 .bind(vec_text)
                 .bind(k as i64)
                 .fetch_all(self.pool)
@@ -278,6 +280,53 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, target_id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn relationship_search_excludes_legacy_transcript_rows(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+
+        // Legacy verbatim turn (contains "\nAI："). It is the NEAREST neighbour
+        // to the query (same seed), so if the filter ran after LIMIT it would
+        // occupy the only slot and the search would return nothing.
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "用户：你好\nAI：我看着你，轻声说。",
+            &unit_embedding(7),
+            None,
+        )
+        .await
+        .unwrap();
+        // New user-only row, FARTHER from the query.
+        let clean_id = repo
+            .upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                user_id,
+                Some(instance_id),
+                "用户：你好",
+                &unit_embedding(8),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hits = repo
+            .search(user_id, Some(instance_id), &unit_embedding(7), 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "filter must run before LIMIT");
+        assert_eq!(
+            hits[0].id, clean_id,
+            "legacy transcript row must be excluded"
+        );
+        assert!(!hits[0].content.contains("\nAI："));
     }
 
     #[sqlx::test(migrations = "./migrations")]

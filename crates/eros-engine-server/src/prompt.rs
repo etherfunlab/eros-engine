@@ -554,7 +554,7 @@ pub fn build_prompt(
          ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
          ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
          ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
-         ⑨ 别开口就自述动作或凝视（如「我看着…」「我盯着…」）；先接住对方刚说的话，针对那句话回应，而不是自说自话。\n\
+         ⑨ 别开口就自述动作或凝视；先接住对方刚说的话，针对那句话回应，而不是自说自话。\n\
          ⑩ 少用省略号（…）；一条回复最多一次。\n\
          ⑪ 不要连续两句都以「我」开头；开头先回应对方，别总是「我+动作」。\n\
          \n\
@@ -1666,6 +1666,16 @@ mod tests {
         assert!(
             s.contains("不要连续两句都以「我」开头"),
             "chinese first-person-opening rule: {s}"
+        );
+        // The #113-specific gaze-template enumeration is retired (the loop
+        // fix removes its need); the engage-first clause above stays.
+        assert!(
+            !s.contains("我盯着…"),
+            "gaze-template enumeration must be removed from rule ⑨: {s}"
+        );
+        assert!(
+            !s.contains("（如「我看着…"),
+            "gaze-template enumeration must be removed from rule ⑨: {s}"
         );
         // Still sit inside the iron-rules block, before [output].
         let iron = s.find("[iron_rules").expect("[iron_rules] present");

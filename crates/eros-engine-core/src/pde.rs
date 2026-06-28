@@ -6,7 +6,7 @@
 
 use crate::affinity::AffinityDeltas;
 use crate::ghost::{self, GhostDecision, GhostSignals};
-use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ReplyStyle};
+use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, ReplyStyle};
 
 // Decision thresholds — tune here rather than at call sites.
 const LONG_MSG_CHARS: usize = 30;
@@ -50,6 +50,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
             image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
         };
     }
 
@@ -66,6 +68,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
         };
     }
 
@@ -78,6 +82,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
             image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
         };
     }
 
@@ -91,6 +97,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
             image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
         };
     }
 
@@ -102,6 +110,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
         image_prompt: None,
+        image_ref: ImageRef::Face,
+        aspect_ratio: None,
     }
 }
 
@@ -117,6 +127,8 @@ pub fn plan_for(
     action: ActionType,
     hints: Vec<String>,
     image_prompt: Option<String>,
+    image_ref: ImageRef,
+    aspect_ratio: Option<String>,
 ) -> ActionPlan {
     match action {
         ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => ActionPlan {
@@ -126,6 +138,8 @@ pub fn plan_for(
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
             image_prompt,
+            image_ref,
+            aspect_ratio,
         },
         ActionType::Ghost => ActionPlan {
             action_type: ActionType::Ghost,
@@ -134,6 +148,8 @@ pub fn plan_for(
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
         },
         ActionType::Proactive => {
             unreachable!("plan_for is never called with Proactive; it comes only from pde::decide")
@@ -422,7 +438,14 @@ mod tests {
     #[test]
     fn plan_for_reply_text_is_neutral_with_hints() {
         let input = test_decision_input();
-        let plan = plan_for(&input, ActionType::ReplyText, vec!["有点开心".into()], None);
+        let plan = plan_for(
+            &input,
+            ActionType::ReplyText,
+            vec!["有点开心".into()],
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(plan.action_type, ActionType::ReplyText);
         assert_eq!(plan.reply_style, ReplyStyle::Neutral);
         assert_eq!(plan.context_hints, vec!["有点开心".to_string()]);
@@ -432,7 +455,14 @@ mod tests {
     #[test]
     fn plan_for_ghost_is_cold_and_drops_hints() {
         let input = test_decision_input();
-        let plan = plan_for(&input, ActionType::Ghost, vec!["想躲".into()], None);
+        let plan = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec!["想躲".into()],
+            None,
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(plan.action_type, ActionType::Ghost);
         assert_eq!(plan.reply_style, ReplyStyle::Cold);
         assert!(plan.context_hints.is_empty());
@@ -447,11 +477,47 @@ mod tests {
             ActionType::ReplyTextImage,
             vec![],
             Some("a selfie in a cafe".to_string()),
+            ImageRef::Face,
+            None,
         );
         assert_eq!(plan.action_type, ActionType::ReplyTextImage);
         assert_eq!(plan.image_prompt.as_deref(), Some("a selfie in a cafe"));
 
-        let ghost = plan_for(&input, ActionType::Ghost, vec![], Some("ignored".into()));
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            Some("ignored".into()),
+            ImageRef::Face,
+            None,
+        );
         assert_eq!(ghost.image_prompt, None, "ghost carries no image prompt");
+    }
+
+    #[test]
+    fn plan_for_threads_image_ref_and_aspect() {
+        let input = test_decision_input(); // reuse the helper the sibling plan_for tests use
+        let plan = plan_for(
+            &input,
+            ActionType::ReplyImage,
+            vec![],
+            Some("a subject".into()),
+            ImageRef::Previous,
+            Some("9:16".into()),
+        );
+        assert_eq!(plan.image_ref, ImageRef::Previous);
+        assert_eq!(plan.aspect_ratio.as_deref(), Some("9:16"));
+
+        // ghost discards image fields → defaults
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            Some("ignored".into()),
+            ImageRef::Previous,
+            Some("9:16".into()),
+        );
+        assert_eq!(ghost.image_ref, ImageRef::Face);
+        assert_eq!(ghost.aspect_ratio, None);
     }
 }

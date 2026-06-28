@@ -115,11 +115,11 @@ pub struct ImageGenRequest {
     pub prompt: String,
     /// Optional face/style reference image URL (image2image hint).
     pub face_ref_url: Option<String>,
-    /// Model-specific aspect ratio hint (e.g. `"3:4"`). Folded into the
-    /// text instruction when present.
+    /// Model-specific aspect ratio hint (e.g. `"3:4"`). Sent as a real size
+    /// parameter (see `build_image_body`).
     pub aspect_ratio: Option<String>,
-    /// Model-specific resolution hint (e.g. `"1024x1024"`). Folded into
-    /// the text instruction when present.
+    /// Model-specific resolution hint (e.g. `"1024x1024"`). Sent as a real
+    /// size parameter (see `build_image_body`); preferred over `aspect_ratio`.
     pub resolution: Option<String>,
     pub max_tokens: u32,
 }
@@ -149,25 +149,50 @@ fn images_from_wire(parsed: &WireResponse) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Map a supported aspect ratio to a concrete `width×height` (pixels). The five
+/// ratios match the engine's validated allow-list. Used to drive a real size
+/// parameter for image models that do not honor a free-form aspect hint. Pure.
+fn aspect_to_resolution(aspect: &str) -> Option<(u32, u32)> {
+    match aspect {
+        "1:1" => Some((1024, 1024)),
+        "3:4" => Some((900, 1200)),
+        "4:3" => Some((1200, 900)),
+        "9:16" => Some((720, 1280)),
+        "16:9" => Some((1280, 720)),
+        _ => None,
+    }
+}
+
+/// Parse an explicit `"WxH"` resolution string into `(width, height)`. Pure.
+fn parse_resolution(res: &str) -> Option<(u32, u32)> {
+    let (w, h) = res.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
 /// Build the OpenRouter wire body for one image-gen attempt. Pure (no I/O).
 fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
-    // Aspect ratio / resolution are model-specific; fold them into the text
-    // instruction as a best-effort hint (works across image models).
-    let mut text = req.prompt.clone();
-    if let Some(ar) = req.aspect_ratio.as_deref().filter(|s| !s.is_empty()) {
-        text.push_str(&format!("\n(aspect ratio: {ar})"));
-    }
-    if let Some(res) = req.resolution.as_deref().filter(|s| !s.is_empty()) {
-        text.push_str(&format!("\n(resolution: {res})"));
-    }
-    let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
+    // Size is a real generation parameter: prefer an explicit resolution, else
+    // derive a concrete width×height from the aspect ratio. (The old text-hint
+    // "(aspect ratio: …)" was ignored by image models — removed.)
+    let size = req
+        .resolution
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(parse_resolution)
+        .or_else(|| {
+            req.aspect_ratio
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(aspect_to_resolution)
+        });
+    let mut content = vec![serde_json::json!({ "type": "text", "text": req.prompt })];
     if let Some(face) = req.face_ref_url.as_deref().filter(|s| !s.is_empty()) {
         content.push(serde_json::json!({
             "type": "image_url",
             "image_url": { "url": face }
         }));
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         // #101: image-only output. Image-only models reject ["image","text"]
         // with 404; text-capable models still return the image for ["image"].
@@ -177,7 +202,12 @@ fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
         "messages": [ { "role": "user", "content": content } ],
         "max_tokens": req.max_tokens,
         "stream": false,
-    })
+    });
+    if let Some((w, h)) = size {
+        body["width"] = serde_json::json!(w);
+        body["height"] = serde_json::json!(h);
+    }
+    body
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2250,6 +2280,51 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn aspect_to_resolution_maps_all_five() {
+        assert_eq!(aspect_to_resolution("1:1"), Some((1024, 1024)));
+        assert_eq!(aspect_to_resolution("3:4"), Some((900, 1200)));
+        assert_eq!(aspect_to_resolution("4:3"), Some((1200, 900)));
+        assert_eq!(aspect_to_resolution("9:16"), Some((720, 1280)));
+        assert_eq!(aspect_to_resolution("16:9"), Some((1280, 720)));
+        assert_eq!(aspect_to_resolution("5:2"), None);
+    }
+
+    #[test]
+    fn build_image_body_sends_size_not_text_hint() {
+        let req = ImageGenRequest {
+            model: "m".into(),
+            prompt: "a cat".into(),
+            aspect_ratio: Some("9:16".into()),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let body = build_image_body(&req, "m");
+        // size is sent as real params
+        assert_eq!(body["width"], 720);
+        assert_eq!(body["height"], 1280);
+        // prompt text is clean — no folded hint
+        let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("aspect ratio"), "no text hint: {text}");
+        assert!(!text.contains("resolution"), "no text hint: {text}");
+        assert_eq!(text, "a cat");
+    }
+
+    #[test]
+    fn build_image_body_prefers_explicit_resolution() {
+        let req = ImageGenRequest {
+            model: "m".into(),
+            prompt: "x".into(),
+            aspect_ratio: Some("1:1".into()),
+            resolution: Some("768x1024".into()),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let body = build_image_body(&req, "m");
+        assert_eq!(body["width"], 768);
+        assert_eq!(body["height"], 1024);
+    }
+
+    #[test]
     fn image_body_has_modalities_and_optional_face_ref() {
         let req = ImageGenRequest {
             model: "m".into(),
@@ -2269,7 +2344,8 @@ data: [DONE]\n\n";
         // text-only content block when no face ref
         assert_eq!(content.as_array().unwrap().len(), 1);
         assert!(content[0]["text"].as_str().unwrap().contains("a cat"));
-        assert!(content[0]["text"].as_str().unwrap().contains("3:4"));
+        // aspect ratio is now sent as width/height params, not folded into text
+        assert!(!content[0]["text"].as_str().unwrap().contains("3:4"));
 
         let req2 = ImageGenRequest {
             face_ref_url: Some("https://x/a.png".into()),

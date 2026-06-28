@@ -14,6 +14,9 @@ pub struct AppState {
     pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
     pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
+    /// Compiled `[tasks.chat_companion].output_regex` rules, built once at boot
+    /// (fail-fast). Empty when none configured. Read by `drive_chat_burst`.
+    pub output_regex: Arc<Vec<eros_engine_llm::model_config::CompiledRegexRule>>,
     pub stream_slots: Arc<StreamSlots>,
 }
 
