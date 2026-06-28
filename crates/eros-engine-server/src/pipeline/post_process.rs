@@ -88,18 +88,8 @@ pub async fn run(
     };
 
     let fut_memory = async {
-        for m in &produced {
-            if !user_msg.is_empty() && !m.full_text.is_empty() {
-                write_turn(
-                    &state,
-                    session_id,
-                    user_id,
-                    instance_id,
-                    &user_msg,
-                    &m.full_text,
-                )
-                .await;
-            }
+        if should_write_user_turn(&user_msg, &produced) {
+            write_turn(&state, session_id, user_id, instance_id, &user_msg).await;
         }
     };
 
@@ -293,6 +283,15 @@ fn relationship_memory_content(user_msg: &str) -> String {
     format!("用户：{user_msg}")
 }
 
+/// Whether to record this turn's user utterance as a companion memory.
+/// One decision per turn (not per produced message): the relationship/profile
+/// rows store the user's utterance only (#113), so a multi-message assistant
+/// burst must not insert duplicate rows. Mirrors the one-eval-per-turn shape
+/// of the affinity path.
+fn should_write_user_turn(user_msg: &str, produced: &[ProducedMessage]) -> bool {
+    !user_msg.is_empty() && produced.iter().any(|m| !m.full_text.is_empty())
+}
+
 /// Write a full conversation turn into both pgvector layers.
 async fn write_turn(
     state: &AppState,
@@ -300,7 +299,6 @@ async fn write_turn(
     user_id: Uuid,
     instance_id: Uuid,
     user_msg: &str,
-    _assistant_msg: &str,
 ) {
     let repo = MemoryRepo { pool: &state.pool };
 
@@ -1498,5 +1496,50 @@ mod tests {
             !c.contains("AI："),
             "relationship memory must not carry assistant prose (#113): {c}"
         );
+    }
+
+    fn make_produced(full_text: &str) -> ProducedMessage {
+        ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: full_text.to_string(),
+            action: ActionType::ReplyText,
+        }
+    }
+
+    #[test]
+    fn should_write_user_turn_empty_user_msg_is_false() {
+        // even if produced has text, an empty user utterance must not write
+        let produced = vec![make_produced("assistant reply")];
+        assert!(!should_write_user_turn("", &produced));
+    }
+
+    #[test]
+    fn should_write_user_turn_empty_produced_is_false() {
+        assert!(!should_write_user_turn("hello", &[]));
+    }
+
+    #[test]
+    fn should_write_user_turn_all_produced_empty_text_is_false() {
+        // produced present but every full_text is empty → no write
+        let produced = vec![make_produced(""), make_produced("")];
+        assert!(!should_write_user_turn("hello", &produced));
+    }
+
+    #[test]
+    fn should_write_user_turn_single_produced_with_text_is_true() {
+        let produced = vec![make_produced("assistant reply")];
+        assert!(should_write_user_turn("hello", &produced));
+    }
+
+    #[test]
+    fn should_write_user_turn_multi_produced_with_text_is_true() {
+        // regression case: multi-message burst must yield ONE decision (true),
+        // not loop N times as the old code did
+        let produced = vec![
+            make_produced("first assistant message"),
+            make_produced("second assistant message"),
+            make_produced("third assistant message"),
+        ];
+        assert!(should_write_user_turn("hello", &produced));
     }
 }
