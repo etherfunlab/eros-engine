@@ -669,6 +669,11 @@ pub(super) async fn build_reply_request(
         });
     emotional_context.reverse();
 
+    // #113: dedup recalled memories (mainly the cross-layer 用户：{u} / {u}
+    // overlap) before they enter the prompt. Pure; no new DB calls.
+    let (profile_groups, relationship_facts) =
+        crate::memory_hygiene::prune_recalled(profile_groups, relationship_facts);
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
