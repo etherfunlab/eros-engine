@@ -270,8 +270,11 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `aspect_ratio` | `String` | 任务 `default_aspect_ratio` | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。非法时返回 `422`。 |
 | `resolution` | `String` | 任务 `default_resolution` | 模型相关的分辨率提示（如 `"1024x1365"`）。仅做形状校验，透传给模型。 |
 | `face_ref_url` | `String` | 缺失 | 图生图面部参考图（绝对 `http(s)` URL，≤ 2048 字符）。格式非法时返回 `422`。 |
+| `prev_image_url` | `String` | 缺失 | 上一张生成的图片，用于迭代续图（绝对 `http(s)` URL，≤ 2048 字符；校验同 `face_ref_url`）。仅当 PDE 选择 `image_ref = "previous"`（见下）时使用，否则忽略。私有对象存储的调用方应传一个短时效签名 URL——引擎不会去拉取它，而是把 URL 嵌进 OpenRouter 请求体，由画图供应商在生成时拉取。格式非法时返回 `422`。 |
 
-校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`face_ref_url` 格式错误、`aspect_ratio` 不在允许集、`resolution` 形状错误，均作为 pre-stream 错误返回 `422 BadRequest`。
+**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`）。出图时引擎据此选参考图：`previous` 且带有 `prev_image_url` ⇒ 在上一张图上迭代；否则回退到 `face_ref_url`（头像）。所选类型记录在 `metadata.image` 中。
+
+校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`face_ref_url` 或 `prev_image_url` 格式错误、`aspect_ratio` 不在允许集、`resolution` 形状错误，均作为 pre-stream 错误返回 `422 BadRequest`。
 
 **`image` SSE 帧** — 图片生成成功时，在文字的 `done` 帧之后发出：
 

@@ -294,6 +294,7 @@ input filter has no triggers, timing, or tiers).
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_generation` | `pipeline::stream` (opt-in image reply executor; activated when this task block is present) | live (opt-in) |
+| `chat_image_prompt_compose` | `pipeline::stream` (opt-in image-prompt composer; expands the PDE seed subject before image generation; activated when this task block is present) | live (opt-in) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
@@ -304,7 +305,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 
@@ -389,6 +390,56 @@ unaffected.
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_gen()` in `model_config.rs`.
+
+### `[tasks.chat_image_prompt_compose]` — image-prompt composer (opt-in)
+
+The PDE writes a terse seed `image_prompt` while also choosing the action and
+`inner_state` on a tight token budget. When this task block is present, the
+engine runs a dedicated composer **after** an image action is decided and
+**before** generation: it sends the model the persona appearance, the recent
+scene, the PDE seed subject, the chosen style, and the target aspect ratio, and
+uses the expanded result as the image subject (sent to the image model,
+persisted to `metadata.image.prompt`, and emitted in the `image` SSE frame). The
+PDE's original seed is preserved separately in the decision audit.
+
+The feature is **off by default** and activates only when this block exists.
+It is **fail-open**: on composer failure / timeout / empty output the engine
+falls back to the PDE seed unchanged, so it never blocks or fails the image
+turn. The task is resolved **lazily, only on image turns**, so it never advances
+a `model` round-robin cursor on text/ghost turns.
+
+```toml
+[tasks.chat_image_prompt_compose]
+model        = "x-ai/grok-4"                       # any text model; pick one comfortable with your content range
+fallback     = ["google/gemini-3.1-flash-lite"]
+retry_depth  = 1
+temperature  = 0.7
+max_tokens   = 700
+# reasoning  = { enabled = false }
+# filter_prompt is OPTIONAL — omit to use the built-in default (below):
+# filter_prompt = """…override…"""
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `model` | `ModelSpec` (string \| array \| table) | absent | Composer model (same three shapes as `chat_companion.model`). |
+| `fallback` | `String` \| `Array<String>` | `[]` | Sequential retry chain (FallbackSpec), truncated to `retry_depth`. |
+| `retry_depth` | `u32` | `1` | Primary + this many fallbacks. |
+| `temperature` | `f64` | task default | Sampling temperature for the composer call. |
+| `max_tokens` | `u32` | task default | Token cap for the composer call. |
+| `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
+| `filter_prompt` | `String` | **built-in default** | **Optional** (unlike other tasks). Blank/absent ⇒ the engine's built-in `DEFAULT_COMPOSE_PROMPT`; non-blank ⇒ override. |
+
+**Built-in default prompt.** Unlike every other task (whose prompt must come from
+config), the composer ships a generic, **product-identity-free** built-in
+default. Its stance is **expand-only**: it faithfully expands the seed subject and
+appearance into a detailed prompt and does **not** soften, downgrade, censor, or
+refuse, and adds no content-moderation layer of its own — moderation is delegated
+to the image-model provider and the downstream deployment, not this step. A
+non-blank `filter_prompt` overrides it; a blank/absent one falls back to it.
+
+Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
+`resolve_image_prompt_compose()` in `model_config.rs`.
 
 ### `[tasks.chat_vision]` — image input (vision pre-stage, opt-in)
 
