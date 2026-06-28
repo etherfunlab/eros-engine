@@ -292,10 +292,17 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
 | `resolution` | `String` | task `default_resolution` | Model-specific hint (e.g. `"1024x1365"`). Shape-validated only — opaque beyond that. |
 | `face_ref_url` | `String` | absent | image2image face/appearance reference (absolute `http(s)`, ≤ 2048 chars). Returns `422` if malformed. |
+| `prev_image_url` | `String` | absent | The previously generated image, for iteration (absolute `http(s)`, ≤ 2048 chars; validated like `face_ref_url`). Used only when the PDE picks `image_ref = "previous"` (see below); otherwise ignored. Clients backed by a private object store should pass a short-lived signed URL — the engine does not fetch it; it embeds the URL in the OpenRouter body and the image provider fetches it at generation time. Returns `422` if malformed. |
+
+**Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
+(`"face"` | `"previous"`, default `"face"`). At draw time the engine picks the
+reference: `previous` + a present `prev_image_url` ⇒ iterate on the previous
+image; otherwise fall back to `face_ref_url` (the avatar). The chosen kind is
+recorded in `metadata.image`.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. A malformed
-`face_ref_url`, unsupported `aspect_ratio`, or invalid `resolution` shape returns
-`422 BadRequest` as a pre-stream error.
+`face_ref_url` or `prev_image_url`, unsupported `aspect_ratio`, or invalid
+`resolution` shape returns `422 BadRequest` as a pre-stream error.
 
 **`image` SSE frame** — emitted after the text's `done` frame when image generation
 succeeds:
