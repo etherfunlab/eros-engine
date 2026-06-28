@@ -120,18 +120,17 @@ mod tests {
             vec!["我看着你的眼睛".into()],
             &["嗯，我看着你的眼睛，慢慢说。".into()],
         );
-        assert!(rel.is_empty(), "contained clause (>= MIN_MATCH_CHARS) must be dropped");
+        assert!(
+            rel.is_empty(),
+            "contained clause (>= MIN_MATCH_CHARS) must be dropped"
+        );
     }
 
     #[test]
     fn keeps_short_incidental_overlap() {
         // "公园" (2 chars) is contained in the recent reply but below
         // MIN_MATCH_CHARS, so it is NOT suppressed by containment.
-        let (_p, rel) = prune_recalled(
-            vec![],
-            vec!["公园".into()],
-            &["我今天去了公园散步".into()],
-        );
+        let (_p, rel) = prune_recalled(vec![], vec!["公园".into()], &["我今天去了公园散步".into()]);
         assert_eq!(rel, vec!["公园".to_string()]);
     }
 
@@ -143,8 +142,14 @@ mod tests {
             vec!["用户：住在上海".into()],
             &[],
         );
-        assert_eq!(profile, vec![("fact".to_string(), vec!["住在上海".to_string()])]);
-        assert!(rel.is_empty(), "relationship dup of a profile fact is dropped");
+        assert_eq!(
+            profile,
+            vec![("fact".to_string(), vec!["住在上海".to_string()])]
+        );
+        assert!(
+            rel.is_empty(),
+            "relationship dup of a profile fact is dropped"
+        );
     }
 
     #[test]
@@ -156,7 +161,11 @@ mod tests {
         );
         assert_eq!(
             rel,
-            vec!["甲".to_string(), "乙丙丁戊己庚".to_string(), "辛壬癸子丑寅".to_string()]
+            vec![
+                "甲".to_string(),
+                "乙丙丁戊己庚".to_string(),
+                "辛壬癸子丑寅".to_string()
+            ]
         );
     }
 

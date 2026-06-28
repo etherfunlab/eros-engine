@@ -293,21 +293,39 @@ mod tests {
         // to the query (same seed), so if the filter ran after LIMIT it would
         // occupy the only slot and the search would return nothing.
         repo.upsert(
-            MemoryLayer::Relationship, session_id, user_id, Some(instance_id),
-            "用户：你好\nAI：我看着你，轻声说。", &unit_embedding(7), None,
-        ).await.unwrap();
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "用户：你好\nAI：我看着你，轻声说。",
+            &unit_embedding(7),
+            None,
+        )
+        .await
+        .unwrap();
         // New user-only row, FARTHER from the query.
-        let clean_id = repo.upsert(
-            MemoryLayer::Relationship, session_id, user_id, Some(instance_id),
-            "用户：你好", &unit_embedding(8), None,
-        ).await.unwrap();
+        let clean_id = repo
+            .upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                user_id,
+                Some(instance_id),
+                "用户：你好",
+                &unit_embedding(8),
+                None,
+            )
+            .await
+            .unwrap();
 
         let hits = repo
             .search(user_id, Some(instance_id), &unit_embedding(7), 1)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "filter must run before LIMIT");
-        assert_eq!(hits[0].id, clean_id, "legacy transcript row must be excluded");
+        assert_eq!(
+            hits[0].id, clean_id,
+            "legacy transcript row must be excluded"
+        );
         assert!(!hits[0].content.contains("\nAI："));
     }
 
