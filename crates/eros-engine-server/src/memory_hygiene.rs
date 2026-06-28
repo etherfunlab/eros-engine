@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Recall-time dedup for companion memories (issue #113): drop recalled items
-//! that duplicate another recalled item. Cross-layer: a fact present in both
-//! the profile and relationship layers is kept in the profile and dropped from
-//! the relationship layer. Pure, deterministic, no I/O.
-
-/// Minimum normalized length (chars) for a *containment* match to count.
-/// Guards against suppressing a memory because a 1–2 char fragment of it
-/// happens to appear in another item. Exact-equality matches are not
-/// length-guarded (an identical line is always redundant).
-const MIN_MATCH_CHARS: usize = 6;
+//! whose normalized form exactly equals an already-kept item. Cross-layer: a
+//! fact present in both the profile and relationship layers is kept in the
+//! profile and dropped from the relationship layer. Pure, deterministic, no I/O.
 
 /// Normalize a memory/turn line for comparison: strip a leading speaker label
 /// (`用户：` / `AI：`), collapse internal whitespace to single spaces, trim,
@@ -38,32 +32,14 @@ fn normalize(s: &str) -> String {
     out
 }
 
-/// True if two normalized strings are "close": equal, or one contains the
-/// other with the shorter at least `MIN_MATCH_CHARS` chars long.
-fn close_match(a: &str, b: &str) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    if a == b {
-        return true;
-    }
-    let (short, long) = if a.chars().count() <= b.chars().count() {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    short.chars().count() >= MIN_MATCH_CHARS && long.contains(short)
-}
-
 /// Decide whether to keep `raw`; on keep, record its normalized form in `kept`.
-/// Drops items that duplicate an already-kept item (normalized equality, or
-/// length-guarded containment).
+/// Drops items whose normalized form exactly equals an already-kept item.
 fn keep_item(raw: &str, kept: &mut Vec<String>) -> bool {
     let n = normalize(raw);
     if n.is_empty() {
         return false;
     }
-    if kept.iter().any(|k| close_match(&n, k)) {
+    if kept.iter().any(|k| k == &n) {
         return false;
     }
     kept.push(n);
@@ -131,9 +107,9 @@ mod tests {
     }
 
     #[test]
-    fn keeps_short_incidental_containment() {
-        // "公园" (2 chars) is contained in the longer item but below
-        // MIN_MATCH_CHARS, so it is NOT deduped away.
+    fn keeps_substring_distinct_items() {
+        // "公园" is a substring of the longer item but they are not equal after
+        // normalization — both must be kept.
         let (_p, rel) = prune_recalled(vec![], vec!["我今天去了公园散步".into(), "公园".into()]);
         assert_eq!(
             rel,
@@ -166,5 +142,24 @@ mod tests {
         let (p, rel) = prune_recalled(vec![], vec![]);
         assert!(p.is_empty());
         assert!(rel.is_empty());
+    }
+
+    #[test]
+    fn keeps_richer_memory_that_contains_a_shorter_profile_fact() {
+        // A profile fact contained in a longer relationship memory must NOT drop
+        // the richer memory — they are not duplicates (codex [P2]).
+        let (profile, rel) = prune_recalled(
+            vec![("preference".into(), vec!["喜欢吃意大利面".into()])],
+            vec!["用户：喜欢吃意大利面，但是对海鲜过敏".into()],
+        );
+        assert_eq!(
+            profile,
+            vec![("preference".to_string(), vec!["喜欢吃意大利面".to_string()])]
+        );
+        assert_eq!(
+            rel,
+            vec!["用户：喜欢吃意大利面，但是对海鲜过敏".to_string()],
+            "richer memory must not be dropped"
+        );
     }
 }
