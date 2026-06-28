@@ -1430,6 +1430,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
+            history_anchor: Default::default(),
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));

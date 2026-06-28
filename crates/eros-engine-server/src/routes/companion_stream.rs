@@ -514,6 +514,7 @@ pub async fn send_message_stream(
                     tips_amount_usd: req.tips_amount_usd,
                     image_url: req.image_url.clone(),
                     image: req.image.clone(),
+                    history_anchor: eros_engine_core::types::HistoryAnchor::Latest,
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
