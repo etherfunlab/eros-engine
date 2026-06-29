@@ -944,7 +944,6 @@
           "event_id",
           "event_type",
           "effective_deltas",
-          "effective_deltas_computed",
           "created_at"
         ],
         "properties": {
@@ -957,8 +956,15 @@
             "description": "Post-EMA effective change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
           },
           "effective_deltas_computed": {
-            "$ref": "#/components/schemas/BondChemistryDeltas",
-            "description": "The post-EMA delta folded into the two lines (raw-composite units)."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BondChemistryDeltas",
+                "description": "Exact per-turn bond/chemistry delta (floored), read from the stored event\ncolumn. None on pre-migration rows."
+              }
+            ]
           },
           "event_id": {
             "type": "string",
@@ -1139,7 +1145,7 @@
       },
       "BondChemistryDeltas": {
         "type": "object",
-        "description": "One turn's post-EMA delta folded into the two lines (raw-composite units).",
+        "description": "One turn's exact per-turn bond/chemistry line delta, computed at persist time\nfrom the floored before/after scores and read from the stored event column.",
         "required": [
           "bond",
           "chemistry"

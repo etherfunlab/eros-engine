@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::routes::companion::AffinityDeltasDto;
 use eros_engine_core::affinity::{bar, Affinity, RelationshipLabel};
 
 /// Point-in-time projection of a session's `Affinity`. Same field set
@@ -71,23 +70,12 @@ impl From<Affinity> for AffinitySnapshot {
     }
 }
 
-/// One turn's post-EMA delta folded into the two lines (raw-composite units).
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+/// One turn's exact per-turn bond/chemistry line delta, computed at persist time
+/// from the floored before/after scores and read from the stored event column.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BondChemistryDeltas {
     pub bond: f64,
     pub chemistry: f64,
-}
-
-impl BondChemistryDeltas {
-    /// Linear fold of a per-axis (post-EMA) delta into the two lines. Exact while
-    /// warmth stays ≥ 0 across the turn (warmth is floored at 0 in the absolute
-    /// composite); a good per-turn pulse otherwise.
-    pub fn from_axis_deltas(d: &AffinityDeltasDto) -> Self {
-        Self {
-            bond: (d.warmth + d.trust + d.intrigue) / 3.0,
-            chemistry: (d.warmth + d.intimacy + d.tension) / 3.0,
-        }
-    }
 }
 
 /// One line's tier transition (serialised keys). Read-side mirror of
@@ -159,20 +147,5 @@ mod tests {
         assert_eq!(snap.relationship_label.as_deref(), Some("stranger"));
         assert_eq!(snap.bond_label, "acquaintance");
         assert_eq!(snap.chemistry_label, "spark");
-    }
-
-    #[test]
-    fn bond_chemistry_deltas_fold_axes() {
-        let d = crate::routes::companion::AffinityDeltasDto {
-            warmth: 0.3,
-            trust: 0.3,
-            intrigue: 0.0,
-            intimacy: 0.6,
-            patience: 0.0,
-            tension: 0.0,
-        };
-        let f = BondChemistryDeltas::from_axis_deltas(&d);
-        assert!((f.bond - 0.2).abs() < 1e-9); // (0.3+0.3+0)/3
-        assert!((f.chemistry - 0.3).abs() < 1e-9); // (0.3+0.6+0)/3
     }
 }

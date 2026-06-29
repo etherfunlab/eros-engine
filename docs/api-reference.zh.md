@@ -516,7 +516,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 ∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
 全为零。
 
-- `effective_deltas_computed` —— `effective_deltas` 折叠到 Bond/Chemistry 两条线（`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`，Chemistry 同理）。单位为原始合成增量（非进度条百分比），适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移 0014 之前的事件中缺省。
+- `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为原始合成增量（非进度条百分比），适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
 
 ## 錯誤響應

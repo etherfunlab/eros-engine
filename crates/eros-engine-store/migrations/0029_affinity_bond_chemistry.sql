@@ -21,3 +21,9 @@ ALTER TABLE engine.companion_affinity
 -- Per-turn tier transition (bond/chemistry); NULL when no tier moved this turn.
 ALTER TABLE engine.companion_affinity_events
     ADD COLUMN label_changes JSONB;
+
+-- Exact per-turn line deltas (floored before/after bond/chemistry scores),
+-- computed at persist time so the per-turn pulse is exact even when warmth < 0
+-- (the linear axis fold was wrong below the warmth floor). NULL on pre-migration rows.
+ALTER TABLE engine.companion_affinity_events
+    ADD COLUMN effective_line_deltas JSONB;

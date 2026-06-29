@@ -86,9 +86,10 @@ fn label_to_str(label: RelationshipLabel) -> &'static str {
 pub struct AffinityEventRow {
     pub id: Uuid,
     pub event_type: String,
-    pub deltas: serde_json::Value,                   // pre-EMA
-    pub effective_deltas: Option<serde_json::Value>, // post-EMA (NULL pre-0014)
-    pub label_changes: Option<serde_json::Value>,    // per-turn tier transition (NULL = none)
+    pub deltas: serde_json::Value,                        // pre-EMA
+    pub effective_deltas: Option<serde_json::Value>,      // post-EMA (NULL pre-0014)
+    pub label_changes: Option<serde_json::Value>,         // per-turn tier transition (NULL = none)
+    pub effective_line_deltas: Option<serde_json::Value>, // exact {bond,chemistry} per-turn delta (NULL pre-migration)
     pub created_at: DateTime<Utc>,
 }
 
@@ -143,7 +144,7 @@ impl<'a> AffinityRepo<'a> {
         event_type: Option<&str>,
     ) -> Result<Vec<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -168,7 +169,7 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
     ) -> Result<Option<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -267,6 +268,14 @@ impl<'a> AffinityRepo<'a> {
         let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
             .and_then(|c| serde_json::to_value(&c).ok());
 
+        // Exact per-turn line delta from the floored before/after scores
+        // (the absolute bond/chemistry formulas use max(warmth,0), so a raw axis
+        // fold would misreport when warmth < 0). Always written for delta events.
+        let effective_line_deltas = serde_json::json!({
+            "bond": current.bond_score() - before_affinity.bond_score(),
+            "chemistry": current.chemistry_score() - before_affinity.chemistry_score(),
+        });
+
         // Post-EMA effective change = after − before (captures EMA + clamping).
         let effective = AffinityDeltas {
             warmth: current.warmth - before.warmth,
@@ -299,15 +308,16 @@ impl<'a> AffinityRepo<'a> {
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, label_changes, context, \
+               (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
                 model, usage, generation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(current.id)
         .bind(event_type)
         .bind(deltas_json)
         .bind(effective_json)
         .bind(label_changes)
+        .bind(effective_line_deltas)
         .bind(context)
         .bind(meta.and_then(|m| m.model.clone()))
         .bind(meta.and_then(|m| m.usage.clone()))
@@ -342,13 +352,15 @@ impl<'a> AffinityRepo<'a> {
         .await?;
 
         let zero = serde_json::to_value(AffinityDeltas::default()).unwrap_or_default();
+        let zero_line = serde_json::json!({ "bond": 0.0, "chemistry": 0.0 });
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, context) \
-             VALUES ($1, 'ghost', '{}'::jsonb, $2, '{}'::jsonb)",
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, context) \
+             VALUES ($1, 'ghost', '{}'::jsonb, $2, $3, '{}'::jsonb)",
         )
         .bind(affinity.id)
         .bind(zero)
+        .bind(zero_line)
         .execute(self.pool)
         .await?;
 
@@ -1021,6 +1033,42 @@ mod tests {
             "bond transition recorded: {first}"
         );
         assert!(rows[1].is_none(), "flat turn records NULL label_changes");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn effective_line_deltas_are_floored_exact(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        // Seed warmth negative so a raw axis fold would differ from the floored truth.
+        // Fresh seed warmth=0.1; push it to -0.3 this turn (ema 0.0 = full apply).
+        let deltas = AffinityDeltas {
+            warmth: -0.4,
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        // before: warmth 0.1, bond=(0.1+0+0)/3=0.0333 ; after: warmth -0.3 → floored 0 → bond 0.
+        // exact line delta = 0 - 0.0333 = -0.0333 (a raw fold would give -0.4/3 = -0.133).
+        let line: serde_json::Value = sqlx::query_scalar(
+            "SELECT effective_line_deltas FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let bond = line["bond"].as_f64().unwrap();
+        assert!(
+            (bond - (-0.033333)).abs() < 1e-4,
+            "floored exact bond delta, got {bond}"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

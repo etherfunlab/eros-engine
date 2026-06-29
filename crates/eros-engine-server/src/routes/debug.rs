@@ -157,9 +157,9 @@ async fn get_affinity_events(
             let effective_deltas: Option<AffinityDeltasDto> = r
                 .effective_deltas
                 .and_then(|v| serde_json::from_value(v).ok());
-            let effective_deltas_computed = effective_deltas
-                .as_ref()
-                .map(BondChemistryDeltas::from_axis_deltas);
+            let effective_deltas_computed = r
+                .effective_line_deltas
+                .and_then(|v| serde_json::from_value::<BondChemistryDeltas>(v).ok());
             let label_changes = r
                 .label_changes
                 .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
@@ -362,11 +362,12 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, label_changes) \
-             VALUES ($1, 'message', '{}'::jsonb, $2, $3)",
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, label_changes) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3, $4)",
         )
         .bind(affinity_id)
         .bind(json!({ "warmth": 0.3, "intimacy": 0.3 }))
+        .bind(json!({ "bond": 0.1, "chemistry": 0.2 }))
         .bind(json!({ "chemistry": { "from": "spark", "to": "flirtation" } }))
         .execute(&pool)
         .await
@@ -378,7 +379,6 @@ mod tests {
         let (status, body) = send_request(&mut app, req(&token, session_id, "")).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         let ev = &body["events"][0];
-        // fold: bond = (0.3+0+0)/3 = 0.1 ; chemistry = (0.3+0.3+0)/3 = 0.2
         assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.1).abs() < 1e-9);
         assert!(
             (ev["effective_deltas_computed"]["chemistry"]

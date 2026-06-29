@@ -30,8 +30,10 @@ pub struct BffAffinityDelta {
     /// Post-EMA effective change of the latest user-turn event. All-zero for
     /// a ghost turn (AI didn't reply; no axis moved).
     pub effective_deltas: AffinityDeltasDto,
-    /// The post-EMA delta folded into the two lines (raw-composite units).
-    pub effective_deltas_computed: BondChemistryDeltas,
+    /// Exact per-turn bond/chemistry delta (floored), read from the stored event
+    /// column. None on pre-migration rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_deltas_computed: Option<BondChemistryDeltas>,
     /// Engine-authoritative per-turn tier transition; absent when no tier moved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label_changes: Option<TurnLabelChangesDto>,
@@ -76,8 +78,9 @@ async fn bff_get_affinity_delta(
             // Pre-0014 rows have NULL effective_deltas → omit (don't fabricate).
             let effective = r.effective_deltas?;
             let effective_deltas: AffinityDeltasDto = serde_json::from_value(effective).ok()?;
-            let effective_deltas_computed =
-                BondChemistryDeltas::from_axis_deltas(&effective_deltas);
+            let effective_deltas_computed = r
+                .effective_line_deltas
+                .and_then(|v| serde_json::from_value::<BondChemistryDeltas>(v).ok());
             let label_changes = r
                 .label_changes
                 .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
@@ -269,11 +272,12 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, label_changes, created_at) \
-             VALUES ($1, 'message', '{}'::jsonb, $2, $3, now())",
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, label_changes, created_at) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3, $4, now())",
         )
         .bind(aid)
         .bind(json!({ "warmth": 0.3, "trust": 0.3 }))
+        .bind(json!({ "bond": 0.2, "chemistry": 0.1 }))
         .bind(json!({ "bond": { "from": "acquaintance", "to": "friend" } }))
         .execute(&pool)
         .await
@@ -285,7 +289,6 @@ mod tests {
         let (status, body) = send_request(&mut app, req(&token, session_id)).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         let ev = &body["event"];
-        // fold: bond = (0.3+0.3+0)/3 = 0.2 ; chemistry = (0.3+0+0)/3 = 0.1
         assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.2).abs() < 1e-9);
         assert!(
             (ev["effective_deltas_computed"]["chemistry"]

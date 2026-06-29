@@ -219,7 +219,7 @@ label_changes = {
 }
 ```
 
-- `effective_deltas_computed` —— 将每轴 `effective_deltas` 线性折叠到两条线（`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`，`Δchemistry = (Δwarmth + Δintimacy + Δtension) / 3`）。单位为原始合成增量（非进度条百分比），适合每轮"+X bond / +Y chemistry"的脉冲显示。
+- `effective_deltas_computed` —— 本轮精确的 bond/chemistry 行增量，在持久化时从取下界前后的分数计算得出，存储于事件行（`companion_affinity_events.effective_line_deltas`）。单位为原始合成增量（非进度条百分比），适合每轮"+X bond / +Y chemistry"的脉冲显示。迁移前的旧行此字段为 `null` / 缺省。
 - `label_changes` —— 本轮引擎权威的档位变化；无档位变化时为 `null`（或缺省）。前端无需自行计算变化，直接消费此字段。
 
 两个字段同样镜像到调试接口 `GET /comp/affinity/{session_id}/event` 的条目上。

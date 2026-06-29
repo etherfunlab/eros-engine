@@ -568,10 +568,10 @@ or only time-decay), or when the latest event predates affinity migration
 `0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
 reports all-zero `effective_deltas`.
 
-- `effective_deltas_computed` — `effective_deltas` folded into Bond/Chemistry
-  lines (`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`, same for Chemistry).
-  Raw-composite units (not bar-percent). Good for a "+X bond / +Y chemistry"
-  per-turn pulse. Absent on pre-migration-0014 events.
+- `effective_deltas_computed` — exact floored per-turn line delta computed at
+  persist time from the floored before/after bond/chemistry scores; read from
+  the stored event column. Raw-composite units (not bar-percent). Good for a
+  "+X bond / +Y chemistry" per-turn pulse. May be absent on pre-migration rows.
 - `label_changes` — engine-authoritative tier transition (`null` / absent when
   no tier crossed this turn). Frontend stops computing this itself.
 

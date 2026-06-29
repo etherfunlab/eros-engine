@@ -263,10 +263,11 @@ the existing `effective_deltas` (per-axis, post-EMA), the event now carries:
 }
 ```
 
-- `effective_deltas_computed` — the per-axis `effective_deltas` folded
-  linearly into the two lines (`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`,
-  `Δchemistry = (Δwarmth + Δintimacy + Δtension) / 3`). Raw-composite units
-  (not bar-percent). Good for a per-turn "+X bond / +Y chemistry" pulse.
+- `effective_deltas_computed` — the exact per-turn bond/chemistry delta
+  computed at persist time from the floored before/after scores and stored on
+  the event row (`companion_affinity_events.effective_line_deltas`). Raw-composite
+  units (not bar-percent). Good for a per-turn "+X bond / +Y chemistry" pulse.
+  `null` / absent on pre-migration rows.
 - `label_changes` — engine-authoritative tier transition for this turn; `null`
   (or absent) when no tier moved. The frontend stops computing transitions
   itself.

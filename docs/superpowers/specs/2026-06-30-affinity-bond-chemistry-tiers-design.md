@@ -222,6 +222,12 @@ ALTER TABLE engine.companion_affinity
 -- per-turn tier transition; NULL on turns where no tier changed
 ALTER TABLE engine.companion_affinity_events
   ADD COLUMN label_changes JSONB;
+
+-- exact per-turn line deltas (floored before/after bond/chemistry scores),
+-- computed at persist time so the per-turn pulse is exact even when warmth < 0.
+-- NULL on pre-migration rows.
+ALTER TABLE engine.companion_affinity_events
+  ADD COLUMN effective_line_deltas JSONB;
 ```
 
 The `companion_affinity` columns store the **raw composite** (0..1), not the bar
@@ -270,8 +276,10 @@ pub struct TurnLabelChanges {            // serde skips None fields
 Store changes (`crates/eros-engine-store/src/affinity.rs`) — note `bond`/
 `chemistry` are DB-generated, so **no engine write code** for them:
 
-- `AffinityEventRow` gains `label_changes: Option<serde_json::Value>`; the
-  `list_events` / `latest_turn_event` `SELECT`s add `e.label_changes`.
+- `AffinityEventRow` gains `label_changes: Option<serde_json::Value>` and
+  `effective_line_deltas: Option<serde_json::Value>`; the
+  `list_events` / `latest_turn_event` `SELECT`s add both `e.label_changes` and
+  `e.effective_line_deltas`.
   (`AffinityRow` / `SELECT *` is unaffected — it ignores the new generated
   columns, and the read layer derives bond/chemistry from the axes anyway.)
 - `persist_with_event`: clone the post-decay/pre-delta `current` as the `before`
@@ -298,22 +306,19 @@ pub chemistry_label: String, // one of the 4 chemistry keys
 siblings to `effective_deltas`:
 
 ```rust
-pub effective_deltas_computed: BondChemistryDeltas, // { bond: f64, chemistry: f64 }
-pub label_changes: Option<TurnLabelChangesDto>,     // engine-authoritative tier transition
+pub effective_deltas_computed: Option<BondChemistryDeltas>, // { bond: f64, chemistry: f64 }; None on pre-migration rows
+pub label_changes: Option<TurnLabelChangesDto>,             // engine-authoritative tier transition
 ```
 
-`effective_deltas_computed` is the existing **post-EMA per-axis**
-`effective_deltas` **folded linearly** into the two lines:
+`effective_deltas_computed` is the **exact** per-turn bond/chemistry delta
+computed at persist time from the floored before/after scores (`bond_score()` /
+`chemistry_score()` floor warmth at 0 via `max(warmth, 0)`), stored on
+`companion_affinity_events.effective_line_deltas`, and read by the BFF and debug
+`/event` endpoints (like `label_changes`). `None` on pre-migration rows.
 
-```
-Δbond      = (Δwarmth + Δtrust   + Δintrigue) / 3
-Δchemistry = (Δwarmth + Δintimacy + Δtension)  / 3
-```
-
-Raw-composite increment (not bar-% units): zero-cost, good for a per-turn
-"+X bond / +Y chemistry" pulse. Exact while warmth stays ≥ 0 across the turn
-(warmth is floored at 0 in the absolute composite); a fair approximation when a
-turn crosses warmth = 0.
+The previous linear axis fold (`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`)
+was dropped: it ignored the warmth floor and reported phantom bond/chemistry
+gains when warmth < 0 across a turn.
 
 `label_changes` is read **straight from the stored event column** (§4.6) — the
 engine is the single authority, so the frontend stops computing transitions
@@ -363,7 +368,7 @@ chat turn → post_process::evaluate_affinity
 read:
   AffinitySnapshot.from(Affinity) → bar(bond_score), bar(chemistry_score),
                                      bond_label, chemistry_label, legacy label
-  BFF /event → effective_deltas + effective_deltas_computed (folded)
+  BFF /event → effective_deltas + effective_deltas_computed (exact, from stored column)
              + label_changes (read from the stored column)
 ```
 
@@ -381,10 +386,12 @@ read:
 
 **Store** (`eros-engine-store/src/affinity.rs`, `migrations/0029_*.sql`)
 - Migration: `bond`/`chemistry` as `GENERATED ALWAYS ... STORED`; lowered
-  default seed (§4.8); events `label_changes JSONB`. `AffinityEventRow` +
-  `list_events`/`latest_turn_event` add `label_changes`; `persist_with_event`
-  writes new legacy label + per-event `label_changes` (bond/chemistry are
-  DB-generated, no write code).
+  default seed (§4.8); events `label_changes JSONB` and `effective_line_deltas JSONB`.
+  `AffinityEventRow` + `list_events`/`latest_turn_event` add both columns;
+  `persist_with_event` writes new legacy label + per-event `label_changes`
+  (NULL when no tier moved) and `effective_line_deltas` (exact floored line delta);
+  `record_ghost` writes `effective_line_deltas = {bond:0,chemistry:0}`.
+  bond/chemistry on `companion_affinity` are DB-generated, no write code.
 - Tests: generated bond/chemistry match `*_score()`; relationship_label uses new
   mapping; a tier-crossing turn writes `label_changes`, a flat turn writes NULL;
   update `load_or_create_idempotent` (now seeds `warmth 0.1`, `intrigue 0`).
