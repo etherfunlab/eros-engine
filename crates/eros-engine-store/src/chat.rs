@@ -2749,12 +2749,13 @@ mod tests {
         repo.merge_assistant_metadata_key(Uuid::new_v4(), msg_id, "x", &serde_json::json!(1))
             .await
             .unwrap();
-        let meta2: serde_json::Value =
+        let meta2: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
                 .bind(msg_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        let meta2 = meta2.unwrap();
         assert!(meta2.get("x").is_none(), "cross-session write must be a no-op");
     }
 }
