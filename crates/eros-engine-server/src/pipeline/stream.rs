@@ -197,6 +197,20 @@ fn build_image_gen_request(
     }
 }
 
+/// The subject-level prompt that actually drew the image, given which variant
+/// won. `Original` → the pre-compose subject; `Composed`/`Single` → the composed
+/// `final_subject`. Used so persisted/emitted prompt reflects the retry winner.
+fn winning_image_prompt(
+    variant: eros_engine_llm::openrouter::PromptVariant,
+    composed: &str,
+    original: &str,
+) -> String {
+    match variant {
+        eros_engine_llm::openrouter::PromptVariant::Original => original.to_string(),
+        _ => composed.to_string(),
+    }
+}
+
 /// Build the `metadata.image_failed` diagnostic for a fully-failed image chain.
 /// `composed_prompt` is the composed `final_subject` (the most useful debug
 /// field); `attempts` is the per-model/per-variant failure list.
@@ -2529,6 +2543,11 @@ pub fn run_stream(
                         let res = req.resolution.clone();
                         match state.openrouter.execute_image(req).await {
                             Ok(resp) if !resp.images.is_empty() => {
+                                let won_prompt = winning_image_prompt(
+                                    resp.winning_variant,
+                                    &final_subject,
+                                    &subject,
+                                );
                                 // Usage logging via the ChatResponse adapter.
                                 let cr = eros_engine_llm::openrouter::ChatResponse {
                                     reply: String::new(),
@@ -2541,7 +2560,7 @@ pub fn run_stream(
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
                                 let mut image_meta = serde_json::json!({
-                                    "prompt": final_subject,
+                                    "prompt": won_prompt,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -2605,7 +2624,7 @@ pub fn run_stream(
                                     message_id: ulid_string(msg_ulid),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(final_subject.clone()),
+                                    image_prompt: Some(won_prompt.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -2999,6 +3018,11 @@ pub fn run_stream(
                         let res = req.resolution.clone();
                         match state.openrouter.execute_image(req).await {
                             Ok(resp) if !resp.images.is_empty() => {
+                                let won_prompt = winning_image_prompt(
+                                    resp.winning_variant,
+                                    &final_subject,
+                                    &subject,
+                                );
                                 let cr = eros_engine_llm::openrouter::ChatResponse {
                                     reply: String::new(),
                                     generation_id: resp.generation_id.clone(),
@@ -3010,7 +3034,7 @@ pub fn run_stream(
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
                                 let mut image_meta = serde_json::json!({
-                                    "prompt": final_subject,
+                                    "prompt": won_prompt,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -3042,7 +3066,7 @@ pub fn run_stream(
                                     message_id: ulid_string(Ulid::from(msg_uuid)),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(final_subject.clone()),
+                                    image_prompt: Some(won_prompt.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -3551,6 +3575,14 @@ mod tests {
         assert_eq!(v["face_ref_used"], true);
         assert_eq!(v["attempts"][0]["status"], 400);
         assert_eq!(v["attempts"][1]["outcome"], "zero_images");
+    }
+
+    #[test]
+    fn winning_image_prompt_picks_variant() {
+        use eros_engine_llm::openrouter::PromptVariant;
+        assert_eq!(winning_image_prompt(PromptVariant::Original, "C", "O"), "O");
+        assert_eq!(winning_image_prompt(PromptVariant::Composed, "C", "O"), "C");
+        assert_eq!(winning_image_prompt(PromptVariant::Single, "C", "O"), "C");
     }
 
     #[test]

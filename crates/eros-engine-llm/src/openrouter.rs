@@ -108,11 +108,12 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
 /// Which prompt variant an image attempt used. `Single` = no compose retry
 /// (compose off, or it left the subject unchanged); `Composed`/`Original` =
 /// the two variants tried per model when compose rewrote the subject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptVariant {
     Composed,
     Original,
+    #[default]
     Single,
 }
 
@@ -217,6 +218,9 @@ pub struct ImageGenResponse {
     /// Failed attempts that preceded the successful one (empty when the first
     /// try succeeded). Lets the success record show "A refused, B drew it".
     pub attempts: Vec<ImageAttempt>,
+    /// Which prompt variant actually produced the returned image. Lets callers
+    /// report the true prompt (composed vs original) on the retry path.
+    pub winning_variant: PromptVariant,
 }
 
 /// Pull all image URLs out of the first choice's `message.images[]`.
@@ -908,6 +912,7 @@ impl OpenRouterClient {
                 usage: parsed.usage,
                 finish_reason,
                 attempts,
+                winning_variant: variant,
             });
         }
         Err(ImageGenError::ChainExhausted { attempts })
