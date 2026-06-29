@@ -306,12 +306,14 @@ pub label_changes: Option<TurnLabelChangesDto>,     // engine-authoritative tier
 `effective_deltas` **folded linearly** into the two lines:
 
 ```
-Δbond      = (Δwarmth/2 + Δtrust   + Δintrigue) / 3
-Δchemistry = (Δwarmth/2 + Δintimacy + Δtension)  / 3
+Δbond      = (Δwarmth + Δtrust   + Δintrigue) / 3
+Δchemistry = (Δwarmth + Δintimacy + Δtension)  / 3
 ```
 
 Raw-composite increment (not bar-% units): zero-cost, good for a per-turn
-"+X bond / +Y chemistry" pulse.
+"+X bond / +Y chemistry" pulse. Exact while warmth stays ≥ 0 across the turn
+(warmth is floored at 0 in the absolute composite); a fair approximation when a
+turn crosses warmth = 0.
 
 `label_changes` is read **straight from the stored event column** (§4.6) — the
 engine is the single authority, so the frontend stops computing transitions
