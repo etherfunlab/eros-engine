@@ -47,7 +47,8 @@ reshapes the eval distribution — **without changing the 6-axis base.**
 **Non-goals (explicitly out of scope)**
 
 - The 6-axis representation, EMA smoothing (`apply_deltas`), and time decay
-  (`apply_time_decay`) are **unchanged**.
+  (`apply_time_decay`) are **unchanged**. (The new-row *default seed* values are
+  lowered — §4.8 — but the axis mechanics and existing rows are untouched.)
 - `AffinityScope` / `length_score` (prompt-injection scoping, issue #40) is
   **untouched** — even though its `bond()`/`chemistry()` axis-sets use a
   *different* grouping (see §4.1 naming note).
@@ -77,15 +78,17 @@ reshapes the eval distribution — **without changing the 6-axis base.**
 
 ### 4.1 Folding (core)
 
-Add two pure methods on `Affinity` (core). With `warm01 = (warmth + 1.0) / 2.0`:
+Add two pure methods on `Affinity` (core). With `warm_pos = warmth.max(0.0)`
+(floored at 0 — **not** `(warmth+1)/2`; see §4.8):
 
 ```
-bond_score      = (warm01 + trust   + intrigue) / 3      ∈ [0, 1]   // 友情
-chemistry_score = (warm01 + intimacy + tension)  / 3      ∈ [0, 1]   // 爱情
+bond_score      = (warm_pos + trust   + intrigue) / 3    ∈ [0, 1]   // 友情
+chemistry_score = (warm_pos + intimacy + tension) / 3    ∈ [0, 1]   // 爱情
 ```
 
 - **`warmth` is shared** into both lines (it underlies both friendship and
-  romance; cold replies should tank both).
+  romance; cold replies tank both). Floored at 0, so a neutral/cold session
+  contributes nothing — a fresh session sits near 0, not at a 0.5 baseline.
 - **`patience` is excluded** from both — it is rule-owned (maintained by
   decay/rules, never scored by the evaluator) and stays an internal pacing axis.
 
@@ -198,13 +201,23 @@ New migration `0029_affinity_bond_chemistry.sql`:
 
 ```sql
 -- raw composites kept in lockstep with the axes by the DB (Postgres 12+).
--- Mirror of eros_engine_core::affinity::{bond_score,chemistry_score} — keep in
--- sync if the folding formula ever changes.
+-- Mirror of eros_engine_core::affinity::{bond_score,chemistry_score}
+-- (warmth floored at 0 via GREATEST) — keep in sync if the formula changes.
 ALTER TABLE engine.companion_affinity
   ADD COLUMN bond DOUBLE PRECISION
-    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, ((warmth + 1)/2 + trust    + intrigue) / 3))) STORED,
+    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + trust    + intrigue) / 3))) STORED,
   ADD COLUMN chemistry DOUBLE PRECISION
-    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, ((warmth + 1)/2 + intimacy + tension)  / 3))) STORED;
+    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + intimacy + tension)  / 3))) STORED;
+
+-- lower the new-row default seed so a fresh session reads as "stranger" with
+-- near-empty bars (existing rows unaffected by an ALTER ... SET DEFAULT).
+-- warmth kept slightly positive (0.1 → still "平淡"/neutral attitude, not 冷淡);
+-- patience keeps its 0.5 pacing default (rule-owned, not a bar). See §4.8.
+ALTER TABLE engine.companion_affinity
+  ALTER COLUMN warmth   SET DEFAULT 0.1,
+  ALTER COLUMN trust    SET DEFAULT 0.0,
+  ALTER COLUMN intrigue SET DEFAULT 0.0,
+  ALTER COLUMN tension  SET DEFAULT 0.0;
 
 -- per-turn tier transition; NULL on turns where no tier changed
 ALTER TABLE engine.companion_affinity_events
@@ -308,6 +321,29 @@ Both fields are mirrored onto the debug `/comp/affinity/{sid}/event` entries for
 consistency (`effective_deltas_computed` is `Option`, `None` for pre-0014 rows
 with no `effective_deltas`).
 
+### 4.8 Starting point (default seed)
+
+With the floored composite, a fresh session must still seed low enough to read as
+`stranger`. The current defaults (`warmth 0.3, trust 0.2, intrigue 0.5, …`) would
+put a brand-new session at bond ≈ 0.33 (tier 2) — past the "easy early" climb. So
+migration 0029 lowers the new-row default seed:
+
+| axis | old default | new default | why |
+|------|-------------|-------------|-----|
+| `warmth` | 0.3 | **0.1** | keep a neutral "平淡" opening tone (0 → 冷淡); near-zero bar |
+| `trust` | 0.2 | **0.0** | start with no earned trust |
+| `intrigue` | 0.5 | **0.0** | start with no built-up interest |
+| `tension` | 0.1 | **0.0** | no romantic tension yet |
+| `intimacy` | 0.0 | 0.0 | already zero |
+| `patience` | 0.5 | 0.5 | rule-owned pacing axis, not a bar — unchanged |
+
+Result: a fresh session has bond ≈ chemistry ≈ 0.033 → both tier 1 → legacy
+`stranger`; bars start ≈ 5–6%. Only **new** rows are affected (`ALTER COLUMN …
+SET DEFAULT` leaves existing rows alone). Side effects to expect (all benign,
+flagged for review): a brand-new session's reply-length tier and warmth attitude
+shift toward the strictest/neutral end, matching a true "just met" state. The
+seed values are **tunable**.
+
 ## 5. Data flow
 
 ```
@@ -342,12 +378,14 @@ read:
   old `infer_label_*` tests.
 
 **Store** (`eros-engine-store/src/affinity.rs`, `migrations/0029_*.sql`)
-- Migration: `bond`/`chemistry` as `GENERATED ALWAYS ... STORED`; events
-  `label_changes JSONB`. `AffinityEventRow` + `list_events`/`latest_turn_event`
-  add `label_changes`; `persist_with_event` writes new legacy label + per-event
-  `label_changes` (bond/chemistry are DB-generated, no write code).
+- Migration: `bond`/`chemistry` as `GENERATED ALWAYS ... STORED`; lowered
+  default seed (§4.8); events `label_changes JSONB`. `AffinityEventRow` +
+  `list_events`/`latest_turn_event` add `label_changes`; `persist_with_event`
+  writes new legacy label + per-event `label_changes` (bond/chemistry are
+  DB-generated, no write code).
 - Tests: generated bond/chemistry match `*_score()`; relationship_label uses new
-  mapping; a tier-crossing turn writes `label_changes`, a flat turn writes NULL.
+  mapping; a tier-crossing turn writes `label_changes`, a flat turn writes NULL;
+  update `load_or_create_idempotent` (now seeds `warmth 0.1`, `intrigue 0`).
 
 **post_process** (`pipeline/post_process.rs`)
 - Asymmetric clamp; update `parse_affinity_eval_clamps_out_of_range` (now
@@ -377,7 +415,8 @@ read:
 - Tier name keys (8) — rename freely.
 - Caps `+0.4 / −0.6`.
 - Legacy mapping table (esp. retiring `frenemy`; chemistry tier 1–2 → `slow_burn`).
-- Folding weights (currently equal; `warmth` shared).
+- Folding weights (currently equal; `warmth` shared, floored at 0).
+- The new-row default seed (§4.8: `warmth 0.1`, `trust/intrigue/tension 0`).
 
 ## 8. Open items
 
