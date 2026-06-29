@@ -217,10 +217,19 @@ Because the strip is layer 0, `cleaned` becomes the single new baseline for
 and extract input. The artifact therefore reaches none of those channels,
 regardless of the LLM filter's `after_extract` / `before_extract` timing.
 
-**Edge case — empty result:** if `cleaned.trim()` is empty (the model emitted
-*only* the artifact), **fail-safe to the raw `acc`**: emit/persist the raw text
-(never an empty bubble), record no strip, and log at `warn`. This is a defensive
-guard; `reply_text_image` text is not expected to be bracket-only.
+**Edge case — empty result** *(revised 2026-06-29; the original fail-safe was a
+bug — see below):* if `cleaned.trim()` is empty (the model emitted *only* the
+artifact, e.g. a bare `[你给对方发送了一张照片：…]`), the strip is **honored**, not
+fail-safed: `cleaned` becomes `""`. The client receives **no content bubble**
+(the buffered branch only emits a `Delta` when `visible` is non-empty), the row
+persists empty `content` (`""`), and the audit is still written
+(`pre_filter_content` = raw `acc`, `filter_model = "<regex>"`). The downstream
+client decides how to render an empty/NULL reply — the reference web client
+simply doesn't show it (a ghost-like non-reply that nudges the user to follow
+up). **History:** the original design fail-safed to the raw `acc` on the
+assumption that "`reply_text_image` text is not expected to be bracket-only."
+Production disproved that — small roleplay models do emit bracket-only replies —
+so the raw artifact leaked to the user. The fail-safe was removed.
 
 `extract_text` (the original-vs-visible chooser) is unaffected in shape: its
 `original` argument is now `cleaned` (post-strip) rather than the raw `acc`, so
@@ -281,7 +290,8 @@ path) are unaffected. `output_regex` set on other task blocks parses but is iner
   - multiple matching rules apply in declaration order;
   - `replacement` non-empty is honored;
   - pattern matches nothing ⇒ unchanged, no audit;
-  - **empty/blank result ⇒ fail-safe returns raw, flagged "no change".**
+  - **empty/blank result ⇒ `cleaned == ""` with the matched rule still
+    reported** (no fail-safe; the artifact-only reply is fully stripped).
 - **Mode selection:** chain with a targeted model ⇒ buffered; chain with no
   targeted model ⇒ live (byte-identical to today).
 - **Stream (wiremock for chat model):**
@@ -294,7 +304,9 @@ path) are unaffected. `output_regex` set on other task blocks parses but is iner
   - regex + LLM `output_filter` both configured ⇒ LLM runs on the cleaned text;
     `filter_model` = LLM model, `filter_triggers` carries both `reason` and
     `regex`; `pre_filter_content` = raw;
-  - strip empties the reply ⇒ raw emitted/persisted, no empty bubble, no audit.
+  - strip empties the reply (artifact-only) ⇒ NO `Delta` reaches the client,
+    row persists empty `content` (`""`), audit recorded (`pre_filter_content` =
+    raw, `filter_model = "<regex>"`, `filter_triggers.regex` = matched indices).
 - **Final frame:** `filtered = true` on a regex strip; `false` when no rule
   matched. Update existing `final_frame_*` constructor tests if needed.
 - **Committed example config:** parses; with `output_regex` absent/commented,
@@ -311,7 +323,7 @@ path) are unaffected. `output_regex` set on other task blocks parses but is iner
   (no lookaround/backrefs).
 - `docs/model-config.md`: document the field, exact-model-id matching, the
   layer-0 / extract semantics (artifact removed from client + history + memory),
-  the empty-result fail-safe, and the `pre_filter_content` audit
+  the artifact-only ⇒ empty-bubble behavior, and the `pre_filter_content` audit
   (`filter_model = "<regex>"`).
 - Additive TOML schema; default behavior unchanged (off unless configured).
 - Dev-track feature: lands on a `feat/output-regex-filter` branch → PR into

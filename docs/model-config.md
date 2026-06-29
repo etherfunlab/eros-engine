@@ -241,11 +241,16 @@ The matched text therefore reaches **neither** the client **nor** the stored
 These columns are set only when at least one rule actually changes the reply (same
 as the LLM filter — a no-op strip leaves them null).
 
-#### Empty-result fail-safe
+#### Artifact-only reply ⇒ empty bubble
 
-A strip that would reduce a non-empty reply to an empty string is a **no-op** — the
-original reply is delivered unchanged and the audit columns are not set. This
-prevents an over-broad pattern from silencing the companion.
+When the reply is **entirely** an artifact (e.g. a bare
+`[你给对方发送了一张照片：…]` with nothing else), the strip empties it. There is
+**no fail-safe**: the client receives **no content bubble** (no delta is sent),
+the row persists empty `content` (`""`), and the audit columns are still set
+(`pre_filter_content` = the raw reply, `filter_model` = `"<regex>"`). The
+downstream client decides how to render an empty/NULL reply — the reference web
+client simply doesn't show it, which reads as a ghost-like non-reply and tends
+to make the user follow up (closer to chatting with a real person).
 
 #### `filtered` flag
 

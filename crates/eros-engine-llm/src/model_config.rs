@@ -406,8 +406,12 @@ pub struct RegexStripOutcome {
 }
 
 /// Apply every rule whose `models` contains `model_id`, in declaration order.
-/// Pure & deterministic. Fail-safe: if stripping empties a non-empty reply,
-/// the raw text is returned unchanged with no matched rules.
+/// Pure & deterministic. No fail-safe: a reply that is *entirely* an artifact
+/// (e.g. a bare `[你给对方发送了一张照片：…]`, or one wrapped in incidental
+/// whitespace) strips to an empty string, and the match is still reported. The
+/// caller persists the audit (raw on `pre_filter_content`) and emits no content
+/// bubble — downstream decides how to render an empty/NULL reply (the web
+/// client simply doesn't show it, a ghost-like effect).
 pub fn apply_output_regex(
     rules: &[CompiledRegexRule],
     model_id: &str,
@@ -425,12 +429,14 @@ pub fn apply_output_regex(
             cleaned = next.into_owned();
         }
     }
-    // Fail-safe: never let a strip produce a blank reply from a non-blank one.
-    if !matched_rules.is_empty() && cleaned.trim().is_empty() && !text.trim().is_empty() {
-        return RegexStripOutcome {
-            cleaned: text.to_string(),
-            matched_rules: Vec::new(),
-        };
+    // An unanchored rule (e.g. `\[[^\]]*\]`) can leave incidental whitespace
+    // behind when the reply was artifact-only (the common `<正文>\n\n[...]`
+    // shape with an empty 正文). Collapse a whitespace-only *stripped* result to
+    // a true empty string so the caller suppresses the bubble — the stream
+    // layer gates on `is_empty()`, not `trim().is_empty()`. Only when a rule
+    // actually matched: an untouched whitespace-only reply is left as-is.
+    if !matched_rules.is_empty() && cleaned.trim().is_empty() {
+        cleaned.clear();
     }
     RegexStripOutcome {
         cleaned,
@@ -3265,11 +3271,43 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn apply_output_regex_empty_result_failsafes_to_raw() {
-        let rules = compiled(&[("m", r#"^\[.*\]$"#, "")]); // whole reply is the artifact
+    fn apply_output_regex_strips_to_empty_when_reply_is_artifact_only() {
+        // A reply that is ENTIRELY the artifact strips to empty. There is no
+        // fail-safe: the empty result is honest, and the match is reported so
+        // the caller persists the audit (pre_filter_content = raw) and the
+        // client receives no content bubble (downstream decides how to render
+        // an empty/NULL reply).
+        let rules = compiled(&[("m", r#"\[[^\]]*\]"#, "")]); // drop any [...]
         let out = apply_output_regex(&rules, "m", "[你给对方发送了一张照片：x]");
-        assert_eq!(out.cleaned, "[你给对方发送了一张照片：x]"); // kept raw
-        assert!(out.matched_rules.is_empty(), "fail-safe reports no change");
+        assert_eq!(
+            out.cleaned, "",
+            "artifact-only reply strips to empty (no fail-safe)"
+        );
+        assert_eq!(
+            out.matched_rules,
+            vec![0],
+            "the matching rule is still reported"
+        );
+    }
+
+    #[test]
+    fn apply_output_regex_collapses_whitespace_only_result_to_empty() {
+        // An UNANCHORED rule (e.g. `\[[^\]]*\]`) drops the bracket but leaves
+        // any surrounding whitespace. A reply that is artifact + incidental
+        // whitespace (the common `<正文>\n\n[...]` shape with an empty 正文)
+        // must still collapse to "" so the caller suppresses the bubble — the
+        // stream layer only checks `is_empty()`, not `trim().is_empty()`.
+        let rules = compiled(&[("m", r#"\[[^\]]*\]"#, "")]); // drop any [...]
+        let out = apply_output_regex(&rules, "m", "\n\n[你给对方发送了一张照片：x]\n");
+        assert_eq!(
+            out.cleaned, "",
+            "a whitespace-only strip result collapses to empty"
+        );
+        assert_eq!(
+            out.matched_rules,
+            vec![0],
+            "the matching rule is still reported"
+        );
     }
 
     #[test]
