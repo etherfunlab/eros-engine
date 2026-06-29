@@ -1014,6 +1014,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
+            history_anchor: Default::default(),
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -1030,6 +1031,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
+            history_anchor: Default::default(),
         };
         assert_eq!(client_id_from_event(&event), None);
     }

@@ -127,6 +127,11 @@ pub struct StreamSendRequest {
     pub image_url: Option<String>,
     #[serde(default)]
     pub image: Option<ImageReplyParams>,
+    /// Optional id of a `chat_messages` row in this session to anchor context on.
+    /// When valid, history rewinds to (and includes) that message; when present
+    /// but unresolvable, history is dropped for this turn (recorded in metadata).
+    #[serde(default)]
+    pub reply_to_message_id: Option<Uuid>,
 }
 
 /// Pre-stream error body per spec §1.3. Schema-only struct for utoipa;
@@ -425,6 +430,21 @@ pub async fn send_message_stream(
             })
         })?;
 
+    // Resolve the optional reply anchor BEFORE the upsert so the outcome can be
+    // recorded in the new row's metadata. A present-but-unresolvable id does not
+    // fail the request — we drop history for this turn and flag it (DropHistory).
+    use eros_engine_core::types::HistoryAnchor;
+    let history_anchor = match req.reply_to_message_id {
+        None => HistoryAnchor::Latest,
+        Some(id) => match chat_repo.message_sent_at_in_session(session_id, id).await? {
+            Some(sent_at) => HistoryAnchor::At {
+                message_id: id,
+                sent_at,
+            },
+            None => HistoryAnchor::DropHistory,
+        },
+    };
+
     // Build metadata: conditionally include tips_amount_usd, tier, and image_url.
     // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
     let mut meta_map = serde_json::Map::new();
@@ -463,6 +483,15 @@ pub async fn send_message_stream(
             .map(|t| serde_json::json!({"tag": t.tag, "text": t.text}))
             .collect();
         meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
+    }
+    match history_anchor {
+        HistoryAnchor::At { message_id, .. } => {
+            meta_map.insert("reply_to_message_id".into(), serde_json::json!(message_id));
+        }
+        HistoryAnchor::DropHistory => {
+            meta_map.insert("reply_to_error".into(), serde_json::json!("not_found"));
+        }
+        HistoryAnchor::Latest => {}
     }
     let persisted_metadata: Option<serde_json::Value> = if meta_map.is_empty() {
         None
@@ -514,6 +543,7 @@ pub async fn send_message_stream(
                     tips_amount_usd: req.tips_amount_usd,
                     image_url: req.image_url.clone(),
                     image: req.image.clone(),
+                    history_anchor,
                 };
                 Box::pin(run_stream(state_arc, user_msg))
             }
@@ -669,6 +699,7 @@ mod tests {
             tips_amount_usd: None,
             image_url: None,
             image: None,
+            reply_to_message_id: None,
         }
     }
 
@@ -684,6 +715,7 @@ mod tests {
             tips_amount_usd: amount,
             image_url: None,
             image: None,
+            reply_to_message_id: None,
         }
     }
 
@@ -998,6 +1030,84 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_records_reply_to_message_id_in_metadata(pool: PgPool) {
+        use eros_engine_store::chat::ChatRepo;
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // An earlier message to quote.
+        let chat_repo = ChatRepo { pool: &pool };
+        let quoted = chat_repo
+            .append_message(session_id, "assistant", "earlier line")
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+
+        // (a) valid quote → metadata.reply_to_message_id set, 200.
+        let body = serde_json::to_vec(&json!({
+            "content": "replying", "client_msg_id": "01J7777777777777777777777A",
+            "reply_to_message_id": quoted.to_string()
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages WHERE client_msg_id = '01J7777777777777777777777A'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(meta["reply_to_message_id"], json!(quoted.to_string()));
+        assert!(meta.get("reply_to_error").is_none());
+
+        // (b) invalid quote (random id) → metadata.reply_to_error, still 200.
+        let body = serde_json::to_vec(&json!({
+            "content": "replying2", "client_msg_id": "01J8888888888888888888888A",
+            "reply_to_message_id": Uuid::new_v4().to_string()
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages WHERE client_msg_id = '01J8888888888888888888888A'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(meta["reply_to_error"], json!("not_found"));
+        assert!(meta.get("reply_to_message_id").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn user_row_omits_scope_raw_keys_when_request_fields_are_none(pool: sqlx::PgPool) {
         use eros_engine_store::chat::ChatRepo;
         let chat_repo = ChatRepo { pool: &pool };
@@ -1047,6 +1157,7 @@ mod validate_payload_tests {
             tips_amount_usd: None,
             image_url: None,
             image: None,
+            reply_to_message_id: None,
         }
     }
 
@@ -1170,6 +1281,7 @@ mod validate_payload_tests {
             tips_amount_usd: None,
             image_url: None,
             image: None,
+            reply_to_message_id: None,
         }
     }
 

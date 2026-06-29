@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Public types for the companion engine.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ pub struct LlmAudit {
 
 /// Events that drive the engine pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // UserMessage is intentionally large; boxing would add indirection
 pub enum Event {
     UserMessage {
         content: String,
@@ -68,9 +70,28 @@ pub enum Event {
         /// gets a tip fragment. `None` for normal messages.
         #[serde(default)]
         tips_amount_usd: Option<f64>,
+        /// Optional caller-supplied reply anchor (#reply_to). Defaults to
+        /// `Latest` (normal tail window) when absent.
+        #[serde(default)]
+        history_anchor: HistoryAnchor,
     },
     ProactiveTrigger,
     AppOpen,
+}
+
+/// Where the turn's main conversation history is anchored. `Latest` (default):
+/// the normal tail window. `At`: rewind to a quoted message — history up to and
+/// including `sent_at`, then the new message. `DropHistory`: the caller's
+/// `reply_to_message_id` was unresolvable, so inject no prior turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HistoryAnchor {
+    #[default]
+    Latest,
+    At {
+        message_id: Uuid,
+        sent_at: DateTime<Utc>,
+    },
+    DropHistory,
 }
 
 /// Which reference image an image turn should build on. `Face` = the static
@@ -296,5 +317,29 @@ mod tests {
         assert!(ActionType::ReplyTextImage.is_text_reply());
         assert!(!ActionType::Ghost.is_text_reply());
         assert!(!ActionType::Proactive.is_text_reply());
+    }
+
+    #[test]
+    fn history_anchor_defaults_to_latest_and_event_omits_it() {
+        // Default is Latest.
+        assert_eq!(HistoryAnchor::default(), HistoryAnchor::Latest);
+
+        // An event JSON without `history_anchor` still parses, defaulting to Latest.
+        let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
+        let ev: Event = serde_json::from_str(raw).unwrap();
+        match ev {
+            Event::UserMessage { history_anchor, .. } => {
+                assert_eq!(history_anchor, HistoryAnchor::Latest);
+            }
+            _ => panic!("expected UserMessage"),
+        }
+
+        // At{...} round-trips through serde.
+        let at = HistoryAnchor::At {
+            message_id: uuid::Uuid::nil(),
+            sent_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+        };
+        let s = serde_json::to_string(&at).unwrap();
+        assert_eq!(serde_json::from_str::<HistoryAnchor>(&s).unwrap(), at);
     }
 }

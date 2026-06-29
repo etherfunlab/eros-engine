@@ -105,6 +105,79 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
     body
 }
 
+/// Which prompt variant an image attempt used. `Single` = no compose retry
+/// (compose off, or it left the subject unchanged); `Composed`/`Original` =
+/// the two variants tried per model when compose rewrote the subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptVariant {
+    Composed,
+    Original,
+    #[default]
+    Single,
+}
+
+/// Outcome of one image-gen attempt (one model × one prompt variant).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// HTTP non-2xx. `status` distinguishes a 400 content-policy refusal from a
+    /// 404 / 5xx; `message` is the provider body (capped).
+    Status { status: u16, message: String },
+    /// 2xx but zero images in the response.
+    ZeroImages,
+    /// Transport failure (connection/TLS) before a response arrived.
+    Transport { message: String },
+    /// 2xx but the body failed to decode as an OpenRouter response.
+    Decode { message: String },
+}
+
+/// One recorded image-gen attempt. Serializes flat:
+/// `{ "model": .., "variant": .., "outcome": .., "status"?: .., "message"?: .. }`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageAttempt {
+    pub model: String,
+    pub variant: PromptVariant,
+    #[serde(flatten)]
+    pub outcome: AttemptOutcome,
+}
+
+/// Error from [`OpenRouterClient::execute_image`]. `Config` is a pre-flight
+/// failure (no api key / no models) with no attempts; `ChainExhausted` carries
+/// every failed attempt in order so the caller can persist a diagnostic.
+#[derive(Debug)]
+pub enum ImageGenError {
+    Config(String),
+    ChainExhausted { attempts: Vec<ImageAttempt> },
+}
+
+impl std::fmt::Display for ImageGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImageGenError::Config(m) => write!(f, "image-gen config error: {m}"),
+            ImageGenError::ChainExhausted { attempts } => {
+                write!(
+                    f,
+                    "image-gen chain exhausted after {} attempt(s)",
+                    attempts.len()
+                )
+            }
+        }
+    }
+}
+impl std::error::Error for ImageGenError {}
+
+/// Cap a provider error body to a bounded length for persistence/logs.
+fn cap_provider_message(s: &str) -> String {
+    const MAX: usize = 600;
+    let t = s.trim();
+    if t.chars().count() <= MAX {
+        t.to_string()
+    } else {
+        t.chars().take(MAX).collect::<String>() + "…"
+    }
+}
+
 /// One-shot image-generation request. The model is expected to return
 /// generated images in `message.images[]` on the wire response.
 #[derive(Debug, Clone, Default)]
@@ -122,6 +195,11 @@ pub struct ImageGenRequest {
     /// size parameter (see `build_image_body`); preferred over `aspect_ratio`.
     pub resolution: Option<String>,
     pub max_tokens: u32,
+    /// The original (pre-compose) PDE prompt, retried after `prompt` for each
+    /// model. `None` ⇒ no second variant (compose off, or it left the subject
+    /// unchanged). Set by `build_image_gen_request` only when
+    /// `chat_image_prompt_compose` actually rewrote the subject.
+    pub prompt_original: Option<String>,
 }
 
 /// Response from a successful image-generation call.
@@ -137,6 +215,12 @@ pub struct ImageGenResponse {
     pub usage: Option<serde_json::Value>,
     /// `finish_reason` from the first choice in the wire response.
     pub finish_reason: Option<String>,
+    /// Failed attempts that preceded the successful one (empty when the first
+    /// try succeeded). Lets the success record show "A refused, B drew it".
+    pub attempts: Vec<ImageAttempt>,
+    /// Which prompt variant actually produced the returned image. Lets callers
+    /// report the true prompt (composed vs original) on the retry path.
+    pub winning_variant: PromptVariant,
 }
 
 /// Pull all image URLs out of the first choice's `message.images[]`.
@@ -170,7 +254,7 @@ fn parse_resolution(res: &str) -> Option<(u32, u32)> {
 }
 
 /// Build the OpenRouter wire body for one image-gen attempt. Pure (no I/O).
-fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
+fn build_image_body(req: &ImageGenRequest, model: &str, prompt: &str) -> serde_json::Value {
     // Size is a real generation parameter: prefer an explicit resolution, else
     // derive a concrete width×height from the aspect ratio. (The old text-hint
     // "(aspect ratio: …)" was ignored by image models — removed.)
@@ -185,7 +269,7 @@ fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
                 .filter(|s| !s.is_empty())
                 .and_then(aspect_to_resolution)
         });
-    let mut content = vec![serde_json::json!({ "type": "text", "text": req.prompt })];
+    let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
     if let Some(face) = req.face_ref_url.as_deref().filter(|s| !s.is_empty()) {
         content.push(serde_json::json!({
             "type": "image_url",
@@ -208,6 +292,28 @@ fn build_image_body(req: &ImageGenRequest, model: &str) -> serde_json::Value {
         body["height"] = serde_json::json!(h);
     }
     body
+}
+
+/// Expand the model chain × prompt variants into the ordered attempt plan.
+/// Model-outer, variant-inner: `[A,B]` with a distinct original yields
+/// `A·composed, A·original, B·composed, B·original`. With no original it is a
+/// single `Single` variant per model.
+fn plan_attempts<'a>(
+    candidates: &[&'a str],
+    prompt: &'a str,
+    prompt_original: Option<&'a str>,
+) -> Vec<(&'a str, PromptVariant, &'a str)> {
+    let variants: Vec<(PromptVariant, &str)> = match prompt_original {
+        Some(orig) => vec![
+            (PromptVariant::Composed, prompt),
+            (PromptVariant::Original, orig),
+        ],
+        None => vec![(PromptVariant::Single, prompt)],
+    };
+    candidates
+        .iter()
+        .flat_map(|m| variants.iter().map(move |(v, p)| (*m, *v, *p)))
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -713,22 +819,26 @@ impl OpenRouterClient {
     /// One-shot image-generation call. Walks `[model] + fallback_model` on
     /// transport failure OR a zero-image success. Returns the first attempt that
     /// yields ≥1 image. Non-streaming.
-    pub async fn execute_image(&self, req: ImageGenRequest) -> Result<ImageGenResponse, LlmError> {
+    pub async fn execute_image(
+        &self,
+        req: ImageGenRequest,
+    ) -> Result<ImageGenResponse, ImageGenError> {
         let candidates: Vec<&str> = std::iter::once(req.model.as_str())
             .chain(req.fallback_model.iter().map(String::as_str))
             .filter(|s| !s.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err(LlmError::Config(
+            return Err(ImageGenError::Config(
                 "openrouter: image-gen has no models".into(),
             ));
         }
         if self.api_key.is_empty() {
-            return Err(LlmError::Config("openrouter: api key not set".into()));
+            return Err(ImageGenError::Config("openrouter: api key not set".into()));
         }
-        let mut last_err: Option<LlmError> = None;
-        for model in &candidates {
-            let mut body = build_image_body(&req, model);
+        let plan = plan_attempts(&candidates, &req.prompt, req.prompt_original.as_deref());
+        let mut attempts: Vec<ImageAttempt> = Vec::new();
+        for (model, variant, prompt) in plan {
+            let mut body = build_image_body(&req, model, prompt);
             if let Some(prefs) = self.provider_prefs() {
                 if let Ok(v) = serde_json::to_value(&prefs) {
                     body["provider"] = v;
@@ -744,30 +854,53 @@ impl OpenRouterClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "openrouter: image attempt failed (transport); next");
-                    last_err = Some(e.into());
+                    tracing::warn!(model = %model, ?variant, error = %e, "openrouter: image attempt failed (transport); next");
+                    attempts.push(ImageAttempt {
+                        model: model.to_string(),
+                        variant,
+                        outcome: AttemptOutcome::Transport {
+                            message: e.to_string(),
+                        },
+                    });
                     continue;
                 }
             };
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                tracing::warn!(model = %model, %status, "openrouter: image attempt failed (status); next");
-                last_err = Some(LlmError::Status(status, text));
+                tracing::warn!(model = %model, ?variant, %status, "openrouter: image attempt failed (status); next");
+                attempts.push(ImageAttempt {
+                    model: model.to_string(),
+                    variant,
+                    outcome: AttemptOutcome::Status {
+                        status: status.as_u16(),
+                        message: cap_provider_message(&text),
+                    },
+                });
                 continue;
             }
             let parsed: WireResponse = match resp.json().await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "openrouter: image attempt failed (decode); next");
-                    last_err = Some(e.into());
+                    tracing::warn!(model = %model, ?variant, error = %e, "openrouter: image attempt failed (decode); next");
+                    attempts.push(ImageAttempt {
+                        model: model.to_string(),
+                        variant,
+                        outcome: AttemptOutcome::Decode {
+                            message: e.to_string(),
+                        },
+                    });
                     continue;
                 }
             };
             let images = images_from_wire(&parsed);
             if images.is_empty() {
-                tracing::warn!(model = %model, "openrouter: image attempt returned zero images; next");
-                last_err = Some(LlmError::Provider("image-gen returned no images".into()));
+                tracing::warn!(model = %model, ?variant, "openrouter: image attempt returned zero images; next");
+                attempts.push(ImageAttempt {
+                    model: model.to_string(),
+                    variant,
+                    outcome: AttemptOutcome::ZeroImages,
+                });
                 continue;
             }
             let first = parsed.choices.into_iter().next();
@@ -778,9 +911,11 @@ impl OpenRouterClient {
                 model: parsed.model,
                 usage: parsed.usage,
                 finish_reason,
+                attempts,
+                winning_variant: variant,
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: image-gen no models".into())))
+        Err(ImageGenError::ChainExhausted { attempts })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2298,7 +2433,7 @@ data: [DONE]\n\n";
             max_tokens: 4096,
             ..Default::default()
         };
-        let body = build_image_body(&req, "m");
+        let body = build_image_body(&req, "m", &req.prompt);
         // size is sent as real params
         assert_eq!(body["width"], 720);
         assert_eq!(body["height"], 1280);
@@ -2319,7 +2454,7 @@ data: [DONE]\n\n";
             max_tokens: 4096,
             ..Default::default()
         };
-        let body = build_image_body(&req, "m");
+        let body = build_image_body(&req, "m", &req.prompt);
         assert_eq!(body["width"], 768);
         assert_eq!(body["height"], 1024);
     }
@@ -2334,8 +2469,9 @@ data: [DONE]\n\n";
             aspect_ratio: Some("3:4".into()),
             resolution: None,
             max_tokens: 4096,
+            prompt_original: None,
         };
-        let body = build_image_body(&req, "m");
+        let body = build_image_body(&req, "m", &req.prompt);
         // #101: image-gen requests image-only output so image-only OpenRouter
         // models (e.g. bytedance-seed/seedream-4.5) don't 404. The engine never
         // uses the image model's text, so we never ask for the text modality.
@@ -2351,7 +2487,7 @@ data: [DONE]\n\n";
             face_ref_url: Some("https://x/a.png".into()),
             ..req
         };
-        let body2 = build_image_body(&req2, "m");
+        let body2 = build_image_body(&req2, "m", &req2.prompt);
         let content2 = &body2["messages"][0]["content"];
         assert_eq!(content2.as_array().unwrap().len(), 2);
         assert_eq!(content2[1]["type"], "image_url");
@@ -2375,5 +2511,63 @@ data: [DONE]\n\n";
         let parsed: WireResponse = serde_json::from_value(wire).unwrap();
         let imgs = images_from_wire(&parsed);
         assert_eq!(imgs, vec!["data:image/png;base64,AAAA".to_string()]);
+    }
+
+    #[test]
+    fn plan_attempts_interleaves_composed_then_original_per_model() {
+        let cands = ["A", "B", "C"];
+        let plan = plan_attempts(&cands, "CP", Some("OP"));
+        assert_eq!(
+            plan,
+            vec![
+                ("A", PromptVariant::Composed, "CP"),
+                ("A", PromptVariant::Original, "OP"),
+                ("B", PromptVariant::Composed, "CP"),
+                ("B", PromptVariant::Original, "OP"),
+                ("C", PromptVariant::Composed, "CP"),
+                ("C", PromptVariant::Original, "OP"),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_attempts_single_variant_when_no_original() {
+        let cands = ["A", "B"];
+        let plan = plan_attempts(&cands, "P", None);
+        assert_eq!(
+            plan,
+            vec![
+                ("A", PromptVariant::Single, "P"),
+                ("B", PromptVariant::Single, "P"),
+            ]
+        );
+    }
+
+    #[test]
+    fn image_attempt_serializes_flat() {
+        let a = ImageAttempt {
+            model: "openai/x".into(),
+            variant: PromptVariant::Composed,
+            outcome: AttemptOutcome::Status {
+                status: 400,
+                message: "policy".into(),
+            },
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["model"], "openai/x");
+        assert_eq!(v["variant"], "composed");
+        assert_eq!(v["outcome"], "status");
+        assert_eq!(v["status"], 400);
+        assert_eq!(v["message"], "policy");
+
+        let z = ImageAttempt {
+            model: "m".into(),
+            variant: PromptVariant::Original,
+            outcome: AttemptOutcome::ZeroImages,
+        };
+        let zv = serde_json::to_value(&z).unwrap();
+        assert_eq!(zv["variant"], "original");
+        assert_eq!(zv["outcome"], "zero_images");
+        assert!(zv.get("status").is_none());
     }
 }

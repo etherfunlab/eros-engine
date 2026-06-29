@@ -147,6 +147,7 @@ fn build_image_gen_request(
     fallback_subject: &str,
     ref_url: Option<String>,
     plan_aspect_ratio: Option<&str>,
+    original_subject: Option<&str>,
 ) -> eros_engine_llm::openrouter::ImageGenRequest {
     use eros_engine_llm::model_config::StyleKey;
     let style: StyleKey = req_image
@@ -180,15 +181,57 @@ fn build_image_gen_request(
             resolved.and_then(|r| r.default_resolution.clone())
         }
     });
+    let prompt_original = original_subject
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::pipeline::handlers::compose_image_prompt(style, persona, s));
     eros_engine_llm::openrouter::ImageGenRequest {
         model: primary,
         fallback_model: chain,
         prompt,
+        prompt_original,
         face_ref_url: ref_url,
         aspect_ratio,
         resolution,
         max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
     }
+}
+
+/// The subject-level prompt that actually drew the image, given which variant
+/// won. `Original` → the pre-compose subject; `Composed`/`Single` → the composed
+/// `final_subject`. Used so persisted/emitted prompt reflects the retry winner.
+fn winning_image_prompt(
+    variant: eros_engine_llm::openrouter::PromptVariant,
+    composed: &str,
+    original: &str,
+) -> String {
+    match variant {
+        eros_engine_llm::openrouter::PromptVariant::Original => original.to_string(),
+        _ => composed.to_string(),
+    }
+}
+
+/// Build the `metadata.image_failed` diagnostic for a fully-failed image chain.
+/// `composed_prompt` is the composed `final_subject` (the most useful debug
+/// field); `attempts` is the per-model/per-variant failure list.
+fn build_image_failed_meta(
+    composed_prompt: &str,
+    style: &str,
+    aspect_ratio: Option<&str>,
+    resolution: Option<&str>,
+    image_ref: &str,
+    face_ref_used: bool,
+    attempts: &[eros_engine_llm::openrouter::ImageAttempt],
+) -> serde_json::Value {
+    serde_json::json!({
+        "prompt": composed_prompt,
+        "style": style,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "image_ref": image_ref,
+        "face_ref_used": face_ref_used,
+        "attempts": attempts,
+    })
 }
 
 /// Parse the MIME type out of a `data:` URL prefix (e.g.
@@ -2156,6 +2199,9 @@ pub struct PersistedUserMessage {
     pub image_url: Option<String>,
     /// Image reply parameters supplied by the client, forwarded from the request.
     pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    /// Where this turn's main history is anchored (resolved from the request's
+    /// `reply_to_message_id`). `Latest` for ordinary turns.
+    pub history_anchor: eros_engine_core::types::HistoryAnchor,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -2225,6 +2271,7 @@ pub fn run_stream(
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
                 tips_amount_usd: user_msg.tips_amount_usd,
+                history_anchor: user_msg.history_anchor,
             },
             affinity: affinity.clone(),
             persona,
@@ -2429,6 +2476,7 @@ pub fn run_stream(
                 // runs as usual and the Image frame is appended after the text
                 // `done`.
                 let mut image_only_done = false;
+                let mut image_failed_meta: Option<serde_json::Value> = None;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
 
@@ -2476,6 +2524,9 @@ pub fn run_stream(
                             .unwrap_or_else(|| subject.clone()),
                             None => subject.clone(),
                         };
+                        let original_subject = (!subject.trim().is_empty()
+                            && final_subject.trim() != subject.trim())
+                            .then_some(subject.as_str());
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2486,11 +2537,17 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
+                            original_subject,
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
                         match state.openrouter.execute_image(req).await {
                             Ok(resp) if !resp.images.is_empty() => {
+                                let won_prompt = winning_image_prompt(
+                                    resp.winning_variant,
+                                    &final_subject,
+                                    &subject,
+                                );
                                 // Usage logging via the ChatResponse adapter.
                                 let cr = eros_engine_llm::openrouter::ChatResponse {
                                     reply: String::new(),
@@ -2502,8 +2559,8 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let image_meta = serde_json::json!({
-                                    "prompt": final_subject,
+                                let mut image_meta = serde_json::json!({
+                                    "prompt": won_prompt,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -2512,6 +2569,10 @@ pub fn run_stream(
                                     "face_ref_used": face_used,
                                     "image_ref": ref_kind,
                                 });
+                                if !resp.attempts.is_empty() {
+                                    image_meta["attempts"] =
+                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
+                                }
                                 let mime = data_url_mime(&resp.images[0]);
                                 let msg_ulid = Ulid::new();
                                 let msg_uuid: Uuid = msg_ulid.into();
@@ -2563,7 +2624,7 @@ pub fn run_stream(
                                     message_id: ulid_string(msg_ulid),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(final_subject.clone()),
+                                    image_prompt: Some(won_prompt.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
@@ -2577,15 +2638,33 @@ pub fn run_stream(
                             }
                             Ok(_) => {
                                 tracing::warn!(
-                                    "stream(image): execute_image returned zero images; \
+                                    "stream(image): execute_image returned zero images \
+                                     (unexpected); falling through to text"
+                                );
+                            }
+                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                tracing::warn!(
+                                    "stream(image): execute_image config error: {m}; \
                                      falling through to text"
                                 );
                             }
-                            Err(e) => {
+                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                attempts,
+                            }) => {
                                 tracing::warn!(
-                                    "stream(image): execute_image failed: {e}; \
-                                     falling through to text"
+                                    attempts = attempts.len(),
+                                    "stream(image): image chain exhausted; persisting \
+                                     image_failed onto the fallthrough text row"
                                 );
+                                image_failed_meta = Some(build_image_failed_meta(
+                                    &final_subject,
+                                    &style_str,
+                                    ar.as_deref(),
+                                    res.as_deref(),
+                                    ref_kind,
+                                    face_used,
+                                    &attempts,
+                                ));
                             }
                         }
                     }
@@ -2630,6 +2709,7 @@ pub fn run_stream(
                         memory_scope: user_msg.memory_scope,
                         affinity_scope: user_msg.affinity_scope,
                         tips_amount_usd: user_msg.tips_amount_usd,
+                        history_anchor: user_msg.history_anchor,
                     };
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
@@ -2828,6 +2908,31 @@ pub fn run_stream(
                     (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter)
                 };
 
+                // If image-only generation failed (ChainExhausted), attach the
+                // diagnostic onto the fallthrough text row that the burst just
+                // produced.
+                if let Some(meta) = image_failed_meta.take() {
+                    if let Some(last) = produced.last() {
+                        if let Err(e) = chat_repo
+                            .merge_assistant_metadata_key(
+                                user_msg.session_id,
+                                last.message_id,
+                                "image_failed",
+                                &meta,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "stream(image): persist image_failed onto text row failed: {e}"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "stream(image): no fallthrough text row to carry image_failed"
+                        );
+                    }
+                }
+
                 // Reset ghost streak (mirrors sync pipeline policy).
                 if let Err(e) = sqlx::query(
                     "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
@@ -2894,6 +2999,9 @@ pub fn run_stream(
                             .unwrap_or_else(|| subject.clone()),
                             None => subject.clone(),
                         };
+                        let original_subject = (!subject.trim().is_empty()
+                            && final_subject.trim() != subject.trim())
+                            .then_some(subject.as_str());
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2904,11 +3012,17 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
+                            original_subject,
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
                         match state.openrouter.execute_image(req).await {
                             Ok(resp) if !resp.images.is_empty() => {
+                                let won_prompt = winning_image_prompt(
+                                    resp.winning_variant,
+                                    &final_subject,
+                                    &subject,
+                                );
                                 let cr = eros_engine_llm::openrouter::ChatResponse {
                                     reply: String::new(),
                                     generation_id: resp.generation_id.clone(),
@@ -2919,8 +3033,8 @@ pub fn run_stream(
                                 // Mirror the other in-stream task log sites
                                 // (vision / filters / pde): session_id = None.
                                 super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let image_meta = serde_json::json!({
-                                    "prompt": final_subject,
+                                let mut image_meta = serde_json::json!({
+                                    "prompt": won_prompt,
                                     "style": style_str,
                                     "model": resp.model,
                                     "aspect_ratio": ar,
@@ -2929,6 +3043,10 @@ pub fn run_stream(
                                     "face_ref_used": face_used,
                                     "image_ref": ref_kind,
                                 });
+                                if !resp.attempts.is_empty() {
+                                    image_meta["attempts"] =
+                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
+                                }
                                 let mime = data_url_mime(&resp.images[0]);
                                 // merge_assistant_image_meta wraps under {"image":..}
                                 // itself — pass the raw image_meta.
@@ -2948,22 +3066,53 @@ pub fn run_stream(
                                     message_id: ulid_string(Ulid::from(msg_uuid)),
                                     data_url: resp.images[0].clone(),
                                     mime,
-                                    image_prompt: Some(final_subject.clone()),
+                                    image_prompt: Some(won_prompt.clone()),
                                     model: resp.model.clone(),
                                     generation_id: resp.generation_id.clone(),
                                 };
                             }
                             Ok(_) => {
                                 tracing::warn!(
-                                    "stream(text_image): execute_image returned zero images; \
+                                    "stream(text_image): execute_image returned zero images \
+                                     (unexpected); no Image frame (text already delivered)"
+                                );
+                            }
+                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                tracing::warn!(
+                                    "stream(text_image): execute_image config error: {m}; \
                                      no Image frame (text already delivered)"
                                 );
                             }
-                            Err(e) => {
+                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                attempts,
+                            }) => {
                                 tracing::warn!(
-                                    "stream(text_image): execute_image failed: {e}; \
-                                     no Image frame (text already delivered)"
+                                    attempts = attempts.len(),
+                                    "stream(text_image): image chain exhausted; persisting \
+                                     image_failed onto the text row"
                                 );
+                                let meta = build_image_failed_meta(
+                                    &final_subject,
+                                    &style_str,
+                                    ar.as_deref(),
+                                    res.as_deref(),
+                                    ref_kind,
+                                    face_used,
+                                    &attempts,
+                                );
+                                if let Err(e) = chat_repo
+                                    .merge_assistant_metadata_key(
+                                        user_msg.session_id,
+                                        msg_uuid,
+                                        "image_failed",
+                                        &meta,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "stream(text_image): persist image_failed failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -3001,6 +3150,7 @@ pub fn run_stream(
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
                     tips_amount_usd: user_msg.tips_amount_usd,
+                    history_anchor: user_msg.history_anchor,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -3287,6 +3437,7 @@ mod tests {
             "fallback subject",
             None, /* ref_url */
             None, /* plan_aspect_ratio */
+            None, /* original_subject */
         );
         assert_eq!(req.model, "img");
         assert!(req.prompt.starts_with("Photorealistic"));
@@ -3313,6 +3464,7 @@ mod tests {
             "fallback subject",
             None,         /* ref_url */
             Some("9:16"), /* plan_aspect_ratio */
+            None,         /* original_subject */
         );
         assert_eq!(
             req.aspect_ratio.as_deref(),
@@ -3323,6 +3475,114 @@ mod tests {
             req.resolution, None,
             "config default_resolution dropped when a plan aspect is set"
         );
+    }
+
+    #[test]
+    fn build_image_gen_request_sets_prompt_original_when_provided() {
+        let persona = test_persona_with_meta(&[]);
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        // composed subject as primary, original subject as the retry variant
+        let req = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            Some("composed scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            Some("original scene"), /* original_subject */
+        );
+        let po = req.prompt_original.expect("prompt_original set");
+        assert!(po.contains("original scene"));
+        assert!(po.starts_with("Photorealistic")); // style wrapping applied to both
+        assert!(req.prompt.contains("composed scene"));
+    }
+
+    #[test]
+    fn build_image_gen_request_no_prompt_original_when_none_or_blank() {
+        let persona = test_persona_with_meta(&[]);
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        let req = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            Some("scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            None,
+        );
+        assert!(req.prompt_original.is_none());
+        let req_blank = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            Some("scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            Some("   "),
+        );
+        assert!(req_blank.prompt_original.is_none(), "blank original ⇒ None");
+    }
+
+    #[test]
+    fn build_image_failed_meta_shape() {
+        use eros_engine_llm::openrouter::{AttemptOutcome, ImageAttempt, PromptVariant};
+        let attempts = vec![
+            ImageAttempt {
+                model: "A".into(),
+                variant: PromptVariant::Composed,
+                outcome: AttemptOutcome::Status {
+                    status: 400,
+                    message: "policy".into(),
+                },
+            },
+            ImageAttempt {
+                model: "A".into(),
+                variant: PromptVariant::Original,
+                outcome: AttemptOutcome::ZeroImages,
+            },
+        ];
+        let v = build_image_failed_meta(
+            "composed final",
+            "realistic",
+            Some("3:4"),
+            None,
+            "face",
+            true,
+            &attempts,
+        );
+        assert_eq!(v["prompt"], "composed final");
+        assert_eq!(v["style"], "realistic");
+        assert_eq!(v["aspect_ratio"], "3:4");
+        assert!(v["resolution"].is_null());
+        assert_eq!(v["image_ref"], "face");
+        assert_eq!(v["face_ref_used"], true);
+        assert_eq!(v["attempts"][0]["status"], 400);
+        assert_eq!(v["attempts"][1]["outcome"], "zero_images");
+    }
+
+    #[test]
+    fn winning_image_prompt_picks_variant() {
+        use eros_engine_llm::openrouter::PromptVariant;
+        assert_eq!(winning_image_prompt(PromptVariant::Original, "C", "O"), "O");
+        assert_eq!(winning_image_prompt(PromptVariant::Composed, "C", "O"), "C");
+        assert_eq!(winning_image_prompt(PromptVariant::Single, "C", "O"), "C");
     }
 
     #[test]
@@ -3611,6 +3871,7 @@ mod tests {
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -3808,6 +4069,7 @@ mod tests {
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -3943,6 +4205,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4028,6 +4291,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4129,6 +4393,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4445,6 +4710,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4569,6 +4835,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4706,6 +4973,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4858,6 +5126,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4972,6 +5241,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5067,6 +5337,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(20.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5174,6 +5445,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5283,6 +5555,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5411,6 +5684,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5612,6 +5886,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5756,6 +6031,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5866,6 +6142,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(0.5),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6041,6 +6318,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6200,6 +6478,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6342,6 +6621,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6464,6 +6744,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6600,6 +6881,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6750,6 +7032,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -7080,6 +7363,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -7131,6 +7415,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -7368,6 +7653,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
