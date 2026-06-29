@@ -731,6 +731,32 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
+    /// Shallow-merge `{ key: value }` into an assistant row's `metadata`
+    /// (`metadata = COALESCE(metadata,'{}') || {key:value}`). Generic sibling of
+    /// `merge_assistant_image_meta` (which hardcodes the `"image"` key). Scoped
+    /// by `session_id` and `role = 'assistant'` (IDOR guard). No-op if no row
+    /// matches.
+    pub async fn merge_assistant_metadata_key(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        let patch = serde_json::json!({ key: value });
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata, '{}'::jsonb) || $3 \
+             WHERE id = $1 AND session_id = $2 AND role = 'assistant'",
+        )
+        .bind(message_id)
+        .bind(session_id)
+        .bind(patch)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Persist the client-written-back storage URL for a generated image, nested
     /// under `metadata.image.url`. Idempotent (re-POST overwrites). Scoped by
     /// `session_id` to prevent cross-session write-back (IDOR): a user may only
@@ -2668,5 +2694,67 @@ mod tests {
             vec!["B", "M", "U"],
             "limit caps total incl. U; oldest (A) trimmed; U survives"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_assistant_metadata_key_writes_under_named_key(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let user_msg_id = match repo
+            .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000002A", "user", None)
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            other => panic!("{other:?}"),
+        };
+        let msg_id = Uuid::new_v4();
+        repo.insert_assistant_batch(
+            s.id,
+            user_msg_id,
+            &[AssistantInsert {
+                id: msg_id,
+                content: "fell through to text".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let value = serde_json::json!({ "prompt": "a selfie", "attempts": [] });
+        repo.merge_assistant_metadata_key(s.id, msg_id, "image_failed", &value)
+            .await
+            .unwrap();
+
+        let meta: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(msg_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let meta = meta.unwrap();
+        assert_eq!(meta["image_failed"]["prompt"], "a selfie");
+
+        // Wrong session must not write (IDOR guard).
+        repo.merge_assistant_metadata_key(Uuid::new_v4(), msg_id, "x", &serde_json::json!(1))
+            .await
+            .unwrap();
+        let meta2: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(msg_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(meta2.get("x").is_none(), "cross-session write must be a no-op");
     }
 }
