@@ -185,6 +185,45 @@ impl ChemistryLabel {
     }
 }
 
+/// One line's tier transition this turn, as serialised keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelTransition {
+    pub from: String,
+    pub to: String,
+}
+
+/// Per-turn tier transition across the two lines. Serde skips `None` fields, so
+/// a JSON object only carries the line(s) that actually moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnLabelChanges {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond: Option<LabelTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chemistry: Option<LabelTransition>,
+}
+
+impl TurnLabelChanges {
+    pub fn is_empty(&self) -> bool {
+        self.bond.is_none() && self.chemistry.is_none()
+    }
+}
+
+/// Tier transition over a delta-only span (before = post-decay/pre-delta,
+/// after = post-delta). `None` when neither line crossed a tier.
+pub fn diff_labels(before: &Affinity, after: &Affinity) -> Option<TurnLabelChanges> {
+    let bond = (before.bond_label() != after.bond_label()).then(|| LabelTransition {
+        from: before.bond_label().as_key().to_string(),
+        to: after.bond_label().as_key().to_string(),
+    });
+    let chemistry =
+        (before.chemistry_label() != after.chemistry_label()).then(|| LabelTransition {
+            from: before.chemistry_label().as_key().to_string(),
+            to: after.chemistry_label().as_key().to_string(),
+        });
+    let changes = TurnLabelChanges { bond, chemistry };
+    (!changes.is_empty()).then_some(changes)
+}
+
 impl Affinity {
     /// 0..1 friendship composite. warmth floored at 0; mirrors the `bond`
     /// generated column in migration 0029.
@@ -464,5 +503,48 @@ mod tests {
         a.trust = 0.0;
         a.intrigue = 0.0;
         assert_eq!(a.legacy_relationship_label(), RelationshipLabel::SlowBurn);
+    }
+
+    #[test]
+    fn diff_labels_none_when_no_tier_change() {
+        let a = fresh();
+        let b = a.clone();
+        assert!(diff_labels(&a, &b).is_none());
+    }
+
+    #[test]
+    fn diff_labels_reports_single_line_change() {
+        let mut before = fresh();
+        before.warmth = 0.0;
+        before.trust = 0.0;
+        before.intrigue = 0.0;
+        before.intimacy = 0.0;
+        before.tension = 0.0; // bond + chem both tier 1
+        let mut after = before.clone();
+        after.trust = 0.9;
+        after.intrigue = 0.9; // bond = 0.6 → tier 3 (close_friend)
+        let d = diff_labels(&before, &after).unwrap();
+        let bond = d.bond.unwrap();
+        assert_eq!(bond.from, "acquaintance");
+        assert_eq!(bond.to, "close_friend");
+        assert!(d.chemistry.is_none());
+    }
+
+    #[test]
+    fn diff_labels_reports_both_lines() {
+        let mut before = fresh();
+        before.warmth = 0.0;
+        before.trust = 0.0;
+        before.intrigue = 0.0;
+        before.intimacy = 0.0;
+        before.tension = 0.0;
+        let mut after = before.clone();
+        after.trust = 0.9;
+        after.intrigue = 0.9; // bond → close_friend
+        after.intimacy = 0.9;
+        after.tension = 0.9; // chem = 0.6 → tier 3 (crush)
+        let d = diff_labels(&before, &after).unwrap();
+        assert_eq!(d.bond.unwrap().to, "close_friend");
+        assert_eq!(d.chemistry.unwrap().to, "crush");
     }
 }
