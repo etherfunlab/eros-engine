@@ -8124,6 +8124,184 @@ data: [DONE]\n\n";
         );
     }
 
+    /// When the reply is ENTIRELY the artifact (a bare `[...]` with nothing
+    /// else), the strip empties it. There is no fail-safe: the client receives
+    /// NO content bubble (no Delta), the row persists empty `content` (""), and
+    /// the audit still records the strip (`pre_filter_content` = raw,
+    /// `filter_model` = "<regex>"). Downstream renders the empty reply however
+    /// it likes (the web client just doesn't show it — a ghost-like effect).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_artifact_only_reply_persists_empty_no_bubble(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ── 1. Mock OpenRouter: reply is ONLY the bracket artifact ─────────────
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片：海边自拍]\"}}],\
+\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":8,\"total_tokens\":10},\
+\"id\":\"gen-bo\",\"model\":\"mock/cydonia\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // ── 2. Seed persona + session ──────────────────────────────────────────
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // ── 3. AppState with a rule that drops any [...] for mock/cydonia ──────
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/cydonia\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/cydonia\"]\n\
+             pattern=\"\\\\[[^\\\\]]*\\\\]\"\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("artifact pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        // ── 4. Insert the user message ─────────────────────────────────────────
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "晚安",
+                "01JT5REGEXBONLY0000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        // ── 5. Drive drive_chat_burst (ReplyText, no LLM filter) ───────────────
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "mock/cydonia".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "晚安".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None, // filter = None: regex-only turn
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        // ── 6. Assertions ─────────────────────────────────────────────────────
+        // No error frame, and crucially NO Delta (no content bubble reaches the client).
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "no error frame expected; got {frames:?}",
+        );
+        let deltas: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.is_empty(),
+            "an artifact-only reply must emit NO Delta bubble; got {deltas:?}",
+        );
+
+        // The strip fired (filtered=true) and extract sees the empty text.
+        {
+            let o = outcome.lock().unwrap();
+            assert!(o.filtered, "outcome.filtered must be true: the strip ran");
+            assert_eq!(
+                o.produced.len(),
+                1,
+                "one produced message; got {:?}",
+                o.produced
+            );
+            assert_eq!(
+                o.produced[0].full_text, "",
+                "extract/memory must see the empty (stripped) text",
+            );
+        }
+
+        // DB row: content == "" (empty, not the raw artifact); audit recorded.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content, "",
+            "persisted content must be empty; got {content:?}"
+        );
+        assert_eq!(
+            pre_filter.as_deref(),
+            Some("[你给对方发送了一张照片：海边自拍]"),
+            "pre_filter_content must hold the raw artifact; got {pre_filter:?}",
+        );
+        assert_eq!(
+            filter_model.as_deref(),
+            Some("<regex>"),
+            "filter_model must be '<regex>'; got {filter_model:?}",
+        );
+        assert_eq!(
+            filter_triggers,
+            Some(serde_json::json!({ "regex": [0usize] })),
+            "filter_triggers must be {{\"regex\":[0]}}; got {filter_triggers:?}",
+        );
+    }
+
     /// Both layers fire on the SAME turn: the per-model output_regex strips the
     /// artifact (layer 0) AND the LLM output_filter rewrites the reply. The LLM
     /// filter must run on the regex-CLEANED text (not the raw `acc`); the
