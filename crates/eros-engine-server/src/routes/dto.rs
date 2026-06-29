@@ -58,7 +58,10 @@ impl From<Affinity> for AffinitySnapshot {
             tension: a.tension,
             ghost_streak: a.ghost_streak,
             total_ghosts: a.total_ghosts,
-            relationship_label: a.relationship_label.map(label_to_str),
+            // Legacy field, derived on read (like bond/chemistry below) so it is
+            // always consistent with the new lines — never NULL on a fresh row
+            // and never a stale pre-migration value from the stored column.
+            relationship_label: Some(label_to_str(a.legacy_relationship_label())),
             updated_at: a.updated_at.to_rfc3339(),
             bond: bar(a.bond_score()),
             chemistry: bar(a.chemistry_score()),
@@ -142,6 +145,20 @@ mod tests {
         // bar(0.6): tier3 band 0.50 + (0.6-0.35)/0.27*0.25
         assert!((snap.bond - (0.50 + (0.6 - 0.35) / 0.27 * 0.25)).abs() < 1e-9);
         assert!((snap.chemistry).abs() < 1e-9);
+        // legacy label derived on read: bond (tier3) leads, neither tier1 → friend
+        assert_eq!(snap.relationship_label.as_deref(), Some("friend"));
+    }
+
+    #[test]
+    fn snapshot_legacy_label_derived_on_read_not_stored() {
+        // Fresh low-seed row (warmth 0.1, rest 0) with a NULL stored label still
+        // reads as "stranger" — the legacy field is derived, not read from the
+        // column. Guards the "fresh session = stranger" goal (codex #132 P2).
+        let a = affinity(0.1, 0.0, 0.0, 0.0, 0.0); // relationship_label: None
+        let snap = AffinitySnapshot::from(a);
+        assert_eq!(snap.relationship_label.as_deref(), Some("stranger"));
+        assert_eq!(snap.bond_label, "acquaintance");
+        assert_eq!(snap.chemistry_label, "spark");
     }
 
     #[test]
