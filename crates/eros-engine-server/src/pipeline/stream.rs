@@ -2510,6 +2510,9 @@ pub fn run_stream(
                             .unwrap_or_else(|| subject.clone()),
                             None => subject.clone(),
                         };
+                        let original_subject = (!subject.trim().is_empty()
+                            && final_subject.trim() != subject.trim())
+                            .then_some(subject.as_str());
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2520,7 +2523,7 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
-                            None, /* original_subject — activated in retry task */
+                            original_subject,
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2977,6 +2980,9 @@ pub fn run_stream(
                             .unwrap_or_else(|| subject.clone()),
                             None => subject.clone(),
                         };
+                        let original_subject = (!subject.trim().is_empty()
+                            && final_subject.trim() != subject.trim())
+                            .then_some(subject.as_str());
                         let req = build_image_gen_request(
                             primary,
                             fallback,
@@ -2987,7 +2993,7 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
-                            None, /* original_subject — activated in retry task */
+                            original_subject,
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
