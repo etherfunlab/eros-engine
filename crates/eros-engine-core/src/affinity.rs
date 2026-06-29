@@ -67,21 +67,25 @@ impl Affinity {
         self.tension = clamp(self.tension - 0.005 * days, 0.0, 1.0);
     }
 
-    pub fn infer_label(&self) -> Option<RelationshipLabel> {
-        // Priority: romantic > friend > frenemy > slow_burn > stranger
-        if self.warmth >= 0.7 && self.tension >= 0.3 && self.intimacy >= 0.4 {
-            return Some(RelationshipLabel::Romantic);
+    /// Legacy 5-name relationship label (back-compat), derived purely from the
+    /// two line scores — replaces the old multi-axis `infer_label` heuristic.
+    /// New consumers should read `bond_label`/`chemistry_label`. `frenemy` is
+    /// retired from emission (kept in the enum for parse compat).
+    pub fn legacy_relationship_label(&self) -> RelationshipLabel {
+        let bond = self.bond_score();
+        let chem = self.chemistry_score();
+        if tier_index(bond) == 1 && tier_index(chem) == 1 {
+            return RelationshipLabel::Stranger;
         }
-        if self.warmth >= 0.7 && self.trust >= 0.6 && self.tension < 0.2 {
-            return Some(RelationshipLabel::Friend);
+        if chem > bond {
+            if tier_index(chem) >= 3 {
+                RelationshipLabel::Romantic
+            } else {
+                RelationshipLabel::SlowBurn
+            }
+        } else {
+            RelationshipLabel::Friend
         }
-        if self.warmth < 0.4 && self.tension >= 0.6 && self.intrigue >= 0.5 {
-            return Some(RelationshipLabel::Frenemy);
-        }
-        if self.intrigue >= 0.6 && self.tension >= 0.4 && self.intimacy < 0.4 {
-            return Some(RelationshipLabel::SlowBurn);
-        }
-        Some(RelationshipLabel::Stranger)
     }
 }
 
@@ -353,47 +357,6 @@ mod tests {
         assert_eq!(a.tension, 0.0);
     }
 
-    #[test]
-    fn infer_label_romantic_when_warm_intimate_and_tense() {
-        let mut a = fresh();
-        a.warmth = 0.8;
-        a.tension = 0.4;
-        a.intimacy = 0.5;
-        assert_eq!(a.infer_label(), Some(RelationshipLabel::Romantic));
-    }
-
-    #[test]
-    fn infer_label_friend_when_warm_trusted_low_tension() {
-        let mut a = fresh();
-        a.warmth = 0.75;
-        a.trust = 0.7;
-        a.tension = 0.1;
-        assert_eq!(a.infer_label(), Some(RelationshipLabel::Friend));
-    }
-
-    #[test]
-    fn infer_label_frenemy_when_cold_tense_intrigued() {
-        let mut a = fresh();
-        a.warmth = 0.3;
-        a.tension = 0.7;
-        a.intrigue = 0.6;
-        assert_eq!(a.infer_label(), Some(RelationshipLabel::Frenemy));
-    }
-
-    #[test]
-    fn infer_label_slow_burn_when_intrigued_tense_not_yet_intimate() {
-        let mut a = fresh();
-        a.intrigue = 0.7;
-        a.tension = 0.5;
-        a.intimacy = 0.2;
-        assert_eq!(a.infer_label(), Some(RelationshipLabel::SlowBurn));
-    }
-
-    #[test]
-    fn infer_label_stranger_when_no_thresholds_met() {
-        let a = fresh();
-        assert_eq!(a.infer_label(), Some(RelationshipLabel::Stranger));
-    }
 
     #[test]
     fn bond_chemistry_scores_fold_axes_with_warmth_floored() {
@@ -454,5 +417,52 @@ mod tests {
         a.intimacy = 1.0;
         a.tension = 1.0; // chem = 0.667 → tier 4
         assert_eq!(a.chemistry_label(), ChemistryLabel::Lover);
+    }
+
+    #[test]
+    fn legacy_label_stranger_when_both_tier1() {
+        let mut a = fresh();
+        a.warmth = 0.0;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Stranger);
+    }
+
+    #[test]
+    fn legacy_label_friend_when_bond_leads() {
+        let mut a = fresh();
+        // bond = (0.3+0.6+0.6)/3 = 0.5 ; chem = (0.3+0+0)/3 = 0.1
+        a.warmth = 0.3;
+        a.trust = 0.6;
+        a.intrigue = 0.6;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Friend);
+    }
+
+    #[test]
+    fn legacy_label_romantic_when_chemistry_high() {
+        let mut a = fresh();
+        // chem = (0.3+0.9+0.9)/3 = 0.7 (tier4) ; bond = 0.1
+        a.warmth = 0.3;
+        a.intimacy = 0.9;
+        a.tension = 0.9;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Romantic);
+    }
+
+    #[test]
+    fn legacy_label_slow_burn_when_chemistry_leads_but_mid() {
+        let mut a = fresh();
+        // chem = (0.3+0.3+0.2)/3 ≈ 0.267 (tier2) ; bond = 0.1 (tier1)
+        a.warmth = 0.3;
+        a.intimacy = 0.3;
+        a.tension = 0.2;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::SlowBurn);
     }
 }

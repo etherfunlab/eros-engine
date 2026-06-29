@@ -259,8 +259,8 @@ impl<'a> AffinityRepo<'a> {
         };
 
         current.apply_deltas(deltas, ema_inertia);
-        let label = current.infer_label();
-        current.relationship_label = label;
+        let label = current.legacy_relationship_label();
+        current.relationship_label = Some(label);
 
         // Post-EMA effective change = after − before (captures EMA + clamping).
         let effective = AffinityDeltas {
@@ -286,7 +286,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(current.intimacy)
         .bind(current.patience)
         .bind(current.tension)
-        .bind(label.map(label_to_str))
+        .bind(label_to_str(label))
         .execute(&mut *tx)
         .await?;
 
