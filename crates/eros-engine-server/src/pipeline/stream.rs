@@ -3489,13 +3489,29 @@ mod tests {
         .unwrap()
         .resolve_image_gen();
         let req = build_image_gen_request(
-            "img".into(), vec![], &persona, Some("scene"), None,
-            resolved.as_ref(), "", None, None, None,
+            "img".into(),
+            vec![],
+            &persona,
+            Some("scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            None,
         );
         assert!(req.prompt_original.is_none());
         let req_blank = build_image_gen_request(
-            "img".into(), vec![], &persona, Some("scene"), None,
-            resolved.as_ref(), "", None, None, Some("   "),
+            "img".into(),
+            vec![],
+            &persona,
+            Some("scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            Some("   "),
         );
         assert!(req_blank.prompt_original.is_none(), "blank original ⇒ None");
     }
@@ -3507,7 +3523,10 @@ mod tests {
             ImageAttempt {
                 model: "A".into(),
                 variant: PromptVariant::Composed,
-                outcome: AttemptOutcome::Status { status: 400, message: "policy".into() },
+                outcome: AttemptOutcome::Status {
+                    status: 400,
+                    message: "policy".into(),
+                },
             },
             ImageAttempt {
                 model: "A".into(),

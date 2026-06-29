@@ -2756,6 +2756,9 @@ mod tests {
                 .await
                 .unwrap();
         let meta2 = meta2.unwrap();
-        assert!(meta2.get("x").is_none(), "cross-session write must be a no-op");
+        assert!(
+            meta2.get("x").is_none(),
+            "cross-session write must be a no-op"
+        );
     }
 }

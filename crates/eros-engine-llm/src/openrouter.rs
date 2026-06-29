@@ -155,7 +155,11 @@ impl std::fmt::Display for ImageGenError {
         match self {
             ImageGenError::Config(m) => write!(f, "image-gen config error: {m}"),
             ImageGenError::ChainExhausted { attempts } => {
-                write!(f, "image-gen chain exhausted after {} attempt(s)", attempts.len())
+                write!(
+                    f,
+                    "image-gen chain exhausted after {} attempt(s)",
+                    attempts.len()
+                )
             }
         }
     }
@@ -811,13 +815,18 @@ impl OpenRouterClient {
     /// One-shot image-generation call. Walks `[model] + fallback_model` on
     /// transport failure OR a zero-image success. Returns the first attempt that
     /// yields ≥1 image. Non-streaming.
-    pub async fn execute_image(&self, req: ImageGenRequest) -> Result<ImageGenResponse, ImageGenError> {
+    pub async fn execute_image(
+        &self,
+        req: ImageGenRequest,
+    ) -> Result<ImageGenResponse, ImageGenError> {
         let candidates: Vec<&str> = std::iter::once(req.model.as_str())
             .chain(req.fallback_model.iter().map(String::as_str))
             .filter(|s| !s.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err(ImageGenError::Config("openrouter: image-gen has no models".into()));
+            return Err(ImageGenError::Config(
+                "openrouter: image-gen has no models".into(),
+            ));
         }
         if self.api_key.is_empty() {
             return Err(ImageGenError::Config("openrouter: api key not set".into()));
@@ -845,7 +854,9 @@ impl OpenRouterClient {
                     attempts.push(ImageAttempt {
                         model: model.to_string(),
                         variant,
-                        outcome: AttemptOutcome::Transport { message: e.to_string() },
+                        outcome: AttemptOutcome::Transport {
+                            message: e.to_string(),
+                        },
                     });
                     continue;
                 }
@@ -871,7 +882,9 @@ impl OpenRouterClient {
                     attempts.push(ImageAttempt {
                         model: model.to_string(),
                         variant,
-                        outcome: AttemptOutcome::Decode { message: e.to_string() },
+                        outcome: AttemptOutcome::Decode {
+                            message: e.to_string(),
+                        },
                     });
                     continue;
                 }
@@ -2530,7 +2543,10 @@ data: [DONE]\n\n";
         let a = ImageAttempt {
             model: "openai/x".into(),
             variant: PromptVariant::Composed,
-            outcome: AttemptOutcome::Status { status: 400, message: "policy".into() },
+            outcome: AttemptOutcome::Status {
+                status: 400,
+                message: "policy".into(),
+            },
         };
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["model"], "openai/x");
