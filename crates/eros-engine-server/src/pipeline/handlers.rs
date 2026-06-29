@@ -40,6 +40,23 @@ const CHAT_TASK: &str = "chat_companion";
 /// Maximum number of recent messages pulled into the prompt.
 const HISTORY_WINDOW: i64 = 20;
 
+/// Resolved fetch strategy for the main history of a turn. Pure mapping of the
+/// event's `HistoryAnchor`, factored out so it can be unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryFetch {
+    Latest,
+    Anchored(Option<chrono::DateTime<chrono::Utc>>),
+}
+
+fn history_fetch_for(anchor: eros_engine_core::types::HistoryAnchor) -> HistoryFetch {
+    use eros_engine_core::types::HistoryAnchor;
+    match anchor {
+        HistoryAnchor::Latest => HistoryFetch::Latest,
+        HistoryAnchor::At { sent_at, .. } => HistoryFetch::Anchored(Some(sent_at)),
+        HistoryAnchor::DropHistory => HistoryFetch::Anchored(None),
+    }
+}
+
 /// Partition caller traits by a tier's resolved allow-list.
 /// - `allow == None` → no gating: all kept, none dropped.
 /// - `allow == Some(set)` → keep only traits whose `tag` ∈ `set`; the rest
@@ -565,7 +582,18 @@ pub(super) async fn build_reply_request(
     user_message_id: Uuid,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
-    let history = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
+    let history_anchor = match &input.event {
+        eros_engine_core::types::Event::UserMessage { history_anchor, .. } => *history_anchor,
+        _ => eros_engine_core::types::HistoryAnchor::Latest,
+    };
+    let history = match history_fetch_for(history_anchor) {
+        HistoryFetch::Latest => chat_repo.history(session_id, HISTORY_WINDOW, 0).await?,
+        HistoryFetch::Anchored(anchor) => {
+            chat_repo
+                .history_anchored(session_id, user_message_id, anchor, HISTORY_WINDOW)
+                .await?
+        }
+    };
 
     // Recall query for the current user turn: the effective caption, or — for an
     // image-only turn — the vision description (recall_query_text), so a photo
@@ -1430,6 +1458,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
+            history_anchor: Default::default(),
         };
         let extracted = audit_from_event(&ev);
         assert_eq!(extracted, Some(&audit));
@@ -1872,5 +1901,26 @@ mod tests {
         );
         assert_eq!(pairs_after[0], ("u0".to_string(), "a0".to_string()));
         assert_eq!(pairs_after[1], ("u1".to_string(), "a1".to_string()));
+    }
+
+    #[test]
+    fn history_fetch_for_maps_each_anchor() {
+        use eros_engine_core::types::HistoryAnchor;
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(123, 0).unwrap();
+        assert_eq!(
+            history_fetch_for(HistoryAnchor::Latest),
+            HistoryFetch::Latest
+        );
+        assert_eq!(
+            history_fetch_for(HistoryAnchor::At {
+                message_id: uuid::Uuid::nil(),
+                sent_at: ts
+            }),
+            HistoryFetch::Anchored(Some(ts)),
+        );
+        assert_eq!(
+            history_fetch_for(HistoryAnchor::DropHistory),
+            HistoryFetch::Anchored(None),
+        );
     }
 }

@@ -234,6 +234,74 @@ impl<'a> ChatRepo<'a> {
         Ok(rows)
     }
 
+    /// `sent_at` of message `id` within `session_id`; `None` if the id is not in
+    /// this session (or does not exist). Resolves a caller-supplied
+    /// `reply_to_message_id` into a history anchor.
+    pub async fn message_sent_at_in_session(
+        &self,
+        session_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT sent_at FROM engine.chat_messages WHERE id = $1 AND session_id = $2",
+        )
+        .bind(id)
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// History for a quote-anchored turn, chronological.
+    ///
+    /// `anchor = Some(ts)` (rewind): returns **at most `limit` rows total**,
+    /// chronological. The current message (`current_msg_id`, whose
+    /// `sent_at > ts`) is always included and **counts toward `limit`**; it
+    /// sorts first under `DESC` so `LIMIT` only trims the oldest
+    /// below-anchor rows. Messages with `sent_at` strictly between `ts` and
+    /// the current message's `sent_at` are excluded. This matches the
+    /// `history()` window contract — both use `limit` rows total including
+    /// the newest (current) message.
+    ///
+    /// `anchor = None` (drop history): only the `current_msg_id` row.
+    ///
+    /// Uses the existing `(session_id, sent_at DESC)` index — no migration.
+    pub async fn history_anchored(
+        &self,
+        session_id: Uuid,
+        current_msg_id: Uuid,
+        anchor: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<ChatMessage>, sqlx::Error> {
+        let mut rows = match anchor {
+            Some(ts) => {
+                sqlx::query_as::<_, ChatMessage>(
+                    "SELECT * FROM engine.chat_messages \
+                     WHERE session_id = $1 AND (sent_at <= $2 OR id = $3) \
+                     ORDER BY sent_at DESC \
+                     LIMIT $4",
+                )
+                .bind(session_id)
+                .bind(ts)
+                .bind(current_msg_id)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, ChatMessage>(
+                    "SELECT * FROM engine.chat_messages \
+                     WHERE session_id = $1 AND id = $2",
+                )
+                .bind(session_id)
+                .bind(current_msg_id)
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Projection-narrowed read used by BFF endpoints (and any caller that
     /// doesn't need `extracted_facts` / idempotency / SSE metadata). Same
     /// DESC+reverse trick as `history()` so the result is chronological.
@@ -2423,5 +2491,182 @@ mod tests {
             .unwrap();
         // Only the non-truncated assistant row, newest-first.
         assert_eq!(got, vec!["assistant-0".to_string()]);
+    }
+
+    async fn insert_at(
+        pool: &PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        sent_at: DateTime<Utc>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(sent_at)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn message_sent_at_in_session_scopes_by_session(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let other = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let base = chrono::Utc::now();
+        let m = insert_at(&pool, s.id, "user", "hi", base).await;
+        let n = insert_at(&pool, other.id, "user", "yo", base).await;
+
+        assert!(repo
+            .message_sent_at_in_session(s.id, m)
+            .await
+            .unwrap()
+            .is_some());
+        // id exists but in a different session → None.
+        assert!(repo
+            .message_sent_at_in_session(s.id, n)
+            .await
+            .unwrap()
+            .is_none());
+        // nonexistent id → None.
+        assert!(repo
+            .message_sent_at_in_session(s.id, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_anchored_rewind_drops_between_and_keeps_m_and_u(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let base = chrono::Utc::now();
+        // A B M C D E U with strictly increasing sent_at.
+        let labels = ["A", "B", "M", "C", "D", "E", "U"];
+        let mut ids = Vec::new();
+        for (i, label) in labels.iter().enumerate() {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            ids.push(
+                insert_at(
+                    &pool,
+                    s.id,
+                    role,
+                    label,
+                    base + chrono::Duration::seconds(i as i64),
+                )
+                .await,
+            );
+        }
+        let m = ids[2];
+        let u = ids[6];
+        let m_ts = repo
+            .message_sent_at_in_session(s.id, m)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let rows = repo
+            .history_anchored(s.id, u, Some(m_ts), 20)
+            .await
+            .unwrap();
+        let got: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["A", "B", "M", "U"],
+            "C/D/E dropped; M and U kept, chronological"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_anchored_drop_history_returns_only_current(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let base = chrono::Utc::now();
+        insert_at(&pool, s.id, "user", "old1", base).await;
+        insert_at(
+            &pool,
+            s.id,
+            "assistant",
+            "old2",
+            base + chrono::Duration::seconds(1),
+        )
+        .await;
+        let u = insert_at(
+            &pool,
+            s.id,
+            "user",
+            "current",
+            base + chrono::Duration::seconds(2),
+        )
+        .await;
+
+        let rows = repo.history_anchored(s.id, u, None, 20).await.unwrap();
+        let got: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["current"],
+            "DropHistory → only the current message"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_anchored_rewind_counts_current_toward_limit(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = repo
+            .create_session(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let base = chrono::Utc::now();
+        // A B M C D E U with strictly increasing sent_at.
+        let labels = ["A", "B", "M", "C", "D", "E", "U"];
+        let mut ids = Vec::new();
+        for (i, label) in labels.iter().enumerate() {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            ids.push(
+                insert_at(
+                    &pool,
+                    s.id,
+                    role,
+                    label,
+                    base + chrono::Duration::seconds(i as i64),
+                )
+                .await,
+            );
+        }
+        let m = ids[2];
+        let u = ids[6];
+        let m_ts = repo
+            .message_sent_at_in_session(s.id, m)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // limit=3: qualifying rows are {A,B,M (sent_at<=ts)} + {U}; DESC = U,M,B,A; LIMIT 3 = U,M,B;
+        // reversed = [B, M, U]. The current message U always survives (highest sent_at sorts first
+        // under DESC); the oldest below-anchor row (A) is trimmed. U counts toward the limit.
+        let rows = repo.history_anchored(s.id, u, Some(m_ts), 3).await.unwrap();
+        let got: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["B", "M", "U"],
+            "limit caps total incl. U; oldest (A) trimmed; U survives"
+        );
     }
 }

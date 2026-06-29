@@ -2156,6 +2156,9 @@ pub struct PersistedUserMessage {
     pub image_url: Option<String>,
     /// Image reply parameters supplied by the client, forwarded from the request.
     pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
+    /// Where this turn's main history is anchored (resolved from the request's
+    /// `reply_to_message_id`). `Latest` for ordinary turns.
+    pub history_anchor: eros_engine_core::types::HistoryAnchor,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -2225,6 +2228,7 @@ pub fn run_stream(
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
                 tips_amount_usd: user_msg.tips_amount_usd,
+                history_anchor: user_msg.history_anchor,
             },
             affinity: affinity.clone(),
             persona,
@@ -2630,6 +2634,7 @@ pub fn run_stream(
                         memory_scope: user_msg.memory_scope,
                         affinity_scope: user_msg.affinity_scope,
                         tips_amount_usd: user_msg.tips_amount_usd,
+                        history_anchor: user_msg.history_anchor,
                     };
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
@@ -3001,6 +3006,7 @@ pub fn run_stream(
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
                     tips_amount_usd: user_msg.tips_amount_usd,
+                    history_anchor: user_msg.history_anchor,
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -3611,6 +3617,7 @@ mod tests {
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -3808,6 +3815,7 @@ mod tests {
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -3943,6 +3951,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4028,6 +4037,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4129,6 +4139,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4445,6 +4456,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4569,6 +4581,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4706,6 +4719,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4858,6 +4872,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -4972,6 +4987,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5067,6 +5083,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(20.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5174,6 +5191,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5283,6 +5301,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5411,6 +5430,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5612,6 +5632,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5756,6 +5777,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -5866,6 +5888,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(0.5),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6041,6 +6064,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6200,6 +6224,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6342,6 +6367,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6464,6 +6490,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6600,6 +6627,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -6750,6 +6778,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
@@ -7080,6 +7109,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -7131,6 +7161,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
+                history_anchor: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -7368,6 +7399,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
+                history_anchor: Default::default(),
             },
         )
         .collect()
