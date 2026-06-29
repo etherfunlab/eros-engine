@@ -20,7 +20,7 @@ use eros_engine_store::affinity::AffinityRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::{require_session_for_user, AffinityDeltasDto};
-use crate::routes::dto::AffinitySnapshot;
+use crate::routes::dto::{AffinitySnapshot, BondChemistryDeltas, TurnLabelChangesDto};
 use crate::state::AppState;
 
 /// Back-compat alias retained for one release so in-crate callers that
@@ -89,6 +89,13 @@ pub struct AffinityEventEntry {
     pub deltas: AffinityDeltasDto,
     /// Post-EMA effective change (after − before). None for pre-0014 rows.
     pub effective_deltas: Option<AffinityDeltasDto>,
+    /// Post-EMA delta folded into the two lines (raw-composite units). None for
+    /// pre-0014 rows with no `effective_deltas`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_deltas_computed: Option<BondChemistryDeltas>,
+    /// Per-turn tier transition; absent when no tier moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_changes: Option<TurnLabelChangesDto>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -146,14 +153,25 @@ async fn get_affinity_events(
 
     let events: Vec<AffinityEventEntry> = rows
         .into_iter()
-        .map(|r| AffinityEventEntry {
-            event_id: r.id,
-            event_type: r.event_type,
-            deltas: serde_json::from_value(r.deltas).unwrap_or_default(),
-            effective_deltas: r
+        .map(|r| {
+            let effective_deltas: Option<AffinityDeltasDto> = r
                 .effective_deltas
-                .and_then(|v| serde_json::from_value(v).ok()),
-            created_at: r.created_at,
+                .and_then(|v| serde_json::from_value(v).ok());
+            let effective_deltas_computed = r
+                .effective_line_deltas
+                .and_then(|v| serde_json::from_value::<BondChemistryDeltas>(v).ok());
+            let label_changes = r
+                .label_changes
+                .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
+            AffinityEventEntry {
+                event_id: r.id,
+                event_type: r.event_type,
+                deltas: serde_json::from_value(r.deltas).unwrap_or_default(),
+                effective_deltas,
+                effective_deltas_computed,
+                label_changes,
+                created_at: r.created_at,
+            }
         })
         .collect();
     let total = events.len();
@@ -324,6 +342,53 @@ mod tests {
         let token = mint_test_jwt(intruder);
         let (status, _b) = send_request(&mut app, req(&token, session_id, "")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn affinity_events_includes_computed_delta_and_label_changes(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let affinity_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, label_changes) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3, $4)",
+        )
+        .bind(affinity_id)
+        .bind(json!({ "warmth": 0.3, "intimacy": 0.3 }))
+        .bind(json!({ "bond": 0.1, "chemistry": 0.2 }))
+        .bind(json!({ "chemistry": { "from": "spark", "to": "flirtation" } }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let ev = &body["events"][0];
+        assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        assert!(
+            (ev["effective_deltas_computed"]["chemistry"]
+                .as_f64()
+                .unwrap()
+                - 0.2)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(ev["label_changes"]["chemistry"]["to"], "flirtation");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

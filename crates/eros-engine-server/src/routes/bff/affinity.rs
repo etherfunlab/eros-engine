@@ -17,6 +17,7 @@ use eros_engine_store::affinity::AffinityRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::{require_session_for_user, AffinityDeltasDto};
+use crate::routes::dto::{BondChemistryDeltas, TurnLabelChangesDto};
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
@@ -29,6 +30,13 @@ pub struct BffAffinityDelta {
     /// Post-EMA effective change of the latest user-turn event. All-zero for
     /// a ghost turn (AI didn't reply; no axis moved).
     pub effective_deltas: AffinityDeltasDto,
+    /// Exact per-turn bond/chemistry delta (floored), read from the stored event
+    /// column. None on pre-migration rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_deltas_computed: Option<BondChemistryDeltas>,
+    /// Engine-authoritative per-turn tier transition; absent when no tier moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_changes: Option<TurnLabelChangesDto>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -70,10 +78,18 @@ async fn bff_get_affinity_delta(
             // Pre-0014 rows have NULL effective_deltas → omit (don't fabricate).
             let effective = r.effective_deltas?;
             let effective_deltas: AffinityDeltasDto = serde_json::from_value(effective).ok()?;
+            let effective_deltas_computed = r
+                .effective_line_deltas
+                .and_then(|v| serde_json::from_value::<BondChemistryDeltas>(v).ok());
+            let label_changes = r
+                .label_changes
+                .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
             Some(BffAffinityDelta {
                 event_id: r.id,
                 event_type: r.event_type,
                 effective_deltas,
+                effective_deltas_computed,
+                label_changes,
                 created_at: r.created_at,
             })
         });
@@ -244,6 +260,45 @@ mod tests {
         let token = mint_test_jwt(intruder);
         let (status, _b) = send_request(&mut app, req(&token, session_id)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_includes_computed_delta_and_label_changes(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, label_changes, created_at) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3, $4, now())",
+        )
+        .bind(aid)
+        .bind(json!({ "warmth": 0.3, "trust": 0.3 }))
+        .bind(json!({ "bond": 0.2, "chemistry": 0.1 }))
+        .bind(json!({ "bond": { "from": "acquaintance", "to": "friend" } }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let ev = &body["event"];
+        assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert!(
+            (ev["effective_deltas_computed"]["chemistry"]
+                .as_f64()
+                .unwrap()
+                - 0.1)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(ev["label_changes"]["bond"]["to"], "friend");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

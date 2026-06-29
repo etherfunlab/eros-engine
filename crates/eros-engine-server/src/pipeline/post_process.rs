@@ -408,11 +408,12 @@ pub(crate) fn find_json_block(raw: &str) -> Option<&str> {
     None
 }
 
-/// Per-axis safety cap on the LLM's raw delta, applied before the pacing
-/// gain. A guardrail against a misbehaving model — independent of
-/// `ema_inertia`. The two jobs (safety cap vs. pacing) are deliberately
-/// separate (see the design spec §5).
-const LLM_AXIS_CAP: f64 = 0.15;
+/// Per-axis safety caps on the LLM's raw delta, applied before the pacing gain.
+/// Asymmetric by design (spec §4.5): losses may be larger and fire more readily
+/// than gains, so a single bad turn can bite while gains stay earned.
+/// Independent of `ema_inertia` (safety cap vs. pacing are separate jobs).
+const LLM_AXIS_POS_CAP: f64 = 0.4;
+const LLM_AXIS_NEG_CAP: f64 = -0.6;
 
 /// Raw shape of the affinity evaluator's JSON output. `patience` is
 /// intentionally absent — it is rule-owned, so any `patience` the model
@@ -445,7 +446,7 @@ fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas
     let Some(e) = parsed else {
         return (AffinityDeltas::default(), String::new());
     };
-    let cap = |v: f64| v.clamp(-LLM_AXIS_CAP, LLM_AXIS_CAP);
+    let cap = |v: f64| v.clamp(LLM_AXIS_NEG_CAP, LLM_AXIS_POS_CAP);
     (
         AffinityDeltas {
             warmth: cap(e.warmth),
@@ -1074,11 +1075,8 @@ mod tests {
     fn parse_affinity_eval_clamps_out_of_range() {
         let raw = r#"{"warmth":5.0,"trust":-2.0,"reason":"x"}"#;
         let (d, _) = parse_affinity_eval(raw);
-        assert!((d.warmth - 0.15).abs() < 1e-9, "warmth caps at +0.15");
-        assert!(
-            (d.trust - (-0.15)).abs() < 1e-9,
-            "trust delta caps at -0.15"
-        );
+        assert!((d.warmth - 0.4).abs() < 1e-9, "warmth caps at +0.4");
+        assert!((d.trust - (-0.6)).abs() < 1e-9, "trust delta caps at -0.6");
     }
 
     #[test]
