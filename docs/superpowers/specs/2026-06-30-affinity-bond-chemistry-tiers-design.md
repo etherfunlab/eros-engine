@@ -197,15 +197,14 @@ decay untouched (per decision).
 New migration `0029_affinity_bond_chemistry.sql`:
 
 ```sql
--- current-state raw composites on the affinity row
+-- raw composites kept in lockstep with the axes by the DB (Postgres 12+).
+-- Mirror of eros_engine_core::affinity::{bond_score,chemistry_score} — keep in
+-- sync if the folding formula ever changes.
 ALTER TABLE engine.companion_affinity
-  ADD COLUMN bond      DOUBLE PRECISION NOT NULL DEFAULT 0,
-  ADD COLUMN chemistry DOUBLE PRECISION NOT NULL DEFAULT 0;
-
--- backfill existing rows from current axes (raw composite)
-UPDATE engine.companion_affinity SET
-  bond      = LEAST(1, GREATEST(0, ((warmth + 1)/2 + trust   + intrigue) / 3)),
-  chemistry = LEAST(1, GREATEST(0, ((warmth + 1)/2 + intimacy + tension)  / 3));
+  ADD COLUMN bond DOUBLE PRECISION
+    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, ((warmth + 1)/2 + trust    + intrigue) / 3))) STORED,
+  ADD COLUMN chemistry DOUBLE PRECISION
+    GENERATED ALWAYS AS (LEAST(1, GREATEST(0, ((warmth + 1)/2 + intimacy + tension)  / 3))) STORED;
 
 -- per-turn tier transition; NULL on turns where no tier changed
 ALTER TABLE engine.companion_affinity_events
@@ -213,8 +212,13 @@ ALTER TABLE engine.companion_affinity_events
 ```
 
 The `companion_affinity` columns store the **raw composite** (0..1), not the bar
-value. Rationale: the curve/thresholds can be retuned later without rewriting
-history; the curve lives only in the read layer.
+value, and are **`GENERATED ALWAYS ... STORED`** — the DB recomputes them from the
+axes on every insert/update, so they can never drift per-row and existing rows
+auto-populate at migration time (no backfill, no engine write path, no
+`load_or_create`/`record_ghost` special-casing). The bar curve + tiers live only
+in the core read layer. Trade-off: the raw-composite formula is duplicated in SQL
+(cross-referenced by comment); the **read-facing** bar/labels always derive from
+core, so the API is correct even if the two ever diverged.
 
 **Per-turn label change (engine-computed, deterministic).** The LLM still only
 evaluates the 6 raw axes; the engine derives bond/chemistry, their tiers, and the
@@ -250,16 +254,19 @@ pub struct TurnLabelChanges {            // serde skips None fields
 // core: diff_labels(before: &Affinity, after: &Affinity) -> Option<TurnLabelChanges>
 ```
 
-Store changes (`crates/eros-engine-store/src/affinity.rs`):
+Store changes (`crates/eros-engine-store/src/affinity.rs`) — note `bond`/
+`chemistry` are DB-generated, so **no engine write code** for them:
 
-- `AffinityRow` + the `SELECT`/`INSERT`/`UPDATE` column lists gain `bond`,
-  `chemistry`; `AffinityEventRow` gains `label_changes: Option<serde_json::Value>`.
+- `AffinityEventRow` gains `label_changes: Option<serde_json::Value>`; the
+  `list_events` / `latest_turn_event` `SELECT`s add `e.label_changes`.
+  (`AffinityRow` / `SELECT *` is unaffected — it ignores the new generated
+  columns, and the read layer derives bond/chemistry from the axes anyway.)
 - `persist_with_event`: clone the post-decay/pre-delta `current` as the `before`
-  baseline; after `apply_deltas`, write `bond`/`chemistry` (raw) +
-  `relationship_label` (new `legacy_relationship_label()`) on the row, and the
-  event's `label_changes` (NULL when empty).
-- `record_ghost`, `load_or_create`: set `bond`/`chemistry` from the current axes
-  (ghost: no axis change → no `label_changes`).
+  baseline; after `apply_deltas`, write `relationship_label` (new
+  `legacy_relationship_label()`) and the event's `label_changes` (NULL when
+  empty). bond/chemistry update themselves.
+- `record_ghost`, `load_or_create`: unchanged for bond/chemistry (DB-generated);
+  ghost has no axis change → no `label_changes`.
 
 ### 4.7 DTO / API surfaces
 
@@ -310,8 +317,7 @@ chat turn → post_process::evaluate_affinity
   → merge with rule deltas → apply_deltas (EMA 0.2, unchanged)
   → store.persist_with_event:
        before := post-decay/pre-delta snapshot
-       write 6 axes (unchanged)
-       write bond/chemistry = bond_score()/chemistry_score()   [raw]
+       write 6 axes (unchanged) → bond/chemistry recomputed by the DB (generated)
        write relationship_label = legacy_relationship_label()  [old names]
        write event row (deltas, effective_deltas,
                         label_changes = diff_labels(before, after) or NULL)
@@ -336,10 +342,11 @@ read:
   old `infer_label_*` tests.
 
 **Store** (`eros-engine-store/src/affinity.rs`, `migrations/0029_*.sql`)
-- Migration (add `bond`/`chemistry` + backfill; add events `label_changes`).
-  Row structs (`AffinityRow`, `AffinityEventRow`) + queries + writes for
-  bond/chemistry + new legacy label + per-event `label_changes`.
-- Tests: persisted bond/chemistry match `*_score()`; relationship_label uses new
+- Migration: `bond`/`chemistry` as `GENERATED ALWAYS ... STORED`; events
+  `label_changes JSONB`. `AffinityEventRow` + `list_events`/`latest_turn_event`
+  add `label_changes`; `persist_with_event` writes new legacy label + per-event
+  `label_changes` (bond/chemistry are DB-generated, no write code).
+- Tests: generated bond/chemistry match `*_score()`; relationship_label uses new
   mapping; a tier-crossing turn writes `label_changes`, a flat turn writes NULL.
 
 **post_process** (`pipeline/post_process.rs`)
