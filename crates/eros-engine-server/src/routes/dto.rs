@@ -8,8 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use eros_engine_core::affinity::{bar, Affinity, RelationshipLabel};
 use crate::routes::companion::AffinityDeltasDto;
+use eros_engine_core::affinity::{bar, Affinity, RelationshipLabel};
 
 /// Point-in-time projection of a session's `Affinity`. Same field set
 /// as the historical `AffinityDebugResponse`; renamed because it now

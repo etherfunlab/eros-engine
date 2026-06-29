@@ -366,30 +366,40 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ### `GET /comp/affinity/{session_id}`
 
-實時 6 維向量 + ghost 統計 + 關係標籤。受 `EXPOSE_AFFINITY_DEBUG=true` 環境變量控制；關閉時返 404。
+实时 6 轴向量 + Bond/Chemistry 进度条与标签 + ghost 统计 + 遗留关系标签。受 `EXPOSE_AFFINITY_DEBUG=true` 环境变量控制；关闭时返 404。
 
 ```json
 {
   "warmth": 0.42,
-  "trust": 0.28,
-  "intrigue": 0.61,
-  "intimacy": 0.15,
+  "trust": 0.08,
+  "intrigue": 0.12,
+  "intimacy": 0.05,
   "patience": 0.55,
-  "tension": 0.18,
+  "tension": 0.04,
+  "bond": 0.31,
+  "chemistry": 0.18,
+  "bond_label": "acquaintance",
+  "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
   "relationship_label": "stranger",
-  "updated_at": "2026-05-05T19:42:00.000000Z"
+  "updated_at": "2026-06-30T12:00:00.000000Z"
 }
 ```
 
-生產部署通常關著（好感度向量是魔法的一部份——把它暴露出來會破壞錯覺）。如果你的前端想實時畫好感度雷達圖，再把它打開。
+- `bond` / `chemistry` —— 进度条值（0–1，曲线映射后）。
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover`
+- `relationship_label` —— 遗留映射值（`stranger | friend | slow_burn | romantic`；`frenemy` 已停止输出）。
+
+生产部署通常关着。若前端需要渲染实时雷达图或检查衍生线，再打开。
 
 ### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
 
 该 session 的好感度**事件日志**，分页、最新在前。和向量路由一样受
 `EXPOSE_AFFINITY_DEBUG=true` 控制（关闭时 404）。每条同时带原始的每轮
-`deltas`（EMA 前）和实际应用的 `effective_deltas`（EMA 后）。`event_type`
+`deltas`（EMA 前）、实际应用的 `effective_deltas`（EMA 后）、折叠后的
+`effective_deltas_computed`，以及档位跨越时的 `label_changes`。`event_type`
 可选用于过滤；`limit` 默认 20（上限 100）。
 
 ```json
@@ -400,6 +410,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
       "event_type": "message",
       "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
       "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
+      "effective_deltas_computed": { "bond": 0.02, "chemistry": 0.006 },
+      "label_changes": null,
       "created_at": "…"
     }
   ]
@@ -473,9 +485,9 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
-最近一次用戶輪次的好感度 delta（post-EMA），供前端做逐輪觀測。與
-canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它 **不受**
-`EXPOSE_AFFINITY_DEBUG` 控制（這塊歸前端所有）——但仍做 JWT + ownership 檢查。
+最近一次用户轮次的好感度 delta（post-EMA），供前端做逐轮观测。与
+canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
+`EXPOSE_AFFINITY_DEBUG` 控制（这块归前端所有）——但仍做 JWT + ownership 检查。
 
 ```json
 {
@@ -487,15 +499,25 @@ canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它 **不受**
       "warmth": 0.03, "trust": 0.01, "intrigue": 0.0,
       "intimacy": 0.0, "patience": 0.0, "tension": -0.01
     },
+    "effective_deltas_computed": {
+      "bond": 0.013,
+      "chemistry": 0.006
+    },
+    "label_changes": {
+      "bond": { "from": "acquaintance", "to": "friend" }
+    },
     "created_at": "…"
   }
 }
 ```
 
-`event` 為 `null` 的情況：還沒有任何用戶輪次事件（全新 session，或只有
-time-decay），或最近一次事件早於 affinity migration `0014`。`event_type`
-∈ `message | gift | proactive | ghost`；ghost 輪次的 `effective_deltas`
-全為零。
+`event` 为 `null` 的情况：还没有任何用户轮次事件（全新 session，或只有
+time-decay），或最近一次事件早于 affinity migration `0014`。`event_type`
+∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
+全为零。
+
+- `effective_deltas_computed` —— `effective_deltas` 折叠到 Bond/Chemistry 两条线（`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`，Chemistry 同理）。单位为原始合成增量（非进度条百分比），适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移 0014 之前的事件中缺省。
+- `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
 
 ## 錯誤響應
 

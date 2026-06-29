@@ -970,7 +970,10 @@ mod tests {
             .await
             .unwrap();
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.relationship_label, Some(RelationshipLabel::Romantic));
+        assert_eq!(
+            reloaded.relationship_label,
+            Some(RelationshipLabel::Romantic)
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1013,7 +1016,10 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 2);
         let first = rows[0].as_ref().expect("first turn records a label change");
-        assert!(first.get("bond").is_some(), "bond transition recorded: {first}");
+        assert!(
+            first.get("bond").is_some(),
+            "bond transition recorded: {first}"
+        );
         assert!(rows[1].is_none(), "flat turn records NULL label_changes");
     }
 

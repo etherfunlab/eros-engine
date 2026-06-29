@@ -396,7 +396,6 @@ mod tests {
         assert_eq!(a.tension, 0.0);
     }
 
-
     #[test]
     fn bond_chemistry_scores_fold_axes_with_warmth_floored() {
         let mut a = fresh();

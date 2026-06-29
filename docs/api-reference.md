@@ -407,32 +407,45 @@ Current `companion_insights` JSONB plus a weighted `training_level`. Same `user_
 
 ### `GET /comp/affinity/{session_id}`
 
-Live 6-dim vector + ghost stats + relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404 when disabled.
+Live 6-axis vector + Bond/Chemistry bars and labels + ghost stats + legacy
+relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404
+when disabled.
 
 ```json
 {
   "warmth": 0.42,
-  "trust": 0.28,
-  "intrigue": 0.61,
-  "intimacy": 0.15,
+  "trust": 0.08,
+  "intrigue": 0.12,
+  "intimacy": 0.05,
   "patience": 0.55,
-  "tension": 0.18,
+  "tension": 0.04,
+  "bond": 0.31,
+  "chemistry": 0.18,
+  "bond_label": "acquaintance",
+  "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
   "relationship_label": "stranger",
-  "updated_at": "2026-05-05T19:42:00.000000Z"
+  "updated_at": "2026-06-30T12:00:00.000000Z"
 }
 ```
 
-Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). Turn it on if your frontend wants to render a live radar of the vector.
+- `bond` / `chemistry` — bar values (0–1, curve-applied).
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover`
+- `relationship_label` — legacy mapped value (`stranger | friend | slow_burn | romantic`; `frenemy` retired from emission).
+
+Production deploys typically keep this off. Turn it on if your frontend wants
+to render a live radar or inspect the derived lines.
 
 ### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
 
 Paginated affinity **event log** for the session, newest first. Same
 `EXPOSE_AFFINITY_DEBUG=true` gate as the vector route (404 when disabled). Each
-entry carries both the raw per-turn `deltas` (pre-EMA) and the applied
-`effective_deltas` (post-EMA). Optional `event_type` filters the log; `limit`
-defaults to 20 (capped at 100).
+entry carries the raw per-turn `deltas` (pre-EMA), the applied
+`effective_deltas` (post-EMA), the folded `effective_deltas_computed`, and
+`label_changes` when a tier crossed. Optional `event_type` filters the log;
+`limit` defaults to 20 (capped at 100).
 
 ```json
 {
@@ -442,6 +455,8 @@ defaults to 20 (capped at 100).
       "event_type": "message",
       "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
       "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
+      "effective_deltas_computed": { "bond": 0.02, "chemistry": 0.006 },
+      "label_changes": null,
       "created_at": "…"
     }
   ]
@@ -536,6 +551,13 @@ this surface) — but it is still JWT + ownership checked.
       "warmth": 0.03, "trust": 0.01, "intrigue": 0.0,
       "intimacy": 0.0, "patience": 0.0, "tension": -0.01
     },
+    "effective_deltas_computed": {
+      "bond": 0.013,
+      "chemistry": 0.006
+    },
+    "label_changes": {
+      "bond": { "from": "acquaintance", "to": "friend" }
+    },
     "created_at": "…"
   }
 }
@@ -545,6 +567,13 @@ this surface) — but it is still JWT + ownership checked.
 or only time-decay), or when the latest event predates affinity migration
 `0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
 reports all-zero `effective_deltas`.
+
+- `effective_deltas_computed` — `effective_deltas` folded into Bond/Chemistry
+  lines (`Δbond = (Δwarmth + Δtrust + Δintrigue) / 3`, same for Chemistry).
+  Raw-composite units (not bar-percent). Good for a "+X bond / +Y chemistry"
+  per-turn pulse. Absent on pre-migration-0014 events.
+- `label_changes` — engine-authoritative tier transition (`null` / absent when
+  no tier crossed this turn). Frontend stops computing this itself.
 
 ## Error responses
 

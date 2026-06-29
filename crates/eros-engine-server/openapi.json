@@ -778,6 +778,17 @@
               }
             ]
           },
+          "effective_deltas_computed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BondChemistryDeltas",
+                "description": "Post-EMA delta folded into the two lines (raw-composite units). None for\npre-0014 rows with no `effective_deltas`."
+              }
+            ]
+          },
           "event_id": {
             "type": "string",
             "format": "uuid",
@@ -785,6 +796,17 @@
           },
           "event_type": {
             "type": "string"
+          },
+          "label_changes": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnLabelChangesDto",
+                "description": "Per-turn tier transition; absent when no tier moved."
+              }
+            ]
           }
         }
       },
@@ -848,9 +870,31 @@
           "tension",
           "ghost_streak",
           "total_ghosts",
-          "updated_at"
+          "updated_at",
+          "bond",
+          "chemistry",
+          "bond_label",
+          "chemistry_label"
         ],
         "properties": {
+          "bond": {
+            "type": "number",
+            "format": "double",
+            "description": "Friendship bar fill, 0..1 (curve-applied; render as %)."
+          },
+          "bond_label": {
+            "type": "string",
+            "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`)."
+          },
+          "chemistry": {
+            "type": "number",
+            "format": "double",
+            "description": "Romance bar fill, 0..1 (curve-applied; render as %)."
+          },
+          "chemistry_label": {
+            "type": "string",
+            "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`)."
+          },
           "ghost_streak": {
             "type": "integer",
             "format": "int32"
@@ -900,6 +944,7 @@
           "event_id",
           "event_type",
           "effective_deltas",
+          "effective_deltas_computed",
           "created_at"
         ],
         "properties": {
@@ -911,6 +956,10 @@
             "$ref": "#/components/schemas/AffinityDeltasDto",
             "description": "Post-EMA effective change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
           },
+          "effective_deltas_computed": {
+            "$ref": "#/components/schemas/BondChemistryDeltas",
+            "description": "The post-EMA delta folded into the two lines (raw-composite units)."
+          },
           "event_id": {
             "type": "string",
             "format": "uuid",
@@ -918,6 +967,17 @@
           },
           "event_type": {
             "type": "string"
+          },
+          "label_changes": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnLabelChangesDto",
+                "description": "Engine-authoritative per-turn tier transition; absent when no tier moved."
+              }
+            ]
           }
         }
       },
@@ -1077,6 +1137,24 @@
           }
         }
       },
+      "BondChemistryDeltas": {
+        "type": "object",
+        "description": "One turn's post-EMA delta folded into the two lines (raw-composite units).",
+        "required": [
+          "bond",
+          "chemistry"
+        ],
+        "properties": {
+          "bond": {
+            "type": "number",
+            "format": "double"
+          },
+          "chemistry": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
       "ChatHistoryEntry": {
         "type": "object",
         "required": [
@@ -1207,6 +1285,22 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "LabelTransitionDto": {
+        "type": "object",
+        "description": "One line's tier transition (serialised keys). Read-side mirror of\n`eros_engine_core::affinity::LabelTransition`.",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
           }
         }
       },
@@ -1506,6 +1600,32 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "TurnLabelChangesDto": {
+        "type": "object",
+        "description": "Per-turn tier transition across the two lines, read from the stored\n`companion_affinity_events.label_changes` JSONB.",
+        "properties": {
+          "bond": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LabelTransitionDto"
+              }
+            ]
+          },
+          "chemistry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LabelTransitionDto"
+              }
+            ]
           }
         }
       }

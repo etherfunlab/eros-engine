@@ -154,10 +154,12 @@ async fn get_affinity_events(
     let events: Vec<AffinityEventEntry> = rows
         .into_iter()
         .map(|r| {
-            let effective_deltas: Option<AffinityDeltasDto> =
-                r.effective_deltas.and_then(|v| serde_json::from_value(v).ok());
-            let effective_deltas_computed =
-                effective_deltas.as_ref().map(BondChemistryDeltas::from_axis_deltas);
+            let effective_deltas: Option<AffinityDeltasDto> = r
+                .effective_deltas
+                .and_then(|v| serde_json::from_value(v).ok());
+            let effective_deltas_computed = effective_deltas
+                .as_ref()
+                .map(BondChemistryDeltas::from_axis_deltas);
             let label_changes = r
                 .label_changes
                 .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
@@ -378,7 +380,14 @@ mod tests {
         let ev = &body["events"][0];
         // fold: bond = (0.3+0+0)/3 = 0.1 ; chemistry = (0.3+0.3+0)/3 = 0.2
         assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.1).abs() < 1e-9);
-        assert!((ev["effective_deltas_computed"]["chemistry"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert!(
+            (ev["effective_deltas_computed"]["chemistry"]
+                .as_f64()
+                .unwrap()
+                - 0.2)
+                .abs()
+                < 1e-9
+        );
         assert_eq!(ev["label_changes"]["chemistry"]["to"], "flirtation");
     }
 

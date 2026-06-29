@@ -76,7 +76,8 @@ async fn bff_get_affinity_delta(
             // Pre-0014 rows have NULL effective_deltas → omit (don't fabricate).
             let effective = r.effective_deltas?;
             let effective_deltas: AffinityDeltasDto = serde_json::from_value(effective).ok()?;
-            let effective_deltas_computed = BondChemistryDeltas::from_axis_deltas(&effective_deltas);
+            let effective_deltas_computed =
+                BondChemistryDeltas::from_axis_deltas(&effective_deltas);
             let label_changes = r
                 .label_changes
                 .and_then(|v| serde_json::from_value::<TurnLabelChangesDto>(v).ok());
@@ -286,7 +287,14 @@ mod tests {
         let ev = &body["event"];
         // fold: bond = (0.3+0.3+0)/3 = 0.2 ; chemistry = (0.3+0+0)/3 = 0.1
         assert!((ev["effective_deltas_computed"]["bond"].as_f64().unwrap() - 0.2).abs() < 1e-9);
-        assert!((ev["effective_deltas_computed"]["chemistry"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        assert!(
+            (ev["effective_deltas_computed"]["chemistry"]
+                .as_f64()
+                .unwrap()
+                - 0.1)
+                .abs()
+                < 1e-9
+        );
         assert_eq!(ev["label_changes"]["bond"]["to"], "friend");
     }
 
