@@ -214,7 +214,11 @@ pub fn affinity_eval_prompt(
          \n\
          判断这一轮应让 warmth、trust、intrigue、intimacy、tension 各变化多少\
          （是【变化量】，不是绝对值；patience 不要输出）。\n\
-         普通寒暄接近 0；真正动情或暧昧的瞬间幅度更大，每个维度大致在 ±0.15 之间。\n\
+         绝大多数普通对话、寒暄、附和都给 0（就是数字 0，不是小数）。\n\
+         只有出现真正推进关系的时刻（真诚的温暖、自我袒露、脆弱、成功的调情暧昧）\
+         才给正分；这种时刻不常见，但一旦出现可以给较大正分（每个维度最高约 +0.4）。\n\
+         负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）要更敢扣、也更常见，\
+         扣分可以更大（每个维度最低约 -0.6）。\n\
          严格只输出 JSON，reason 用一句中文简述：\n\
          {{\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"tension\": 0.0, \"reason\": \"...\"}}",
         warmth = affinity.warmth,
@@ -1471,6 +1475,9 @@ mod tests {
             ),
             "five-axis JSON output schema (+reason) must be present"
         );
+        // new sparse/asymmetric scoring guidance present
+        assert!(p.contains("+0.4"), "positive cap guidance present");
+        assert!(p.contains("-0.6"), "negative cap guidance present");
     }
 
     // ─── Insight prompt tests ──────────────────────────────────────
