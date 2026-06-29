@@ -178,13 +178,13 @@ label_changes = {
   "intimacy": 0.05,
   "patience": 0.55,
   "tension": 0.04,
-  "bond": 0.31,
-  "chemistry": 0.18,
-  "bond_label": "acquaintance",
-  "chemistry_label": "spark",
+  "bond": 0.32,
+  "chemistry": 0.28,
+  "bond_label": "friend",
+  "chemistry_label": "flirtation",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "stranger",
+  "relationship_label": "friend",
   "updated_at": "2026-06-30T12:00:00.000000Z"
 }
 ```
