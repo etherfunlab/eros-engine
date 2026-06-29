@@ -147,6 +147,7 @@ fn build_image_gen_request(
     fallback_subject: &str,
     ref_url: Option<String>,
     plan_aspect_ratio: Option<&str>,
+    original_subject: Option<&str>,
 ) -> eros_engine_llm::openrouter::ImageGenRequest {
     use eros_engine_llm::model_config::StyleKey;
     let style: StyleKey = req_image
@@ -180,10 +181,15 @@ fn build_image_gen_request(
             resolved.and_then(|r| r.default_resolution.clone())
         }
     });
+    let prompt_original = original_subject
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::pipeline::handlers::compose_image_prompt(style, persona, s));
     eros_engine_llm::openrouter::ImageGenRequest {
         model: primary,
         fallback_model: chain,
         prompt,
+        prompt_original,
         face_ref_url: ref_url,
         aspect_ratio,
         resolution,
@@ -2490,6 +2496,7 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
+                            None, /* original_subject — activated in retry task */
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2581,14 +2588,22 @@ pub fn run_stream(
                             }
                             Ok(_) => {
                                 tracing::warn!(
-                                    "stream(image): execute_image returned zero images; \
+                                    "stream(image): execute_image returned zero images \
+                                     (unexpected); falling through to text"
+                                );
+                            }
+                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                tracing::warn!(
+                                    "stream(image): execute_image config error: {m}; \
                                      falling through to text"
                                 );
                             }
-                            Err(e) => {
+                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                attempts,
+                            }) => {
                                 tracing::warn!(
-                                    "stream(image): execute_image failed: {e}; \
-                                     falling through to text"
+                                    attempts = attempts.len(),
+                                    "stream(image): image chain exhausted; falling through to text"
                                 );
                             }
                         }
@@ -2909,6 +2924,7 @@ pub fn run_stream(
                             "",
                             ref_url.clone(),
                             plan.aspect_ratio.as_deref(),
+                            None, /* original_subject — activated in retry task */
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
@@ -2960,13 +2976,22 @@ pub fn run_stream(
                             }
                             Ok(_) => {
                                 tracing::warn!(
-                                    "stream(text_image): execute_image returned zero images; \
+                                    "stream(text_image): execute_image returned zero images \
+                                     (unexpected); no Image frame (text already delivered)"
+                                );
+                            }
+                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                tracing::warn!(
+                                    "stream(text_image): execute_image config error: {m}; \
                                      no Image frame (text already delivered)"
                                 );
                             }
-                            Err(e) => {
+                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                attempts,
+                            }) => {
                                 tracing::warn!(
-                                    "stream(text_image): execute_image failed: {e}; \
+                                    attempts = attempts.len(),
+                                    "stream(text_image): image chain exhausted; \
                                      no Image frame (text already delivered)"
                                 );
                             }
@@ -3293,6 +3318,7 @@ mod tests {
             "fallback subject",
             None, /* ref_url */
             None, /* plan_aspect_ratio */
+            None, /* original_subject */
         );
         assert_eq!(req.model, "img");
         assert!(req.prompt.starts_with("Photorealistic"));
@@ -3319,6 +3345,7 @@ mod tests {
             "fallback subject",
             None,         /* ref_url */
             Some("9:16"), /* plan_aspect_ratio */
+            None,         /* original_subject */
         );
         assert_eq!(
             req.aspect_ratio.as_deref(),
@@ -3329,6 +3356,53 @@ mod tests {
             req.resolution, None,
             "config default_resolution dropped when a plan aspect is set"
         );
+    }
+
+    #[test]
+    fn build_image_gen_request_sets_prompt_original_when_provided() {
+        let persona = test_persona_with_meta(&[]);
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        // composed subject as primary, original subject as the retry variant
+        let req = build_image_gen_request(
+            "img".into(),
+            vec![],
+            &persona,
+            Some("composed scene"),
+            None,
+            resolved.as_ref(),
+            "",
+            None,
+            None,
+            Some("original scene"), /* original_subject */
+        );
+        let po = req.prompt_original.expect("prompt_original set");
+        assert!(po.contains("original scene"));
+        assert!(po.starts_with("Photorealistic")); // style wrapping applied to both
+        assert!(req.prompt.contains("composed scene"));
+    }
+
+    #[test]
+    fn build_image_gen_request_no_prompt_original_when_none_or_blank() {
+        let persona = test_persona_with_meta(&[]);
+        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
+        )
+        .unwrap()
+        .resolve_image_gen();
+        let req = build_image_gen_request(
+            "img".into(), vec![], &persona, Some("scene"), None,
+            resolved.as_ref(), "", None, None, None,
+        );
+        assert!(req.prompt_original.is_none());
+        let req_blank = build_image_gen_request(
+            "img".into(), vec![], &persona, Some("scene"), None,
+            resolved.as_ref(), "", None, None, Some("   "),
+        );
+        assert!(req_blank.prompt_original.is_none(), "blank original ⇒ None");
     }
 
     #[test]
