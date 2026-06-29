@@ -88,6 +88,7 @@ pub struct AffinityEventRow {
     pub event_type: String,
     pub deltas: serde_json::Value,                   // pre-EMA
     pub effective_deltas: Option<serde_json::Value>, // post-EMA (NULL pre-0014)
+    pub label_changes: Option<serde_json::Value>,    // per-turn tier transition (NULL = none)
     pub created_at: DateTime<Utc>,
 }
 
@@ -142,7 +143,7 @@ impl<'a> AffinityRepo<'a> {
         event_type: Option<&str>,
     ) -> Result<Vec<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -167,7 +168,7 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
     ) -> Result<Option<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -249,6 +250,7 @@ impl<'a> AffinityRepo<'a> {
         // Decay from the locked row, then snapshot the pre-delta baseline so
         // effective_deltas captures only the delta application, not decay.
         current.apply_time_decay();
+        let before_affinity = current.clone();
         let before = AffinityDeltas {
             warmth: current.warmth,
             trust: current.trust,
@@ -261,6 +263,9 @@ impl<'a> AffinityRepo<'a> {
         current.apply_deltas(deltas, ema_inertia);
         let label = current.legacy_relationship_label();
         current.relationship_label = Some(label);
+
+        let label_changes = eros_engine_core::affinity::diff_labels(&before_affinity, &current)
+            .and_then(|c| serde_json::to_value(&c).ok());
 
         // Post-EMA effective change = after − before (captures EMA + clamping).
         let effective = AffinityDeltas {
@@ -294,14 +299,15 @@ impl<'a> AffinityRepo<'a> {
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
-               (affinity_id, event_type, deltas, effective_deltas, context, \
+               (affinity_id, event_type, deltas, effective_deltas, label_changes, context, \
                 model, usage, generation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(current.id)
         .bind(event_type)
         .bind(deltas_json)
         .bind(effective_json)
+        .bind(label_changes)
         .bind(context)
         .bind(meta.and_then(|m| m.model.clone()))
         .bind(meta.and_then(|m| m.usage.clone()))
@@ -382,9 +388,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(a1.id, a2.id);
-        // Defaults from migration
-        assert!((a1.warmth - 0.3).abs() < 1e-9);
-        assert!((a1.intrigue - 0.5).abs() < 1e-9);
+        // Lowered seed (stranger start) from migration 0029.
+        assert!((a1.warmth - 0.1).abs() < 1e-9);
+        assert!((a1.intrigue).abs() < 1e-9);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -509,7 +515,8 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        // trust starts at 0.2; push it past the [0,1] ceiling with no smoothing.
+        // trust starts at 0.0 (lowered seed from migration 0029); push it past
+        // the [0,1] ceiling with no smoothing.
         let deltas = AffinityDeltas {
             trust: 5.0,
             ..Default::default()
@@ -525,8 +532,8 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        // Effective is the CLAMPED change (1.0 − 0.2 = 0.8), not the raw 5.0.
-        assert!((eff.unwrap()["trust"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+        // Effective is the CLAMPED change (1.0 − 0.0 = 1.0), not the raw 5.0.
+        assert!((eff.unwrap()["trust"].as_f64().unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -910,6 +917,104 @@ mod tests {
             vec!["上一轮".to_string()],
             "an affinity event created after the cutoff message must be excluded"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn generated_bond_chemistry_match_core(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let deltas = AffinityDeltas {
+            warmth: 0.5,
+            trust: 0.4,
+            intrigue: 0.6,
+            intimacy: 0.3,
+            patience: 0.0,
+            tension: 0.2,
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let (bond, chemistry): (f64, f64) =
+            sqlx::query_as("SELECT bond, chemistry FROM engine.companion_affinity WHERE id = $1")
+                .bind(a.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!((bond - a.bond_score()).abs() < 1e-9);
+        assert!((chemistry - a.chemistry_score()).abs() < 1e-9);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_writes_new_legacy_label(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        // Push chemistry high → romantic.
+        let deltas = AffinityDeltas {
+            intimacy: 0.9,
+            tension: 0.9,
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.relationship_label, Some(RelationshipLabel::Romantic));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn label_changes_recorded_on_tier_crossing_and_null_otherwise(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        // Big positive turn crosses bond tier 1 → 4.
+        let deltas = AffinityDeltas {
+            trust: 0.9,
+            intrigue: 0.9,
+            ..Default::default()
+        };
+        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        // Flat turn crosses nothing.
+        repo.persist_with_event(
+            &mut a,
+            &AffinityDeltas::default(),
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        let rows: Vec<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT label_changes FROM engine.companion_affinity_events \
+             WHERE affinity_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(a.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let first = rows[0].as_ref().expect("first turn records a label change");
+        assert!(first.get("bond").is_some(), "bond transition recorded: {first}");
+        assert!(rows[1].is_none(), "flat turn records NULL label_changes");
     }
 
     #[sqlx::test(migrations = "./migrations")]
