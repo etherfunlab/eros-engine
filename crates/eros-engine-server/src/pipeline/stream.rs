@@ -36,6 +36,18 @@ pub enum FrameActionType {
     ReplyTextImage,
 }
 
+/// Why an image-generation turn failed, carried by the `image_failed` frame.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFailReason {
+    /// Every candidate model failed (transport / status / decode / zero-images).
+    ChainExhausted,
+    /// A success response carried zero images (defensive; unexpected).
+    ZeroImages,
+    /// Pre-flight failure: no api key or no models configured.
+    ConfigError,
+}
+
 /// One wire frame in the SSE protocol.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -90,6 +102,20 @@ pub enum ProtocolFrame {
         model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         generation_id: Option<String>,
+    },
+    ImagePending {
+        message_id: String,
+    },
+    ImageAttempt {
+        message_id: String,
+        model: String,
+        variant: eros_engine_llm::openrouter::PromptVariant,
+        index: u32,
+        total: u32,
+    },
+    ImageFailed {
+        message_id: String,
+        reason: ImageFailReason,
     },
 }
 
@@ -8756,5 +8782,46 @@ data: [DONE]\n\n"
             Some("<regex>"),
             "filter_model must be '<regex>' (LLM filter skipped); got {filter_model:?}",
         );
+    }
+
+    #[test]
+    fn image_pending_frame_serializes() {
+        let f = ProtocolFrame::ImagePending { message_id: ulid_string(Ulid::new()) };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_pending");
+        assert_eq!(v["message_id"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn image_attempt_frame_serializes() {
+        let f = ProtocolFrame::ImageAttempt {
+            message_id: ulid_string(Ulid::new()),
+            model: "google/gemini-2.5-flash-image".into(),
+            variant: eros_engine_llm::openrouter::PromptVariant::Composed,
+            index: 1,
+            total: 3,
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_attempt");
+        assert_eq!(v["model"], "google/gemini-2.5-flash-image");
+        assert_eq!(v["variant"], "composed");
+        assert_eq!(v["index"], 1);
+        assert_eq!(v["total"], 3);
+    }
+
+    #[test]
+    fn image_failed_frame_serializes_each_reason() {
+        let mk = |r| {
+            serde_json::to_value(&ProtocolFrame::ImageFailed {
+                message_id: ulid_string(Ulid::new()),
+                reason: r,
+            })
+            .unwrap()
+        };
+        let chain = mk(ImageFailReason::ChainExhausted);
+        assert_eq!(chain["type"], "image_failed");
+        assert_eq!(chain["reason"], "chain_exhausted");
+        assert_eq!(mk(ImageFailReason::ZeroImages)["reason"], "zero_images");
+        assert_eq!(mk(ImageFailReason::ConfigError)["reason"], "config_error");
     }
 }
