@@ -142,6 +142,18 @@ pub struct ImageAttempt {
     pub outcome: AttemptOutcome,
 }
 
+/// Live progress for one image-gen attempt, surfaced to a streaming caller
+/// immediately before each HTTP post so the SSE layer can emit `image_attempt`
+/// frames as the fallback chain walks. `index` is 1-based; `total` is the full
+/// planned attempt count.
+#[derive(Debug, Clone)]
+pub struct ImageAttemptProgress {
+    pub model: String,
+    pub variant: PromptVariant,
+    pub index: u32,
+    pub total: u32,
+}
+
 /// Error from [`OpenRouterClient::execute_image`]. `Config` is a pre-flight
 /// failure (no api key / no models) with no attempts; `ChainExhausted` carries
 /// every failed attempt in order so the caller can persist a diagnostic.
@@ -819,9 +831,25 @@ impl OpenRouterClient {
     /// One-shot image-generation call. Walks `[model] + fallback_model` on
     /// transport failure OR a zero-image success. Returns the first attempt that
     /// yields ≥1 image. Non-streaming.
+    ///
+    /// Retained as the stable public entry point for downstream library
+    /// consumers; in-tree callers that need live per-attempt progress use
+    /// [`OpenRouterClient::execute_image_inner`] instead. Do not remove as
+    /// "unused" — it has no in-tree callers by design.
     pub async fn execute_image(
         &self,
         req: ImageGenRequest,
+    ) -> Result<ImageGenResponse, ImageGenError> {
+        self.execute_image_inner(req, |_| {}).await
+    }
+
+    /// Like [`execute_image`], but invokes `on_attempt` immediately before each
+    /// HTTP post so a streaming caller can surface fallback-chain progress live.
+    /// The hook is synchronous and best-effort — it must not block.
+    pub async fn execute_image_inner(
+        &self,
+        req: ImageGenRequest,
+        mut on_attempt: impl FnMut(ImageAttemptProgress),
     ) -> Result<ImageGenResponse, ImageGenError> {
         let candidates: Vec<&str> = std::iter::once(req.model.as_str())
             .chain(req.fallback_model.iter().map(String::as_str))
@@ -836,8 +864,15 @@ impl OpenRouterClient {
             return Err(ImageGenError::Config("openrouter: api key not set".into()));
         }
         let plan = plan_attempts(&candidates, &req.prompt, req.prompt_original.as_deref());
+        let total = plan.len() as u32;
         let mut attempts: Vec<ImageAttempt> = Vec::new();
-        for (model, variant, prompt) in plan {
+        for (i, (model, variant, prompt)) in plan.into_iter().enumerate() {
+            on_attempt(ImageAttemptProgress {
+                model: model.to_string(),
+                variant,
+                index: i as u32 + 1,
+                total,
+            });
             let mut body = build_image_body(&req, model, prompt);
             if let Some(prefs) = self.provider_prefs() {
                 if let Ok(v) = serde_json::to_value(&prefs) {
@@ -2569,5 +2604,41 @@ data: [DONE]\n\n";
         assert_eq!(zv["variant"], "original");
         assert_eq!(zv["outcome"], "zero_images");
         assert!(zv.get("status").is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_image_inner_reports_each_attempt() {
+        // Every candidate returns 500 ⇒ each attempt fails (Status) ⇒ ChainExhausted.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let req = ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec!["m2".into()],
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        // prompt_original is None ⇒ Single variant per model ⇒ 2 planned attempts.
+        let mut seen: Vec<(String, PromptVariant, u32, u32)> = Vec::new();
+        let result = client
+            .execute_image_inner(req, |p| seen.push((p.model, p.variant, p.index, p.total)))
+            .await;
+
+        assert!(
+            matches!(result, Err(ImageGenError::ChainExhausted { ref attempts }) if attempts.len() == 2),
+            "all-500 chain should exhaust with 2 attempts: {result:?}"
+        );
+        assert_eq!(seen.len(), 2, "on_attempt fires once per planned attempt");
+        assert_eq!(seen[0], ("m1".to_string(), PromptVariant::Single, 1, 2));
+        assert_eq!(seen[1], ("m2".to_string(), PromptVariant::Single, 2, 2));
     }
 }

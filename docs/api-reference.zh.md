@@ -292,16 +292,58 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 | `model` | `String` \| `null` | 实际服务的图片模型。 |
 | `generation_id` | `String` \| `null` | OpenRouter 生成 id。 |
 
+**`image_pending` SSE 帧** — 引擎决定为某条消息生成图片时（生成开始前）发出。
+客户端可据此开始显示「生成中…」状态：
+
+```text
+data: {"type":"image_pending","message_id":"01J..."}
+```
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `type` | `"image_pending"` | 帧类型标识符。 |
+| `message_id` | `String` | 正在为其生成图片的消息。对 `reply_image` 而言这是*预期*的图片 id；若生成失败，整轮会降级为另一条文字消息（见下文）。 |
+
+**`image_attempt` SSE 帧** — 模型回退链每尝试一个候选模型时，在该次尝试开始时
+发出一帧：
+
+```text
+data: {"type":"image_attempt","message_id":"01J...","model":"google/gemini-2.5-flash-image","variant":"composed","index":1,"total":3}
+```
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `type` | `"image_attempt"` | 帧类型标识符。 |
+| `message_id` | `String` | 与 `image_pending` 帧的 `message_id` 相同。 |
+| `model` | `String` | 本次尝试所用的模型。 |
+| `variant` | `"composed"` \| `"original"` \| `"single"` | 本次尝试使用的提示词变体（`single` = 未启用 compose 重试）。 |
+| `index` | `Number` | 在尝试计划中的位置（从 1 开始）。 |
+| `total` | `Number` | 计划尝试的总次数。 |
+
+**`image_failed` SSE 帧** — 图片生成放弃时发出。客户端应清除 pending 状态，并渲染
+「生成失败」状态：
+
+```text
+data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
+```
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `type` | `"image_failed"` | 帧类型标识符。 |
+| `message_id` | `String` | 与 `image_pending` 帧的 `message_id` 相同。 |
+| `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = 所有候选模型均失败；`zero_images` = 成功响应但未含图片（防御性）；`config_error` = 未配置 key 或模型。 |
+
 **完整 SSE 帧序列：**
 
-- `reply_text_image`：`meta(action_type=reply_text_image) → delta* → done → image → final`
-- `reply_image`：`meta(action_type=reply_image) → image → done → final`
+- `reply_text_image`：`meta(action_type=reply_text_image) → delta* → done → image_pending → image_attempt* → (image | image_failed) → final`
+- `reply_image`（成功）：`image_pending → image_attempt* → meta(action_type=reply_image) → image → done → final`
+- `reply_image`（图片失败）：`image_pending → image_attempt* → image_failed → meta(action_type=reply_text) → delta* → done → final` — 整轮降级为普通文字回复，并使用**新的** `message_id`（见下文）。
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
 
 **图片失败客户端约定** — 图片失败时不会发出额外的 error 帧。客户端通过 `meta` 帧的 `action_type` 判断预期形状：
 
 - **`reply_text_image`** — `image` 帧在 `done` 之后到达。若流已到达 `final` 但仍未收到 `image` 帧，则图片生成失败（fail-open）；文字已正常投递，渲染即可。
-- **`reply_image`** — `image` 帧在 `done` 之前到达。`reply_image` 类型的 `meta` 只在图片确定可投递时才会下发，因此收到该 `meta` 后 `image` 帧必然随后出现。若图片失败，整轮会降级：客户端收到的是 `meta.action_type=reply_text`（而非 `reply_image`）加上普通文字流——降级从 `meta` 帧起即可见，不会出现空的 `reply_image`。
+- **`reply_image`** — `image_pending` 和 `image_attempt*` 先到达，携带*预期*的图片 id `X`。成功时，`meta(action_type=reply_image) → image → done` 随后到达，使用同一个 `X`。失败时，会发出一帧 `image_failed`（同样携带 `X`），整轮降级为普通文字回复，其 `meta` / `delta` / `done` 携带**另一个** `message_id` `Y`（`meta.action_type = reply_text`）。客户端在收到 `image_failed` 时清除 `X` 的 pending 状态，再把 `Y` 当作普通文字消息渲染。（`X` 不会被持久化；失败诊断信息持久化在 `Y` 所在行。）
 
 **写回端点** — 收到 `image` 帧后，客户端应将 `data_url` 上传到自有存储，然后把结果 URL 写回引擎：
 
