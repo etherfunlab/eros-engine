@@ -8993,4 +8993,85 @@ data: [DONE]\n\n"
             "last event is Done(Err(ChainExhausted)) with 2 attempts"
         );
     }
+
+    #[tokio::test]
+    async fn drive_image_gen_drop_cancels_inflight() {
+        use futures_util::StreamExt as _;
+        use std::time::Duration;
+        // The first attempt's response is held briefly so its request is
+        // in-flight when we drop the stream. The fallback chain is sequential, so
+        // the second candidate (m2) is only ever requested AFTER the first
+        // attempt's response lands (~DELAY later). We then wait WELL PAST that
+        // window before asserting m2 was never requested — so the test fails if a
+        // regression let the gen future keep running in the background after the
+        // drop (it would receive m1's response and advance to m2). With true
+        // cancellation, dropping the in-place future stops it and m2 never fires.
+        const DELAY_MS: u64 = 200;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).set_delay(Duration::from_millis(DELAY_MS)),
+            )
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec!["m2".into()],
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+
+        let mut s = Box::pin(drive_image_gen(client, req));
+        // First event is Attempt(1) for m1, emitted before its HTTP post is
+        // awaited — by the time we receive it, the m1 request is in-flight.
+        let first = s.next().await;
+        assert!(
+            matches!(
+                first,
+                Some(ImageGenEvent::Attempt(ref p)) if p.index == 1 && p.model == "m1"
+            ),
+            "first event should be Attempt(1) for m1",
+        );
+
+        // Dropping the stream drops the in-place gen future → cancels the m1
+        // request mid-flight. The chain must never advance to the m2 candidate.
+        drop(s);
+
+        // Wait past m1's response delay + a fallback request window: a cancelled
+        // gen stays stopped; an uncancelled one would request m2 within this gap.
+        tokio::time::sleep(Duration::from_millis(DELAY_MS * 5)).await;
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let requested_m2 = received.iter().any(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("m2")
+        });
+        assert!(
+            !requested_m2,
+            "second candidate m2 must never be requested after drop ({} request(s) seen)",
+            received.len(),
+        );
+        // Correct cancellation leaves only m1 in flight (often aborted before it
+        // even reaches the mock ⇒ 0 received). A regression that kept the gen
+        // running would land m1's 500 and then request m2 ⇒ ≥2 received.
+        assert!(
+            received.len() <= 1,
+            "drop must stop the chain at m1; got {} requests",
+            received.len(),
+        );
+    }
 }
