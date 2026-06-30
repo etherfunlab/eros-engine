@@ -888,7 +888,9 @@ impl OpenRouterClient {
                     attempts.push(ImageAttempt {
                         model: model.to_string(),
                         variant,
-                        outcome: AttemptOutcome::Transport { message: e.to_string() },
+                        outcome: AttemptOutcome::Transport {
+                            message: e.to_string(),
+                        },
                     });
                     continue;
                 }
@@ -914,7 +916,9 @@ impl OpenRouterClient {
                     attempts.push(ImageAttempt {
                         model: model.to_string(),
                         variant,
-                        outcome: AttemptOutcome::Decode { message: e.to_string() },
+                        outcome: AttemptOutcome::Decode {
+                            message: e.to_string(),
+                        },
                     });
                     continue;
                 }
