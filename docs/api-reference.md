@@ -321,10 +321,52 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 | `model` | `String` \| `null` | Image model actually served. |
 | `generation_id` | `String` \| `null` | OpenRouter generation id. |
 
+**`image_pending` SSE frame** — emitted when the engine commits to generating an
+image for a message, before generation begins. Start a "generating…" indicator:
+
+```text
+data: {"type":"image_pending","message_id":"01J..."}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_pending"` | Frame type discriminator. |
+| `message_id` | `String` | The message the image is being generated for. For `reply_image` this is the *intended* image id; on failure the turn degrades to a different text message (see below). |
+
+**`image_attempt` SSE frame** — emitted as the model fallback chain walks, one
+per attempt as it begins:
+
+```text
+data: {"type":"image_attempt","message_id":"01J...","model":"google/gemini-2.5-flash-image","variant":"composed","index":1,"total":3}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_attempt"` | Frame type discriminator. |
+| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
+| `model` | `String` | The model being tried for this attempt. |
+| `variant` | `"composed"` \| `"original"` \| `"single"` | Which prompt variant is being tried (`single` = no compose retry). |
+| `index` | `Number` | 1-based position in the attempt plan. |
+| `total` | `Number` | Total planned attempts. |
+
+**`image_failed` SSE frame** — emitted when image generation gives up. Clear the
+pending state and render a "couldn't generate" state:
+
+```text
+data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_failed"` | Frame type discriminator. |
+| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
+| `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = every candidate model failed; `zero_images` = a success response carried no image (defensive); `config_error` = no key / no models. |
+
 **Full SSE frame sequences:**
 
-- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image → final`
-- `reply_image`: `meta(action_type=reply_image) → image → done → final`
+- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image_pending → image_attempt* → (image | image_failed) → final`
+- `reply_image` (success): `image_pending → image_attempt* → meta(action_type=reply_image) → image → done → final`
+- `reply_image` (image failed): `image_pending → image_attempt* → image_failed → meta(action_type=reply_text) → delta* → done → final` — the turn degrades to a normal text reply with a **new** `message_id` (see below).
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 
 **Failed-image client contract** — no new error frame is emitted on image failure.
@@ -333,11 +375,14 @@ The `meta` frame's `action_type` declares the intended shape:
 - **`reply_text_image`** — the `image` frame arrives *after* `done`. If the stream
   reaches `final` with no `image` frame, the image generation failed (fail-open);
   the text was still delivered — render it.
-- **`reply_image`** — the `image` frame arrives *before* `done`. A `reply_image`
-  meta is only ever emitted when the image is already in-flight, so an `image`
-  frame will always follow. A failed image instead degrades the whole turn: the
-  client sees `meta.action_type=reply_text` (never `reply_image`) and a normal
-  text stream — the degrade is visible up front.
+- **`reply_image`** — `image_pending` and `image_attempt*` arrive first, carrying
+  the *intended* image id `X`. On success, `meta(action_type=reply_image) → image
+  → done` follow with that same `X`. On failure, an `image_failed` frame (also
+  `X`) is emitted and the turn degrades to a normal text reply whose `meta` /
+  `delta` / `done` carry a **different** `message_id` `Y` (`meta.action_type =
+  reply_text`). A consumer clears the pending state for `X` on `image_failed`,
+  then renders `Y` as an ordinary text message. (`X` is never persisted; the
+  failure diagnostic is persisted on `Y`'s row.)
 
 **Write-back endpoint** — after receiving the `image` frame, the client should
 upload the `data_url` to its own storage and post the resulting URL back:
