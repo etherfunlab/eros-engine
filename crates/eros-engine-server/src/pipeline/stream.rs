@@ -2562,6 +2562,16 @@ pub fn run_stream(
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
                     if let Some((primary, fallback)) = image_chain.clone() {
+                        // #131: pre-allocate the assistant id up front so the
+                        // image lifecycle frames can reference it before the
+                        // (blocking) generation. On success this same id labels
+                        // the persisted row + meta/image/done. On failure it is
+                        // never persisted — the turn degrades to a separate text
+                        // row (Y); image_failed(X) lets a consumer clear pending.
+                        let msg_ulid = Ulid::new();
+                        let msg_uuid: Uuid = msg_ulid.into();
+                        let img_mid = ulid_string(msg_ulid);
+                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -2621,7 +2631,29 @@ pub fn run_stream(
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
-                        match state.openrouter.execute_image(req).await {
+                        // #131: drive image-gen, forwarding each attempt as an
+                        // image_attempt frame; capture the single terminal Done.
+                        let mut img_events =
+                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
+                        let mut img_outcome = None;
+                        {
+                            use futures_util::StreamExt as _;
+                            while let Some(ev) = img_events.next().await {
+                                match ev {
+                                    ImageGenEvent::Attempt(p) => {
+                                        yield ProtocolFrame::ImageAttempt {
+                                            message_id: img_mid.clone(),
+                                            model: p.model,
+                                            variant: p.variant,
+                                            index: p.index,
+                                            total: p.total,
+                                        };
+                                    }
+                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
+                                }
+                            }
+                        }
+                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
                             Ok(resp) if !resp.images.is_empty() => {
                                 let won_prompt = winning_image_prompt(
                                     resp.winning_variant,
@@ -2654,8 +2686,6 @@ pub fn run_stream(
                                         serde_json::to_value(&resp.attempts).unwrap_or_default();
                                 }
                                 let mime = data_url_mime(&resp.images[0]);
-                                let msg_ulid = Ulid::new();
-                                let msg_uuid: Uuid = msg_ulid.into();
                                 let row = eros_engine_store::chat::AssistantInsert {
                                     id: msg_uuid,
                                     content: String::new(),
@@ -2721,12 +2751,20 @@ pub fn run_stream(
                                     "stream(image): execute_image returned zero images \
                                      (unexpected); falling through to text"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ZeroImages,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
                                 tracing::warn!(
                                     "stream(image): execute_image config error: {m}; \
                                      falling through to text"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ConfigError,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
                                 attempts,
@@ -2745,6 +2783,10 @@ pub fn run_stream(
                                     face_used,
                                     &attempts,
                                 ));
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ChainExhausted,
+                                };
                             }
                         }
                     }
