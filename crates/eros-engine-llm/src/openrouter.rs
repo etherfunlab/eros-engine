@@ -831,6 +831,11 @@ impl OpenRouterClient {
     /// One-shot image-generation call. Walks `[model] + fallback_model` on
     /// transport failure OR a zero-image success. Returns the first attempt that
     /// yields ≥1 image. Non-streaming.
+    ///
+    /// Retained as the stable public entry point for downstream library
+    /// consumers; in-tree callers that need live per-attempt progress use
+    /// [`OpenRouterClient::execute_image_inner`] instead. Do not remove as
+    /// "unused" — it has no in-tree callers by design.
     pub async fn execute_image(
         &self,
         req: ImageGenRequest,
