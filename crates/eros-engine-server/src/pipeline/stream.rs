@@ -36,6 +36,18 @@ pub enum FrameActionType {
     ReplyTextImage,
 }
 
+/// Why an image-generation turn failed, carried by the `image_failed` frame.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFailReason {
+    /// Every candidate model failed (transport / status / decode / zero-images).
+    ChainExhausted,
+    /// A success response carried zero images (defensive; unexpected).
+    ZeroImages,
+    /// Pre-flight failure: no api key or no models configured.
+    ConfigError,
+}
+
 /// One wire frame in the SSE protocol.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -90,6 +102,20 @@ pub enum ProtocolFrame {
         model: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         generation_id: Option<String>,
+    },
+    ImagePending {
+        message_id: String,
+    },
+    ImageAttempt {
+        message_id: String,
+        model: String,
+        variant: eros_engine_llm::openrouter::PromptVariant,
+        index: u32,
+        total: u32,
+    },
+    ImageFailed {
+        message_id: String,
+        reason: ImageFailReason,
     },
 }
 
@@ -194,6 +220,51 @@ fn build_image_gen_request(
         aspect_ratio,
         resolution,
         max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
+    }
+}
+
+/// Internal event from [`drive_image_gen`]: one `Attempt` per fallback-chain
+/// step (emitted as it begins), then exactly one terminal `Done`.
+enum ImageGenEvent {
+    Attempt(eros_engine_llm::openrouter::ImageAttemptProgress),
+    Done(
+        Result<
+            eros_engine_llm::openrouter::ImageGenResponse,
+            eros_engine_llm::openrouter::ImageGenError,
+        >,
+    ),
+}
+
+/// Drive `execute_image_inner` while surfacing each attempt live, so both image
+/// actions can stream `image_attempt` frames without duplicating the
+/// channel/`select!` plumbing. Owns the client `Arc` and polls the gen future
+/// in place; dropping the returned stream cancels the in-flight call. The
+/// channel is `tokio::sync::mpsc::unbounded` (futures-channel is not a workspace
+/// dependency).
+fn drive_image_gen(
+    client: std::sync::Arc<eros_engine_llm::openrouter::OpenRouterClient>,
+    req: eros_engine_llm::openrouter::ImageGenRequest,
+) -> impl futures_util::Stream<Item = ImageGenEvent> {
+    async_stream::stream! {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
+            eros_engine_llm::openrouter::ImageAttemptProgress,
+        >();
+        let gen = client.execute_image_inner(req, move |p| {
+            let _ = tx.send(p);
+        });
+        tokio::pin!(gen);
+        let result = loop {
+            tokio::select! {
+                Some(p) = rx.recv() => yield ImageGenEvent::Attempt(p),
+                r = &mut gen => {
+                    while let Ok(p) = rx.try_recv() {
+                        yield ImageGenEvent::Attempt(p);
+                    }
+                    break r;
+                }
+            }
+        };
+        yield ImageGenEvent::Done(result);
     }
 }
 
@@ -2491,6 +2562,16 @@ pub fn run_stream(
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
                     if let Some((primary, fallback)) = image_chain.clone() {
+                        // #131: pre-allocate the assistant id up front so the
+                        // image lifecycle frames can reference it before the
+                        // (blocking) generation. On success this same id labels
+                        // the persisted row + meta/image/done. On failure it is
+                        // never persisted — the turn degrades to a separate text
+                        // row (Y); image_failed(X) lets a consumer clear pending.
+                        let msg_ulid = Ulid::new();
+                        let msg_uuid: Uuid = msg_ulid.into();
+                        let img_mid = ulid_string(msg_ulid);
+                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -2550,7 +2631,29 @@ pub fn run_stream(
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
-                        match state.openrouter.execute_image(req).await {
+                        // #131: drive image-gen, forwarding each attempt as an
+                        // image_attempt frame; capture the single terminal Done.
+                        let mut img_events =
+                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
+                        let mut img_outcome = None;
+                        {
+                            use futures_util::StreamExt as _;
+                            while let Some(ev) = img_events.next().await {
+                                match ev {
+                                    ImageGenEvent::Attempt(p) => {
+                                        yield ProtocolFrame::ImageAttempt {
+                                            message_id: img_mid.clone(),
+                                            model: p.model,
+                                            variant: p.variant,
+                                            index: p.index,
+                                            total: p.total,
+                                        };
+                                    }
+                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
+                                }
+                            }
+                        }
+                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
                             Ok(resp) if !resp.images.is_empty() => {
                                 let won_prompt = winning_image_prompt(
                                     resp.winning_variant,
@@ -2583,8 +2686,6 @@ pub fn run_stream(
                                         serde_json::to_value(&resp.attempts).unwrap_or_default();
                                 }
                                 let mime = data_url_mime(&resp.images[0]);
-                                let msg_ulid = Ulid::new();
-                                let msg_uuid: Uuid = msg_ulid.into();
                                 let row = eros_engine_store::chat::AssistantInsert {
                                     id: msg_uuid,
                                     content: String::new(),
@@ -2650,12 +2751,20 @@ pub fn run_stream(
                                     "stream(image): execute_image returned zero images \
                                      (unexpected); falling through to text"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ZeroImages,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
                                 tracing::warn!(
                                     "stream(image): execute_image config error: {m}; \
                                      falling through to text"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ConfigError,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
                                 attempts,
@@ -2674,6 +2783,10 @@ pub fn run_stream(
                                     face_used,
                                     &attempts,
                                 ));
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ChainExhausted,
+                                };
                             }
                         }
                     }
@@ -2966,6 +3079,11 @@ pub fn run_stream(
                         (produced.last(), image_chain.clone())
                     {
                         let msg_uuid = last.message_id;
+                        // #131: an image is now being generated for this message.
+                        // Emitted before run_image_prompt_compose (itself an LLM
+                        // call) so it covers the whole gap after the text `done`.
+                        let img_mid = ulid_string(Ulid::from(msg_uuid));
+                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -3025,7 +3143,29 @@ pub fn run_stream(
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
-                        match state.openrouter.execute_image(req).await {
+                        // #131: drive image-gen, forwarding each attempt as an
+                        // image_attempt frame; capture the single terminal Done.
+                        let mut img_events =
+                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
+                        let mut img_outcome = None;
+                        {
+                            use futures_util::StreamExt as _;
+                            while let Some(ev) = img_events.next().await {
+                                match ev {
+                                    ImageGenEvent::Attempt(p) => {
+                                        yield ProtocolFrame::ImageAttempt {
+                                            message_id: img_mid.clone(),
+                                            model: p.model,
+                                            variant: p.variant,
+                                            index: p.index,
+                                            total: p.total,
+                                        };
+                                    }
+                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
+                                }
+                            }
+                        }
+                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
                             Ok(resp) if !resp.images.is_empty() => {
                                 let won_prompt = winning_image_prompt(
                                     resp.winning_variant,
@@ -3085,12 +3225,20 @@ pub fn run_stream(
                                     "stream(text_image): execute_image returned zero images \
                                      (unexpected); no Image frame (text already delivered)"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ZeroImages,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
                                 tracing::warn!(
                                     "stream(text_image): execute_image config error: {m}; \
                                      no Image frame (text already delivered)"
                                 );
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ConfigError,
+                                };
                             }
                             Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
                                 attempts,
@@ -3122,6 +3270,10 @@ pub fn run_stream(
                                         "stream(text_image): persist image_failed failed: {e}"
                                     );
                                 }
+                                yield ProtocolFrame::ImageFailed {
+                                    message_id: img_mid.clone(),
+                                    reason: ImageFailReason::ChainExhausted,
+                                };
                             }
                         }
                     }
@@ -8755,6 +8907,171 @@ data: [DONE]\n\n"
             filter_model.as_deref(),
             Some("<regex>"),
             "filter_model must be '<regex>' (LLM filter skipped); got {filter_model:?}",
+        );
+    }
+
+    #[test]
+    fn image_pending_frame_serializes() {
+        let f = ProtocolFrame::ImagePending {
+            message_id: ulid_string(Ulid::new()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_pending");
+        assert_eq!(v["message_id"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn image_attempt_frame_serializes() {
+        let f = ProtocolFrame::ImageAttempt {
+            message_id: ulid_string(Ulid::new()),
+            model: "google/gemini-2.5-flash-image".into(),
+            variant: eros_engine_llm::openrouter::PromptVariant::Composed,
+            index: 1,
+            total: 3,
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_attempt");
+        assert_eq!(v["model"], "google/gemini-2.5-flash-image");
+        assert_eq!(v["variant"], "composed");
+        assert_eq!(v["index"], 1);
+        assert_eq!(v["total"], 3);
+    }
+
+    #[test]
+    fn image_failed_frame_serializes_each_reason() {
+        let mk = |r| {
+            serde_json::to_value(&ProtocolFrame::ImageFailed {
+                message_id: ulid_string(Ulid::new()),
+                reason: r,
+            })
+            .unwrap()
+        };
+        let chain = mk(ImageFailReason::ChainExhausted);
+        assert_eq!(chain["type"], "image_failed");
+        assert_eq!(chain["reason"], "chain_exhausted");
+        assert_eq!(mk(ImageFailReason::ZeroImages)["reason"], "zero_images");
+        assert_eq!(mk(ImageFailReason::ConfigError)["reason"], "config_error");
+    }
+
+    #[tokio::test]
+    async fn drive_image_gen_streams_attempts_then_done() {
+        use futures_util::StreamExt as _;
+        // Every request 500s ⇒ each candidate fails (Status) ⇒ ChainExhausted.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec!["m2".into()],
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        // 2 candidates, no prompt_original ⇒ Single variant ⇒ 2 planned attempts.
+        let events: Vec<ImageGenEvent> = drive_image_gen(client, req).collect().await;
+        let attempts = events
+            .iter()
+            .filter(|e| matches!(e, ImageGenEvent::Attempt(_)))
+            .count();
+        assert_eq!(attempts, 2, "one Attempt event per planned candidate");
+        assert!(
+            matches!(
+                events.last(),
+                Some(ImageGenEvent::Done(Err(
+                    eros_engine_llm::openrouter::ImageGenError::ChainExhausted { attempts }
+                ))) if attempts.len() == 2
+            ),
+            "last event is Done(Err(ChainExhausted)) with 2 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_image_gen_drop_cancels_inflight() {
+        use futures_util::StreamExt as _;
+        use std::time::Duration;
+        // The first attempt's response is held briefly so its request is
+        // in-flight when we drop the stream. The fallback chain is sequential, so
+        // the second candidate (m2) is only ever requested AFTER the first
+        // attempt's response lands (~DELAY later). We then wait WELL PAST that
+        // window before asserting m2 was never requested — so the test fails if a
+        // regression let the gen future keep running in the background after the
+        // drop (it would receive m1's response and advance to m2). With true
+        // cancellation, dropping the in-place future stops it and m2 never fires.
+        const DELAY_MS: u64 = 200;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).set_delay(Duration::from_millis(DELAY_MS)),
+            )
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec!["m2".into()],
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+
+        let mut s = Box::pin(drive_image_gen(client, req));
+        // First event is Attempt(1) for m1, emitted before its HTTP post is
+        // awaited — by the time we receive it, the m1 request is in-flight.
+        let first = s.next().await;
+        assert!(
+            matches!(
+                first,
+                Some(ImageGenEvent::Attempt(ref p)) if p.index == 1 && p.model == "m1"
+            ),
+            "first event should be Attempt(1) for m1",
+        );
+
+        // Dropping the stream drops the in-place gen future → cancels the m1
+        // request mid-flight. The chain must never advance to the m2 candidate.
+        drop(s);
+
+        // Wait past m1's response delay + a fallback request window: a cancelled
+        // gen stays stopped; an uncancelled one would request m2 within this gap.
+        tokio::time::sleep(Duration::from_millis(DELAY_MS * 5)).await;
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let requested_m2 = received.iter().any(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("m2")
+        });
+        assert!(
+            !requested_m2,
+            "second candidate m2 must never be requested after drop ({} request(s) seen)",
+            received.len(),
+        );
+        // Correct cancellation leaves only m1 in flight (often aborted before it
+        // even reaches the mock ⇒ 0 received). A regression that kept the gen
+        // running would land m1's 500 and then request m2 ⇒ ≥2 received.
+        assert!(
+            received.len() <= 1,
+            "drop must stop the chain at m1; got {} requests",
+            received.len(),
         );
     }
 }

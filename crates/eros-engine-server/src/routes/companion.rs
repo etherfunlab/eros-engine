@@ -956,9 +956,9 @@ mod tests {
             .unwrap();
         let (status, body) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::OK, "got body: {body}");
-        // Defaults from migration: warmth=0.3, intrigue=0.5
-        assert!((body["warmth"].as_f64().unwrap() - 0.3).abs() < 1e-9);
-        assert!((body["intrigue"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        // Defaults from migration 0029: warmth=0.1, intrigue=0.0 (lowered seed §4.8)
+        assert!((body["warmth"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        assert!((body["intrigue"].as_f64().unwrap() - 0.0).abs() < 1e-9);
     }
 
     // ─── Prompt-traits validator unit tests ─────────────────────────

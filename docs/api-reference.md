@@ -321,10 +321,52 @@ data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,..
 | `model` | `String` \| `null` | Image model actually served. |
 | `generation_id` | `String` \| `null` | OpenRouter generation id. |
 
+**`image_pending` SSE frame** — emitted when the engine commits to generating an
+image for a message, before generation begins. Start a "generating…" indicator:
+
+```text
+data: {"type":"image_pending","message_id":"01J..."}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_pending"` | Frame type discriminator. |
+| `message_id` | `String` | The message the image is being generated for. For `reply_image` this is the *intended* image id; on failure the turn degrades to a different text message (see below). |
+
+**`image_attempt` SSE frame** — emitted as the model fallback chain walks, one
+per attempt as it begins:
+
+```text
+data: {"type":"image_attempt","message_id":"01J...","model":"google/gemini-2.5-flash-image","variant":"composed","index":1,"total":3}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_attempt"` | Frame type discriminator. |
+| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
+| `model` | `String` | The model being tried for this attempt. |
+| `variant` | `"composed"` \| `"original"` \| `"single"` | Which prompt variant is being tried (`single` = no compose retry). |
+| `index` | `Number` | 1-based position in the attempt plan. |
+| `total` | `Number` | Total planned attempts. |
+
+**`image_failed` SSE frame** — emitted when image generation gives up. Clear the
+pending state and render a "couldn't generate" state:
+
+```text
+data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"image_failed"` | Frame type discriminator. |
+| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
+| `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = every candidate model failed; `zero_images` = a success response carried no image (defensive); `config_error` = no key / no models. |
+
 **Full SSE frame sequences:**
 
-- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image → final`
-- `reply_image`: `meta(action_type=reply_image) → image → done → final`
+- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image_pending → image_attempt* → (image | image_failed) → final`
+- `reply_image` (success): `image_pending → image_attempt* → meta(action_type=reply_image) → image → done → final`
+- `reply_image` (image failed): `image_pending → image_attempt* → image_failed → meta(action_type=reply_text) → delta* → done → final` — the turn degrades to a normal text reply with a **new** `message_id` (see below).
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 
 **Failed-image client contract** — no new error frame is emitted on image failure.
@@ -333,11 +375,14 @@ The `meta` frame's `action_type` declares the intended shape:
 - **`reply_text_image`** — the `image` frame arrives *after* `done`. If the stream
   reaches `final` with no `image` frame, the image generation failed (fail-open);
   the text was still delivered — render it.
-- **`reply_image`** — the `image` frame arrives *before* `done`. A `reply_image`
-  meta is only ever emitted when the image is already in-flight, so an `image`
-  frame will always follow. A failed image instead degrades the whole turn: the
-  client sees `meta.action_type=reply_text` (never `reply_image`) and a normal
-  text stream — the degrade is visible up front.
+- **`reply_image`** — `image_pending` and `image_attempt*` arrive first, carrying
+  the *intended* image id `X`. On success, `meta(action_type=reply_image) → image
+  → done` follow with that same `X`. On failure, an `image_failed` frame (also
+  `X`) is emitted and the turn degrades to a normal text reply whose `meta` /
+  `delta` / `done` carry a **different** `message_id` `Y` (`meta.action_type =
+  reply_text`). A consumer clears the pending state for `X` on `image_failed`,
+  then renders `Y` as an ordinary text message. (`X` is never persisted; the
+  failure diagnostic is persisted on `Y`'s row.)
 
 **Write-back endpoint** — after receiving the `image` frame, the client should
 upload the `data_url` to its own storage and post the resulting URL back:
@@ -407,32 +452,45 @@ Current `companion_insights` JSONB plus a weighted `training_level`. Same `user_
 
 ### `GET /comp/affinity/{session_id}`
 
-Live 6-dim vector + ghost stats + relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404 when disabled.
+Live 6-axis vector + Bond/Chemistry bars and labels + ghost stats + legacy
+relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404
+when disabled.
 
 ```json
 {
   "warmth": 0.42,
-  "trust": 0.28,
-  "intrigue": 0.61,
-  "intimacy": 0.15,
+  "trust": 0.08,
+  "intrigue": 0.12,
+  "intimacy": 0.05,
   "patience": 0.55,
-  "tension": 0.18,
+  "tension": 0.04,
+  "bond": 0.32,
+  "chemistry": 0.28,
+  "bond_label": "friend",
+  "chemistry_label": "flirtation",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "stranger",
-  "updated_at": "2026-05-05T19:42:00.000000Z"
+  "relationship_label": "friend",
+  "updated_at": "2026-06-30T12:00:00.000000Z"
 }
 ```
 
-Production deploys typically keep this off (the affinity vector is part of the magic — exposing it ruins the illusion). Turn it on if your frontend wants to render a live radar of the vector.
+- `bond` / `chemistry` — bar values (0–1, curve-applied).
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover`
+- `relationship_label` — legacy mapped value (`stranger | friend | slow_burn | romantic`; `frenemy` retired from emission).
+
+Production deploys typically keep this off. Turn it on if your frontend wants
+to render a live radar or inspect the derived lines.
 
 ### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
 
 Paginated affinity **event log** for the session, newest first. Same
 `EXPOSE_AFFINITY_DEBUG=true` gate as the vector route (404 when disabled). Each
-entry carries both the raw per-turn `deltas` (pre-EMA) and the applied
-`effective_deltas` (post-EMA). Optional `event_type` filters the log; `limit`
-defaults to 20 (capped at 100).
+entry carries the raw per-turn `deltas` (pre-EMA), the applied
+`effective_deltas` (post-EMA), the folded `effective_deltas_computed`, and
+`label_changes` when a tier crossed. Optional `event_type` filters the log;
+`limit` defaults to 20 (capped at 100).
 
 ```json
 {
@@ -442,6 +500,8 @@ defaults to 20 (capped at 100).
       "event_type": "message",
       "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
       "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
+      "effective_deltas_computed": { "bond": 0.02, "chemistry": 0.006 },
+      "label_changes": null,
       "created_at": "…"
     }
   ]
@@ -536,6 +596,13 @@ this surface) — but it is still JWT + ownership checked.
       "warmth": 0.03, "trust": 0.01, "intrigue": 0.0,
       "intimacy": 0.0, "patience": 0.0, "tension": -0.01
     },
+    "effective_deltas_computed": {
+      "bond": 0.013,
+      "chemistry": 0.006
+    },
+    "label_changes": {
+      "bond": { "from": "acquaintance", "to": "friend" }
+    },
     "created_at": "…"
   }
 }
@@ -545,6 +612,13 @@ this surface) — but it is still JWT + ownership checked.
 or only time-decay), or when the latest event predates affinity migration
 `0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
 reports all-zero `effective_deltas`.
+
+- `effective_deltas_computed` — exact floored per-turn line delta computed at
+  persist time from the floored before/after bond/chemistry scores; read from
+  the stored event column. Raw-composite units (not bar-percent). Good for a
+  "+X bond / +Y chemistry" per-turn pulse. May be absent on pre-migration rows.
+- `label_changes` — engine-authoritative tier transition (`null` / absent when
+  no tier crossed this turn). Frontend stops computing this itself.
 
 ## Error responses
 
