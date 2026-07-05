@@ -22,7 +22,10 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
-use crate::pipeline::stream::{replay_stream, run_stream, PersistedUserMessage, ProtocolFrame};
+use crate::pipeline::stream::{
+    draw_image_frames, replay_stream, run_stream, select_image_ref, PersistedUserMessage,
+    ProtocolFrame,
+};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
@@ -176,6 +179,33 @@ fn image_url_is_valid(url: &str) -> bool {
     // Require a non-empty host (reject "https://").
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     !host.is_empty()
+}
+
+/// Body of the engine draw endpoint. Echoes the `image_request` frame contents
+/// back plus the draw-time knobs. The engine draws `composed_prompt` verbatim —
+/// no re-compose, no persona load, no persistence.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct DrawImageRequest {
+    /// The assistant message id `X` from the `image_request` frame. Echoed on
+    /// every draw frame so the consumer correlates the draw to its bubble.
+    pub message_id: String,
+    /// base64(STANDARD) of the final wire prompt — exactly the `composed_prompt`
+    /// from the `image_request` frame. Decoded and drawn verbatim.
+    pub composed_prompt: String,
+    /// Which reference image the plan chose (`face` | `previous`).
+    #[schema(value_type = String)]
+    pub image_ref: eros_engine_core::types::ImageRef,
+    #[serde(default)]
+    pub face_ref_url: Option<String>,
+    #[serde(default)]
+    pub prev_image_url: Option<String>,
+    /// Per-draw model override (highest precedence in `effective_image_chain`).
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub aspect_ratio: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
@@ -337,6 +367,64 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                     original_user_message_id: None,
                 }));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_draw_request(req: &DrawImageRequest) -> Result<(), AppError> {
+    if req.message_id.is_empty() || req.message_id.len() > MAX_CLIENT_MSG_ID_LEN {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_payload",
+            message: format!("message_id must be 1..={MAX_CLIENT_MSG_ID_LEN} chars"),
+            user_message: "请求无效".into(),
+            original_user_message_id: None,
+        }));
+    }
+    for (url, field) in [
+        (req.face_ref_url.as_deref(), "face_ref_url"),
+        (req.prev_image_url.as_deref(), "prev_image_url"),
+    ] {
+        if let Some(u) = url {
+            if !image_url_is_valid(u) {
+                return Err(AppError::StreamPre(StreamPreError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "unprocessable",
+                    message: format!("{field} must be an absolute http(s) URL"),
+                    user_message: "图片参考链接无效".into(),
+                    original_user_message_id: None,
+                }));
+            }
+        }
+    }
+    if let Some(ar) = req.aspect_ratio.as_deref() {
+        if !matches!(ar, "1:1" | "3:4" | "4:3" | "9:16" | "16:9") {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "unsupported aspect_ratio".into(),
+                user_message: "不支持的画幅比例".into(),
+                original_user_message_id: None,
+            }));
+        }
+    }
+    if let Some(res) = req.resolution.as_deref() {
+        let ok = res.len() <= 16
+            && res.split_once('x').is_some_and(|(w, h)| {
+                !w.is_empty()
+                    && !h.is_empty()
+                    && w.bytes().all(|b| b.is_ascii_digit())
+                    && h.bytes().all(|b| b.is_ascii_digit())
+            });
+        if !ok {
+            return Err(AppError::StreamPre(StreamPreError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unprocessable",
+                message: "resolution must look like WxH".into(),
+                user_message: "分辨率格式无效".into(),
+                original_user_message_id: None,
+            }));
         }
     }
     Ok(())
@@ -605,6 +693,112 @@ pub async fn send_message_stream(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/comp/chat/{session_id}/image/stream",
+    tag = "companion",
+    params(("session_id" = Uuid, Path, description = "Chat session id")),
+    request_body = DrawImageRequest,
+    responses(
+        (status = 200, description = "SSE draw stream (text/event-stream)", content_type = "text/event-stream"),
+        (status = 400, body = StreamPreErrorBody),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, body = StreamPreErrorBody),
+        (status = 404, body = StreamPreErrorBody),
+        (status = 422, body = StreamPreErrorBody),
+        (status = 501, body = StreamPreErrorBody),
+    ),
+    security(("bearer" = []))
+)]
+pub async fn draw_image_stream(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<DrawImageRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    validate_draw_request(&req)?;
+    // Decode the echoed composed prompt (base64 → UTF-8); malformed body → 400.
+    use base64::Engine as _;
+    let prompt = base64::engine::general_purpose::STANDARD
+        .decode(req.composed_prompt.as_bytes())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| {
+            AppError::StreamPre(StreamPreError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_payload",
+                message: "composed_prompt must be valid base64 of UTF-8".into(),
+                user_message: "请求无效".into(),
+                original_user_message_id: None,
+            })
+        })?;
+    // Ownership gate — mirrors send_message_stream exactly.
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_FOUND,
+            code: "session_not_found",
+            message: "session not found".into(),
+            user_message: "会话不存在".into(),
+            original_user_message_id: None,
+        })
+    })?;
+    if session.user_id != user_id {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::FORBIDDEN,
+            code: "session_forbidden",
+            message: "session not owned by JWT user".into(),
+            user_message: "无权访问该会话".into(),
+            original_user_message_id: None,
+        }));
+    }
+    // Resolve the image-model chain. Absent `[tasks.chat_image_generation]`
+    // (or no model resolves) ⇒ 501: the engine won't draw and the consumer must
+    // self-draw. Distinct from a per-draw `image_failed`.
+    let resolved = state.model_config.resolve_image_gen();
+    let (primary, fallback) = eros_engine_llm::model_config::effective_image_chain(
+        req.model.as_deref(),
+        resolved.as_ref(),
+    )
+    .ok_or_else(|| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "image_generation_disabled",
+            message: "engine image generation is not configured on this deployment".into(),
+            user_message: "该服务未启用生图".into(),
+            original_user_message_id: None,
+        })
+    })?;
+    // Resolve the reference URL (face | previous, with fallback). Draw the given
+    // prompt verbatim — no compose, no persona.
+    let (ref_url, _kind) = select_image_ref(
+        req.image_ref,
+        req.face_ref_url.as_deref(),
+        req.prev_image_url.as_deref(),
+    );
+    let gen_req = eros_engine_llm::openrouter::ImageGenRequest {
+        model: primary,
+        fallback_model: fallback,
+        prompt,
+        prompt_original: None,
+        face_ref_url: ref_url,
+        aspect_ratio: req.aspect_ratio.clone(),
+        resolution: req.resolution.clone(),
+        max_tokens: resolved.as_ref().map(|r| r.max_tokens).unwrap_or(4096),
+    };
+    let proto = draw_image_frames(state.openrouter.clone(), gen_req, req.message_id.clone());
+    let sse = futures_util::StreamExt::map(proto, |frame: ProtocolFrame| {
+        let json =
+            serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
+        Ok::<_, Infallible>(Event::default().data(json))
+    });
+    Ok(Sse::new(sse).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
+            .text("ping"),
+    ))
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SetImageUrlRequest {
     pub url: String,
@@ -682,6 +876,7 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(send_message_stream))
         .routes(routes!(set_generated_image_url))
+        .routes(routes!(draw_image_stream))
 }
 
 #[cfg(test)]
@@ -1146,6 +1341,226 @@ mod tests {
             stored.is_none(),
             "metadata must be NULL when no fields present"
         );
+    }
+
+    fn draw_body(prompt_b64: &str) -> serde_json::Value {
+        json!({
+            "message_id": "01J9000000000000000000000A",
+            "composed_prompt": prompt_b64,
+            "image_ref": "face"
+        })
+    }
+
+    async fn post_draw(
+        router: &mut Router,
+        session_id: Uuid,
+        jwt: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/image/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router.call(req).await.unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_image_501_when_image_gen_absent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str("").unwrap(),
+        );
+        let mut router = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("a cat")
+        };
+        let resp = post_draw(&mut router, session_id, &jwt, draw_body(&b64)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_image_400_on_bad_base64(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_image_generation]\nmodel = \"img-a\"\n",
+            )
+            .unwrap(),
+        );
+        let mut router = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let resp = post_draw(
+            &mut router,
+            session_id,
+            &jwt,
+            draw_body("!!! not base64 !!!"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_image_403_when_not_owner(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let mut router = build_router(state);
+        let other = Uuid::new_v4();
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("a cat")
+        };
+        let resp = post_draw(&mut router, session_id, &mint_jwt(other), draw_body(&b64)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_image_success_streams_and_persists_nothing(pool: PgPool) {
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mock = MockServer::start().await;
+        let wire = serde_json::json!({
+            "id": "gen_1", "model": "served",
+            "choices": [{"message": {"content": "", "images": [{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}, "finish_reason": "stop"}]
+        });
+        // Assert the model override reaches the provider body.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "override-model" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(wire))
+            .mount(&mock)
+            .await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_image_generation]\nmodel = \"cfg-img\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut router = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("a cat")
+        };
+        let mut body = draw_body(&b64);
+        body["model"] = serde_json::json!("override-model");
+        let resp = post_draw(&mut router, session_id, &jwt, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"image_pending\""), "{text}");
+        assert!(text.contains("\"type\":\"image\""), "{text}");
+        assert!(
+            text.contains("01J9000000000000000000000A"),
+            "echoes message_id: {text}"
+        );
+        // Stateless: no chat_messages row was written.
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after, "the draw endpoint must persist nothing");
     }
 }
 

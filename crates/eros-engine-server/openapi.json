@@ -421,6 +421,102 @@
         ]
       }
     },
+    "/comp/chat/{session_id}/image/stream": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "draw_image_stream",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DrawImageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE draw stream (text/event-stream)",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/chat/{session_id}/message/stream": {
       "post": {
         "tags": [
@@ -1182,6 +1278,60 @@
           "sent_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "DrawImageRequest": {
+        "type": "object",
+        "description": "Body of the engine draw endpoint. Echoes the `image_request` frame contents\nback plus the draw-time knobs. The engine draws `composed_prompt` verbatim —\nno re-compose, no persona load, no persistence.",
+        "required": [
+          "message_id",
+          "composed_prompt",
+          "image_ref"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "composed_prompt": {
+            "type": "string",
+            "description": "base64(STANDARD) of the final wire prompt — exactly the `composed_prompt`\nfrom the `image_request` frame. Decoded and drawn verbatim."
+          },
+          "face_ref_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_ref": {
+            "type": "string",
+            "description": "Which reference image the plan chose (`face` | `previous`)."
+          },
+          "message_id": {
+            "type": "string",
+            "description": "The assistant message id `X` from the `image_request` frame. Echoed on\nevery draw frame so the consumer correlates the draw to its bubble."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-draw model override (highest precedence in `effective_image_chain`)."
+          },
+          "prev_image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

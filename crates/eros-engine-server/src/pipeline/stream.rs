@@ -148,19 +148,17 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     }
 }
 
-/// Pick the reference image for an image turn and report which kind was used.
-/// `Previous` falls back to the face ref when no previous URL is supplied.
-/// Empty strings are treated as absent. Pure.
-fn select_image_ref(
+/// Pick the reference image URL for an image draw and report which kind was
+/// used. `Previous` falls back to the face ref when no previous URL is
+/// supplied. Empty strings are treated as absent. Pure. `pub(crate)` so the
+/// draw endpoint (routes::companion_stream) can reuse it.
+pub(crate) fn select_image_ref(
     image_ref: eros_engine_core::types::ImageRef,
-    req: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    face_ref_url: Option<&str>,
+    prev_image_url: Option<&str>,
 ) -> (Option<String>, &'static str) {
-    let face = req
-        .and_then(|i| i.face_ref_url.clone())
-        .filter(|s| !s.is_empty());
-    let prev = req
-        .and_then(|i| i.prev_image_url.clone())
-        .filter(|s| !s.is_empty());
+    let face = face_ref_url.filter(|s| !s.is_empty()).map(str::to_string);
+    let prev = prev_image_url.filter(|s| !s.is_empty()).map(str::to_string);
     match image_ref {
         eros_engine_core::types::ImageRef::Previous => match prev {
             Some(u) => (Some(u), "previous"),
@@ -278,6 +276,71 @@ fn drive_image_gen(
             }
         };
         yield ImageGenEvent::Done(result);
+    }
+}
+
+/// Drive an engine-side image draw and yield the SSE frame sequence used by the
+/// draw endpoint: `image_pending → image_attempt* → (image | image_failed)`.
+/// `message_id` echoes the assistant message id `X` from the originating
+/// `image_request` frame so the consumer correlates the draw to its bubble.
+/// Persists nothing — the endpoint is stateless. `pub(crate)` for
+/// routes::companion_stream.
+pub(crate) fn draw_image_frames(
+    client: std::sync::Arc<eros_engine_llm::openrouter::OpenRouterClient>,
+    req: eros_engine_llm::openrouter::ImageGenRequest,
+    message_id: String,
+) -> impl futures_util::Stream<Item = ProtocolFrame> {
+    async_stream::stream! {
+        yield ProtocolFrame::ImagePending { message_id: message_id.clone() };
+        let mut img_events = Box::pin(drive_image_gen(client, req));
+        let mut img_outcome = None;
+        {
+            use futures_util::StreamExt as _;
+            while let Some(ev) = img_events.next().await {
+                match ev {
+                    ImageGenEvent::Attempt(p) => {
+                        yield ProtocolFrame::ImageAttempt {
+                            message_id: message_id.clone(),
+                            model: p.model,
+                            variant: p.variant,
+                            index: p.index,
+                            total: p.total,
+                        };
+                    }
+                    ImageGenEvent::Done(r) => img_outcome = Some(r),
+                }
+            }
+        }
+        match img_outcome.expect("drive_image_gen yields exactly one Done") {
+            Ok(resp) if !resp.images.is_empty() => {
+                let cr = eros_engine_llm::openrouter::ChatResponse {
+                    reply: String::new(),
+                    generation_id: resp.generation_id.clone(),
+                    model: resp.model.clone(),
+                    usage: resp.usage.clone(),
+                    finish_reason: resp.finish_reason.clone(),
+                };
+                super::log_openrouter_usage("chat_image_generation", None, &cr);
+                let mime = data_url_mime(&resp.images[0]);
+                yield ProtocolFrame::Image {
+                    message_id,
+                    data_url: resp.images[0].clone(),
+                    mime,
+                    image_prompt: None,
+                    model: resp.model,
+                    generation_id: resp.generation_id,
+                };
+            }
+            Ok(_) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ZeroImages };
+            }
+            Err(eros_engine_llm::openrouter::ImageGenError::Config(_)) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ConfigError };
+            }
+            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted { .. }) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ChainExhausted };
+            }
+        }
     }
 }
 
@@ -2668,7 +2731,11 @@ pub fn run_stream(
                             .ok()
                             .and_then(|v| v.as_str().map(String::from))
                             .unwrap_or_else(|| "realistic".to_string());
-                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let (ref_url, ref_kind) = select_image_ref(
+                            plan.image_ref,
+                            req_image.and_then(|i| i.face_ref_url.as_deref()),
+                            req_image.and_then(|i| i.prev_image_url.as_deref()),
+                        );
                         let face_used = ref_url.is_some();
                         let final_subject = match state.model_config.resolve_image_prompt_compose() {
                             Some(c) => run_image_prompt_compose(
@@ -3234,7 +3301,11 @@ pub fn run_stream(
                             .ok()
                             .and_then(|v| v.as_str().map(String::from))
                             .unwrap_or_else(|| "realistic".to_string());
-                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
+                        let (ref_url, ref_kind) = select_image_ref(
+                            plan.image_ref,
+                            req_image.and_then(|i| i.face_ref_url.as_deref()),
+                            req_image.and_then(|i| i.prev_image_url.as_deref()),
+                        );
                         let face_used = ref_url.is_some();
                         let final_subject = match state.model_config.resolve_image_prompt_compose() {
                             Some(c) => run_image_prompt_compose(
@@ -3701,35 +3772,31 @@ mod tests {
 
     #[test]
     fn select_image_ref_picks_and_falls_back() {
-        use crate::routes::companion_stream::ImageReplyParams;
         use eros_engine_core::types::ImageRef;
-
-        let both = ImageReplyParams {
-            face_ref_url: Some("https://x/face.png".into()),
-            prev_image_url: Some("https://x/prev.png".into()),
-            ..Default::default()
-        };
-        // previous chosen, prev present → previous
+        // Face → the face url.
         assert_eq!(
-            select_image_ref(ImageRef::Previous, Some(&both)),
-            (Some("https://x/prev.png".into()), "previous")
+            select_image_ref(ImageRef::Face, Some("https://f/a.png"), None),
+            (Some("https://f/a.png".into()), "face")
         );
-        // face chosen → face
+        // Previous → the previous url when present.
         assert_eq!(
-            select_image_ref(ImageRef::Face, Some(&both)),
-            (Some("https://x/face.png".into()), "face")
+            select_image_ref(
+                ImageRef::Previous,
+                Some("https://f/a.png"),
+                Some("https://p/b.png")
+            ),
+            (Some("https://p/b.png".into()), "previous")
         );
-        // previous chosen but absent → fall back to face
-        let face_only = ImageReplyParams {
-            face_ref_url: Some("https://x/face.png".into()),
-            ..Default::default()
-        };
+        // Previous with no previous url → falls back to face.
         assert_eq!(
-            select_image_ref(ImageRef::Previous, Some(&face_only)),
-            (Some("https://x/face.png".into()), "face")
+            select_image_ref(ImageRef::Previous, Some("https://f/a.png"), None),
+            (Some("https://f/a.png".into()), "face")
         );
-        // nothing supplied → no url, kind reflects request fallback
-        assert_eq!(select_image_ref(ImageRef::Previous, None), (None, "face"));
+        // Empty strings are treated as absent.
+        assert_eq!(
+            select_image_ref(ImageRef::Face, Some(""), None),
+            (None, "face")
+        );
     }
 
     #[test]
@@ -9549,6 +9616,110 @@ data: [DONE]\n\n"
             meta.get("model").is_none(),
             "delegated meta carries no model"
         );
+    }
+
+    #[tokio::test]
+    async fn draw_image_frames_success_emits_pending_attempt_image() {
+        use futures_util::StreamExt as _;
+        // One candidate returns a valid image on the first try.
+        let server = wiremock::MockServer::start().await;
+        let wire = serde_json::json!({
+            "id": "gen_1",
+            "model": "served-model",
+            "usage": {"total_tokens": 1},
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "images": [{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(wire))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let frames: Vec<ProtocolFrame> = draw_image_frames(client, req, "01ECHO".into())
+            .collect()
+            .await;
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["image_pending", "image_attempt", "image"],
+            "{frames:?}"
+        );
+        // The image frame carries the data url and echoes message_id.
+        let (data_url, mid) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Image {
+                    data_url,
+                    message_id,
+                    ..
+                } => Some((data_url.clone(), message_id.clone())),
+                _ => None,
+            })
+            .expect("image frame present");
+        assert_eq!(data_url, "data:image/png;base64,AAAA");
+        assert_eq!(
+            mid, "01ECHO",
+            "message_id echoes the request id on every frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn draw_image_frames_chain_exhausted_emits_image_failed() {
+        use futures_util::StreamExt as _;
+        // Every request 500s ⇒ ChainExhausted ⇒ image_failed(chain_exhausted).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let frames: Vec<ProtocolFrame> = draw_image_frames(client, req, "01ECHO".into())
+            .collect()
+            .await;
+        assert_eq!(
+            serde_json::to_value(frames.first().unwrap()).unwrap()["type"],
+            "image_pending"
+        );
+        let last = serde_json::to_value(frames.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "image_failed");
+        assert_eq!(last["reason"], "chain_exhausted");
     }
 
     #[tokio::test]
