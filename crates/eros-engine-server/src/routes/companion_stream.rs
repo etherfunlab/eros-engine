@@ -104,6 +104,17 @@ pub struct ImageReplyParams {
     /// clients backed by a private store should pass a short-lived signed URL.
     #[serde(default)]
     pub prev_image_url: Option<String>,
+    /// Delegate drawing to the downstream consumer. Default `false` keeps
+    /// today's in-engine draw path unchanged. When `true`, the engine composes
+    /// the prompt and emits a single `image_request` frame (no provider call, no
+    /// image bytes, no draw-result persistence); the consumer draws, uploads,
+    /// and records the outcome. `model`, `face_ref_url`, `prev_image_url`, and
+    /// `resolution` are ignored when delegated (the composer needs only `style`).
+    // Read by the delegated image-reply branch added later on this branch; the
+    // allow is removed once that reader lands.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub delegate: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -1340,5 +1351,13 @@ mod validate_payload_tests {
             ..Default::default()
         });
         assert!(validate_payload(&ok).is_ok());
+    }
+
+    #[test]
+    fn image_reply_params_delegate_defaults_false() {
+        let none: ImageReplyParams = serde_json::from_str("{}").unwrap();
+        assert!(!none.delegate, "absent delegate must default to false");
+        let on: ImageReplyParams = serde_json::from_str(r#"{"delegate":true}"#).unwrap();
+        assert!(on.delegate);
     }
 }

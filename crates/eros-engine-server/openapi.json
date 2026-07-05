@@ -1249,6 +1249,10 @@
               "null"
             ]
           },
+          "delegate": {
+            "type": "boolean",
+            "description": "Delegate drawing to the downstream consumer. Default `false` keeps\ntoday's in-engine draw path unchanged. When `true`, the engine composes\nthe prompt and emits a single `image_request` frame (no provider call, no\nimage bytes, no draw-result persistence); the consumer draws, uploads,\nand records the outcome. `model`, `face_ref_url`, `prev_image_url`, and\n`resolution` are ignored when delegated (the composer needs only `style`)."
+          },
           "face_ref_url": {
             "type": [
               "string",
