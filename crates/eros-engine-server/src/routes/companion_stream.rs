@@ -110,9 +110,6 @@ pub struct ImageReplyParams {
     /// image bytes, no draw-result persistence); the consumer draws, uploads,
     /// and records the outcome. `model`, `face_ref_url`, `prev_image_url`, and
     /// `resolution` are ignored when delegated (the composer needs only `style`).
-    // Read by the delegated image-reply branch added later on this branch; the
-    // allow is removed once that reader lands.
-    #[allow(dead_code)]
     #[serde(default)]
     pub delegate: bool,
 }

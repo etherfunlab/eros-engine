@@ -120,8 +120,6 @@ pub enum ProtocolFrame {
     /// Delegated image turn: the engine composed the prompt and hands drawing to
     /// the consumer. Replaces the whole `image_pending`/`image_attempt`/`image`/
     /// `image_failed` sequence for this turn — the engine draws nothing.
-    // non-test callers land later on this branch (delegated image branch); allow removed then.
-    #[allow(dead_code)]
     ImageRequest {
         message_id: String,
         /// base64(STANDARD, unwrapped) of the UTF-8 final wire prompt — exactly
@@ -288,8 +286,6 @@ fn drive_image_gen(
 /// appearance + enriched subject) — exactly what the provider would receive.
 /// base64(STANDARD, unwrapped) of its UTF-8 bytes keeps the explicit/CJK text
 /// out of SSE transport and intermediary logs. Pure.
-// non-test callers land later on this branch (delegated image branch); allow removed then.
-#[allow(dead_code)]
 fn build_image_request_frame(
     message_id: String,
     req: &eros_engine_llm::openrouter::ImageGenRequest,
@@ -309,8 +305,6 @@ fn build_image_request_frame(
 /// and the aspect ratio — deliberately NOT the composed wire prompt, model,
 /// generation id, url, or success/failure. Preserves the PDE image-awareness
 /// transcript (§5) while leaving the draw result with the consumer. Pure.
-// non-test callers land later on this branch (delegated image branch); allow removed then.
-#[allow(dead_code)]
 fn build_delegated_image_marker(
     seed_subject: &str,
     aspect_ratio: Option<&str>,
@@ -320,6 +314,32 @@ fn build_delegated_image_marker(
         m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
     }
     m
+}
+
+/// The three ordered frames of a delegated image-only turn:
+/// `meta → done → image_request`. No `image_pending`/`image_attempt`/`image`/
+/// `image_failed`, no image bytes. Meta carries no model (the consumer selects
+/// it). Pure, so the order is unit-testable without the stream generator.
+fn delegated_image_only_frames(
+    message_id: String,
+    req: &eros_engine_llm::openrouter::ImageGenRequest,
+    image_ref: eros_engine_core::types::ImageRef,
+) -> Vec<ProtocolFrame> {
+    vec![
+        ProtocolFrame::Meta {
+            message_id: message_id.clone(),
+            action_type: FrameActionType::ReplyImage,
+            model: None,
+            continues_from: None,
+        },
+        ProtocolFrame::Done {
+            message_id: message_id.clone(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+        },
+        build_image_request_frame(message_id, req, image_ref),
+    ]
 }
 
 /// The subject-level prompt that actually drew the image, given which variant
@@ -2625,7 +2645,10 @@ pub fn run_stream(
                         let msg_ulid = Ulid::new();
                         let msg_uuid: Uuid = msg_ulid.into();
                         let img_mid = ulid_string(msg_ulid);
-                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
+                        let delegate = req_image.is_some_and(|i| i.delegate);
+                        if !delegate {
+                            yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
+                        }
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -2685,162 +2708,213 @@ pub fn run_stream(
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
-                        // #131: drive image-gen, forwarding each attempt as an
-                        // image_attempt frame; capture the single terminal Done.
-                        let mut img_events =
-                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
-                        let mut img_outcome = None;
-                        {
-                            use futures_util::StreamExt as _;
-                            while let Some(ev) = img_events.next().await {
-                                match ev {
-                                    ImageGenEvent::Attempt(p) => {
-                                        yield ProtocolFrame::ImageAttempt {
-                                            message_id: img_mid.clone(),
-                                            model: p.model,
-                                            variant: p.variant,
-                                            index: p.index,
-                                            total: p.total,
-                                        };
+                        if delegate {
+                            // Delegated image-only: no provider call. Persist an
+                            // empty-content row carrying ONLY the minimal marker
+                            // (seed subject + aspect) so the PDE stays image-aware
+                            // (§5); the composed prompt + draw result live with the
+                            // consumer. Then meta → done → image_request, and fall
+                            // into the shared image-only completion below (final +
+                            // post-process, text path skipped).
+                            let marker = build_delegated_image_marker(&subject, ar.as_deref());
+                            let row = eros_engine_store::chat::AssistantInsert {
+                                id: msg_uuid,
+                                content: String::new(),
+                                assistant_action_type: "reply".into(),
+                                continues_from_message_id: None,
+                                truncated: false,
+                                model: None,
+                                usage: None,
+                                generation_id: None,
+                                filter_audit: None,
+                                metadata: Some(serde_json::json!({ "image": marker })),
+                            };
+                            if let Err(e) = chat_repo
+                                .insert_assistant_batch(
+                                    user_msg.session_id,
+                                    user_msg.user_message_id,
+                                    std::slice::from_ref(&row),
+                                )
+                                .await
+                            {
+                                tracing::warn!("stream(image,delegate): persist failed: {e}");
+                            }
+                            // full_text="" so insight/memory extraction skips this
+                            // row; affinity uses plan.image_prompt as the proxy,
+                            // mirroring the non-delegated image-only path.
+                            image_only_produced.push(
+                                crate::pipeline::post_process::ProducedMessage {
+                                    message_id: msg_uuid,
+                                    full_text: String::new(),
+                                    action: ActionType::ReplyImage,
+                                },
+                            );
+                            for frame in delegated_image_only_frames(
+                                img_mid.clone(),
+                                &req,
+                                plan.image_ref,
+                            ) {
+                                yield frame;
+                            }
+                            image_only_done = true;
+                        } else {
+                            // #131: drive image-gen, forwarding each attempt as an
+                            // image_attempt frame; capture the single terminal Done.
+                            let mut img_events =
+                                Box::pin(drive_image_gen(state.openrouter.clone(), req));
+                            let mut img_outcome = None;
+                            {
+                                use futures_util::StreamExt as _;
+                                while let Some(ev) = img_events.next().await {
+                                    match ev {
+                                        ImageGenEvent::Attempt(p) => {
+                                            yield ProtocolFrame::ImageAttempt {
+                                                message_id: img_mid.clone(),
+                                                model: p.model,
+                                                variant: p.variant,
+                                                index: p.index,
+                                                total: p.total,
+                                            };
+                                        }
+                                        ImageGenEvent::Done(r) => img_outcome = Some(r),
                                     }
-                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
                                 }
                             }
-                        }
-                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
-                            Ok(resp) if !resp.images.is_empty() => {
-                                let won_prompt = winning_image_prompt(
-                                    resp.winning_variant,
-                                    &final_subject,
-                                    &subject,
-                                );
-                                // Usage logging via the ChatResponse adapter.
-                                let cr = eros_engine_llm::openrouter::ChatResponse {
-                                    reply: String::new(),
-                                    generation_id: resp.generation_id.clone(),
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    finish_reason: resp.finish_reason.clone(),
-                                };
-                                // Mirror the other in-stream task log sites
-                                // (vision / filters / pde): session_id = None.
-                                super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let mut image_meta = serde_json::json!({
-                                    "prompt": won_prompt,
-                                    "style": style_str,
-                                    "model": resp.model,
-                                    "aspect_ratio": ar,
-                                    "resolution": res,
-                                    "generation_id": resp.generation_id,
-                                    "face_ref_used": face_used,
-                                    "image_ref": ref_kind,
-                                });
-                                if !resp.attempts.is_empty() {
-                                    image_meta["attempts"] =
-                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
+                            match img_outcome.expect("drive_image_gen yields exactly one Done") {
+                                Ok(resp) if !resp.images.is_empty() => {
+                                    let won_prompt = winning_image_prompt(
+                                        resp.winning_variant,
+                                        &final_subject,
+                                        &subject,
+                                    );
+                                    // Usage logging via the ChatResponse adapter.
+                                    let cr = eros_engine_llm::openrouter::ChatResponse {
+                                        reply: String::new(),
+                                        generation_id: resp.generation_id.clone(),
+                                        model: resp.model.clone(),
+                                        usage: resp.usage.clone(),
+                                        finish_reason: resp.finish_reason.clone(),
+                                    };
+                                    // Mirror the other in-stream task log sites
+                                    // (vision / filters / pde): session_id = None.
+                                    super::log_openrouter_usage("chat_image_generation", None, &cr);
+                                    let mut image_meta = serde_json::json!({
+                                        "prompt": won_prompt,
+                                        "style": style_str,
+                                        "model": resp.model,
+                                        "aspect_ratio": ar,
+                                        "resolution": res,
+                                        "generation_id": resp.generation_id,
+                                        "face_ref_used": face_used,
+                                        "image_ref": ref_kind,
+                                    });
+                                    if !resp.attempts.is_empty() {
+                                        image_meta["attempts"] =
+                                            serde_json::to_value(&resp.attempts).unwrap_or_default();
+                                    }
+                                    let mime = data_url_mime(&resp.images[0]);
+                                    let row = eros_engine_store::chat::AssistantInsert {
+                                        id: msg_uuid,
+                                        content: String::new(),
+                                        assistant_action_type: "reply".into(),
+                                        continues_from_message_id: None,
+                                        truncated: false,
+                                        model: resp.model.clone(),
+                                        usage: resp.usage.clone(),
+                                        generation_id: resp.generation_id.clone(),
+                                        filter_audit: None,
+                                        metadata: Some(serde_json::json!({ "image": image_meta })),
+                                    };
+                                    if let Err(e) = chat_repo
+                                        .insert_assistant_batch(
+                                            user_msg.session_id,
+                                            user_msg.user_message_id,
+                                            std::slice::from_ref(&row),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!("stream(image): persist failed: {e}");
+                                    }
+                                    // full_text="" so insight/memory extraction skips
+                                    // this row; affinity uses plan.image_prompt as the
+                                    // proxy (Task 12).
+                                    image_only_produced.push(
+                                        crate::pipeline::post_process::ProducedMessage {
+                                            message_id: msg_uuid,
+                                            full_text: String::new(),
+                                            action: ActionType::ReplyImage,
+                                        },
+                                    );
+                                    let mut wire_usage = resp.usage.clone();
+                                    filter_usage_keys(
+                                        &mut wire_usage,
+                                        &state.config.openrouter_usage_hidden_keys,
+                                    );
+                                    // Frame order: meta → image → done → final.
+                                    yield ProtocolFrame::Meta {
+                                        message_id: ulid_string(msg_ulid),
+                                        action_type: FrameActionType::ReplyImage,
+                                        model: resp.model.clone(),
+                                        continues_from: None,
+                                    };
+                                    yield ProtocolFrame::Image {
+                                        message_id: ulid_string(msg_ulid),
+                                        data_url: resp.images[0].clone(),
+                                        mime,
+                                        image_prompt: Some(won_prompt.clone()),
+                                        model: resp.model.clone(),
+                                        generation_id: resp.generation_id.clone(),
+                                    };
+                                    yield ProtocolFrame::Done {
+                                        message_id: ulid_string(msg_ulid),
+                                        truncated: false,
+                                        usage: wire_usage,
+                                        generation_id: resp.generation_id.clone(),
+                                    };
+                                    image_only_done = true;
                                 }
-                                let mime = data_url_mime(&resp.images[0]);
-                                let row = eros_engine_store::chat::AssistantInsert {
-                                    id: msg_uuid,
-                                    content: String::new(),
-                                    assistant_action_type: "reply".into(),
-                                    continues_from_message_id: None,
-                                    truncated: false,
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                    filter_audit: None,
-                                    metadata: Some(serde_json::json!({ "image": image_meta })),
-                                };
-                                if let Err(e) = chat_repo
-                                    .insert_assistant_batch(
-                                        user_msg.session_id,
-                                        user_msg.user_message_id,
-                                        std::slice::from_ref(&row),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("stream(image): persist failed: {e}");
+                                Ok(_) => {
+                                    tracing::warn!(
+                                        "stream(image): execute_image returned zero images \
+                                         (unexpected); falling through to text"
+                                    );
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ZeroImages,
+                                    };
                                 }
-                                // full_text="" so insight/memory extraction skips
-                                // this row; affinity uses plan.image_prompt as the
-                                // proxy (Task 12).
-                                image_only_produced.push(
-                                    crate::pipeline::post_process::ProducedMessage {
-                                        message_id: msg_uuid,
-                                        full_text: String::new(),
-                                        action: ActionType::ReplyImage,
-                                    },
-                                );
-                                let mut wire_usage = resp.usage.clone();
-                                filter_usage_keys(
-                                    &mut wire_usage,
-                                    &state.config.openrouter_usage_hidden_keys,
-                                );
-                                // Frame order: meta → image → done → final.
-                                yield ProtocolFrame::Meta {
-                                    message_id: ulid_string(msg_ulid),
-                                    action_type: FrameActionType::ReplyImage,
-                                    model: resp.model.clone(),
-                                    continues_from: None,
-                                };
-                                yield ProtocolFrame::Image {
-                                    message_id: ulid_string(msg_ulid),
-                                    data_url: resp.images[0].clone(),
-                                    mime,
-                                    image_prompt: Some(won_prompt.clone()),
-                                    model: resp.model.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                                yield ProtocolFrame::Done {
-                                    message_id: ulid_string(msg_ulid),
-                                    truncated: false,
-                                    usage: wire_usage,
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                                image_only_done = true;
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    "stream(image): execute_image returned zero images \
-                                     (unexpected); falling through to text"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ZeroImages,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
-                                tracing::warn!(
-                                    "stream(image): execute_image config error: {m}; \
-                                     falling through to text"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ConfigError,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
-                                attempts,
-                            }) => {
-                                tracing::warn!(
-                                    attempts = attempts.len(),
-                                    "stream(image): image chain exhausted; persisting \
-                                     image_failed onto the fallthrough text row"
-                                );
-                                image_failed_meta = Some(build_image_failed_meta(
-                                    &final_subject,
-                                    &style_str,
-                                    ar.as_deref(),
-                                    res.as_deref(),
-                                    ref_kind,
-                                    face_used,
-                                    &attempts,
-                                ));
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ChainExhausted,
-                                };
+                                Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                    tracing::warn!(
+                                        "stream(image): execute_image config error: {m}; \
+                                         falling through to text"
+                                    );
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ConfigError,
+                                    };
+                                }
+                                Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                    attempts,
+                                }) => {
+                                    tracing::warn!(
+                                        attempts = attempts.len(),
+                                        "stream(image): image chain exhausted; persisting \
+                                         image_failed onto the fallthrough text row"
+                                    );
+                                    image_failed_meta = Some(build_image_failed_meta(
+                                        &final_subject,
+                                        &style_str,
+                                        ar.as_deref(),
+                                        res.as_deref(),
+                                        ref_kind,
+                                        face_used,
+                                        &attempts,
+                                    ));
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ChainExhausted,
+                                    };
+                                }
                             }
                         }
                     }
@@ -9062,6 +9136,42 @@ data: [DONE]\n\n"
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
         assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
+    }
+
+    #[test]
+    fn delegated_image_only_frames_are_meta_done_image_request() {
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec![],
+            prompt: "a wire prompt".into(),
+            prompt_original: None,
+            face_ref_url: None,
+            aspect_ratio: Some("1:1".into()),
+            resolution: None,
+            max_tokens: 4096,
+        };
+        let frames = delegated_image_only_frames(
+            "01XYZ".into(),
+            &req,
+            eros_engine_core::types::ImageRef::Face,
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(types, ["meta", "done", "image_request"]);
+        // meta has no model (the consumer chooses it); no image_pending/attempt/failed.
+        let meta = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(meta["action_type"], "reply_image");
+        assert!(
+            meta.get("model").is_none(),
+            "delegated meta carries no model"
+        );
     }
 
     #[tokio::test]
