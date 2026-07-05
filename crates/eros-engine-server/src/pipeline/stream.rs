@@ -3211,7 +3211,10 @@ pub fn run_stream(
                         // Emitted before run_image_prompt_compose (itself an LLM
                         // call) so it covers the whole gap after the text `done`.
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
-                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
+                        let delegate = req_image.is_some_and(|i| i.delegate);
+                        if !delegate {
+                            yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
+                        }
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -3271,137 +3274,160 @@ pub fn run_stream(
                         );
                         let ar = req.aspect_ratio.clone();
                         let res = req.resolution.clone();
-                        // #131: drive image-gen, forwarding each attempt as an
-                        // image_attempt frame; capture the single terminal Done.
-                        let mut img_events =
-                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
-                        let mut img_outcome = None;
-                        {
-                            use futures_util::StreamExt as _;
-                            while let Some(ev) = img_events.next().await {
-                                match ev {
-                                    ImageGenEvent::Attempt(p) => {
-                                        yield ProtocolFrame::ImageAttempt {
-                                            message_id: img_mid.clone(),
-                                            model: p.model,
-                                            variant: p.variant,
-                                            index: p.index,
-                                            total: p.total,
-                                        };
+                        if delegate {
+                            // Delegated text+image: no provider call. Merge ONLY
+                            // the minimal marker (seed subject + aspect) onto the
+                            // already-persisted text row so the PDE stays
+                            // image-aware (§5); emit one image_request. The text
+                            // already reached the client via meta → delta* → done;
+                            // `final` follows below.
+                            let marker = build_delegated_image_marker(&subject, ar.as_deref());
+                            if let Err(e) = chat_repo
+                                .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "stream(text_image,delegate): merge marker failed: {e}"
+                                );
+                            }
+                            yield build_image_request_frame(
+                                img_mid.clone(),
+                                &req,
+                                plan.image_ref,
+                            );
+                        } else {
+                            // #131: drive image-gen, forwarding each attempt as an
+                            // image_attempt frame; capture the single terminal Done.
+                            let mut img_events =
+                                Box::pin(drive_image_gen(state.openrouter.clone(), req));
+                            let mut img_outcome = None;
+                            {
+                                use futures_util::StreamExt as _;
+                                while let Some(ev) = img_events.next().await {
+                                    match ev {
+                                        ImageGenEvent::Attempt(p) => {
+                                            yield ProtocolFrame::ImageAttempt {
+                                                message_id: img_mid.clone(),
+                                                model: p.model,
+                                                variant: p.variant,
+                                                index: p.index,
+                                                total: p.total,
+                                            };
+                                        }
+                                        ImageGenEvent::Done(r) => img_outcome = Some(r),
                                     }
-                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
                                 }
                             }
-                        }
-                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
-                            Ok(resp) if !resp.images.is_empty() => {
-                                let won_prompt = winning_image_prompt(
-                                    resp.winning_variant,
-                                    &final_subject,
-                                    &subject,
-                                );
-                                let cr = eros_engine_llm::openrouter::ChatResponse {
-                                    reply: String::new(),
-                                    generation_id: resp.generation_id.clone(),
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    finish_reason: resp.finish_reason.clone(),
-                                };
-                                // Mirror the other in-stream task log sites
-                                // (vision / filters / pde): session_id = None.
-                                super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let mut image_meta = serde_json::json!({
-                                    "prompt": won_prompt,
-                                    "style": style_str,
-                                    "model": resp.model,
-                                    "aspect_ratio": ar,
-                                    "resolution": res,
-                                    "generation_id": resp.generation_id,
-                                    "face_ref_used": face_used,
-                                    "image_ref": ref_kind,
-                                });
-                                if !resp.attempts.is_empty() {
-                                    image_meta["attempts"] =
-                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
-                                }
-                                let mime = data_url_mime(&resp.images[0]);
-                                // merge_assistant_image_meta wraps under {"image":..}
-                                // itself — pass the raw image_meta.
-                                if let Err(e) = chat_repo
-                                    .merge_assistant_image_meta(
-                                        user_msg.session_id,
-                                        msg_uuid,
-                                        &image_meta,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "stream(text_image): merge image meta failed: {e}"
+                            match img_outcome.expect("drive_image_gen yields exactly one Done") {
+                                Ok(resp) if !resp.images.is_empty() => {
+                                    let won_prompt = winning_image_prompt(
+                                        resp.winning_variant,
+                                        &final_subject,
+                                        &subject,
                                     );
+                                    let cr = eros_engine_llm::openrouter::ChatResponse {
+                                        reply: String::new(),
+                                        generation_id: resp.generation_id.clone(),
+                                        model: resp.model.clone(),
+                                        usage: resp.usage.clone(),
+                                        finish_reason: resp.finish_reason.clone(),
+                                    };
+                                    // Mirror the other in-stream task log sites
+                                    // (vision / filters / pde): session_id = None.
+                                    super::log_openrouter_usage("chat_image_generation", None, &cr);
+                                    let mut image_meta = serde_json::json!({
+                                        "prompt": won_prompt,
+                                        "style": style_str,
+                                        "model": resp.model,
+                                        "aspect_ratio": ar,
+                                        "resolution": res,
+                                        "generation_id": resp.generation_id,
+                                        "face_ref_used": face_used,
+                                        "image_ref": ref_kind,
+                                    });
+                                    if !resp.attempts.is_empty() {
+                                        image_meta["attempts"] =
+                                            serde_json::to_value(&resp.attempts).unwrap_or_default();
+                                    }
+                                    let mime = data_url_mime(&resp.images[0]);
+                                    // merge_assistant_image_meta wraps under {"image":..}
+                                    // itself — pass the raw image_meta.
+                                    if let Err(e) = chat_repo
+                                        .merge_assistant_image_meta(
+                                            user_msg.session_id,
+                                            msg_uuid,
+                                            &image_meta,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "stream(text_image): merge image meta failed: {e}"
+                                        );
+                                    }
+                                    yield ProtocolFrame::Image {
+                                        message_id: ulid_string(Ulid::from(msg_uuid)),
+                                        data_url: resp.images[0].clone(),
+                                        mime,
+                                        image_prompt: Some(won_prompt.clone()),
+                                        model: resp.model.clone(),
+                                        generation_id: resp.generation_id.clone(),
+                                    };
                                 }
-                                yield ProtocolFrame::Image {
-                                    message_id: ulid_string(Ulid::from(msg_uuid)),
-                                    data_url: resp.images[0].clone(),
-                                    mime,
-                                    image_prompt: Some(won_prompt.clone()),
-                                    model: resp.model.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    "stream(text_image): execute_image returned zero images \
-                                     (unexpected); no Image frame (text already delivered)"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ZeroImages,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
-                                tracing::warn!(
-                                    "stream(text_image): execute_image config error: {m}; \
-                                     no Image frame (text already delivered)"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ConfigError,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
-                                attempts,
-                            }) => {
-                                tracing::warn!(
-                                    attempts = attempts.len(),
-                                    "stream(text_image): image chain exhausted; persisting \
-                                     image_failed onto the text row"
-                                );
-                                let meta = build_image_failed_meta(
-                                    &final_subject,
-                                    &style_str,
-                                    ar.as_deref(),
-                                    res.as_deref(),
-                                    ref_kind,
-                                    face_used,
-                                    &attempts,
-                                );
-                                if let Err(e) = chat_repo
-                                    .merge_assistant_metadata_key(
-                                        user_msg.session_id,
-                                        msg_uuid,
-                                        "image_failed",
-                                        &meta,
-                                    )
-                                    .await
-                                {
+                                Ok(_) => {
                                     tracing::warn!(
-                                        "stream(text_image): persist image_failed failed: {e}"
+                                        "stream(text_image): execute_image returned zero images \
+                                         (unexpected); no Image frame (text already delivered)"
                                     );
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ZeroImages,
+                                    };
                                 }
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ChainExhausted,
-                                };
+                                Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
+                                    tracing::warn!(
+                                        "stream(text_image): execute_image config error: {m}; \
+                                         no Image frame (text already delivered)"
+                                    );
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ConfigError,
+                                    };
+                                }
+                                Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
+                                    attempts,
+                                }) => {
+                                    tracing::warn!(
+                                        attempts = attempts.len(),
+                                        "stream(text_image): image chain exhausted; persisting \
+                                         image_failed onto the text row"
+                                    );
+                                    let meta = build_image_failed_meta(
+                                        &final_subject,
+                                        &style_str,
+                                        ar.as_deref(),
+                                        res.as_deref(),
+                                        ref_kind,
+                                        face_used,
+                                        &attempts,
+                                    );
+                                    if let Err(e) = chat_repo
+                                        .merge_assistant_metadata_key(
+                                            user_msg.session_id,
+                                            msg_uuid,
+                                            "image_failed",
+                                            &meta,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "stream(text_image): persist image_failed failed: {e}"
+                                        );
+                                    }
+                                    yield ProtocolFrame::ImageFailed {
+                                        message_id: img_mid.clone(),
+                                        reason: ImageFailReason::ChainExhausted,
+                                    };
+                                }
                             }
                         }
                     }
