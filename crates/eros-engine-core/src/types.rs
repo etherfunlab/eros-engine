@@ -254,7 +254,10 @@ mod tests {
     fn image_ref_serializes_snake_case() {
         use crate::types::ImageRef;
         assert_eq!(serde_json::to_value(ImageRef::Face).unwrap(), "face");
-        assert_eq!(serde_json::to_value(ImageRef::Previous).unwrap(), "previous");
+        assert_eq!(
+            serde_json::to_value(ImageRef::Previous).unwrap(),
+            "previous"
+        );
     }
 
     #[test]
