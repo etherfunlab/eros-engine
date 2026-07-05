@@ -298,7 +298,7 @@ input filter has no triggers, timing, or tiers).
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
-| `chat_image_generation` | `pipeline::stream` (opt-in image reply executor; activated when this task block is present) | live (opt-in) |
+| `chat_image_generation` | `pipeline::stream` (opt-in engine-side image draw executor — the draw endpoint; activated when this task block is present) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (opt-in image-prompt composer; expands the PDE seed subject before image generation; activated when this task block is present) | live (opt-in) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
@@ -319,26 +319,31 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants execute when `[tasks.chat_image_generation]` is configured, a model is resolvable, **and the request includes an `image` block**; otherwise they degrade to `reply_text` — task block absent, no model resolvable, or no `image` block on the request)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. Availability no longer depends on `[tasks.chat_image_generation]`: the chat stream never draws, it emits an `image_request` frame. `[tasks.chat_image_generation]` gates only the separate draw endpoint, `POST /comp/chat/{session_id}/image/stream`.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `image_prompt`, `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost twice in a row, one-hour ghost cooldown.
 - Every judge call is audited to `companion_decision_events`.
 
-**Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image executor is resolvable this turn (`[tasks.chat_image_generation]` configured **and** the request carries an `image` block), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
+**Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image action is available this turn (the request carries an `image` block), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
-### `[tasks.chat_image_generation]` — companion image replies (opt-in)
+### `[tasks.chat_image_generation]` — engine-side image drawing (opt-in)
 
-The companion image executor is **off by default**. It activates when this task
-block exists in the config **and** the per-turn request carries an `image` block
-(omitting `image` turns generation off for that turn, mirroring how `chat_vision`
-runs only when `image_url` is present). When active, the engine executes
-`reply_image` and `reply_text_image` actions instead of degrading them to
-`reply_text`. Degradation to `reply_text` still occurs when the block is absent,
-no model is resolvable for the turn, or the request omits `image`.
+This block configures the engine's image executor — the model chain, styles, and
+size defaults the draw endpoint (`POST /comp/chat/{session_id}/image/stream`) uses
+to draw a composed prompt. It is **off by default** and **optional**.
+
+It does **not** gate the chat stream. A turn's `reply_image` / `reply_text_image`
+action is available whenever the per-turn request carries an `image` block
+(omitting `image` degrades those actions to `reply_text`, mirroring how
+`chat_vision` runs only when `image_url` is present); the chat stream then always
+emits an `image_request` frame and never draws. This block controls only whether
+the engine will *draw* when the consumer calls the draw endpoint: present ⇒ the
+endpoint draws, walking the model chain below; absent (or no model resolvable) ⇒
+the endpoint returns `501` and the consumer draws the composed prompt itself.
 
 Any OpenRouter image model works here, including **image-only** models (e.g. `bytedance-seed/seedream-4.5`): the engine requests `modalities: ["image"]` and never asks the image model for text. The caption on a `reply_text_image` turn always comes from `chat_companion`, never the image model.
 
