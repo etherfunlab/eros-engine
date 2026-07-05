@@ -96,9 +96,9 @@ pub enum HistoryAnchor {
 
 /// Which reference image an image turn should build on. `Face` = the static
 /// avatar / face reference; `Previous` = the previously generated image
-/// (iteration). Defaults to `Face`. Internal-only (mapped from the PDE verdict);
-/// not serialized to any DB/SSE wire path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+/// (iteration). Defaults to `Face`. Serialized (snake_case) into the delegated
+/// `image_request` SSE frame; deserialized from the PDE verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageRef {
     #[default]
@@ -248,6 +248,13 @@ mod tests {
             }
             _ => panic!("expected UserMessage"),
         }
+    }
+
+    #[test]
+    fn image_ref_serializes_snake_case() {
+        use crate::types::ImageRef;
+        assert_eq!(serde_json::to_value(ImageRef::Face).unwrap(), "face");
+        assert_eq!(serde_json::to_value(ImageRef::Previous).unwrap(), "previous");
     }
 
     #[test]
