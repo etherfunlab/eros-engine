@@ -293,6 +293,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `resolution` | `String` | task `default_resolution` | Model-specific hint (e.g. `"1024x1365"`). Shape-validated only — opaque beyond that. |
 | `face_ref_url` | `String` | absent | image2image face/appearance reference (absolute `http(s)`, ≤ 2048 chars). Returns `422` if malformed. |
 | `prev_image_url` | `String` | absent | The previously generated image, for iteration (absolute `http(s)`, ≤ 2048 chars; validated like `face_ref_url`). Used only when the PDE picks `image_ref = "previous"` (see below); otherwise ignored. Clients backed by a private object store should pass a short-lived signed URL — the engine does not fetch it; it embeds the URL in the OpenRouter body and the image provider fetches it at generation time. Returns `422` if malformed. |
+| `delegate` | `bool` | `false` | When `true`, the engine composes the prompt and emits a single `image_request` frame instead of drawing inline; it makes no provider call, streams no image bytes, and persists no draw result. The consumer draws the composed prompt, uploads, and records the outcome. `model`, `face_ref_url`, `prev_image_url`, and `resolution` are ignored when delegated (only `style` is used). Default `false` preserves the in-engine draw path. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
 (`"face"` | `"previous"`, default `"face"`). At draw time the engine picks the
@@ -361,6 +362,30 @@ data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
 | `type` | `"image_failed"` | Frame type discriminator. |
 | `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
 | `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = every candidate model failed; `zero_images` = a success response carried no image (defensive); `config_error` = no key / no models. |
+
+**`image_request` SSE frame** — emitted for a *delegated* image turn
+(`image.delegate: true`) in place of the whole
+`image_pending`/`image_attempt`/`image`/`image_failed` sequence. The engine
+composed the prompt; the consumer draws it. The engine draws nothing, streams no
+image bytes, and persists no draw result.
+
+```
+data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `type` | `"image_request"` | Frame type discriminator. |
+| `message_id` | `String` | The real assistant `message_id`; key the draw and storage to it. |
+| `composed_prompt` | `String` | base64(`STANDARD`, unwrapped) of the UTF-8 final wire prompt. Decode at the last hop and use verbatim as the provider text prompt — reconstruct no prompt logic. |
+| `image_ref` | `"face"` \| `"previous"` | Which reference image the plan chose; the consumer resolves the actual URL. |
+| `aspect_ratio` | `String` \| absent | The semantic aspect (`1:1`,`3:4`,`4:3`,`9:16`,`16:9`) or absent. The consumer owns aspect→resolution mapping; no width/height is sent. |
+
+**Delegated sequences.** Image-only:
+`meta(reply_image) → done → image_request → final`.
+Text + image: `meta(reply_text_image) → delta* → done → image_request → final`.
+No `image_pending`/`image_attempt`/`image`/`image_failed` is emitted on the chat
+stream in the delegated path; total-failure handling is the consumer's.
 
 **Full SSE frame sequences:**
 
