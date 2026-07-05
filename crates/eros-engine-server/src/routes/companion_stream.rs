@@ -81,6 +81,11 @@ pub enum ImageMode {
     ImageOnly,
 }
 
+/// Per-turn image parameters. Presence of this block signals the consumer
+/// handles images this turn (it drives image-action availability). The engine
+/// composes the prompt and emits a single `image_request` frame — it never
+/// draws on the chat stream. Draw-time knobs (model, reference URLs, resolution)
+/// live on the draw endpoint (`DrawImageRequest`), not here.
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
 pub struct ImageReplyParams {
     #[serde(default)]
@@ -91,30 +96,9 @@ pub struct ImageReplyParams {
     #[schema(value_type = Option<String>)]
     pub style: Option<StyleKey>,
     #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
     pub image_prompt: Option<String>,
     #[serde(default)]
     pub aspect_ratio: Option<String>,
-    #[serde(default)]
-    pub resolution: Option<String>,
-    #[serde(default)]
-    pub face_ref_url: Option<String>,
-    /// Optional URL of the previously generated image, for iteration. Selected
-    /// when the PDE chooses `image_ref = previous`. Same validation as
-    /// `face_ref_url`; the engine never fetches it — it is embedded in the
-    /// OpenRouter body and fetched by the image provider at generation time, so
-    /// clients backed by a private store should pass a short-lived signed URL.
-    #[serde(default)]
-    pub prev_image_url: Option<String>,
-    /// Delegate drawing to the downstream consumer. Default `false` keeps
-    /// today's in-engine draw path unchanged. When `true`, the engine composes
-    /// the prompt and emits a single `image_request` frame (no provider call, no
-    /// image bytes, no draw-result persistence); the consumer draws, uploads,
-    /// and records the outcome. `model`, `face_ref_url`, `prev_image_url`, and
-    /// `resolution` are ignored when delegated (the composer needs only `style`).
-    #[serde(default)]
-    pub delegate: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -317,28 +301,6 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                 original_user_message_id: None,
             }));
         }
-        if let Some(url) = img.face_ref_url.as_deref() {
-            if !image_url_is_valid(url) {
-                return Err(AppError::StreamPre(StreamPreError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    code: "unprocessable",
-                    message: "face_ref_url must be an absolute http(s) URL".into(),
-                    user_message: "脸部参考图链接无效".into(),
-                    original_user_message_id: None,
-                }));
-            }
-        }
-        if let Some(url) = img.prev_image_url.as_deref() {
-            if !image_url_is_valid(url) {
-                return Err(AppError::StreamPre(StreamPreError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    code: "unprocessable",
-                    message: "prev_image_url must be an absolute http(s) URL".into(),
-                    user_message: "上一张图片链接无效".into(),
-                    original_user_message_id: None,
-                }));
-            }
-        }
         if let Some(ar) = img.aspect_ratio.as_deref() {
             if !matches!(ar, "1:1" | "3:4" | "4:3" | "9:16" | "16:9") {
                 return Err(AppError::StreamPre(StreamPreError {
@@ -346,24 +308,6 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
                     code: "unprocessable",
                     message: "unsupported aspect_ratio".into(),
                     user_message: "不支持的画幅比例".into(),
-                    original_user_message_id: None,
-                }));
-            }
-        }
-        if let Some(res) = img.resolution.as_deref() {
-            let ok = res.len() <= 16
-                && res.split_once('x').is_some_and(|(w, h)| {
-                    !w.is_empty()
-                        && !h.is_empty()
-                        && w.bytes().all(|b| b.is_ascii_digit())
-                        && h.bytes().all(|b| b.is_ascii_digit())
-                });
-            if !ok {
-                return Err(AppError::StreamPre(StreamPreError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    code: "unprocessable",
-                    message: "resolution must look like WxH".into(),
-                    user_message: "分辨率格式无效".into(),
                     original_user_message_id: None,
                 }));
             }
@@ -1732,44 +1676,12 @@ mod validate_payload_tests {
     }
 
     #[test]
-    fn validate_rejects_bad_face_ref_and_aspect() {
+    fn validate_rejects_bad_aspect() {
         let mut req = minimal_req();
         req.image = Some(ImageReplyParams {
-            face_ref_url: Some("ftp://x".into()),
-            ..Default::default()
-        });
-        assert!(validate_payload(&req).is_err());
-        let mut req2 = minimal_req();
-        req2.image = Some(ImageReplyParams {
             aspect_ratio: Some("2:5".into()),
             ..Default::default()
         });
-        assert!(validate_payload(&req2).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_bad_prev_image_url() {
-        let mut req = minimal_req();
-        req.image = Some(ImageReplyParams {
-            prev_image_url: Some("ftp://nope".into()),
-            ..Default::default()
-        });
         assert!(validate_payload(&req).is_err());
-
-        // a valid absolute https URL is accepted
-        let mut ok = minimal_req();
-        ok.image = Some(ImageReplyParams {
-            prev_image_url: Some("https://example.test/a.png".into()),
-            ..Default::default()
-        });
-        assert!(validate_payload(&ok).is_ok());
-    }
-
-    #[test]
-    fn image_reply_params_delegate_defaults_false() {
-        let none: ImageReplyParams = serde_json::from_str("{}").unwrap();
-        assert!(!none.delegate, "absent delegate must default to false");
-        let on: ImageReplyParams = serde_json::from_str(r#"{"delegate":true}"#).unwrap();
-        assert!(on.delegate);
     }
 }
