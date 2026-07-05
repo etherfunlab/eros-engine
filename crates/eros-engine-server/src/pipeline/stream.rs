@@ -4638,6 +4638,357 @@ data: [DONE]\n\n";
         }
     }
 
+    // ── Delegated image drawing (image.delegate) — the two arms end-to-end ──
+    // These drive `run_stream` with `delegate:true` and a `force`d image action
+    // (mode selects the arm), asserting the delegated frame sequence, that NO
+    // in-engine draw happens, and that only the minimal `metadata.image` marker
+    // is persisted. The model config enables the image executor
+    // (`chat_image_generation`) but omits the judge (`pde_decision`) and the
+    // composer (`chat_image_prompt_compose`), so the image-only turn makes zero
+    // LLM calls and the outcome is deterministic.
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn delegated_reply_image_emits_image_request_and_marker_no_draw(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Any OpenRouter call 500s — so an ERRONEOUS draw would surface as an
+        // `image_failed` frame (asserted absent). The correct delegated
+        // image-only path makes no provider call at all.
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_image_generation]\nmodel = \"img-a\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "draw me",
+                "01J9000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "draw me".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    delegate: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    image_prompt: Some("a beach at sunset".into()),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        // Exact delegated image-only sequence: meta → done → image_request → final.
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "done", "image_request", "final"],
+            "delegated image-only sequence, got {frames:?}"
+        );
+        // No in-engine draw-lifecycle frame may appear in the delegated path.
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ImagePending { .. }
+                    | ProtocolFrame::ImageAttempt { .. }
+                    | ProtocolFrame::Image { .. }
+                    | ProtocolFrame::ImageFailed { .. }
+            )),
+            "no draw frame may appear: {frames:?}"
+        );
+        // meta carries reply_image and no model (the consumer chooses the model).
+        let (action, model) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta {
+                    action_type, model, ..
+                } => Some((*action_type, model.clone())),
+                _ => None,
+            })
+            .expect("meta present");
+        assert_eq!(action, FrameActionType::ReplyImage);
+        assert!(model.is_none(), "delegated meta carries no model");
+        // image_request: face ref + base64 composed wire prompt containing the subject.
+        let (composed_b64, image_ref) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt,
+                    image_ref,
+                    ..
+                } => Some((composed_prompt.clone(), *image_ref)),
+                _ => None,
+            })
+            .expect("image_request present");
+        assert_eq!(image_ref, eros_engine_core::types::ImageRef::Face);
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("a beach at sunset"),
+            "composed wire prompt should contain the subject: {composed}"
+        );
+
+        // Persistence: minimal marker only (seed subject under `prompt`), and NOT
+        // the composed wire prompt / model / generation_id / url.
+        let meta_row: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let img = meta_row.expect("assistant row has metadata")["image"].clone();
+        assert_eq!(
+            img["prompt"], "a beach at sunset",
+            "marker keeps the seed subject"
+        );
+        assert!(img.get("model").is_none(), "marker must not store a model");
+        assert!(
+            img.get("generation_id").is_none(),
+            "marker must not store a generation id"
+        );
+        assert!(img.get("url").is_none(), "marker must not store a url");
+        assert_ne!(
+            img["prompt"],
+            serde_json::json!(composed),
+            "the composed wire prompt must not be persisted (only the seed subject)"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn delegated_reply_text_image_appends_image_request_and_marker(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The text reply streams from this mock (≥ MIN_FILTERED_OUTPUT_CHARS so it
+        // is not degraded as too-short). The delegated image path makes NO extra
+        // (draw) call; a draw would reuse this endpoint but we assert no
+        // image_failed / image frame appears.
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_image_generation]\nmodel = \"img-a\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9111111111111111111111A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    delegate: true,
+                    // default mode = TextImage ⇒ ReplyTextImage
+                    image_prompt: Some("in a red dress".into()),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        // meta(reply_text_image) → delta* → done → image_request → final.
+        assert_eq!(types.first().map(String::as_str), Some("meta"), "{types:?}");
+        assert_eq!(types.last().map(String::as_str), Some("final"), "{types:?}");
+        assert!(
+            types.iter().any(|t| t == "delta"),
+            "text burst delta present: {types:?}"
+        );
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request present");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done: {types:?}"
+        );
+        assert_eq!(
+            types[ir_pos + 1],
+            "final",
+            "image_request immediately before final"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| t.as_str() == "image_request")
+                .count(),
+            1,
+            "exactly one image_request"
+        );
+        // No draw-lifecycle frames.
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ImagePending { .. }
+                    | ProtocolFrame::ImageAttempt { .. }
+                    | ProtocolFrame::Image { .. }
+                    | ProtocolFrame::ImageFailed { .. }
+            )),
+            "no draw frame may appear: {types:?}"
+        );
+        let action = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta { action_type, .. } => Some(*action_type),
+                _ => None,
+            })
+            .expect("meta present");
+        assert_eq!(action, FrameActionType::ReplyTextImage);
+
+        // The minimal marker was MERGED onto the assistant TEXT row (content
+        // non-empty), carrying only the seed subject.
+        let row: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!row.0.is_empty(), "the text reply row has content");
+        let img = row.1.expect("row has metadata")["image"].clone();
+        assert_eq!(img["prompt"], "in a red dress");
+        assert!(img.get("model").is_none(), "marker must not store a model");
+        assert!(
+            img.get("generation_id").is_none(),
+            "marker must not store a generation id"
+        );
+        assert!(img.get("url").is_none(), "marker must not store a url");
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn live_burst_meta_omits_model_when_override_false(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
