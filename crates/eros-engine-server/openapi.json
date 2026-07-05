@@ -623,87 +623,6 @@
         ]
       }
     },
-    "/comp/chat/{session_id}/message/{message_id}/image": {
-      "post": {
-        "tags": [
-          "companion"
-        ],
-        "summary": "Write back a generated image URL to an existing assistant message.",
-        "operationId": "set_generated_image_url",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "message_id",
-            "in": "path",
-            "description": "Assistant message id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetImageUrlRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "stored"
-          },
-          "403": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
     "/comp/chat/{user_id}/sessions": {
       "get": {
         "tags": [
@@ -1555,17 +1474,6 @@
           "session_id": {
             "type": "string",
             "format": "uuid"
-          }
-        }
-      },
-      "SetImageUrlRequest": {
-        "type": "object",
-        "required": [
-          "url"
-        ],
-        "properties": {
-          "url": {
-            "type": "string"
           }
         }
       },

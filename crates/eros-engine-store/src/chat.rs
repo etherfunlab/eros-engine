@@ -757,35 +757,6 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
-    /// Persist the client-written-back storage URL for a generated image, nested
-    /// under `metadata.image.url`. Idempotent (re-POST overwrites). Scoped by
-    /// `session_id` to prevent cross-session write-back (IDOR): a user may only
-    /// stamp a URL onto an assistant row that belongs to the session they own.
-    /// The merge ensures the `image` parent object exists before setting `url`,
-    /// avoiding the `jsonb_set` no-op-when-parent-missing bug. Returns the number
-    /// of rows affected (`0` when no matching assistant row exists in the session
-    /// — the caller maps that to 404).
-    pub async fn set_assistant_image_url(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-        url: &str,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE engine.chat_messages \
-             SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object( \
-                   'image', \
-                   COALESCE(metadata -> 'image', '{}'::jsonb) || jsonb_build_object('url', $3::text)) \
-             WHERE id = $1 AND session_id = $2 AND role = 'assistant'",
-        )
-        .bind(message_id)
-        .bind(session_id)
-        .bind(url)
-        .execute(self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// Persist a burst of assistant messages keyed back to the driving user
     /// message. Caller picks the ULID-shaped `id` so the streamed `meta.message_id`
     /// matches the DB row. Bumps `last_active_at` once at the end.
@@ -2295,7 +2266,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn assistant_image_meta_merge_and_url_writeback(pool: PgPool) {
+    async fn assistant_image_meta_merge(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         // minimal session + user row + assistant row
         let user_id = Uuid::new_v4();
@@ -2339,11 +2310,6 @@ mod tests {
         repo.merge_assistant_image_meta(s.id, aid, &image)
             .await
             .unwrap();
-        let rows = repo
-            .set_assistant_image_url(s.id, aid, "https://cdn/x.png")
-            .await
-            .unwrap();
-        assert_eq!(rows, 1, "same-session write-back affects exactly one row");
 
         let meta: serde_json::Value =
             sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
@@ -2352,102 +2318,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(meta["image"]["prompt"], "a cat");
-        assert_eq!(meta["image"]["url"], "https://cdn/x.png");
-    }
-
-    /// IDOR regression: `set_assistant_image_url` must refuse to write to an
-    /// assistant row that does not belong to the supplied session. A user owning
-    /// session B must not be able to stamp a URL onto session A's assistant row
-    /// by supplying A's message UUID. The cross-session call returns 0 rows and
-    /// leaves `metadata.image.url` unset; the correct (session, message) pair
-    /// returns 1 and sets it.
-    #[sqlx::test(migrations = "./migrations")]
-    async fn set_assistant_image_url_is_scoped_to_session(pool: PgPool) {
-        let repo = ChatRepo { pool: &pool };
-
-        // Session A with an assistant row.
-        let session_a = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let user_a = match repo
-            .upsert_user_message_idempotent(
-                session_a.id,
-                "hi",
-                "client-msg-id-session-a-0001",
-                "user",
-                None,
-            )
-            .await
-            .unwrap()
-        {
-            UpsertUserOutcome::Inserted { message_id } => message_id,
-            _ => panic!(),
-        };
-        let assistant_a = Uuid::new_v4();
-        repo.insert_assistant_batch(
-            session_a.id,
-            user_a,
-            &[AssistantInsert {
-                id: assistant_a,
-                content: String::new(),
-                assistant_action_type: "reply".into(),
-                continues_from_message_id: None,
-                truncated: false,
-                model: None,
-                usage: None,
-                generation_id: None,
-                filter_audit: None,
-                metadata: None,
-            }],
-        )
-        .await
-        .unwrap();
-
-        // Session B (a different session — here a different user, the IDOR shape).
-        let session_b = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
-
-        // Cross-session write-back: B's session id + A's assistant message id.
-        // Must affect 0 rows and never set the url.
-        let rows = repo
-            .set_assistant_image_url(session_b.id, assistant_a, "https://evil/x.png")
-            .await
-            .unwrap();
-        assert_eq!(rows, 0, "cross-session write-back must affect no rows");
-
-        let meta: Option<serde_json::Value> =
-            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
-                .bind(assistant_a)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        // metadata is either NULL or has no image.url after a foreign write.
-        let url_after_foreign = meta
-            .as_ref()
-            .and_then(|m| m.get("image"))
-            .and_then(|i| i.get("url"));
-        assert!(
-            url_after_foreign.is_none(),
-            "foreign write must not set metadata.image.url; got {url_after_foreign:?}"
-        );
-
-        // Correct (session_a, assistant_a) pair: affects 1 row and sets the url.
-        let rows = repo
-            .set_assistant_image_url(session_a.id, assistant_a, "https://cdn/good.png")
-            .await
-            .unwrap();
-        assert_eq!(rows, 1, "in-session write-back affects exactly one row");
-
-        let meta: serde_json::Value =
-            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
-                .bind(assistant_a)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(meta["image"]["url"], "https://cdn/good.png");
     }
 
     #[sqlx::test(migrations = "./migrations")]

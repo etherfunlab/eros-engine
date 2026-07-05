@@ -743,83 +743,9 @@ pub async fn draw_image_stream(
     ))
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SetImageUrlRequest {
-    pub url: String,
-}
-
-/// Write back a generated image URL to an existing assistant message.
-#[utoipa::path(
-    post,
-    path = "/comp/chat/{session_id}/message/{message_id}/image",
-    tag = "companion",
-    params(
-        ("session_id" = Uuid, Path, description = "Chat session id"),
-        ("message_id" = Uuid, Path, description = "Assistant message id"),
-    ),
-    request_body = SetImageUrlRequest,
-    responses(
-        (status = 204, description = "stored"),
-        (status = 403, body = StreamPreErrorBody),
-        (status = 404, body = StreamPreErrorBody),
-        (status = 422, body = StreamPreErrorBody),
-    ),
-    security(("bearer" = []))
-)]
-pub async fn set_generated_image_url(
-    State(state): State<AppState>,
-    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
-    Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(req): Json<SetImageUrlRequest>,
-) -> Result<StatusCode, AppError> {
-    if !image_url_is_valid(&req.url) {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "unprocessable",
-            message: "url must be an absolute http(s) URL".into(),
-            user_message: "图片链接无效".into(),
-            original_user_message_id: None,
-        }));
-    }
-    let chat_repo = ChatRepo { pool: &state.pool };
-    // Ownership gate — mirrors send_message_stream exactly.
-    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
-        AppError::StreamPre(StreamPreError {
-            status: StatusCode::NOT_FOUND,
-            code: "session_not_found",
-            message: "session not found".into(),
-            user_message: "会话不存在".into(),
-            original_user_message_id: None,
-        })
-    })?;
-    if session.user_id != user_id {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::FORBIDDEN,
-            code: "session_forbidden",
-            message: "session not owned by JWT user".into(),
-            user_message: "无权访问该会话".into(),
-            original_user_message_id: None,
-        }));
-    }
-    let rows = chat_repo
-        .set_assistant_image_url(session_id, message_id, &req.url)
-        .await?;
-    if rows == 0 {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::NOT_FOUND,
-            code: "message_not_found",
-            message: "assistant message not found in session".into(),
-            user_message: "消息不存在".into(),
-            original_user_message_id: None,
-        }));
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(send_message_stream))
-        .routes(routes!(set_generated_image_url))
         .routes(routes!(draw_image_stream))
 }
 
@@ -1605,27 +1531,6 @@ mod validate_payload_tests {
         let mut r = base();
         r.image_url = Some("https://example.com/a b.png".into());
         assert!(validate_payload(&r).is_err());
-    }
-
-    // --- SetImageUrlRequest / writeback validation ---
-
-    #[test]
-    fn writeback_rejects_bad_url() {
-        assert!(!image_url_is_valid("not-a-url"));
-        assert!(image_url_is_valid("https://cdn.example/x.png"));
-    }
-
-    #[test]
-    fn set_image_url_request_deserializes() {
-        let v: SetImageUrlRequest =
-            serde_json::from_str(r#"{"url":"https://cdn.example/x.png"}"#).unwrap();
-        assert_eq!(v.url, "https://cdn.example/x.png");
-    }
-
-    #[test]
-    fn set_image_url_request_rejects_missing_url_field() {
-        // url is required (no default); missing field → deserialization error.
-        assert!(serde_json::from_str::<SetImageUrlRequest>(r#"{}"#).is_err());
     }
 
     #[test]
