@@ -271,6 +271,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `resolution` | `String` | 任务 `default_resolution` | 模型相关的分辨率提示（如 `"1024x1365"`）。仅做形状校验，透传给模型。 |
 | `face_ref_url` | `String` | 缺失 | 图生图面部参考图（绝对 `http(s)` URL，≤ 2048 字符）。格式非法时返回 `422`。 |
 | `prev_image_url` | `String` | 缺失 | 上一张生成的图片，用于迭代续图（绝对 `http(s)` URL，≤ 2048 字符；校验同 `face_ref_url`）。仅当 PDE 选择 `image_ref = "previous"`（见下）时使用，否则忽略。私有对象存储的调用方应传一个短时效签名 URL——引擎不会去拉取它，而是把 URL 嵌进 OpenRouter 请求体，由画图供应商在生成时拉取。格式非法时返回 `422`。 |
+| `delegate` | `bool` | `false` | 为 `true` 时，引擎只组装提示词并发送单个 `image_request` 帧，不再内联绘图：不调用图像服务、不回传图像字节、不持久化绘图结果。由下游消费方绘制组装后的提示词、上传并记录结果。委托模式下忽略 `model`、`face_ref_url`、`prev_image_url`、`resolution`（仅使用 `style`）。默认 `false`，保持引擎内绘图路径不变。|
 
 **参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`）。出图时引擎据此选参考图：`previous` 且带有 `prev_image_url` ⇒ 在上一张图上迭代；否则回退到 `face_ref_url`（头像）。所选类型记录在 `metadata.image` 中。
 
@@ -332,6 +333,27 @@ data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
 | `type` | `"image_failed"` | 帧类型标识符。 |
 | `message_id` | `String` | 与 `image_pending` 帧的 `message_id` 相同。 |
 | `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = 所有候选模型均失败；`zero_images` = 成功响应但未含图片（防御性）；`config_error` = 未配置 key 或模型。 |
+
+**`image_request` SSE 帧** —— 委托绘图时（`image.delegate: true`）替代整套
+`image_pending`/`image_attempt`/`image`/`image_failed` 序列。引擎负责组装提示词，
+消费方负责绘制。引擎不绘图、不回传图像字节、不持久化绘图结果。
+
+```
+data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `type` | `"image_request"` | 帧类型标识。|
+| `message_id` | `String` | 真实的 assistant `message_id`；绘图与存储都以它为键。|
+| `composed_prompt` | `String` | 最终发给图像服务的提示词的 UTF-8 字节的 base64（`STANDARD`，无换行）。在最后一跳解码后原样用作图像服务的文本提示词，不要再重建任何提示词逻辑。|
+| `image_ref` | `"face"` \| `"previous"` | 计划选择的参考图；实际 URL 由消费方解析。|
+| `aspect_ratio` | `String` \| 不存在 | 语义画幅（`1:1`,`3:4`,`4:3`,`9:16`,`16:9`）或不存在。画幅→分辨率映射由消费方负责，引擎不发送宽高。|
+
+**委托序列。** 纯图片：`meta(reply_image) → done → image_request → final`。
+图文：`meta(reply_text_image) → delta* → done → image_request → final`。
+委托路径下聊天流不再发送 `image_pending`/`image_attempt`/`image`/`image_failed`；
+整体失败的处理归消费方。
 
 **完整 SSE 帧序列：**
 
