@@ -117,6 +117,21 @@ pub enum ProtocolFrame {
         message_id: String,
         reason: ImageFailReason,
     },
+    /// Delegated image turn: the engine composed the prompt and hands drawing to
+    /// the consumer. Replaces the whole `image_pending`/`image_attempt`/`image`/
+    /// `image_failed` sequence for this turn — the engine draws nothing.
+    // non-test callers land later on this branch (delegated image branch); allow removed then.
+    #[allow(dead_code)]
+    ImageRequest {
+        message_id: String,
+        /// base64(STANDARD, unwrapped) of the UTF-8 final wire prompt — exactly
+        /// what the provider would have received. Opaque in transport; the
+        /// consumer decodes it at the last hop and uses it verbatim.
+        composed_prompt: String,
+        image_ref: eros_engine_core::types::ImageRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aspect_ratio: Option<String>,
+    },
 }
 
 /// Render a 128-bit id as a Crockford Base32 ULID string (26 chars).
@@ -266,6 +281,45 @@ fn drive_image_gen(
         };
         yield ImageGenEvent::Done(result);
     }
+}
+
+/// Build the delegated `image_request` frame from the already-composed image
+/// request. `req.prompt` is the final wire prompt (style preset + persona
+/// appearance + enriched subject) — exactly what the provider would receive.
+/// base64(STANDARD, unwrapped) of its UTF-8 bytes keeps the explicit/CJK text
+/// out of SSE transport and intermediary logs. Pure.
+// non-test callers land later on this branch (delegated image branch); allow removed then.
+#[allow(dead_code)]
+fn build_image_request_frame(
+    message_id: String,
+    req: &eros_engine_llm::openrouter::ImageGenRequest,
+    image_ref: eros_engine_core::types::ImageRef,
+) -> ProtocolFrame {
+    use base64::Engine as _;
+    ProtocolFrame::ImageRequest {
+        message_id,
+        composed_prompt: base64::engine::general_purpose::STANDARD.encode(req.prompt.as_bytes()),
+        image_ref,
+        aspect_ratio: req.aspect_ratio.clone(),
+    }
+}
+
+/// Minimal `metadata.image` marker for a delegated image turn. Stores ONLY the
+/// PDE seed subject (under `prompt`, the key `assistant_transcript_line` reads)
+/// and the aspect ratio — deliberately NOT the composed wire prompt, model,
+/// generation id, url, or success/failure. Preserves the PDE image-awareness
+/// transcript (§5) while leaving the draw result with the consumer. Pure.
+// non-test callers land later on this branch (delegated image branch); allow removed then.
+#[allow(dead_code)]
+fn build_delegated_image_marker(
+    seed_subject: &str,
+    aspect_ratio: Option<&str>,
+) -> serde_json::Value {
+    let mut m = serde_json::json!({ "prompt": seed_subject });
+    if let Some(ar) = aspect_ratio.filter(|s| !s.is_empty()) {
+        m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
+    }
+    m
 }
 
 /// The subject-level prompt that actually drew the image, given which variant
@@ -8951,6 +9005,63 @@ data: [DONE]\n\n"
         assert_eq!(chain["reason"], "chain_exhausted");
         assert_eq!(mk(ImageFailReason::ZeroImages)["reason"], "zero_images");
         assert_eq!(mk(ImageFailReason::ConfigError)["reason"], "config_error");
+    }
+
+    #[test]
+    fn image_request_frame_serializes_with_base64_and_snake_ref() {
+        use base64::Engine as _;
+        let prompt = "写实风格，海边少女，画幅 3:4"; // CJK + explicit-ish, exercises base64 of UTF-8
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            fallback_model: vec![],
+            prompt: prompt.to_string(),
+            prompt_original: None,
+            face_ref_url: None,
+            aspect_ratio: Some("3:4".into()),
+            resolution: None,
+            max_tokens: 4096,
+        };
+        let f = build_image_request_frame(
+            "01ABC".into(),
+            &req,
+            eros_engine_core::types::ImageRef::Previous,
+        );
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_request");
+        assert_eq!(v["message_id"], "01ABC");
+        assert_eq!(v["image_ref"], "previous");
+        assert_eq!(v["aspect_ratio"], "3:4");
+        // composed_prompt round-trips base64 -> the exact UTF-8 wire prompt
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["composed_prompt"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), prompt);
+    }
+
+    #[test]
+    fn delegated_marker_preserves_image_awareness() {
+        // Seed subject under `prompt` (the key assistant_transcript_line reads),
+        // plus aspect — and NOTHING else (no composed prompt / model / gen id).
+        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"));
+        assert_eq!(marker["prompt"], "beach at sunset");
+        assert_eq!(marker["aspect_ratio"], "3:4");
+        assert_eq!(
+            marker.as_object().unwrap().len(),
+            2,
+            "marker must be minimal"
+        );
+        // The §5 regression guard: transcript still annotates it as a prior image.
+        let wrapped = serde_json::json!({ "image": marker });
+        let line = assistant_transcript_line("", Some(&wrapped));
+        assert!(line.contains("beach at sunset"), "subject surfaced: {line}");
+        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_ne!(line.trim(), "", "image turn must not be a blank line");
+
+        // No aspect => still a valid one-key marker that annotates.
+        let m2 = build_delegated_image_marker("a portrait", None);
+        assert_eq!(m2.as_object().unwrap().len(), 1);
+        let w2 = serde_json::json!({ "image": m2 });
+        assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
     }
 
     #[tokio::test]

@@ -36,3 +36,4 @@ futures-util       = "0.3"
 tokio-stream       = "0.1"
 async-stream       = "0.3"
 ulid               = { version = "1", features = ["serde", "uuid"] }
+base64             = "0.22"
