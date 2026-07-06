@@ -219,10 +219,17 @@ drift. Revisiting strict neutrality is a possible follow-up, not a blocker.
   audit row is dropped by the web's `isEmptyAssistantTurn` → nothing shown,
   identical to a real ghost's reload and to today. No history/BFF change.
 - **Replay (idempotent re-request).** `upsert_user_message_idempotent`
-  (`chat.rs:581-608`) returns the assistant row as a normal reply; with empty
-  content the web drops it → nothing shown. The live-only hint is not
-  reconstructed on replay — consistent with real-ghost reload. **No replay
-  change.**
+  (`chat.rs:581-608`) returns the persisted assistant row and `replay_stream`
+  re-emits its frames. `replay_stream` **re-emits `Done{ghost_fallback:true}`**
+  for a fallback row (matched precisely on `metadata.fallback_reason ∈
+  {regex_strip, empty_completion}` — the pseudo-ghost `stream_failure` and
+  `garble_repaired` rows carry a `fallback_reason` too but are non-empty replies,
+  so they stay `false`). This makes an idempotent retry wire-identical to the
+  original live stream, exactly as a **real** ghost re-emits its `Meta{Ghost}`
+  frames on replay. (Corrected after codex review — an earlier draft hard-coded
+  `ghost_fallback:false` on replay, which made a reconnecting client render the
+  fallback as a plain empty done instead of a ghost.) **Reload** still shows
+  nothing (slim history has no flag), matching a real ghost's reload.
 
 ## 8. Consumer (eros-engine-web) change
 
