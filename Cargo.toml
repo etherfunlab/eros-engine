@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/etherfunlab/eros-engine"
@@ -28,7 +28,10 @@ async-trait = "0.1"
 utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
-jsonwebtoken = "9"
+# v10 makes the crypto backend a selectable feature (default enables none, which
+# panics at first decode). rust_crypto = pure-Rust provider, so OSS self-hosters
+# building for musl/Alpine/cross targets don't need the aws-lc-sys C toolchain.
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 eventsource-stream = "0.2"
@@ -36,3 +39,4 @@ futures-util       = "0.3"
 tokio-stream       = "0.1"
 async-stream       = "0.3"
 ulid               = { version = "1", features = ["serde", "uuid"] }
+base64             = "0.22"

@@ -13,9 +13,9 @@ name = "eros-engine"
 path = "src/main.rs"
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.7.0" }
-eros-engine-llm  = { path = "../eros-engine-llm", version = "0.7.0" }
-eros-engine-store = { path = "../eros-engine-store", version = "0.7.0" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.7.1" }
+eros-engine-llm  = { path = "../eros-engine-llm", version = "0.7.1" }
+eros-engine-store = { path = "../eros-engine-store", version = "0.7.1" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -48,6 +48,7 @@ futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 ulid         = { workspace = true }
+base64       = { workspace = true }
 rand = "0.8"
 # 6-field cron schedule parser (sec min hr dom mon dow). Pure parser; the
 # sweeper drives ticks via tokio::time::sleep. No runtime scheduler.

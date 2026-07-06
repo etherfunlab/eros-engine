@@ -73,6 +73,10 @@ pub enum ProtocolFrame {
         /// full unfiltered usage separately.
         usage: Option<serde_json::Value>,
         generation_id: Option<String>,
+        /// True when this served reply_text resolved empty and is surfaced as a
+        /// ghost. The cause lives in the persisted row's metadata.fallback_reason.
+        #[serde(default, skip_serializing_if = "is_false")]
+        ghost_fallback: bool,
     },
     Final {
         lead_score: f64,
@@ -117,6 +121,23 @@ pub enum ProtocolFrame {
         message_id: String,
         reason: ImageFailReason,
     },
+    /// Delegated image turn: the engine composed the prompt and hands drawing to
+    /// the consumer. Replaces the whole `image_pending`/`image_attempt`/`image`/
+    /// `image_failed` sequence for this turn — the engine draws nothing.
+    ImageRequest {
+        message_id: String,
+        /// base64(STANDARD, unwrapped) of the UTF-8 final wire prompt — exactly
+        /// what the provider would have received. Opaque in transport; the
+        /// consumer decodes it at the last hop and uses it verbatim.
+        composed_prompt: String,
+        image_ref: eros_engine_core::types::ImageRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aspect_ratio: Option<String>,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Render a 128-bit id as a Crockford Base32 ULID string (26 chars).
@@ -135,91 +156,23 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     }
 }
 
-/// Pick the reference image for an image turn and report which kind was used.
-/// `Previous` falls back to the face ref when no previous URL is supplied.
-/// Empty strings are treated as absent. Pure.
-fn select_image_ref(
+/// Pick the reference image URL for an image draw and report which kind was
+/// used. `Previous` falls back to the face ref when no previous URL is
+/// supplied. Empty strings are treated as absent. Pure. `pub(crate)` so the
+/// draw endpoint (routes::companion_stream) can reuse it.
+pub(crate) fn select_image_ref(
     image_ref: eros_engine_core::types::ImageRef,
-    req: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    face_ref_url: Option<&str>,
+    prev_image_url: Option<&str>,
 ) -> (Option<String>, &'static str) {
-    let face = req
-        .and_then(|i| i.face_ref_url.clone())
-        .filter(|s| !s.is_empty());
-    let prev = req
-        .and_then(|i| i.prev_image_url.clone())
-        .filter(|s| !s.is_empty());
+    let face = face_ref_url.filter(|s| !s.is_empty()).map(str::to_string);
+    let prev = prev_image_url.filter(|s| !s.is_empty()).map(str::to_string);
     match image_ref {
         eros_engine_core::types::ImageRef::Previous => match prev {
             Some(u) => (Some(u), "previous"),
             None => (face, "face"),
         },
         eros_engine_core::types::ImageRef::Face => (face, "face"),
-    }
-}
-
-/// Assemble an `ImageGenRequest` from the per-turn image executor chain, the
-/// resolved `chat_image_generation` defaults, the persona, and the optional
-/// per-turn `ImageReplyParams`. Pure (no I/O). Per-turn overrides win over the
-/// resolved defaults; `plan_image_prompt` (the judge's / forced prompt) wins as
-/// the subject, then the per-turn `image_prompt`, then `fallback_subject`.
-#[allow(clippy::too_many_arguments)]
-fn build_image_gen_request(
-    primary: String,
-    chain: Vec<String>,
-    persona: &eros_engine_core::persona::CompanionPersona,
-    plan_image_prompt: Option<&str>,
-    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
-    resolved: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
-    fallback_subject: &str,
-    ref_url: Option<String>,
-    plan_aspect_ratio: Option<&str>,
-    original_subject: Option<&str>,
-) -> eros_engine_llm::openrouter::ImageGenRequest {
-    use eros_engine_llm::model_config::StyleKey;
-    let style: StyleKey = req_image
-        .and_then(|i| i.style)
-        .or_else(|| resolved.map(|r| r.default_style))
-        .unwrap_or_default();
-    let subject = plan_image_prompt
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            req_image
-                .and_then(|i| i.image_prompt.as_deref())
-                .filter(|s| !s.trim().is_empty())
-        })
-        .unwrap_or(fallback_subject);
-    let prompt = crate::pipeline::handlers::compose_image_prompt(style, persona, subject);
-    // A per-turn aspect (PDE/plan or per-request) — NOT the config default — wins.
-    let turn_aspect = plan_aspect_ratio
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| req_image.and_then(|i| i.aspect_ratio.clone()));
-    let aspect_ratio = turn_aspect
-        .clone()
-        .or_else(|| resolved.map(|r| r.default_aspect_ratio.clone()));
-    let resolution = req_image.and_then(|i| i.resolution.clone()).or_else(|| {
-        // Don't let a static config default_resolution override a per-turn aspect
-        // choice — build_image_body prefers resolution over aspect_ratio, so a
-        // default_resolution would otherwise defeat the PDE's per-scene ratio.
-        if turn_aspect.is_some() {
-            None
-        } else {
-            resolved.and_then(|r| r.default_resolution.clone())
-        }
-    });
-    let prompt_original = original_subject
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| crate::pipeline::handlers::compose_image_prompt(style, persona, s));
-    eros_engine_llm::openrouter::ImageGenRequest {
-        model: primary,
-        fallback_model: chain,
-        prompt,
-        prompt_original,
-        face_ref_url: ref_url,
-        aspect_ratio,
-        resolution,
-        max_tokens: resolved.map(|r| r.max_tokens).unwrap_or(4096),
     }
 }
 
@@ -268,41 +221,131 @@ fn drive_image_gen(
     }
 }
 
-/// The subject-level prompt that actually drew the image, given which variant
-/// won. `Original` → the pre-compose subject; `Composed`/`Single` → the composed
-/// `final_subject`. Used so persisted/emitted prompt reflects the retry winner.
-fn winning_image_prompt(
-    variant: eros_engine_llm::openrouter::PromptVariant,
-    composed: &str,
-    original: &str,
-) -> String {
-    match variant {
-        eros_engine_llm::openrouter::PromptVariant::Original => original.to_string(),
-        _ => composed.to_string(),
+/// Drive an engine-side image draw and yield the SSE frame sequence used by the
+/// draw endpoint: `image_pending → image_attempt* → (image | image_failed)`.
+/// `message_id` echoes the assistant message id `X` from the originating
+/// `image_request` frame so the consumer correlates the draw to its bubble.
+/// Persists nothing — the endpoint is stateless. `pub(crate)` for
+/// routes::companion_stream.
+pub(crate) fn draw_image_frames(
+    client: std::sync::Arc<eros_engine_llm::openrouter::OpenRouterClient>,
+    req: eros_engine_llm::openrouter::ImageGenRequest,
+    message_id: String,
+) -> impl futures_util::Stream<Item = ProtocolFrame> {
+    async_stream::stream! {
+        yield ProtocolFrame::ImagePending { message_id: message_id.clone() };
+        let mut img_events = Box::pin(drive_image_gen(client, req));
+        let mut img_outcome = None;
+        {
+            use futures_util::StreamExt as _;
+            while let Some(ev) = img_events.next().await {
+                match ev {
+                    ImageGenEvent::Attempt(p) => {
+                        yield ProtocolFrame::ImageAttempt {
+                            message_id: message_id.clone(),
+                            model: p.model,
+                            variant: p.variant,
+                            index: p.index,
+                            total: p.total,
+                        };
+                    }
+                    ImageGenEvent::Done(r) => img_outcome = Some(r),
+                }
+            }
+        }
+        match img_outcome.expect("drive_image_gen yields exactly one Done") {
+            Ok(resp) if !resp.images.is_empty() => {
+                let cr = eros_engine_llm::openrouter::ChatResponse {
+                    reply: String::new(),
+                    generation_id: resp.generation_id.clone(),
+                    model: resp.model.clone(),
+                    usage: resp.usage.clone(),
+                    finish_reason: resp.finish_reason.clone(),
+                };
+                super::log_openrouter_usage("chat_image_generation", None, &cr);
+                let mime = data_url_mime(&resp.images[0]);
+                yield ProtocolFrame::Image {
+                    message_id,
+                    data_url: resp.images[0].clone(),
+                    mime,
+                    image_prompt: None,
+                    model: resp.model,
+                    generation_id: resp.generation_id,
+                };
+            }
+            Ok(_) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ZeroImages };
+            }
+            Err(eros_engine_llm::openrouter::ImageGenError::Config(_)) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ConfigError };
+            }
+            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted { .. }) => {
+                yield ProtocolFrame::ImageFailed { message_id, reason: ImageFailReason::ChainExhausted };
+            }
+        }
     }
 }
 
-/// Build the `metadata.image_failed` diagnostic for a fully-failed image chain.
-/// `composed_prompt` is the composed `final_subject` (the most useful debug
-/// field); `attempts` is the per-model/per-variant failure list.
-fn build_image_failed_meta(
+/// Build the delegated `image_request` frame. `composed_prompt` is the final
+/// wire prompt (style preset + persona appearance + enriched subject) — exactly
+/// what the provider would receive. base64(STANDARD, unwrapped) of its UTF-8
+/// bytes keeps the explicit/CJK text out of SSE transport. Pure.
+fn build_image_request_frame(
+    message_id: String,
     composed_prompt: &str,
-    style: &str,
+    image_ref: eros_engine_core::types::ImageRef,
     aspect_ratio: Option<&str>,
-    resolution: Option<&str>,
-    image_ref: &str,
-    face_ref_used: bool,
-    attempts: &[eros_engine_llm::openrouter::ImageAttempt],
+) -> ProtocolFrame {
+    use base64::Engine as _;
+    ProtocolFrame::ImageRequest {
+        message_id,
+        composed_prompt: base64::engine::general_purpose::STANDARD
+            .encode(composed_prompt.as_bytes()),
+        image_ref,
+        aspect_ratio: aspect_ratio.map(str::to_string),
+    }
+}
+
+/// Minimal `metadata.image` marker for a delegated image turn. Stores ONLY the
+/// PDE seed subject (under `prompt`, the key `assistant_transcript_line` reads)
+/// and the aspect ratio — deliberately NOT the composed wire prompt, model,
+/// generation id, url, or success/failure. Preserves the PDE image-awareness
+/// transcript (§5) while leaving the draw result with the consumer. Pure.
+fn build_delegated_image_marker(
+    seed_subject: &str,
+    aspect_ratio: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "prompt": composed_prompt,
-        "style": style,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "image_ref": image_ref,
-        "face_ref_used": face_ref_used,
-        "attempts": attempts,
-    })
+    let mut m = serde_json::json!({ "prompt": seed_subject });
+    if let Some(ar) = aspect_ratio.filter(|s| !s.is_empty()) {
+        m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
+    }
+    m
+}
+
+/// The three ordered frames of an image-only turn: `meta → done → image_request`.
+/// No image bytes; meta carries no model (the consumer selects it). Pure.
+fn delegated_image_only_frames(
+    message_id: String,
+    composed_prompt: &str,
+    image_ref: eros_engine_core::types::ImageRef,
+    aspect_ratio: Option<&str>,
+) -> Vec<ProtocolFrame> {
+    vec![
+        ProtocolFrame::Meta {
+            message_id: message_id.clone(),
+            action_type: FrameActionType::ReplyImage,
+            model: None,
+            continues_from: None,
+        },
+        ProtocolFrame::Done {
+            message_id: message_id.clone(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            ghost_fallback: false,
+        },
+        build_image_request_frame(message_id, composed_prompt, image_ref, aspect_ratio),
+    ]
 }
 
 /// Parse the MIME type out of a `data:` URL prefix (e.g.
@@ -341,6 +384,9 @@ pub struct BurstOutcome {
     pub filtered: bool,
     pub retries_chat: u32,   // successful chat-attempt index (0 = primary)
     pub retries_filter: u32, // served filter-model index (0 when none/primary)
+    /// True when this burst ended as an empty-reply ghost fallback. The caller
+    /// skips affinity side-effects (the ghost_streak reset) when set.
+    pub ghost_fallback: bool,
 }
 
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
@@ -449,6 +495,7 @@ fn drive_chat_burst(
                 let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
                 let mut last_gen_id: Option<String> = None;
                 let mut truncated = false;
+                let mut empty_completion = false;
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
@@ -488,7 +535,7 @@ fn drive_chat_burst(
                             }
                         }
                         if !truncated && acc.is_empty() {
-                            truncated = true;
+                            empty_completion = true;
                         }
                     }
                     Err(e) => {
@@ -522,6 +569,20 @@ fn drive_chat_burst(
                     }
                 }
 
+                // Disposition, computed once up front (spec §5.3): a non-last
+                // empty completion advances to the next model below; only the
+                // LAST chain attempt returning empty is a ghost fallback,
+                // distinct from length/transport truncation (pseudo-ghost).
+                let is_ghost_fallback = empty_completion && idx + 1 == chain.len();
+                // A non-last empty completion is a superseded attempt, not a
+                // successful turn: mark it `truncated` so the persisted row and
+                // its Done frame carry the "replace me" signal (as before this
+                // feature) and the client / replay never see a spurious empty
+                // reply bubble. Only the LAST empty attempt is the ghost.
+                if empty_completion && !is_ghost_fallback {
+                    truncated = true;
+                }
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -533,7 +594,11 @@ fn drive_chat_burst(
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
                     filter_audit: None,
-                    metadata: build_metadata(None),
+                    metadata: if is_ghost_fallback {
+                        ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                    } else {
+                        build_metadata(None)
+                    },
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -557,7 +622,28 @@ fn drive_chat_burst(
                     truncated,
                     usage: wire_usage,
                     generation_id: last_gen_id,
+                    ghost_fallback: is_ghost_fallback,
                 };
+
+                if is_ghost_fallback {
+                    let mut o = outcome.lock().unwrap();
+                    o.ghost_fallback = true;
+                    // retries_chat = fallback count consumed (0-based, matches
+                    // the sibling chain-exhausted-truncated branch below) so
+                    // the Final frame doesn't under-report fallback attempts
+                    // when only the LAST chain model returns empty.
+                    o.retries_chat = (chain.len() as u32).saturating_sub(1);
+                    // Drop any earlier (superseded) truncated attempts pushed
+                    // in prior loop iterations — mirrors the accept path just
+                    // below so post_process (memory/insight/affinity) only
+                    // ever sees this ghost's empty full_text, never a partial
+                    // truncated attempt from earlier in the chain.
+                    o.produced.retain(|m| m.message_id == msg_uuid);
+                    return;
+                }
+                // (A non-last empty completion is now marked `truncated` above,
+                // so it falls through to the existing chain-advance path below —
+                // no separate branch needed.)
 
                 if !truncated {
                     let mut o = outcome.lock().unwrap();
@@ -669,6 +755,7 @@ fn drive_chat_burst(
             let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
             let mut last_gen_id: Option<String> = None;
             let mut truncated = false;
+            let mut empty_completion = false;
 
             let mut per_model_req = req.clone();
             per_model_req.model = model_id.clone();
@@ -687,7 +774,7 @@ fn drive_chat_burst(
                             Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
                         }
                     }
-                    if !truncated && acc.is_empty() { truncated = true; }
+                    if !truncated && acc.is_empty() { empty_completion = true; }
                 }
                 Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
             }
@@ -701,6 +788,81 @@ fn drive_chat_burst(
                 // fallback — doing so would discard a recoverable complete garble if
                 // the later attempt failed. An INCOMPLETE garble is already
                 // `truncated` (length / transport) and handled by the block below.
+            }
+
+            if empty_completion {
+                if idx + 1 == chain.len() {
+                    // Last attempt served a 200 OK with an empty body: ghost
+                    // fallback (affinity-neutral), NOT the pseudo-ghost/Error
+                    // path below — that's reserved for length/transport
+                    // truncation. Mirrors the regex-strip-to-empty case (a)
+                    // above (`ghost_fallback_metadata`), tagged distinctly as
+                    // "empty_completion" so ops can tell the two apart.
+                    let msg_ulid = Ulid::new();
+                    let msg_uuid: Uuid = msg_ulid.into();
+                    let row = eros_engine_store::chat::AssistantInsert {
+                        id: msg_uuid,
+                        content: String::new(),
+                        assistant_action_type: persist_action.into(),
+                        continues_from_message_id: None,
+                        truncated: false,
+                        model: Some(model_id.clone()),
+                        usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: last_gen_id.clone(),
+                        filter_audit: None,
+                        metadata: ghost_fallback_metadata(build_metadata(None), "empty_completion"),
+                    };
+                    if let Err(e) = chat_repo
+                        .insert_assistant_batch(session_id, user_message_id, &[row])
+                        .await
+                    {
+                        tracing::warn!("stream(filtered): ghost-fallback persist failed: {e}");
+                    }
+                    {
+                        // Mirror the sibling truncated branch: report the
+                        // fallback attempts consumed so the Final frame's
+                        // retries_chat isn't under-reported when only the LAST
+                        // chain model returns an empty completion.
+                        let mut o = outcome.lock().unwrap();
+                        o.ghost_fallback = true;
+                        o.retries_chat = (chain.len() as u32).saturating_sub(1);
+                        // Keep an (empty) produced row so a ReplyTextImage turn's
+                        // trailing image_request still fires — the caller gates it
+                        // on `produced.last()`. The live and regex-strip ghost
+                        // paths both retain their row; without this, filtered-mode
+                        // text+image turns would silently drop the image half. The
+                        // empty full_text keeps the turn memory/insight/eval-neutral
+                        // downstream (persist_affinity's rule delta is unchanged).
+                        o.produced
+                            .push(crate::pipeline::post_process::ProducedMessage {
+                                message_id: msg_uuid,
+                                full_text: String::new(),
+                                action: plan_action,
+                            });
+                    }
+                    yield ProtocolFrame::Meta {
+                        message_id: ulid_string(msg_ulid),
+                        action_type: frame_action,
+                        model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                        continues_from: None,
+                    };
+                    // Forward the served usage (a provider can emit a usage block
+                    // on an otherwise-empty completion) — same wire contract as the
+                    // other served Done frames; the DB row above already persisted
+                    // the full unfiltered usage.
+                    let mut wire_usage =
+                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
+                    yield ProtocolFrame::Done {
+                        message_id: ulid_string(msg_ulid),
+                        truncated: false,
+                        usage: wire_usage,
+                        generation_id: last_gen_id,
+                        ghost_fallback: true,
+                    };
+                    return;
+                }
+                continue; // non-last empty completion: try the next model
             }
 
             if truncated {
@@ -876,6 +1038,15 @@ fn drive_chat_burst(
                 None => (cleaned.clone(), regex_audit(&acc), None), // regex-only turn
                 }
             };
+            // Empty visible text (regex-strip-to-empty, case a) means nothing
+            // was served: the assistant row is a ghost fallback, not a normal
+            // reply — tag it in metadata and keep affinity's ghost_streak
+            // untouched (see BurstOutcome.ghost_fallback gating). Tagging it
+            // `"regex_strip"` is always correct here: `visible` can only be
+            // empty via the regex-strip-to-empty branch above, since the LLM
+            // output filter fails open to the (non-empty) `cleaned` text and
+            // never emptifies an otherwise non-empty reply.
+            let is_ghost = visible.is_empty();
 
             if !visible.is_empty() {
                 yield ProtocolFrame::Delta {
@@ -894,7 +1065,11 @@ fn drive_chat_burst(
                 usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 generation_id: last_gen_id.clone(),
                 filter_audit,
-                metadata: build_metadata(filter_failure.as_ref()),
+                metadata: if is_ghost {
+                    ghost_fallback_metadata(build_metadata(filter_failure.as_ref()), "regex_strip")
+                } else {
+                    build_metadata(filter_failure.as_ref())
+                },
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
@@ -911,15 +1086,32 @@ fn drive_chat_burst(
 
             let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
+            if is_ghost {
+                outcome.lock().unwrap().ghost_fallback = true;
+            }
             yield ProtocolFrame::Done {
                 message_id: ulid_string(msg_ulid),
                 truncated: false,
                 usage: wire_usage,
                 generation_id: last_gen_id,
+                ghost_fallback: is_ghost,
             };
             return;
         }
     }
+}
+
+/// Assistant-row metadata for an empty-reply ghost fallback: the base metadata
+/// bag (may be None) plus a `fallback_reason` tag.
+fn ghost_fallback_metadata(
+    base: Option<serde_json::Value>,
+    reason: &str,
+) -> Option<serde_json::Value> {
+    let mut obj = base
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert("fallback_reason".into(), serde_json::json!(reason));
+    Some(serde_json::Value::Object(obj))
 }
 
 /// Pick the text post_process extracts from: original (after) vs visible (before).
@@ -2149,6 +2341,7 @@ async fn build_stream_failure_pseudo_ghost(
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         },
     ];
     let produced = crate::pipeline::post_process::ProducedMessage {
@@ -2250,6 +2443,7 @@ async fn build_garble_repaired_replacement(
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         },
     ];
     let produced = crate::pipeline::post_process::ProducedMessage {
@@ -2362,29 +2556,17 @@ pub fn run_stream(
         // short-circuits all of them. Tip turns and feature-off skip the judge
         // (rule engine). Fail-open: any non-Ok status falls back to pde::decide.
         let is_tip = user_msg.tips_amount_usd.is_some();
-        // Per-turn image executor resolution. The executor counts as available
-        // only when the caller opted in (an `image` block is present) AND a model
-        // resolves this turn. Omitting `image` turns image generation OFF for the
-        // turn even when a config `fallback` model exists — mirroring chat_vision,
-        // which runs only when `image_url` is present. With no executor, image
-        // actions degrade to text (guard_action) and a forced request is ignored.
-        //
-        // Resolve the chain ONLY when opted in: `effective_image_chain` advances
-        // the image ModelSpec round-robin cursor (`ModelSpec::select`), so calling
-        // it on opted-out / text turns would consume image-model slots and skew
-        // the sequencing of later opted-in image turns.
+        // Delegate-only: the chat stream never draws, so image-action
+        // availability keys on the PRESENCE of the request `image` block (the
+        // consumer signalling "I handle images this turn"), independent of
+        // `[tasks.chat_image_generation]`. `resolve_image_gen()` is still read
+        // for the composer's default_style / default_aspect_ratio (it does not
+        // advance the image round-robin cursor); the cursor is advanced only by
+        // the draw endpoint's `effective_image_chain` call.
         let resolved_image_gen = state.model_config.resolve_image_gen();
         let req_image = user_msg.image.as_ref();
-        let image_chain = req_image.and_then(|i| {
-            eros_engine_llm::model_config::effective_image_chain(
-                i.model.as_deref(),
-                resolved_image_gen.as_ref(),
-            )
-        });
-        let image_executor_available = image_chain.is_some();
-        // Forced image: the client asked for it, an executor chain exists this
-        // turn, and it is not a tip turn (tips skip the judge / image path).
-        let force_image = req_image.is_some_and(|i| i.force) && image_executor_available && !is_tip;
+        let image_executor_available = req_image.is_some();
+        let force_image = req_image.is_some_and(|i| i.force) && !is_tip;
         // Skip resolution on tip turns: the judge won't run, and resolve_pde()
         // advances the round-robin model cursor as a side effect — resolving on a
         // skipped turn would skew which model later (non-tip) judge calls pick.
@@ -2533,263 +2715,125 @@ pub fn run_stream(
                     truncated: false,
                     usage: None,
                     generation_id: None,
+                    ghost_fallback: false,
                 };
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
             }
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
-                // ── Image-reply executor wiring (Task 10) ─────────────────────
-                // `image_chain` / `resolved_image_gen` / `req_image` were already
-                // resolved in the decision block above and are REUSED here — do
-                // NOT recompute `effective_image_chain` (it advances a round-robin
-                // cursor). The chain is guaranteed `Some` whenever the plan is
-                // ReplyImage / ReplyTextImage (guard_action / force only kept the
-                // image action when the executor was available). Persona comes
-                // from `input.persona` (the local `persona` binding was moved into
-                // `input` above).
-                //
-                // For ReplyImage we generate FIRST and, on success, emit the
-                // image-only trio and skip the text path entirely. On failure (or
-                // zero images) we fall through to the normal text path so the turn
-                // is never empty — no premature `meta` is emitted before the
-                // generation outcome is known. For ReplyTextImage the text reply
-                // runs as usual and the Image frame is appended after the text
-                // `done`.
+                // ── Image-reply wiring (delegate-only) ────────────────────────
+                // `resolved_image_gen` / `req_image` were resolved in the decision
+                // block above and are REUSED here. The chat stream never draws:
+                // for ReplyImage we compose the prompt, persist the minimal marker,
+                // emit `meta → done → image_request`, and skip the text path
+                // entirely; for ReplyTextImage the text reply runs as usual and a
+                // single `image_request` is appended after the text `done`. Persona
+                // comes from `input.persona` (the local `persona` binding was moved
+                // into `input` above).
                 let mut image_only_done = false;
-                let mut image_failed_meta: Option<serde_json::Value> = None;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
-                    if let Some((primary, fallback)) = image_chain.clone() {
-                        // #131: pre-allocate the assistant id up front so the
-                        // image lifecycle frames can reference it before the
-                        // (blocking) generation. On success this same id labels
-                        // the persisted row + meta/image/done. On failure it is
-                        // never persisted — the turn degrades to a separate text
-                        // row (Y); image_failed(X) lets a consumer clear pending.
-                        let msg_ulid = Ulid::new();
-                        let msg_uuid: Uuid = msg_ulid.into();
-                        let img_mid = ulid_string(msg_ulid);
-                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
-                        let subject = plan
-                            .image_prompt
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .or_else(|| {
-                                req_image
-                                    .and_then(|i| i.image_prompt.as_deref())
-                                    .filter(|s| !s.trim().is_empty())
-                            })
-                            .unwrap_or("")
-                            .to_string();
-                        let style: eros_engine_llm::model_config::StyleKey = req_image
-                            .and_then(|i| i.style)
-                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
-                            .unwrap_or_default();
-                        let style_str = serde_json::to_value(style)
-                            .ok()
-                            .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| "realistic".to_string());
-                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
-                        let face_used = ref_url.is_some();
-                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
-                            Some(c) => run_image_prompt_compose(
-                                &state,
-                                &c,
-                                &input.persona,
-                                &subject,
-                                &pde_transcript,
-                                plan.aspect_ratio
-                                    .as_deref()
-                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
-                                    .or_else(|| {
-                                        resolved_image_gen
-                                            .as_ref()
-                                            .map(|r| r.default_aspect_ratio.as_str())
-                                    }),
-                                &style_str,
-                            )
-                            .await
-                            .unwrap_or_else(|| subject.clone()),
-                            None => subject.clone(),
-                        };
-                        let original_subject = (!subject.trim().is_empty()
-                            && final_subject.trim() != subject.trim())
-                            .then_some(subject.as_str());
-                        let req = build_image_gen_request(
-                            primary,
-                            fallback,
+                    // Delegate-only: compose the prompt and emit `image_request`;
+                    // the engine never draws. Pre-allocate the assistant id so
+                    // the persisted row and the delegated frames share it.
+                    let msg_ulid = Ulid::new();
+                    let msg_uuid: Uuid = msg_ulid.into();
+                    let img_mid = ulid_string(msg_ulid);
+                    let subject = plan
+                        .image_prompt
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            req_image
+                                .and_then(|i| i.image_prompt.as_deref())
+                                .filter(|s| !s.trim().is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    let style: eros_engine_llm::model_config::StyleKey = req_image
+                        .and_then(|i| i.style)
+                        .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
+                        .unwrap_or_default();
+                    let style_str = serde_json::to_value(style)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "realistic".to_string());
+                    // A per-turn aspect (PDE/plan or per-request) beats the config default.
+                    let aspect: Option<String> = plan
+                        .aspect_ratio
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            req_image
+                                .and_then(|i| i.aspect_ratio.as_deref())
+                                .filter(|s| !s.trim().is_empty())
+                        })
+                        .map(str::to_string)
+                        .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_aspect_ratio.clone()));
+                    let final_subject = match state.model_config.resolve_image_prompt_compose() {
+                        Some(c) => run_image_prompt_compose(
+                            &state,
+                            &c,
                             &input.persona,
-                            Some(final_subject.as_str()),
-                            req_image,
-                            resolved_image_gen.as_ref(),
-                            "",
-                            ref_url.clone(),
-                            plan.aspect_ratio.as_deref(),
-                            original_subject,
-                        );
-                        let ar = req.aspect_ratio.clone();
-                        let res = req.resolution.clone();
-                        // #131: drive image-gen, forwarding each attempt as an
-                        // image_attempt frame; capture the single terminal Done.
-                        let mut img_events =
-                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
-                        let mut img_outcome = None;
-                        {
-                            use futures_util::StreamExt as _;
-                            while let Some(ev) = img_events.next().await {
-                                match ev {
-                                    ImageGenEvent::Attempt(p) => {
-                                        yield ProtocolFrame::ImageAttempt {
-                                            message_id: img_mid.clone(),
-                                            model: p.model,
-                                            variant: p.variant,
-                                            index: p.index,
-                                            total: p.total,
-                                        };
-                                    }
-                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
-                                }
-                            }
-                        }
-                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
-                            Ok(resp) if !resp.images.is_empty() => {
-                                let won_prompt = winning_image_prompt(
-                                    resp.winning_variant,
-                                    &final_subject,
-                                    &subject,
-                                );
-                                // Usage logging via the ChatResponse adapter.
-                                let cr = eros_engine_llm::openrouter::ChatResponse {
-                                    reply: String::new(),
-                                    generation_id: resp.generation_id.clone(),
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    finish_reason: resp.finish_reason.clone(),
-                                };
-                                // Mirror the other in-stream task log sites
-                                // (vision / filters / pde): session_id = None.
-                                super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let mut image_meta = serde_json::json!({
-                                    "prompt": won_prompt,
-                                    "style": style_str,
-                                    "model": resp.model,
-                                    "aspect_ratio": ar,
-                                    "resolution": res,
-                                    "generation_id": resp.generation_id,
-                                    "face_ref_used": face_used,
-                                    "image_ref": ref_kind,
-                                });
-                                if !resp.attempts.is_empty() {
-                                    image_meta["attempts"] =
-                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
-                                }
-                                let mime = data_url_mime(&resp.images[0]);
-                                let row = eros_engine_store::chat::AssistantInsert {
-                                    id: msg_uuid,
-                                    content: String::new(),
-                                    assistant_action_type: "reply".into(),
-                                    continues_from_message_id: None,
-                                    truncated: false,
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                    filter_audit: None,
-                                    metadata: Some(serde_json::json!({ "image": image_meta })),
-                                };
-                                if let Err(e) = chat_repo
-                                    .insert_assistant_batch(
-                                        user_msg.session_id,
-                                        user_msg.user_message_id,
-                                        std::slice::from_ref(&row),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("stream(image): persist failed: {e}");
-                                }
-                                // full_text="" so insight/memory extraction skips
-                                // this row; affinity uses plan.image_prompt as the
-                                // proxy (Task 12).
-                                image_only_produced.push(
-                                    crate::pipeline::post_process::ProducedMessage {
-                                        message_id: msg_uuid,
-                                        full_text: String::new(),
-                                        action: ActionType::ReplyImage,
-                                    },
-                                );
-                                let mut wire_usage = resp.usage.clone();
-                                filter_usage_keys(
-                                    &mut wire_usage,
-                                    &state.config.openrouter_usage_hidden_keys,
-                                );
-                                // Frame order: meta → image → done → final.
-                                yield ProtocolFrame::Meta {
-                                    message_id: ulid_string(msg_ulid),
-                                    action_type: FrameActionType::ReplyImage,
-                                    model: resp.model.clone(),
-                                    continues_from: None,
-                                };
-                                yield ProtocolFrame::Image {
-                                    message_id: ulid_string(msg_ulid),
-                                    data_url: resp.images[0].clone(),
-                                    mime,
-                                    image_prompt: Some(won_prompt.clone()),
-                                    model: resp.model.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                                yield ProtocolFrame::Done {
-                                    message_id: ulid_string(msg_ulid),
-                                    truncated: false,
-                                    usage: wire_usage,
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                                image_only_done = true;
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    "stream(image): execute_image returned zero images \
-                                     (unexpected); falling through to text"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ZeroImages,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
-                                tracing::warn!(
-                                    "stream(image): execute_image config error: {m}; \
-                                     falling through to text"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ConfigError,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
-                                attempts,
-                            }) => {
-                                tracing::warn!(
-                                    attempts = attempts.len(),
-                                    "stream(image): image chain exhausted; persisting \
-                                     image_failed onto the fallthrough text row"
-                                );
-                                image_failed_meta = Some(build_image_failed_meta(
-                                    &final_subject,
-                                    &style_str,
-                                    ar.as_deref(),
-                                    res.as_deref(),
-                                    ref_kind,
-                                    face_used,
-                                    &attempts,
-                                ));
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ChainExhausted,
-                                };
-                            }
-                        }
+                            &subject,
+                            &pde_transcript,
+                            aspect.as_deref(),
+                            &style_str,
+                        )
+                        .await
+                        .unwrap_or_else(|| subject.clone()),
+                        None => subject.clone(),
+                    };
+                    let composed_prompt = crate::pipeline::handlers::compose_image_prompt(
+                        style,
+                        &input.persona,
+                        &final_subject,
+                    );
+                    // Persist an empty-content row carrying ONLY the minimal
+                    // marker (seed subject + aspect) so the PDE stays image-aware
+                    // (§5); the composed prompt and the draw result live with the
+                    // consumer.
+                    let marker = build_delegated_image_marker(&subject, aspect.as_deref());
+                    let row = eros_engine_store::chat::AssistantInsert {
+                        id: msg_uuid,
+                        content: String::new(),
+                        assistant_action_type: "reply".into(),
+                        continues_from_message_id: None,
+                        truncated: false,
+                        model: None,
+                        usage: None,
+                        generation_id: None,
+                        filter_audit: None,
+                        metadata: Some(serde_json::json!({ "image": marker })),
+                    };
+                    if let Err(e) = chat_repo
+                        .insert_assistant_batch(
+                            user_msg.session_id,
+                            user_msg.user_message_id,
+                            std::slice::from_ref(&row),
+                        )
+                        .await
+                    {
+                        tracing::warn!("stream(image): persist failed: {e}");
                     }
+                    // full_text="" so insight/memory extraction skips this row;
+                    // affinity uses plan.image_prompt as the proxy.
+                    image_only_produced.push(crate::pipeline::post_process::ProducedMessage {
+                        message_id: msg_uuid,
+                        full_text: String::new(),
+                        action: ActionType::ReplyImage,
+                    });
+                    for frame in delegated_image_only_frames(
+                        img_mid.clone(),
+                        &composed_prompt,
+                        plan.image_ref,
+                        aspect.as_deref(),
+                    ) {
+                        yield frame;
+                    }
+                    image_only_done = true;
                 }
 
                 // Image-only success: reset ghost streak, emit the computed
@@ -3025,46 +3069,25 @@ pub fn run_stream(
                         yield frame;
                     }
                 }
-                let (produced, did_filter, retries_chat, retries_filter) = {
+                let (produced, did_filter, retries_chat, retries_filter, ghost_fallback) = {
                     let g = outcome.lock().unwrap();
-                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter)
+                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter, g.ghost_fallback)
                 };
 
-                // If image-only generation failed (ChainExhausted), attach the
-                // diagnostic onto the fallthrough text row that the burst just
-                // produced.
-                if let Some(meta) = image_failed_meta.take() {
-                    if let Some(last) = produced.last() {
-                        if let Err(e) = chat_repo
-                            .merge_assistant_metadata_key(
-                                user_msg.session_id,
-                                last.message_id,
-                                "image_failed",
-                                &meta,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "stream(image): persist image_failed onto text row failed: {e}"
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "stream(image): no fallthrough text row to carry image_failed"
-                        );
+                // Reset ghost streak (mirrors sync pipeline policy). A ghost
+                // fallback (empty served reply) is affinity-neutral — do NOT
+                // reset, per the design's "既不加也不清零".
+                if !ghost_fallback {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
+                         WHERE session_id = $1 AND ghost_streak <> 0",
+                    )
+                    .bind(user_msg.session_id)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::warn!("stream: ghost streak reset failed: {e}");
                     }
-                }
-
-                // Reset ghost streak (mirrors sync pipeline policy).
-                if let Err(e) = sqlx::query(
-                    "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
-                     WHERE session_id = $1 AND ghost_streak <> 0",
-                )
-                .bind(user_msg.session_id)
-                .execute(&state.pool)
-                .await
-                {
-                    tracing::warn!("stream: ghost streak reset failed: {e}");
                 }
 
                 // ── ReplyTextImage: append the generated image AFTER the text ──
@@ -3075,15 +3098,9 @@ pub fn run_stream(
                 // (or zero images / empty produced) we emit NO Image frame — the
                 // text reply already reached the client, so the turn is complete.
                 if matches!(plan.action_type, ActionType::ReplyTextImage) {
-                    if let (Some(last), Some((primary, fallback))) =
-                        (produced.last(), image_chain.clone())
-                    {
+                    if let Some(last) = produced.last() {
                         let msg_uuid = last.message_id;
-                        // #131: an image is now being generated for this message.
-                        // Emitted before run_image_prompt_compose (itself an LLM
-                        // call) so it covers the whole gap after the text `done`.
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
-                        yield ProtocolFrame::ImagePending { message_id: img_mid.clone() };
                         let subject = plan
                             .image_prompt
                             .as_deref()
@@ -3103,8 +3120,17 @@ pub fn run_stream(
                             .ok()
                             .and_then(|v| v.as_str().map(String::from))
                             .unwrap_or_else(|| "realistic".to_string());
-                        let (ref_url, ref_kind) = select_image_ref(plan.image_ref, req_image);
-                        let face_used = ref_url.is_some();
+                        let aspect: Option<String> = plan
+                            .aspect_ratio
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| {
+                                req_image
+                                    .and_then(|i| i.aspect_ratio.as_deref())
+                                    .filter(|s| !s.trim().is_empty())
+                            })
+                            .map(str::to_string)
+                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_aspect_ratio.clone()));
                         let final_subject = match state.model_config.resolve_image_prompt_compose() {
                             Some(c) => run_image_prompt_compose(
                                 &state,
@@ -3112,170 +3138,35 @@ pub fn run_stream(
                                 &input.persona,
                                 &subject,
                                 &pde_transcript,
-                                plan.aspect_ratio
-                                    .as_deref()
-                                    .or_else(|| req_image.and_then(|i| i.aspect_ratio.as_deref()))
-                                    .or_else(|| {
-                                        resolved_image_gen
-                                            .as_ref()
-                                            .map(|r| r.default_aspect_ratio.as_str())
-                                    }),
+                                aspect.as_deref(),
                                 &style_str,
                             )
                             .await
                             .unwrap_or_else(|| subject.clone()),
                             None => subject.clone(),
                         };
-                        let original_subject = (!subject.trim().is_empty()
-                            && final_subject.trim() != subject.trim())
-                            .then_some(subject.as_str());
-                        let req = build_image_gen_request(
-                            primary,
-                            fallback,
+                        let composed_prompt = crate::pipeline::handlers::compose_image_prompt(
+                            style,
                             &input.persona,
-                            Some(final_subject.as_str()),
-                            req_image,
-                            resolved_image_gen.as_ref(),
-                            "",
-                            ref_url.clone(),
-                            plan.aspect_ratio.as_deref(),
-                            original_subject,
+                            &final_subject,
                         );
-                        let ar = req.aspect_ratio.clone();
-                        let res = req.resolution.clone();
-                        // #131: drive image-gen, forwarding each attempt as an
-                        // image_attempt frame; capture the single terminal Done.
-                        let mut img_events =
-                            Box::pin(drive_image_gen(state.openrouter.clone(), req));
-                        let mut img_outcome = None;
+                        // Merge ONLY the minimal marker (seed subject + aspect)
+                        // onto the already-persisted text row so the PDE stays
+                        // image-aware (§5). The text already reached the client;
+                        // `final` follows below.
+                        let marker = build_delegated_image_marker(&subject, aspect.as_deref());
+                        if let Err(e) = chat_repo
+                            .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
+                            .await
                         {
-                            use futures_util::StreamExt as _;
-                            while let Some(ev) = img_events.next().await {
-                                match ev {
-                                    ImageGenEvent::Attempt(p) => {
-                                        yield ProtocolFrame::ImageAttempt {
-                                            message_id: img_mid.clone(),
-                                            model: p.model,
-                                            variant: p.variant,
-                                            index: p.index,
-                                            total: p.total,
-                                        };
-                                    }
-                                    ImageGenEvent::Done(r) => img_outcome = Some(r),
-                                }
-                            }
+                            tracing::warn!("stream(text_image): merge marker failed: {e}");
                         }
-                        match img_outcome.expect("drive_image_gen yields exactly one Done") {
-                            Ok(resp) if !resp.images.is_empty() => {
-                                let won_prompt = winning_image_prompt(
-                                    resp.winning_variant,
-                                    &final_subject,
-                                    &subject,
-                                );
-                                let cr = eros_engine_llm::openrouter::ChatResponse {
-                                    reply: String::new(),
-                                    generation_id: resp.generation_id.clone(),
-                                    model: resp.model.clone(),
-                                    usage: resp.usage.clone(),
-                                    finish_reason: resp.finish_reason.clone(),
-                                };
-                                // Mirror the other in-stream task log sites
-                                // (vision / filters / pde): session_id = None.
-                                super::log_openrouter_usage("chat_image_generation", None, &cr);
-                                let mut image_meta = serde_json::json!({
-                                    "prompt": won_prompt,
-                                    "style": style_str,
-                                    "model": resp.model,
-                                    "aspect_ratio": ar,
-                                    "resolution": res,
-                                    "generation_id": resp.generation_id,
-                                    "face_ref_used": face_used,
-                                    "image_ref": ref_kind,
-                                });
-                                if !resp.attempts.is_empty() {
-                                    image_meta["attempts"] =
-                                        serde_json::to_value(&resp.attempts).unwrap_or_default();
-                                }
-                                let mime = data_url_mime(&resp.images[0]);
-                                // merge_assistant_image_meta wraps under {"image":..}
-                                // itself — pass the raw image_meta.
-                                if let Err(e) = chat_repo
-                                    .merge_assistant_image_meta(
-                                        user_msg.session_id,
-                                        msg_uuid,
-                                        &image_meta,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "stream(text_image): merge image meta failed: {e}"
-                                    );
-                                }
-                                yield ProtocolFrame::Image {
-                                    message_id: ulid_string(Ulid::from(msg_uuid)),
-                                    data_url: resp.images[0].clone(),
-                                    mime,
-                                    image_prompt: Some(won_prompt.clone()),
-                                    model: resp.model.clone(),
-                                    generation_id: resp.generation_id.clone(),
-                                };
-                            }
-                            Ok(_) => {
-                                tracing::warn!(
-                                    "stream(text_image): execute_image returned zero images \
-                                     (unexpected); no Image frame (text already delivered)"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ZeroImages,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::Config(m)) => {
-                                tracing::warn!(
-                                    "stream(text_image): execute_image config error: {m}; \
-                                     no Image frame (text already delivered)"
-                                );
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ConfigError,
-                                };
-                            }
-                            Err(eros_engine_llm::openrouter::ImageGenError::ChainExhausted {
-                                attempts,
-                            }) => {
-                                tracing::warn!(
-                                    attempts = attempts.len(),
-                                    "stream(text_image): image chain exhausted; persisting \
-                                     image_failed onto the text row"
-                                );
-                                let meta = build_image_failed_meta(
-                                    &final_subject,
-                                    &style_str,
-                                    ar.as_deref(),
-                                    res.as_deref(),
-                                    ref_kind,
-                                    face_used,
-                                    &attempts,
-                                );
-                                if let Err(e) = chat_repo
-                                    .merge_assistant_metadata_key(
-                                        user_msg.session_id,
-                                        msg_uuid,
-                                        "image_failed",
-                                        &meta,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "stream(text_image): persist image_failed failed: {e}"
-                                    );
-                                }
-                                yield ProtocolFrame::ImageFailed {
-                                    message_id: img_mid.clone(),
-                                    reason: ImageFailReason::ChainExhausted,
-                                };
-                            }
-                        }
+                        yield build_image_request_frame(
+                            img_mid.clone(),
+                            &composed_prompt,
+                            plan.image_ref,
+                            aspect.as_deref(),
+                        );
                     }
                 }
 
@@ -3410,6 +3301,7 @@ pub fn replay_stream(
                 truncated: false,
                 usage: None,
                 generation_id: None,
+                ghost_fallback: false,
             };
         } else {
             for row in &rows {
@@ -3445,6 +3337,20 @@ pub fn replay_stream(
                     truncated: row.truncated,
                     usage,
                     generation_id: row.generation_id.clone(),
+                    // Re-emit the ghost-fallback flag so an idempotent replay of an
+                    // empty-reply fallback turn is wire-identical to the original
+                    // live stream (a real ghost likewise re-emits its ghost frames
+                    // on replay). Match ONLY the ghost-fallback reasons — the
+                    // pseudo-ghost ("stream_failure") and garble-repaired
+                    // ("garble_repaired") rows also carry a fallback_reason but are
+                    // non-empty canned/ salvaged replies, not ghosts.
+                    ghost_fallback: matches!(
+                        row.metadata
+                            .as_ref()
+                            .and_then(|m| m.get("fallback_reason"))
+                            .and_then(|v| v.as_str()),
+                        Some("regex_strip") | Some("empty_completion")
+                    ),
                 };
             }
             // If every persisted assistant row was truncated, emit the same
@@ -3516,234 +3422,33 @@ mod tests {
         assert!(v.get("model").is_none(), "model must be omitted when None");
     }
 
-    fn test_persona_with_meta(
-        pairs: &[(&str, &str)],
-    ) -> eros_engine_core::persona::CompanionPersona {
-        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
-        let iid = uuid::Uuid::new_v4();
-        let gid = uuid::Uuid::new_v4();
-        let oid = uuid::Uuid::new_v4();
-        let meta: serde_json::Map<String, serde_json::Value> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-            .collect();
-        CompanionPersona {
-            instance_id: iid,
-            genome: PersonaGenome {
-                id: gid,
-                name: "TestPersona".into(),
-                system_prompt: "You are TestPersona.".into(),
-                tip_personality: None,
-                art_metadata: serde_json::Value::Object(meta),
-            },
-            instance: PersonaInstance {
-                id: iid,
-                genome_id: gid,
-                owner_uid: oid,
-                status: "active".into(),
-            },
-        }
-    }
-
     #[test]
     fn select_image_ref_picks_and_falls_back() {
-        use crate::routes::companion_stream::ImageReplyParams;
         use eros_engine_core::types::ImageRef;
-
-        let both = ImageReplyParams {
-            face_ref_url: Some("https://x/face.png".into()),
-            prev_image_url: Some("https://x/prev.png".into()),
-            ..Default::default()
-        };
-        // previous chosen, prev present → previous
+        // Face → the face url.
         assert_eq!(
-            select_image_ref(ImageRef::Previous, Some(&both)),
-            (Some("https://x/prev.png".into()), "previous")
+            select_image_ref(ImageRef::Face, Some("https://f/a.png"), None),
+            (Some("https://f/a.png".into()), "face")
         );
-        // face chosen → face
+        // Previous → the previous url when present.
         assert_eq!(
-            select_image_ref(ImageRef::Face, Some(&both)),
-            (Some("https://x/face.png".into()), "face")
+            select_image_ref(
+                ImageRef::Previous,
+                Some("https://f/a.png"),
+                Some("https://p/b.png")
+            ),
+            (Some("https://p/b.png".into()), "previous")
         );
-        // previous chosen but absent → fall back to face
-        let face_only = ImageReplyParams {
-            face_ref_url: Some("https://x/face.png".into()),
-            ..Default::default()
-        };
+        // Previous with no previous url → falls back to face.
         assert_eq!(
-            select_image_ref(ImageRef::Previous, Some(&face_only)),
-            (Some("https://x/face.png".into()), "face")
+            select_image_ref(ImageRef::Previous, Some("https://f/a.png"), None),
+            (Some("https://f/a.png".into()), "face")
         );
-        // nothing supplied → no url, kind reflects request fallback
-        assert_eq!(select_image_ref(ImageRef::Previous, None), (None, "face"));
-    }
-
-    #[test]
-    fn build_image_gen_request_uses_subject_chain_and_style() {
-        let persona = test_persona_with_meta(&[]);
-        let plan_prompt = Some("a selfie".to_string());
-        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\ndefault_aspect_ratio=\"3:4\"\n",
-        )
-        .unwrap()
-        .resolve_image_gen();
-        let (primary, chain) = ("img".to_string(), vec![]);
-        let req = build_image_gen_request(
-            primary,
-            chain,
-            &persona,
-            plan_prompt.as_deref(),
-            None, /* req_image */
-            resolved.as_ref(),
-            "fallback subject",
-            None, /* ref_url */
-            None, /* plan_aspect_ratio */
-            None, /* original_subject */
-        );
-        assert_eq!(req.model, "img");
-        assert!(req.prompt.starts_with("Photorealistic"));
-        assert!(req.prompt.contains("a selfie")); // plan image_prompt wins over fallback subject
-        assert_eq!(req.aspect_ratio.as_deref(), Some("3:4"));
-    }
-
-    #[test]
-    fn build_image_gen_request_plan_aspect_beats_config_default_resolution() {
-        let persona = test_persona_with_meta(&[]);
-        // Both default_aspect_ratio and default_resolution are set in the config.
-        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\ndefault_aspect_ratio=\"3:4\"\ndefault_resolution=\"1024x1024\"\n",
-        )
-        .unwrap()
-        .resolve_image_gen();
-        let req = build_image_gen_request(
-            "img".into(),
-            vec![],
-            &persona,
-            None, /* plan_image_prompt */
-            None, /* req_image */
-            resolved.as_ref(),
-            "fallback subject",
-            None,         /* ref_url */
-            Some("9:16"), /* plan_aspect_ratio */
-            None,         /* original_subject */
-        );
+        // Empty strings are treated as absent.
         assert_eq!(
-            req.aspect_ratio.as_deref(),
-            Some("9:16"),
-            "plan aspect wins"
+            select_image_ref(ImageRef::Face, Some(""), None),
+            (None, "face")
         );
-        assert_eq!(
-            req.resolution, None,
-            "config default_resolution dropped when a plan aspect is set"
-        );
-    }
-
-    #[test]
-    fn build_image_gen_request_sets_prompt_original_when_provided() {
-        let persona = test_persona_with_meta(&[]);
-        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
-        )
-        .unwrap()
-        .resolve_image_gen();
-        // composed subject as primary, original subject as the retry variant
-        let req = build_image_gen_request(
-            "img".into(),
-            vec![],
-            &persona,
-            Some("composed scene"),
-            None,
-            resolved.as_ref(),
-            "",
-            None,
-            None,
-            Some("original scene"), /* original_subject */
-        );
-        let po = req.prompt_original.expect("prompt_original set");
-        assert!(po.contains("original scene"));
-        assert!(po.starts_with("Photorealistic")); // style wrapping applied to both
-        assert!(req.prompt.contains("composed scene"));
-    }
-
-    #[test]
-    fn build_image_gen_request_no_prompt_original_when_none_or_blank() {
-        let persona = test_persona_with_meta(&[]);
-        let resolved = eros_engine_llm::model_config::ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img\"\ndefault_style=\"realistic\"\n",
-        )
-        .unwrap()
-        .resolve_image_gen();
-        let req = build_image_gen_request(
-            "img".into(),
-            vec![],
-            &persona,
-            Some("scene"),
-            None,
-            resolved.as_ref(),
-            "",
-            None,
-            None,
-            None,
-        );
-        assert!(req.prompt_original.is_none());
-        let req_blank = build_image_gen_request(
-            "img".into(),
-            vec![],
-            &persona,
-            Some("scene"),
-            None,
-            resolved.as_ref(),
-            "",
-            None,
-            None,
-            Some("   "),
-        );
-        assert!(req_blank.prompt_original.is_none(), "blank original ⇒ None");
-    }
-
-    #[test]
-    fn build_image_failed_meta_shape() {
-        use eros_engine_llm::openrouter::{AttemptOutcome, ImageAttempt, PromptVariant};
-        let attempts = vec![
-            ImageAttempt {
-                model: "A".into(),
-                variant: PromptVariant::Composed,
-                outcome: AttemptOutcome::Status {
-                    status: 400,
-                    message: "policy".into(),
-                },
-            },
-            ImageAttempt {
-                model: "A".into(),
-                variant: PromptVariant::Original,
-                outcome: AttemptOutcome::ZeroImages,
-            },
-        ];
-        let v = build_image_failed_meta(
-            "composed final",
-            "realistic",
-            Some("3:4"),
-            None,
-            "face",
-            true,
-            &attempts,
-        );
-        assert_eq!(v["prompt"], "composed final");
-        assert_eq!(v["style"], "realistic");
-        assert_eq!(v["aspect_ratio"], "3:4");
-        assert!(v["resolution"].is_null());
-        assert_eq!(v["image_ref"], "face");
-        assert_eq!(v["face_ref_used"], true);
-        assert_eq!(v["attempts"][0]["status"], 400);
-        assert_eq!(v["attempts"][1]["outcome"], "zero_images");
-    }
-
-    #[test]
-    fn winning_image_prompt_picks_variant() {
-        use eros_engine_llm::openrouter::PromptVariant;
-        assert_eq!(winning_image_prompt(PromptVariant::Original, "C", "O"), "O");
-        assert_eq!(winning_image_prompt(PromptVariant::Composed, "C", "O"), "C");
-        assert_eq!(winning_image_prompt(PromptVariant::Single, "C", "O"), "C");
     }
 
     #[test]
@@ -3813,6 +3518,7 @@ mod tests {
                 "total_tokens": 14,
             })),
             generation_id: Some("gen-1".into()),
+            ghost_fallback: false,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "done");
@@ -3878,11 +3584,41 @@ mod tests {
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         // Spec §1.5 done schema permits `usage: null` — do NOT omit.
         assert!(v.get("usage").is_some());
         assert!(v["usage"].is_null());
+    }
+
+    #[test]
+    fn done_frame_omits_ghost_fallback_when_false() {
+        let f = ProtocolFrame::Done {
+            message_id: "m".into(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            ghost_fallback: false,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(!s.contains("ghost_fallback"), "false must be omitted: {s}");
+    }
+
+    #[test]
+    fn done_frame_serializes_ghost_fallback_when_true() {
+        let f = ProtocolFrame::Done {
+            message_id: "m".into(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            ghost_fallback: true,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(
+            s.contains("\"ghost_fallback\":true"),
+            "true must serialize: {s}"
+        );
     }
 
     #[test]
@@ -4301,6 +4037,80 @@ mod tests {
         assert_eq!(usage["total_tokens"], 1307);
     }
 
+    /// Codex P2 (PR #141): an idempotent replay of an empty-reply ghost-fallback
+    /// row must re-emit Done{ghost_fallback:true} — wire-identical to the original
+    /// live stream (a real ghost likewise re-emits its ghost frames on replay). A
+    /// pseudo-ghost / garble row also carries a fallback_reason but is a non-empty
+    /// canned/salvaged reply, so it must replay as ghost_fallback:false.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_reemits_ghost_fallback_only_for_empty_reply_fallbacks(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+
+        let mk = |content: &str, reason: &str| eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("m/x".into()),
+            usage: None,
+            generation_id: Some("gen-x".into()),
+            assistant_action_type: Some("reply".into()),
+            pre_filter_content: None,
+            metadata: Some(serde_json::json!({ "fallback_reason": reason })),
+        };
+
+        let done_flag = |frames: &[ProtocolFrame]| -> bool {
+            frames
+                .iter()
+                .find_map(|f| match f {
+                    ProtocolFrame::Done { ghost_fallback, .. } => Some(*ghost_fallback),
+                    _ => None,
+                })
+                .expect("a Done frame")
+        };
+
+        // Empty-reply ghost fallback → replay re-emits ghost_fallback:true.
+        let ghost: Vec<ProtocolFrame> = replay_stream(
+            state.clone(),
+            session_id,
+            user_id,
+            false,
+            vec![mk("", "empty_completion")],
+        )
+        .collect()
+        .await;
+        assert!(
+            done_flag(&ghost),
+            "empty_completion fallback row must replay as ghost_fallback:true"
+        );
+
+        // Pseudo-ghost: a fallback_reason is present but the content is a real
+        // canned reply → must NOT replay as a ghost.
+        let pseudo: Vec<ProtocolFrame> = replay_stream(
+            state,
+            session_id,
+            user_id,
+            false,
+            vec![mk("稍后再聊", "stream_failure")],
+        )
+        .collect()
+        .await;
+        assert!(
+            !done_flag(&pseudo),
+            "pseudo-ghost row (non-empty, stream_failure) must replay as ghost_fallback:false"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_stream_reply_terminates_cleanly_with_mock_openrouter(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -4382,6 +4192,514 @@ data: [DONE]\n\n";
             "no error frame expected, got {frames:?}",
         );
         assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn normal_reply_resets_ghost_streak(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hey\"}}],\"id\":\"gen-r\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        // Seed a non-zero ghost streak on the session's affinity row. The row
+        // doesn't exist yet at this point (created lazily by run_stream's
+        // `AffinityRepo::load_or_create`), so upsert rather than UPDATE —
+        // a bare UPDATE here would silently affect 0 rows and the later
+        // load_or_create would just insert a fresh ghost_streak=0 row,
+        // making the assertion below pass trivially regardless of the
+        // reset/gate logic under test.
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, ghost_streak) \
+             VALUES ($1, $2, $3, 3) \
+             ON CONFLICT (session_id) DO UPDATE SET ghost_streak = 3",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J2222222222222222222222A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        let gs: i32 = sqlx::query_scalar(
+            "SELECT ghost_streak FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(gs, 0, "a real reply must reset ghost_streak");
+    }
+
+    /// Filtered mode, case (a): a reply that's entirely a bracketed artifact
+    /// strips to "" via `output_regex`, so nothing is served. That must
+    /// surface as `Done{ghost_fallback:true}` (no `Delta` at all), tag the
+    /// persisted assistant row with `metadata.fallback_reason = "regex_strip"`,
+    /// and — per the design's "既不加也不清零" — leave `ghost_streak` untouched
+    /// (gated in `run_stream` via `BurstOutcome.ghost_fallback`, asserted
+    /// separately by `normal_reply_resets_ghost_streak` for the real-reply
+    /// case). `[tasks.chat_companion].model = "primary"` is set explicitly so
+    /// the `output_regex` rule's `models` list actually targets the model
+    /// `state.model_config.resolve` picks — the default `ModelConfig` (no
+    /// `[tasks.chat_companion]` block) falls through to the compiled-in
+    /// `x-ai/grok-4-mini`, which wouldn't match a rule scoped to "primary" and
+    /// would silently fall back to LIVE mode instead of filtered.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_strip_to_empty_becomes_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Reply is entirely a bracketed artifact.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片]\"}}],\"id\":\"gen-a\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        // Seed ghost_streak = 2 on the affinity row (upsert, not a bare UPDATE:
+        // the row doesn't exist yet — created lazily by run_stream's
+        // `AffinityRepo::load_or_create` — same rationale as
+        // `normal_reply_resets_ghost_streak` above). This also happens to sit
+        // at the ghost anti-streak veto's threshold (`ghost_streak >= 2` in
+        // `eros_engine_core::ghost::ghost_permitted`), but that veto is moot
+        // here anyway: a brand-new session's `message_count < 10` already
+        // forces `pde::decide` to `ActionType::ReplyText` deterministically.
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, ghost_streak) \
+             VALUES ($1, $2, $3, 2) \
+             ON CONFLICT (session_id) DO UPDATE SET ghost_streak = 2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // One config carries both the resolved chat model ("primary") and the
+        // output_regex rule scoped to it — built via `ModelConfig::from_toml_str`
+        // + `compile_output_regex()` rather than constructing `CompiledRegexRule`
+        // by hand, so the test doesn't need `regex` as a direct dependency of
+        // eros-engine-server (mirrors the `regex_target_buffers_without_...`
+        // / `regex_strips_artifact_from_client_and_memory` tests above). The
+        // pattern matches a WHOLE reply that's just one bracketed artifact
+        // (TOML literal string — `'...'` — so the backslashes reach `regex`
+        // unescaped).
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^\s*\[[^\]]*\]\s*$'
+            "#,
+        )
+        .unwrap();
+        state.model_config = std::sync::Arc::new(regex_cfg.clone());
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("bracket-only pattern compiles"),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J3333333333333333333333A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        // Done carries ghost_fallback; no Delta was emitted.
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "expected Done{{ghost_fallback:true}}, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "no Delta for an empty reply"
+        );
+        // Audit row: empty content + fallback_reason.
+        let (content, reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "");
+        assert_eq!(reason.as_deref(), Some("regex_strip"));
+        // Affinity-neutral: ghost_streak untouched.
+        let gs: i32 = sqlx::query_scalar(
+            "SELECT ghost_streak FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(gs, 2, "ghost fallback must not reset ghost_streak");
+    }
+
+    /// Filtered mode, case (b): the served model returns a 200 OK stream
+    /// whose delta never carries a `content` field, so `acc` stays empty and
+    /// `finish_reason` is never `"length"` — an empty completion, distinct
+    /// from case (a)'s regex-strip-to-empty above. On the LAST chain attempt
+    /// (single-model chain here, so this is also the first) that must
+    /// surface as `Done{ghost_fallback:true}` tagged
+    /// `metadata.fallback_reason = "empty_completion"`, NOT the
+    /// pseudo-ghost/Error truncation path. The `output_regex` rule below
+    /// targets the chain model ("primary") purely so `regex_targets_chain`
+    /// forces FILTERED mode — an unpinned/untargeted rule would silently
+    /// fall through to LIVE mode instead (see
+    /// `regex_strip_to_empty_becomes_ghost_fallback` above) — but its
+    /// pattern never matches anything, so it's a pure mode-selection no-op
+    /// and the empty-completion branch (which returns before the regex is
+    /// ever applied) never touches it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn empty_completion_last_attempt_becomes_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // 200 stream with a delta that carries no `content` at all → empty completion.
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Pin the chain model to "primary" (matching the mock) and target it
+        // with a never-matching output_regex rule: forces FILTERED mode via
+        // `regex_targets_chain` without ever altering the (already empty)
+        // reply. Built via `ModelConfig::from_toml_str` +
+        // `compile_output_regex()` — not `regex::Regex::new` by hand — since
+        // `regex` isn't a direct dependency of eros-engine-server.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^THIS_PATTERN_NEVER_MATCHES_ANYTHING$'
+            "#,
+        )
+        .unwrap();
+        state.model_config = std::sync::Arc::new(regex_cfg.clone());
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("never-matching pattern compiles"),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J4444444444444444444444A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "expected Done{{ghost_fallback:true}}, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "empty completion must not error"
+        );
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reason.as_deref(), Some("empty_completion"));
+    }
+
+    /// LIVE mode (primary-risk), case (b): the served model returns a 200 OK
+    /// stream whose delta never carries a `content` field, so `acc` stays
+    /// empty and `finish_reason` is never `"length"` — an empty completion on
+    /// the LAST (here, only) chain attempt in the un-buffered path, which
+    /// interleaves persist → Done → accept/advance per attempt. Unlike the
+    /// filtered-mode sibling above, this test carries NO `output_regex` rule
+    /// and no LLM `filter` — `test_state`'s bare defaults leave both
+    /// `regex_targets_chain` and `llm_filter_arms` false, so `filtered_mode`
+    /// is false and the turn runs the LIVE branch under test. Must surface as
+    /// `Done{ghost_fallback:true}` tagged `metadata.fallback_reason =
+    /// "empty_completion"`, NOT the pseudo-ghost/Error truncation path that
+    /// the sibling `run_stream_reply_terminates_cleanly_with_mock_openrouter`
+    /// / multi-attempt tests exercise.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn empty_completion_live_last_attempt_becomes_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // 200 stream with a delta that carries no `content` at all → empty completion.
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-el\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // No output_regex, no filter → live mode.
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J5555555555555555555555B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "expected Done{{ghost_fallback:true}}, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "empty completion must not error"
+        );
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reason.as_deref(), Some("empty_completion"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -4482,6 +4800,356 @@ data: [DONE]\n\n";
                 "a Reply burst ran but no Done frame carried usage to filter"
             );
         }
+    }
+
+    // ── Delegate-only image drawing — the two arms end-to-end ──────────────
+    // These drive `run_stream` with a `force`d image action (mode selects the
+    // arm), asserting the delegated frame sequence, that NO in-engine draw
+    // happens, and that only the minimal `metadata.image` marker is persisted.
+    // The model config OMITS `[tasks.chat_image_generation]` — proving the gate
+    // flip: the chat stream still emits `image_request` (and the marker) with no
+    // image-gen task configured. It also omits the judge (`pde_decision`) and the
+    // composer (`chat_image_prompt_compose`), so the image-only turn makes zero
+    // LLM calls and the outcome is deterministic.
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_image_emits_image_request_and_marker_no_draw(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Any OpenRouter call 500s — so an ERRONEOUS draw would surface as an
+        // `image_failed` frame (asserted absent). The correct delegated
+        // image-only path makes no provider call at all.
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "draw me",
+                "01J9000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "draw me".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    image_prompt: Some("a beach at sunset".into()),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        // Exact delegated image-only sequence: meta → done → image_request → final.
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "done", "image_request", "final"],
+            "delegated image-only sequence, got {frames:?}"
+        );
+        // No in-engine draw-lifecycle frame may appear in the delegated path.
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ImagePending { .. }
+                    | ProtocolFrame::ImageAttempt { .. }
+                    | ProtocolFrame::Image { .. }
+                    | ProtocolFrame::ImageFailed { .. }
+            )),
+            "no draw frame may appear: {frames:?}"
+        );
+        // meta carries reply_image and no model (the consumer chooses the model).
+        let (action, model) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta {
+                    action_type, model, ..
+                } => Some((*action_type, model.clone())),
+                _ => None,
+            })
+            .expect("meta present");
+        assert_eq!(action, FrameActionType::ReplyImage);
+        assert!(model.is_none(), "delegated meta carries no model");
+        // image_request: face ref + base64 composed wire prompt containing the subject.
+        let (composed_b64, image_ref) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt,
+                    image_ref,
+                    ..
+                } => Some((composed_prompt.clone(), *image_ref)),
+                _ => None,
+            })
+            .expect("image_request present");
+        assert_eq!(image_ref, eros_engine_core::types::ImageRef::Face);
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("a beach at sunset"),
+            "composed wire prompt should contain the subject: {composed}"
+        );
+
+        // Persistence: minimal marker only (seed subject under `prompt`), and NOT
+        // the composed wire prompt / model / generation_id / url.
+        let meta_row: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let img = meta_row.expect("assistant row has metadata")["image"].clone();
+        assert_eq!(
+            img["prompt"], "a beach at sunset",
+            "marker keeps the seed subject"
+        );
+        assert!(img.get("model").is_none(), "marker must not store a model");
+        assert!(
+            img.get("generation_id").is_none(),
+            "marker must not store a generation id"
+        );
+        assert!(img.get("url").is_none(), "marker must not store a url");
+        assert_ne!(
+            img["prompt"],
+            serde_json::json!(composed),
+            "the composed wire prompt must not be persisted (only the seed subject)"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_appends_image_request_and_marker(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The text reply streams from this mock (≥ MIN_FILTERED_OUTPUT_CHARS so it
+        // is not degraded as too-short). The delegated image path makes NO extra
+        // (draw) call; a draw would reuse this endpoint but we assert no
+        // image_failed / image frame appears.
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9111111111111111111111A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    // default mode = TextImage ⇒ ReplyTextImage
+                    image_prompt: Some("in a red dress".into()),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        // meta(reply_text_image) → delta* → done → image_request → final.
+        assert_eq!(types.first().map(String::as_str), Some("meta"), "{types:?}");
+        assert_eq!(types.last().map(String::as_str), Some("final"), "{types:?}");
+        assert!(
+            types.iter().any(|t| t == "delta"),
+            "text burst delta present: {types:?}"
+        );
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request present");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done: {types:?}"
+        );
+        assert_eq!(
+            types[ir_pos + 1],
+            "final",
+            "image_request immediately before final"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| t.as_str() == "image_request")
+                .count(),
+            1,
+            "exactly one image_request"
+        );
+        // No draw-lifecycle frames.
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::ImagePending { .. }
+                    | ProtocolFrame::ImageAttempt { .. }
+                    | ProtocolFrame::Image { .. }
+                    | ProtocolFrame::ImageFailed { .. }
+            )),
+            "no draw frame may appear: {types:?}"
+        );
+        let action = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Meta { action_type, .. } => Some(*action_type),
+                _ => None,
+            })
+            .expect("meta present");
+        assert_eq!(action, FrameActionType::ReplyTextImage);
+
+        // The minimal marker was MERGED onto the assistant TEXT row (content
+        // non-empty), carrying only the seed subject.
+        let row: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!row.0.is_empty(), "the text reply row has content");
+        let img = row.1.expect("row has metadata")["image"].clone();
+        assert_eq!(img["prompt"], "in a red dress");
+        assert!(img.get("model").is_none(), "marker must not store a model");
+        assert!(
+            img.get("generation_id").is_none(),
+            "marker must not store a generation id"
+        );
+        assert!(img.get("url").is_none(), "marker must not store a url");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -7347,6 +8015,272 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Codex P2 (PR #141): a NON-last empty completion in LIVE mode is a
+    /// superseded (truncated) attempt that advances the chain — NOT a spurious
+    /// successful empty turn, and NOT a ghost. Only the LAST empty attempt is the
+    /// ghost fallback; here a later model replies, so there is no ghost at all.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_nonlast_empty_completion_advances_as_truncated(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "e/x" returns a 200 stream with NO content (empty completion);
+        // fallback "f/x" streams clean text.
+        let empty = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"e/x\"}\n\ndata: [DONE]\n\n";
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "e/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(empty, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JEMPTYADVANCE000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "e/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        // One Done per attempt: the non-last empty attempt is truncated (a
+        // superseded "replace me" signal), NOT a ghost; the clean fallback is a
+        // normal accepted reply.
+        let dones: Vec<(bool, bool)> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Done {
+                    truncated,
+                    ghost_fallback,
+                    ..
+                } => Some((*truncated, *ghost_fallback)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 2, "one Done per attempt: {frames:?}");
+        assert_eq!(
+            dones[0],
+            (true, false),
+            "non-last empty attempt must be truncated, never a spurious success or ghost: {frames:?}"
+        );
+        assert_eq!(
+            dones[1],
+            (false, false),
+            "the clean fallback is a normal accepted reply: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "no ghost fallback when a later model replies: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, ProtocolFrame::Delta { content, .. } if content == "hi there")
+            ),
+            "the clean fallback text must be delivered: {frames:?}"
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback remains in produced; got {produced:?}"
+        );
+        assert_eq!(produced[0].full_text, "hi there");
+    }
+
+    /// Codex P2 (PR #141, round 3): the FILTERED empty-completion ghost fallback
+    /// must retain an (empty) produced row like the live/regex-strip paths —
+    /// otherwise a ReplyTextImage turn's trailing image_request (gated on
+    /// `produced.last()`) silently drops the image half in filtered mode only.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_empty_completion_ghost_retains_produced_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Never-matching regex targeting "primary" forces FILTERED mode.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^THIS_PATTERN_NEVER_MATCHES_ANYTHING$'
+            "#,
+        )
+        .unwrap();
+        state.output_regex =
+            std::sync::Arc::new(regex_cfg.compile_output_regex().expect("compiles"));
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JFILTEREDIMG0000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "primary".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            umid,
+            FrameActionType::ReplyTextImage,
+            "reply",
+            ActionType::ReplyTextImage,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "filtered empty completion must ghost: {frames:?}"
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "filtered empty-completion ghost must retain a produced row so ReplyTextImage's \
+             image_request still fires; got {produced:?}"
+        );
+        assert_eq!(
+            produced[0].full_text, "",
+            "the retained produced row is empty (memory/insight/eval-neutral)"
+        );
+    }
+
     /// Codex P2 (round 6): a COMPLETE garbled primary followed by a failing fallback
     /// must still be salvaged — the repaired primary text is retained across the
     /// chain and emitted as the replacement, not discarded for a pseudo-ghost.
@@ -8951,6 +9885,183 @@ data: [DONE]\n\n"
         assert_eq!(chain["reason"], "chain_exhausted");
         assert_eq!(mk(ImageFailReason::ZeroImages)["reason"], "zero_images");
         assert_eq!(mk(ImageFailReason::ConfigError)["reason"], "config_error");
+    }
+
+    #[test]
+    fn image_request_frame_serializes_with_base64_and_snake_ref() {
+        use base64::Engine as _;
+        let prompt = "写实风格，海边少女，画幅 3:4"; // CJK, exercises base64 of UTF-8
+        let f = build_image_request_frame(
+            "01ABC".into(),
+            prompt,
+            eros_engine_core::types::ImageRef::Previous,
+            Some("3:4"),
+        );
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], "image_request");
+        assert_eq!(v["message_id"], "01ABC");
+        assert_eq!(v["image_ref"], "previous");
+        assert_eq!(v["aspect_ratio"], "3:4");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["composed_prompt"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), prompt);
+    }
+
+    #[test]
+    fn delegated_marker_preserves_image_awareness() {
+        // Seed subject under `prompt` (the key assistant_transcript_line reads),
+        // plus aspect — and NOTHING else (no composed prompt / model / gen id).
+        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"));
+        assert_eq!(marker["prompt"], "beach at sunset");
+        assert_eq!(marker["aspect_ratio"], "3:4");
+        assert_eq!(
+            marker.as_object().unwrap().len(),
+            2,
+            "marker must be minimal"
+        );
+        // The §5 regression guard: transcript still annotates it as a prior image.
+        let wrapped = serde_json::json!({ "image": marker });
+        let line = assistant_transcript_line("", Some(&wrapped));
+        assert!(line.contains("beach at sunset"), "subject surfaced: {line}");
+        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_ne!(line.trim(), "", "image turn must not be a blank line");
+
+        // No aspect => still a valid one-key marker that annotates.
+        let m2 = build_delegated_image_marker("a portrait", None);
+        assert_eq!(m2.as_object().unwrap().len(), 1);
+        let w2 = serde_json::json!({ "image": m2 });
+        assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
+    }
+
+    #[test]
+    fn delegated_image_only_frames_are_meta_done_image_request() {
+        let frames = delegated_image_only_frames(
+            "01XYZ".into(),
+            "a wire prompt",
+            eros_engine_core::types::ImageRef::Face,
+            Some("1:1"),
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(types, ["meta", "done", "image_request"]);
+        let meta = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(meta["action_type"], "reply_image");
+        assert!(
+            meta.get("model").is_none(),
+            "delegated meta carries no model"
+        );
+    }
+
+    #[tokio::test]
+    async fn draw_image_frames_success_emits_pending_attempt_image() {
+        use futures_util::StreamExt as _;
+        // One candidate returns a valid image on the first try.
+        let server = wiremock::MockServer::start().await;
+        let wire = serde_json::json!({
+            "id": "gen_1",
+            "model": "served-model",
+            "usage": {"total_tokens": 1},
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "images": [{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(wire))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let frames: Vec<ProtocolFrame> = draw_image_frames(client, req, "01ECHO".into())
+            .collect()
+            .await;
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["image_pending", "image_attempt", "image"],
+            "{frames:?}"
+        );
+        // The image frame carries the data url and echoes message_id.
+        let (data_url, mid) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Image {
+                    data_url,
+                    message_id,
+                    ..
+                } => Some((data_url.clone(), message_id.clone())),
+                _ => None,
+            })
+            .expect("image frame present");
+        assert_eq!(data_url, "data:image/png;base64,AAAA");
+        assert_eq!(
+            mid, "01ECHO",
+            "message_id echoes the request id on every frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn draw_image_frames_chain_exhausted_emits_image_failed() {
+        use futures_util::StreamExt as _;
+        // Every request 500s ⇒ ChainExhausted ⇒ image_failed(chain_exhausted).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+        let req = eros_engine_llm::openrouter::ImageGenRequest {
+            model: "m1".into(),
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let frames: Vec<ProtocolFrame> = draw_image_frames(client, req, "01ECHO".into())
+            .collect()
+            .await;
+        assert_eq!(
+            serde_json::to_value(frames.first().unwrap()).unwrap()["type"],
+            "image_pending"
+        );
+        let last = serde_json::to_value(frames.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "image_failed");
+        assert_eq!(last["reason"], "chain_exhausted");
     }
 
     #[tokio::test]
