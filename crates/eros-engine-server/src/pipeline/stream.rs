@@ -31,7 +31,7 @@ pub enum StreamErrorCode {
 /// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image`.
 ///
 /// Asymmetry worth calling out: this is the *wire* action, coarser than the
-/// internal PDE [`ActionType`](eros_engine_core::types::ActionType). A plain-text
+/// internal PDE [`ActionType`]. A plain-text
 /// turn (`ActionType::ReplyText`, audited as `reply_text`) is reported here as
 /// **`reply`** — there is no `reply_text` on the wire. The text+image variant, by
 /// contrast, keeps its full name **`reply_text_image`**. So `reply_text_image`
