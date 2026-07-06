@@ -544,6 +544,15 @@ pub enum UpsertUserOutcome {
     DuplicateInProgress { user_message_id: Uuid },
 }
 
+/// Outcome of `insert_voice_user_message`. The route uses this to distinguish
+/// a fresh user turn (proceed to generation) from a replayed `client_msg_id`
+/// (return 409, never regenerate a second assistant reply).
+#[derive(Debug, Clone, Copy)]
+pub enum VoiceUserInsert {
+    Inserted(Uuid),
+    Duplicate(Uuid),
+}
+
 impl<'a> ChatRepo<'a> {
     /// Insert a user message keyed by `client_msg_id` with permanent
     /// idempotency. The partial unique index on `(session_id, client_msg_id)`
@@ -825,14 +834,16 @@ impl<'a> ChatRepo<'a> {
 
     /// Idempotently persist a user turn on the voice channel. Mirrors the
     /// `(session_id, client_msg_id)` uniqueness of the text path but writes
-    /// `channel = 'voice'` and skips all replay/ghost machinery. Returns the row
-    /// id — the existing row's id when `client_msg_id` was already seen.
+    /// `channel = 'voice'` and skips all replay/ghost machinery. Returns
+    /// which case occurred — `Duplicate` when `client_msg_id` was already
+    /// seen (existing row's id), `Inserted` (fresh row's id) otherwise — so
+    /// callers can refuse to regenerate a reply for a duplicate.
     pub async fn insert_voice_user_message(
         &self,
         session_id: Uuid,
         content: &str,
         client_msg_id: &str,
-    ) -> Result<Uuid, sqlx::Error> {
+    ) -> Result<VoiceUserInsert, sqlx::Error> {
         if let Some(id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM engine.chat_messages \
              WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
@@ -843,7 +854,7 @@ impl<'a> ChatRepo<'a> {
         .fetch_optional(self.pool)
         .await?
         {
-            return Ok(id);
+            return Ok(VoiceUserInsert::Duplicate(id));
         }
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
@@ -854,7 +865,7 @@ impl<'a> ChatRepo<'a> {
         .bind(client_msg_id)
         .fetch_one(self.pool)
         .await?;
-        Ok(id)
+        Ok(VoiceUserInsert::Inserted(id))
     }
 
     /// Persist an assistant turn on the voice channel: `role='assistant'`,
@@ -2757,15 +2768,24 @@ mod tests {
 
         // User insert: idempotent on client_msg_id.
         let cmid = "01J9000000000000000000VOICE";
-        let u1 = repo
+        let u1 = match repo
             .insert_voice_user_message(session_id, "hello", cmid)
             .await
-            .unwrap();
-        let u2 = repo
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        match repo
             .insert_voice_user_message(session_id, "hello again", cmid)
             .await
-            .unwrap();
-        assert_eq!(u1, u2, "same client_msg_id must return the same row id");
+            .unwrap()
+        {
+            VoiceUserInsert::Duplicate(id) => {
+                assert_eq!(id, u1, "same client_msg_id must return the same row id");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
 
         let (role, channel): (String, Option<String>) =
             sqlx::query_as("SELECT role, channel FROM engine.chat_messages WHERE id = $1")

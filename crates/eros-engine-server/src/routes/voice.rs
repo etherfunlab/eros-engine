@@ -15,7 +15,7 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::chat::{ChatRepo, VoiceUserInsert};
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -152,10 +152,23 @@ pub async fn voice_turn_stream(
             )
         })?;
 
-    // Persist the user turn (idempotent on (session_id, client_msg_id)).
-    let user_message_id = chat_repo
+    // Persist the user turn (idempotent on (session_id, client_msg_id)). A
+    // duplicate client_msg_id must NOT trigger a second assistant reply /
+    // second upstream LLM call — return 409 instead of regenerating.
+    let user_message_id = match chat_repo
         .insert_voice_user_message(session_id, &req.content, &req.client_msg_id)
-        .await?;
+        .await?
+    {
+        VoiceUserInsert::Inserted(id) => id,
+        VoiceUserInsert::Duplicate(_) => {
+            return Err(pre(
+                StatusCode::CONFLICT,
+                "duplicate",
+                "duplicate client_msg_id for this session",
+                "这条消息已在处理",
+            ));
+        }
+    };
 
     let turn = VoiceTurn {
         session_id,
@@ -308,5 +321,37 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_409_on_duplicate_client_msg_id(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let client_msg_id = "01J2222222222222222222222A";
+
+        // Pre-seed a user voice row with this client_msg_id, as if a first
+        // request already landed it.
+        let chat_repo = ChatRepo { pool: &pool };
+        match chat_repo
+            .insert_voice_user_message(session_id, "hi", client_msg_id)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(_) => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let jwt = mint_jwt(user_id);
+        // No mock OpenRouter configured — the 409 must happen before any
+        // generation is attempted.
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({"content":"hi","client_msg_id": client_msg_id}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 }

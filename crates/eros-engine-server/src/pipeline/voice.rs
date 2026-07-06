@@ -179,8 +179,10 @@ pub fn run_voice_turn(
             }
         }
 
-        // Nothing ever streamed and no successful open ⇒ upstream error.
-        if acc.is_empty() && served_model.is_none() && last_gen_id.is_none() {
+        // Any empty accumulation — no successful open, or a stream that sent
+        // only metadata (id/model) and then errored or ended without content
+        // — is an upstream failure. Never emit an empty `done`.
+        if acc.is_empty() {
             yield ProtocolFrame::Error {
                 code: StreamErrorCode::UpstreamUnavailable,
                 retryable: true,
@@ -326,10 +328,14 @@ data: [DONE]\n\n";
 
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
-        let umid = repo
+        let umid = match repo
             .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOICE")
             .await
-            .unwrap();
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
 
         // State with a chat_voice task + mock OpenRouter.
         let mut state = crate::routes::companion::test_state(pool.clone());
@@ -385,6 +391,119 @@ data: [DONE]\n\n";
         .unwrap();
         assert_eq!(content, "hi there");
         assert_eq!(channel.as_deref(), Some("voice"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_empty_completion_is_error(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Metadata-only frame (no content delta) then a clean [DONE] — the
+        // stream ends without ever producing text.
+        let body = "\
+data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC3")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        // An empty completion must yield an Error frame, never a Done.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "expected an Error frame, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Done { .. })),
+            "must not emit Done on an empty completion; got {frames:?}"
+        );
+
+        // No assistant row persisted.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "no assistant row should be persisted on empty completion"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -444,10 +563,14 @@ data: [DONE]\n\n";
 
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
-        let umid = repo
+        let umid = match repo
             .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC2")
             .await
-            .unwrap();
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
 
         // State with a chat_voice task + mock OpenRouter.
         let mut state = crate::routes::companion::test_state(pool.clone());
