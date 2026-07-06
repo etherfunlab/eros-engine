@@ -579,28 +579,32 @@ pub fn build_prompt(
 /// the JSONB shape that `InsightRepo::merge` accepts, with each field's
 /// `compute_training_level` weight implicitly determined by presence.
 pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
-companion_insights schema (all fields optional, only include if confident):
+companion_insights schema（真人用户画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
-  "city": "string — 常住城市（用户长期居住的城市）",
-  "location": "string — 目前所在地（用户此刻所在的城市/地点，如出差、旅游）",
-  "hometown": "string — 老家（用户的籍贯 / 出生成长地）",
-  "nationality": "string — 国籍",
-  "occupation": "string — job/career",
-  "mbti_guess": "string — e.g. INFP",
-  "love_values": "string — attitude toward love & relationships",
-  "interests": ["list", "of", "hobbies"],
-  "emotional_needs": "string — what emotional support they need",
-  "life_rhythm": "string — e.g. 夜猫子, 早睡早起",
+  "city": "string — 常住城市（用户长期居住/生活的地方）。写出具体地点，如事实支持可加居住时长等细节，不要只写省份或泛称。例：深圳南山，工作生活五年多",
+  "location": "string — 此刻/近期所在地（出差、旅行、临时停留），仅当明显不同于常住城市才填。例：这周在东京出差",
+  "hometown": "string — 老家 / 籍贯 / 出生成长地，仅当用户明确提到才填，不要用当前居住城市替代。例：湖南长沙人，大学才离开",
+  "nationality": "string — 国籍/地区身份。例：中国香港",
+  "occupation": "string — 职业与工作状态，写出行业/职级/公司类型/日常细节，不要只写职位名词（不要只写「工程师」）。例：在深圳一家中厂做后端工程师，常年加班，最近想跳槽",
+  "mbti_guess": "string — MBTI。用户自报的类型直接填；没有自报时，只有当事实里反复出现同一类典型行为/表达模式，才可基于此谨慎推断，并在值里带上推测措辞（如「像/偏」），不要凭一两句话臆断。例：用户自述 INFP；或 偏 INFP，多次表现出重意义、不爱社交",
+  "love_values": "string — 对爱情/亲密关系的态度与期待，写成一两句具体总结。例：渴望被理解胜过浪漫仪式，慢热，怕被抛弃所以习惯先推开人",
+  "interests": ["array of strings — 兴趣爱好，每项 4~12 个汉字的具体短语，带一个实际细节，不要是孤立的单字/双字标签（如「爬山」「音乐」）。例：周末常去爬山 / 沉迷手冲咖啡 / 养了只橘猫"],
+  "emotional_needs": "string — 需要什么样的情感支持，写成一两句。例：下班后想有人先听他吐槽、被肯定，不喜欢被讲道理",
+  "life_rhythm": "string — 作息与生活节奏，写出具体模式，不要只写单一标签（不要只写「夜猫子」）。例：典型夜猫子，凌晨两三点睡、中午起，靠咖啡和外卖过日子",
   "matching_preferences": {
-    "preferred_gender": "string",
+    "preferred_gender": "string — 偏好对象性别",
     "age_range": [min_int, max_int],
-    "deal_breakers": ["list"]
+    "deal_breakers": ["array of strings — 无法接受的点，每项一个具体短语。例：长期冷暴力"]
   },
-  "personality_traits": ["list", "of", "traits"]
+  "personality_traits": ["array of strings — 性格特质，每项 4~12 个汉字的具体短语，带依据/情境，不要是孤立单字（如「内向」「幽默」）。例：嘴硬心软 / 难过也说没事 / 对朋友很讲义气"]
 }
-地理字段示例：一个在深圳工作的香港新界人到台北旅游 → city=深圳, location=台北, hometown=新界, nationality=中国香港
-Return ONLY a JSON object with the fields you are confident about.
-Do not invent or guess anything not clearly supported by the facts.
+地理字段示例：一个在深圳工作的香港新界人到台北旅游 → city=深圳, location=台北, hometown=新界, nationality=中国香港。
+填写规范：
+- 只填【用户事实】清楚支持的字段；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
+- 绝不虚构、外推或编造事实中没有的信息；mbti_guess 的推断规则见上，且仍需基于事实中反复出现的信号，不要凭单次只言片语臆断。
+- 更新 matching_preferences 等嵌套对象时，把仍然成立的旧字段一起带上返回完整对象，不要只给单个子字段（否则旧值会被覆盖丢失）。
+- 只输出上表列出的字段名，不要新增、不要改名。
+- 仅输出一个 JSON 对象，不要 markdown、不要解释。
 "#;
 
 /// Build the *user* message for the facts-extraction call: just the turn,
@@ -639,7 +643,8 @@ pub fn extract_structured_insights_prompt(
     format!(
         "以下是从对话中提取的【用户】事实：\n\
          {facts_str}\n\n\
-         现有的用户画像（companion_insights，供参考，不要重复已知信息）：\n\
+         现有的用户画像（companion_insights，供参考；如新事实能让某个已有字段更完整或更准确，\
+         请输出更新后的完整版本覆盖旧值，不要因为字段已存在就跳过或原样重复）：\n\
          {existing_str}\n\n\
          请根据上方的【用户事实】，填充以下 schema 中你有信心的字段。\
          schema 描述的是【真人用户】本人——occupation、city、location 等都指用户，绝不是 AI 伴侣：\n\
