@@ -779,7 +779,15 @@ fn drive_chat_burst(
                     {
                         tracing::warn!("stream(filtered): ghost-fallback persist failed: {e}");
                     }
-                    outcome.lock().unwrap().ghost_fallback = true;
+                    {
+                        // Mirror the sibling truncated branch: report the
+                        // fallback attempts consumed so the Final frame's
+                        // retries_chat isn't under-reported when only the LAST
+                        // chain model returns an empty completion.
+                        let mut o = outcome.lock().unwrap();
+                        o.ghost_fallback = true;
+                        o.retries_chat = (chain.len() as u32).saturating_sub(1);
+                    }
                     yield ProtocolFrame::Meta {
                         message_id: ulid_string(msg_ulid),
                         action_type: frame_action,
