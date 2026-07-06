@@ -1014,7 +1014,11 @@ fn drive_chat_burst(
             // Empty visible text (regex-strip-to-empty, case a) means nothing
             // was served: the assistant row is a ghost fallback, not a normal
             // reply — tag it in metadata and keep affinity's ghost_streak
-            // untouched (see BurstOutcome.ghost_fallback gating).
+            // untouched (see BurstOutcome.ghost_fallback gating). Tagging it
+            // `"regex_strip"` is always correct here: `visible` can only be
+            // empty via the regex-strip-to-empty branch above, since the LLM
+            // output filter fails open to the (non-empty) `cleaned` text and
+            // never emptifies an otherwise non-empty reply.
             let is_ghost = visible.is_empty();
 
             if !visible.is_empty() {

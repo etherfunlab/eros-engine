@@ -1542,4 +1542,132 @@ mod tests {
         ];
         assert!(should_write_user_turn("hello", &produced));
     }
+
+    /// Locks the *accepted* partial affinity-neutrality contract for a
+    /// fallback-ghost turn (design spec
+    /// `docs/superpowers/specs/2026-07-06-empty-reply-ghost-fallback-design.md`
+    /// §6). `post_process::run` has no visibility into
+    /// `BurstOutcome.ghost_fallback` — from here a fallback-ghost turn (regex-
+    /// strip-to-empty or empty-completion) is indistinguishable from any other
+    /// `ReplyText` turn that happens to carry empty `produced` text. The
+    /// maintainer explicitly accepted that this path is NOT fully affinity-
+    /// neutral: `persist_affinity` still writes an `event_type = "message"`
+    /// event and applies the user-derived rule delta (`predict_reply_deltas`),
+    /// even though the LLM eval / memory / insight writes are all skipped. If
+    /// a future change makes this fully neutral (or silently regresses further,
+    /// e.g. by resurrecting a `ghost` event here), this test must fail and
+    /// force an explicit decision rather than drifting quietly.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fallback_ghost_turn_writes_message_event_with_eval_skipped(pool: sqlx::PgPool) {
+        let state = crate::routes::companion::test_state(pool.clone());
+
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // "hi" is short enough to trip both the PDE's short-message rule delta
+        // (a patience penalty) AND `eval_skip_reason`'s `short_user_msg` gate,
+        // so the LLM affinity eval never fires while the rule delta still does.
+        let event = Event::UserMessage {
+            content: "hi".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            history_anchor: Default::default(),
+        };
+
+        // Mirrors what `pde::decide` would compute for a short user message
+        // (`predict_reply_deltas`'s short-message patience penalty) — built
+        // directly here since `run` takes an already-decided `ActionPlan`.
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: eros_engine_core::affinity::AffinityDeltas {
+                patience: -0.02,
+                ..Default::default()
+            },
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            image_prompt: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+
+        // EMPTY text — this is exactly what a fallback-ghost turn produces when
+        // it is served through the `ReplyText` arm.
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: String::new(),
+            action: ActionType::ReplyText,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            event,
+            plan,
+            produced,
+        )
+        .await;
+
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT e.event_type, e.context \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "a fallback-ghost turn still writes exactly one affinity event \
+             (accepted, NOT neutral); got {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "message",
+            "NOT 'ghost' — post_process::run can't see BurstOutcome.ghost_fallback, \
+             so a fallback-ghost turn is indistinguishable from a real empty reply \
+             and takes the same event_type=\"message\" path"
+        );
+        assert_eq!(
+            rows[0].1.get("eval_skip_reason").and_then(|v| v.as_str()),
+            Some("short_user_msg"),
+            "the LLM affinity eval must still be skipped (the guaranteed-neutral \
+             half of the contract); context: {:?}",
+            rows[0].1
+        );
+
+        // The rule-based delta (user-derived, not from the empty reply) still
+        // moved the vector: default patience 0.5 - 0.02 = 0.48 (test_state's
+        // ema_inertia = 0.0 → applied 1:1, no smoothing).
+        let patience: f64 = sqlx::query_scalar(
+            "SELECT patience FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (patience - 0.48).abs() < 1e-9,
+            "rule delta (-0.02 patience) still applied even though the reply \
+             was empty; got {patience}"
+        );
+    }
 }
