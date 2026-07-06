@@ -109,6 +109,11 @@ pub fn run_voice_turn(
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(WireMessage { role: "system".into(), content: system_prompt });
         for m in history {
+            if m.content.is_empty() {
+                continue; // defensive: never emit an empty-content wire message
+                          // (e.g. a caption-less image turn from a mixed session) —
+                          // some providers reject empty messages.
+            }
             let role = match m.role.as_str() {
                 "assistant" => "assistant",
                 "user" | "gift_user" => "user",
@@ -380,5 +385,131 @@ data: [DONE]\n\n";
         .unwrap();
         assert_eq!(content, "hi there");
         assert_eq!(channel.as_deref(), Some("voice"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_skips_empty_content_history_rows(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3},\"id\":\"gen-v\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A stray empty-content assistant row (e.g. a caption-less image turn
+        // from a mixed session) landing BEFORE the voice user turn. It must be
+        // skipped in the wire-message mapping, never sent upstream.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', '')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC2")
+            .await
+            .unwrap();
+
+        // State with a chat_voice task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        // Stream still completes cleanly: delta(s) carry the text, terminal
+        // frame is Done, no Error — the empty history row must not break the
+        // turn.
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi there");
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Done { .. })));
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Error { .. })));
+
+        // The outgoing request body must NOT contain the empty-content row —
+        // proof the skip guard actually dropped it from the wire mapping.
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        assert!(
+            !received.is_empty(),
+            "expected at least one upstream request"
+        );
+        for req in &received {
+            let req_body = String::from_utf8_lossy(&req.body);
+            assert!(
+                !req_body.contains("\"content\":\"\""),
+                "request body must not contain an empty-content message; body={req_body}",
+            );
+        }
     }
 }
