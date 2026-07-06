@@ -359,7 +359,8 @@ ownership match `message/stream`.
 store); every frame echoes `message_id`.
 
 **Errors** — `400` malformed `composed_prompt` (bad base64); `403`/`404` session
-ownership; `422` bad URL / aspect / resolution; `501` (`image_generation_disabled`)
+ownership; `422` bad URL / aspect / resolution; `429` per-user concurrent-stream
+cap reached (shared with the chat stream); `501` (`image_generation_disabled`)
 when the engine has no image-generation config — the consumer should self-draw.
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`

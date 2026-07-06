@@ -650,6 +650,7 @@ pub async fn send_message_stream(
         (status = 403, body = StreamPreErrorBody),
         (status = 404, body = StreamPreErrorBody),
         (status = 422, body = StreamPreErrorBody),
+        (status = 429, body = StreamPreErrorBody),
         (status = 501, body = StreamPreErrorBody),
     ),
     security(("bearer" = []))
@@ -713,6 +714,23 @@ pub async fn draw_image_stream(
             original_user_message_id: None,
         })
     })?;
+    // Bound concurrent draw streams per user (mirrors send_message_stream): each
+    // draw holds a provider image stream open for 15-60s, so this new SSE path
+    // must honor the same per-user cap. Acquired after the ownership + config
+    // gates so a rejected request never consumes a slot; held until the response
+    // body finishes (moved into the stream below).
+    let guard = state
+        .stream_slots
+        .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+        .ok_or_else(|| {
+            AppError::StreamPre(StreamPreError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "rate_limited",
+                message: format!("per-user stream cap reached ({CONCURRENT_STREAMS_PER_USER})"),
+                user_message: "请求过多，请稍后再试".into(),
+                original_user_message_id: None,
+            })
+        })?;
     // Resolve the reference URL (face | previous, with fallback). Draw the given
     // prompt verbatim — no compose, no persona.
     let (ref_url, _kind) = select_image_ref(
@@ -731,11 +749,23 @@ pub async fn draw_image_stream(
         max_tokens: resolved.as_ref().map(|r| r.max_tokens).unwrap_or(4096),
     };
     let proto = draw_image_frames(state.openrouter.clone(), gen_req, req.message_id.clone());
-    let sse = futures_util::StreamExt::map(proto, |frame: ProtocolFrame| {
-        let json =
-            serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
-        Ok::<_, Infallible>(Event::default().data(json))
-    });
+    // Hold the stream slot for the whole response body — released when the SSE
+    // stream is dropped (client disconnect or completion), mirroring
+    // send_message_stream.
+    let sse = futures_util::StreamExt::map(
+        async_stream::stream! {
+            let _guard = guard;
+            futures_util::pin_mut!(proto);
+            while let Some(frame) = futures_util::StreamExt::next(&mut proto).await {
+                yield frame;
+            }
+        },
+        |frame: ProtocolFrame| {
+            let json =
+                serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
+            Ok::<_, Infallible>(Event::default().data(json))
+        },
+    );
     Ok(Sse::new(sse).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
@@ -1348,6 +1378,68 @@ mod tests {
         };
         let resp = post_draw(&mut router, session_id, &mint_jwt(other), draw_body(&b64)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn draw_image_429_when_user_stream_cap_reached(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Config present so the request passes the 501 gate and reaches the slot cap.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_image_generation]\nmodel = \"img-a\"\n",
+            )
+            .unwrap(),
+        );
+        // Exhaust the user's stream slots and HOLD the guards across the request
+        // (the AppState clone below shares the same `Arc<StreamSlots>`).
+        let _held: Vec<_> = (0..CONCURRENT_STREAMS_PER_USER)
+            .map(|_| {
+                state
+                    .stream_slots
+                    .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+                    .expect("slot available")
+            })
+            .collect();
+        assert!(
+            state
+                .stream_slots
+                .try_acquire(user_id, CONCURRENT_STREAMS_PER_USER)
+                .is_none(),
+            "cap should now be exhausted"
+        );
+
+        let mut router = build_router(state.clone());
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("a cat")
+        };
+        let resp = post_draw(&mut router, session_id, &mint_jwt(user_id), draw_body(&b64)).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

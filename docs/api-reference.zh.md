@@ -320,8 +320,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 `message_id`。
 
 **错误**——`400` `composed_prompt` 非法（base64 解码失败）；`403`/`404` 会话归属；
-`422` URL/画幅/分辨率非法；`501`（`image_generation_disabled`）引擎未配置生图——
-消费方应自行绘制。
+`422` URL/画幅/分辨率非法；`429` 达到每用户并发流上限（与聊天流共用）；
+`501`（`image_generation_disabled`）引擎未配置生图——消费方应自行绘制。
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
