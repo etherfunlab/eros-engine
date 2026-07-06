@@ -21,6 +21,7 @@ pub mod companion_stream;
 pub mod debug;
 pub mod dto;
 pub mod health;
+pub mod voice;
 
 /// Compose the full app router with auth layers attached.
 ///
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let comp = OpenApiRouter::new()
         .merge(companion::router())
         .merge(companion_stream::router())
+        .merge(voice::router())
         .merge(debug::router(state.config.expose_affinity_debug))
         .merge(bff::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
@@ -49,6 +51,7 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(health::router())
         .merge(companion::router())
         .merge(companion_stream::router())
+        .merge(voice::router())
         .merge(debug::router(expose_affinity_debug))
         .merge(bff::router())
 }
