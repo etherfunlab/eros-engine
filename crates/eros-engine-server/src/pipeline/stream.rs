@@ -384,6 +384,9 @@ pub struct BurstOutcome {
     pub filtered: bool,
     pub retries_chat: u32,   // successful chat-attempt index (0 = primary)
     pub retries_filter: u32, // served filter-model index (0 when none/primary)
+    /// True when this burst ended as an empty-reply ghost fallback. The caller
+    /// skips affinity side-effects (the ghost_streak reset) when set.
+    pub ghost_fallback: bool,
 }
 
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
@@ -2922,21 +2925,25 @@ pub fn run_stream(
                         yield frame;
                     }
                 }
-                let (produced, did_filter, retries_chat, retries_filter) = {
+                let (produced, did_filter, retries_chat, retries_filter, ghost_fallback) = {
                     let g = outcome.lock().unwrap();
-                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter)
+                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter, g.ghost_fallback)
                 };
 
-                // Reset ghost streak (mirrors sync pipeline policy).
-                if let Err(e) = sqlx::query(
-                    "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
-                     WHERE session_id = $1 AND ghost_streak <> 0",
-                )
-                .bind(user_msg.session_id)
-                .execute(&state.pool)
-                .await
-                {
-                    tracing::warn!("stream: ghost streak reset failed: {e}");
+                // Reset ghost streak (mirrors sync pipeline policy). A ghost
+                // fallback (empty served reply) is affinity-neutral — do NOT
+                // reset, per the design's "既不加也不清零".
+                if !ghost_fallback {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE engine.companion_affinity SET ghost_streak = 0, updated_at = now() \
+                         WHERE session_id = $1 AND ghost_streak <> 0",
+                    )
+                    .bind(user_msg.session_id)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::warn!("stream: ghost streak reset failed: {e}");
+                    }
                 }
 
                 // ── ReplyTextImage: append the generated image AFTER the text ──
@@ -3951,6 +3958,102 @@ data: [DONE]\n\n";
             "no error frame expected, got {frames:?}",
         );
         assert!(matches!(frames.last(), Some(ProtocolFrame::Final { .. })));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn normal_reply_resets_ghost_streak(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hey\"}}],\"id\":\"gen-r\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        // Seed a non-zero ghost streak on the session's affinity row. The row
+        // doesn't exist yet at this point (created lazily by run_stream's
+        // `AffinityRepo::load_or_create`), so upsert rather than UPDATE —
+        // a bare UPDATE here would silently affect 0 rows and the later
+        // load_or_create would just insert a fresh ghost_streak=0 row,
+        // making the assertion below pass trivially regardless of the
+        // reset/gate logic under test.
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id, ghost_streak) \
+             VALUES ($1, $2, $3, 3) \
+             ON CONFLICT (session_id) DO UPDATE SET ghost_streak = 3",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J2222222222222222222222A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        let gs: i32 = sqlx::query_scalar(
+            "SELECT ghost_streak FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(gs, 0, "a real reply must reset ghost_streak");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
