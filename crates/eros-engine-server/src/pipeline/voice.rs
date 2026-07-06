@@ -150,6 +150,12 @@ pub fn run_voice_turn(
         let mut truncated = false;
 
         'candidates: for model_id in candidates {
+            // Per-attempt metadata: reset so an abandoned candidate's usage / gen_id /
+            // model / truncated never leaks onto a later fallback's reply.
+            last_usage = None;
+            last_gen_id = None;
+            served_model = None;
+            truncated = false;
             let req = ChatRequest {
                 model: model_id.clone(),
                 messages: messages.clone(),
@@ -212,9 +218,11 @@ pub fn run_voice_turn(
             return;
         }
 
-        // Persist the assistant turn only when it carries text.
+        // Persist the assistant turn only when it carries text. The DB always
+        // gets the FULL unfiltered usage; the wire `Done` frame below gets a
+        // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
+        let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
         if !acc.is_empty() {
-            let usage_json = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             if let Err(e) = chat_repo
                 .insert_voice_assistant_message(
                     turn.session_id,
@@ -222,7 +230,7 @@ pub fn run_voice_turn(
                     assistant_uuid,
                     &acc,
                     served_model.as_deref(),
-                    usage_json.as_ref(),
+                    usage_full.as_ref(),
                     last_gen_id.as_deref(),
                     truncated,
                 )
@@ -232,10 +240,16 @@ pub fn run_voice_turn(
             }
         }
 
+        let mut usage_wire = usage_full;
+        crate::routes::companion::filter_usage_keys(
+            &mut usage_wire,
+            &state.config.openrouter_usage_hidden_keys,
+        );
+
         yield ProtocolFrame::Done {
             message_id,
             truncated,
-            usage: last_usage.and_then(|u| serde_json::to_value(u).ok()),
+            usage: usage_wire,
             generation_id: last_gen_id,
             ghost_fallback: false,
         };
@@ -792,5 +806,280 @@ data: [DONE]\n\n";
                 "request body must not contain an empty-content message; body={req_body}",
             );
         }
+    }
+
+    /// Codex P2 (r5): the `Done` frame's usage must have deployment-hidden keys
+    /// (e.g. `cost`) stripped, while the persisted assistant row keeps the FULL
+    /// unfiltered usage — mirrors the text/replay paths' `filter_usage_keys` use.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_done_filters_hidden_usage_keys(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3,\"cost\":0.01},\"id\":\"gen-v\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC5")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task + mock OpenRouter, and `cost` configured
+        // as a deployment-hidden usage key.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.config.openrouter_usage_hidden_keys =
+            std::collections::HashSet::from(["cost".to_string()]);
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        let usage = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("a Done frame")
+            .expect("usage present");
+        assert!(
+            usage.get("cost").is_none(),
+            "cost must be stripped from the wire Done frame; got {usage}"
+        );
+        assert_eq!(usage["prompt_tokens"], 1);
+        assert_eq!(usage["total_tokens"], 3);
+
+        // The persisted row keeps the FULL unfiltered usage, incl. `cost`.
+        let persisted_usage: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT usage FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let persisted_usage = persisted_usage.expect("usage persisted");
+        assert_eq!(
+            persisted_usage["cost"], 0.01,
+            "DB row must keep the FULL unfiltered usage; got {persisted_usage}"
+        );
+    }
+
+    /// Codex P2 (r5): when a primary candidate emits terminal metadata (usage /
+    /// generation_id / a `length` finish) but NO content and the loop falls
+    /// through to a fallback, that abandoned metadata must never leak onto the
+    /// fallback's successful reply.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_fallback_does_not_inherit_primary_metadata(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // First request (PRIMARY) — metadata-only, a `length` finish, usage +
+        // generation_id, but NO content: an empty completion that also happens
+        // to carry terminal metadata. Limited to one match so the SECOND
+        // request (the fallback candidate) falls through to the content mock.
+        let primary_body = "\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":0,\"total_tokens\":9},\"id\":\"gen-primary\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(primary_body, "text/event-stream"),
+            )
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // Second request onward (the fallback candidate) — plain content, no
+        // usage/id/model of its own.
+        let fallback_body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(fallback_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC6")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task configured with a fallback model, +
+        // mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        assert_eq!(resolved.fallback_model, vec!["backup".to_string()]);
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "recovered");
+
+        let done = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done {
+                    truncated,
+                    generation_id,
+                    ..
+                } => Some((*truncated, generation_id.clone())),
+                _ => None,
+            })
+            .expect("a Done frame");
+        assert!(
+            !done.0,
+            "truncated must not inherit the abandoned primary's `length` finish"
+        );
+        assert_ne!(
+            done.1,
+            Some("gen-primary".to_string()),
+            "generation_id must not inherit the abandoned primary's id"
+        );
+        assert_eq!(
+            done.1, None,
+            "the successful fallback carried no generation_id of its own"
+        );
+
+        // The persisted row carries the fallback's content — proof the earlier
+        // primary's abandoned metadata never reached persistence either.
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "recovered");
     }
 }
