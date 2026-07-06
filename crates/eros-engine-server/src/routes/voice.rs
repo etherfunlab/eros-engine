@@ -16,6 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_store::chat::{ChatRepo, VoiceUserInsert};
+use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
@@ -140,6 +141,15 @@ pub async fn voice_turn_stream(
             "该服务未启用语音",
         )
     })?;
+
+    // Reject a session whose persona instance is missing/inactive BEFORE
+    // acquiring a slot or persisting the user turn — mirrors the text stream so
+    // a recoverable precondition failure never leaves an orphaned user row.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    persona_repo
+        .load_companion(instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
 
     let guard = state
         .stream_slots
@@ -354,5 +364,50 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_404_when_persona_instance_missing(pool: PgPool) {
+        // A session whose persona instance is missing/inactive must be rejected
+        // pre-stream (404) WITHOUT persisting a user row. chat_sessions.instance_id
+        // has no FK, so a dangling instance_id is possible; load_companion also
+        // filters status='active', so an archived instance takes the same path.
+        let user_id = Uuid::new_v4();
+        let missing_instance = Uuid::new_v4(); // no matching persona_instances row
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(missing_instance)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+        let jwt = mint_jwt(user_id);
+        let cmid = "01J3333333333333333333333A";
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({"content":"hi","client_msg_id": cmid}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The pre-stream 404 must not have persisted a user row.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE client_msg_id = $1",
+        )
+        .bind(cmid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "no user row should be persisted when the instance is missing"
+        );
     }
 }
