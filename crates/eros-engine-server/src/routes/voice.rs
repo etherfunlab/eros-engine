@@ -106,7 +106,12 @@ pub async fn voice_turn_stream(
 
     let chat_repo = ChatRepo { pool: &state.pool };
     let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
-        pre(StatusCode::NOT_FOUND, "session_not_found", "session not found", "会话不存在")
+        pre(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+            "会话不存在",
+        )
     })?;
     if session.user_id != user_id {
         return Err(pre(
@@ -152,7 +157,11 @@ pub async fn voice_turn_stream(
         .insert_voice_user_message(session_id, &req.content, &req.client_msg_id)
         .await?;
 
-    let turn = VoiceTurn { session_id, instance_id, user_message_id };
+    let turn = VoiceTurn {
+        session_id,
+        instance_id,
+        user_message_id,
+    };
     let proto = run_voice_turn(Arc::new(state.clone()), turn, resolved);
 
     let sse = futures_util::StreamExt::map(
@@ -164,8 +173,8 @@ pub async fn voice_turn_stream(
             }
         },
         |frame: ProtocolFrame| {
-            let json = serde_json::to_string(&frame)
-                .expect("ProtocolFrame serialization is infallible");
+            let json =
+                serde_json::to_string(&frame).expect("ProtocolFrame serialization is infallible");
             Ok::<_, Infallible>(Event::default().data(json))
         },
     );
@@ -212,13 +221,21 @@ mod tests {
         let genome_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
              VALUES ('V','p','{}'::jsonb) RETURNING id",
-        ).fetch_one(pool).await.unwrap();
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let instance_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
         ).bind(genome_id).bind(user_id).fetch_one(pool).await.unwrap();
         sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
-        ).bind(user_id).bind(instance_id).fetch_one(pool).await.unwrap()
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     fn with_voice(mut state: AppState) -> AppState {
@@ -228,9 +245,12 @@ mod tests {
         state
     }
 
-    async fn post_voice(app: &mut Router, session_id: Uuid, jwt: &str, body: serde_json::Value)
-        -> axum::http::Response<Body>
-    {
+    async fn post_voice(
+        app: &mut Router,
+        session_id: Uuid,
+        jwt: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
         let req = Request::builder()
             .method("POST")
             .uri(format!("/comp/voice/{session_id}/turn/stream"))
@@ -247,8 +267,13 @@ mod tests {
         let session_id = seed(&pool, user_id).await;
         let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
         let jwt = mint_jwt(user_id);
-        let resp = post_voice(&mut app, session_id, &jwt,
-            json!({"content":"","client_msg_id":"01J2222222222222222222222A"})).await;
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({"content":"","client_msg_id":"01J2222222222222222222222A"}),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -259,8 +284,13 @@ mod tests {
         // Default test_state has no chat_voice task.
         let mut app = build_router(crate::routes::companion::test_state(pool));
         let jwt = mint_jwt(user_id);
-        let resp = post_voice(&mut app, session_id, &jwt,
-            json!({"content":"hi","client_msg_id":"01J2222222222222222222222A"})).await;
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({"content":"hi","client_msg_id":"01J2222222222222222222222A"}),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -270,8 +300,13 @@ mod tests {
         let session_id = seed(&pool, owner).await;
         let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
         let other = mint_jwt(Uuid::new_v4());
-        let resp = post_voice(&mut app, session_id, &other,
-            json!({"content":"hi","client_msg_id":"01J2222222222222222222222A"})).await;
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &other,
+            json!({"content":"hi","client_msg_id":"01J2222222222222222222222A"}),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
