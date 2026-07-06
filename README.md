@@ -125,12 +125,12 @@ The server listens on `0.0.0.0:8080` by default. Scalar API docs are available a
 All `/comp/*` routes require `Authorization: Bearer <Supabase JWT>` by default (the `AuthValidator` trait is pluggable for other identity providers). Key endpoints:
 
 - `POST /comp/chat/start` — open a chat session against a persona.
-- `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events. Optional per-turn fields include `tier`, `prompt_traits`, `audit`, `tips_amount_usd` (tip the companion), `image_url` (send the companion a photo), and `image` (request a companion-generated image — style / model / aspect ratio / face reference).
-- `POST /comp/chat/{session_id}/message/{message_id}/image` — write back the storage URL of a companion-generated image.
+- `POST /comp/chat/{session_id}/message/stream` — **the** chat turn endpoint: token-by-token Server-Sent Events. Optional per-turn fields include `tier`, `prompt_traits`, `audit`, `tips_amount_usd` (tip the companion), `image_url` (send the companion a photo), and `image` (request a companion-generated image — style / aspect ratio). For an image turn the engine composes the prompt and emits an `image_request` frame; it does not draw on the chat stream.
+- `POST /comp/chat/{session_id}/image/stream` — opt-in: on receiving an `image_request`, have the engine draw the composed prompt and stream the image back (`image_pending` → `image_attempt*` → `image` / `image_failed`). Requires `[tasks.chat_image_generation]`; absent, it returns `501` and the consumer draws the prompt itself.
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — history, session list, and the structured insight profile.
 - `GET /comp/affinity/{session_id}` — debug-only live affinity vector (`EXPOSE_AFFINITY_DEBUG=true`).
 
-For the full request schema, SSE frame layout (including `delta`, `image`, ghost, and error frames), and per-field semantics, see the [API reference](docs/api-reference.md).
+For the full request schema, SSE frame layout (including `delta`, `image_request`, ghost, and error frames on the chat stream, and the draw endpoint's `image` frames), and per-field semantics, see the [API reference](docs/api-reference.md).
 
 ## Configuration
 

@@ -421,6 +421,112 @@
         ]
       }
     },
+    "/comp/chat/{session_id}/image/stream": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "draw_image_stream",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DrawImageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE draw stream (text/event-stream)",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/chat/{session_id}/message/stream": {
       "post": {
         "tags": [
@@ -510,87 +616,6 @@
             }
           },
           "429": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/comp/chat/{session_id}/message/{message_id}/image": {
-      "post": {
-        "tags": [
-          "companion"
-        ],
-        "summary": "Write back a generated image URL to an existing assistant message.",
-        "operationId": "set_generated_image_url",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "message_id",
-            "in": "path",
-            "description": "Assistant message id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetImageUrlRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "stored"
-          },
-          "403": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StreamPreErrorBody"
-                }
-              }
-            }
-          },
-          "422": {
             "description": "",
             "content": {
               "application/json": {
@@ -1185,6 +1210,60 @@
           }
         }
       },
+      "DrawImageRequest": {
+        "type": "object",
+        "description": "Body of the engine draw endpoint. Echoes the `image_request` frame contents\nback plus the draw-time knobs. The engine draws `composed_prompt` verbatim —\nno re-compose, no persona load, no persistence.",
+        "required": [
+          "message_id",
+          "composed_prompt",
+          "image_ref"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "composed_prompt": {
+            "type": "string",
+            "description": "base64(STANDARD) of the final wire prompt — exactly the `composed_prompt`\nfrom the `image_request` frame. Decoded and drawn verbatim."
+          },
+          "face_ref_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_ref": {
+            "type": "string",
+            "description": "Which reference image the plan chose (`face` | `previous`)."
+          },
+          "message_id": {
+            "type": "string",
+            "description": "The assistant message id `X` from the `image_request` frame. Echoed on\nevery draw frame so the consumer correlates the draw to its bubble."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-draw model override (highest precedence in `effective_image_chain`)."
+          },
+          "prev_image_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "HealthResponse": {
         "type": "object",
         "description": "Health check response.",
@@ -1242,18 +1321,9 @@
       },
       "ImageReplyParams": {
         "type": "object",
+        "description": "Per-turn image parameters. Presence of this block signals the consumer\nhandles images this turn (it drives image-action availability). The engine\ncomposes the prompt and emits a single `image_request` frame — it never\ndraws on the chat stream. Draw-time knobs (model, reference URLs, resolution)\nlive on the draw endpoint (`DrawImageRequest`), not here.",
         "properties": {
           "aspect_ratio": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "delegate": {
-            "type": "boolean",
-            "description": "Delegate drawing to the downstream consumer. Default `false` keeps\ntoday's in-engine draw path unchanged. When `true`, the engine composes\nthe prompt and emits a single `image_request` frame (no provider call, no\nimage bytes, no draw-result persistence); the consumer draws, uploads,\nand records the outcome. `model`, `face_ref_url`, `prev_image_url`, and\n`resolution` are ignored when delegated (the composer needs only `style`)."
-          },
-          "face_ref_url": {
             "type": [
               "string",
               "null"
@@ -1270,25 +1340,6 @@
           },
           "mode": {
             "$ref": "#/components/schemas/ImageMode"
-          },
-          "model": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "prev_image_url": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional URL of the previously generated image, for iteration. Selected\nwhen the PDE chooses `image_ref = previous`. Same validation as\n`face_ref_url`; the engine never fetches it — it is embedded in the\nOpenRouter body and fetched by the image provider at generation time, so\nclients backed by a private store should pass a short-lived signed URL."
-          },
-          "resolution": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "style": {
             "type": [
@@ -1433,17 +1484,6 @@
           "session_id": {
             "type": "string",
             "format": "uuid"
-          }
-        }
-      },
-      "SetImageUrlRequest": {
-        "type": "object",
-        "required": [
-          "url"
-        ],
-        "properties": {
-          "url": {
-            "type": "string"
           }
         }
       },

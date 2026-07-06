@@ -125,12 +125,12 @@ cargo run -p eros-engine-server -- serve
 默认所有 `/comp/*` 路由都需要 `Authorization: Bearer <Supabase JWT>`（`AuthValidator` trait 可替换成其他身份提供方）。核心端点：
 
 - `POST /comp/chat/start`——与指定人设开启聊天会话。
-- `POST /comp/chat/{session_id}/message/stream`——**核心**对话端点：逐 token 的 Server-Sent Events。每轮可选字段：`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（给角色打赏）、`image_url`（给角色发一张照片）、`image`（请求角色生成一张图片——风格 / 模型 / 画幅 / 脸部参考）。
-- `POST /comp/chat/{session_id}/message/{message_id}/image`——回写角色所生成图片在你存储里的 URL。
+- `POST /comp/chat/{session_id}/message/stream`——**核心**对话端点：逐 token 的 Server-Sent Events。每轮可选字段：`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（给角色打赏）、`image_url`（给角色发一张照片）、`image`（请求角色生成一张图片——风格 / 画幅）。图片轮次由引擎组合提示词并发出 `image_request` 帧，聊天流本身不绘图。
+- `POST /comp/chat/{session_id}/image/stream`——可选：收到 `image_request` 后，让引擎绘制已组合的提示词并把图片流式返回（`image_pending` → `image_attempt*` → `image` / `image_failed`）。需要 `[tasks.chat_image_generation]`；缺失时返回 `501`，由调用方自行绘制。
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile`——历史、会话列表、结构化画像。
 - `GET /comp/affinity/{session_id}`——仅调试用的实时亲密度向量（`EXPOSE_AFFINITY_DEBUG=true`）。
 
-有关完整的请求 schema、SSE 帧布局（包括 `delta`、`image`、ghost 和 error 帧）以及各字段语义，请参阅 [API 参考](docs/api-reference.zh.md)。
+有关完整的请求 schema、SSE 帧布局（包括聊天流上的 `delta`、`image_request`、ghost 和 error 帧，以及绘图端点的 `image` 帧）以及各字段语义，请参阅 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 

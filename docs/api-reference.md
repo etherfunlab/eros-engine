@@ -253,12 +253,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **Optional: companion image reply.** The body may include an `image` object —
 `ImageReplyParams` — to request or force a companion-generated image this turn.
-Requires `[tasks.chat_image_generation]` to be configured (see
-[model-config.md](model-config.md)); the executor is off by default. The `image`
-block is also the per-turn opt-in: **omit it to suppress image generation for the
-turn** (the PDE may then only `reply_text` / `ghost`), or send `image: {}` to
-enable it with the config model. This lets a caller's own per-turn policy gate
-images independently of the PDE's content decision.
+The `image` block is also the per-turn opt-in: **omit it to suppress image
+generation for the turn** (the PDE may then only `reply_text` / `ghost`), or
+send `image: {}` to enable it with the task defaults. This lets a caller's own
+per-turn policy gate images independently of the PDE's content decision.
+`[tasks.chat_image_generation]` (see [model-config.md](model-config.md)) is
+**optional** here — it now gates only the draw endpoint below (`POST
+/comp/chat/{session_id}/image/stream`); the chat stream's `image_request`
+emission does not depend on it.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -270,15 +272,16 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
           "force": true,
           "mode": "text_image",
           "style": "realistic",
-          "model": "google/gemini-2.5-flash-image",
           "image_prompt": "warm candid selfie, soft indoor light",
-          "aspect_ratio": "3:4",
-          "resolution": "1024x1365",
-          "face_ref_url": "https://cdn.example/aria_avatar.png"
+          "aspect_ratio": "3:4"
         }
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
+
+An `image` block signals the consumer handles image drawing this turn; the
+engine composes the prompt and emits a single `image_request` frame (it never
+draws on the chat stream).
 
 `ImageReplyParams` fields (all optional):
 
@@ -287,87 +290,24 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | task `default_style` | One of the three engine-owned style presets. |
-| `model` | `String` | config | Per-turn single-id override of the config `ModelSpec`. Wins over config `model` but falls back to config `fallback`. |
 | `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
 | `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
-| `resolution` | `String` | task `default_resolution` | Model-specific hint (e.g. `"1024x1365"`). Shape-validated only — opaque beyond that. |
-| `face_ref_url` | `String` | absent | image2image face/appearance reference (absolute `http(s)`, ≤ 2048 chars). Returns `422` if malformed. |
-| `prev_image_url` | `String` | absent | The previously generated image, for iteration (absolute `http(s)`, ≤ 2048 chars; validated like `face_ref_url`). Used only when the PDE picks `image_ref = "previous"` (see below); otherwise ignored. Clients backed by a private object store should pass a short-lived signed URL — the engine does not fetch it; it embeds the URL in the OpenRouter body and the image provider fetches it at generation time. Returns `422` if malformed. |
-| `delegate` | `bool` | `false` | When `true`, the engine composes the prompt and emits a single `image_request` frame instead of drawing inline; it makes no provider call, streams no image bytes, and persists no draw result. The consumer draws the composed prompt, uploads, and records the outcome. `model`, `face_ref_url`, `prev_image_url`, and `resolution` are ignored when delegated (only `style` is used). Default `false` preserves the in-engine draw path. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
-(`"face"` | `"previous"`, default `"face"`). At draw time the engine picks the
-reference: `previous` + a present `prev_image_url` ⇒ iterate on the previous
-image; otherwise fall back to `face_ref_url` (the avatar). The chosen kind is
-recorded in `metadata.image`.
+(`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
+frame (below) — the chat stream never resolves it to a URL itself. The
+`previous`-with-no-image → `face` fallback, and the `face_ref_url` /
+`prev_image_url` reference URLs, belong to the draw endpoint (see its request
+body below). The persisted `metadata.image` marker records only the seed
+subject and aspect ratio, not the reference kind.
 
-Validation: `force` + `tips_amount_usd` on the same turn → `422`. A malformed
-`face_ref_url` or `prev_image_url`, unsupported `aspect_ratio`, or invalid
-`resolution` shape returns `422 BadRequest` as a pre-stream error.
+Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
+unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
 
-**`image` SSE frame** — emitted after the text's `done` frame when image generation
-succeeds:
-
-```text
-data: {"type":"image","message_id":"01J...","data_url":"data:image/png;base64,...","mime":"image/png","image_prompt":"warm candid selfie, soft indoor light","model":"google/gemini-2.5-flash-image","generation_id":"gen-xyz"}
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `type` | `"image"` | Frame type discriminator. |
-| `message_id` | `String` | Matches the `meta` frame's `message_id`. |
-| `data_url` | `String` | Base64 data-URL of the generated image (`"data:image/png;base64,..."`). |
-| `mime` | `String` | MIME type of the image (e.g. `"image/png"`). |
-| `image_prompt` | `String` \| `null` | The subject used for generation (also persisted). |
-| `model` | `String` \| `null` | Image model actually served. |
-| `generation_id` | `String` \| `null` | OpenRouter generation id. |
-
-**`image_pending` SSE frame** — emitted when the engine commits to generating an
-image for a message, before generation begins. Start a "generating…" indicator:
-
-```text
-data: {"type":"image_pending","message_id":"01J..."}
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `type` | `"image_pending"` | Frame type discriminator. |
-| `message_id` | `String` | The message the image is being generated for. For `reply_image` this is the *intended* image id; on failure the turn degrades to a different text message (see below). |
-
-**`image_attempt` SSE frame** — emitted as the model fallback chain walks, one
-per attempt as it begins:
-
-```text
-data: {"type":"image_attempt","message_id":"01J...","model":"google/gemini-2.5-flash-image","variant":"composed","index":1,"total":3}
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `type` | `"image_attempt"` | Frame type discriminator. |
-| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
-| `model` | `String` | The model being tried for this attempt. |
-| `variant` | `"composed"` \| `"original"` \| `"single"` | Which prompt variant is being tried (`single` = no compose retry). |
-| `index` | `Number` | 1-based position in the attempt plan. |
-| `total` | `Number` | Total planned attempts. |
-
-**`image_failed` SSE frame** — emitted when image generation gives up. Clear the
-pending state and render a "couldn't generate" state:
-
-```text
-data: {"type":"image_failed","message_id":"01J...","reason":"chain_exhausted"}
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `type` | `"image_failed"` | Frame type discriminator. |
-| `message_id` | `String` | Matches the `image_pending` frame's `message_id`. |
-| `reason` | `"chain_exhausted"` \| `"zero_images"` \| `"config_error"` | `chain_exhausted` = every candidate model failed; `zero_images` = a success response carried no image (defensive); `config_error` = no key / no models. |
-
-**`image_request` SSE frame** — emitted for a *delegated* image turn
-(`image.delegate: true`) in place of the whole
-`image_pending`/`image_attempt`/`image`/`image_failed` sequence. The engine
-composed the prompt; the consumer draws it. The engine draws nothing, streams no
-image bytes, and persists no draw result.
+**`image_request` SSE frame** — emitted once per image turn in place of any
+in-engine draw. The engine composes the prompt; the consumer draws it (directly
+or via the draw endpoint below). The chat stream itself draws nothing, streams
+no image bytes, and persists no draw result.
 
 ```
 data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
@@ -381,52 +321,47 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 | `image_ref` | `"face"` \| `"previous"` | Which reference image the plan chose; the consumer resolves the actual URL. |
 | `aspect_ratio` | `String` \| absent | The semantic aspect (`1:1`,`3:4`,`4:3`,`9:16`,`16:9`) or absent. The consumer owns aspect→resolution mapping; no width/height is sent. |
 
-**Delegated sequences.** Image-only:
-`meta(reply_image) → done → image_request → final`.
-Text + image: `meta(reply_text_image) → delta* → done → image_request → final`.
-No `image_pending`/`image_attempt`/`image`/`image_failed` is emitted on the chat
-stream in the delegated path; total-failure handling is the consumer's.
-
 **Full SSE frame sequences:**
 
-- `reply_text_image`: `meta(action_type=reply_text_image) → delta* → done → image_pending → image_attempt* → (image | image_failed) → final`
-- `reply_image` (success): `image_pending → image_attempt* → meta(action_type=reply_image) → image → done → final`
-- `reply_image` (image failed): `image_pending → image_attempt* → image_failed → meta(action_type=reply_text) → delta* → done → final` — the turn degrades to a normal text reply with a **new** `message_id` (see below).
+- image-only: `meta(reply_image) → done → image_request → final`
+- text + image: `meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 
-**Failed-image client contract** — no new error frame is emitted on image failure.
-The `meta` frame's `action_type` declares the intended shape:
+The chat stream emits none of `image_pending`/`image_attempt`/`image`/`image_failed`
+and persists no draw result — total-failure handling is the consumer's (see the
+draw endpoint below, which does emit that sequence).
 
-- **`reply_text_image`** — the `image` frame arrives *after* `done`. If the stream
-  reaches `final` with no `image` frame, the image generation failed (fail-open);
-  the text was still delivered — render it.
-- **`reply_image`** — `image_pending` and `image_attempt*` arrive first, carrying
-  the *intended* image id `X`. On success, `meta(action_type=reply_image) → image
-  → done` follow with that same `X`. On failure, an `image_failed` frame (also
-  `X`) is emitted and the turn degrades to a normal text reply whose `meta` /
-  `delta` / `done` carry a **different** `message_id` `Y` (`meta.action_type =
-  reply_text`). A consumer clears the pending state for `X` on `image_failed`,
-  then renders `Y` as an ordinary text message. (`X` is never persisted; the
-  failure diagnostic is persisted on `Y`'s row.)
+### `POST /comp/chat/{session_id}/image/stream`
 
-**Write-back endpoint** — after receiving the `image` frame, the client should
-upload the `data_url` to its own storage and post the resulting URL back:
+Opt-in SSE endpoint: on receiving an `image_request` frame, the consumer may
+call this to have the engine draw the composed prompt (instead of drawing it
+itself). The engine draws the prompt **verbatim** — no re-compose, no persona —
+and persists nothing (the consumer owns image storage). Requires
+`[tasks.chat_image_generation]` in the model config; when that block is absent
+the endpoint returns `501` and the consumer must self-draw. Auth + session
+ownership match `message/stream`.
 
-### `POST /comp/chat/{session_id}/message/{message_id}/image`
+**Request body**
 
-Stores the CDN URL of a companion-generated image. Called by the client after
-uploading the received `data_url` to its own storage.
+| Field | Type | Notes |
+|---|---|---|
+| `message_id` | `String` | The assistant message id `X` from the `image_request` frame; echoed on every draw frame. |
+| `composed_prompt` | `String` | base64(STANDARD) of the final wire prompt, copied from the frame. Drawn verbatim. |
+| `image_ref` | `"face"` \| `"previous"` | From the frame; selects the reference image. |
+| `face_ref_url` | `String?` | Absolute http(s) URL of the face/style reference. |
+| `prev_image_url` | `String?` | Absolute http(s) URL of the previous image (for `image_ref: "previous"`; falls back to `face_ref_url` when absent). |
+| `model` | `String?` | Per-draw model override. |
+| `aspect_ratio` | `String?` | One of `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
+| `resolution` | `String?` | Explicit `WxH` (overrides `aspect_ratio`). |
 
-```bash
-curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"url":"https://cdn.example/gen/abc.png"}' \
-  http://localhost:8080/comp/chat/<session_id>/message/<message_id>/image
-```
+**Output frames** — `image_pending → image_attempt* → (image | image_failed)`.
+`image` carries the generated image as a base64 data URL (the engine has no blob
+store); every frame echoes `message_id`.
 
-Returns `204 No Content` on success. `url` must be an absolute `http(s)` URL
-(≤ 2048 chars). Returns `422` on a malformed URL, `404` if `message_id` is not an
-assistant row in this session, `403` if the session is not owned by the JWT user.
-The call is idempotent — re-posting overwrites the same key.
+**Errors** — `400` malformed `composed_prompt` (bad base64); `403`/`404` session
+ownership; `422` bad URL / aspect / resolution; `429` per-user concurrent-stream
+cap reached (shared with the chat stream); `501` (`image_generation_disabled`)
+when the engine has no image-generation config — the consumer should self-draw.
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 
