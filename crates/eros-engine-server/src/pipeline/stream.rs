@@ -716,6 +716,7 @@ fn drive_chat_burst(
             let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
             let mut last_gen_id: Option<String> = None;
             let mut truncated = false;
+            let mut empty_completion = false;
 
             let mut per_model_req = req.clone();
             per_model_req.model = model_id.clone();
@@ -734,7 +735,7 @@ fn drive_chat_burst(
                             Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
                         }
                     }
-                    if !truncated && acc.is_empty() { truncated = true; }
+                    if !truncated && acc.is_empty() { empty_completion = true; }
                 }
                 Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
             }
@@ -748,6 +749,53 @@ fn drive_chat_burst(
                 // fallback — doing so would discard a recoverable complete garble if
                 // the later attempt failed. An INCOMPLETE garble is already
                 // `truncated` (length / transport) and handled by the block below.
+            }
+
+            if empty_completion {
+                if idx + 1 == chain.len() {
+                    // Last attempt served a 200 OK with an empty body: ghost
+                    // fallback (affinity-neutral), NOT the pseudo-ghost/Error
+                    // path below — that's reserved for length/transport
+                    // truncation. Mirrors the regex-strip-to-empty case (a)
+                    // above (`ghost_fallback_metadata`), tagged distinctly as
+                    // "empty_completion" so ops can tell the two apart.
+                    let msg_ulid = Ulid::new();
+                    let msg_uuid: Uuid = msg_ulid.into();
+                    let row = eros_engine_store::chat::AssistantInsert {
+                        id: msg_uuid,
+                        content: String::new(),
+                        assistant_action_type: persist_action.into(),
+                        continues_from_message_id: None,
+                        truncated: false,
+                        model: Some(model_id.clone()),
+                        usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: last_gen_id.clone(),
+                        filter_audit: None,
+                        metadata: ghost_fallback_metadata(build_metadata(None), "empty_completion"),
+                    };
+                    if let Err(e) = chat_repo
+                        .insert_assistant_batch(session_id, user_message_id, &[row])
+                        .await
+                    {
+                        tracing::warn!("stream(filtered): ghost-fallback persist failed: {e}");
+                    }
+                    outcome.lock().unwrap().ghost_fallback = true;
+                    yield ProtocolFrame::Meta {
+                        message_id: ulid_string(msg_ulid),
+                        action_type: frame_action,
+                        model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                        continues_from: None,
+                    };
+                    yield ProtocolFrame::Done {
+                        message_id: ulid_string(msg_ulid),
+                        truncated: false,
+                        usage: None,
+                        generation_id: last_gen_id,
+                        ghost_fallback: true,
+                    };
+                    return;
+                }
+                continue; // non-last empty completion: try the next model
             }
 
             if truncated {
@@ -4248,6 +4296,141 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(gs, 2, "ghost fallback must not reset ghost_streak");
+    }
+
+    /// Filtered mode, case (b): the served model returns a 200 OK stream
+    /// whose delta never carries a `content` field, so `acc` stays empty and
+    /// `finish_reason` is never `"length"` — an empty completion, distinct
+    /// from case (a)'s regex-strip-to-empty above. On the LAST chain attempt
+    /// (single-model chain here, so this is also the first) that must
+    /// surface as `Done{ghost_fallback:true}` tagged
+    /// `metadata.fallback_reason = "empty_completion"`, NOT the
+    /// pseudo-ghost/Error truncation path. The `output_regex` rule below
+    /// targets the chain model ("primary") purely so `regex_targets_chain`
+    /// forces FILTERED mode — an unpinned/untargeted rule would silently
+    /// fall through to LIVE mode instead (see
+    /// `regex_strip_to_empty_becomes_ghost_fallback` above) — but its
+    /// pattern never matches anything, so it's a pure mode-selection no-op
+    /// and the empty-completion branch (which returns before the regex is
+    /// ever applied) never touches it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn empty_completion_last_attempt_becomes_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // 200 stream with a delta that carries no `content` at all → empty completion.
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Pin the chain model to "primary" (matching the mock) and target it
+        // with a never-matching output_regex rule: forces FILTERED mode via
+        // `regex_targets_chain` without ever altering the (already empty)
+        // reply. Built via `ModelConfig::from_toml_str` +
+        // `compile_output_regex()` — not `regex::Regex::new` by hand — since
+        // `regex` isn't a direct dependency of eros-engine-server.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^THIS_PATTERN_NEVER_MATCHES_ANYTHING$'
+            "#,
+        )
+        .unwrap();
+        state.model_config = std::sync::Arc::new(regex_cfg.clone());
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("never-matching pattern compiles"),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J4444444444444444444444A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "expected Done{{ghost_fallback:true}}, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "empty completion must not error"
+        );
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reason.as_deref(), Some("empty_completion"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
