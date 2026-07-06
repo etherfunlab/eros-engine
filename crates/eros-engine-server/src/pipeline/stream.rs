@@ -3458,7 +3458,10 @@ mod tests {
             ghost_fallback: true,
         };
         let s = serde_json::to_string(&f).unwrap();
-        assert!(s.contains("\"ghost_fallback\":true"), "true must serialize: {s}");
+        assert!(
+            s.contains("\"ghost_fallback\":true"),
+            "true must serialize: {s}"
+        );
     }
 
     #[test]
