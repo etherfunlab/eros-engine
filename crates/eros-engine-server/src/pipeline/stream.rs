@@ -73,6 +73,10 @@ pub enum ProtocolFrame {
         /// full unfiltered usage separately.
         usage: Option<serde_json::Value>,
         generation_id: Option<String>,
+        /// True when this served reply_text resolved empty and is surfaced as a
+        /// ghost. The cause lives in the persisted row's metadata.fallback_reason.
+        #[serde(default, skip_serializing_if = "is_false")]
+        ghost_fallback: bool,
     },
     Final {
         lead_score: f64,
@@ -130,6 +134,10 @@ pub enum ProtocolFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         aspect_ratio: Option<String>,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Render a 128-bit id as a Crockford Base32 ULID string (26 chars).
@@ -334,6 +342,7 @@ fn delegated_image_only_frames(
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         },
         build_image_request_frame(message_id, composed_prompt, image_ref, aspect_ratio),
     ]
@@ -591,6 +600,7 @@ fn drive_chat_burst(
                     truncated,
                     usage: wire_usage,
                     generation_id: last_gen_id,
+                    ghost_fallback: false,
                 };
 
                 if !truncated {
@@ -950,6 +960,7 @@ fn drive_chat_burst(
                 truncated: false,
                 usage: wire_usage,
                 generation_id: last_gen_id,
+                ghost_fallback: false,
             };
             return;
         }
@@ -2183,6 +2194,7 @@ async fn build_stream_failure_pseudo_ghost(
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         },
     ];
     let produced = crate::pipeline::post_process::ProducedMessage {
@@ -2284,6 +2296,7 @@ async fn build_garble_repaired_replacement(
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         },
     ];
     let produced = crate::pipeline::post_process::ProducedMessage {
@@ -2555,6 +2568,7 @@ pub fn run_stream(
                     truncated: false,
                     usage: None,
                     generation_id: None,
+                    ghost_fallback: false,
                 };
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
                 yield final_frame;
@@ -3136,6 +3150,7 @@ pub fn replay_stream(
                 truncated: false,
                 usage: None,
                 generation_id: None,
+                ghost_fallback: false,
             };
         } else {
             for row in &rows {
@@ -3171,6 +3186,7 @@ pub fn replay_stream(
                     truncated: row.truncated,
                     usage,
                     generation_id: row.generation_id.clone(),
+                    ghost_fallback: false,
                 };
             }
             // If every persisted assistant row was truncated, emit the same
@@ -3338,6 +3354,7 @@ mod tests {
                 "total_tokens": 14,
             })),
             generation_id: Some("gen-1".into()),
+            ghost_fallback: false,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "done");
@@ -3403,11 +3420,38 @@ mod tests {
             truncated: false,
             usage: None,
             generation_id: None,
+            ghost_fallback: false,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         // Spec §1.5 done schema permits `usage: null` — do NOT omit.
         assert!(v.get("usage").is_some());
         assert!(v["usage"].is_null());
+    }
+
+    #[test]
+    fn done_frame_omits_ghost_fallback_when_false() {
+        let f = ProtocolFrame::Done {
+            message_id: "m".into(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            ghost_fallback: false,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(!s.contains("ghost_fallback"), "false must be omitted: {s}");
+    }
+
+    #[test]
+    fn done_frame_serializes_ghost_fallback_when_true() {
+        let f = ProtocolFrame::Done {
+            message_id: "m".into(),
+            truncated: false,
+            usage: None,
+            generation_id: None,
+            ghost_fallback: true,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"ghost_fallback\":true"), "true must serialize: {s}");
     }
 
     #[test]
