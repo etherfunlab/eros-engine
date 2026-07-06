@@ -3,8 +3,20 @@
 //!
 //! Spec: docs/superpowers/specs/2026-07-07-voice-call-parts-design.md
 
+use std::sync::Arc;
+use ulid::Ulid;
+use uuid::Uuid;
+
 use eros_engine_core::affinity::{Affinity, RelationshipLabel};
 use eros_engine_core::persona::PersonaGenome;
+use eros_engine_llm::model_config::ResolvedVoice;
+use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
+use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::persona::PersonaRepo;
+
+use crate::pipeline::stream::{ulid_string, ProtocolFrame, StreamErrorCode};
+use crate::state::AppState;
 
 /// Assemble the thin voice system prompt: persona + voice directive + one
 /// optional relationship line. Deliberately excludes recall, memories, traits,
@@ -39,6 +51,168 @@ fn relationship_line(affinity: &Affinity) -> Option<String> {
         None => return None,
     };
     Some(phrase.to_string())
+}
+
+/// Inputs for one voice turn. The user utterance is already persisted (by the
+/// route) as the latest history row, so the generator reads it from history —
+/// it is not passed again here.
+pub struct VoiceTurn {
+    pub session_id: Uuid,
+    pub instance_id: Uuid,
+    pub user_message_id: Uuid,
+}
+
+/// Recent turns fed to the model on a voice turn. Shorter than the text path to
+/// keep latency/tokens down.
+pub const VOICE_HISTORY_WINDOW: i64 = 12;
+
+/// Drive one voice turn: load persona + (optional) affinity + recent history,
+/// assemble the thin prompt, stream a single-model completion (walking the
+/// outage fallback chain ourselves, since `execute_stream` is single-model),
+/// emit `delta`* then `done`, and persist the assistant turn. `error` only when
+/// no candidate produced anything.
+pub fn run_voice_turn(
+    state: Arc<AppState>,
+    turn: VoiceTurn,
+    resolved: ResolvedVoice,
+) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
+    async_stream::stream! {
+        let chat_repo = ChatRepo { pool: &state.pool };
+        let persona_repo = PersonaRepo { pool: &state.pool };
+        let affinity_repo = AffinityRepo { pool: &state.pool };
+
+        let persona = match persona_repo.load_companion(turn.instance_id).await {
+            Ok(Some(p)) => p,
+            _ => {
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: false,
+                    message: "persona instance not found".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+                return;
+            }
+        };
+
+        // Read-only affinity load (never creates a row on the voice path).
+        let affinity = affinity_repo.load(turn.session_id).await.unwrap_or(None);
+
+        // Chronological history, includes the just-persisted user turn.
+        let history = chat_repo
+            .history(turn.session_id, VOICE_HISTORY_WINDOW, 0)
+            .await
+            .unwrap_or_default();
+
+        let system_prompt =
+            build_voice_prompt(&persona.genome, &resolved.directive, affinity.as_ref());
+
+        let mut messages = Vec::with_capacity(history.len() + 1);
+        messages.push(WireMessage { role: "system".into(), content: system_prompt });
+        for m in history {
+            let role = match m.role.as_str() {
+                "assistant" => "assistant",
+                "user" | "gift_user" => "user",
+                _ => continue,
+            };
+            messages.push(WireMessage { role: role.into(), content: m.content });
+        }
+
+        // Candidate chain: primary + outage fallbacks (single-model each).
+        let mut candidates = Vec::with_capacity(1 + resolved.fallback_model.len());
+        candidates.push(resolved.model.clone());
+        candidates.extend(resolved.fallback_model.iter().cloned());
+
+        let mid = Ulid::new();
+        let message_id = ulid_string(mid);
+        let assistant_uuid: Uuid = mid.into();
+
+        let mut acc = String::new();
+        let mut last_usage: Option<UsageBlock> = None;
+        let mut last_gen_id: Option<String> = None;
+        let mut served_model: Option<String> = None;
+        let mut truncated = false;
+
+        'candidates: for model_id in candidates {
+            let req = ChatRequest {
+                model: model_id.clone(),
+                messages: messages.clone(),
+                temperature: resolved.temperature as f32,
+                max_tokens: resolved.max_tokens,
+                reasoning: resolved.reasoning.clone(),
+                ..Default::default()
+            };
+            let stream = match state.openrouter.execute_stream(req).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(model = %model_id, error = %e, "voice: open stream failed");
+                    if acc.is_empty() { continue 'candidates; }
+                    truncated = true;
+                    break 'candidates;
+                }
+            };
+            futures_util::pin_mut!(stream);
+            loop {
+                match futures_util::StreamExt::next(&mut stream).await {
+                    Some(Ok(chunk)) => {
+                        if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
+                        if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
+                        if chunk.model.is_some() { served_model = chunk.model.clone(); }
+                        if let Some(text) = chunk.content {
+                            acc.push_str(&text);
+                            yield ProtocolFrame::Delta { message_id: message_id.clone(), content: text };
+                        }
+                        if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(model = %model_id, error = %e, "voice: mid-stream error");
+                        if acc.is_empty() { continue 'candidates; }
+                        truncated = true;
+                        break 'candidates;
+                    }
+                    None => break 'candidates, // clean [DONE]
+                }
+            }
+        }
+
+        // Nothing ever streamed and no successful open ⇒ upstream error.
+        if acc.is_empty() && served_model.is_none() && last_gen_id.is_none() {
+            yield ProtocolFrame::Error {
+                code: StreamErrorCode::UpstreamUnavailable,
+                retryable: true,
+                message: "voice generation failed on all candidates".into(),
+                user_message: "对方暂时说不出话，请稍后再试".into(),
+            };
+            return;
+        }
+
+        // Persist the assistant turn only when it carries text.
+        if !acc.is_empty() {
+            let usage_json = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            if let Err(e) = chat_repo
+                .insert_voice_assistant_message(
+                    turn.session_id,
+                    turn.user_message_id,
+                    assistant_uuid,
+                    &acc,
+                    served_model.as_deref(),
+                    usage_json.as_ref(),
+                    last_gen_id.as_deref(),
+                    truncated,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "voice: assistant persist failed");
+            }
+        }
+
+        yield ProtocolFrame::Done {
+            message_id,
+            truncated,
+            usage: last_usage.and_then(|u| serde_json::to_value(u).ok()),
+            generation_id: last_gen_id,
+            ghost_fallback: false,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -100,5 +274,111 @@ mod tests {
         let a = affinity_with(None);
         let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a));
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_streams_delta_then_done_and_persists(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3},\"id\":\"gen-v\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOICE")
+            .await
+            .unwrap();
+
+        // State with a chat_voice task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        // delta(s) carry the text; terminal frame is Done; no Error.
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi there");
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Done { .. })));
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Error { .. })));
+
+        // Assistant row persisted on the voice channel.
+        let (content, channel): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, channel FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "hi there");
+        assert_eq!(channel.as_deref(), Some("voice"));
     }
 }
