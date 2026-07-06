@@ -822,6 +822,74 @@ impl<'a> ChatRepo<'a> {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Idempotently persist a user turn on the voice channel. Mirrors the
+    /// `(session_id, client_msg_id)` uniqueness of the text path but writes
+    /// `channel = 'voice'` and skips all replay/ghost machinery. Returns the row
+    /// id — the existing row's id when `client_msg_id` was already seen.
+    pub async fn insert_voice_user_message(
+        &self,
+        session_id: Uuid,
+        content: &str,
+        client_msg_id: &str,
+    ) -> Result<Uuid, sqlx::Error> {
+        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM engine.chat_messages \
+             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .fetch_optional(self.pool)
+        .await?
+        {
+            return Ok(id);
+        }
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
+             VALUES ($1, 'user', $2, $3, 'voice') RETURNING id",
+        )
+        .bind(session_id)
+        .bind(content)
+        .bind(client_msg_id)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Persist an assistant turn on the voice channel: `role='assistant'`,
+    /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
+    /// continues_from — voice replies are single, whole messages.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_voice_assistant_message(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        id: Uuid,
+        content: &str,
+        model: Option<&str>,
+        usage: Option<&serde_json::Value>,
+        generation_id: Option<&str>,
+        truncated: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+              generation_id, assistant_action_type, channel) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice')",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(user_message_id)
+        .bind(truncated)
+        .bind(model)
+        .bind(usage)
+        .bind(generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2673,5 +2741,71 @@ mod tests {
             err.is_err(),
             "channel = 'bogus' must violate the CHECK constraint"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_inserts_are_marked_and_idempotent(pool: PgPool) {
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let repo = ChatRepo { pool: &pool };
+
+        // User insert: idempotent on client_msg_id.
+        let cmid = "01J9000000000000000000VOICE";
+        let u1 = repo
+            .insert_voice_user_message(session_id, "hello", cmid)
+            .await
+            .unwrap();
+        let u2 = repo
+            .insert_voice_user_message(session_id, "hello again", cmid)
+            .await
+            .unwrap();
+        assert_eq!(u1, u2, "same client_msg_id must return the same row id");
+
+        let (role, channel): (String, Option<String>) =
+            sqlx::query_as("SELECT role, channel FROM engine.chat_messages WHERE id = $1")
+                .bind(u1)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(channel.as_deref(), Some("voice"));
+
+        // Assistant insert.
+        let aid: Uuid = ulid::Ulid::new().into();
+        repo.insert_voice_assistant_message(
+            session_id,
+            u1,
+            aid,
+            "hi there",
+            Some("primary"),
+            None,
+            Some("gen-1"),
+            false,
+        )
+        .await
+        .unwrap();
+        let (role, aat, channel): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT role, assistant_action_type, channel FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(aid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "assistant");
+        assert_eq!(aat.as_deref(), Some("reply"));
+        assert_eq!(channel.as_deref(), Some("voice"));
+
+        // history() returns both, chronologically, and content survives.
+        let h = repo.history(session_id, 10, 0).await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].role, "user");
+        assert_eq!(h[1].role, "assistant");
+        assert_eq!(h[1].content, "hi there");
     }
 }
