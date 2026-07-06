@@ -98,10 +98,22 @@ pub fn run_voice_turn(
         let affinity = affinity_repo.load(turn.session_id).await.unwrap_or(None);
 
         // Chronological history, includes the just-persisted user turn.
-        let history = chat_repo
+        let history = match chat_repo
             .history(turn.session_id, VOICE_HISTORY_WINDOW, 0)
             .await
-            .unwrap_or_default();
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "voice: history read failed");
+                yield ProtocolFrame::Error {
+                    code: StreamErrorCode::Internal,
+                    retryable: true,
+                    message: "history read failed".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+                return;
+            }
+        };
 
         let system_prompt =
             build_voice_prompt(&persona.genome, &resolved.directive, affinity.as_ref());

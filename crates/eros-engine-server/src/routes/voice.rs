@@ -90,6 +90,7 @@ fn validate(req: &VoiceTurnRequest) -> Result<(), AppError> {
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 409, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 422, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 429, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 501, body = crate::routes::companion_stream::StreamPreErrorBody),
