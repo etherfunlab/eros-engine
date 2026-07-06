@@ -151,6 +151,7 @@ async fn classify_session(
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM engine.chat_messages \
          WHERE session_id = $1 AND role IN ('user', 'assistant') \
+           AND channel IS DISTINCT FROM 'voice' \
          ORDER BY sent_at",
     )
     .bind(session_id)
@@ -470,5 +471,73 @@ mod tests {
         assert_eq!(written, 0, "empty memories → no rows");
         // mock.expect(1) is verified on MockServer drop: the request carried the
         // configured system prompt sentinel.
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_excludes_voice_rows(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
+                "id": "gen-x", "model": "primary"
+            })))
+            .mount(&mock)
+            .await;
+
+        // Seed session with one TEXT assistant turn and one VOICE assistant turn.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) VALUES ('V','p','{}'::jsonb) RETURNING id",
+        ).fetch_one(&pool).await.unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1,'user','TEXTLINE')")
+            .bind(session_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1,'assistant','VOICELINE','voice')")
+            .bind(session_id).execute(&pool).await.unwrap();
+
+        // State with a memory_extraction task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // Drive the private classify_session (same module).
+        let _ = super::classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        // The request the extractor sent must contain the text turn, not the voice turn.
+        let reqs = mock.received_requests().await.unwrap();
+        let joined: String = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
+        assert!(
+            !joined.contains("VOICELINE"),
+            "voice turn must be excluded from memory extraction"
+        );
     }
 }
