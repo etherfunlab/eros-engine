@@ -26,7 +26,16 @@ pub enum StreamErrorCode {
     Timeout,
 }
 
-/// Action type tag used in `meta` frames.
+/// Action type tag carried by the `meta` frame's `action_type` field.
+///
+/// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image`.
+///
+/// Asymmetry worth calling out: this is the *wire* action, coarser than the
+/// internal PDE [`ActionType`]. A plain-text
+/// turn (`ActionType::ReplyText`, audited as `reply_text`) is reported here as
+/// **`reply`** — there is no `reply_text` on the wire. The text+image variant, by
+/// contrast, keeps its full name **`reply_text_image`**. So `reply_text_image`
+/// appears but `reply_text` never does. See [`frame_action_for`] for the mapping.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameActionType {
@@ -54,6 +63,10 @@ pub enum ImageFailReason {
 pub enum ProtocolFrame {
     Meta {
         message_id: String,
+        /// Coarse wire action: `reply` | `ghost` | `reply_image` |
+        /// `reply_text_image`. A plain-text `reply_text` turn is reported as
+        /// `reply` (there is no `reply_text` on the wire); only the text+image
+        /// variant keeps its full `reply_text_image` name. See [`FrameActionType`].
         action_type: FrameActionType,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
@@ -145,8 +158,12 @@ pub fn ulid_string(u: Ulid) -> String {
     u.to_string()
 }
 
-/// Map an `ActionType` to the `FrameActionType` used in SSE Meta/Image frames.
-/// Consumed by the image execution arm (Task 10).
+/// Map the internal PDE `ActionType` to the coarser `FrameActionType` sent on the
+/// wire in SSE Meta/Image frames. Consumed by the image execution arm (Task 10).
+///
+/// Note the asymmetry: `ReplyText` collapses to `Reply` (wire `reply`), so a plain
+/// text turn is never reported as `reply_text`; only `ReplyTextImage` keeps its
+/// full name (`reply_text_image`). See [`FrameActionType`].
 fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
     match a {
         eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
