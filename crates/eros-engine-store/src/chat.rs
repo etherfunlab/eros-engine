@@ -2631,4 +2631,47 @@ mod tests {
             "cross-session write must be a no-op"
         );
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn channel_column_accepts_voice_and_null_rejects_other(pool: PgPool) {
+        // Minimal session to satisfy FKs.
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // NULL channel (default) — ok.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, 'user', 'a')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 'voice' — ok.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1, 'user', 'b', 'voice')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 'bogus' — rejected by CHECK.
+        let err = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1, 'user', 'c', 'bogus')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "channel = 'bogus' must violate the CHECK constraint"
+        );
+    }
 }
