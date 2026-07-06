@@ -495,6 +495,7 @@ fn drive_chat_burst(
                 let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
                 let mut last_gen_id: Option<String> = None;
                 let mut truncated = false;
+                let mut empty_completion = false;
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
@@ -534,7 +535,7 @@ fn drive_chat_burst(
                             }
                         }
                         if !truncated && acc.is_empty() {
-                            truncated = true;
+                            empty_completion = true;
                         }
                     }
                     Err(e) => {
@@ -568,6 +569,12 @@ fn drive_chat_burst(
                     }
                 }
 
+                // Disposition, computed once up front (spec §5.3): a non-last
+                // empty completion advances to the next model below; only the
+                // LAST chain attempt returning empty is a ghost fallback,
+                // distinct from length/transport truncation (pseudo-ghost).
+                let is_ghost_fallback = empty_completion && idx + 1 == chain.len();
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -579,7 +586,11 @@ fn drive_chat_burst(
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
                     filter_audit: None,
-                    metadata: build_metadata(None),
+                    metadata: if is_ghost_fallback {
+                        ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                    } else {
+                        build_metadata(None)
+                    },
                 };
                 if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -603,8 +614,29 @@ fn drive_chat_burst(
                     truncated,
                     usage: wire_usage,
                     generation_id: last_gen_id,
-                    ghost_fallback: false,
+                    ghost_fallback: is_ghost_fallback,
                 };
+
+                if is_ghost_fallback {
+                    let mut o = outcome.lock().unwrap();
+                    o.ghost_fallback = true;
+                    // retries_chat = fallback count consumed (0-based, matches
+                    // the sibling chain-exhausted-truncated branch below) so
+                    // the Final frame doesn't under-report fallback attempts
+                    // when only the LAST chain model returns empty.
+                    o.retries_chat = (chain.len() as u32).saturating_sub(1);
+                    // Drop any earlier (superseded) truncated attempts pushed
+                    // in prior loop iterations — mirrors the accept path just
+                    // below so post_process (memory/insight/affinity) only
+                    // ever sees this ghost's empty full_text, never a partial
+                    // truncated attempt from earlier in the chain.
+                    o.produced.retain(|m| m.message_id == msg_uuid);
+                    return;
+                }
+                if empty_completion {
+                    // Non-last empty completion: advance to the next model.
+                    continue;
+                }
 
                 if !truncated {
                     let mut o = outcome.lock().unwrap();
@@ -4381,6 +4413,117 @@ data: [DONE]\n\n";
                 session_id,
                 "hi",
                 "01J4444444444444444444444A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "expected Done{{ghost_fallback:true}}, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "empty completion must not error"
+        );
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(umid)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reason.as_deref(), Some("empty_completion"));
+    }
+
+    /// LIVE mode (primary-risk), case (b): the served model returns a 200 OK
+    /// stream whose delta never carries a `content` field, so `acc` stays
+    /// empty and `finish_reason` is never `"length"` — an empty completion on
+    /// the LAST (here, only) chain attempt in the un-buffered path, which
+    /// interleaves persist → Done → accept/advance per attempt. Unlike the
+    /// filtered-mode sibling above, this test carries NO `output_regex` rule
+    /// and no LLM `filter` — `test_state`'s bare defaults leave both
+    /// `regex_targets_chain` and `llm_filter_arms` false, so `filtered_mode`
+    /// is false and the turn runs the LIVE branch under test. Must surface as
+    /// `Done{ghost_fallback:true}` tagged `metadata.fallback_reason =
+    /// "empty_completion"`, NOT the pseudo-ghost/Error truncation path that
+    /// the sibling `run_stream_reply_terminates_cleanly_with_mock_openrouter`
+    /// / multi-attempt tests exercise.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn empty_completion_live_last_attempt_becomes_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // 200 stream with a delta that carries no `content` at all → empty completion.
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-el\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // No output_regex, no filter → live mode.
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J5555555555555555555555B",
                 "user",
                 None,
             )
