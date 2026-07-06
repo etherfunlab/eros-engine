@@ -826,6 +826,19 @@ fn drive_chat_burst(
                         let mut o = outcome.lock().unwrap();
                         o.ghost_fallback = true;
                         o.retries_chat = (chain.len() as u32).saturating_sub(1);
+                        // Keep an (empty) produced row so a ReplyTextImage turn's
+                        // trailing image_request still fires — the caller gates it
+                        // on `produced.last()`. The live and regex-strip ghost
+                        // paths both retain their row; without this, filtered-mode
+                        // text+image turns would silently drop the image half. The
+                        // empty full_text keeps the turn memory/insight/eval-neutral
+                        // downstream (persist_affinity's rule delta is unchanged).
+                        o.produced
+                            .push(crate::pipeline::post_process::ProducedMessage {
+                                message_id: msg_uuid,
+                                full_text: String::new(),
+                                action: plan_action,
+                            });
                     }
                     yield ProtocolFrame::Meta {
                         message_id: ulid_string(msg_ulid),
@@ -8148,6 +8161,124 @@ data: [DONE]\n\n";
             "only the accepted fallback remains in produced; got {produced:?}"
         );
         assert_eq!(produced[0].full_text, "hi there");
+    }
+
+    /// Codex P2 (PR #141, round 3): the FILTERED empty-completion ghost fallback
+    /// must retain an (empty) produced row like the live/regex-strip paths —
+    /// otherwise a ReplyTextImage turn's trailing image_request (gated on
+    /// `produced.last()`) silently drops the image half in filtered mode only.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn filtered_empty_completion_ghost_retains_produced_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-e\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Never-matching regex targeting "primary" forces FILTERED mode.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            r#"
+            [tasks.chat_companion]
+            model = "primary"
+
+            [[tasks.chat_companion.output_regex]]
+            models = ["primary"]
+            pattern = '^THIS_PATTERN_NEVER_MATCHES_ANYTHING$'
+            "#,
+        )
+        .unwrap();
+        state.output_regex =
+            std::sync::Arc::new(regex_cfg.compile_output_regex().expect("compiles"));
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JFILTEREDIMG0000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "primary".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            umid,
+            FrameActionType::ReplyTextImage,
+            "reply",
+            ActionType::ReplyTextImage,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "filtered empty completion must ghost: {frames:?}"
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "filtered empty-completion ghost must retain a produced row so ReplyTextImage's \
+             image_request still fires; got {produced:?}"
+        );
+        assert_eq!(
+            produced[0].full_text, "",
+            "the retained produced row is empty (memory/insight/eval-neutral)"
+        );
     }
 
     /// Codex P2 (round 6): a COMPLETE garbled primary followed by a failing fallback
