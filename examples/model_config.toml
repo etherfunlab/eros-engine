@@ -409,3 +409,24 @@ max_tokens = 400
 [tasks.embedding]
 model = "voyage-3-lite"
 dimensions = 512
+
+# ── Voice channel (chat_voice) ───────────────────────────────────────────────
+# OPT-IN. Feature is OFF unless this block exists. Powers the lean voice-call
+# endpoint POST /comp/voice/{session_id}/turn/stream (text in → streamed text
+# out). Latency-sensitive: pick a fast model (time-to-first-token first).
+#
+# `model` MUST be a single fixed id — NOT the round-robin array or weighted
+# table forms (the server refuses to boot otherwise). `fallback` is allowed as
+# an outage retry chain (tried sequentially; NOT rotation). `filter_prompt` is
+# OPTIONAL: it overrides the built-in, product-identity-free voice directive
+# (short, spoken, no markdown/emoji/stage-directions). Voice turns persist on a
+# `channel = 'voice'` column and are excluded from session-end memory extraction.
+#[tasks.chat_voice]
+#model        = "vendor/fast-voice-model"
+#fallback     = ["vendor/backup-model"]
+#temperature  = 0.8
+#max_tokens   = 300
+#reasoning    = { enabled = false }
+#filter_prompt = """
+#…optional override of the built-in voice directive…
+#"""

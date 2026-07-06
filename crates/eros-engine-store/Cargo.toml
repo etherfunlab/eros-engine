@@ -26,3 +26,4 @@ rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+ulid = { workspace = true }

@@ -544,6 +544,15 @@ pub enum UpsertUserOutcome {
     DuplicateInProgress { user_message_id: Uuid },
 }
 
+/// Outcome of `insert_voice_user_message`. The route uses this to distinguish
+/// a fresh user turn (proceed to generation) from a replayed `client_msg_id`
+/// (return 409, never regenerate a second assistant reply).
+#[derive(Debug, Clone, Copy)]
+pub enum VoiceUserInsert {
+    Inserted(Uuid),
+    Duplicate(Uuid),
+}
+
 impl<'a> ChatRepo<'a> {
     /// Insert a user message keyed by `client_msg_id` with permanent
     /// idempotency. The partial unique index on `(session_id, client_msg_id)`
@@ -820,6 +829,86 @@ impl<'a> ChatRepo<'a> {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Idempotently persist a user turn on the voice channel. Mirrors the
+    /// `(session_id, client_msg_id)` uniqueness of the text path but writes
+    /// `channel = 'voice'` and skips all replay/ghost machinery. Returns
+    /// which case occurred — `Duplicate` when `client_msg_id` was already
+    /// seen (existing row's id), `Inserted` (fresh row's id) otherwise — so
+    /// callers can refuse to regenerate a reply for a duplicate.
+    pub async fn insert_voice_user_message(
+        &self,
+        session_id: Uuid,
+        content: &str,
+        client_msg_id: &str,
+    ) -> Result<VoiceUserInsert, sqlx::Error> {
+        // Atomic: on a (session_id, client_msg_id) conflict — the partial unique
+        // index chat_messages_client_msg_id_uidx (WHERE client_msg_id IS NOT NULL,
+        // migration 0012) — DO NOTHING and fall through to reading the existing id,
+        // so concurrent duplicates are classified reliably (the loser gets
+        // Duplicate, never a unique-violation 500).
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
+             VALUES ($1, 'user', $2, $3, 'voice') \
+             ON CONFLICT (session_id, client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(content)
+        .bind(client_msg_id)
+        .fetch_optional(self.pool)
+        .await?;
+        if let Some(id) = inserted {
+            return Ok(VoiceUserInsert::Inserted(id));
+        }
+        // Conflict → a row with this (session_id, client_msg_id) already exists.
+        // The unique index is role-agnostic, so the conflicting row may be a
+        // `user` OR a `gift_user` (tip) row — do NOT filter by role, or a tip
+        // collision would miss and surface a 500 instead of the 409 duplicate.
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT id FROM engine.chat_messages \
+             WHERE session_id = $1 AND client_msg_id = $2 LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(VoiceUserInsert::Duplicate(existing))
+    }
+
+    /// Persist an assistant turn on the voice channel: `role='assistant'`,
+    /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
+    /// continues_from — voice replies are single, whole messages.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_voice_assistant_message(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        id: Uuid,
+        content: &str,
+        model: Option<&str>,
+        usage: Option<&serde_json::Value>,
+        generation_id: Option<&str>,
+        truncated: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+              generation_id, assistant_action_type, channel) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice')",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(user_message_id)
+        .bind(truncated)
+        .bind(model)
+        .bind(usage)
+        .bind(generation_id)
+        .execute(self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -2629,6 +2718,161 @@ mod tests {
         assert!(
             meta2.get("x").is_none(),
             "cross-session write must be a no-op"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn channel_column_accepts_voice_and_null_rejects_other(pool: PgPool) {
+        // Minimal session to satisfy FKs.
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // NULL channel (default) — ok.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, 'user', 'a')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 'voice' — ok.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1, 'user', 'b', 'voice')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 'bogus' — rejected by CHECK.
+        let err = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1, 'user', 'c', 'bogus')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "channel = 'bogus' must violate the CHECK constraint"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_inserts_are_marked_and_idempotent(pool: PgPool) {
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let repo = ChatRepo { pool: &pool };
+
+        // User insert: idempotent on client_msg_id.
+        let cmid = "01J9000000000000000000VOICE";
+        let u1 = match repo
+            .insert_voice_user_message(session_id, "hello", cmid)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        match repo
+            .insert_voice_user_message(session_id, "hello again", cmid)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Duplicate(id) => {
+                assert_eq!(id, u1, "same client_msg_id must return the same row id");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+
+        let (role, channel): (String, Option<String>) =
+            sqlx::query_as("SELECT role, channel FROM engine.chat_messages WHERE id = $1")
+                .bind(u1)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(channel.as_deref(), Some("voice"));
+
+        // Assistant insert.
+        let aid: Uuid = ulid::Ulid::new().into();
+        repo.insert_voice_assistant_message(
+            session_id,
+            u1,
+            aid,
+            "hi there",
+            Some("primary"),
+            None,
+            Some("gen-1"),
+            false,
+        )
+        .await
+        .unwrap();
+        let (role, aat, channel): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT role, assistant_action_type, channel FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(aid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "assistant");
+        assert_eq!(aat.as_deref(), Some("reply"));
+        assert_eq!(channel.as_deref(), Some("voice"));
+
+        // history() returns both, chronologically, and content survives.
+        let h = repo.history(session_id, 10, 0).await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].role, "user");
+        assert_eq!(h[1].role, "assistant");
+        assert_eq!(h[1].content, "hi there");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_insert_duplicate_against_gift_user_row_is_not_500(pool: PgPool) {
+        // A voice request reusing a client_msg_id that already exists on a tip
+        // (`gift_user`) row must be classified as Duplicate (→ 409), not error
+        // out with RowNotFound (→ 500). The unique index is role-agnostic, so
+        // the conflict-recovery SELECT must not filter by role.
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cmid = "01J9000000000000000000GIFT1";
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'gift_user', '(tip)', $2)",
+        )
+        .bind(session_id)
+        .bind(cmid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = ChatRepo { pool: &pool };
+        // Must NOT panic (no RowNotFound → no 500); must be Duplicate.
+        let out = repo
+            .insert_voice_user_message(session_id, "hi", cmid)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, VoiceUserInsert::Duplicate(_)),
+            "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
         );
     }
 }
