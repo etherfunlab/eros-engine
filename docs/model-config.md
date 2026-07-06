@@ -382,7 +382,7 @@ leaves no safety net on failure.
 | `fallback` | `String` \| `Array<String>` | `[]` | Sequential retry chain (FallbackSpec). |
 | `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | Per-turn style key (overridable via `req.image.style`). |
 | `default_aspect_ratio` | `String` | `"3:4"` | Per-turn aspect ratio (overridable via `req.image.aspect_ratio`). Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
-| `default_resolution` | `String` | absent | Per-turn resolution hint (overridable via `req.image.resolution`). Model-specific (e.g. `"1024x1365"`). |
+| `default_resolution` | `String` | absent | Model-specific resolution hint (e.g. `"1024x1365"`). **Not applied by the draw endpoint** — the endpoint derives image size from the per-scene aspect carried in the `image_request` frame, and honors only an explicit `resolution` on the draw request (`DrawImageRequest.resolution`). |
 | `max_tokens` | `u32` | compiled-in default | Token cap for the image-gen call. |
 
 **Style presets** are engine-owned constants injected into the generation prompt:

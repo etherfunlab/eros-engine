@@ -325,7 +325,7 @@ max_tokens = 4096
 | `fallback` | `String` \| `Array<String>` | `[]` | 顺序重试链（FallbackSpec）。 |
 | `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 每轮 style key（可通过 `req.image.style` 覆盖）。 |
 | `default_aspect_ratio` | `String` | `"3:4"` | 每轮宽高比（可通过 `req.image.aspect_ratio` 覆盖）。允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。 |
-| `default_resolution` | `String` | 缺失 | 每轮分辨率提示（可通过 `req.image.resolution` 覆盖）。取决于模型（例如 `"1024x1365"`）。 |
+| `default_resolution` | `String` | 缺失 | 取决于模型的分辨率提示（例如 `"1024x1365"`）。**绘图端点不会应用它**——端点根据 `image_request` 帧中携带的每轮宽高比推导图片尺寸，仅在绘图请求显式传入 `resolution`（`DrawImageRequest.resolution`）时才使用它。 |
 | `max_tokens` | `u32` | 编译时内置默认值 | 图片生成调用的 token 上限。 |
 
 **Style preset** 是引擎所有的常量，会注入生成 prompt：
