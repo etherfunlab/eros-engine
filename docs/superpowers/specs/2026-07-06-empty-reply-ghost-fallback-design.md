@@ -145,13 +145,18 @@ persist/`Done`, then:
 
 - Persist the row with `metadata.fallback_reason = "empty_completion"` when
   `is_ghost_fallback`.
-- Emit `Done{ ghost_fallback: is_ghost_fallback, truncated: <length/transport
-  only> }`.
-- Adjust the tail so a non-last empty completion **advances** (not accepted as a
-  reply), a last empty completion **returns via ghost-fallback** (not
-  pseudo-ghost), and a genuine truncation keeps its current path. Note: because
-  `empty_completion` is now split from `truncated`, the "accept reply" gate
-  (`596`) must become `if !truncated && !empty_completion`.
+- Emit `Done{ ghost_fallback: is_ghost_fallback }`.
+- **A non-last empty completion is marked `truncated = true`** (before the
+  persist/`Done`) so it flows through the *existing* superseded-attempt
+  advance path unchanged — the persisted row and its `Done{truncated:true}`
+  carry the "replace me" signal, exactly as before this feature, so the client
+  and replay never see a spurious *successful* empty turn. (An earlier draft
+  routed it through a separate `if empty_completion { continue }` branch that
+  left `truncated:false` and emitted a phantom completed empty turn — a bug
+  caught in codex review; marking it truncated is the fix.) Only the **last**
+  empty attempt (`is_ghost_fallback`) returns via the ghost path; genuine
+  length/transport truncation keeps its current pseudo-ghost/`Error` path. The
+  "accept reply" gate (`if !truncated`) is therefore **unchanged**.
 
 Case (a) does not occur in live mode (regex only runs when buffering), so live
 mode only handles case (b).

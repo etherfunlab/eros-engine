@@ -574,6 +574,14 @@ fn drive_chat_burst(
                 // LAST chain attempt returning empty is a ghost fallback,
                 // distinct from length/transport truncation (pseudo-ghost).
                 let is_ghost_fallback = empty_completion && idx + 1 == chain.len();
+                // A non-last empty completion is a superseded attempt, not a
+                // successful turn: mark it `truncated` so the persisted row and
+                // its Done frame carry the "replace me" signal (as before this
+                // feature) and the client / replay never see a spurious empty
+                // reply bubble. Only the LAST empty attempt is the ghost.
+                if empty_completion && !is_ghost_fallback {
+                    truncated = true;
+                }
 
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
@@ -633,10 +641,9 @@ fn drive_chat_burst(
                     o.produced.retain(|m| m.message_id == msg_uuid);
                     return;
                 }
-                if empty_completion {
-                    // Non-last empty completion: advance to the next model.
-                    continue;
-                }
+                // (A non-last empty completion is now marked `truncated` above,
+                // so it falls through to the existing chain-advance path below —
+                // no separate branch needed.)
 
                 if !truncated {
                     let mut o = outcome.lock().unwrap();
