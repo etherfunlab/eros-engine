@@ -174,7 +174,15 @@ pub fn run_voice_turn(
                         truncated = true;
                         break 'candidates;
                     }
-                    None => break 'candidates, // clean [DONE]
+                    None => {
+                        // Clean stream end. If this candidate streamed nothing, treat it as an
+                        // empty/failed candidate and try the next one (fallbacks apply to empty
+                        // completions too); otherwise we have a reply — stop.
+                        if acc.is_empty() {
+                            continue 'candidates;
+                        }
+                        break 'candidates;
+                    }
                 }
             }
         }
@@ -504,6 +512,144 @@ data: [DONE]\n\n";
             n, 0,
             "no assistant row should be persisted on empty completion"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_falls_back_to_content_on_empty_primary(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // First request (PRIMARY) — metadata-only + clean [DONE]: an empty
+        // completion. Limited to one match so the SECOND request (the
+        // fallback candidate) falls through to the content mock below.
+        let empty_body = "\
+data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-empty\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(empty_body, "text/event-stream"),
+            )
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // Second request onward (the fallback candidate) — normal content.
+        let content_body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3},\"id\":\"gen-backup\",\"model\":\"backup\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(content_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC4")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task configured with a fallback model, +
+        // mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        assert_eq!(resolved.fallback_model, vec!["backup".to_string()]);
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        // The empty PRIMARY must not surface as an error — the fallback
+        // candidate's content wins: a Delta carrying "recovered", a terminal
+        // Done, and no Error frame.
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "recovered");
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Done { .. })));
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Error { .. })));
+
+        // Assistant row persisted with the fallback's content.
+        let (content, channel): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, channel FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "recovered");
+        assert_eq!(channel.as_deref(), Some("voice"));
+
+        // Sanity: both candidates were actually hit (one empty, one content).
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        assert_eq!(received.len(), 2, "expected primary + fallback requests");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

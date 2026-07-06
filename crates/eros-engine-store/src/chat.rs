@@ -844,28 +844,35 @@ impl<'a> ChatRepo<'a> {
         content: &str,
         client_msg_id: &str,
     ) -> Result<VoiceUserInsert, sqlx::Error> {
-        if let Some(id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM engine.chat_messages \
-             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' \
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(client_msg_id)
-        .fetch_optional(self.pool)
-        .await?
-        {
-            return Ok(VoiceUserInsert::Duplicate(id));
-        }
-        let id: Uuid = sqlx::query_scalar(
+        // Atomic: on a (session_id, client_msg_id) conflict — the partial unique
+        // index chat_messages_client_msg_id_uidx (WHERE client_msg_id IS NOT NULL,
+        // migration 0012) — DO NOTHING and fall through to reading the existing id,
+        // so concurrent duplicates are classified reliably (the loser gets
+        // Duplicate, never a unique-violation 500).
+        let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
-             VALUES ($1, 'user', $2, $3, 'voice') RETURNING id",
+             VALUES ($1, 'user', $2, $3, 'voice') \
+             ON CONFLICT (session_id, client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING \
+             RETURNING id",
         )
         .bind(session_id)
         .bind(content)
         .bind(client_msg_id)
+        .fetch_optional(self.pool)
+        .await?;
+        if let Some(id) = inserted {
+            return Ok(VoiceUserInsert::Inserted(id));
+        }
+        // Conflict → the row already exists; fetch its id.
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT id FROM engine.chat_messages \
+             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
         .fetch_one(self.pool)
         .await?;
-        Ok(VoiceUserInsert::Inserted(id))
+        Ok(VoiceUserInsert::Duplicate(existing))
     }
 
     /// Persist an assistant turn on the voice channel: `role='assistant'`,
