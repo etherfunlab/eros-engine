@@ -160,27 +160,44 @@ mode only handles case (b).
 > live-mode chain-exhaustion control flow. It is the main area for careful tests
 > (§8) and review.
 
-## 6. Affinity neutrality
+## 6. Affinity effect — *partial* neutrality (consciously scoped)
 
-A fallback-ghost turn must have **zero** affinity effect:
+A fallback-ghost turn is **partially** affinity-neutral. The final whole-branch
+review (2026-07-06) found that strict "zero affinity effect" is not achieved by
+construction, and the maintainer chose to accept the status quo rather than
+expand scope. The actual, guaranteed contract:
 
-- No `record_ghost` (we are not in the ghost branch — satisfied by construction).
-- **Skip the post-burst `ghost_streak = 0` reset** (`run_stream`,
-  `stream.rs:2916-2926`) for a fallback-ghost outcome — the reply-path normally
-  resets it, but a technical empty reply is not "engagement." The burst outcome
-  must carry a `ghost_fallback` signal that `run_stream` checks before resetting.
-- **No per-turn affinity delta.** The empty `produced.full_text` already causes
-  memory/insight writes to be skipped (`post_process.rs:291-293`, insight loop
-  `74-82`); the per-turn affinity eval must likewise not run on an empty reply.
-  The implementation propagates the fallback signal (or reuses the empty-text
-  guard) so post-process treats the turn as a no-op.
+**Neutral (guaranteed):**
+- No `record_ghost` — we are not in the ghost branch. So **no `ghost` affinity
+  event** is written.
+- **`ghost_streak` reset skipped** — `run_stream` gates the post-burst
+  `ghost_streak = 0` reset on `BurstOutcome.ghost_fallback`. A technical empty
+  reply does not clear a real-ghost streak (neither increments nor resets it).
+- **LLM affinity eval skipped** — the empty `produced.full_text` makes the
+  evaluator's `eval_text` empty, so `eval_skip_reason` marks the turn skipped and
+  no LLM-scored delta is computed.
+- **Memory + insight skipped** — empty produced text is filtered by
+  `should_write_user_turn` (`post_process.rs:291-293`) and the insight loop
+  (`74-87`).
 
-> **Open confirmation for review:** decisions here refine "affinity-neutral" from
-> the brainstorm. Case (a) already flows through the reply path today (so its
-> current affinity behavior is the status quo); this spec tightens it to be
-> strictly neutral. Confirm that the `ghost_streak` reset skip and the
-> no-affinity-delta rule are wanted (they match the stated "既不加也不清零"
-> intent).
+**NOT neutral (accepted status quo):**
+- `post_process::run` still runs for the `ReplyText` arm (it is not gated on
+  `ghost_fallback`). Inside it, `persist_affinity` still writes an
+  `event_type="message"` affinity event and applies the **rule-based** delta
+  `predict_reply_deltas` (`pde.rs`), which is derived from the *user* message's
+  length / staleness — **not** from the empty reply — and `refresh_lead_score`
+  runs. So affinity meters can still move by the small user-side rule delta.
+
+**Rationale.** For case (a) (regex-strip-to-empty) this is exactly the
+pre-existing behavior — **not a regression**. Making it strictly neutral would
+require threading `ghost_fallback` into `post_process::run` and gating
+`persist_affinity` / lead refresh there — a change to `post_process.rs` beyond
+this feature's scope, for a small effect (the rule delta is user-derived and
+typically tiny). The guaranteed-neutral pieces above are what keep *ghost*
+analytics clean (no ghost event, no streak change, no LLM eval, no
+memory/insight); the residual `message` event + rule delta are identical to any
+other reply turn. A test (§10) locks this accepted contract against silent
+drift. Revisiting strict neutrality is a possible follow-up, not a blocker.
 
 ## 7. Persistence, replay, reload
 
