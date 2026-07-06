@@ -863,10 +863,13 @@ impl<'a> ChatRepo<'a> {
         if let Some(id) = inserted {
             return Ok(VoiceUserInsert::Inserted(id));
         }
-        // Conflict → the row already exists; fetch its id.
+        // Conflict → a row with this (session_id, client_msg_id) already exists.
+        // The unique index is role-agnostic, so the conflicting row may be a
+        // `user` OR a `gift_user` (tip) row — do NOT filter by role, or a tip
+        // collision would miss and surface a 500 instead of the 409 duplicate.
         let existing: Uuid = sqlx::query_scalar(
             "SELECT id FROM engine.chat_messages \
-             WHERE session_id = $1 AND client_msg_id = $2 AND role = 'user' LIMIT 1",
+             WHERE session_id = $1 AND client_msg_id = $2 LIMIT 1",
         )
         .bind(session_id)
         .bind(client_msg_id)
@@ -2834,5 +2837,42 @@ mod tests {
         assert_eq!(h[0].role, "user");
         assert_eq!(h[1].role, "assistant");
         assert_eq!(h[1].content, "hi there");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_insert_duplicate_against_gift_user_row_is_not_500(pool: PgPool) {
+        // A voice request reusing a client_msg_id that already exists on a tip
+        // (`gift_user`) row must be classified as Duplicate (→ 409), not error
+        // out with RowNotFound (→ 500). The unique index is role-agnostic, so
+        // the conflict-recovery SELECT must not filter by role.
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cmid = "01J9000000000000000000GIFT1";
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'gift_user', '(tip)', $2)",
+        )
+        .bind(session_id)
+        .bind(cmid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = ChatRepo { pool: &pool };
+        // Must NOT panic (no RowNotFound → no 500); must be Duplicate.
+        let out = repo
+            .insert_voice_user_message(session_id, "hi", cmid)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, VoiceUserInsert::Duplicate(_)),
+            "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
+        );
     }
 }
