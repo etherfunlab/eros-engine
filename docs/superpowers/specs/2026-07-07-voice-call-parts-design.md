@@ -42,13 +42,13 @@ engine:
    1. JWT auth + session-ownership check (same as message/stream)
    2. acquire a per-user stream slot (reuse existing guard, cap 3)
    3. persist user turn (role=user, channel="voice")
-   4. read last N turns of history (text turns + voice turns, interleaved)
+   4. read last N turns of THIS session's history (in-call conversation memory; no vector recall)
    5. load 1 affinity row (cheap single-row read)
    6. assemble thin system_prompt (persona + voice directive + one relationship line)
    7. single-model OpenRouter streaming call ([tasks.chat_voice])
-   8. SSE: delta* → final
+   8. SSE: delta* → done
    9. persist assistant turn (role=assistant, assistant_action_type="reply", channel="voice")
-engine → consumer:  SSE  delta* / final ( / error )
+engine → consumer:  SSE  delta* / done ( / error )
 consumer:  text deltas → sentence-wise TTS → playback
 ```
 
@@ -71,7 +71,7 @@ A dedicated thin handler that only shares the parts — OpenRouter client / `mod
 
 **Reused**: JWT + session-ownership gate, per-user stream slot guard (`CONCURRENT_STREAMS_PER_USER = 3`), the `StreamPreError` pre-stream error shape, `upsert_user_message_idempotent` for the user turn.
 
-**SSE frames (thin)**: only `delta` / `final` / `error` (reuse the corresponding `ProtocolFrame` variants); **no** `meta` / `image*` / `pending` heavy frames. Streaming is required so the consumer can TTS sentence-by-sentence for a real-time feel. Keep-alive reuses the existing 15s ping.
+**SSE frames (thin)**: only `delta` / `done` / `error` (reuse the corresponding `ProtocolFrame` variants — the per-message terminal is the existing `done` frame; the chat-only `final` frame is deliberately NOT emitted); **no** `meta` / `image*` / `pending` heavy frames. Streaming is required so the consumer can TTS sentence-by-sentence for a real-time feel. Keep-alive reuses the existing 15s ping.
 
 **Errors**:
 - `[tasks.chat_voice]` not configured ⇒ `501` (same pattern as the image endpoint: the feature is opt-in).
@@ -89,7 +89,13 @@ system_prompt =
 - The **voice directive** lives in the new task's `filter_prompt`, with a product-identity-free **built-in default** (same pattern as `chat_image_prompt_compose`: the deployment may override). Default intent: *you are on a voice call; keep replies short and spoken; no markdown / emoji / bracketed stage directions* (TTS reads everything literally, so symbols and asides must be suppressed).
 - **Relationship state**: inject `relationship_label` and a short tone hint so the call's tone tracks the text relationship's progress. **No** vector recall, no memory pull, no traits/scopes/emotional_context/avoid_repetition heavy blocks.
 
-**history → wire messages**: read the session's last N turns (a dedicated constant `VOICE_HISTORY_WINDOW`, shorter than the text path to cut latency/tokens). Text and voice turns are **interleaved**, so a call remembers the text chat and vice versa. Voice-turn `role` stays `user`/`assistant`, so mapping to wire role is free.
+**history → wire messages**: the engine reads THIS session's last N turns (a dedicated constant `VOICE_HISTORY_WINDOW`, shorter than the text path to cut latency/tokens) so the model has **in-call memory** — OpenRouter is stateless, so each turn must resend the recent conversation or the companion forgets what was just said. This is the conversation flow, distinct from the thin *system* prompt above. Voice-turn `role` stays `user`/`assistant`, so wire-role mapping is free. Empty-`content` history rows are **skipped** (defensive: a caption-less image turn — which stores empty `content` — would otherwise become an empty wire message some providers reject).
+
+## Session scope & known characteristics
+
+- **Voice uses its own session (downstream policy).** The engine is session-agnostic — it reads whatever `session_id` it is given. The intended usage is that a voice call opens a **separate** session, so voice and text turns never share one. The `channel='voice'` marking + the dreaming filter are belt-and-suspenders that keep voice out of long-term memory even if a consumer does mix them.
+- **`last_active_at` is intentionally not bumped by voice turns.** Voice is deliberately isolated from the text recency/memory machinery. Consequence: a voice-only session ranks by its creation time in `last_active_at`-ordered lists, and — only in a mixed session, which the intended usage avoids — a long call would not defer dreaming. Accepted for this experimental feature; revisit if voice and text are ever meant to share a session.
+- **Empty-`content` history rows are skipped** in the wire mapping (defensive; see the history note above).
 
 ## New model_config task
 
@@ -120,7 +126,7 @@ Voice turns land in the existing `chat_messages` (reusing the session for contin
 | user voice turn | `user` (unchanged) | — | `voice` |
 | assistant voice turn | `assistant` (unchanged) | `reply` (unchanged) | `voice` |
 
-- `role` never changes, so every time-ordered history read naturally includes voice turns → two-way continuity, and existing role-filtered queries/analytics are undisturbed.
+- `role` never changes, so wire-role mapping is free and existing role-filtered queries/analytics are undisturbed. (Whether voice and text share a session is a downstream policy — see "Session scope" below — so "continuity" here means in-call memory within the voice session, not cross-channel mixing.)
 - `assistant_action_type` stays `'reply'` → **no** change to its CHECK constraint, and no asymmetric "what do we call the user side" problem. The `channel` column marks both sides identically.
 - `channel` is the single exclusion/selection key for everything voice.
 
