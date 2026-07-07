@@ -86,7 +86,9 @@ fn validate(req: &VoiceTurnRequest) -> Result<(), AppError> {
     params(("session_id" = Uuid, Path, description = "Chat session id")),
     request_body = VoiceTurnRequest,
     responses(
-        (status = 200, description = "SSE event stream (text/event-stream)", content_type = "text/event-stream"),
+        (status = 200, description = "SSE event stream (text/event-stream). Lean frame set: \
+            `delta`* then a terminal `done` (or a single `error`). Unlike the chat message \
+            stream, the voice turn emits no `meta` frame and no `action_type`.", content_type = "text/event-stream"),
         (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = crate::routes::companion_stream::StreamPreErrorBody),
