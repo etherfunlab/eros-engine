@@ -751,7 +751,7 @@
         },
         "responses": {
           "200": {
-            "description": "SSE event stream (text/event-stream)",
+            "description": "SSE event stream (text/event-stream). Lean frame set: `delta`* then a terminal `done` (or a single `error`). Unlike the chat message stream, the voice turn emits no `meta` frame and no `action_type`.",
             "content": {
               "text/event-stream": {}
             }
