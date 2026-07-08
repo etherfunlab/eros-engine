@@ -436,8 +436,8 @@ when disabled.
 ```
 
 - `bond` / `chemistry` — bar values (0–1, curve-applied).
-- `bond_label` ∈ `acquaintance | friend | close_friend | confidant`
-- `chemistry_label` ∈ `spark | flirtation | crush | lover`
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
 - `relationship_label` — legacy mapped value (`stranger | friend | slow_burn | romantic`; `frenemy` retired from emission).
 
 Production deploys typically keep this off. Turn it on if your frontend wants

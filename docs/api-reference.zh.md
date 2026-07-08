@@ -394,8 +394,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 ```
 
 - `bond` / `chemistry` —— 进度条值（0–1，曲线映射后）。
-- `bond_label` ∈ `acquaintance | friend | close_friend | confidant`
-- `chemistry_label` ∈ `spark | flirtation | crush | lover`
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
 - `relationship_label` —— 遗留映射值（`stranger | friend | slow_burn | romantic`；`frenemy` 已停止输出）。
 
 生产部署通常关着。若前端需要渲染实时雷达图或检查衍生线，再打开。

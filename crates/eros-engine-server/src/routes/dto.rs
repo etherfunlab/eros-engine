@@ -3,8 +3,8 @@
 //!
 //! Currently holds:
 //!   * `AffinitySnapshot` — point-in-time view of the 6-axis affinity
-//!     vector, used by both `/comp/affinity/{sid}` (debug) and
-//!     `/bff/v1/comp/chat/start` (Plan C).
+//!     vector, returned by `/comp/affinity/{sid}` (debug, gated by
+//!     `EXPOSE_AFFINITY_DEBUG`).
 
 use serde::{Deserialize, Serialize};
 
@@ -29,9 +29,9 @@ pub struct AffinitySnapshot {
     pub bond: f64,
     /// Romance bar fill, 0..1 (curve-applied; render as %).
     pub chemistry: f64,
-    /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`).
+    /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`).
     pub bond_label: String,
-    /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`).
+    /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`).
     pub chemistry_label: String,
 }
 
