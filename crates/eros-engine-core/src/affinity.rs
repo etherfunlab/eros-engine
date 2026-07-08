@@ -109,13 +109,14 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
 // (warmth floored via GREATEST(warmth,0)). Keep the formula in sync.
 
 /// Tier upper bounds on a line's 0..1 score. Widening by design: easy early, a
-/// grind near the top. Tier 1 = [0, T1), 2 = [T1, T2), 3 = [T2, T3), 4 = [T3, 1].
-/// Tunable.
+/// grind near the top. Tier 1 = [0, T1), 2 = [T1, T2), 3 = [T2, T3),
+/// 4 = [T3, T4), 5 = [T4, 1]. Tunable.
 const TIER1_HI: f64 = 0.15;
 const TIER2_HI: f64 = 0.35;
 const TIER3_HI: f64 = 0.62;
+const TIER4_HI: f64 = 0.9;
 
-/// 1..=4 tier index for a 0..1 line score.
+/// 1..=5 tier index for a 0..1 line score.
 fn tier_index(score: f64) -> u8 {
     if score < TIER1_HI {
         1
@@ -123,23 +124,29 @@ fn tier_index(score: f64) -> u8 {
         2
     } else if score < TIER3_HI {
         3
-    } else {
+    } else if score < TIER4_HI {
         4
+    } else {
+        5
     }
 }
 
-/// Map a 0..1 line score to a 0..1 bar fill: each tier fills an even 25% band,
-/// linear within. Higher tiers span more raw score, so the bar fills fast early
-/// and crawls near the top. Tunable alongside the thresholds.
+/// Map a 0..1 line score to a 0..1 bar fill. Bands are NOT even: tiers 1–4 fill
+/// 25% / 25% / 25% / 20% and tier 5 fills the top 5% (`[0.95, 1.0]`). The apex band
+/// is deliberately narrow so the ceiling reads as rare, but wide enough that the bar
+/// still moves across tier 5's 0.10 raw span (avoids lv4→lv5 damping). Linear within
+/// each band; higher tiers span more raw score, so the bar fills fast early and crawls
+/// near the top. Tunable alongside the thresholds.
 pub fn bar(score: f64) -> f64 {
-    let (lo, hi, band_lo) = match tier_index(score) {
-        1 => (0.0, TIER1_HI, 0.0),
-        2 => (TIER1_HI, TIER2_HI, 0.25),
-        3 => (TIER2_HI, TIER3_HI, 0.50),
-        _ => (TIER3_HI, 1.0, 0.75),
+    let (lo, hi, band_lo, band_hi) = match tier_index(score) {
+        1 => (0.0, TIER1_HI, 0.0, 0.25),
+        2 => (TIER1_HI, TIER2_HI, 0.25, 0.50),
+        3 => (TIER2_HI, TIER3_HI, 0.50, 0.75),
+        4 => (TIER3_HI, TIER4_HI, 0.75, 0.95),
+        _ => (TIER4_HI, 1.0, 0.95, 1.0),
     };
     let within = ((score - lo) / (hi - lo)).clamp(0.0, 1.0);
-    (band_lo + within * 0.25).clamp(0.0, 1.0)
+    (band_lo + within * (band_hi - band_lo)).clamp(0.0, 1.0)
 }
 
 /// Friendship-line tier (pure function of `bond_score`). Serialised snake_case
@@ -151,6 +158,7 @@ pub enum BondLabel {
     Friend,
     CloseFriend,
     Confidant,
+    Soulmate,
 }
 
 impl BondLabel {
@@ -160,6 +168,7 @@ impl BondLabel {
             BondLabel::Friend => "friend",
             BondLabel::CloseFriend => "close_friend",
             BondLabel::Confidant => "confidant",
+            BondLabel::Soulmate => "soulmate",
         }
     }
 }
@@ -172,6 +181,7 @@ pub enum ChemistryLabel {
     Flirtation,
     Crush,
     Lover,
+    Beloved,
 }
 
 impl ChemistryLabel {
@@ -181,6 +191,7 @@ impl ChemistryLabel {
             ChemistryLabel::Flirtation => "flirtation",
             ChemistryLabel::Crush => "crush",
             ChemistryLabel::Lover => "lover",
+            ChemistryLabel::Beloved => "beloved",
         }
     }
 }
@@ -245,7 +256,8 @@ impl Affinity {
             1 => BondLabel::Acquaintance,
             2 => BondLabel::Friend,
             3 => BondLabel::CloseFriend,
-            _ => BondLabel::Confidant,
+            4 => BondLabel::Confidant,
+            _ => BondLabel::Soulmate,
         }
     }
 
@@ -255,7 +267,8 @@ impl Affinity {
             1 => ChemistryLabel::Spark,
             2 => ChemistryLabel::Flirtation,
             3 => ChemistryLabel::Crush,
-            _ => ChemistryLabel::Lover,
+            4 => ChemistryLabel::Lover,
+            _ => ChemistryLabel::Beloved,
         }
     }
 }
@@ -424,18 +437,26 @@ mod tests {
         assert_eq!(tier_index(0.35), 3);
         assert_eq!(tier_index(0.619), 3);
         assert_eq!(tier_index(0.62), 4);
-        assert_eq!(tier_index(1.0), 4);
+        assert_eq!(tier_index(0.899), 4);
+        assert_eq!(tier_index(0.9), 5);
+        assert_eq!(tier_index(1.0), 5);
     }
 
     #[test]
-    fn bar_maps_tiers_to_even_bands() {
+    fn bar_maps_tiers_to_bands() {
+        // Tier lower edges land on their band's lower edge.
         assert!((bar(0.0)).abs() < 1e-9);
         assert!((bar(0.15) - 0.25).abs() < 1e-9);
         assert!((bar(0.35) - 0.50).abs() < 1e-9);
         assert!((bar(0.62) - 0.75).abs() < 1e-9);
+        assert!((bar(0.9) - 0.95).abs() < 1e-9); // tier 5 lower edge
         assert!((bar(1.0) - 1.0).abs() < 1e-9);
         // midpoint of tier 1 [0,0.15) → 0.075 → half of the 0..0.25 band
         assert!((bar(0.075) - 0.125).abs() < 1e-9);
+        // tier 4 midpoint 0.76 → 0.75 + 0.5*(0.95-0.75) = 0.85 (inside [0.75,0.95))
+        assert!((bar(0.76) - 0.85).abs() < 1e-9);
+        // tier 5 midpoint 0.95 → 0.95 + 0.5*(1.0-0.95) = 0.975
+        assert!((bar(0.95) - 0.975).abs() < 1e-9);
     }
 
     #[test]
@@ -455,6 +476,16 @@ mod tests {
         a.intimacy = 1.0;
         a.tension = 1.0; // chem = 0.667 → tier 4
         assert_eq!(a.chemistry_label(), ChemistryLabel::Lover);
+        // tier 5 apex
+        a.warmth = 1.0;
+        a.trust = 1.0;
+        a.intrigue = 1.0; // bond = 1.0 → tier 5
+        assert_eq!(a.bond_label(), BondLabel::Soulmate);
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chem = 1.0 → tier 5
+        assert_eq!(a.chemistry_label(), ChemistryLabel::Beloved);
+        assert_eq!(BondLabel::Soulmate.as_key(), "soulmate");
+        assert_eq!(ChemistryLabel::Beloved.as_key(), "beloved");
     }
 
     #[test]

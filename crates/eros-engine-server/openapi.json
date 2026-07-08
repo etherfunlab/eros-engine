@@ -1025,7 +1025,7 @@
           },
           "bond_label": {
             "type": "string",
-            "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`)."
+            "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`)."
           },
           "chemistry": {
             "type": "number",
@@ -1034,7 +1034,7 @@
           },
           "chemistry_label": {
             "type": "string",
-            "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`)."
+            "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`)."
           },
           "ghost_streak": {
             "type": "integer",

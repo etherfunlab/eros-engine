@@ -29,9 +29,9 @@ pub struct AffinitySnapshot {
     pub bond: f64,
     /// Romance bar fill, 0..1 (curve-applied; render as %).
     pub chemistry: f64,
-    /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`).
+    /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`).
     pub bond_label: String,
-    /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`).
+    /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`).
     pub chemistry_label: String,
 }
 

@@ -76,44 +76,48 @@ session starts at bond ≈ chemistry ≈ 0.033 — both in tier 1 (stranger).
 
 ## Tiers and bar curve
 
-Each line has **four tiers** with widening raw-score gaps (each step costs
-more):
+Each line has **five tiers** with widening raw-score gaps (each step costs more)
+until a narrow apex tier 5:
 
 | Tier | Raw range | Gap |
 |------|-----------|-----|
 | 1 | `[0.00, 0.15)` | 0.15 |
 | 2 | `[0.15, 0.35)` | 0.20 |
 | 3 | `[0.35, 0.62)` | 0.27 |
-| 4 | `[0.62, 1.00]` | 0.38 |
+| 4 | `[0.62, 0.90)` | 0.28 |
+| 5 | `[0.90, 1.00]` | 0.10 |
 
-**Bar value (0–1, rendered by the frontend):** each tier maps to an even 25%
-band, linear within the band:
+**Bar value (0–1, rendered by the frontend):** tiers 1–4 fill 25% / 25% / 25% /
+20% of the bar and tier 5 fills the top 5%, linear within each band:
 
 ```
-bar(raw) = band_lo(tier) + (raw − tier_lo) / (tier_hi − tier_lo) × 0.25
+bar(raw) = band_lo(tier) + (raw − tier_lo) / (tier_hi − tier_lo) × band_width(tier)
   Tier 1: 0.00 + (raw − 0.00) / 0.15 × 0.25  →  [0.00, 0.25)
   Tier 2: 0.25 + (raw − 0.15) / 0.20 × 0.25  →  [0.25, 0.50)
   Tier 3: 0.50 + (raw − 0.35) / 0.27 × 0.25  →  [0.50, 0.75)
-  Tier 4: 0.75 + (raw − 0.62) / 0.38 × 0.25  →  [0.75, 1.00]
+  Tier 4: 0.75 + (raw − 0.62) / 0.28 × 0.20  →  [0.75, 0.95)
+  Tier 5: 0.95 + (raw − 0.90) / 0.10 × 0.05  →  [0.95, 1.00]
 clamped to [0, 1]
 ```
 
 Because higher tiers span more raw affinity, the bar fills quickly early and
 crawls near 100% — easy first two tiers, grind at the top — without a literal
 `exp()`. A fixed per-turn raw delta also moves the bar *less* in higher tiers.
+Tier 5 is a deliberately narrow 5% apex band so the ceiling reads as rare, yet
+wide enough to keep the bar moving across its 0.10 raw span (no lv4→lv5 damping).
 
 All thresholds and bands are tunable constants.
 
 ## Tiered labels
 
-Two independent sets of four labels, one per line (serialized snake_case):
+Two independent sets of five labels, one per line (serialized snake_case):
 
-| Line | Tier 1 | Tier 2 | Tier 3 | Tier 4 |
-|------|--------|--------|--------|--------|
-| **Bond** | `acquaintance` | `friend` | `close_friend` | `confidant` |
-| **Chemistry** | `spark` | `flirtation` | `crush` | `lover` |
+| Line | Tier 1 | Tier 2 | Tier 3 | Tier 4 | Tier 5 |
+|------|--------|--------|--------|--------|--------|
+| **Bond** | `acquaintance` | `friend` | `close_friend` | `confidant` | `soulmate` |
+| **Chemistry** | `spark` | `flirtation` | `crush` | `lover` | `beloved` |
 
-`bond_label` and `chemistry_label` are always one of their respective four
+`bond_label` and `chemistry_label` are always one of their respective five
 values — they never emit `stranger`. The `stranger` state is conveyed only by
 the legacy field (see below).
 
@@ -130,7 +134,7 @@ legacy_relationship_label(bond, chemistry):
   match higher:
     Bond                                         →  friend
     Chemistry if tier(chemistry) in {1, 2}       →  slow_burn
-    Chemistry if tier(chemistry) in {3, 4}       →  romantic
+    Chemistry if tier(chemistry) in {3, 4, 5}    →  romantic
 ```
 
 `frenemy` is retired from emission but kept parseable in the enum (for
