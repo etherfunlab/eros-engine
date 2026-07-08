@@ -3,8 +3,8 @@
 //!
 //! Currently holds:
 //!   * `AffinitySnapshot` — point-in-time view of the 6-axis affinity
-//!     vector, used by both `/comp/affinity/{sid}` (debug) and
-//!     `/bff/v1/comp/chat/start` (Plan C).
+//!     vector, returned by `/comp/affinity/{sid}` (debug, gated by
+//!     `EXPOSE_AFFINITY_DEBUG`).
 
 use serde::{Deserialize, Serialize};
 
