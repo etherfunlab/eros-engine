@@ -683,6 +683,24 @@ pub struct ResolvedVision {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Built-in, product-identity-free voice directive. Deployments override it via
+/// `[tasks.chat_voice].filter_prompt`. Kept terse: it is appended to the persona
+/// prompt on every voice turn.
+pub const DEFAULT_VOICE_DIRECTIVE: &str = "You are on a live voice call. Speak the way people talk out loud. Keep replies short — usually one or two sentences. Do not use markdown, lists, emoji, asterisks, or bracketed stage directions: everything you write is read aloud verbatim by a text-to-speech voice, so write only words meant to be spoken.";
+
+/// Resolved `[tasks.chat_voice]` (voice channel). `directive` is the effective
+/// voice instruction: the configured `filter_prompt`, or `DEFAULT_VOICE_DIRECTIVE`
+/// when blank/omitted.
+#[derive(Debug, Clone)]
+pub struct ResolvedVoice {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub directive: String,
+}
+
 /// Generic, product-identity-free default prompt for the image-prompt composer.
 /// Used when the task is enabled but supplies no `filter_prompt`; deployments
 /// override it via `[tasks.chat_image_prompt_compose].filter_prompt`. Keep the
@@ -1044,6 +1062,47 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
         })
+    }
+
+    /// Resolve the voice task. `None` ⇒ feature off (no `[tasks.chat_voice]`).
+    /// Unlike vision, a blank `filter_prompt` does NOT disable the feature — it
+    /// falls back to the built-in `DEFAULT_VOICE_DIRECTIVE`.
+    pub fn resolve_voice(&self) -> Option<ResolvedVoice> {
+        const VOICE_TASK: &str = "chat_voice";
+        let task_cfg = self.tasks.get(VOICE_TASK)?;
+        let directive = task_cfg
+            .filter_prompt
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_VOICE_DIRECTIVE.to_string());
+        let m = self.resolve(VOICE_TASK, None);
+        Some(ResolvedVoice {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            reasoning: m.reasoning,
+            directive,
+        })
+    }
+
+    /// Boot gate: if `[tasks.chat_voice]` is present, its `model` MUST be a single
+    /// fixed, non-empty id (no round-robin array, no weighted table). Absent task
+    /// is fine (feature off).
+    pub fn validate_voice_model(&self) -> Result<(), String> {
+        const VOICE_TASK: &str = "chat_voice";
+        match self.tasks.get(VOICE_TASK) {
+            None => Ok(()),
+            Some(t) => match &t.model {
+                ModelSpec::Fixed(s) if !s.trim().is_empty() => Ok(()),
+                ModelSpec::Fixed(_) => {
+                    Err("[tasks.chat_voice].model must be set to a single model id".to_string())
+                }
+                _ => Err("[tasks.chat_voice].model must be a single fixed id \
+                          (no round-robin array or weighted table)"
+                    .to_string()),
+            },
+        }
     }
 
     /// Resolve the PDE decision task. `None` (feature off → rule engine) when
@@ -2777,6 +2836,71 @@ retry_depth = 0
         let r = cfg.resolve_vision().expect("vision resolves");
         assert_eq!(r.retry_depth, 0);
         assert!(r.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_voice_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.resolve_voice().is_none());
+    }
+
+    #[test]
+    fn resolve_voice_uses_default_directive_and_model() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_voice]\nmodel = \"vendor/fast\"\nmax_tokens = 200\ntemperature = 0.7\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_voice().expect("voice resolved");
+        assert_eq!(v.model, "vendor/fast");
+        assert_eq!(v.max_tokens, 200);
+        assert_eq!(v.directive, DEFAULT_VOICE_DIRECTIVE);
+    }
+
+    #[test]
+    fn resolve_voice_directive_override() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_voice]\nmodel = \"vendor/fast\"\nfilter_prompt = \"speak like a pirate\"\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_voice().unwrap();
+        assert_eq!(v.directive, "speak like a pirate");
+    }
+
+    #[test]
+    fn validate_voice_model_rejects_non_fixed_and_empty() {
+        // Absent task: ok.
+        assert!(ModelConfig::from_toml_str("")
+            .unwrap()
+            .validate_voice_model()
+            .is_ok());
+        // Fixed non-empty: ok.
+        assert!(
+            ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = \"a/b\"\n")
+                .unwrap()
+                .validate_voice_model()
+                .is_ok()
+        );
+        // Round-robin array: rejected.
+        assert!(
+            ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = [\"a/b\", \"c/d\"]\n")
+                .unwrap()
+                .validate_voice_model()
+                .is_err()
+        );
+        // Weighted table: rejected.
+        assert!(
+            ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = { \"a/b\" = 1.0 }\n")
+                .unwrap()
+                .validate_voice_model()
+                .is_err()
+        );
+        // Missing model (empty Fixed default): rejected.
+        assert!(
+            ModelConfig::from_toml_str("[tasks.chat_voice]\ntemperature = 0.7\n")
+                .unwrap()
+                .validate_voice_model()
+                .is_err()
+        );
     }
 
     #[test]

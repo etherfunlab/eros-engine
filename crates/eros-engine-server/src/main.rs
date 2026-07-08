@@ -291,6 +291,10 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    if let Err(msg) = model_config.validate_voice_model() {
+        anyhow::bail!(msg);
+    }
+
     let output_regex = match model_config.compile_output_regex() {
         Ok(rules) => Arc::new(rules),
         Err(msg) => anyhow::bail!(msg),

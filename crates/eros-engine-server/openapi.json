@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.7.1"
+    "version": "0.7.2"
   },
   "servers": [
     {
@@ -557,7 +557,7 @@
         },
         "responses": {
           "200": {
-            "description": "SSE event stream (text/event-stream)",
+            "description": "SSE event stream (text/event-stream). The `meta` frame's `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image`. Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no `reply_text` on the wire), while the text+image variant keeps its full `reply_text_image` name.",
             "content": {
               "text/event-stream": {}
             }
@@ -712,6 +712,122 @@
           },
           "403": {
             "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/comp/voice/{session_id}/turn/stream": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "voice_turn_stream",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE event stream (text/event-stream). Lean frame set: `delta`* then a terminal `done` (or a single `error`). Unlike the chat message stream, the voice turn emits no `meta` frame and no `action_type`.",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -909,7 +1025,7 @@
           },
           "bond_label": {
             "type": "string",
-            "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`)."
+            "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`)."
           },
           "chemistry": {
             "type": "number",
@@ -918,7 +1034,7 @@
           },
           "chemistry_label": {
             "type": "string",
-            "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`)."
+            "description": "Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`)."
           },
           "ghost_streak": {
             "type": "integer",
@@ -1676,6 +1792,21 @@
                 "$ref": "#/components/schemas/LabelTransitionDto"
               }
             ]
+          }
+        }
+      },
+      "VoiceTurnRequest": {
+        "type": "object",
+        "required": [
+          "content",
+          "client_msg_id"
+        ],
+        "properties": {
+          "client_msg_id": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
           }
         }
       }
