@@ -454,8 +454,10 @@ pub async fn send_message_stream(
     })?;
     // Verify the instance still exists and is active (404 otherwise) before
     // opening the stream. (Previously this load also fed the NFT-ownership gate.)
+    // The loaded persona is threaded into `run_stream` below so the turn does
+    // not re-issue the same `load_companion` query inside the generator.
     let persona_repo = PersonaRepo { pool: &state.pool };
-    persona_repo
+    let persona = persona_repo
         .load_companion(instance_id)
         .await?
         .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
@@ -589,7 +591,7 @@ pub async fn send_message_stream(
                     image: req.image.clone(),
                     history_anchor,
                 };
-                Box::pin(run_stream(state_arc, user_msg))
+                Box::pin(run_stream(state_arc, user_msg, Some(persona)))
             }
             UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
                 return Err(AppError::StreamPre(StreamPreError {
