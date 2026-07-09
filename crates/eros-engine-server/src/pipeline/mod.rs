@@ -59,24 +59,18 @@ pub async fn compute_signals_for_session(
     session_id: Uuid,
     affinity: &Affinity,
 ) -> Result<ConversationSignals, AppError> {
-    let message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM engine.chat_messages \
-         WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+    // One aggregate roundtrip instead of two separate scans of the same rows.
+    // Fail-open matches the previous per-query behavior: any error collapses to
+    // count 0 / last_time None (→ 0.0 hours). `COUNT(*)` is never NULL;
+    // `MAX(sent_at)` is NULL for an empty session.
+    let (message_count, last_time): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(sent_at) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role IN ('user', 'gift_user')",
     )
     .bind(session_id)
     .fetch_one(pool)
     .await
-    .unwrap_or(0);
-
-    let last_time: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT MAX(sent_at) FROM engine.chat_messages \
-         WHERE session_id = $1 AND role IN ('user', 'gift_user')",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    .unwrap_or((0, None));
 
     let hours_since_last_message = last_time
         .map(|t| (chrono::Utc::now() - t).num_minutes() as f64 / 60.0)
@@ -203,5 +197,55 @@ mod tests {
             .unwrap();
 
         assert_eq!(signals.message_count, 2, "two user rows must yield count 2");
+    }
+
+    /// Characterization: `hours_since_last_message` derives from the MAX(sent_at)
+    /// of the user/gift_user rows. Pins the MAX half of the signal before COUNT
+    /// and MAX are merged into a single aggregate query (the COUNT half is
+    /// already covered by `signals_count_*`).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_hours_since_reflects_latest_user_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        // Two user rows; MAX(sent_at) = the newer one (~1h ago).
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) VALUES \
+                 ($1, 'user', 'older', now() - interval '3 hours'), \
+                 ($1, 'user', 'newer', now() - interval '1 hour')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aff = fixture_affinity(session_id, user_id, instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff)
+            .await
+            .unwrap();
+
+        assert_eq!(signals.message_count, 2);
+        assert!(
+            (signals.hours_since_last_message - 1.0).abs() < 0.1,
+            "hours_since_last_message must track MAX(sent_at) (~1.0), got {}",
+            signals.hours_since_last_message
+        );
+    }
+
+    /// Characterization: an empty session yields count 0 and 0.0 hours (the
+    /// `MAX(sent_at) IS NULL` / no-rows fail-open path). Pins the empty-session
+    /// behavior before the COUNT+MAX merge.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_empty_session_zero_count_zero_hours(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        let aff = fixture_affinity(session_id, user_id, instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff)
+            .await
+            .unwrap();
+
+        assert_eq!(signals.message_count, 0);
+        assert_eq!(signals.hours_since_last_message, 0.0);
     }
 }

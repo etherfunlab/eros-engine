@@ -2502,23 +2502,31 @@ pub struct PersistedUserMessage {
 pub fn run_stream(
     state: Arc<AppState>,
     user_msg: PersistedUserMessage,
+    prefetched_persona: Option<eros_engine_core::persona::CompanionPersona>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
         let persona_repo = PersonaRepo { pool: &state.pool };
         let affinity_repo = AffinityRepo { pool: &state.pool };
 
-        let persona = match persona_repo.load_companion(user_msg.instance_id).await {
-            Ok(Some(p)) => p,
-            _ => {
-                yield ProtocolFrame::Error {
-                    code: StreamErrorCode::Internal,
-                    retryable: false,
-                    message: "persona instance not found".into(),
-                    user_message: "服务出现问题，请稍后再试".into(),
-                };
-                return;
-            }
+        // Reuse the persona the entry handler already loaded for its
+        // existence/active check, so a turn hits `load_companion` once, not
+        // twice. Fall back to a DB load only when no prefetch was threaded
+        // through — the direct-`run_stream` test paths pass `None`.
+        let persona = match prefetched_persona {
+            Some(p) => p,
+            None => match persona_repo.load_companion(user_msg.instance_id).await {
+                Ok(Some(p)) => p,
+                _ => {
+                    yield ProtocolFrame::Error {
+                        code: StreamErrorCode::Internal,
+                        retryable: false,
+                        message: "persona instance not found".into(),
+                        user_message: "服务出现问题，请稍后再试".into(),
+                    };
+                    return;
+                }
+            },
         };
         let mut affinity = match affinity_repo
             .load_or_create(user_msg.session_id, user_msg.user_id, user_msg.instance_id)
@@ -3985,6 +3993,7 @@ mod tests {
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4195,6 +4204,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4293,6 +4303,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4430,6 +4441,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4576,6 +4588,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4687,6 +4700,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4789,6 +4803,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -4902,6 +4917,7 @@ data: [DONE]\n\n";
                 }),
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5082,6 +5098,7 @@ data: [DONE]\n\n";
                 }),
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5241,6 +5258,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5558,6 +5576,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5683,6 +5702,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5821,6 +5841,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -5974,6 +5995,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6089,6 +6111,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6185,6 +6208,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6293,6 +6317,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6403,6 +6428,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6532,6 +6558,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6734,6 +6761,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6879,6 +6907,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -6990,6 +7019,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7166,6 +7196,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7326,6 +7357,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7469,6 +7501,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7592,6 +7625,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7729,6 +7763,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -7880,6 +7915,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
@@ -8767,6 +8803,7 @@ data: [DONE]\n\n";
                 image: None,
                 history_anchor: Default::default(),
             },
+            None,
         )
         .collect()
         .await;
