@@ -430,3 +430,10 @@ dimensions = 512
 #filter_prompt = """
 #…optional override of the built-in voice directive…
 #"""
+# `tts_audio_tags` (OPTIONAL, default false): when true, the voice directive
+# invites inline audio tags — bracketed cues like [laughs], [whispers] that
+# Gemini TTS models interpret as delivery/emotion. Tags pass through verbatim
+# (streamed, persisted, replayed); the client must feed the text to a TTS model
+# that understands them. Works with a custom filter_prompt too (the tag guidance
+# is appended to it).
+#tts_audio_tags = true
