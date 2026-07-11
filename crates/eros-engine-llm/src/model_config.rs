@@ -535,6 +535,15 @@ pub struct TaskConfig {
     /// chat_image_generation-only: default resolution (e.g. "1024x1365").
     #[serde(default)]
     pub default_resolution: Option<String>,
+    /// chat_voice-only: opt into inline TTS audio tags (Gemini transcript tags
+    /// like `[laughs]`, `[whispers]`). Absent/`false` ⇒ the built-in voice
+    /// directive keeps forbidding brackets (unchanged behaviour). `true` ⇒ the
+    /// directive invites inline `[tag]` markup; emitted tags flow through the
+    /// voice path verbatim (no engine-side parsing/stripping). Read only by
+    /// `resolve_voice`. See
+    /// docs/superpowers/specs/2026-07-11-voice-tts-audio-tags-design.md.
+    #[serde(default)]
+    pub tts_audio_tags: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -687,6 +696,19 @@ pub struct ResolvedVision {
 /// `[tasks.chat_voice].filter_prompt`. Kept terse: it is appended to the persona
 /// prompt on every voice turn.
 pub const DEFAULT_VOICE_DIRECTIVE: &str = "You are on a live voice call. Speak the way people talk out loud. Keep replies short — usually one or two sentences. Do not use markdown, lists, emoji, asterisks, or bracketed stage directions: everything you write is read aloud verbatim by a text-to-speech voice, so write only words meant to be spoken.";
+
+/// Bracket-neutral speech base for the audio-tags voice default: the same
+/// live-call guidance as `DEFAULT_VOICE_DIRECTIVE` minus the no-brackets clause
+/// (brackets are now meaningful audio tags). Composed with `AUDIO_TAGS_ADDENDUM`
+/// in `resolve_voice` — kept private since only that call site uses it.
+const VOICE_SPEECH_BASE_AUDIO_TAGS: &str = "You are on a live voice call. Speak the way people talk out loud. Keep replies short — usually one or two sentences. Do not use markdown, lists, or emoji — everything you write is read aloud by a text-to-speech voice.";
+
+/// Appended to the effective voice directive when `tts_audio_tags` is on. Names
+/// the inline-tag syntax, the commonly-supported tags, and explicit permission
+/// to improvise. Product-identity-free. Authored ONCE here and reused for both
+/// the built-in audio-tags default and the custom-`filter_prompt` path, so the
+/// tag list lives in a single place.
+pub const AUDIO_TAGS_ADDENDUM: &str = "You may add inline audio tags to make your speech more expressive. An audio tag is a short cue in square brackets placed right before the words it affects — e.g. [laughs] that's so funny, or [whispers] come closer. Use them sparingly, only when they fit the moment. Commonly supported tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]. You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short.";
 
 /// Resolved `[tasks.chat_voice]` (voice channel). `directive` is the effective
 /// voice instruction: the configured `filter_prompt`, or `DEFAULT_VOICE_DIRECTIVE`
@@ -1066,15 +1088,28 @@ impl ModelConfig {
 
     /// Resolve the voice task. `None` ⇒ feature off (no `[tasks.chat_voice]`).
     /// Unlike vision, a blank `filter_prompt` does NOT disable the feature — it
-    /// falls back to the built-in `DEFAULT_VOICE_DIRECTIVE`.
+    /// falls back to the built-in directive.
+    ///
+    /// Directive selection is a 2×2 over (has custom `filter_prompt`?) ×
+    /// (`tts_audio_tags` on?):
+    ///   - (none, off) → `DEFAULT_VOICE_DIRECTIVE` (unchanged)
+    ///   - (none, on)  → `VOICE_SPEECH_BASE_AUDIO_TAGS` + `AUDIO_TAGS_ADDENDUM`
+    ///   - (custom, off) → the custom prompt
+    ///   - (custom, on)  → the custom prompt + `AUDIO_TAGS_ADDENDUM`
     pub fn resolve_voice(&self) -> Option<ResolvedVoice> {
         const VOICE_TASK: &str = "chat_voice";
         let task_cfg = self.tasks.get(VOICE_TASK)?;
-        let directive = task_cfg
+        let audio_tags = task_cfg.tts_audio_tags.unwrap_or(false);
+        let custom = task_cfg
             .filter_prompt
             .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_VOICE_DIRECTIVE.to_string());
+            .filter(|s| !s.trim().is_empty());
+        let directive = match (custom, audio_tags) {
+            (Some(c), true) => format!("{c}\n\n{AUDIO_TAGS_ADDENDUM}"),
+            (Some(c), false) => c,
+            (None, true) => format!("{VOICE_SPEECH_BASE_AUDIO_TAGS}\n\n{AUDIO_TAGS_ADDENDUM}"),
+            (None, false) => DEFAULT_VOICE_DIRECTIVE.to_string(),
+        };
         let m = self.resolve(VOICE_TASK, None);
         Some(ResolvedVoice {
             model: m.model,
@@ -2864,6 +2899,58 @@ retry_depth = 0
         .unwrap();
         let v = cfg.resolve_voice().unwrap();
         assert_eq!(v.directive, "speak like a pirate");
+    }
+
+    #[test]
+    fn resolve_voice_default_off_is_unchanged() {
+        // Toggle absent ⇒ today's built-in directive, byte-for-byte.
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = \"vendor/fast\"\n").unwrap();
+        let v = cfg.resolve_voice().expect("voice enabled");
+        assert_eq!(v.directive, DEFAULT_VOICE_DIRECTIVE);
+    }
+
+    #[test]
+    fn resolve_voice_audio_tags_default_invites_tags() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_voice]\nmodel = \"vendor/fast\"\ntts_audio_tags = true\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_voice().expect("voice enabled");
+        // No longer the plain default, and no longer forbids brackets.
+        assert_ne!(v.directive, DEFAULT_VOICE_DIRECTIVE);
+        assert!(!v.directive.contains("bracketed stage directions"));
+        // Invites tags: carries the syntax guidance and a sample tag.
+        assert!(v.directive.contains("audio tag"));
+        assert!(v.directive.contains("[laughs]"));
+        // Built from the shared addendum (tag list authored once).
+        assert!(v.directive.contains(AUDIO_TAGS_ADDENDUM));
+    }
+
+    #[test]
+    fn resolve_voice_audio_tags_appends_to_custom_prompt() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_voice]\nmodel = \"vendor/fast\"\ntts_audio_tags = true\n\
+             filter_prompt = \"Speak like a pirate.\"\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_voice().expect("voice enabled");
+        // Operator prose kept verbatim, tag guidance appended.
+        assert!(v.directive.starts_with("Speak like a pirate."));
+        assert!(v.directive.contains(AUDIO_TAGS_ADDENDUM));
+        assert!(v.directive.contains("[whispers]"));
+    }
+
+    #[test]
+    fn resolve_voice_custom_prompt_off_has_no_tag_guidance() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_voice]\nmodel = \"vendor/fast\"\n\
+             filter_prompt = \"Speak like a pirate.\"\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_voice().expect("voice enabled");
+        assert_eq!(v.directive, "Speak like a pirate.");
+        assert!(!v.directive.contains("[laughs]"));
     }
 
     #[test]
