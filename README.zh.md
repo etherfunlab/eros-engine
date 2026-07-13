@@ -66,9 +66,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.6"
-eros-engine-store = "0.6"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.6"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.7"
+eros-engine-store = "0.7"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` 有意不发布到 crates.io——请使用 Docker 镜像运行（见下文）。
