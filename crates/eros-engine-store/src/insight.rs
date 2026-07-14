@@ -17,17 +17,27 @@ pub struct CompanionInsightsRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Per-field weights summing to 1.0. Matches the gateway's WEIGHTS table.
+/// Per-field weights summing to 1.0 (pinned by `weights_sum_to_one`).
+/// Rebalanced 2026-07-15 for the six-slot profile expansion; the geo trio
+/// (location / hometown / nationality) stays unweighted as historically
+/// decided. finance_status is weighted lowest — it is the least often
+/// disclosed and must not gate progress.
 const WEIGHTS: &[(&str, f64)] = &[
-    ("city", 0.05),
-    ("occupation", 0.05),
-    ("interests", 0.10),
-    ("mbti_guess", 0.15),
-    ("love_values", 0.15),
-    ("emotional_needs", 0.15),
-    ("life_rhythm", 0.10),
-    ("personality_traits", 0.15),
-    ("matching_preferences", 0.10),
+    ("city", 0.04),
+    ("occupation", 0.04),
+    ("interests", 0.08),
+    ("mbti_guess", 0.10),
+    ("love_values", 0.12),
+    ("emotional_needs", 0.12),
+    ("life_rhythm", 0.06),
+    ("personality_traits", 0.12),
+    ("matching_preferences", 0.08),
+    ("education", 0.04),
+    ("family", 0.04),
+    ("relationship_history", 0.06),
+    ("social_pattern", 0.04),
+    ("future_plans", 0.04),
+    ("finance_status", 0.02),
 ];
 
 /// Compute a [0.0, 1.0] training level from the JSONB insights blob.
@@ -186,13 +196,41 @@ mod tests {
     }
 
     #[test]
+    fn weights_sum_to_one() {
+        let sum: f64 = WEIGHTS.iter().map(|&(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "WEIGHTS must sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
     fn training_level_partial() {
         let v = serde_json::json!({
             "city": "Shanghai",
             "interests": ["coffee"],
         });
-        // 0.05 + 0.10
-        assert!((compute_training_level(&v) - 0.15).abs() < 1e-3);
+        // 0.04 + 0.08
+        assert!((compute_training_level(&v) - 0.12).abs() < 1e-3);
+    }
+
+    #[test]
+    fn training_level_legacy_full_schema_is_0_76() {
+        // Documents the accepted one-time regression: a user who had filled the
+        // entire pre-expansion schema drops from 1.0 to 0.76 and climbs back as
+        // the six new slots fill (spec 2026-07-15).
+        let v = serde_json::json!({
+            "city": "Shanghai",
+            "occupation": "engineer",
+            "interests": ["coffee"],
+            "mbti_guess": "INFP",
+            "love_values": "slow burn",
+            "emotional_needs": "validation",
+            "life_rhythm": "night owl",
+            "personality_traits": ["curious"],
+            "matching_preferences": { "preferred_gender": "any" },
+        });
+        assert!((compute_training_level(&v) - 0.76).abs() < 1e-3);
     }
 
     #[test]
@@ -207,6 +245,12 @@ mod tests {
             "life_rhythm": "night owl",
             "personality_traits": ["curious"],
             "matching_preferences": { "preferred_gender": "any" },
+            "education": "985 本科",
+            "family": "独生子",
+            "relationship_history": "单身两年",
+            "social_pattern": "线上开黑",
+            "future_plans": "考研",
+            "finance_status": "奖学金",
         });
         let l = compute_training_level(&v);
         assert!((l - 1.0).abs() < 1e-3);
@@ -224,7 +268,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.user_id, user_id);
         assert_eq!(first.insights["city"], "Shanghai");
-        assert!((first.training_level - 0.05).abs() < 1e-3);
+        assert!((first.training_level - 0.04).abs() < 1e-3); // city
 
         // Second merge → adds field, level rises.
         let second = repo
@@ -237,7 +281,7 @@ mod tests {
         assert_eq!(second.insights["city"], "Shanghai");
         assert_eq!(second.insights["occupation"], "engineer");
         assert!(second.training_level > first.training_level);
-        assert!((second.training_level - 0.20).abs() < 1e-3);
+        assert!((second.training_level - 0.16).abs() < 1e-3); // city 0.04 + occupation 0.04 + interests 0.08
     }
 
     #[sqlx::test(migrations = "./migrations")]
