@@ -125,6 +125,19 @@ pub async fn voice_turn_stream(
             "无权访问该会话",
         ));
     }
+    // Channel-scoped enforcement: the voice endpoint writes `channel = 'voice'`
+    // messages, so it must only operate on a voice-channel session. Reject a
+    // text (or otherwise non-voice) session here — before persisting any turn —
+    // so voice messages never leak into a text conversation's history. Voice
+    // clients obtain a voice session via `chat/start` with `channel: "voice"`.
+    if session.channel != "voice" {
+        return Err(pre(
+            StatusCode::CONFLICT,
+            "wrong_channel",
+            "session is not a voice-channel session",
+            "该会话不是语音会话",
+        ));
+    }
     let instance_id = session.instance_id.ok_or_else(|| {
         pre(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -243,7 +256,14 @@ mod tests {
         axum.with_state(state)
     }
 
+    /// Seed a voice-channel session (the voice endpoint's valid input).
     async fn seed(pool: &PgPool, user_id: Uuid) -> Uuid {
+        seed_channel(pool, user_id, "voice").await
+    }
+
+    /// Seed a session on an explicit `channel` for the voice endpoint's
+    /// channel-scoping tests.
+    async fn seed_channel(pool: &PgPool, user_id: Uuid, channel: &str) -> Uuid {
         let genome_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
              VALUES ('V','p','{}'::jsonb) RETURNING id",
@@ -255,10 +275,11 @@ mod tests {
             "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
         ).bind(genome_id).bind(user_id).fetch_one(pool).await.unwrap();
         sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) VALUES ($1,$2,$3) RETURNING id",
         )
         .bind(user_id)
         .bind(instance_id)
+        .bind(channel)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -369,6 +390,37 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_409_when_session_not_voice_channel(pool: PgPool) {
+        // The voice endpoint must only operate on voice-channel sessions.
+        // `seed` creates a default (text-channel) session; posting a voice turn
+        // to it must be rejected pre-stream (409) WITHOUT persisting a user row,
+        // so voice turns never leak into a text conversation.
+        let user_id = Uuid::new_v4();
+        let session_id = seed_channel(&pool, user_id, "text").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+        let jwt = mint_jwt(user_id);
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({"content":"hi","client_msg_id":"01J2222222222222222222222A"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // No user row persisted — the rejection happened before the insert.
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "wrong-channel rejection must not persist a turn");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn voice_404_when_persona_instance_missing(pool: PgPool) {
         // A session whose persona instance is missing/inactive must be rejected
         // pre-stream (404) WITHOUT persisting a user row. chat_sessions.instance_id
@@ -377,7 +429,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         let missing_instance = Uuid::new_v4(); // no matching persona_instances row
         let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
         )
         .bind(user_id)
         .bind(missing_instance)
