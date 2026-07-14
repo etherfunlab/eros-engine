@@ -12,7 +12,7 @@ keywords = ["companion", "openrouter", "voyage", "embeddings", "llm"]
 categories = ["api-bindings"]
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.7.4" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.7.5-dev" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
