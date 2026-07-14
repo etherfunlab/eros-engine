@@ -1295,6 +1295,12 @@ mod tests {
             age_min: Some(25),
             age_max: Some(35),
             deal_breakers: vec!["抽烟".into()],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1375,6 +1381,12 @@ mod tests {
             age_min: None,
             age_max: None,
             deal_breakers: vec![],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
             updated_at: chrono::Utc::now(),
         }
     }
