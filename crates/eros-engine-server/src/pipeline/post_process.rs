@@ -362,6 +362,7 @@ async fn embed_and_upsert(
         content,
         &embedding,
         None,
+        None, // metadata: raw-turn writer supplies none
     )
     .await
     .map_err(|e| format!("memory insert failed: {e}"))?;

@@ -233,6 +233,7 @@ async fn classify_session(
                         trimmed,
                         &embedding,
                         Some(&category),
+                        None,
                     )
                     .await
                 {

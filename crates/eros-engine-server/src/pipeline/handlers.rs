@@ -944,6 +944,7 @@ mod tests {
             "profile fact",
             &unit_embedding(11),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -954,6 +955,7 @@ mod tests {
             Some(instance_id),
             "relationship fact",
             &unit_embedding(11),
+            None,
             None,
         )
         .await
@@ -993,6 +995,7 @@ mod tests {
             "lives in shanghai",
             &unit_embedding(7),
             Some("fact"),
+            None,
         )
         .await
         .unwrap();
@@ -1004,6 +1007,7 @@ mod tests {
             "loves coffee",
             &unit_embedding(8),
             Some("preference"),
+            None,
         )
         .await
         .unwrap();
@@ -1014,6 +1018,7 @@ mod tests {
             None,
             "raw turn dump — should be filtered out",
             &unit_embedding(9),
+            None,
             None,
         )
         .await
@@ -1063,6 +1068,7 @@ mod tests {
                 &format!("profile-{i}"),
                 &unit_embedding(100 + i),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1075,6 +1081,7 @@ mod tests {
                 Some(instance_id),
                 &format!("relationship-{i}"),
                 &unit_embedding(200 + i),
+                None,
                 None,
             )
             .await
@@ -1115,6 +1122,7 @@ mod tests {
             "profile target",
             &unit_embedding(42),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1126,6 +1134,7 @@ mod tests {
                 None,
                 &format!("profile decoy-{i}"),
                 &unit_embedding(300 + i),
+                None,
                 None,
             )
             .await
@@ -1141,6 +1150,7 @@ mod tests {
             "relationship target",
             &unit_embedding(99),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1151,6 +1161,7 @@ mod tests {
             Some(instance_id),
             "relationship decoy",
             &unit_embedding(400),
+            None,
             None,
         )
         .await
@@ -1205,6 +1216,7 @@ mod tests {
             "profile fact",
             &unit_embedding(11),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1215,6 +1227,7 @@ mod tests {
             Some(instance_id),
             "relationship fact",
             &unit_embedding(11),
+            None,
             None,
         )
         .await
