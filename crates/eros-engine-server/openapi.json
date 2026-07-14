@@ -1221,6 +1221,13 @@
       "BffStartRequest": {
         "type": "object",
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation channel ('text' default, or 'voice'). Passed through to\nthe canonical start; see `StartChatRequest::channel`."
+          },
           "genome_id": {
             "type": [
               "string",
@@ -1576,9 +1583,14 @@
           "session_id",
           "lead_score",
           "is_converted",
-          "last_active_at"
+          "last_active_at",
+          "channel"
         ],
         "properties": {
+          "channel": {
+            "type": "string",
+            "description": "Conversation channel ('text' or 'voice'); start/resume is channel-scoped."
+          },
           "instance_id": {
             "type": [
               "string",
@@ -1606,6 +1618,13 @@
       "StartChatRequest": {
         "type": "object",
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation channel for the session: `\"text\"` (default) or `\"voice\"`.\nStart/resume is channel-scoped — a voice-channel start never resumes a\ntext session and vice versa, so the two conversations stay isolated."
+          },
           "genome_id": {
             "type": [
               "string",

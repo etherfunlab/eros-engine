@@ -78,6 +78,11 @@ pub struct StartChatRequest {
     /// Ignored when resuming an existing session.
     #[serde(default)]
     pub is_demo: Option<bool>,
+    /// Conversation channel for the session: `"text"` (default) or `"voice"`.
+    /// Start/resume is channel-scoped — a voice-channel start never resumes a
+    /// text session and vice versa, so the two conversations stay isolated.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -117,6 +122,8 @@ pub struct SessionListEntry {
     pub lead_score: f64,
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
+    /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
+    pub channel: String,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -411,6 +418,12 @@ pub(crate) async fn resolve_or_create_session(
     let persona_repo = PersonaRepo { pool: &state.pool };
     let chat_repo = ChatRepo { pool: &state.pool };
 
+    let channel = match req.channel.as_deref() {
+        None | Some("text") => "text",
+        Some("voice") => "voice",
+        Some(other) => return Err(AppError::BadRequest(format!("invalid channel: {other}"))),
+    };
+
     let (instance_id, persona_name) = match req.instance_id {
         Some(iid) => {
             // Explicit instance: one JOIN read gives owner + genome name
@@ -456,7 +469,7 @@ pub(crate) async fn resolve_or_create_session(
     // Resume the latest session (bumping last_active_at in one statement), or
     // create a fresh one. Only `id` is consumed downstream.
     let (session_id, is_new) = match chat_repo
-        .resume_latest_session(user_id, instance_id)
+        .resume_latest_session(user_id, instance_id, channel)
         .await?
     {
         Some(s) => (s.id, false),
@@ -467,7 +480,7 @@ pub(crate) async fn resolve_or_create_session(
                 serde_json::json!({})
             };
             let s = chat_repo
-                .create_session_with_metadata(user_id, instance_id, metadata)
+                .create_session_with_metadata(user_id, instance_id, metadata, channel)
                 .await?;
             (s.id, true)
         }
@@ -601,6 +614,7 @@ async fn list_sessions(
             lead_score: s.lead_score,
             is_converted: s.is_converted,
             last_active_at: s.last_active_at,
+            channel: s.channel,
         })
         .collect();
     Ok(Json(ListSessionsResponse {
@@ -906,6 +920,52 @@ mod tests {
             .unwrap();
         let (status, _body) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ─── Test 4b: GET /sessions exposes channel for text vs voice ───
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn get_sessions_exposes_channel_text_and_voice(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nyx").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+
+        // seed_session creates a plain (text-channel-default) session.
+        let text_session = seed_session(&pool, user_id, instance_id).await;
+        let voice_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let req = Request::builder()
+            .uri(format!("/comp/chat/{user_id}/sessions"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let sessions = body["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 2);
+
+        let channel_of = |id: Uuid| -> Option<String> {
+            sessions
+                .iter()
+                .find(|s| s["session_id"].as_str() == Some(id.to_string().as_str()))
+                .and_then(|s| s["channel"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(channel_of(text_session), Some("text".to_string()));
+        assert_eq!(channel_of(voice_session), Some("voice".to_string()));
     }
 
     // ─── Bonus: debug affinity endpoint round-trips when enabled ────
@@ -1333,6 +1393,7 @@ mod tests {
             instance_id: None,
             genome_id: Some(genome_id),
             is_demo: None,
+            channel: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1368,6 +1429,7 @@ mod tests {
             instance_id: None,
             genome_id: Some(genome_id),
             is_demo: None,
+            channel: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1398,6 +1460,7 @@ mod tests {
             instance_id: Some(instance_id),
             genome_id: None,
             is_demo: None,
+            channel: None,
         };
         let err = resolve_or_create_session(&state, intruder, &req)
             .await
@@ -1426,6 +1489,7 @@ mod tests {
             instance_id: Some(instance_id),
             genome_id: None,
             is_demo: None,
+            channel: None,
         };
         let err = resolve_or_create_session(&state, user_id, &req)
             .await
