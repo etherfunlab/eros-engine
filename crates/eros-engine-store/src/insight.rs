@@ -131,9 +131,9 @@ impl<'a> InsightRepo<'a> {
     }
 }
 
-/// One `companion_insights_events` row to insert. `payload` is the facts array
-/// (`stage='facts'`) or the structured insight delta (`stage='structured'`), or
-/// `None` on a parse error.
+/// One `companion_insights_events` row to insert. `payload` is the
+/// `{facts, details}` object (`stage='facts'`) or the structured insight delta
+/// (`stage='structured'`), or `None` on a parse error.
 pub struct InsightEventInsert<'a> {
     pub run_id: Uuid,
     pub user_id: Uuid,
