@@ -122,6 +122,8 @@ pub struct SessionListEntry {
     pub lead_score: f64,
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
+    /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
+    pub channel: String,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -612,6 +614,7 @@ async fn list_sessions(
             lead_score: s.lead_score,
             is_converted: s.is_converted,
             last_active_at: s.last_active_at,
+            channel: s.channel,
         })
         .collect();
     Ok(Json(ListSessionsResponse {
@@ -917,6 +920,52 @@ mod tests {
             .unwrap();
         let (status, _body) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ─── Test 4b: GET /sessions exposes channel for text vs voice ───
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn get_sessions_exposes_channel_text_and_voice(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nyx").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+
+        // seed_session creates a plain (text-channel-default) session.
+        let text_session = seed_session(&pool, user_id, instance_id).await;
+        let voice_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let req = Request::builder()
+            .uri(format!("/comp/chat/{user_id}/sessions"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let sessions = body["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 2);
+
+        let channel_of = |id: Uuid| -> Option<String> {
+            sessions
+                .iter()
+                .find(|s| s["session_id"].as_str() == Some(id.to_string().as_str()))
+                .and_then(|s| s["channel"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(channel_of(text_session), Some("text".to_string()));
+        assert_eq!(channel_of(voice_session), Some("voice".to_string()));
     }
 
     // ─── Bonus: debug affinity endpoint round-trips when enabled ────

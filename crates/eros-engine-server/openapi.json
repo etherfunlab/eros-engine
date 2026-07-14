@@ -1583,9 +1583,14 @@
           "session_id",
           "lead_score",
           "is_converted",
-          "last_active_at"
+          "last_active_at",
+          "channel"
         ],
         "properties": {
+          "channel": {
+            "type": "string",
+            "description": "Conversation channel ('text' or 'voice'); start/resume is channel-scoped."
+          },
           "instance_id": {
             "type": [
               "string",

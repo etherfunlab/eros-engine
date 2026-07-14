@@ -15,6 +15,8 @@ pub struct ChatSession {
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
+    /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
+    pub channel: String,
     /// Set by the dreaming-lite sweeper after a classification pass.
     /// `None` means the session is still eligible for the next sweep tick.
     pub classified_at: Option<DateTime<Utc>>,
@@ -138,6 +140,10 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// Resume the most recent session for a user×instance pair, or create a new one.
+    ///
+    /// WARNING: channel-unaware — resumes the latest session on ANY channel.
+    /// Test-only convenience; production paths use `resume_latest_session`
+    /// with an explicit channel.
     pub async fn create_or_resume(
         &self,
         user_id: Uuid,
@@ -1023,12 +1029,24 @@ mod tests {
         let i3 = Uuid::new_v4();
 
         repo.create_session(user_id, i1).await.unwrap();
-        repo.create_session(user_id, i2).await.unwrap();
+        repo.create_session_with_metadata(user_id, i2, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
         repo.create_session(other_user, i3).await.unwrap();
 
         let sessions = repo.list_sessions(user_id).await.unwrap();
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|s| s.user_id == user_id));
+        // channel is exposed on the projection and distinguishes the two
+        // sessions (the text default vs. the explicit voice session above).
+        let channels: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.channel.as_str()).collect();
+        assert_eq!(
+            channels,
+            ["text", "voice"]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
