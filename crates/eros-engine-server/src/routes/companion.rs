@@ -78,6 +78,11 @@ pub struct StartChatRequest {
     /// Ignored when resuming an existing session.
     #[serde(default)]
     pub is_demo: Option<bool>,
+    /// Conversation channel for the session: `"text"` (default) or `"voice"`.
+    /// Start/resume is channel-scoped — a voice-channel start never resumes a
+    /// text session and vice versa, so the two conversations stay isolated.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -411,6 +416,12 @@ pub(crate) async fn resolve_or_create_session(
     let persona_repo = PersonaRepo { pool: &state.pool };
     let chat_repo = ChatRepo { pool: &state.pool };
 
+    let channel = match req.channel.as_deref() {
+        None | Some("text") => "text",
+        Some("voice") => "voice",
+        Some(other) => return Err(AppError::BadRequest(format!("invalid channel: {other}"))),
+    };
+
     let (instance_id, persona_name) = match req.instance_id {
         Some(iid) => {
             // Explicit instance: one JOIN read gives owner + genome name
@@ -456,7 +467,7 @@ pub(crate) async fn resolve_or_create_session(
     // Resume the latest session (bumping last_active_at in one statement), or
     // create a fresh one. Only `id` is consumed downstream.
     let (session_id, is_new) = match chat_repo
-        .resume_latest_session(user_id, instance_id)
+        .resume_latest_session(user_id, instance_id, channel)
         .await?
     {
         Some(s) => (s.id, false),
@@ -467,7 +478,7 @@ pub(crate) async fn resolve_or_create_session(
                 serde_json::json!({})
             };
             let s = chat_repo
-                .create_session_with_metadata(user_id, instance_id, metadata)
+                .create_session_with_metadata(user_id, instance_id, metadata, channel)
                 .await?;
             (s.id, true)
         }
@@ -1333,6 +1344,7 @@ mod tests {
             instance_id: None,
             genome_id: Some(genome_id),
             is_demo: None,
+            channel: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1368,6 +1380,7 @@ mod tests {
             instance_id: None,
             genome_id: Some(genome_id),
             is_demo: None,
+            channel: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1398,6 +1411,7 @@ mod tests {
             instance_id: Some(instance_id),
             genome_id: None,
             is_demo: None,
+            channel: None,
         };
         let err = resolve_or_create_session(&state, intruder, &req)
             .await
@@ -1426,6 +1440,7 @@ mod tests {
             instance_id: Some(instance_id),
             genome_id: None,
             is_demo: None,
+            channel: None,
         };
         let err = resolve_or_create_session(&state, user_id, &req)
             .await

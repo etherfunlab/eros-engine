@@ -65,6 +65,10 @@ pub struct BffStartRequest {
     /// BFF-only field; not present in the canonical /comp/chat/start body.
     #[serde(default)]
     pub history_limit: Option<i64>,
+    /// Conversation channel ('text' default, or 'voice'). Passed through to
+    /// the canonical start; see `StartChatRequest::channel`.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 impl From<&BffStartRequest> for StartChatRequest {
@@ -73,6 +77,7 @@ impl From<&BffStartRequest> for StartChatRequest {
             instance_id: b.instance_id,
             genome_id: b.genome_id,
             is_demo: b.is_demo,
+            channel: b.channel.clone(),
         }
     }
 }
@@ -694,5 +699,74 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(bff["session_id"].as_str().unwrap(), canonical_session_id);
         assert!(!bff["is_new"].as_bool().unwrap()); // canonical already created it
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_voice_channel_is_isolated_from_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // 1. Text start creates the text session.
+        let (status, text1) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={text1}");
+        assert!(text1["is_new"].as_bool().unwrap());
+
+        // 2. Voice start must NOT resume it — it creates a separate session.
+        let (status, voice1) = send_request(
+            &mut app,
+            bff_start_request(
+                &token,
+                json!({ "genome_id": genome_id, "channel": "voice" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={voice1}");
+        assert!(voice1["is_new"].as_bool().unwrap());
+        assert_ne!(voice1["session_id"], text1["session_id"]);
+
+        // 3. A second voice start resumes the SAME voice session.
+        let (_status, voice2) = send_request(
+            &mut app,
+            bff_start_request(
+                &token,
+                json!({ "genome_id": genome_id, "channel": "voice" }),
+            ),
+        )
+        .await;
+        assert!(!voice2["is_new"].as_bool().unwrap());
+        assert_eq!(voice2["session_id"], voice1["session_id"]);
+
+        // 4. Text start still resumes the TEXT session, even though the voice
+        //    session is more recent.
+        let (_status, text2) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert!(!text2["is_new"].as_bool().unwrap());
+        assert_eq!(text2["session_id"], text1["session_id"]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_rejects_invalid_channel(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, _body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id, "channel": "sms" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
