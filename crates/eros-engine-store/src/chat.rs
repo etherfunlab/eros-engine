@@ -15,6 +15,8 @@ pub struct ChatSession {
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
+    /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
+    pub channel: String,
     /// Set by the dreaming-lite sweeper after a classification pass.
     /// `None` means the session is still eligible for the next sweep tick.
     pub classified_at: Option<DateTime<Utc>>,
@@ -94,33 +96,37 @@ pub struct ChatRepo<'a> {
 }
 
 impl<'a> ChatRepo<'a> {
-    /// Create a new chat session for `user_id` × `instance_id`.
+    /// Create a new (text-channel) chat session for `user_id` × `instance_id`.
     pub async fn create_session(
         &self,
         user_id: Uuid,
         instance_id: Uuid,
     ) -> Result<ChatSession, sqlx::Error> {
-        self.create_session_with_metadata(user_id, instance_id, serde_json::json!({}))
+        self.create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "text")
             .await
     }
 
     /// Create a session and seed `metadata` as the JSONB column. Used by
     /// callers that need session-scoped flags (e.g. `is_demo`) the
-    /// pipeline reads later.
+    /// pipeline reads later. `channel` scopes the session ('text'/'voice');
+    /// resume is channel-scoped so the two never cross (see
+    /// `resume_latest_session`).
     pub async fn create_session_with_metadata(
         &self,
         user_id: Uuid,
         instance_id: Uuid,
         metadata: serde_json::Value,
+        channel: &str,
     ) -> Result<ChatSession, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id, metadata) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, metadata, channel) \
+             VALUES ($1, $2, $3, $4) \
              RETURNING *",
         )
         .bind(user_id)
         .bind(instance_id)
         .bind(metadata)
+        .bind(channel)
         .fetch_one(self.pool)
         .await
     }
@@ -134,6 +140,10 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// Resume the most recent session for a user×instance pair, or create a new one.
+    ///
+    /// WARNING: channel-unaware — resumes the latest session on ANY channel.
+    /// Test-only convenience; production paths use `resume_latest_session`
+    /// with an explicit channel.
     pub async fn create_or_resume(
         &self,
         user_id: Uuid,
@@ -163,16 +173,18 @@ impl<'a> ChatRepo<'a> {
     /// exists (caller then creates). Folds the former SELECT-latest +
     /// separate UPDATE into one round-trip. Callers consume only `id`
     /// (immutable), so returning the post-bump row is immaterial.
+    /// Channel-scoped: only sessions on `channel` are candidates.
     pub async fn resume_latest_session(
         &self,
         user_id: Uuid,
         instance_id: Uuid,
+        channel: &str,
     ) -> Result<Option<ChatSession>, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
             "UPDATE engine.chat_sessions SET last_active_at = now() \
              WHERE id = ( \
                  SELECT id FROM engine.chat_sessions \
-                 WHERE user_id = $1 AND instance_id = $2 \
+                 WHERE user_id = $1 AND instance_id = $2 AND channel = $3 \
                  ORDER BY last_active_at DESC \
                  LIMIT 1 \
              ) \
@@ -180,6 +192,7 @@ impl<'a> ChatRepo<'a> {
         )
         .bind(user_id)
         .bind(instance_id)
+        .bind(channel)
         .fetch_optional(self.pool)
         .await
     }
@@ -1016,12 +1029,24 @@ mod tests {
         let i3 = Uuid::new_v4();
 
         repo.create_session(user_id, i1).await.unwrap();
-        repo.create_session(user_id, i2).await.unwrap();
+        repo.create_session_with_metadata(user_id, i2, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
         repo.create_session(other_user, i3).await.unwrap();
 
         let sessions = repo.list_sessions(user_id).await.unwrap();
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|s| s.user_id == user_id));
+        // channel is exposed on the projection and distinguishes the two
+        // sessions (the text default vs. the explicit voice session above).
+        let channels: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.channel.as_str()).collect();
+        assert_eq!(
+            channels,
+            ["text", "voice"]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1221,7 +1246,7 @@ mod tests {
 
         // no session yet → None
         assert!(repo
-            .resume_latest_session(user_id, instance_id)
+            .resume_latest_session(user_id, instance_id, "text")
             .await
             .unwrap()
             .is_none());
@@ -1254,7 +1279,7 @@ mod tests {
                 .unwrap();
 
         let resumed = repo
-            .resume_latest_session(user_id, instance_id)
+            .resume_latest_session(user_id, instance_id, "text")
             .await
             .unwrap()
             .expect("resume the most-recent session");
@@ -2874,5 +2899,41 @@ mod tests {
             matches!(out, VoiceUserInsert::Duplicate(_)),
             "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sessions_are_channel_scoped(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (user_id, instance_id) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let text = repo.create_session(user_id, instance_id).await.unwrap();
+
+        // No voice session yet → nothing to resume on the voice channel.
+        assert!(repo
+            .resume_latest_session(user_id, instance_id, "voice")
+            .await
+            .unwrap()
+            .is_none());
+
+        let voice = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        // Each channel resumes ITS OWN latest session, even though the other
+        // channel's session is more recent.
+        let resumed_text = repo
+            .resume_latest_session(user_id, instance_id, "text")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed_text.id, text.id);
+
+        let resumed_voice = repo
+            .resume_latest_session(user_id, instance_id, "voice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed_voice.id, voice.id);
     }
 }

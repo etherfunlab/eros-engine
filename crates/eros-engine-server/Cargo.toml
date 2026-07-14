@@ -13,9 +13,9 @@ name = "eros-engine"
 path = "src/main.rs"
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.7.3" }
-eros-engine-llm  = { path = "../eros-engine-llm", version = "0.7.3" }
-eros-engine-store = { path = "../eros-engine-store", version = "0.7.3" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.7.4" }
+eros-engine-llm  = { path = "../eros-engine-llm", version = "0.7.4" }
+eros-engine-store = { path = "../eros-engine-store", version = "0.7.4" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
