@@ -722,6 +722,7 @@ pub(super) async fn build_reply_request(
         Some(&input.affinity),
         plan.reply_style,
         &plan.context_hints,
+        plan.reply_tone.as_deref(),
         &kept_traits,
         affinity_scope,
         &recent_turns,
