@@ -148,6 +148,11 @@ pub struct ActionPlan {
     pub affinity_deltas: AffinityDeltas,
     pub energy_cost: f64,
     pub context_hints: Vec<String>,
+    /// Judge-directed delivery for this turn's reply (free text, sanitized by
+    /// the server before it gets here). `Some` only on LLM-judge, text-bearing
+    /// turns (reply_text / reply_text_image); `None` everywhere else — rule
+    /// PDE, fail-open, tips, ghost, reply_image.
+    pub reply_tone: Option<String>,
     /// Subject for the image executor (`reply_image`/`reply_text_image`); `None`
     /// for text/ghost/proactive. Carried from the PDE verdict or a forced turn.
     pub image_prompt: Option<String>,

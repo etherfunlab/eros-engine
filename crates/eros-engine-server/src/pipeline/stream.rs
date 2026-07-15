@@ -1437,6 +1437,10 @@ pub(crate) struct PdeVerdict {
     action: PdeAction,
     #[serde(default)]
     inner_state: String,
+    /// Prescriptive delivery for this turn's reply (free text; sanitized like
+    /// inner_state before injection). `None` on old prompts / null verdicts.
+    #[serde(default)]
+    tone: Option<String>,
     #[serde(default)]
     image_prompt: Option<String>,
     #[serde(default)]
@@ -1458,8 +1462,9 @@ fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
 
 const INNER_STATE_MAX_CHARS: usize = 200;
 
-/// Sanitize judge-authored `inner_state` before folding it into the system
-/// prompt's `[inner_state]` section. Drops lines that look like prompt section
+/// Sanitize judge-authored prose (`inner_state` / `tone`) before folding it into
+/// the system prompt's `[inner_state]` / `[reply_tone]` sections. Drops lines
+/// that look like prompt section
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
@@ -1530,11 +1535,12 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "image_prompt", "reason", "image_ref", "aspect_ratio"],
+                "required": ["action", "inner_state", "tone", "image_prompt", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
                     "inner_state": { "type": "string" },
+                    "tone": { "type": ["string", "null"] },
                     "image_prompt": { "type": ["string", "null"] },
                     "reason": { "type": ["string", "null"] },
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
@@ -1711,6 +1717,7 @@ fn apply_ghosting_killswitch(
             ActionType::ReplyText,
             hints,
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         )
@@ -1831,6 +1838,8 @@ struct VerdictAudit<'a> {
     action: &'a str,
     inner_state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tone: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_prompt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
@@ -1844,6 +1853,7 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
         VerdictAudit {
             action: v.action.as_str(),
             inner_state: &v.inner_state,
+            tone: v.tone.as_deref(),
             image_prompt: v.image_prompt.as_deref(),
             reason: v.reason.as_deref(),
             image_ref: match v.image_ref {
@@ -2627,6 +2637,13 @@ pub fn run_stream(
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
+                            // Same sanitizer, same discipline: judge-authored
+                            // prose never carries section markers into the prompt.
+                            let tone = v
+                                .tone
+                                .as_deref()
+                                .map(sanitize_inner_state)
+                                .filter(|s| !s.is_empty());
                             // Capture the judge's image prompt while `v` is still
                             // borrowed here (the run/verdict is moved into the
                             // audit task below). Only image actions carry it.
@@ -2641,7 +2658,9 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, img_prompt, img_ref, img_aspect)
+                            pde::plan_for(
+                                &input, action, hints, tone, img_prompt, img_ref, img_aspect,
+                            )
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2674,6 +2693,7 @@ pub fn run_stream(
                 &input,
                 action,
                 plan.context_hints.clone(),
+                plan.reply_tone.clone(),
                 req_image.and_then(|i| i.image_prompt.clone()),
                 eros_engine_core::types::ImageRef::Face,
                 None,
@@ -3682,6 +3702,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_pde_verdict_tone_roundtrip() {
+        // With tone.
+        let v =
+            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","tone":"敷衍一点"}"#)
+                .unwrap();
+        assert_eq!(v.tone.as_deref(), Some("敷衍一点"));
+        // Without tone (old prompts) and explicit null (strict providers).
+        let v = parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok"}"#).unwrap();
+        assert_eq!(v.tone, None);
+        let v =
+            parse_pde_verdict(r#"{"action":"reply_text","inner_state":"ok","tone":null}"#).unwrap();
+        assert_eq!(v.tone, None);
+    }
+
+    #[test]
+    fn verdict_audit_serializes_tone_when_present() {
+        let with: PdeVerdict =
+            serde_json::from_str(r#"{"action":"ghost","inner_state":"想躲","tone":"冷淡"}"#)
+                .unwrap();
+        let j = serde_json::to_value(VerdictAudit::from(&with)).unwrap();
+        assert_eq!(
+            j["tone"], "冷淡",
+            "audit records what the judge said even when the plan drops it (ghost)"
+        );
+        let without: PdeVerdict =
+            serde_json::from_str(r#"{"action":"ghost","inner_state":"想躲"}"#).unwrap();
+        let j = serde_json::to_value(VerdictAudit::from(&without)).unwrap();
+        assert!(
+            j.get("tone").is_none(),
+            "absent tone is omitted from audit: {j}"
+        );
+    }
+
+    #[test]
     fn verdict_audit_includes_image_ref_and_aspect() {
         let j = "{\"action\":\"reply_image\",\"inner_state\":\"x\",\"image_ref\":\"previous\",\"aspect_ratio\":\"3:4\"}";
         let v = parse_pde_verdict(j).unwrap();
@@ -3881,6 +3935,7 @@ mod tests {
             ActionType::Ghost,
             vec![],
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         );
@@ -3904,6 +3959,7 @@ mod tests {
             &input,
             acted,
             hints.clone(),
+            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -7535,6 +7591,145 @@ data: [DONE]\n\n";
             chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
             "the judge's inner_state must be injected into the chat system prompt; got {chat_sent}",
         );
+        assert!(
+            !chat_sent.contains("[reply_tone]"),
+            "a verdict without tone must not render a [reply_tone] section; got {chat_sent}",
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_reply_injects_reply_tone(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `reply_text` verdict carrying BOTH an
+        // inner_state and a tone. Both are plain prose (no headers/brackets)
+        // so they survive `sanitize_inner_state` unchanged and land in the
+        // prompt's `[inner_state]` / `[reply_tone]` sections via
+        // `pde::plan_for` → `build_prompt`.
+        let verdict = serde_json::json!({
+            "action": "reply_text",
+            "inner_state": "有点开心",
+            "tone": "撒娇一点，句子短一点"
+        })
+        .to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): normal SSE reply. The mock matches the chat call;
+        // we capture its request body afterward to assert the injected tone.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "你今天怎么样",
+                "01JPDETONE0000000000000000",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "你今天怎么样".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "a reply_text verdict must produce a normal reply; got {frames:?}",
+        );
+
+        // The chat call's system prompt must carry the injected inner_state.
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| {
+                let b = String::from_utf8_lossy(&r.body);
+                b.contains("deepseek/x")
+            })
+            .expect("the chat call must have fired");
+        let chat_sent = String::from_utf8_lossy(&chat_req.body);
+        assert!(
+            chat_sent.contains("[reply_tone]")
+                && chat_sent.contains("这一轮回复的语气：撒娇一点，句子短一点。"),
+            "the judge's tone must be injected as [reply_tone] in the chat system prompt; got {chat_sent}",
+        );
+        assert!(
+            chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
+            "inner_state still injected alongside tone; got {chat_sent}",
+        );
     }
 
     // Optional (spec §12): a junk (non-JSON) judge reply must fail OPEN — the turn
@@ -8595,10 +8790,16 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 6, "all six properties required: {v}");
+        assert_eq!(req.len(), 7, "all seven properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
+        );
+        assert!(req.iter().any(|x| x == "tone"), "tone required: {v}");
+        assert_eq!(
+            v["json_schema"]["schema"]["properties"]["tone"]["type"],
+            serde_json::json!(["string", "null"]),
+            "tone is nullable for strict providers: {v}"
         );
         assert!(
             req.iter().any(|x| x == "aspect_ratio"),

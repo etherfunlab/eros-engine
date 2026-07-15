@@ -340,6 +340,9 @@ pub fn build_prompt(
     affinity: Option<&Affinity>,
     style: ReplyStyle,
     hints: &[String],
+    // Judge-directed delivery for this turn (ActionPlan.reply_tone). `None`
+    // or blank ⇒ the `[reply_tone]` block is omitted.
+    reply_tone: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
     recent_turns: &[(String, String)],
@@ -478,6 +481,15 @@ pub fn build_prompt(
         )
     };
 
+    // Judge-directed delivery tone for this turn (ActionPlan.reply_tone).
+    // `None`/blank ⇒ omitted, prompt byte-identical to the no-tone case.
+    let tone_section = match reply_tone.map(str::trim) {
+        Some(t) if !t.is_empty() => format!(
+            "\n[reply_tone]\n这一轮回复的语气：{t}。语气随对话自然流动，不要为了贴合语气而显得刻意。"
+        ),
+        _ => String::new(),
+    };
+
     // Volatile (per-turn) anti-repetition directive — rendered after the stable
     // cache prefix so prefix caching is unaffected. Empty ⇒ omitted.
     let avoid_section = if avoid_patterns.is_empty() {
@@ -544,7 +556,7 @@ pub fn build_prompt(
          [user_profile]\n{profile_str}\n\
          \n\
          [shared_memories]\n{rel_str}\
-         {attitude}{state}{hints_section}{avoid_section}{emotional_section}\n\
+         {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}\n\
          \n\
          [now]\n{tc}\n\
          {recent_section}\
@@ -710,6 +722,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -746,6 +759,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &traits,
             AffinityScope::full(),
             &[],
@@ -777,6 +791,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &traits,
             AffinityScope::full(),
             &[],
@@ -793,6 +808,57 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_renders_reply_tone_after_inner_state() {
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &["有点想躲".to_string()],
+            Some("语气敷衍一点，句子短一点"),
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(p.contains("[reply_tone]"), "section present: {p}");
+        assert!(
+            p.contains("这一轮回复的语气：语气敷衍一点，句子短一点。语气随对话自然流动，不要为了贴合语气而显得刻意。"),
+            "directive framing verbatim: {p}"
+        );
+        let inner = p.find("[inner_state]").expect("inner_state present");
+        let tone = p.find("[reply_tone]").unwrap();
+        assert!(tone > inner, "[reply_tone] renders after [inner_state]");
+        assert!(
+            tone < p.find("[now]").unwrap(),
+            "[reply_tone] renders in the volatile block before [now]"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_reply_tone_when_none_or_blank() {
+        for tone in [None, Some(""), Some("   ")] {
+            let p = build_prompt(
+                &fixture_persona(),
+                &[],
+                &[],
+                None,
+                ReplyStyle::Neutral,
+                &[],
+                tone,
+                &[],
+                AffinityScope::default(),
+                &[],
+                &[],
+                &[],
+            );
+            assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
+        }
+    }
+
+    #[test]
     fn build_prompt_full_order_and_cache_break() {
         let s = build_prompt(
             &fixture_persona(),
@@ -801,6 +867,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -847,6 +914,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -877,6 +945,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -904,6 +973,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -939,6 +1009,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -960,6 +1031,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -986,6 +1058,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1007,6 +1080,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1033,6 +1107,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1056,6 +1131,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &pairs,
@@ -1108,6 +1184,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1129,6 +1206,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1153,6 +1231,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1194,6 +1273,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1208,6 +1288,7 @@ mod tests {
             Some(&fixture_affinity()),
             ReplyStyle::Warm,
             &["想他".to_string()],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1242,6 +1323,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &t1,
             AffinityScope::full(),
             &[],
@@ -1255,6 +1337,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &t2,
             AffinityScope::full(),
             &[],
@@ -1281,6 +1364,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1311,6 +1395,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1334,6 +1419,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1368,6 +1454,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
@@ -1595,6 +1682,7 @@ mod tests {
             Some(&a),
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::bond(),
             &[],
@@ -1619,6 +1707,7 @@ mod tests {
             Some(&a),
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::none(),
             &[],
@@ -1685,6 +1774,7 @@ mod tests {
             None,
             ReplyStyle::Neutral,
             &[],
+            None,
             &[],
             AffinityScope::full(),
             &[],
