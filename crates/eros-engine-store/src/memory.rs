@@ -44,6 +44,11 @@ pub struct MemoryRow {
     /// `None` for rows written by the raw-turn writer; populated once the
     /// classifier extraction step lands.
     pub category: Option<String>,
+    /// Opaque extraction metadata (domain / evidence_type / temporality /
+    /// persistence / confidence). Vocabulary is owned by the extraction
+    /// prompt; the engine stores it verbatim and does not read it yet.
+    /// `None` for raw-turn / relationship rows and old-prompt deployments.
+    pub metadata: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -66,6 +71,7 @@ impl<'a> MemoryRepo<'a> {
         content: &str,
         embedding: &[f32],
         category: Option<&str>,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<Uuid, sqlx::Error> {
         let resolved_instance = match layer {
             MemoryLayer::Profile => None,
@@ -75,8 +81,8 @@ impl<'a> MemoryRepo<'a> {
 
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.companion_memories \
-                 (session_id, user_id, instance_id, content, embedding, category) \
-             VALUES ($1, $2, $3, $4, $5::vector, $6) RETURNING id",
+                 (session_id, user_id, instance_id, content, embedding, category, metadata) \
+             VALUES ($1, $2, $3, $4, $5::vector, $6, $7) RETURNING id",
         )
         .bind(session_id)
         .bind(user_id)
@@ -84,6 +90,7 @@ impl<'a> MemoryRepo<'a> {
         .bind(content)
         .bind(vec_text)
         .bind(category)
+        .bind(metadata)
         .fetch_one(self.pool)
         .await?;
         Ok(id)
@@ -106,9 +113,9 @@ impl<'a> MemoryRepo<'a> {
     ) -> Result<Vec<MemoryRow>, sqlx::Error> {
         let vec_text = format_vector(query_embedding);
         sqlx::query_as::<_, MemoryRow>(
-            "SELECT id, session_id, user_id, instance_id, content, category, created_at \
+            "SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at \
              FROM ( \
-                 SELECT id, session_id, user_id, instance_id, content, category, \
+                 SELECT id, session_id, user_id, instance_id, content, category, metadata, \
                         embedding, created_at, \
                         ROW_NUMBER() OVER ( \
                             PARTITION BY category \
@@ -145,7 +152,7 @@ impl<'a> MemoryRepo<'a> {
         match instance_id {
             Some(pid) => {
                 sqlx::query_as::<_, MemoryRow>(
-                    "SELECT id, session_id, user_id, instance_id, content, category, created_at \
+                    "SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at \
                      FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id = $2 \
                        AND content NOT LIKE $3 \
@@ -162,7 +169,7 @@ impl<'a> MemoryRepo<'a> {
             }
             None => {
                 sqlx::query_as::<_, MemoryRow>(
-                    "SELECT id, session_id, user_id, instance_id, content, category, created_at \
+                    "SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at \
                      FROM engine.companion_memories \
                      WHERE user_id = $1 AND instance_id IS NULL \
                      ORDER BY embedding <=> $2::vector \
@@ -218,6 +225,7 @@ mod tests {
                 "user lives in shanghai",
                 &emb,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -248,6 +256,7 @@ mod tests {
                 "target",
                 &unit_embedding(42),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -259,6 +268,7 @@ mod tests {
             "decoy a",
             &unit_embedding(100),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -269,6 +279,7 @@ mod tests {
             Some(instance_id),
             "decoy b",
             &unit_embedding(200),
+            None,
             None,
         )
         .await
@@ -300,6 +311,7 @@ mod tests {
             "用户：你好\nAI：我看着你，轻声说。",
             &unit_embedding(7),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -312,6 +324,7 @@ mod tests {
                 Some(instance_id),
                 "用户：你好",
                 &unit_embedding(8),
+                None,
                 None,
             )
             .await
@@ -355,6 +368,7 @@ mod tests {
                 &format!("{cat}-{seed}"),
                 &unit_embedding(*seed),
                 Some(cat),
+                None,
             )
             .await
             .unwrap();
@@ -367,6 +381,7 @@ mod tests {
             None,
             "raw-untagged",
             &unit_embedding(10),
+            None,
             None,
         )
         .await
@@ -418,6 +433,7 @@ mod tests {
             "tagged",
             &unit_embedding(33),
             Some("preference"),
+            None,
         )
         .await
         .unwrap();
@@ -428,6 +444,7 @@ mod tests {
             Some(instance_id),
             "untagged",
             &unit_embedding(34),
+            None,
             None,
         )
         .await
@@ -461,6 +478,7 @@ mod tests {
             "profile fact",
             &unit_embedding(11),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -472,6 +490,7 @@ mod tests {
             Some(instance_id),
             "relationship fact",
             &unit_embedding(11),
+            None,
             None,
         )
         .await
@@ -491,5 +510,67 @@ mod tests {
             .unwrap();
         assert_eq!(rel_hits.len(), 1);
         assert_eq!(rel_hits[0].content, "relationship fact");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_roundtrips_metadata_and_defaults_to_null(pool: PgPool) {
+        let repo = MemoryRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, None).await;
+
+        let meta = serde_json::json!({
+            "domain": "career",
+            "evidence_type": "explicit_statement",
+            "temporality": "current",
+            "persistence": "ongoing",
+            "confidence": "high"
+        });
+        let with_meta = repo
+            .upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                "用户目前正在找工作",
+                &unit_embedding(1),
+                Some("fact"),
+                Some(&meta),
+            )
+            .await
+            .unwrap();
+        let without_meta = repo
+            .upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                "用户喜欢咖啡",
+                &unit_embedding(2),
+                Some("preference"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let rows: Vec<(Uuid, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT id, metadata FROM engine.companion_memories WHERE user_id = $1 ORDER BY created_at",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, with_meta);
+        assert_eq!(rows[0].1, Some(meta));
+        assert_eq!(rows[1].0, without_meta);
+        assert_eq!(rows[1].1, None, "no metadata ⇒ NULL column");
+
+        // MemoryRow surfaces the column through the search path too.
+        let hits = repo
+            .search(user_id, None, &unit_embedding(1), 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].metadata.is_some());
     }
 }

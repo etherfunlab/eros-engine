@@ -321,6 +321,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
   - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. Availability no longer depends on `[tasks.chat_image_generation]`: the chat stream never draws, it emits an `image_request` frame. `[tasks.chat_image_generation]` gates only the separate draw endpoint, `POST /comp/chat/{session_id}/image/stream`.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
+  - `tone` (optional): a short delivery directive for this turn's reply — injected into the reply prompt as a `[reply_tone]` section on text-bearing actions; omitted when absent
   - `image_prompt`, `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost twice in a row, one-hour ghost cooldown.

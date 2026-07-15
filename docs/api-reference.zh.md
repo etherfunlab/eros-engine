@@ -361,7 +361,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 }
 ```
 
-`training_level` 是九個字段加權後的分數（city 0.05、occupation 0.05、interests 0.10、mbti_guess 0.15、love_values 0.15、emotional_needs 0.15、life_rhythm 0.10、personality_traits 0.15、matching_preferences 0.10）。權重總和為 1.0。
+`training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
 
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）

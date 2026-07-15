@@ -47,6 +47,22 @@ const PICK_BATCH: i64 = 10;
 struct MemoryCandidate {
     content: String,
     category: String,
+    /// Everything else the extraction prompt emitted per memory (domain /
+    /// evidence_type / temporality / persistence / confidence, plus whatever
+    /// future prompts add). Captured opaquely — the engine never validates
+    /// the vocabulary; it lands verbatim in companion_memories.metadata.
+    #[serde(flatten)]
+    metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Flattened remainder → the JSONB value to persist. Empty map ⇒ `None`
+/// ⇒ NULL column (old-prompt deployments keep writing NULL, not `{}`).
+fn candidate_metadata(cand: &MemoryCandidate) -> Option<serde_json::Value> {
+    if cand.metadata.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(cand.metadata.clone()))
+    }
 }
 
 /// Run forever. Spawn this once at server startup. Returns immediately
@@ -222,6 +238,7 @@ async fn classify_session(
             continue;
         }
         let category = normalise_category(&cand.category);
+        let metadata = candidate_metadata(cand);
         match state.voyage.embed_document(trimmed).await {
             Ok(embedding) => {
                 if let Err(e) = repo
@@ -233,6 +250,7 @@ async fn classify_session(
                         trimmed,
                         &embedding,
                         Some(&category),
+                        metadata.as_ref(),
                     )
                     .await
                 {
@@ -378,6 +396,40 @@ mod tests {
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].content, "a");
         assert_eq!(cands[1].content, "c");
+    }
+
+    #[test]
+    fn parse_memory_candidates_captures_extra_keys_as_metadata() {
+        let raw = r#"{"memories":[{
+            "content": "用户目前正在找工作",
+            "category": "fact",
+            "domain": "career",
+            "evidence_type": "explicit_statement",
+            "temporality": "current",
+            "persistence": "ongoing",
+            "confidence": "high"
+        }]}"#;
+        let cands = parse_memory_candidates(raw);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].content, "用户目前正在找工作");
+        assert_eq!(cands[0].category, "fact");
+        let meta = candidate_metadata(&cands[0]).expect("metadata present");
+        assert_eq!(meta["domain"], "career");
+        assert_eq!(meta["confidence"], "high");
+        // Named fields are NOT duplicated into the flattened remainder.
+        assert!(meta.get("content").is_none());
+        assert!(meta.get("category").is_none());
+    }
+
+    #[test]
+    fn candidate_metadata_is_none_for_bare_candidates() {
+        let raw = r#"{"memories":[{"content":"养了一只猫","category":"fact"}]}"#;
+        let cands = parse_memory_candidates(raw);
+        assert_eq!(cands.len(), 1);
+        assert!(
+            candidate_metadata(&cands[0]).is_none(),
+            "no extra keys ⇒ None ⇒ NULL column"
+        );
     }
 
     #[test]

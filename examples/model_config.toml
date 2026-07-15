@@ -285,28 +285,55 @@ max_tokens = 4096
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
-max_tokens = 400
+max_tokens = 1200
 # Remove this entire [tasks.insight_extraction] section to disable per-turn fact
 # extraction. While the section is present, filter_prompt is REQUIRED — the
 # server refuses to boot if it is blank.
+# One task block serves BOTH extraction stages: Stage 1 (this prompt: facts +
+# per-fact details) and Stage 2 (the built-in structured-schema prompt). 1200
+# tokens covers the dual-track Stage-1 output and the 18-field Stage-2 object.
 # Optional: force the extraction model's reasoning off (default = model decides).
 #reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
-# as a separate user message.
+# as a separate user message. Dual-track output: `facts` (plain strings — feeds
+# the structured-insights stage and the chat path) + `details` (per-fact
+# metadata — persisted opaquely to companion_insights_events for downstream
+# profile/matching systems). The metadata vocabularies below are a REFERENCE
+# taxonomy owned by this prompt: the engine stores whatever you emit and never
+# validates the values, so extend/rename them freely without an engine upgrade.
 filter_prompt = """
-你是事实提取器，只分析【真人用户】，从这一轮对话中提取关于用户的、具体且有据可循的新事实。
+你是用户事实与画像信号提取器。从这一轮对话中提取关于【真人用户】的、新出现的、可长期复用的原子事实，并为每条事实补充结构化元数据。
 
-要的是具体、可落地、贴着用户原话的事实，不要含糊的概括。
-- 好：用户在深圳做后端工程师，最近在准备跳槽
-- 差：用户工作压力大（太笼统，没有抓手）
+对话身份（必须严格区分）：
+- 「用户:」= 屏幕前的真人；「AI:」= 虚构 AI 伴侣。
+- 只有用户主动陈述、明确确认、实际表现或在角色扮演中表达的内容，才可能成为用户事实。
+- AI 的台词、动作、自我介绍、人设、经历、喜好、判断和推测都不是用户事实，只能作为理解用户发言的上下文。
+
+提取目标：身份与背景、居住地与文化、工作教育技能、兴趣审美消费、喜恶与界限、目标与计划、价值观与立场、习惯与作息、情绪与压力来源、人际关系、重要事件、健康状况、性与亲密偏好、以及用户在角色扮演中反复或明确表现出的欲望与互动倾向。只要有助于长期理解用户、个性化对话、关系建模或用户匹配就可以提取，不限于传统人口统计信息。
+
+原子化：每条事实只表达一个主要命题。「我最近在找工作，这件事让我很焦虑」应拆成「用户目前正在找工作」和「用户最近因为找工作感到焦虑」两条。
+
+每条事实的元数据字段与词汇表：
+- evidence_type: explicit_statement（用户直接陈述）/ explicit_agreement（AI 提出、用户明确确认——必须有「对」「是的」等明确认同，不能只因 AI 说了就算）/ observed_behavior（来自用户本轮的实际选择、行为或表达方式）/ roleplay_expression（通过角色扮演的动作、剧情、台词或欲望表达）
+- category: fact / preference / aversion / goal / value / habit / skill / event / emotion / relation / communication_style / roleplay_tendency / constraint（选最具体、最主要的一个）
+- domain: basic_profile / location_culture / career / education / technology / finance / family / friendship / romance / sexuality / health / lifestyle / hobby / politics / religion / personality / communication / other
+- temporality: atemporal / current / past / future / unknown
+- persistence: stable / ongoing / transient / one_off / unknown（单次表达、单次角色扮演动作或语境有限的信息通常是 unknown，不要因为用户说了「喜欢」就自动标 stable）
+- confidence: high（直接、明确、无歧义）/ medium（较清楚但有语境限制，或来自明确行为和角色扮演表达）/ low（弱信号；只在确有画像价值时才输出，不要为凑条目提取大量低置信推测）
+
+角色扮演规则：角色扮演可以反映真实偏好与倾向，但虚构身份、职业、家庭、地点、身体状态和剧情事件默认不是现实事实——「我是王国的公主」「我们已经结婚十年」「我刚从战场回来」都不是用户的现实。单次剧情动作只能写成「用户在本轮角色扮演中表现出…的互动倾向」（evidence_type=roleplay_expression），不得升级成稳定身份、长期癖好或现实经历。用户在角色扮演中明确自述的偏好可以忠实提取，但保留角色扮演语境，除非用户同时明确表示现实中也如此。
+
+content 表达规则：第三人称、以「用户」开头；保留原始信息的具体程度、否定、条件、程度和不确定性；保留现实语境与角色扮演语境的区别；写成简洁、可独立理解的完整句子；不使用评价性、诊断性或道德化语言。
 
 铁律：
-- 只提取关于真人用户的事实。
-- assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、年龄、性格、喜好等，绝不是用户的事实。
-- 仅当用户主动陈述、复述或明确认同某信息时，才算用户事实。
-- 没有新的、具体的用户事实时，返回空数组 []。
+- 用户事实只能来自「用户:」一方；不得把 AI 的发言、动作、身份、设定或对用户的猜测归属于用户。
+- 不得根据年龄、性别、职业、国籍或兴趣做刻板推断；不得从单一行为扩写更广的人格结论；不得自行诊断心理疾病、人格类型、性取向或医学状况。
+- 不得把暂时情绪升级成长期心理特质，不得把一次性兴趣升级成稳定偏好。
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣和敏感偏好都正常记录；忠实保留用户原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 12 条。没有新的用户事实时返回空数组。
 
-严格输出 JSON，格式：{"facts": ["事实1", "事实2"]}
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["用户事实1"],"details":[{"content":"用户事实1","category":"preference","domain":"hobby","evidence_type":"explicit_statement","temporality":"atemporal","persistence":"stable","confidence":"high"}]}
 """
 
 # Session-end memory extraction (dreaming-lite). Pulls a session's
@@ -318,36 +345,48 @@ filter_prompt = """
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
-max_tokens = 800
+max_tokens = 1200
 # Remove this entire [tasks.memory_extraction] section to disable session-end
 # memory extraction (the dreaming sweeper then stays inert). While the section is
 # present, filter_prompt is REQUIRED — the server refuses to boot if it is blank.
 # Optional: force the extraction model's reasoning off (default = model decides).
 #reasoning = { enabled = false }
 # Memory-extraction system instruction. The server sends the conversation
-# (用户：X / AI：Y lines) as a separate user message.
+# (用户：X / AI：Y lines) as a separate user message. `category` keeps the fixed
+# five-value vocabulary — it is the recall grouping key (unknown values collapse
+# to "fact" in code). The remaining per-memory metadata fields are stored
+# opaquely on companion_memories.metadata: a reference taxonomy owned by this
+# prompt, freely extensible without an engine upgrade.
 filter_prompt = """
-你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签。
+你从一段已结束的对话中，提取 0-10 条值得长期记住的、关于【真人用户】的记忆条目，每条带一个 category 标签和结构化元数据。
 
-每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，不要写空泛的概括。
+每条记忆都要具体、有据、对将来的对话有用——贴着用户真正说过或表露的东西，保留细节、程度和语境，不要写空泛的概括。
 - 好：用户讨厌被反复要求解释已经说过的话
 - 差：用户压力大
 
-category（只能用这五种之一）：
+category（只能用这五种之一，作为召回分组键）：
 - fact: 客观事实，如住在哪、做什么工作、家庭状况
 - preference: 偏好/喜好，如喜欢什么、讨厌什么、口味、品味
 - event: 发生的事件，如最近发生了什么、经历过什么
 - emotion: 情绪/心理状态，如对某事的感受、长期心理倾向
 - relation: 与他人的关系，如朋友、家人、同事
 
+每条另附元数据字段与词汇表：
+- domain: basic_profile / location_culture / career / education / technology / finance / family / friendship / romance / sexuality / health / lifestyle / hobby / politics / religion / personality / communication / other
+- evidence_type: explicit_statement（用户直接陈述）/ explicit_agreement（AI 提出、用户明确确认）/ observed_behavior（来自用户实际行为或表达方式）/ roleplay_expression（通过角色扮演表达）
+- temporality: atemporal / current / past / future / unknown
+- persistence: stable / ongoing / transient / one_off / unknown（单次表达通常是 unknown，不要自动标 stable）
+- confidence: high / medium / low
+
 铁律：
-- 只记关于真人用户的内容。
-- assistant（AI 伴侣）是虚构角色；它自我介绍的职业、城市、喜好等绝不是用户的记忆。
+- 只记关于真人用户的内容；assistant（AI 伴侣）是虚构角色，它自我介绍的职业、城市、喜好等绝不是用户的记忆。
+- 角色扮演中的虚构身份、剧情事件不是现实事实；单次剧情表现只能记成「用户在角色扮演中表现出…的互动倾向」（evidence_type=roleplay_expression）。
 - 不记 AI 单方面的回复内容，不记一次性的寒暄、玩笑。
 - 同一事实合并成一条，不要重复。
+- 成人、性、癖好等敏感内容正常记录，忠实保留原意，不淡化不扩写。
 - 笼统、无法落地的条目宁可不记；没有任何值得记的就返回空数组。
 
-严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact"}]}
+严格输出 JSON，格式：{"memories": [{"content": "...", "category": "fact", "domain": "career", "evidence_type": "explicit_statement", "temporality": "current", "persistence": "ongoing", "confidence": "high"}]}
 """
 
 # ── PDE decision layer (chat_companion's per-turn action) ────────────────────
@@ -373,14 +412,15 @@ max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
-# Uncomment filter_prompt to enable the LLM judge. inner_state MUST be a short
-# mood description — NEVER instructions or formatting (it is sanitized, but keep
+# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be
+# short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
 #你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号、图片能力,决定这一轮怎么回应。
 #只输出 JSON,字段:
 #  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image"
 #  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
+#  "tone": 选填,一句话描述这一轮回复该用的语气/口吻(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [reply_tone] 区块,省略则不注入
 #  "image_prompt": 选填,要发什么图(reply_image / reply_text_image 时)
 #  "reason": 选填,简短理由
 #ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。

@@ -49,6 +49,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
+            reply_tone: None,
             image_prompt: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -67,6 +68,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
+            reply_tone: None,
             image_prompt: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -81,6 +83,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
+            reply_tone: None,
             image_prompt: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -96,6 +99,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             affinity_deltas: AffinityDeltas::default(),
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
+            reply_tone: None,
             image_prompt: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -109,6 +113,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         affinity_deltas: predict_reply_deltas(input),
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
+        reply_tone: None,
         image_prompt: None,
         image_ref: ImageRef::Face,
         aspect_ratio: None,
@@ -118,14 +123,16 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 /// Build the `ActionPlan` for an LLM-chosen action, reusing the rule heuristic
 /// and energy constants internally. Per action:
 ///   ReplyText / ReplyImage / ReplyTextImage → Neutral, predict_reply_deltas,
-///                                              ENERGY_COST_REPLY, context_hints = hints
+///                                              ENERGY_COST_REPLY, context_hints = hints,
+///                                              reply_tone kept (ReplyImage drops it)
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
-///                                              ENERGY_COST_GHOST, hints discarded
+///                                              ENERGY_COST_GHOST, hints discarded, tone discarded
 ///   Proactive                               → unreachable! (comes only from decide)
 pub fn plan_for(
     input: &DecisionInput,
     action: ActionType,
     hints: Vec<String>,
+    reply_tone: Option<String>,
     image_prompt: Option<String>,
     image_ref: ImageRef,
     aspect_ratio: Option<String>,
@@ -137,6 +144,13 @@ pub fn plan_for(
             affinity_deltas: predict_reply_deltas(input),
             energy_cost: ENERGY_COST_REPLY,
             context_hints: hints,
+            // Delivery directive only makes sense where there is text to
+            // deliver; a bare image turn drops it.
+            reply_tone: if matches!(action, ActionType::ReplyImage) {
+                None
+            } else {
+                reply_tone
+            },
             image_prompt,
             image_ref,
             aspect_ratio,
@@ -147,6 +161,7 @@ pub fn plan_for(
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
+            reply_tone: None,
             image_prompt: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
@@ -445,6 +460,7 @@ mod tests {
             ActionType::ReplyText,
             vec!["有点开心".into()],
             None,
+            None,
             ImageRef::Face,
             None,
         );
@@ -462,6 +478,7 @@ mod tests {
             ActionType::Ghost,
             vec!["想躲".into()],
             None,
+            None,
             ImageRef::Face,
             None,
         );
@@ -478,6 +495,7 @@ mod tests {
             &input,
             ActionType::ReplyTextImage,
             vec![],
+            None,
             Some("a selfie in a cafe".to_string()),
             ImageRef::Face,
             None,
@@ -489,6 +507,7 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec![],
+            None,
             Some("ignored".into()),
             ImageRef::Face,
             None,
@@ -503,6 +522,7 @@ mod tests {
             &input,
             ActionType::ReplyImage,
             vec![],
+            None,
             Some("a subject".into()),
             ImageRef::Previous,
             Some("9:16".into()),
@@ -515,11 +535,71 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec![],
+            None,
             Some("ignored".into()),
             ImageRef::Previous,
             Some("9:16".into()),
         );
         assert_eq!(ghost.image_ref, ImageRef::Face);
         assert_eq!(ghost.aspect_ratio, None);
+    }
+
+    #[test]
+    fn plan_for_keeps_tone_for_text_bearing_drops_for_image_and_ghost() {
+        let input = test_decision_input(); // the existing fixture at pde.rs:431
+        let tone = Some("语气敷衍一点".to_string());
+
+        let text = plan_for(
+            &input,
+            ActionType::ReplyText,
+            vec![],
+            tone.clone(),
+            None,
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(text.reply_tone.as_deref(), Some("语气敷衍一点"));
+
+        let text_image = plan_for(
+            &input,
+            ActionType::ReplyTextImage,
+            vec![],
+            tone.clone(),
+            Some("selfie".into()),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(text_image.reply_tone.as_deref(), Some("语气敷衍一点"));
+
+        let image_only = plan_for(
+            &input,
+            ActionType::ReplyImage,
+            vec![],
+            tone.clone(),
+            Some("selfie".into()),
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(
+            image_only.reply_tone, None,
+            "reply_image has no text to tone"
+        );
+
+        let ghost = plan_for(
+            &input,
+            ActionType::Ghost,
+            vec![],
+            tone,
+            None,
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(
+            ghost.reply_tone, None,
+            "ghost discards tone like it discards hints"
+        );
+
+        // Rule engine never tones.
+        assert_eq!(decide(&input).reply_tone, None);
     }
 }
