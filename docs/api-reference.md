@@ -401,7 +401,7 @@ Current `companion_insights` JSONB plus a weighted `training_level`. Same `user_
 }
 ```
 
-`training_level` is a weighted score across nine fields (city 0.05, occupation 0.05, interests 0.10, mbti_guess 0.15, love_values 0.15, emotional_needs 0.15, life_rhythm 0.10, personality_traits 0.15, matching_preferences 0.10). Weights sum to 1.0.
+`training_level` is a weighted score across 15 fields summing to 1.0 (city 0.04, occupation 0.04, interests 0.08, mbti_guess 0.10, love_values 0.12, emotional_needs 0.12, life_rhythm 0.06, personality_traits 0.12, matching_preferences 0.08, education 0.04, family 0.04, relationship_history 0.06, social_pattern 0.04, future_plans 0.04, finance_status 0.02). Source of truth: `WEIGHTS` in `crates/eros-engine-store/src/insight.rs`.
 
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)

@@ -2,7 +2,7 @@
 //! Companion insight storage + JSONB merge + training-level computation.
 //!
 //! `training_level` is a weighted score across known schema fields.
-//! Weights ported verbatim from the gateway implementation.
+//! Weights were rebalanced 2026-07-15 for the six-slot profile expansion.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -366,7 +366,7 @@ mod tests {
             message_id: Some(message_id),
             stage: "facts",
             status: "ok",
-            payload: Some(serde_json::json!(["用户在深圳工作"])),
+            payload: Some(serde_json::json!({"facts": ["用户在深圳工作"], "details": []})),
             meta: crate::OpenRouterCallMeta {
                 generation_id: Some("gen-facts".into()),
                 model: Some("ins/m".into()),
@@ -411,7 +411,10 @@ mod tests {
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "ok");
         assert_eq!(rows[0].2.as_deref(), Some("gen-facts"));
-        assert_eq!(rows[0].3, Some(serde_json::json!(["用户在深圳工作"])));
+        assert_eq!(
+            rows[0].3,
+            Some(serde_json::json!({"facts": ["用户在深圳工作"], "details": []}))
+        );
         assert_eq!(rows[0].4, Some(serde_json::json!({"total_tokens": 7})));
         assert_eq!(rows[1].0, "structured");
         assert_eq!(rows[1].1, "parse_error");

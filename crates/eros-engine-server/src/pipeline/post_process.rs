@@ -870,12 +870,8 @@ async fn extract_facts(
             // Opaque sibling of `facts`: per-fact structured metadata emitted by
             // dual-track prompts. The engine never validates items or zips them
             // against `facts` — vocabulary and the facts[i]==details[i].content
-            // contract are prompt-level concerns. Missing / non-array ⇒ [].
-            let details = v
-                .get("details")
-                .and_then(|a| a.as_array())
-                .cloned()
-                .unwrap_or_default();
+            // contract are prompt-level concerns.
+            let details = extract_details_array(&v);
             let status = if facts.is_empty() { "empty" } else { "ok" };
             let audit = CallAudit {
                 status,
@@ -903,6 +899,14 @@ fn extract_facts_array(v: &serde_json::Value) -> Vec<String> {
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Extracts the `details` array; missing or non-array `details` ⇒ `[]`.
+fn extract_details_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.get("details")
+        .and_then(|a| a.as_array())
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -1066,6 +1070,33 @@ mod tests {
     #[test]
     fn find_json_block_returns_none_when_no_object() {
         assert!(find_json_block("no json here").is_none());
+    }
+
+    #[test]
+    fn extract_details_array_valid_array_returned_as_is() {
+        let v = serde_json::json!({"facts": ["f1"], "details": [{"content": "f1"}]});
+        assert_eq!(
+            extract_details_array(&v),
+            vec![serde_json::json!({"content": "f1"})]
+        );
+    }
+
+    #[test]
+    fn extract_details_array_missing_key_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"]});
+        assert!(extract_details_array(&v).is_empty());
+    }
+
+    #[test]
+    fn extract_details_array_string_value_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"], "details": "oops"});
+        assert!(extract_details_array(&v).is_empty());
+    }
+
+    #[test]
+    fn extract_details_array_number_value_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"], "details": 42});
+        assert!(extract_details_array(&v).is_empty());
     }
 
     #[test]

@@ -233,6 +233,13 @@ prose is an implementation detail; keep the existing "写具体、带细节、�
    review. `finance_status` is weighted lowest because it is the least often
    disclosed — it must not gate progress.
 
+   The same drop propagates to `lead_score` (`post_process.rs::refresh_lead_score`,
+   `training_level × 10`) and the CTA gate (`stream.rs::should_show_cta`,
+   `lead_score >= 7.0 && training_level >= 0.4`): legacy users already sitting
+   near either threshold may see the CTA suppressed until the new slots fill
+   their profile back up. Accepted in the same spirit as the display
+   regression above — a one-time dip, not a permanent loss.
+
 ## A4. OSS example config refresh (`examples/model_config.toml`)
 
 - **`insight_extraction.filter_prompt`** → a product-neutral **facts+details
