@@ -362,6 +362,7 @@ async fn embed_and_upsert(
         content,
         &embedding,
         None,
+        None, // metadata: raw-turn writer supplies none
     )
     .await
     .map_err(|e| format!("memory insert failed: {e}"))?;
@@ -866,10 +867,15 @@ async fn extract_facts(
     match parsed {
         Some(v) => {
             let facts = extract_facts_array(&v);
+            // Opaque sibling of `facts`: per-fact structured metadata emitted by
+            // dual-track prompts. The engine never validates items or zips them
+            // against `facts` — vocabulary and the facts[i]==details[i].content
+            // contract are prompt-level concerns.
+            let details = extract_details_array(&v);
             let status = if facts.is_empty() { "empty" } else { "ok" };
             let audit = CallAudit {
                 status,
-                payload: Some(serde_json::json!(facts)),
+                payload: Some(serde_json::json!({ "facts": facts, "details": details })),
                 meta,
             };
             (facts, Some(audit))
@@ -893,6 +899,14 @@ fn extract_facts_array(v: &serde_json::Value) -> Vec<String> {
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Extracts the `details` array; missing or non-array `details` ⇒ `[]`.
+fn extract_details_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.get("details")
+        .and_then(|a| a.as_array())
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -1056,6 +1070,33 @@ mod tests {
     #[test]
     fn find_json_block_returns_none_when_no_object() {
         assert!(find_json_block("no json here").is_none());
+    }
+
+    #[test]
+    fn extract_details_array_valid_array_returned_as_is() {
+        let v = serde_json::json!({"facts": ["f1"], "details": [{"content": "f1"}]});
+        assert_eq!(
+            extract_details_array(&v),
+            vec![serde_json::json!({"content": "f1"})]
+        );
+    }
+
+    #[test]
+    fn extract_details_array_missing_key_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"]});
+        assert!(extract_details_array(&v).is_empty());
+    }
+
+    #[test]
+    fn extract_details_array_string_value_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"], "details": "oops"});
+        assert!(extract_details_array(&v).is_empty());
+    }
+
+    #[test]
+    fn extract_details_array_number_value_is_empty() {
+        let v = serde_json::json!({"facts": ["f1"], "details": 42});
+        assert!(extract_details_array(&v).is_empty());
     }
 
     #[test]
@@ -1275,7 +1316,9 @@ mod tests {
         let facts_body = serde_json::json!({
             "id": "gen-facts", "model": "ins/m",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "{\"facts\":[\"用户在深圳工作\"]}"}}],
+            "choices": [{"message": {"content":
+                "{\"facts\":[\"用户在深圳工作\"],\"details\":[{\"content\":\"用户在深圳工作\",\"category\":\"fact\",\"domain\":\"career\",\"evidence_type\":\"explicit_statement\",\"temporality\":\"current\",\"persistence\":\"stable\",\"confidence\":\"high\"}]}"
+            }}],
         });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
@@ -1328,9 +1371,16 @@ mod tests {
         )
         .await;
 
-        let rows: Vec<(uuid::Uuid, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT run_id, stage, status, generation_id \
-             FROM engine.companion_insights_events WHERE user_id = $1 ORDER BY stage",
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            uuid::Uuid,
+            String,
+            String,
+            Option<String>,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT run_id, stage, status, generation_id, payload \
+                 FROM engine.companion_insights_events WHERE user_id = $1 ORDER BY stage",
         )
         .bind(user_id)
         .fetch_all(&pool)
@@ -1342,6 +1392,11 @@ mod tests {
         assert_eq!(rows[0].0, rows[1].0, "both rows share one run_id");
         assert_eq!(rows[0].3.as_deref(), Some("gen-facts"));
         assert_eq!(rows[1].3.as_deref(), Some("gen-struct"));
+        // facts-stage payload is now a {facts, details} object.
+        let payload = rows[0].4.as_ref().expect("facts payload present");
+        assert_eq!(payload["facts"], serde_json::json!(["用户在深圳工作"]));
+        assert_eq!(payload["details"][0]["category"], "fact");
+        assert_eq!(payload["details"][0]["confidence"], "high");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1399,8 +1454,8 @@ mod tests {
         )
         .await;
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT stage, status FROM engine.companion_insights_events WHERE user_id = $1",
+        let rows: Vec<(String, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT stage, status, payload FROM engine.companion_insights_events WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_all(&pool)
@@ -1409,6 +1464,11 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the facts row; got {rows:?}");
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "empty");
+        assert_eq!(
+            rows[0].2,
+            Some(serde_json::json!({"facts": [], "details": []})),
+            "empty run still writes the uniform object payload"
+        );
     }
 
     #[test]
@@ -1486,6 +1546,91 @@ mod tests {
         assert_eq!(rows[0].0, "facts");
         assert_eq!(rows[0].1, "parse_error");
         assert_eq!(rows[0].2, None, "parse_error ⇒ NULL payload");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn insight_extraction_details_absent_persists_empty_array(pool: sqlx::PgPool) {
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Stage-1 facts call → non-empty facts, old-prompt shape (no `details`
+        // key). Matched by a substring unique to the system message
+        // (filter_prompt sentinel).
+        let facts_body = serde_json::json!({
+            "id": "gen-facts", "model": "ins/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"facts\":[\"用户在深圳工作\"]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("facts-sys-prompt-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+
+        // Stage-2 structured call. Matched by a substring unique to
+        // extract_structured_insights_prompt.
+        let struct_body = serde_json::json!({
+            "id": "gen-struct", "model": "ins/m",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "{\"city\":\"深圳\"}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("填充以下 schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let user_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let message_id = uuid::Uuid::new_v4();
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我在深圳工作",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        let rows: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT status, payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'facts'",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ok");
+        let payload = rows[0].1.as_ref().unwrap();
+        assert_eq!(payload["facts"], serde_json::json!(["用户在深圳工作"]));
+        assert_eq!(
+            payload["details"],
+            serde_json::json!([]),
+            "no details key ⇒ []"
+        );
     }
 
     #[test]

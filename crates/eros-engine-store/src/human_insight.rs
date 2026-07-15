@@ -28,6 +28,12 @@ pub struct ProjectedColumns {
     pub age_min: Option<i32>,
     pub age_max: Option<i32>,
     pub deal_breakers: Vec<String>,
+    pub education: Option<String>,
+    pub family: Option<String>,
+    pub relationship_history: Option<String>,
+    pub social_pattern: Option<String>,
+    pub future_plans: Option<String>,
+    pub finance_status: Option<String>,
 }
 
 fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -94,6 +100,12 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
         deal_breakers: prefs
             .map(|p| str_array(p, "deal_breakers"))
             .unwrap_or_default(),
+        education: str_field(insights, "education"),
+        family: str_field(insights, "family"),
+        relationship_history: str_field(insights, "relationship_history"),
+        social_pattern: str_field(insights, "social_pattern"),
+        future_plans: str_field(insights, "future_plans"),
+        finance_status: str_field(insights, "finance_status"),
     }
 }
 
@@ -115,6 +127,12 @@ pub struct HumanInsightsRow {
     pub age_min: Option<i32>,
     pub age_max: Option<i32>,
     pub deal_breakers: Vec<String>,
+    pub education: Option<String>,
+    pub family: Option<String>,
+    pub relationship_history: Option<String>,
+    pub social_pattern: Option<String>,
+    pub future_plans: Option<String>,
+    pub finance_status: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -136,25 +154,34 @@ impl<'a> HumanInsightRepo<'a> {
             "INSERT INTO engine.human_insights \
                 (user_id, city, occupation, mbti_guess, love_values, emotional_needs, \
                  life_rhythm, interests, personality_traits, preferred_gender, \
-                 age_min, age_max, deal_breakers, location, hometown, nationality) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+                 age_min, age_max, deal_breakers, location, hometown, nationality, \
+                 education, family, relationship_history, social_pattern, \
+                 future_plans, finance_status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                     $17, $18, $19, $20, $21, $22) \
              ON CONFLICT (user_id) DO UPDATE SET \
-                 city               = EXCLUDED.city, \
-                 occupation         = EXCLUDED.occupation, \
-                 mbti_guess         = EXCLUDED.mbti_guess, \
-                 love_values        = EXCLUDED.love_values, \
-                 emotional_needs    = EXCLUDED.emotional_needs, \
-                 life_rhythm        = EXCLUDED.life_rhythm, \
-                 interests          = EXCLUDED.interests, \
-                 personality_traits = EXCLUDED.personality_traits, \
-                 preferred_gender   = EXCLUDED.preferred_gender, \
-                 age_min            = EXCLUDED.age_min, \
-                 age_max            = EXCLUDED.age_max, \
-                 deal_breakers      = EXCLUDED.deal_breakers, \
-                 location           = EXCLUDED.location, \
-                 hometown           = EXCLUDED.hometown, \
-                 nationality        = EXCLUDED.nationality, \
-                 updated_at         = now()",
+                 city                 = EXCLUDED.city, \
+                 occupation           = EXCLUDED.occupation, \
+                 mbti_guess           = EXCLUDED.mbti_guess, \
+                 love_values          = EXCLUDED.love_values, \
+                 emotional_needs      = EXCLUDED.emotional_needs, \
+                 life_rhythm          = EXCLUDED.life_rhythm, \
+                 interests            = EXCLUDED.interests, \
+                 personality_traits   = EXCLUDED.personality_traits, \
+                 preferred_gender     = EXCLUDED.preferred_gender, \
+                 age_min              = EXCLUDED.age_min, \
+                 age_max              = EXCLUDED.age_max, \
+                 deal_breakers        = EXCLUDED.deal_breakers, \
+                 location             = EXCLUDED.location, \
+                 hometown             = EXCLUDED.hometown, \
+                 nationality          = EXCLUDED.nationality, \
+                 education            = EXCLUDED.education, \
+                 family               = EXCLUDED.family, \
+                 relationship_history = EXCLUDED.relationship_history, \
+                 social_pattern       = EXCLUDED.social_pattern, \
+                 future_plans         = EXCLUDED.future_plans, \
+                 finance_status       = EXCLUDED.finance_status, \
+                 updated_at           = now()",
         )
         .bind(user_id)
         .bind(c.city)
@@ -172,6 +199,12 @@ impl<'a> HumanInsightRepo<'a> {
         .bind(c.location)
         .bind(c.hometown)
         .bind(c.nationality)
+        .bind(c.education)
+        .bind(c.family)
+        .bind(c.relationship_history)
+        .bind(c.social_pattern)
+        .bind(c.future_plans)
+        .bind(c.finance_status)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -232,6 +265,37 @@ mod tests {
     }
 
     #[test]
+    fn project_columns_expansion_fields() {
+        let v = serde_json::json!({
+            "education": "985 本科计算机，毕业五年",
+            "family": "独生子，父母在老家，未婚",
+            "relationship_history": "去年和异地恋三年的前任分手，之后一直单身",
+            "social_pattern": "周末宅家，社交主要靠线上游戏开黑",
+            "future_plans": "想两年内跳去外企，攒钱在老家买房",
+            "finance_status": "月薪两万出头，房贷压力大"
+        });
+        let c = project_columns(&v);
+        assert_eq!(c.education.as_deref(), Some("985 本科计算机，毕业五年"));
+        assert_eq!(c.family.as_deref(), Some("独生子，父母在老家，未婚"));
+        assert_eq!(
+            c.relationship_history.as_deref(),
+            Some("去年和异地恋三年的前任分手，之后一直单身")
+        );
+        assert_eq!(
+            c.social_pattern.as_deref(),
+            Some("周末宅家，社交主要靠线上游戏开黑")
+        );
+        assert_eq!(
+            c.future_plans.as_deref(),
+            Some("想两年内跳去外企，攒钱在老家买房")
+        );
+        assert_eq!(
+            c.finance_status.as_deref(),
+            Some("月薪两万出头，房贷压力大")
+        );
+    }
+
+    #[test]
     fn project_columns_missing_fields_are_null_and_empty() {
         let c = project_columns(&serde_json::json!({}));
         assert_eq!(c.city, None);
@@ -244,6 +308,12 @@ mod tests {
         assert!(c.interests.is_empty());
         assert!(c.personality_traits.is_empty());
         assert!(c.deal_breakers.is_empty());
+        assert_eq!(c.education, None);
+        assert_eq!(c.family, None);
+        assert_eq!(c.relationship_history, None);
+        assert_eq!(c.social_pattern, None);
+        assert_eq!(c.future_plans, None);
+        assert_eq!(c.finance_status, None);
     }
 
     #[test]
@@ -334,6 +404,40 @@ mod tests {
         assert_eq!(row.location.as_deref(), Some("台北"));
         assert_eq!(row.hometown.as_deref(), Some("新界"));
         assert_eq!(row.nationality.as_deref(), Some("中国香港"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn expansion_fields_roundtrip(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        repo.project_from_insights(
+            user_id,
+            &serde_json::json!({
+                "education": "本科在读",
+                "family": "有个妹妹",
+                "relationship_history": "单身两年",
+                "social_pattern": "喜欢小圈子聚会",
+                "future_plans": "准备考研",
+                "finance_status": "靠奖学金和兼职"
+            }),
+        )
+        .await
+        .unwrap();
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(row.education.as_deref(), Some("本科在读"));
+        assert_eq!(row.family.as_deref(), Some("有个妹妹"));
+        assert_eq!(row.relationship_history.as_deref(), Some("单身两年"));
+        assert_eq!(row.social_pattern.as_deref(), Some("喜欢小圈子聚会"));
+        assert_eq!(row.future_plans.as_deref(), Some("准备考研"));
+        assert_eq!(row.finance_status.as_deref(), Some("靠奖学金和兼职"));
+
+        // Full-overwrite semantics apply to the new columns too.
+        repo.project_from_insights(user_id, &serde_json::json!({ "city": "上海" }))
+            .await
+            .unwrap();
+        let wiped = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(wiped.education, None, "absent key overwrites to NULL");
+        assert_eq!(wiped.finance_status, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]
