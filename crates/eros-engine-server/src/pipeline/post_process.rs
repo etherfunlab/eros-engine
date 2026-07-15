@@ -1744,6 +1744,7 @@ mod tests {
             },
             energy_cost: 0.0,
             context_hints: Vec::new(),
+            reply_tone: None,
             image_prompt: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,

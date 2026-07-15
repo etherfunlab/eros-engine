@@ -1711,6 +1711,7 @@ fn apply_ghosting_killswitch(
             ActionType::ReplyText,
             hints,
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         )
@@ -2641,7 +2642,9 @@ pub fn run_stream(
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(&input, action, hints, img_prompt, img_ref, img_aspect)
+                            pde::plan_for(
+                                &input, action, hints, None, img_prompt, img_ref, img_aspect,
+                            )
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -2674,6 +2677,7 @@ pub fn run_stream(
                 &input,
                 action,
                 plan.context_hints.clone(),
+                plan.reply_tone.clone(),
                 req_image.and_then(|i| i.image_prompt.clone()),
                 eros_engine_core::types::ImageRef::Face,
                 None,
@@ -3881,6 +3885,7 @@ mod tests {
             ActionType::Ghost,
             vec![],
             None,
+            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         );
@@ -3904,6 +3909,7 @@ mod tests {
             &input,
             acted,
             hints.clone(),
+            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
