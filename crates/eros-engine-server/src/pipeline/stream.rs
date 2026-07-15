@@ -1463,7 +1463,8 @@ fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
 const INNER_STATE_MAX_CHARS: usize = 200;
 
 /// Sanitize judge-authored prose (`inner_state` / `tone`) before folding it into
-/// prompt's `[inner_state]` section. Drops lines that look like prompt section
+/// the system prompt's `[inner_state]` / `[reply_tone]` sections. Drops lines
+/// that look like prompt section
 /// headers / structural markers, strips `[`/`]` tokens and control characters,
 /// collapses whitespace, and caps length. Returns plain single-line prose
 /// (`""` ⇒ caller treats as no hint).
@@ -7605,10 +7606,11 @@ data: [DONE]\n\n";
 
         let mock = MockServer::start().await;
 
-        // Judge ("pde/judge"): a `reply_text` verdict carrying an inner_state.
-        // `有点开心` is plain prose (no headers/brackets) so it survives
-        // `sanitize_inner_state` unchanged and lands in the prompt's
-        // `[inner_state]` section via `pde::plan_for` → `build_prompt`.
+        // Judge ("pde/judge"): a `reply_text` verdict carrying BOTH an
+        // inner_state and a tone. Both are plain prose (no headers/brackets)
+        // so they survive `sanitize_inner_state` unchanged and land in the
+        // prompt's `[inner_state]` / `[reply_tone]` sections via
+        // `pde::plan_for` → `build_prompt`.
         let verdict = serde_json::json!({
             "action": "reply_text",
             "inner_state": "有点开心",
@@ -7627,7 +7629,7 @@ data: [DONE]\n\n";
             .await;
 
         // Chat ("deepseek/x"): normal SSE reply. The mock matches the chat call;
-        // we capture its request body afterward to assert the injected inner_state.
+        // we capture its request body afterward to assert the injected tone.
         let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("deepseek/x"))

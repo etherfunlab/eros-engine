@@ -412,8 +412,8 @@ max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
-# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be short prose
-# — NEVER instructions or formatting (they are sanitized, but keep
+# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be
+# short prose — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
 #你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号、图片能力,决定这一轮怎么回应。
