@@ -708,7 +708,7 @@ const VOICE_SPEECH_BASE_AUDIO_TAGS: &str = "You are on a live voice call. Speak 
 /// to improvise. Product-identity-free. Authored ONCE here and reused for both
 /// the built-in audio-tags default and the custom-`filter_prompt` path, so the
 /// tag list lives in a single place.
-pub const AUDIO_TAGS_ADDENDUM: &str = "You may add inline audio tags to make your speech more expressive. An audio tag is a short cue in square brackets placed right before the words it affects — e.g. [laughs] that's so funny, or [whispers] come closer. Use them sparingly, only when they fit the moment. Commonly supported tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]. You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short.";
+pub const AUDIO_TAGS_ADDENDUM: &str = "Weave inline audio tags through your speech to make it expressive. An audio tag is a short cue in square brackets placed right before the words it affects. Aim for two to four tags per reply, placed at the emotional beats — mid-sentence placements are better than tagging only the start, and never bunch them all at the beginning. For example: 今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦，你怎么当真了 — or: wait [gasp] you actually did it? [laughs] no way. Commonly supported tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]. You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short.";
 
 /// Resolved `[tasks.chat_voice]` (voice channel). `directive` is the effective
 /// voice instruction: the configured `filter_prompt`, or `DEFAULT_VOICE_DIRECTIVE`
@@ -2972,6 +2972,37 @@ retry_depth = 0
         let v = cfg.resolve_voice().expect("voice enabled");
         assert_eq!(v.directive, "Speak like a pirate.");
         assert!(!v.directive.contains("[laughs]"));
+    }
+
+    #[test]
+    fn audio_tags_addendum_encourages_interspersed_multi_tag() {
+        // The reason for the 2026-07-16 rewrite: grok emitted one leading tag.
+        // Density guidance is present, the old minimizing instruction is gone.
+        assert!(
+            AUDIO_TAGS_ADDENDUM.contains("two to four"),
+            "must give a soft density target"
+        );
+        assert!(
+            !AUDIO_TAGS_ADDENDUM.contains("sparingly"),
+            "the old 'use them sparingly' instruction caused single-tag output"
+        );
+        // Examples must show mid-sentence interspersal (tag NOT at position 0),
+        // including a Chinese-sentence-with-English-tags sample.
+        assert!(
+            AUDIO_TAGS_ADDENDUM.contains("[sighs] 不想说了"),
+            "Chinese interspersal example present"
+        );
+        assert!(
+            AUDIO_TAGS_ADDENDUM.contains("[gasp] you actually did it"),
+            "English interspersal example present"
+        );
+        // Preserved clauses (unchanged contract).
+        assert!(
+            AUDIO_TAGS_ADDENDUM.contains("[amazed]") && AUDIO_TAGS_ADDENDUM.contains("[whispers]")
+        );
+        assert!(AUDIO_TAGS_ADDENDUM
+            .contains("Write tags in English even when speaking another language"));
+        assert!(AUDIO_TAGS_ADDENDUM.contains("spoken aloud"));
     }
 
     #[test]

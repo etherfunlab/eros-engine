@@ -12,7 +12,7 @@ keywords = ["companion", "memory", "pgvector", "postgres", "sqlx"]
 categories = ["database"]
 
 [dependencies]
-eros-engine-core = { path = "../eros-engine-core", version = "0.8.0" }
+eros-engine-core = { path = "../eros-engine-core", version = "0.8.1" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
