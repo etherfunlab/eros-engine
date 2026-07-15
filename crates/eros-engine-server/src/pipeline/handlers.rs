@@ -491,12 +491,18 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
     push_str(&mut out, "hometown", "老家");
     push_str(&mut out, "nationality", "国籍");
     push_str(&mut out, "occupation", "职业");
+    push_str(&mut out, "education", "教育");
     push_str(&mut out, "mbti_guess", "MBTI");
     push_str(&mut out, "love_values", "感情观");
+    push_str(&mut out, "relationship_history", "感情经历");
     push_arr(&mut out, "interests", "兴趣");
     push_str(&mut out, "emotional_needs", "情感需求");
+    push_str(&mut out, "family", "家庭");
+    push_str(&mut out, "finance_status", "经济状况");
     push_str(&mut out, "life_rhythm", "作息");
+    push_str(&mut out, "social_pattern", "社交模式");
     push_arr(&mut out, "personality_traits", "性格特质");
+    push_str(&mut out, "future_plans", "未来计划");
 
     out
 }
@@ -504,7 +510,8 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
 /// Render a `human_insights` row as 基础画像 bullets. Mirrors
 /// `insights_to_bullets`' labels / order / trim / empty-skip exactly so that
 /// `InsightMode::Full` reproduces the legacy output byte-for-byte. `Neutral`
-/// drops the intimate fields (love_values / emotional_needs / interests).
+/// drops the intimate fields (love_values / relationship_history / interests /
+/// emotional_needs / family / finance_status).
 /// Matching-only columns (preferred_gender / age / deal_breakers) are never
 /// rendered. `Off` → empty (defensive; loaders gate it before calling).
 fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
@@ -537,14 +544,20 @@ fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<S
     push_str(&mut out, &row.hometown, "老家");
     push_str(&mut out, &row.nationality, "国籍");
     push_str(&mut out, &row.occupation, "职业");
+    push_str(&mut out, &row.education, "教育");
     push_str(&mut out, &row.mbti_guess, "MBTI");
     if intimate {
         push_str(&mut out, &row.love_values, "感情观");
+        push_str(&mut out, &row.relationship_history, "感情经历");
         push_arr(&mut out, &row.interests, "兴趣");
         push_str(&mut out, &row.emotional_needs, "情感需求");
+        push_str(&mut out, &row.family, "家庭");
+        push_str(&mut out, &row.finance_status, "经济状况");
     }
     push_str(&mut out, &row.life_rhythm, "作息");
+    push_str(&mut out, &row.social_pattern, "社交模式");
     push_arr(&mut out, &row.personality_traits, "性格特质");
+    push_str(&mut out, &row.future_plans, "未来计划");
     out
 }
 
@@ -1295,30 +1308,36 @@ mod tests {
             age_min: Some(25),
             age_max: Some(35),
             deal_breakers: vec!["抽烟".into()],
-            education: None,
-            family: None,
-            relationship_history: None,
-            social_pattern: None,
-            future_plans: None,
-            finance_status: None,
+            education: Some("美院本科".into()),
+            family: Some("独生女，父母在杭州".into()),
+            relationship_history: Some("单身两年".into()),
+            social_pattern: Some("小圈子聚会".into()),
+            future_plans: Some("想开工作室".into()),
+            finance_status: Some("攒钱中".into()),
             updated_at: chrono::Utc::now(),
         }
     }
 
     #[test]
-    fn human_insights_full_renders_all_eight_fields_in_order() {
+    fn human_insights_full_renders_all_fields_in_order() {
         let bullets = human_insights_to_bullets(&sample_human_row(), InsightMode::Full);
         assert_eq!(
             bullets,
             vec![
                 "城市：上海",
                 "职业：设计师",
+                "教育：美院本科",
                 "MBTI：INFP",
                 "感情观：慢热",
+                "感情经历：单身两年",
                 "兴趣：登山、摄影",
                 "情感需求：被理解",
+                "家庭：独生女，父母在杭州",
+                "经济状况：攒钱中",
                 "作息：夜猫子",
+                "社交模式：小圈子聚会",
                 "性格特质：温柔",
+                "未来计划：想开工作室",
             ]
         );
     }
@@ -1331,12 +1350,16 @@ mod tests {
             vec![
                 "城市：上海",
                 "职业：设计师",
+                "教育：美院本科",
                 "MBTI：INFP",
                 "作息：夜猫子",
-                "性格特质：温柔"
+                "社交模式：小圈子聚会",
+                "性格特质：温柔",
+                "未来计划：想开工作室",
             ]
         );
-        // matching-only columns (preferred_gender / age / deal_breakers) are
+        // Intimate additions (感情经历/家庭/经济状况) join love_values/interests/
+        // emotional_needs in the Full-only cluster; matching-only columns are
         // never rendered in any mode — proven by the exact vec above.
     }
 
@@ -1348,12 +1371,18 @@ mod tests {
         let equivalent = serde_json::json!({
             "city": "上海",
             "occupation": "设计师",
+            "education": "美院本科",
             "mbti_guess": "INFP",
             "love_values": "慢热",
+            "relationship_history": "单身两年",
             "interests": ["登山", "摄影"],
             "emotional_needs": "被理解",
+            "family": "独生女，父母在杭州",
+            "finance_status": "攒钱中",
             "life_rhythm": "夜猫子",
+            "social_pattern": "小圈子聚会",
             "personality_traits": ["温柔"],
+            "future_plans": "想开工作室",
             // matching-only fields exist in JSON too but neither renderer emits them
             "matching_preferences": { "preferred_gender": "female", "age_range": [25, 35] }
         });
