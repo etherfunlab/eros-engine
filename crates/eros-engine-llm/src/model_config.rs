@@ -1997,6 +1997,27 @@ reasoning = { exclude = true }
         );
     }
 
+    // Regression: the committed example extraction prompts stay dual-track
+    // (insight: facts+details; memory: category + metadata taxonomy) with the
+    // budget that covers them (spec 2026-07-15-insight-memory-enrichment).
+    #[test]
+    fn committed_example_extraction_tasks_are_dual_track() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+        let ins = cfg.resolve_insight_extract().expect("insight task present");
+        assert_eq!(ins.max_tokens, 1200);
+        assert!(
+            ins.extract_prompt.contains("\"details\""),
+            "insight prompt must demand the dual-track output"
+        );
+        let mem = cfg.resolve_memory_extract().expect("memory task present");
+        assert_eq!(mem.max_tokens, 1200);
+        assert!(
+            mem.extract_prompt.contains("evidence_type"),
+            "memory prompt must carry the metadata taxonomy"
+        );
+    }
+
     #[test]
     fn committed_example_chat_companion_disables_reasoning() {
         let text = include_str!("../../../examples/model_config.toml");
