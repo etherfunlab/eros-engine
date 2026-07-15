@@ -412,14 +412,15 @@ max_tokens  = 400
 #reasoning   = { enabled = false }
 #ghosting    = false   # uncomment to hard-disable ghosting for this deployment
 #structured_output = true   # send response_format=json_schema on the judge (default true); set false if your provider 400s on it
-# Uncomment filter_prompt to enable the LLM judge. inner_state MUST be a short
-# mood description — NEVER instructions or formatting (it is sanitized, but keep
+# Uncomment filter_prompt to enable the LLM judge. inner_state / tone MUST be short prose
+# — NEVER instructions or formatting (they are sanitized, but keep
 # the model honest). Output JSON only, no code fences.
 #filter_prompt = """
 #你是 AI 伴侣的"行为判断器"。读最近对话、关系状态、信号、图片能力,决定这一轮怎么回应。
 #只输出 JSON,字段:
 #  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image"
 #  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
+#  "tone": 选填,一句话描述这一轮回复该用的语气/口吻(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [reply_tone] 区块,省略则不注入
 #  "image_prompt": 选填,要发什么图(reply_image / reply_text_image 时)
 #  "reason": 选填,简短理由
 #ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。
