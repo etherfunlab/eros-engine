@@ -295,6 +295,19 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    if let Err(msg) = model_config.validate_product_qa_prompt() {
+        anyhow::bail!(msg);
+    }
+    // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
+    // LLM PDE off the action is unreachable — warn once and stay inert rather
+    // than refusing to boot ("此功能不启用").
+    if model_config.resolve_product_qa().is_some() && model_config.resolve_pde().is_none() {
+        tracing::warn!(
+            "model_config: [tasks.chat_product_qa] is configured but the LLM PDE \
+             ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"
+        );
+    }
+
     let output_regex = match model_config.compile_output_regex() {
         Ok(rules) => Arc::new(rules),
         Err(msg) => anyhow::bail!(msg),
@@ -388,6 +401,15 @@ mod tests {
             "shipped config must pass the extraction boot gate: {:?}",
             cfg.validate_extraction_prompts()
         );
+    }
+
+    #[test]
+    fn shipped_model_config_satisfies_product_qa_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(text)
+            .expect("shipped example parses");
+        cfg.validate_product_qa_prompt()
+            .expect("shipped example must pass the product_qa boot gate");
     }
 
     #[test]
