@@ -2061,6 +2061,11 @@ async fn build_input_filter_transcript(
         if m.id == current_user_message_id {
             continue;
         }
+        // Channel-marked rows (voice / product_qa) are out of companion
+        // context — the judge and input filter never see them.
+        if m.channel.is_some() {
+            continue;
+        }
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
@@ -4092,6 +4097,7 @@ mod tests {
             })),
             generation_id: Some("gen-1".into()),
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: None,
         };
@@ -4147,6 +4153,7 @@ mod tests {
             usage: None,
             generation_id: Some("gen-x".into()),
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: Some(serde_json::json!({ "fallback_reason": reason })),
         };
@@ -5348,6 +5355,7 @@ data: [DONE]\n\n";
             usage: None,
             generation_id: None,
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: None,
         };

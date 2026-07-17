@@ -167,7 +167,7 @@ async fn classify_session(
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM engine.chat_messages \
          WHERE session_id = $1 AND role IN ('user', 'assistant') \
-           AND channel IS DISTINCT FROM 'voice' \
+           AND channel IS NULL \
          ORDER BY sent_at",
     )
     .bind(session_id)
