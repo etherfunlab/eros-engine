@@ -28,7 +28,7 @@ pub enum StreamErrorCode {
 
 /// Action type tag carried by the `meta` frame's `action_type` field.
 ///
-/// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image`.
+/// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
 ///
 /// Asymmetry worth calling out: this is the *wire* action, coarser than the
 /// internal PDE [`ActionType`]. A plain-text
@@ -43,6 +43,7 @@ pub enum FrameActionType {
     Ghost,
     ReplyImage,
     ReplyTextImage,
+    ProductQa,
 }
 
 /// Why an image-generation turn failed, carried by the `image_failed` frame.
@@ -169,6 +170,7 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
         eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
         eros_engine_core::types::ActionType::ReplyTextImage => FrameActionType::ReplyTextImage,
         eros_engine_core::types::ActionType::Ghost => FrameActionType::Ghost,
+        eros_engine_core::types::ActionType::ProductQa => FrameActionType::ProductQa,
         _ => FrameActionType::Reply,
     }
 }
@@ -1794,11 +1796,6 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
 
 /// Render recent product-QA pairs for the judge's `[最近产品咨询]` block and
 /// the executor's follow-up context. Plain 用户/回答 lines, chronological.
-///
-/// Not yet called from production: the caller that fetches persisted
-/// product-QA pairs and wires this into `build_pde_ctx`'s `product_qa_recent`
-/// arg lands in a later task.
-#[allow(dead_code)]
 fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
@@ -2649,6 +2646,29 @@ pub fn run_stream(
         } else {
             state.model_config.resolve_pde()
         };
+        // product_qa executor: hard-gated on the judge being live (spec §1.1) —
+        // resolve only then, so the availability flag, the judge ctx lines, and
+        // the arm all agree, and no model cursor advances on inert deployments.
+        let resolved_product_qa = if resolved_pde.is_some() {
+            state.model_config.resolve_product_qa()
+        } else {
+            None
+        };
+        // One fetch per enabled turn, reused by judge ctx AND the executor arm.
+        let product_qa_pairs: Vec<(String, String)> = if resolved_product_qa.is_some() {
+            chat_repo
+                .recent_product_qa_pairs(user_msg.session_id, user_msg.user_message_id, 3)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("stream: recent_product_qa_pairs failed: {e}");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        let product_qa_recent: Option<String> = resolved_product_qa
+            .as_ref()
+            .map(|_| render_product_qa_pairs(&product_qa_pairs));
         // Shared history transcript: built once, reused by the judge here AND the
         // input filter below (which previously fetched its own). `resolved_pde` is
         // already None on tip turns, so this only fires for a real judge turn.
@@ -2661,8 +2681,12 @@ pub fn run_stream(
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
-                    let ctx =
-                        build_pde_ctx(&pde_transcript, &input, image_executor_available, None);
+                    let ctx = build_pde_ctx(
+                        &pde_transcript,
+                        &input,
+                        image_executor_available,
+                        product_qa_recent.as_deref(),
+                    );
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
@@ -2671,7 +2695,7 @@ pub fn run_stream(
                                 &input.affinity,
                                 &input.signals,
                                 image_executor_available,
-                                false,
+                                resolved_product_qa.is_some(),
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -2801,6 +2825,189 @@ pub fn run_stream(
                     truncated: false,
                     usage: None,
                     generation_id: None,
+                    ghost_fallback: false,
+                };
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                yield final_frame;
+            }
+            ActionType::ProductQa => {
+                // Out-of-character product answer (spec §1.4): mark the user row,
+                // run the dedicated executor, persist with channel='product_qa'.
+                // Skips the entire companion chain — no vision, no input filter, no
+                // persona prompt, no output filter, no post_process.
+                let p = resolved_product_qa
+                    .as_ref()
+                    .expect("guard passed ⇒ chat_product_qa resolved");
+                if let Err(e) = chat_repo
+                    .mark_user_message_product_qa(user_msg.user_message_id)
+                    .await
+                {
+                    tracing::warn!("stream: product_qa mark failed: {e}");
+                }
+
+                let mid = Ulid::new();
+                let message_id = ulid_string(mid);
+                let assistant_uuid: Uuid = mid.into();
+                yield ProtocolFrame::Meta {
+                    message_id: message_id.clone(),
+                    action_type: FrameActionType::ProductQa,
+                    model: None,
+                    continues_from: None,
+                };
+
+                // Executor payload: recent product-QA pairs (shared fetch) + question.
+                let question = match &input.event {
+                    eros_engine_core::types::Event::UserMessage { content, .. } => content.clone(),
+                    _ => String::new(),
+                };
+                let recent = product_qa_recent.as_deref().unwrap_or("");
+                let user_payload = if recent.is_empty() {
+                    format!("[用户提问]\n{question}")
+                } else {
+                    format!("[最近产品咨询]\n{recent}\n\n[用户提问]\n{question}")
+                };
+                let messages = vec![
+                    eros_engine_llm::openrouter::ChatMessage {
+                        role: "system".into(),
+                        content: p.answer_prompt.clone(),
+                    },
+                    eros_engine_llm::openrouter::ChatMessage {
+                        role: "user".into(),
+                        content: user_payload,
+                    },
+                ];
+
+                // Candidate chain walk + streaming — mirrors voice.rs:137-206.
+                let mut candidates = Vec::with_capacity(1 + p.fallback_model.len());
+                candidates.push(p.model.clone());
+                candidates.extend(p.fallback_model.iter().cloned());
+                let mut acc = String::new();
+                let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+                let mut last_gen_id: Option<String> = None;
+                let mut served_model: Option<String> = None;
+                let mut truncated = false;
+                'candidates: for model_id in candidates {
+                    last_usage = None;
+                    last_gen_id = None;
+                    served_model = None;
+                    truncated = false;
+                    let req = eros_engine_llm::openrouter::ChatRequest {
+                        model: model_id.clone(),
+                        messages: messages.clone(),
+                        temperature: p.temperature as f32,
+                        max_tokens: p.max_tokens,
+                        reasoning: p.reasoning.clone(),
+                        ..Default::default()
+                    };
+                    let stream = match state.openrouter.execute_stream(req).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(model = %model_id, error = %e, "product_qa: open stream failed");
+                            if acc.is_empty() { continue 'candidates; }
+                            truncated = true;
+                            break 'candidates;
+                        }
+                    };
+                    futures_util::pin_mut!(stream);
+                    loop {
+                        match futures_util::StreamExt::next(&mut stream).await {
+                            Some(Ok(chunk)) => {
+                                if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
+                                if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
+                                if chunk.model.is_some() { served_model = chunk.model.clone(); }
+                                if let Some(text) = chunk.content {
+                                    acc.push_str(&text);
+                                    yield ProtocolFrame::Delta {
+                                        message_id: message_id.clone(),
+                                        content: text,
+                                    };
+                                }
+                                if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(model = %model_id, error = %e, "product_qa: mid-stream error");
+                                if acc.is_empty() { continue 'candidates; }
+                                truncated = true;
+                                break 'candidates;
+                            }
+                            None => {
+                                if acc.is_empty() { continue 'candidates; }
+                                break 'candidates;
+                            }
+                        }
+                    }
+                }
+
+                // Chain exhausted with nothing streamed: error_handling fallback
+                // phrase, persisted WITH the channel marker so replay/idempotency
+                // hold (spec §4). Never degrade to the companion reply path — the
+                // companion doesn't know the product facts.
+                if acc.is_empty() {
+                    let phrase = ErrorHandlingRepo { pool: &state.pool }
+                        .pick_chat_stream_fallback_phrase()
+                        .await
+                        .ok()
+                        .flatten();
+                    match phrase {
+                        Some(text) => {
+                            acc = text.clone();
+                            truncated = false;
+                            yield ProtocolFrame::Delta {
+                                message_id: message_id.clone(),
+                                content: text,
+                            };
+                        }
+                        None => {
+                            // No phrase configured: same terminal shape as the voice
+                            // path's all-candidates failure. (Parity note: like a
+                            // normal chat failure, retry of this client_msg_id will
+                            // 409 until a row exists.)
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "product_qa generation failed on all candidates".into(),
+                                user_message: "服务暂时不可用，请稍后再试".into(),
+                            };
+                            return;
+                        }
+                    }
+                }
+
+                let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                if let Err(e) = chat_repo
+                    .insert_product_qa_assistant_message(
+                        user_msg.session_id,
+                        user_msg.user_message_id,
+                        assistant_uuid,
+                        &acc,
+                        served_model.as_deref(),
+                        usage_full.as_ref(),
+                        last_gen_id.as_deref(),
+                        truncated,
+                    )
+                    .await
+                {
+                    tracing::warn!("stream: product_qa persist failed: {e}");
+                }
+                super::log_openrouter_usage(
+                    "chat_product_qa",
+                    Some(user_msg.session_id),
+                    &eros_engine_llm::openrouter::ChatResponse {
+                        reply: String::new(), // usage log only — never echo content
+                        generation_id: last_gen_id.clone(),
+                        model: served_model.clone(),
+                        usage: usage_full.clone(),
+                        finish_reason: None,
+                    },
+                );
+
+                let mut usage_wire = usage_full;
+                filter_usage_keys(&mut usage_wire, &state.config.openrouter_usage_hidden_keys);
+                yield ProtocolFrame::Done {
+                    message_id,
+                    truncated,
+                    usage: usage_wire,
+                    generation_id: last_gen_id,
                     ghost_fallback: false,
                 };
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
@@ -7667,6 +7874,211 @@ data: [DONE]\n\n";
             !chat_sent.contains("[reply_tone]"),
             "a verdict without tone must not render a [reply_tone] section; got {chat_sent}",
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_product_qa_routes_to_dedicated_executor(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `product_qa` verdict, empty inner_state.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Product-QA executor ("qa/exec"): streams the out-of-character answer.
+        let qa_body = "data: {\"choices\":[{\"delta\":{\"content\":\"这是产品说明\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8},\"id\":\"gen-qa\",\"model\":\"qa/exec\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(qa_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Companion chat ("deepseek/x"): MUST NOT be called — a product_qa verdict
+        // skips the entire companion chain. `.expect(0)` fails the test on any hit.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON (routes the judge) + chat_product_qa ON (routes the executor).
+        // Both need a non-blank filter_prompt to resolve to `Some`.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec\"\nfilter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品支持退货吗",
+                "01JPDEQA0000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品支持退货吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // frame order: meta(product_qa) → delta+ → done → final
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta{{action_type: ProductQa}}, got {frames:?}",
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "delta", "done", "final"],
+            "product_qa sequence, got {frames:?}"
+        );
+
+        // The companion chat mock's `.expect(0)` already proves the companion call
+        // never fired; belt-and-suspenders: only the judge + executor calls landed.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "exactly two upstream calls (judge + product_qa executor); got {} calls",
+            reqs.len(),
+        );
+
+        // rows: user row marked, assistant row marked + linked.
+        let user_ch: Option<String> =
+            sqlx::query_scalar("SELECT channel FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user_ch.as_deref(), Some("product_qa"));
+
+        let (a_ch, a_action): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT channel, assistant_action_type FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(a_ch.as_deref(), Some("product_qa"));
+        assert_eq!(a_action.as_deref(), Some("reply"));
+
+        // post_process did not run: no affinity event rows for this turn. The
+        // events table has no session_id column, so join through the affinity
+        // row (mirrors post_process.rs's own test query).
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "product_qa must skip post_process / affinity events");
+
+        // Decision audit recorded the action. The write is `tokio::spawn`ed
+        // fire-and-forget (see the ghost/reply tests above), so poll briefly
+        // for it to land rather than asserting immediately.
+        let mut decision_row: Option<(Option<String>, Option<String>)> = None;
+        for _ in 0..50 {
+            if let Ok(row) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT proposed_action, action FROM engine.companion_decision_events \
+                 WHERE message_id = $1",
+            )
+            .bind(user_message_id)
+            .fetch_one(&pool)
+            .await
+            {
+                decision_row = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (proposed, acted) =
+            decision_row.expect("companion_decision_events row must land within timeout");
+        assert_eq!(proposed.as_deref(), Some("product_qa"));
+        assert_eq!(acted.as_deref(), Some("product_qa"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

@@ -382,7 +382,8 @@ fn validate_draw_request(req: &DrawImageRequest) -> Result<(), AppError> {
     request_body = StreamSendRequest,
     responses(
         (status = 200, description = "SSE event stream (text/event-stream). The `meta` frame's \
-            `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image`. \
+            `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | \
+            `product_qa`. \
             Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no \
             `reply_text` on the wire), while the text+image variant keeps its full \
             `reply_text_image` name.", content_type = "text/event-stream"),
