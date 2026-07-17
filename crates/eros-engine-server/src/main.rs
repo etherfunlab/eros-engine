@@ -271,15 +271,24 @@ async fn run_server() -> Result<()> {
 
     // model_config: env override > examples/model_config.toml dev default.
     // The committed example is sanitized; the real config is opted into via
-    // MODEL_CONFIG_PATH (the docker/Dockerfile.fly image bakes it in for prod).
-    let model_config_path =
-        std::env::var("MODEL_CONFIG_PATH").unwrap_or_else(|_| "examples/model_config.toml".into());
-    let model_config_text = std::fs::read_to_string(&model_config_path)
-        .with_context(|| format!("model_config read failed: {model_config_path}"))?;
-    let model_config = Arc::new(
-        eros_engine_llm::model_config::ModelConfig::from_toml_str(&model_config_text)
-            .with_context(|| format!("model_config parse failed: {model_config_path}"))?,
-    );
+    // MODEL_CONFIG_PATH (single file — the docker/Dockerfile.fly image bakes
+    // it in for prod) or MODEL_CONFIG_DIR (a directory of .toml fragments
+    // merged at boot; duplicate sections are boot errors). Mutually exclusive.
+    let source = eros_engine_llm::model_config::resolve_config_source(
+        std::env::var("MODEL_CONFIG_PATH").ok(),
+        std::env::var("MODEL_CONFIG_DIR").ok(),
+    )
+    .context("model_config source resolution failed")?;
+    let model_config = Arc::new(match &source {
+        eros_engine_llm::model_config::ConfigSource::File(p) => {
+            eros_engine_llm::model_config::ModelConfig::from_toml_file(std::path::Path::new(p))
+                .with_context(|| format!("model_config load failed: {p}"))?
+        }
+        eros_engine_llm::model_config::ConfigSource::Dir(d) => {
+            eros_engine_llm::model_config::ModelConfig::from_toml_dir(std::path::Path::new(d))
+                .with_context(|| format!("model_config load failed from dir: {d}"))?
+        }
+    });
 
     // Extraction prompts are required ONLY when the task section exists. A
     // missing [tasks.*_extraction] section means that extraction is off — the

@@ -971,17 +971,21 @@ impl ModelConfig {
         Ok(cfg)
     }
 
-    /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml` to match the
-    /// `eros-engine-server` boot default. The server binary itself reads
-    /// the file inline via `from_toml_str` rather than calling this; this
-    /// method is provided for embedders who want the same behaviour in
-    /// one call.
+    /// Library-side convenience: resolve `MODEL_CONFIG_PATH` /
+    /// `MODEL_CONFIG_DIR` (mutually exclusive; neither set falls back to
+    /// `examples/model_config.toml` to match the `eros-engine-server` boot
+    /// default) and load. The server binary does the same resolution in
+    /// `main.rs` via `resolve_config_source`, so embedders and the server
+    /// stay behaviour-identical.
     pub fn load() -> Result<Arc<Self>, LlmError> {
-        let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
-        let text = std::fs::read_to_string(&path)?;
-        let cfg = Self::from_toml_str(&text)?;
+        let source = resolve_config_source(
+            std::env::var("MODEL_CONFIG_PATH").ok(),
+            std::env::var("MODEL_CONFIG_DIR").ok(),
+        )?;
+        let cfg = match &source {
+            ConfigSource::File(p) => Self::from_toml_file(std::path::Path::new(p))?,
+            ConfigSource::Dir(d) => Self::from_toml_dir(std::path::Path::new(d))?,
+        };
         Ok(Arc::new(cfg))
     }
 
