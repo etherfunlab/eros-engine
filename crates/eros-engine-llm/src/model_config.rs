@@ -768,6 +768,22 @@ pub struct ResolvedPde {
     pub structured_output: bool,
 }
 
+/// Resolved product-QA executor task (`chat_product_qa`). Mirrors
+/// `ResolvedVision`: the configured `filter_prompt` (product docs + answering
+/// rules) is the executor's system instruction; the engine builds the user
+/// payload (recent product-QA pairs + the current question). `fallback_model`
+/// is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedProductQa {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub answer_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
 /// The configured `filter_prompt` is the system instruction; the server assembles
 /// the conversation as a separate user message. Model selection mirrors the generic
@@ -1165,6 +1181,49 @@ impl ModelConfig {
             reasoning: task_cfg.reasoning.clone(),
             structured_output: task_cfg.structured_output.unwrap_or(true),
         })
+    }
+
+    /// Resolve the product-QA executor task. `None` (feature off) when
+    /// `[tasks.chat_product_qa]` is absent OR its `filter_prompt` is blank.
+    /// Task-level only (no tier override), like `chat_vision` / `pde_decision`.
+    /// NOTE: `None`-when-blank is what `validate_product_qa_prompt` turns into
+    /// a boot refusal — a present-but-blank section must never silently no-op.
+    pub fn resolve_product_qa(&self) -> Option<ResolvedProductQa> {
+        const PRODUCT_QA_TASK: &str = "chat_product_qa";
+        let task_cfg = self.tasks.get(PRODUCT_QA_TASK)?;
+        let answer_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if answer_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(PRODUCT_QA_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedProductQa {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            answer_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// Boot-time validation for the product-QA task: a present section must
+    /// carry a usable `filter_prompt` (else `Err`); an absent section means the
+    /// feature is simply off (`Ok`). Same contract as
+    /// `validate_extraction_prompts`.
+    pub fn validate_product_qa_prompt(&self) -> Result<(), String> {
+        const PRODUCT_QA_TASK: &str = "chat_product_qa";
+        if self.tasks.contains_key(PRODUCT_QA_TASK) && self.resolve_product_qa().is_none() {
+            return Err(format!(
+                "[tasks.{PRODUCT_QA_TASK}] is present but its filter_prompt is unset — eros-engine \
+                 refuses to boot. Set a filter_prompt (product docs + answering rules), or remove \
+                 the [tasks.{PRODUCT_QA_TASK}] section to disable product_qa."
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the image-generation task. `None` (feature off) when
@@ -1665,6 +1724,14 @@ temperature  = 0.3
 max_tokens   = 400
 filter_prompt = "Rewrite per policy."
 reasoning    = { enabled = false }
+
+[tasks.chat_product_qa]
+model        = "x-ai/grok-4-mini"
+fallback     = "deepseek/deepseek-chat-v3.2"
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 800
+filter_prompt = "Answer product questions from the docs."
 "#;
 
     #[test]
@@ -1747,6 +1814,19 @@ reasoning    = { enabled = false }
         assert_eq!(pde.ghosting, Some(false));
         assert!(cfg.resolve_pde().is_some());
         assert!(!cfg.pde_ghosting_enabled());
+
+        // chat_product_qa — executor for the PDE product_qa action.
+        let pq = cfg.tasks.get("chat_product_qa").unwrap();
+        assert_eq!(pq.model.as_fixed(), Some("x-ai/grok-4-mini"));
+        assert_eq!(pq.retry_depth, Some(1));
+        assert_eq!(
+            pq.filter_prompt.as_deref(),
+            Some("Answer product questions from the docs.")
+        );
+        let rpq = cfg
+            .resolve_product_qa()
+            .expect("fixture product_qa resolves");
+        assert_eq!(rpq.answer_prompt, "Answer product questions from the docs.");
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
@@ -3198,6 +3278,52 @@ filter_prompt = "   "
             "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"d\"\nstructured_output = false\n",
         ).unwrap();
         assert!(!cfg.resolve_pde().unwrap().structured_output);
+    }
+
+    #[test]
+    fn resolve_product_qa_absent_is_none() {
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(cfg.resolve_product_qa().is_none());
+        assert!(cfg.validate_product_qa_prompt().is_ok()); // absent = feature off, boots fine
+    }
+
+    #[test]
+    fn resolve_product_qa_blank_prompt_is_none_and_fails_validation() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = "x-ai/grok-4-mini"
+temperature = 0.3
+max_tokens = 800
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.resolve_product_qa().is_none());
+        let err = cfg.validate_product_qa_prompt().unwrap_err();
+        assert!(err.contains("chat_product_qa"));
+        assert!(err.contains("refuses to boot"));
+    }
+
+    #[test]
+    fn resolve_product_qa_resolves_full_shape() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model        = "x-ai/grok-4-mini"
+fallback     = ["deepseek/deepseek-chat-v3.2", "b", "c"]
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 800
+reasoning    = { enabled = false }
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "x-ai/grok-4-mini");
+        assert_eq!(
+            p.fallback_model,
+            vec!["deepseek/deepseek-chat-v3.2".to_string()]
+        ); // truncated to retry_depth=1
+        assert_eq!(p.answer_prompt, "只根据产品资料作答。");
+        assert_eq!(p.max_tokens, 800);
+        assert!(cfg.validate_product_qa_prompt().is_ok());
     }
 
     #[test]
