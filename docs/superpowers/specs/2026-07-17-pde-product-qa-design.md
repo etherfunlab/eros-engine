@@ -63,6 +63,11 @@ marker **`'product_qa'`**.
   (migration 0030). Voice assistant rows use `assistant_action_type='reply'` +
   `channel='voice'` (`chat.rs:894-912`) — the "channel marks the flavor,
   action type stays `reply`" convention this spec follows.
+- The `ChatMessage` struct (`chat.rs`) has **no `channel` field today** — the
+  column exists in the DB (migration 0030) but nothing reads it back into
+  Rust. This spec adds `pub channel: Option<String>` to `ChatMessage`; that
+  field is what every in-Rust transcript/replay filter point (§2.2) actually
+  matches on.
 - The voice path (`voice.rs`) never runs the PDE and uses its own `history()`
   window on a separate voice-channel session — untouched by this spec.
 - Tip turns skip the judge entirely (rule path) — a tip can never become
@@ -183,20 +188,34 @@ context) is enforced by query-side exclusion (§2.2).
 > **A non-NULL `channel` row is invisible to the companion brain and fully
 > visible to the client.**
 
-Four reader changes, all to `AND channel IS NULL`:
+Six reader changes:
 
-1. `recent_turn_pairs` + `recent_turn_pairs_before_message`
-   (`[recent_conversation]`; also the judge's shared transcript source — the
-   judge's *companion* transcript loses product-QA rows automatically, and
-   gets them back only via the dedicated `[最近产品咨询]` block).
-2. `recent_assistant_contents` (`[avoid_repetition]`).
+1. `recent_turn_pairs` + `recent_turn_pairs_before_message` (`[recent_conversation]`,
+   SQL-level `AND channel IS NULL`) pair `user|gift_user → assistant` rows for
+   the reply prompt.
+2. `recent_assistant_contents` (`[avoid_repetition]`, SQL-level
+   `AND channel IS NULL`).
 3. Dreaming's session-log pull (currently `IS DISTINCT FROM 'voice'` —
    equivalent for voice sessions, which contain only voice rows, and now also
    excludes `product_qa`).
 4. `compute_signals_for_session` (`message_count` /
-   `hours_since_last_message`) — product questions don't advance the ghost
-   message-count floor or relationship-depth signals. (Plan must verify the
-   voice path doesn't call this on voice sessions; believed text-path-only.)
+   `hours_since_last_message`, SQL-level `AND channel IS NULL`) — product
+   questions don't advance the ghost message-count floor or
+   relationship-depth signals. (Plan must verify the voice path doesn't call
+   this on voice sessions; believed text-path-only.)
+5. **`build_input_filter_transcript`** (`stream.rs`) — NOT `recent_turn_pairs`.
+   This is the judge's *actual* shared transcript source: an 8-row
+   `chat_repo.history()` window also used by the input filter, filtered **in
+   Rust** on `ChatMessage.channel.is_some()` (skip), not by a SQL clause. The
+   judge's companion transcript loses product-QA rows this way, and gets them
+   back only via the dedicated `[最近产品咨询]` block.
+6. **`assemble_chat_request`** (`handlers.rs`) — the companion LLM's own live
+   message window. It also reads a raw `history()`-shaped row list and
+   filters **in Rust** on `ChatMessage.channel.is_some()` (skip), the same
+   pattern as reader 5. Discovered during implementation as a fourth
+   server-side reader that needed the same filter: without it a product-QA
+   turn would silently re-enter the companion's own conversation history on
+   the very next reply.
 
 `history()` (client-facing history + voice generator window) is **not**
 filtered — the client keeps seeing the Q&A. Voice sessions never contain
@@ -316,15 +335,19 @@ regression.
 
 | File | Change |
 | --- | --- |
-| `crates/eros-engine-store/migrations/0034_chat_messages_channel_product_qa.sql` | **New** — extend `channel` CHECK to `('voice','product_qa')`. |
+| `crates/eros-engine-store/migrations/0034_chat_messages_channel_product_qa.sql` | **New** — extend `channel` CHECK to `('voice','product_qa')`. The 0030 CHECK was added unnamed; drop it via a `pg_constraint` catalog lookup (same precedent as migration `0014`), not a guessed constraint name, then re-add it named (`chat_messages_channel_check`). |
 | `crates/eros-engine-core/src/types.rs` | `ActionType` gains `ProductQa`; `is_text_reply()` stays false for it. |
 | `crates/eros-engine-core/src/pde.rs` | `plan_for` gains `ProductQa` arm (zero deltas, zero energy, hints ignored). |
 | `crates/eros-engine-llm/src/model_config.rs` | `ResolvedProductQa` + `resolve_product_qa()`; blank-prompt boot refusal; `COMPAT_FIXTURE` entry. |
 | `crates/eros-engine-server/src/main.rs` (or boot path) | Boot WARN when `chat_product_qa` configured with PDE off; boot refusal on blank prompt. |
-| `crates/eros-engine-server/src/pipeline/stream.rs` | `PdeAction::ProductQa` + schema enum; `build_pde_ctx` availability line + `[最近产品咨询]`; `guard_action(product_qa_available)`; `ProductQa` stream arm (streaming executor, skip whole companion chain); `FrameActionType::ProductQa`; replay Meta mapping. |
+| `crates/eros-engine-server/src/pipeline/stream.rs` | `PdeAction::ProductQa` + schema enum; `build_pde_ctx` availability line + `[最近产品咨询]`; `guard_action(product_qa_available)`; `ProductQa` stream arm (streaming executor, skip whole companion chain); `FrameActionType::ProductQa`; replay Meta mapping; `build_input_filter_transcript` filters `ChatMessage.channel.is_some()` in Rust (the judge's actual shared transcript reader, §2.2). |
+| `crates/eros-engine-server/src/pipeline/handlers.rs` | `assemble_chat_request` filters `ChatMessage.channel.is_some()` in Rust — the companion LLM's own live message window (§2.2 reader 6). |
 | `crates/eros-engine-server/src/pipeline/mod.rs` | `compute_signals_for_session` gains `AND channel IS NULL`. |
 | `crates/eros-engine-server/src/pipeline/dreaming.rs` | Log pull filter → `AND channel IS NULL`. |
-| `crates/eros-engine-store/src/chat.rs` | `recent_turn_pairs*` / `recent_assistant_contents` gain `AND channel IS NULL`; new `recent_product_qa_pairs`; new `mark_user_message_product_qa`; assistant insert accepts the channel marker. |
+| `crates/eros-engine-store/src/chat.rs` | `ChatMessage` gains a `channel: Option<String>` field; `recent_turn_pairs*` / `recent_assistant_contents` gain `AND channel IS NULL`; new `recent_product_qa_pairs`; new `mark_user_message_product_qa`; assistant insert accepts the channel marker. |
+| `crates/eros-engine-server/src/routes/companion.rs` | `ChatHistoryEntry` gains an optional `channel` field (history projection). |
+| `crates/eros-engine-server/src/routes/bff/companion.rs` | `BffHistoryEntry` gains an optional `channel` field (BFF history projection). |
+| `crates/eros-engine-server/src/routes/companion_stream.rs` | openapi `#[utoipa::path]` prose: `action_type` enum gains `product_qa`; unknown-`action_type` client-tolerance note. |
 | `examples/model_config.toml` | Commented `[tasks.chat_product_qa]` block; `pde_decision` sample-prompt routing paragraph. |
 | `docs/model-config.md`/`.zh`, `docs/architecture.md`/`.zh`, `docs/api-reference.md`/`.zh`, `README*` | Per §7. |
 | `openapi` artifacts | Regenerate if the frame action enum is part of the published schema. |
