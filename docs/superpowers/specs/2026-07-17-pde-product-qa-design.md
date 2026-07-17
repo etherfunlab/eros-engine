@@ -236,6 +236,12 @@ regression.
   `Delta*` → `Done(generation_id)` → `Final`. Downstream clients can render
   an "official info" bubble; clients must tolerate unknown action-type
   values (flagged as a client-contract addition in the API docs).
+- Live/replay `Meta.model` asymmetry (accepted, documented): the live
+  ProductQa arm emits `Meta.model: None` — the serving model isn't known
+  until the candidate-chain walk completes, and `Meta` is yielded before
+  that walk starts. Replay, reading a persisted row, can and does emit
+  `Meta.model: row.model`. Clients must not treat `Meta.model` presence as
+  a signal of live-vs-replay.
 - The history projection should expose `channel` so clients can style
   historical product-QA rows (plan verifies whether it already does).
 

@@ -2952,6 +2952,20 @@ pub fn run_stream(
                         Some(text) => {
                             acc = text.clone();
                             truncated = false;
+                            // A final candidate can reach here having streamed
+                            // metadata (usage/model/generation_id) with zero
+                            // content — e.g. a terminal SSE chunk that reports
+                            // usage but no delta. That trio belongs to a call
+                            // that produced nothing; leaving it set would plant
+                            // a real generation_id/model/usage on a row whose
+                            // content is actually this canned phrase, poisoning
+                            // OpenRouter-log reconciliation (audit attribution
+                            // noise). Reset before persistence — this is the
+                            // ONLY branch reached with `acc` non-empty despite
+                            // no candidate having produced it.
+                            last_usage = None;
+                            last_gen_id = None;
+                            served_model = None;
                             yield ProtocolFrame::Delta {
                                 message_id: message_id.clone(),
                                 content: text,
@@ -8150,6 +8164,249 @@ data: [DONE]\n\n";
             decision_row.expect("companion_decision_events row must land within timeout");
         assert_eq!(proposed.as_deref(), Some("product_qa"));
         assert_eq!(acted.as_deref(), Some("product_qa"));
+    }
+
+    /// Spec §6 failure path: "executor exhausted → fallback text emitted AND
+    /// persisted with the channel marker." Both product_qa candidates fail to
+    /// produce usable content — the primary 500s outright, the fallback opens
+    /// a 200 stream but only ever emits a metadata chunk (usage/model/id) with
+    /// an EMPTY delta before `[DONE]`, mirroring a real OpenRouter completion
+    /// that reports usage without content. That second shape is deliberate:
+    /// it's exactly the "final candidate streamed metadata but zero content"
+    /// case the stale-audit-trio bug (Fix 2) was about — `last_usage`/
+    /// `last_gen_id`/`served_model` get set from that chunk even though `acc`
+    /// stays empty, so a naive persist would leak a real
+    /// generation_id/model/usage onto a row whose content is actually the
+    /// canned error_handling phrase. The fallback phrase itself is pinned to
+    /// a single deterministic entry (migration 0020 seeds 10 and picks at
+    /// random) so the test can assert on exact content.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_product_qa_executor_exhausted_persists_fallback_phrase(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const FALLBACK_PHRASE: &str = "稍后再答你";
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `product_qa` verdict, empty inner_state — same
+        // routing setup as the happy-path E2E above.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Primary product-QA executor ("qa/exec-a"): hard failure, HTTP 500.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-a"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        // Fallback product-QA executor ("qa/exec-b"), last in the chain: opens
+        // fine (200) but the only SSE frame is metadata-only — usage/model/id
+        // set, `delta` empty — before `[DONE]`. `acc` stays empty ⇒ chain
+        // exhausted, but `last_usage`/`last_gen_id`/`served_model` are left
+        // holding real values from this candidate.
+        let exhausted_body = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0,\"total_tokens\":3},\"id\":\"gen-exhausted\",\"model\":\"qa/exec-b\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(exhausted_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Companion chat ("deepseek/x"): MUST NOT be called — product_qa never
+        // degrades to the companion chain, even on total executor failure.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Pin the error_handling fallback phrase to a single deterministic
+        // entry (the seeded migration row has 10, picked at random) so the
+        // Delta content / row content assertions below are exact-match.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = $1 \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .bind(serde_json::json!([FALLBACK_PHRASE]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON (routes the judge) + chat_product_qa ON (routes the executor)
+        // with a two-candidate chain (primary + one fallback), both of which
+        // must fail before the pseudo-ghost path fires.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品能用几年",
+                "01JPDEQAEXHAUSTED000000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品能用几年".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // frame order: meta(product_qa) → delta(phrase) → done → final.
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta{{action_type: ProductQa}}, got {frames:?}",
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "delta", "done", "final"],
+            "exhausted-chain product_qa sequence, got {frames:?}"
+        );
+
+        let delta_text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delta_text, FALLBACK_PHRASE,
+            "the Delta frame must carry the seeded error_handling phrase verbatim"
+        );
+
+        // Done frame: the audit trio must be None — no leaked generation_id/
+        // model/usage from the exhausted fallback candidate's metadata-only
+        // chunk (Fix 2).
+        let done = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done {
+                    usage,
+                    generation_id,
+                    ..
+                } => Some((usage.clone(), generation_id.clone())),
+                _ => None,
+            })
+            .expect("a Done frame");
+        assert_eq!(
+            done,
+            (None, None),
+            "Done frame must carry usage:None, generation_id:None on chain exhaustion, got {done:?}"
+        );
+
+        // Assistant row: channel marker + phrase content + null audit trio.
+        let (content, channel, model, usage, generation_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT content, channel, model, usage, generation_id FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, FALLBACK_PHRASE);
+        assert_eq!(channel.as_deref(), Some("product_qa"));
+        assert_eq!(
+            model, None,
+            "the fallback row must not carry the exhausted candidate's model"
+        );
+        assert_eq!(
+            usage, None,
+            "the fallback row must not carry the exhausted candidate's usage"
+        );
+        assert_eq!(
+            generation_id, None,
+            "the fallback row must not carry the exhausted candidate's generation_id"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
