@@ -136,7 +136,7 @@ For the full request schema, SSE frame layout (including `delta`, `image_request
 
 Required env vars: `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and **one** auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS, the post-2025 Supabase default) **or** `SUPABASE_JWT_SECRET` (legacy HS256). The server refuses to boot if no auth source is set.
 
-Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
+Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`, or a split config directory via `MODEL_CONFIG_DIR`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
 
 ## Roadmap
 

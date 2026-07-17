@@ -7,10 +7,38 @@
 ## 文件位置
 
 - 默认路径：`examples/model_config.toml`（相对于工作目录）。`examples/` 下的文件是示例模板——请根据自己的需求调整（或通过 `MODEL_CONFIG_PATH` 指向自己的文件）。
-- 覆盖方式：`MODEL_CONFIG_PATH` 环境变量
-- 服务器启动时由 `eros-engine-server/src/main.rs` 加载一次（直接读取 `MODEL_CONFIG_PATH`，然后调用 `ModelConfig::from_toml_str`）。对于嵌入该库的应用，`crates/eros-engine-llm/src/model_config.rs` 中的 `ModelConfig::load()` 以相同方式加载，并使用相同的默认路径（`examples/model_config.toml`）。
+- 覆盖方式：`MODEL_CONFIG_PATH` 环境变量（单文件），或 `MODEL_CONFIG_DIR`（目录模式，见下）。两者互斥——同时设置会导致启动报错。
+- 服务器启动时由 `eros-engine-server/src/main.rs` 加载一次（`resolve_config_source` → `ModelConfig::from_toml_file` / `from_toml_dir`）。对于嵌入该库的应用，`crates/eros-engine-llm/src/model_config.rs` 中的 `ModelConfig::load()` 执行相同的解析逻辑，并使用相同的默认路径（`examples/model_config.toml`）。
 - 以 `Arc<ModelConfig>` 保存在 `AppState` 中；由所有 chat / post-process 轮次共享
 - 服务器启动时还会调用 `dotenvy::dotenv()`，因此快速入门中执行 `cp .env.example .env` 后无需显式执行 `source .env`
+
+## 目录模式
+
+`MODEL_CONFIG_DIR` 指向一个目录，启动时将其中的 `.toml` 文件合并成完整配置——用于把大配置按 section 拆分，而不是分层覆盖：
+
+- 只读取目录第一层（不递归）；dotfile 和非 `.toml` 条目会被跳过。目录中没有任何 `.toml` 文件会导致启动报错。
+- 每个文件独立解析后合并；加载顺序为文件名字节序（重复即报错，因此顺序不影响结果，只保证报错信息可复现）。
+- `[defaults]` 和每个 `[tasks.<name>]` 只能来自一个文件。同一 section 定义两次会启动失败并点名两个文件：`model_config merge failed: [tasks.chat_companion] in chat.toml already defined in base.toml`。文件之间不存在覆盖或优先级。
+- 合并成功后服务器会记录文件清单日志：`model_config: loaded from dir`（含目录、文件名列表和数量）。
+
+拆分示例：
+
+```toml
+# defaults.toml
+[defaults]
+fallback_model       = "x-ai/grok-4-mini"
+fallback_temperature = 0.5
+
+# chat.toml
+[tasks.chat_companion]
+model = "provider/chat-model"
+
+# extraction.toml
+[tasks.insight_extraction]
+model = "provider/extract-model"
+[tasks.memory_extraction]
+model = "provider/extract-model"
+```
 
 ## Schema
 

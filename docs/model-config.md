@@ -7,10 +7,38 @@ LLM model selection for the engine lives in a TOML file loaded at server start. 
 ## Where it lives
 
 - Default path: `examples/model_config.toml` (relative to the working directory). The file under `examples/` is an illustrative template — adapt it to your own needs (or point `MODEL_CONFIG_PATH` at your own file).
-- Override: `MODEL_CONFIG_PATH` environment variable
-- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path (`examples/model_config.toml`).
+- Override: `MODEL_CONFIG_PATH` environment variable (single file), or `MODEL_CONFIG_DIR` (directory mode, below). The two are mutually exclusive — setting both is a boot error.
+- Loaded once at server start by `eros-engine-server/src/main.rs` (`resolve_config_source` → `ModelConfig::from_toml_file` / `from_toml_dir`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same resolution with the same default path (`examples/model_config.toml`).
 - Held as `Arc<ModelConfig>` in `AppState`; shared across all chat / post-process turns
 - The server also calls `dotenvy::dotenv()` at startup, so `cp .env.example .env` works for the quickstart without an explicit `source .env`
+
+## Directory mode
+
+`MODEL_CONFIG_DIR` points at a directory whose `.toml` files are merged into one config at boot — for splitting a large config by section, not for layering:
+
+- Only the directory's top level is read (no recursion); dotfiles and non-`.toml` entries are skipped. A directory with no `.toml` files is a boot error.
+- Files are parsed independently and merged; load order is filename byte order (order can't change the result — duplicates are errors — it only keeps messages deterministic).
+- `[defaults]` and each `[tasks.<name>]` must come from exactly one file. A section defined twice fails boot naming both files: `model_config merge failed: [tasks.chat_companion] in chat.toml already defined in base.toml`. There is no override or precedence between files.
+- On success the server logs the merged file list: `model_config: loaded from dir` with the directory, filenames, and count.
+
+Example split:
+
+```toml
+# defaults.toml
+[defaults]
+fallback_model       = "x-ai/grok-4-mini"
+fallback_temperature = 0.5
+
+# chat.toml
+[tasks.chat_companion]
+model = "provider/chat-model"
+
+# extraction.toml
+[tasks.insight_extraction]
+model = "provider/extract-model"
+[tasks.memory_extraction]
+model = "provider/extract-model"
+```
 
 ## Schema
 

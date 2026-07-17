@@ -136,7 +136,7 @@ cargo run -p eros-engine-server -- serve
 
 必須の環境変数は `DATABASE_URL`、`OPENROUTER_API_KEY`、`VOYAGE_API_KEY` と、**いずれか 1 つ**の認証元です。`SUPABASE_URL` / `SUPABASE_JWKS_URL`（JWKS、2025 年以降の Supabase のデフォルト）、**または** `SUPABASE_JWT_SECRET`（旧来の HS256）を設定してください。認証元が未設定の場合、サーバーは起動しません。
 
-その他の項目には適切なデフォルト値があります。モデルルーティング（`MODEL_CONFIG_PATH` → `model_config.toml`）、OpenRouter attribution headers、dreaming-lite / snapshot sweepers、関係性の難易度を調整する `EMA_INERTIA`、debug toggles などです。注釈付きの全項目は [`.env.example`](.env.example)、運用ガイドは [Deploying](docs/deploying.md)、モデルルーティングは [Model config](docs/model-config.md) を参照してください。
+その他の項目には適切なデフォルト値があります。モデルルーティング（`MODEL_CONFIG_PATH` → `model_config.toml`、または `MODEL_CONFIG_DIR` で分割設定ディレクトリ）、OpenRouter attribution headers、dreaming-lite / snapshot sweepers、関係性の難易度を調整する `EMA_INERTIA`、debug toggles などです。注釈付きの全項目は [`.env.example`](.env.example)、運用ガイドは [Deploying](docs/deploying.md)、モデルルーティングは [Model config](docs/model-config.md) を参照してください。
 
 ## Roadmap
 

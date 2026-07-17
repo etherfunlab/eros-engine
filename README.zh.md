@@ -136,7 +136,7 @@ cargo run -p eros-engine-server -- serve
 
 必填环境变量：`DATABASE_URL`、`OPENROUTER_API_KEY`、`VOYAGE_API_KEY`，以及**一个**身份验证来源——`SUPABASE_URL` / `SUPABASE_JWKS_URL`（JWKS，Supabase 在 2025 年之后的默认方式）**或** `SUPABASE_JWT_SECRET`（旧版 HS256）。若未设置身份验证来源，服务将拒绝启动。
 
-其余配置均有合理的默认值：模型路由（`MODEL_CONFIG_PATH` → `model_config.toml`）、OpenRouter 归因标头、dreaming-lite / snapshot sweepers、用于调整关系难度的 `EMA_INERTIA`，以及调试开关。完整注释清单见 [`.env.example`](.env.example)；操作指南见[部署](docs/deploying.zh.md)，模型路由见[模型配置](docs/model-config.zh.md)。
+其余配置均有合理的默认值：模型路由（`MODEL_CONFIG_PATH` → `model_config.toml`，或通过 `MODEL_CONFIG_DIR` 使用拆分的配置目录）、OpenRouter 归因标头、dreaming-lite / snapshot sweepers、用于调整关系难度的 `EMA_INERTIA`，以及调试开关。完整注释清单见 [`.env.example`](.env.example)；操作指南见[部署](docs/deploying.zh.md)，模型路由见[模型配置](docs/model-config.zh.md)。
 
 ## Roadmap
 
