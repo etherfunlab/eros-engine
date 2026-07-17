@@ -1873,6 +1873,7 @@ fn action_type_audit_str(a: ActionType) -> &'static str {
         ActionType::ReplyImage => "reply_image",
         ActionType::ReplyTextImage => "reply_text_image",
         ActionType::Proactive => "proactive",
+        ActionType::ProductQa => "product_qa",
     }
 }
 

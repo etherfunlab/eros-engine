@@ -115,6 +115,10 @@ pub enum ActionType {
     Ghost,
     ReplyImage,     // reserved — degrades to ReplyText until the image executor ships
     ReplyTextImage, // reserved — degrades to ReplyText until the image executor ships
+    /// Out-of-character product answer (PDE action `product_qa`): a dedicated
+    /// executor replies from operator-authored product docs; the turn is
+    /// invisible to the companion brain. Never produced by the rule engine.
+    ProductQa,
     Proactive, // KEPT — built by pde::decide for ProactiveTrigger/AppOpen; matched in post_process
 }
 
