@@ -127,6 +127,8 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
 ///                                              reply_tone kept (ReplyImage drops it)
 ///   Ghost                                   → Cold, ghost_affinity_deltas,
 ///                                              ENERGY_COST_GHOST, hints discarded, tone discarded
+///   ProductQa                               → Neutral, all-zero deltas, zero energy,
+///                                              hints/tone dropped (out-of-character aside)
 ///   Proactive                               → unreachable! (comes only from decide)
 pub fn plan_for(
     input: &DecisionInput,
@@ -160,6 +162,20 @@ pub fn plan_for(
             reply_style: ReplyStyle::Cold,
             affinity_deltas: ghost_affinity_deltas(),
             energy_cost: ENERGY_COST_GHOST,
+            context_hints: vec![],
+            reply_tone: None,
+            image_prompt: None,
+            image_ref: ImageRef::Face,
+            aspect_ratio: None,
+        },
+        ActionType::ProductQa => ActionPlan {
+            action_type: ActionType::ProductQa,
+            reply_style: ReplyStyle::Neutral,
+            // Out-of-character aside: no relationship movement, no energy,
+            // no persona-prompt inputs (hints/tone are dropped — there is no
+            // companion prompt to fold them into).
+            affinity_deltas: AffinityDeltas::default(),
+            energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
             image_prompt: None,
@@ -601,5 +617,32 @@ mod tests {
 
         // Rule engine never tones.
         assert_eq!(decide(&input).reply_tone, None);
+    }
+
+    #[test]
+    fn plan_for_product_qa_is_inert_out_of_character_plan() {
+        let input = test_decision_input(); // the module's existing DecisionInput helper
+        let plan = plan_for(
+            &input,
+            ActionType::ProductQa,
+            vec!["ignored".into()],
+            Some("ignored".into()),
+            None,
+            ImageRef::Face,
+            None,
+        );
+        assert_eq!(plan.action_type, ActionType::ProductQa);
+        assert_eq!(plan.reply_style, ReplyStyle::Neutral);
+        // zero deltas — a product answer moves no relationship axis
+        assert_eq!(plan.affinity_deltas.warmth, 0.0);
+        assert_eq!(plan.affinity_deltas.trust, 0.0);
+        assert_eq!(plan.affinity_deltas.intrigue, 0.0);
+        assert_eq!(plan.affinity_deltas.intimacy, 0.0);
+        assert_eq!(plan.affinity_deltas.patience, 0.0);
+        assert_eq!(plan.affinity_deltas.tension, 0.0);
+        assert_eq!(plan.energy_cost, 0.0);
+        assert!(plan.context_hints.is_empty()); // hints/tone dropped — no persona prompt
+        assert!(plan.reply_tone.is_none());
+        assert!(!ActionType::ProductQa.is_text_reply());
     }
 }

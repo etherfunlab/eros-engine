@@ -89,7 +89,7 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 
 Frame fields worth noting:
 
-- **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain).
+- **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; may be omitted), `generation_id` (optional OpenRouter id).
 - **`final`** — turn summary: `lead_score`, `should_show_cta`, `agent_training_level`, plus `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served).
 
@@ -326,6 +326,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - image-only: `meta(reply_image) → done → image_request → final`
 - text + image: `meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
+- `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
 The chat stream emits none of `image_pending`/`image_attempt`/`image`/`image_failed`
 and persists no draw result — total-failure handling is the consumer's (see the
@@ -371,13 +372,18 @@ Paginated message history, newest first.
 {
   "messages": [
     { "id": "…", "role": "assistant", "content": "Bishop.", "sent_at": "…" },
-    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…" }
+    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…" },
+    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
   ]
 }
 ```
 
 `role` ∈ `user | assistant | gift_user | system_error`. `gift_user` is a tip
-turn (sent via `tips_amount_usd` on the stream route, above).
+turn (sent via `tips_amount_usd` on the stream route, above). Each entry also
+carries an optional `channel` field — `"product_qa"` marks an
+out-of-character product answer (excluded from companion context/memory,
+same as its live-stream `action_type`); the field is omitted for normal
+turns.
 
 ## Profile
 
@@ -516,7 +522,10 @@ independent of `EXPOSE_AFFINITY_DEBUG`.
 
 Slim history projection for the chat screen: `id` / `client_msg_id` /
 `role` / `content` / `sent_at` (no `extracted_facts`), plus `tips_amount_usd`
-on tip rows (present only when `role = gift_user`; omitted otherwise). `id` is the
+on tip rows (present only when `role = gift_user`; omitted otherwise), and an
+optional `channel` field — `"product_qa"` marks an out-of-character product
+answer (excluded from companion context/memory); omitted for normal turns.
+`id` is the
 `chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
 sent during streaming (`null` for rows that never carried one, e.g.
 assistant turns). Same auth, ownership check, and
@@ -530,9 +539,10 @@ round-trip.
   "session_id": "…",
   "messages": [
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" }
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
+    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" }
   ],
-  "total": 2
+  "total": 3
 }
 ```
 

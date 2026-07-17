@@ -57,6 +57,15 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
+**PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
+`reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
+其中三个是有条件可用的：`reply_image` 和 `reply_text_image` 都要求请求带
+`image` 块；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM PDE
+已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
+`product_qa` 会短路整条伴侣链路（不注入人格 prompt、不跑 post-process）：
+它路由到一个独立的产品问答执行器，而不是 `ReplyHandler`。各动作的启用
+门槛见 [model-config.zh.md](model-config.zh.md)。
+
 ## Auth
 
 中間件（`auth::middleware::require_auth`）只掛在 `/comp/*` 上。它讀 `Authorization: Bearer …` 頭，調 `state.auth.validate(token)`，把 `AuthUser(user_id)` 作為 extension 注入請求。每個受保護的 handler 讀 `Extension(AuthUser(user_id))`；請求體裡的 `user_id` 永不被信任。
@@ -88,6 +97,11 @@ eros-engine-server :8080
 ```
 
 post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
+
+**`chat_messages.channel`**：`NULL` = 普通文本；`'voice'` = 语音频道；
+`'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在伴侣上下文与记忆之外
+（短期回忆、对话信号、dreaming、好感度评估、insight 抽取），但在实时流、
+重放和客户端历史记录里完全可见。
 
 ## 為甚麼 core 必須純領域
 

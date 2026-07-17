@@ -65,7 +65,8 @@ pub async fn compute_signals_for_session(
     // `MAX(sent_at)` is NULL for an empty session.
     let (message_count, last_time): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
         "SELECT COUNT(*), MAX(sent_at) FROM engine.chat_messages \
-             WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+             WHERE session_id = $1 AND role IN ('user', 'gift_user') \
+               AND channel IS NULL",
     )
     .bind(session_id)
     .fetch_one(pool)
@@ -247,5 +248,33 @@ mod tests {
 
         assert_eq!(signals.message_count, 0);
         assert_eq!(signals.hours_since_last_message, 0.0);
+    }
+
+    /// `channel`-marked rows (e.g. `product_qa`) are out-of-character asides,
+    /// not companion conversation — they must not count toward the signal.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn signals_exclude_channel_marked_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_genome_id, instance_id, session_id) = seed_session(&pool, user_id).await;
+
+        for (role, channel) in [("user", None::<&str>), ("user", Some("product_qa"))] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+                 VALUES ($1, $2, 'x', $3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(channel)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let aff = fixture_affinity(session_id, user_id, instance_id);
+        let signals = compute_signals_for_session(&pool, session_id, &aff)
+            .await
+            .unwrap();
+
+        assert_eq!(signals.message_count, 1); // the product_qa question doesn't count
     }
 }

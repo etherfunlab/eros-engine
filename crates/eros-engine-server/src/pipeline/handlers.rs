@@ -221,6 +221,13 @@ fn assemble_chat_request(
         content: system_prompt,
     });
     for msg in history {
+        // Channel-marked rows (voice / product_qa) are out of companion
+        // context — they must never re-enter the model's own conversation
+        // history, even though `history()` itself stays unfiltered for the
+        // client route and the voice window.
+        if msg.channel.is_some() {
+            continue;
+        }
         // User and TIP gift_user rows feed the MODEL-FACING text under the "user"
         // role — a tip turn IS a user turn to the model (OpenRouter only knows
         // system/user/assistant). gift_user is tip-only now (the legacy in-app
@@ -1586,6 +1593,7 @@ mod tests {
             usage: None,
             generation_id: None,
             assistant_action_type: None,
+            channel: None,
             pre_filter_content: pre.map(|s| s.to_string()),
             metadata: None,
         }
@@ -1704,6 +1712,53 @@ mod tests {
             .all(|m| matches!(m.role.as_str(), "system" | "user" | "assistant")));
     }
 
+    /// `channel`-marked rows (voice / product_qa) are out of companion context —
+    /// they must never re-enter the model's own conversation history, mirroring
+    /// the isolation invariant already enforced for signals/dreaming/judge.
+    #[test]
+    fn assemble_excludes_channel_marked_rows() {
+        use eros_engine_llm::model_config::ResolvedModel;
+
+        let mut product_qa_user = user_row("这个产品是什么", None);
+        product_qa_user.channel = Some("product_qa".into());
+        let mut product_qa_assistant = user_row("这是官方说明", None);
+        product_qa_assistant.role = "assistant".into();
+        product_qa_assistant.channel = Some("product_qa".into());
+        let plain = user_row("普通消息", None);
+
+        let resolved = ResolvedModel {
+            model: "m".into(),
+            fallback_model: vec![],
+            temperature: 0.7,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 100,
+            allow_traits: None,
+            reasoning: None,
+            retry_depth: 0,
+        };
+        let req = assemble_chat_request(
+            resolved,
+            "SYS".into(),
+            vec![product_qa_user, product_qa_assistant, plain],
+            None,
+        );
+
+        let contents: Vec<&str> = req.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            !contents.contains(&"这个产品是什么"),
+            "channel-marked user row must not enter the model's messages: {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"这是官方说明"),
+            "channel-marked assistant row must not enter the model's messages: {contents:?}"
+        );
+        assert!(contents.contains(&"普通消息"));
+        // system prompt + the one surviving (unmarked) turn only.
+        assert_eq!(req.messages.len(), 2);
+    }
+
     #[test]
     fn recall_query_prefers_caption() {
         let row = user_row_meta(
@@ -1805,6 +1860,7 @@ mod tests {
             usage: None,
             generation_id: None,
             assistant_action_type: None,
+            channel: None,
             pre_filter_content: None,
             metadata,
         }

@@ -28,7 +28,7 @@ pub enum StreamErrorCode {
 
 /// Action type tag carried by the `meta` frame's `action_type` field.
 ///
-/// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image`.
+/// Serializes snake_case: `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
 ///
 /// Asymmetry worth calling out: this is the *wire* action, coarser than the
 /// internal PDE [`ActionType`]. A plain-text
@@ -43,6 +43,7 @@ pub enum FrameActionType {
     Ghost,
     ReplyImage,
     ReplyTextImage,
+    ProductQa,
 }
 
 /// Why an image-generation turn failed, carried by the `image_failed` frame.
@@ -169,6 +170,7 @@ fn frame_action_for(a: eros_engine_core::types::ActionType) -> FrameActionType {
         eros_engine_core::types::ActionType::ReplyImage => FrameActionType::ReplyImage,
         eros_engine_core::types::ActionType::ReplyTextImage => FrameActionType::ReplyTextImage,
         eros_engine_core::types::ActionType::Ghost => FrameActionType::Ghost,
+        eros_engine_core::types::ActionType::ProductQa => FrameActionType::ProductQa,
         _ => FrameActionType::Reply,
     }
 }
@@ -1409,7 +1411,7 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
 // ── PDE judge primitives ──────────────────────────────────────────────────────
 
 /// Judge verdict action. serde `snake_case` matches the JSON contract
-/// (`reply_text` / `ghost` / `reply_image` / `reply_text_image`).
+/// (`reply_text` / `ghost` / `reply_image` / `reply_text_image` / `product_qa`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PdeAction {
@@ -1417,6 +1419,7 @@ pub(crate) enum PdeAction {
     Ghost,
     ReplyImage,
     ReplyTextImage,
+    ProductQa,
 }
 
 impl PdeAction {
@@ -1426,6 +1429,7 @@ impl PdeAction {
             PdeAction::Ghost => "ghost",
             PdeAction::ReplyImage => "reply_image",
             PdeAction::ReplyTextImage => "reply_text_image",
+            PdeAction::ProductQa => "product_qa",
         }
     }
 }
@@ -1538,7 +1542,7 @@ fn pde_response_format() -> serde_json::Value {
                 "required": ["action", "inner_state", "tone", "image_prompt", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
-                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
+                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
                     "inner_state": { "type": "string" },
                     "tone": { "type": ["string", "null"] },
                     "image_prompt": { "type": ["string", "null"] },
@@ -1680,6 +1684,7 @@ fn guard_action(
     affinity: &eros_engine_core::affinity::Affinity,
     signals: &eros_engine_core::types::ConversationSignals,
     image_executor_available: bool,
+    product_qa_available: bool,
 ) -> ActionType {
     match proposed {
         PdeAction::Ghost => {
@@ -1698,6 +1703,10 @@ fn guard_action(
         PdeAction::ReplyImage if image_executor_available => ActionType::ReplyImage,
         PdeAction::ReplyTextImage if image_executor_available => ActionType::ReplyTextImage,
         PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
+        PdeAction::ProductQa if product_qa_available => ActionType::ProductQa,
+        // Hallucinated / stale-prompt proposal with the task unconfigured (or
+        // the PDE-off deployment's schema echo): degrade like the image actions.
+        PdeAction::ProductQa => ActionType::ReplyText,
         PdeAction::ReplyText => ActionType::ReplyText,
     }
 }
@@ -1785,11 +1794,22 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
     lines.join("\n")
 }
 
+/// Render recent product-QA pairs for the judge's `[最近产品咨询]` block and
+/// the executor's follow-up context. Plain 用户/回答 lines, chronological.
+fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(q, a)| format!("用户: {q}\n回答: {a}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(
     transcript: &str,
     input: &eros_engine_core::types::DecisionInput,
     image_available: bool,
+    product_qa_recent: Option<&str>,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -1811,11 +1831,21 @@ fn build_pde_ctx(
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
+    // Product-QA lines render ONLY when the task is enabled this deployment —
+    // old judge prompts see zero drift and pay zero tokens (unlike 图片能力,
+    // whose negative is itself a signal). `Some("")` = enabled, no history yet.
+    let product_qa_section = match product_qa_recent {
+        None => String::new(),
+        Some("") => "[产品咨询] 本轮可答产品问题=是\n".to_string(),
+        Some(recent) => {
+            format!("[产品咨询] 本轮可答产品问题=是\n[最近产品咨询]\n{recent}\n")
+        }
+    };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
-         [图片能力] 本轮可发图={image_flag}\n\n\
+         [图片能力] 本轮可发图={image_flag}\n{product_qa_section}\n\
          [用户最新消息]\n{latest}",
         a.warmth,
         a.trust,
@@ -1873,6 +1903,7 @@ fn action_type_audit_str(a: ActionType) -> &'static str {
         ActionType::ReplyImage => "reply_image",
         ActionType::ReplyTextImage => "reply_text_image",
         ActionType::Proactive => "proactive",
+        ActionType::ProductQa => "product_qa",
     }
 }
 
@@ -2059,6 +2090,11 @@ async fn build_input_filter_transcript(
     let mut lines = Vec::new();
     for m in rows {
         if m.id == current_user_message_id {
+            continue;
+        }
+        // Channel-marked rows (voice / product_qa) are out of companion
+        // context — the judge and input filter never see them.
+        if m.channel.is_some() {
             continue;
         }
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
@@ -2610,6 +2646,29 @@ pub fn run_stream(
         } else {
             state.model_config.resolve_pde()
         };
+        // product_qa executor: hard-gated on the judge being live (spec §1.1).
+        // `resolve_product_qa()` advances the chat_product_qa round-robin model
+        // cursor as a side effect (like `resolve_pde()` above) — every judged
+        // turn would consume a cursor position even when the action taken is
+        // ordinary chat, skewing the model sequence actual product-QA
+        // executions see. Use the side-effect-free `product_qa_enabled()` here
+        // for availability; the executor itself is resolved only in the
+        // ProductQa arm below, where the action is actually taken.
+        let product_qa_available = resolved_pde.is_some() && state.model_config.product_qa_enabled();
+        // One fetch per enabled turn, reused by judge ctx AND the executor arm.
+        let product_qa_pairs: Vec<(String, String)> = if product_qa_available {
+            chat_repo
+                .recent_product_qa_pairs(user_msg.session_id, user_msg.user_message_id, 3)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("stream: recent_product_qa_pairs failed: {e}");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        let product_qa_recent: Option<String> =
+            product_qa_available.then(|| render_product_qa_pairs(&product_qa_pairs));
         // Shared history transcript: built once, reused by the judge here AND the
         // input filter below (which previously fetched its own). `resolved_pde` is
         // already None on tip turns, so this only fires for a real judge turn.
@@ -2622,7 +2681,12 @@ pub fn run_stream(
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
-                    let ctx = build_pde_ctx(&pde_transcript, &input, image_executor_available);
+                    let ctx = build_pde_ctx(
+                        &pde_transcript,
+                        &input,
+                        image_executor_available,
+                        product_qa_recent.as_deref(),
+                    );
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
@@ -2631,6 +2695,7 @@ pub fn run_stream(
                                 &input.affinity,
                                 &input.signals,
                                 image_executor_available,
+                                product_qa_available,
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -2760,6 +2825,204 @@ pub fn run_stream(
                     truncated: false,
                     usage: None,
                     generation_id: None,
+                    ghost_fallback: false,
+                };
+                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                yield final_frame;
+            }
+            ActionType::ProductQa => {
+                // Out-of-character product answer (spec §1.4): mark the user row,
+                // run the dedicated executor, persist with channel='product_qa'.
+                // Skips the entire companion chain — no vision, no input filter, no
+                // persona prompt, no output filter, no post_process.
+                let p = state
+                    .model_config
+                    .resolve_product_qa()
+                    .expect("guard passed ⇒ chat_product_qa resolvable");
+                if let Err(e) = chat_repo
+                    .mark_user_message_product_qa(user_msg.user_message_id)
+                    .await
+                {
+                    tracing::warn!("stream: product_qa mark failed: {e}");
+                }
+
+                let mid = Ulid::new();
+                let message_id = ulid_string(mid);
+                let assistant_uuid: Uuid = mid.into();
+                yield ProtocolFrame::Meta {
+                    message_id: message_id.clone(),
+                    action_type: FrameActionType::ProductQa,
+                    model: None,
+                    continues_from: None,
+                };
+
+                // Executor payload: recent product-QA pairs (shared fetch) + question.
+                let question = match &input.event {
+                    eros_engine_core::types::Event::UserMessage { content, .. } => content.clone(),
+                    _ => String::new(),
+                };
+                let recent = product_qa_recent.as_deref().unwrap_or("");
+                let user_payload = if recent.is_empty() {
+                    format!("[用户提问]\n{question}")
+                } else {
+                    format!("[最近产品咨询]\n{recent}\n\n[用户提问]\n{question}")
+                };
+                let messages = vec![
+                    eros_engine_llm::openrouter::ChatMessage {
+                        role: "system".into(),
+                        content: p.answer_prompt.clone(),
+                    },
+                    eros_engine_llm::openrouter::ChatMessage {
+                        role: "user".into(),
+                        content: user_payload,
+                    },
+                ];
+
+                // Candidate chain walk + streaming — mirrors voice.rs:137-206.
+                let mut candidates = Vec::with_capacity(1 + p.fallback_model.len());
+                candidates.push(p.model.clone());
+                candidates.extend(p.fallback_model.iter().cloned());
+                let mut acc = String::new();
+                let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+                let mut last_gen_id: Option<String> = None;
+                let mut served_model: Option<String> = None;
+                let mut truncated = false;
+                'candidates: for model_id in candidates {
+                    last_usage = None;
+                    last_gen_id = None;
+                    served_model = None;
+                    truncated = false;
+                    let req = eros_engine_llm::openrouter::ChatRequest {
+                        model: model_id.clone(),
+                        messages: messages.clone(),
+                        temperature: p.temperature as f32,
+                        max_tokens: p.max_tokens,
+                        reasoning: p.reasoning.clone(),
+                        ..Default::default()
+                    };
+                    let stream = match state.openrouter.execute_stream(req).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(model = %model_id, error = %e, "product_qa: open stream failed");
+                            if acc.is_empty() { continue 'candidates; }
+                            truncated = true;
+                            break 'candidates;
+                        }
+                    };
+                    futures_util::pin_mut!(stream);
+                    loop {
+                        match futures_util::StreamExt::next(&mut stream).await {
+                            Some(Ok(chunk)) => {
+                                if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
+                                if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
+                                if chunk.model.is_some() { served_model = chunk.model.clone(); }
+                                if let Some(text) = chunk.content {
+                                    acc.push_str(&text);
+                                    yield ProtocolFrame::Delta {
+                                        message_id: message_id.clone(),
+                                        content: text,
+                                    };
+                                }
+                                if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(model = %model_id, error = %e, "product_qa: mid-stream error");
+                                if acc.is_empty() { continue 'candidates; }
+                                truncated = true;
+                                break 'candidates;
+                            }
+                            None => {
+                                if acc.is_empty() { continue 'candidates; }
+                                break 'candidates;
+                            }
+                        }
+                    }
+                }
+
+                // Chain exhausted with nothing streamed: error_handling fallback
+                // phrase, persisted WITH the channel marker so replay/idempotency
+                // hold (spec §4). Never degrade to the companion reply path — the
+                // companion doesn't know the product facts.
+                if acc.is_empty() {
+                    let phrase = ErrorHandlingRepo { pool: &state.pool }
+                        .pick_chat_stream_fallback_phrase()
+                        .await
+                        .ok()
+                        .flatten();
+                    match phrase {
+                        Some(text) => {
+                            acc = text.clone();
+                            truncated = false;
+                            // A final candidate can reach here having streamed
+                            // metadata (usage/model/generation_id) with zero
+                            // content — e.g. a terminal SSE chunk that reports
+                            // usage but no delta. That trio belongs to a call
+                            // that produced nothing; leaving it set would plant
+                            // a real generation_id/model/usage on a row whose
+                            // content is actually this canned phrase, poisoning
+                            // OpenRouter-log reconciliation (audit attribution
+                            // noise). Reset before persistence — this is the
+                            // ONLY branch reached with `acc` non-empty despite
+                            // no candidate having produced it.
+                            last_usage = None;
+                            last_gen_id = None;
+                            served_model = None;
+                            yield ProtocolFrame::Delta {
+                                message_id: message_id.clone(),
+                                content: text,
+                            };
+                        }
+                        None => {
+                            // No phrase configured: same terminal shape as the voice
+                            // path's all-candidates failure. (Parity note: like a
+                            // normal chat failure, retry of this client_msg_id will
+                            // 409 until a row exists.)
+                            yield ProtocolFrame::Error {
+                                code: StreamErrorCode::UpstreamUnavailable,
+                                retryable: true,
+                                message: "product_qa generation failed on all candidates".into(),
+                                user_message: "服务暂时不可用，请稍后再试".into(),
+                            };
+                            return;
+                        }
+                    }
+                }
+
+                let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                if let Err(e) = chat_repo
+                    .insert_product_qa_assistant_message(
+                        user_msg.session_id,
+                        user_msg.user_message_id,
+                        assistant_uuid,
+                        &acc,
+                        served_model.as_deref(),
+                        usage_full.as_ref(),
+                        last_gen_id.as_deref(),
+                        truncated,
+                    )
+                    .await
+                {
+                    tracing::warn!("stream: product_qa persist failed: {e}");
+                }
+                super::log_openrouter_usage(
+                    "chat_product_qa",
+                    Some(user_msg.session_id),
+                    &eros_engine_llm::openrouter::ChatResponse {
+                        reply: String::new(), // usage log only — never echo content
+                        generation_id: last_gen_id.clone(),
+                        model: served_model.clone(),
+                        usage: usage_full.clone(),
+                        finish_reason: None,
+                    },
+                );
+
+                let mut usage_wire = usage_full;
+                filter_usage_keys(&mut usage_wire, &state.config.openrouter_usage_hidden_keys);
+                yield ProtocolFrame::Done {
+                    message_id,
+                    truncated,
+                    usage: usage_wire,
+                    generation_id: last_gen_id,
                     ghost_fallback: false,
                 };
                 let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
@@ -3352,7 +3615,11 @@ pub fn replay_stream(
             for row in &rows {
                 let msg_ulid = Ulid::from(row.id);
                 let prev_ulid = row.continues_from_message_id.map(Ulid::from);
-                let action = FrameActionType::Reply;
+                let action = if row.channel.as_deref() == Some("product_qa") {
+                    FrameActionType::ProductQa
+                } else {
+                    FrameActionType::Reply
+                };
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
@@ -3400,8 +3667,18 @@ pub fn replay_stream(
             }
             // If every persisted assistant row was truncated, emit the same
             // terminal Error that the original burst emitted so the client
-            // knows retrying is appropriate.
-            if !rows.is_empty() && rows.iter().all(|r| r.truncated) {
+            // knows retrying is appropriate. This is companion multi-candidate
+            // chain semantics (every fallback model exhausted, all truncated).
+            // A product-QA turn persists exactly one assistant row, and a
+            // truncated product-QA answer is still a served answer — the live
+            // burst emits Meta → Delta → Done(truncated:true) → Final, no
+            // Error — so exclude product-QA chains from this rule (chains
+            // never mix companion and product_qa rows under one
+            // user_message_id).
+            let product_qa_chain = rows
+                .iter()
+                .any(|r| r.channel.as_deref() == Some("product_qa"));
+            if !rows.is_empty() && !product_qa_chain && rows.iter().all(|r| r.truncated) {
                 yield ProtocolFrame::Error {
                     code: StreamErrorCode::UpstreamUnavailable,
                     retryable: true,
@@ -3688,6 +3965,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_pde_verdict_product_qa_action() {
+        let v =
+            parse_pde_verdict(r#"{"action":"product_qa","inner_state":"想介绍"}"#).expect("parses");
+        assert_eq!(v.action, PdeAction::ProductQa);
+        assert_eq!(PdeAction::ProductQa.as_str(), "product_qa");
+    }
+
+    #[test]
     fn parse_pde_verdict_image_ref_and_aspect() {
         // defaults when omitted (backward compat)
         let v = parse_pde_verdict("{\"action\":\"reply_image\",\"inner_state\":\"ok\"}").unwrap();
@@ -3881,25 +4166,25 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false),
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false, false),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false),
             ActionType::ReplyText
         );
         // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
     }
@@ -3909,20 +4194,34 @@ mod tests {
         let aff = test_affinity();
         let sig = test_signals();
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, true),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false),
             ActionType::ReplyImage
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false),
             ActionType::ReplyTextImage
         );
         // executor unavailable → degrade (today's behaviour)
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn guard_product_qa_available_passes_unavailable_degrades() {
+        let a = pde_test_affinity();
+        let s = sigs(50, None);
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &s, false, true),
+            ActionType::ProductQa
+        );
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &s, false, false),
             ActionType::ReplyText
         );
     }
@@ -3951,7 +4250,13 @@ mod tests {
     #[test]
     fn ghost_then_killswitch_yields_reply_with_hints() {
         let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
-        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals, false);
+        let acted = guard_action(
+            PdeAction::Ghost,
+            &input.affinity,
+            &input.signals,
+            false,
+            false,
+        );
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
@@ -4092,6 +4397,7 @@ mod tests {
             })),
             generation_id: Some("gen-1".into()),
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: None,
         };
@@ -4147,6 +4453,7 @@ mod tests {
             usage: None,
             generation_id: Some("gen-x".into()),
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: Some(serde_json::json!({ "fallback_reason": reason })),
         };
@@ -4190,6 +4497,152 @@ mod tests {
         assert!(
             !done_flag(&pseudo),
             "pseudo-ghost row (non-empty, stream_failure) must replay as ghost_fallback:false"
+        );
+    }
+
+    /// A persisted row marked `channel = "product_qa"` must replay with
+    /// `Meta { action_type: FrameActionType::ProductQa }` — matching the live
+    /// burst's product-QA labeling — while a normal (channel-NULL) row
+    /// continues to replay as `FrameActionType::Reply`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_maps_product_qa_channel_to_meta_action_type(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+
+        let mk = |content: &str, channel: Option<&str>| eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("m/x".into()),
+            usage: None,
+            generation_id: Some("gen-x".into()),
+            assistant_action_type: Some("reply".into()),
+            channel: channel.map(String::from),
+            pre_filter_content: None,
+            metadata: None,
+        };
+
+        let rows = vec![
+            mk("product answer", Some("product_qa")),
+            mk("normal reply", None),
+        ];
+
+        let frames: Vec<ProtocolFrame> = replay_stream(state, session_id, user_id, false, rows)
+            .collect()
+            .await;
+
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "channel='product_qa' row must replay as Meta(action_type=product_qa); got {:?}",
+            frames[0]
+        );
+        // Each row with non-empty content emits Meta, Delta, Done (3 frames),
+        // so the second row's Meta lands at index 3.
+        assert!(
+            matches!(
+                &frames[3],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Reply,
+                    ..
+                }
+            ),
+            "channel=NULL row must replay as Meta(action_type=reply); got {:?}",
+            frames[3]
+        );
+    }
+
+    /// Codex P2: a product-QA turn persists exactly one assistant row, and a
+    /// truncated (finish_reason == "length") product-QA row is still a served
+    /// answer — the live burst emits Meta → Delta → Done(truncated:true) →
+    /// Final, no Error. The pre-existing "every persisted row truncated ⇒
+    /// Error(UpstreamUnavailable)" rule is companion multi-candidate-chain
+    /// semantics (all fallback models exhausted, truncated); it must not fire
+    /// for a single truncated product_qa row, or replay would diverge from
+    /// live by injecting a spurious terminal Error with no Final.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_product_qa_truncated_row_replays_answer_not_error(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+
+        let row = eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: "product answer, cut off mid-".into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: true,
+            model: Some("qa/exec".into()),
+            usage: None,
+            generation_id: Some("gen-qa".into()),
+            assistant_action_type: Some("product_qa".into()),
+            channel: Some("product_qa".into()),
+            pre_filter_content: None,
+            metadata: None,
+        };
+
+        let frames: Vec<ProtocolFrame> =
+            replay_stream(state, session_id, user_id, false, vec![row])
+                .collect()
+                .await;
+
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta(action_type=product_qa); got {:?}",
+            frames[0]
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Delta { content, .. } if content == "product answer, cut off mid-"
+            )),
+            "must replay the persisted content as a Delta; got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    truncated: true,
+                    ..
+                }
+            )),
+            "must replay Done(truncated:true); got {frames:?}"
+        );
+        assert!(
+            matches!(frames.last(), Some(ProtocolFrame::Final { .. })),
+            "terminal frame must be Final, not an Error; got {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "a truncated product_qa row is still a served answer — must not emit Error; got {frames:?}"
         );
     }
 
@@ -5348,6 +5801,7 @@ data: [DONE]\n\n";
             usage: None,
             generation_id: None,
             assistant_action_type: Some("reply".into()),
+            channel: None,
             pre_filter_content: None,
             metadata: None,
         };
@@ -7598,6 +8052,454 @@ data: [DONE]\n\n";
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_pde_judge_product_qa_routes_to_dedicated_executor(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `product_qa` verdict, empty inner_state.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Product-QA executor ("qa/exec"): streams the out-of-character answer.
+        let qa_body = "data: {\"choices\":[{\"delta\":{\"content\":\"这是产品说明\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8},\"id\":\"gen-qa\",\"model\":\"qa/exec\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(qa_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Companion chat ("deepseek/x"): MUST NOT be called — a product_qa verdict
+        // skips the entire companion chain. `.expect(0)` fails the test on any hit.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON (routes the judge) + chat_product_qa ON (routes the executor).
+        // Both need a non-blank filter_prompt to resolve to `Some`.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec\"\nfilter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品支持退货吗",
+                "01JPDEQA0000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品支持退货吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // frame order: meta(product_qa) → delta+ → done → final
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta{{action_type: ProductQa}}, got {frames:?}",
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "delta", "done", "final"],
+            "product_qa sequence, got {frames:?}"
+        );
+
+        // The companion chat mock's `.expect(0)` already proves the companion call
+        // never fired; belt-and-suspenders: only the judge + executor calls landed.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "exactly two upstream calls (judge + product_qa executor); got {} calls",
+            reqs.len(),
+        );
+
+        // rows: user row marked, assistant row marked + linked.
+        let user_ch: Option<String> =
+            sqlx::query_scalar("SELECT channel FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user_ch.as_deref(), Some("product_qa"));
+
+        let (a_ch, a_action): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT channel, assistant_action_type FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(a_ch.as_deref(), Some("product_qa"));
+        assert_eq!(a_action.as_deref(), Some("reply"));
+
+        // post_process did not run: no affinity event rows for this turn. The
+        // events table has no session_id column, so join through the affinity
+        // row (mirrors post_process.rs's own test query).
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "product_qa must skip post_process / affinity events");
+
+        // Decision audit recorded the action. The write is `tokio::spawn`ed
+        // fire-and-forget (see the ghost/reply tests above), so poll briefly
+        // for it to land rather than asserting immediately.
+        let mut decision_row: Option<(Option<String>, Option<String>)> = None;
+        for _ in 0..50 {
+            if let Ok(row) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT proposed_action, action FROM engine.companion_decision_events \
+                 WHERE message_id = $1",
+            )
+            .bind(user_message_id)
+            .fetch_one(&pool)
+            .await
+            {
+                decision_row = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (proposed, acted) =
+            decision_row.expect("companion_decision_events row must land within timeout");
+        assert_eq!(proposed.as_deref(), Some("product_qa"));
+        assert_eq!(acted.as_deref(), Some("product_qa"));
+    }
+
+    /// Spec §6 failure path: "executor exhausted → fallback text emitted AND
+    /// persisted with the channel marker." Both product_qa candidates fail to
+    /// produce usable content — the primary 500s outright, the fallback opens
+    /// a 200 stream but only ever emits a metadata chunk (usage/model/id) with
+    /// an EMPTY delta before `[DONE]`, mirroring a real OpenRouter completion
+    /// that reports usage without content. That second shape is deliberate:
+    /// it's exactly the "final candidate streamed metadata but zero content"
+    /// case the stale-audit-trio bug (Fix 2) was about — `last_usage`/
+    /// `last_gen_id`/`served_model` get set from that chunk even though `acc`
+    /// stays empty, so a naive persist would leak a real
+    /// generation_id/model/usage onto a row whose content is actually the
+    /// canned error_handling phrase. The fallback phrase itself is pinned to
+    /// a single deterministic entry (migration 0020 seeds 10 and picks at
+    /// random) so the test can assert on exact content.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_product_qa_executor_exhausted_persists_fallback_phrase(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const FALLBACK_PHRASE: &str = "稍后再答你";
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a `product_qa` verdict, empty inner_state — same
+        // routing setup as the happy-path E2E above.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Primary product-QA executor ("qa/exec-a"): hard failure, HTTP 500.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-a"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        // Fallback product-QA executor ("qa/exec-b"), last in the chain: opens
+        // fine (200) but the only SSE frame is metadata-only — usage/model/id
+        // set, `delta` empty — before `[DONE]`. `acc` stays empty ⇒ chain
+        // exhausted, but `last_usage`/`last_gen_id`/`served_model` are left
+        // holding real values from this candidate.
+        let exhausted_body = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0,\"total_tokens\":3},\"id\":\"gen-exhausted\",\"model\":\"qa/exec-b\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(exhausted_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Companion chat ("deepseek/x"): MUST NOT be called — product_qa never
+        // degrades to the companion chain, even on total executor failure.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"SHOULD_NOT_RUN\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // Pin the error_handling fallback phrase to a single deterministic
+        // entry (the seeded migration row has 10, picked at random) so the
+        // Delta content / row content assertions below are exact-match.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = $1 \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .bind(serde_json::json!([FALLBACK_PHRASE]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // PDE ON (routes the judge) + chat_product_qa ON (routes the executor)
+        // with a two-candidate chain (primary + one fallback), both of which
+        // must fail before the pseudo-ghost path fires.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品能用几年",
+                "01JPDEQAEXHAUSTED000000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品能用几年".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // frame order: meta(product_qa) → delta(phrase) → done → final.
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta{{action_type: ProductQa}}, got {frames:?}",
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            ["meta", "delta", "done", "final"],
+            "exhausted-chain product_qa sequence, got {frames:?}"
+        );
+
+        let delta_text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delta_text, FALLBACK_PHRASE,
+            "the Delta frame must carry the seeded error_handling phrase verbatim"
+        );
+
+        // Done frame: the audit trio must be None — no leaked generation_id/
+        // model/usage from the exhausted fallback candidate's metadata-only
+        // chunk (Fix 2).
+        let done = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done {
+                    usage,
+                    generation_id,
+                    ..
+                } => Some((usage.clone(), generation_id.clone())),
+                _ => None,
+            })
+            .expect("a Done frame");
+        assert_eq!(
+            done,
+            (None, None),
+            "Done frame must carry usage:None, generation_id:None on chain exhaustion, got {done:?}"
+        );
+
+        // Assistant row: channel marker + phrase content + null audit trio.
+        let (content, channel, model, usage, generation_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT content, channel, model, usage, generation_id FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, FALLBACK_PHRASE);
+        assert_eq!(channel.as_deref(), Some("product_qa"));
+        assert_eq!(
+            model, None,
+            "the fallback row must not carry the exhausted candidate's model"
+        );
+        assert_eq!(
+            usage, None,
+            "the fallback row must not carry the exhausted candidate's usage"
+        );
+        assert_eq!(
+            generation_id, None,
+            "the fallback row must not carry the exhausted candidate's generation_id"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_stream_pde_judge_reply_injects_reply_tone(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
@@ -8712,7 +9614,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true);
+        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
         assert!(
@@ -8764,7 +9666,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("", &input, false);
+        let ctx = build_pde_ctx("", &input, false, None);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -8779,6 +9681,24 @@ data: [DONE]\n\n";
             !ctx.contains("本轮可发图=是"),
             "no positive variant when unavailable: {ctx}"
         );
+    }
+
+    #[test]
+    fn pde_ctx_renders_product_qa_blocks_only_when_enabled() {
+        let input = pde_test_input();
+        // feature off → no lines at all
+        let off = build_pde_ctx("t", &input, true, None);
+        assert!(!off.contains("[产品咨询]"));
+        assert!(!off.contains("[最近产品咨询]"));
+        // on, no history → availability line only
+        let on_empty = build_pde_ctx("t", &input, true, Some(""));
+        assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
+        assert!(!on_empty.contains("[最近产品咨询]"));
+        // on, with history → both blocks, before [用户最新消息]
+        let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
+        let on_recent = build_pde_ctx("t", &input, true, Some(&recent));
+        assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
+        assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
 
     // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
@@ -8808,7 +9728,11 @@ data: [DONE]\n\n";
         let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(actions.len(), 4, "four actions: {v}");
+        assert_eq!(actions.len(), 5, "five actions: {v}");
+        assert!(
+            actions.iter().any(|x| x == "product_qa"),
+            "product_qa in action enum: {v}"
+        );
     }
 
     fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {

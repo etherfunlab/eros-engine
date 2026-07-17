@@ -244,6 +244,11 @@ async fn persist_affinity(
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
         }
+        ActionType::ProductQa => {
+            // product_qa turns never run post_process (the stream arm skips
+            // it); keep the match exhaustive without side effects.
+            tracing::warn!("persist_affinity called with ProductQa — ignoring");
+        }
         ActionType::ReplyText
         | ActionType::ReplyImage
         | ActionType::ReplyTextImage
@@ -254,6 +259,7 @@ async fn persist_affinity(
                     "message"
                 }
                 ActionType::Ghost => unreachable!(),
+                ActionType::ProductQa => unreachable!(),
             };
             if let Err(e) = repo
                 .persist_with_event(
@@ -548,6 +554,10 @@ fn eval_skip_reason(
         // Ghost takes the `record_ghost` path, which ignores `context` entirely —
         // this arm exists only for match exhaustiveness and is never persisted.
         ActionType::Ghost => Some("ghost"),
+        // product_qa turns never reach the affinity-eval gate — post_process's
+        // top-level match (persist_affinity) skips them before this helper is
+        // called. Exhaustiveness only.
+        ActionType::ProductQa => Some("product_qa"),
         // Image variants route through the same gate as ReplyText. For reply_image
         // the caller passes `image_prompt` as the assistant-content proxy so an
         // image-send still moves affinity (assistant_empty=false when prompt is set).
