@@ -859,6 +859,17 @@ impl ModelConfig {
         Ok(toml::from_str(text)?)
     }
 
+    /// Load a single-file config, logging the resolved path on success.
+    /// `from_toml_str` stays available for callers that already hold the text.
+    pub fn from_toml_file(path: &std::path::Path) -> Result<Self, LlmError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            LlmError::Config(format!("model_config read failed: {}: {e}", path.display()))
+        })?;
+        let cfg = Self::from_toml_str(&text)?;
+        tracing::info!(path = %path.display(), "model_config: loaded");
+        Ok(cfg)
+    }
+
     /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
     /// or fall back to `examples/model_config.toml` to match the
     /// `eros-engine-server` boot default. The server binary itself reads
@@ -3922,5 +3933,23 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             resolve_config_source(Some(String::new()), None).unwrap(),
             ConfigSource::File("examples/model_config.toml".to_string())
         );
+    }
+
+    fn write_cfg(dir: &std::path::Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn from_toml_file_reads_and_wraps_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "cfg.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        let cfg = ModelConfig::from_toml_file(&tmp.path().join("cfg.toml")).unwrap();
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+
+        // Missing file: error message carries the path.
+        let err = ModelConfig::from_toml_file(&tmp.path().join("nope.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.toml"), "{err}");
     }
 }
