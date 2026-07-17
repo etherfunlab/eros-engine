@@ -1160,6 +1160,13 @@
           "sent_at"
         ],
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation-flavor marker: `\"product_qa\"` = out-of-character product\nanswer (excluded from companion context). Omitted for normal turns."
+          },
           "client_msg_id": {
             "type": [
               "string",
@@ -1318,6 +1325,13 @@
           "extracted_facts"
         ],
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation-flavor marker: `\"product_qa\"` = out-of-character product\nanswer (excluded from companion context). Omitted for normal turns."
+          },
           "content": {
             "type": "string"
           },

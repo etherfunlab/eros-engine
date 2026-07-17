@@ -94,6 +94,10 @@ pub struct ChatMessageSlim {
     /// instead of parsing the `(打赏 $X)` content marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tips_amount_usd: Option<f64>,
+    /// Conversation-flavor marker: `"product_qa"` = out-of-character product
+    /// answer (excluded from companion context). NULL for normal turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 pub struct ChatRepo<'a> {
@@ -332,7 +336,8 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
-                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd \
+                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
+                    channel \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
@@ -1130,6 +1135,35 @@ mod tests {
         assert_eq!(
             page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_exposes_channel(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        repo.append_message(s.id, "user", "normal turn")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'answer', 'product_qa')",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let slim = repo.history_slim(s.id, 50, 0).await.unwrap();
+        assert_eq!(slim.len(), 2);
+        assert_eq!(slim[0].channel, None, "normal turn has no channel marker");
+        assert_eq!(
+            slim[1].channel.as_deref(),
+            Some("product_qa"),
+            "product_qa projection must surface the channel column"
         );
     }
 

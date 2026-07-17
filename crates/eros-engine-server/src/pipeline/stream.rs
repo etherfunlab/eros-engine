@@ -3600,7 +3600,11 @@ pub fn replay_stream(
             for row in &rows {
                 let msg_ulid = Ulid::from(row.id);
                 let prev_ulid = row.continues_from_message_id.map(Ulid::from);
-                let action = FrameActionType::Reply;
+                let action = if row.channel.as_deref() == Some("product_qa") {
+                    FrameActionType::ProductQa
+                } else {
+                    FrameActionType::Reply
+                };
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: action,
@@ -4468,6 +4472,73 @@ mod tests {
         assert!(
             !done_flag(&pseudo),
             "pseudo-ghost row (non-empty, stream_failure) must replay as ghost_fallback:false"
+        );
+    }
+
+    /// A persisted row marked `channel = "product_qa"` must replay with
+    /// `Meta { action_type: FrameActionType::ProductQa }` — matching the live
+    /// burst's product-QA labeling — while a normal (channel-NULL) row
+    /// continues to replay as `FrameActionType::Reply`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_maps_product_qa_channel_to_meta_action_type(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+
+        let mk = |content: &str, channel: Option<&str>| eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: content.into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: false,
+            model: Some("m/x".into()),
+            usage: None,
+            generation_id: Some("gen-x".into()),
+            assistant_action_type: Some("reply".into()),
+            channel: channel.map(String::from),
+            pre_filter_content: None,
+            metadata: None,
+        };
+
+        let rows = vec![
+            mk("product answer", Some("product_qa")),
+            mk("normal reply", None),
+        ];
+
+        let frames: Vec<ProtocolFrame> = replay_stream(state, session_id, user_id, false, rows)
+            .collect()
+            .await;
+
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "channel='product_qa' row must replay as Meta(action_type=product_qa); got {:?}",
+            frames[0]
+        );
+        // Each row with non-empty content emits Meta, Delta, Done (3 frames),
+        // so the second row's Meta lands at index 3.
+        assert!(
+            matches!(
+                &frames[3],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::Reply,
+                    ..
+                }
+            ),
+            "channel=NULL row must replay as Meta(action_type=reply); got {:?}",
+            frames[3]
         );
     }
 
