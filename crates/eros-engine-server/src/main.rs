@@ -301,7 +301,7 @@ async fn run_server() -> Result<()> {
     // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
     // LLM PDE off the action is unreachable — warn once and stay inert rather
     // than refusing to boot ("此功能不启用").
-    if model_config.resolve_product_qa().is_some() && model_config.resolve_pde().is_none() {
+    if model_config.product_qa_enabled() && !model_config.pde_enabled() {
         tracing::warn!(
             "model_config: [tasks.chat_product_qa] is configured but the LLM PDE \
              ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"

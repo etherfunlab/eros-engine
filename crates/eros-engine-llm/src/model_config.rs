@@ -1223,13 +1223,26 @@ impl ModelConfig {
             .is_some_and(|p| !p.trim().is_empty())
     }
 
+    /// Side-effect-free LLM-PDE availability check: true iff
+    /// `[tasks.pde_decision]` is present with a non-blank `filter_prompt`.
+    /// Mirrors `product_qa_enabled` — boot-time checks must not call
+    /// `resolve_pde()`, which advances the task's round-robin cursor.
+    pub fn pde_enabled(&self) -> bool {
+        self.tasks
+            .get("pde_decision")
+            .and_then(|t| t.filter_prompt.as_deref())
+            .is_some_and(|p| !p.trim().is_empty())
+    }
+
     /// Boot-time validation for the product-QA task: a present section must
     /// carry a usable `filter_prompt` (else `Err`); an absent section means the
     /// feature is simply off (`Ok`). Same contract as
-    /// `validate_extraction_prompts`.
+    /// `validate_extraction_prompts`. Side-effect-free: built on
+    /// `product_qa_enabled()`, never calls `resolve_product_qa()`, so booting
+    /// (even repeatedly) advances no round-robin/weighted model cursor.
     pub fn validate_product_qa_prompt(&self) -> Result<(), String> {
         const PRODUCT_QA_TASK: &str = "chat_product_qa";
-        if self.tasks.contains_key(PRODUCT_QA_TASK) && self.resolve_product_qa().is_none() {
+        if self.tasks.contains_key(PRODUCT_QA_TASK) && !self.product_qa_enabled() {
             return Err(format!(
                 "[tasks.{PRODUCT_QA_TASK}] is present but its filter_prompt is unset — eros-engine \
                  refuses to boot. Set a filter_prompt (product docs + answering rules), or remove \
@@ -3379,6 +3392,46 @@ filter_prompt = "只根据产品资料作答。"
         // pick — proving enabled() advanced nothing.
         let p = cfg.resolve_product_qa().expect("resolves");
         assert_eq!(p.model, "model-a");
+    }
+
+    #[test]
+    fn validate_product_qa_prompt_advances_no_round_robin_cursor() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = ["model-a", "model-b"]
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Call the boot-time validator several times — it must not resolve
+        // (and therefore not advance) the round-robin cursor.
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        // The first real resolve() must still land on the first round-robin
+        // pick — proving validation drew nothing.
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "model-a");
+    }
+
+    #[test]
+    fn pde_enabled_truth_table() {
+        // absent → false
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(!cfg.pde_enabled());
+        // present, blank filter_prompt → false
+        let cfg = ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\n").unwrap();
+        assert!(!cfg.pde_enabled());
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(!cfg.pde_enabled());
+        // present, non-blank filter_prompt → true
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"decide\"\n",
+        )
+        .unwrap();
+        assert!(cfg.pde_enabled());
     }
 
     #[test]
