@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.8.1"
+    "version": "0.8.2"
   },
   "servers": [
     {
@@ -557,7 +557,7 @@
         },
         "responses": {
           "200": {
-            "description": "SSE event stream (text/event-stream). The `meta` frame's `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image`. Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no `reply_text` on the wire), while the text+image variant keeps its full `reply_text_image` name.",
+            "description": "SSE event stream (text/event-stream). The `meta` frame's `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`. Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no `reply_text` on the wire), while the text+image variant keeps its full `reply_text_image` name. `product_qa` marks an out-of-character product answer (excluded from companion context; also reported on replay). Clients must tolerate unknown `action_type` values.",
             "content": {
               "text/event-stream": {}
             }
@@ -1160,6 +1160,13 @@
           "sent_at"
         ],
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation-flavor marker: `\"product_qa\"` = out-of-character product\nanswer (excluded from companion context). Omitted for normal turns."
+          },
           "client_msg_id": {
             "type": [
               "string",
@@ -1318,6 +1325,13 @@
           "extracted_facts"
         ],
         "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation-flavor marker: `\"product_qa\"` = out-of-character product\nanswer (excluded from companion context). Omitted for normal turns."
+          },
           "content": {
             "type": "string"
           },

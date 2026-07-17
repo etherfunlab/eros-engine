@@ -85,7 +85,7 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 
 帧字段说明：
 
-- **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。
+- **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后，可能省略）、`generation_id`（可选的 OpenRouter id）。
 - **`final`** —— 本轮汇总：`lead_score`、`should_show_cta`、`agent_training_level`，外加 `filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。
 
@@ -291,6 +291,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - 纯图片：`meta(reply_image) → done → image_request → final`
 - 图文：`meta(reply_text_image) → delta* → done → image_request → final`
 - `ghost`：`meta(action_type=ghost) → done → final` — 无 `delta`，`meta` 中无 `model`，`done` 的 `usage` 和 `generation_id` 均为 `null`。该轮伴侣保持沉默，未调用任何 LLM。
+- `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
 聊天流不会发送 `image_pending`/`image_attempt`/`image`/`image_failed` 中的任何一帧，也不持久化绘图结果——整体失败的处理归消费方（见下方绘图端点，它才会发出该序列）。
 
@@ -331,13 +332,16 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 {
   "messages": [
     { "id": "…", "role": "assistant", "content": "Bishop。", "sent_at": "…" },
-    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…" }
+    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…" },
+    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
   ]
 }
 ```
 
 `role` ∈ `user | assistant | gift_user | system_error`。`gift_user` 是打赏轮
-（通过上面 stream 路由的 `tips_amount_usd` 发起）。
+（通过上面 stream 路由的 `tips_amount_usd` 发起）。每条记录还带一个可选的
+`channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
+外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。
 
 ## 用戶畫像
 
@@ -469,7 +473,9 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 
 給聊天屏用的精簡歷史投影：`id` / `client_msg_id` / `role` / `content` /
 `sent_at`（不含 `extracted_facts`），打赏行另带 `tips_amount_usd`（仅在
-`role = gift_user` 时出现，否则省略）。`id` 是 `chat_messages` 行的主鍵（UUID）；
+`role = gift_user` 时出现，否则省略），以及可选的 `channel` 字段——
+`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之外）；普通轮次
+省略该字段。`id` 是 `chat_messages` 行的主鍵（UUID）；
 `client_msg_id` 是前端串流時帶上的 id（沒帶的行為 `null`，例如 assistant 回合）。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
@@ -480,9 +486,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   "session_id": "…",
   "messages": [
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" }
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
+    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" }
   ],
-  "total": 2
+  "total": 3
 }
 ```
 

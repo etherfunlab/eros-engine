@@ -768,6 +768,22 @@ pub struct ResolvedPde {
     pub structured_output: bool,
 }
 
+/// Resolved product-QA executor task (`chat_product_qa`). Mirrors
+/// `ResolvedVision`: the configured `filter_prompt` (product docs + answering
+/// rules) is the executor's system instruction; the engine builds the user
+/// payload (recent product-QA pairs + the current question). `fallback_model`
+/// is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedProductQa {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub answer_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+}
+
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
 /// The configured `filter_prompt` is the system instruction; the server assembles
 /// the conversation as a separate user message. Model selection mirrors the generic
@@ -808,22 +824,173 @@ impl TaskConfig {
     }
 }
 
+/// Where the model config comes from, resolved from the two env vars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Single TOML file (`MODEL_CONFIG_PATH`, or the compiled-in default).
+    File(String),
+    /// Directory of `.toml` fragments (`MODEL_CONFIG_DIR`), merged at load.
+    Dir(String),
+}
+
+/// Pure resolution of the `MODEL_CONFIG_PATH` / `MODEL_CONFIG_DIR` values —
+/// the caller reads the env so this stays unit-testable. Empty strings count
+/// as unset (a dotenv `VAR=` line is not an opt-in). Both set is a hard
+/// error: no silent precedence between the two mechanisms.
+pub fn resolve_config_source(
+    path: Option<String>,
+    dir: Option<String>,
+) -> Result<ConfigSource, LlmError> {
+    let path = path.filter(|s| !s.is_empty());
+    let dir = dir.filter(|s| !s.is_empty());
+    match (path, dir) {
+        (Some(_), Some(_)) => Err(LlmError::Config(
+            "MODEL_CONFIG_PATH and MODEL_CONFIG_DIR are mutually exclusive; set only one"
+                .to_string(),
+        )),
+        (None, Some(d)) => Ok(ConfigSource::Dir(d)),
+        (Some(p), None) => Ok(ConfigSource::File(p)),
+        (None, None) => Ok(ConfigSource::File("examples/model_config.toml".to_string())),
+    }
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
     }
 
-    /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml` to match the
-    /// `eros-engine-server` boot default. The server binary itself reads
-    /// the file inline via `from_toml_str` rather than calling this; this
-    /// method is provided for embedders who want the same behaviour in
-    /// one call.
+    /// Load a single-file config, logging the resolved path on success.
+    /// `from_toml_str` stays available for callers that already hold the text.
+    pub fn from_toml_file(path: &std::path::Path) -> Result<Self, LlmError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            LlmError::Config(format!("model_config read failed: {}: {e}", path.display()))
+        })?;
+        let cfg = Self::from_toml_str(&text).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config parse failed: {}: {e}",
+                path.display()
+            ))
+        })?;
+        tracing::info!(path = %path.display(), "model_config: loaded");
+        Ok(cfg)
+    }
+
+    /// Directory mode (`MODEL_CONFIG_DIR`): merge every top-level `*.toml` in
+    /// `dir` into one config. Selection: regular files at the top level only,
+    /// dotfiles skipped, filename byte order (duplicates are errors, so order
+    /// never changes the result — it only makes error messages deterministic).
+    /// Split-by-section semantics: each `tasks.<name>` and every other top-level
+    /// key must come from exactly one file; duplicates fail the load naming both
+    /// files.
+    pub fn from_toml_dir(dir: &std::path::Path) -> Result<Self, LlmError> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config dir read failed: {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                LlmError::Config(format!(
+                    "model_config dir read failed: {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !path.is_file() || name.starts_with('.') || !name.ends_with(".toml") {
+                continue;
+            }
+            files.push(path);
+        }
+        files.sort();
+        if files.is_empty() {
+            return Err(LlmError::Config(format!(
+                "model_config dir contains no .toml files: {}",
+                dir.display()
+            )));
+        }
+
+        let mut merged = toml::Table::new();
+        let mut file_names: Vec<String> = Vec::new();
+        // Which file first defined each top-level key (or `tasks.<name>`) — so
+        // duplicate-definition errors can name both files.
+        let mut owners: HashMap<String, String> = HashMap::new();
+        for file in &files {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string());
+            let text = std::fs::read_to_string(file).map_err(|e| {
+                LlmError::Config(format!("model_config read failed: {}: {e}", file.display()))
+            })?;
+            let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+                LlmError::Config(format!("model_config parse failed: {file_name}: {e}"))
+            })?;
+            for (key, value) in table {
+                if key == "tasks" {
+                    let toml::Value::Table(tasks) = value else {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: `tasks` in {file_name} is not a table"
+                        )));
+                    };
+                    let merged_tasks = merged
+                        .entry("tasks")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .expect("`tasks` is only ever inserted as a table");
+                    for (task_name, task_value) in tasks {
+                        let owner_key = format!("tasks.{task_name}");
+                        if let Some(prev) = owners.get(&owner_key) {
+                            return Err(LlmError::Config(format!(
+                                "model_config merge failed: [tasks.{task_name}] in {file_name} already defined in {prev}"
+                            )));
+                        }
+                        owners.insert(owner_key, file_name.clone());
+                        merged_tasks.insert(task_name, task_value);
+                    }
+                } else {
+                    if let Some(prev) = owners.get(&key) {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: [{key}] in {file_name} already defined in {prev}"
+                        )));
+                    }
+                    owners.insert(key.clone(), file_name.clone());
+                    merged.insert(key, value);
+                }
+            }
+            file_names.push(file_name);
+        }
+
+        let cfg: Self = merged.try_into().map_err(|e: toml::de::Error| {
+            LlmError::Config(format!("model_config deserialize failed after merge: {e}"))
+        })?;
+        tracing::info!(
+            dir = %dir.display(),
+            files = ?file_names,
+            count = file_names.len(),
+            "model_config: loaded from dir"
+        );
+        Ok(cfg)
+    }
+
+    /// Library-side convenience: resolve `MODEL_CONFIG_PATH` /
+    /// `MODEL_CONFIG_DIR` (mutually exclusive; neither set falls back to
+    /// `examples/model_config.toml` to match the `eros-engine-server` boot
+    /// default) and load. The server binary does the same resolution in
+    /// `main.rs` via `resolve_config_source`, so embedders and the server
+    /// stay behaviour-identical.
     pub fn load() -> Result<Arc<Self>, LlmError> {
-        let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
-        let text = std::fs::read_to_string(&path)?;
-        let cfg = Self::from_toml_str(&text)?;
+        let source = resolve_config_source(
+            std::env::var("MODEL_CONFIG_PATH").ok(),
+            std::env::var("MODEL_CONFIG_DIR").ok(),
+        )?;
+        let cfg = match &source {
+            ConfigSource::File(p) => Self::from_toml_file(std::path::Path::new(p))?,
+            ConfigSource::Dir(d) => Self::from_toml_dir(std::path::Path::new(d))?,
+        };
         Ok(Arc::new(cfg))
     }
 
@@ -1165,6 +1332,75 @@ impl ModelConfig {
             reasoning: task_cfg.reasoning.clone(),
             structured_output: task_cfg.structured_output.unwrap_or(true),
         })
+    }
+
+    /// Resolve the product-QA executor task. `None` (feature off) when
+    /// `[tasks.chat_product_qa]` is absent OR its `filter_prompt` is blank.
+    /// Task-level only (no tier override), like `chat_vision` / `pde_decision`.
+    /// NOTE: `None`-when-blank is what `validate_product_qa_prompt` turns into
+    /// a boot refusal — a present-but-blank section must never silently no-op.
+    pub fn resolve_product_qa(&self) -> Option<ResolvedProductQa> {
+        const PRODUCT_QA_TASK: &str = "chat_product_qa";
+        let task_cfg = self.tasks.get(PRODUCT_QA_TASK)?;
+        let answer_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if answer_prompt.trim().is_empty() {
+            return None;
+        }
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(PRODUCT_QA_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedProductQa {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            answer_prompt,
+            retry_depth,
+            reasoning: task_cfg.reasoning.clone(),
+        })
+    }
+
+    /// Side-effect-free availability check for the product-QA task: true iff
+    /// `[tasks.chat_product_qa]` is present with a non-blank `filter_prompt`.
+    /// The judge/guard wiring runs this every turn — unlike
+    /// `resolve_product_qa()` it never touches `resolve()`, so it advances no
+    /// round-robin cursor. Resolve the executor only when the action is
+    /// actually taken (the ProductQa arm).
+    pub fn product_qa_enabled(&self) -> bool {
+        self.tasks
+            .get("chat_product_qa")
+            .and_then(|t| t.filter_prompt.as_deref())
+            .is_some_and(|p| !p.trim().is_empty())
+    }
+
+    /// Side-effect-free LLM-PDE availability check: true iff
+    /// `[tasks.pde_decision]` is present with a non-blank `filter_prompt`.
+    /// Mirrors `product_qa_enabled` — boot-time checks must not call
+    /// `resolve_pde()`, which advances the task's round-robin cursor.
+    pub fn pde_enabled(&self) -> bool {
+        self.tasks
+            .get("pde_decision")
+            .and_then(|t| t.filter_prompt.as_deref())
+            .is_some_and(|p| !p.trim().is_empty())
+    }
+
+    /// Boot-time validation for the product-QA task: a present section must
+    /// carry a usable `filter_prompt` (else `Err`); an absent section means the
+    /// feature is simply off (`Ok`). Same contract as
+    /// `validate_extraction_prompts`. Side-effect-free: built on
+    /// `product_qa_enabled()`, never calls `resolve_product_qa()`, so booting
+    /// (even repeatedly) advances no round-robin/weighted model cursor.
+    pub fn validate_product_qa_prompt(&self) -> Result<(), String> {
+        const PRODUCT_QA_TASK: &str = "chat_product_qa";
+        if self.tasks.contains_key(PRODUCT_QA_TASK) && !self.product_qa_enabled() {
+            return Err(format!(
+                "[tasks.{PRODUCT_QA_TASK}] is present but its filter_prompt is unset — eros-engine \
+                 refuses to boot. Set a filter_prompt (product docs + answering rules), or remove \
+                 the [tasks.{PRODUCT_QA_TASK}] section to disable product_qa."
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the image-generation task. `None` (feature off) when
@@ -1665,6 +1901,14 @@ temperature  = 0.3
 max_tokens   = 400
 filter_prompt = "Rewrite per policy."
 reasoning    = { enabled = false }
+
+[tasks.chat_product_qa]
+model        = "x-ai/grok-4-mini"
+fallback     = "deepseek/deepseek-chat-v3.2"
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 800
+filter_prompt = "Answer product questions from the docs."
 "#;
 
     #[test]
@@ -1747,6 +1991,19 @@ reasoning    = { enabled = false }
         assert_eq!(pde.ghosting, Some(false));
         assert!(cfg.resolve_pde().is_some());
         assert!(!cfg.pde_ghosting_enabled());
+
+        // chat_product_qa — executor for the PDE product_qa action.
+        let pq = cfg.tasks.get("chat_product_qa").unwrap();
+        assert_eq!(pq.model.as_fixed(), Some("x-ai/grok-4-mini"));
+        assert_eq!(pq.retry_depth, Some(1));
+        assert_eq!(
+            pq.filter_prompt.as_deref(),
+            Some("Answer product questions from the docs.")
+        );
+        let rpq = cfg
+            .resolve_product_qa()
+            .expect("fixture product_qa resolves");
+        assert_eq!(rpq.answer_prompt, "Answer product questions from the docs.");
 
         // embedding — reserved, with `dimensions` set.
         let emb = cfg.tasks.get("embedding").unwrap();
@@ -3201,6 +3458,134 @@ filter_prompt = "   "
     }
 
     #[test]
+    fn resolve_product_qa_absent_is_none() {
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(cfg.resolve_product_qa().is_none());
+        assert!(cfg.validate_product_qa_prompt().is_ok()); // absent = feature off, boots fine
+    }
+
+    #[test]
+    fn resolve_product_qa_blank_prompt_is_none_and_fails_validation() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = "x-ai/grok-4-mini"
+temperature = 0.3
+max_tokens = 800
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.resolve_product_qa().is_none());
+        let err = cfg.validate_product_qa_prompt().unwrap_err();
+        assert!(err.contains("chat_product_qa"));
+        assert!(err.contains("refuses to boot"));
+    }
+
+    #[test]
+    fn resolve_product_qa_resolves_full_shape() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model        = "x-ai/grok-4-mini"
+fallback     = ["deepseek/deepseek-chat-v3.2", "b", "c"]
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 800
+reasoning    = { enabled = false }
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "x-ai/grok-4-mini");
+        assert_eq!(
+            p.fallback_model,
+            vec!["deepseek/deepseek-chat-v3.2".to_string()]
+        ); // truncated to retry_depth=1
+        assert_eq!(p.answer_prompt, "只根据产品资料作答。");
+        assert_eq!(p.max_tokens, 800);
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+    }
+
+    #[test]
+    fn product_qa_enabled_truth_table() {
+        // absent → false
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(!cfg.product_qa_enabled());
+        // present, blank filter_prompt → false
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\n")
+                .unwrap();
+        assert!(!cfg.product_qa_enabled());
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(!cfg.product_qa_enabled());
+        // present, non-blank filter_prompt → true
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\nfilter_prompt = \"只根据产品资料作答。\"\n",
+        )
+        .unwrap();
+        assert!(cfg.product_qa_enabled());
+    }
+
+    #[test]
+    fn product_qa_enabled_advances_no_round_robin_cursor() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = ["model-a", "model-b"]
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Call the side-effect-free check several times — the round-robin
+        // cursor must not move.
+        assert!(cfg.product_qa_enabled());
+        assert!(cfg.product_qa_enabled());
+        assert!(cfg.product_qa_enabled());
+        // The first real resolve() must still land on the first round-robin
+        // pick — proving enabled() advanced nothing.
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "model-a");
+    }
+
+    #[test]
+    fn validate_product_qa_prompt_advances_no_round_robin_cursor() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = ["model-a", "model-b"]
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Call the boot-time validator several times — it must not resolve
+        // (and therefore not advance) the round-robin cursor.
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        assert!(cfg.validate_product_qa_prompt().is_ok());
+        // The first real resolve() must still land on the first round-robin
+        // pick — proving validation drew nothing.
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "model-a");
+    }
+
+    #[test]
+    fn pde_enabled_truth_table() {
+        // absent → false
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(!cfg.pde_enabled());
+        // present, blank filter_prompt → false
+        let cfg = ModelConfig::from_toml_str("[tasks.pde_decision]\nmodel = \"m\"\n").unwrap();
+        assert!(!cfg.pde_enabled());
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(!cfg.pde_enabled());
+        // present, non-blank filter_prompt → true
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"decide\"\n",
+        )
+        .unwrap();
+        assert!(cfg.pde_enabled());
+    }
+
+    #[test]
     fn pde_ghosting_enabled_default_true_else_field() {
         // task missing → true
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
@@ -3621,5 +4006,188 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.compose_prompt, "compose it");
         assert_eq!(r.retry_depth, 1);
         assert_eq!(r.fallback_model.len(), 1);
+    }
+
+    #[test]
+    fn resolve_config_source_combinations() {
+        // Neither set → compiled-in default single file.
+        assert_eq!(
+            resolve_config_source(None, None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
+        // Path only.
+        assert_eq!(
+            resolve_config_source(Some("my.toml".to_string()), None).unwrap(),
+            ConfigSource::File("my.toml".to_string())
+        );
+        // Dir only.
+        assert_eq!(
+            resolve_config_source(None, Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        // Both set → hard error mentioning both var names.
+        let err = resolve_config_source(Some("my.toml".to_string()), Some("conf.d".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(
+            err.contains("MODEL_CONFIG_PATH") && err.contains("MODEL_CONFIG_DIR"),
+            "{err}"
+        );
+        // Empty string counts as unset (dotenv `VAR=` lines must not trip the exclusion).
+        assert_eq!(
+            resolve_config_source(Some(String::new()), Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        assert_eq!(
+            resolve_config_source(Some(String::new()), None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
+    }
+
+    fn write_cfg(dir: &std::path::Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn from_toml_file_reads_and_wraps_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "cfg.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        let cfg = ModelConfig::from_toml_file(&tmp.path().join("cfg.toml")).unwrap();
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+
+        // Missing file: error message carries the path.
+        let err = ModelConfig::from_toml_file(&tmp.path().join("nope.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.toml"), "{err}");
+
+        // Malformed TOML: error names the file and says parse failed.
+        write_cfg(tmp.path(), "broken.toml", "[tasks.a\nmodel = \n");
+        let err = ModelConfig::from_toml_file(&tmp.path().join("broken.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
+        assert!(err.contains("parse failed"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_split_load_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "defaults.toml",
+            "[defaults]\nfallback_model = \"p/fall\"\nfallback_temperature = 0.4\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "chat.toml",
+            "[tasks.chat_companion]\nmodel = \"p/chat\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "extraction.toml",
+            "[tasks.memory_extraction]\nmodel = \"p/extract\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.defaults.fallback_model.as_deref(), Some("p/fall"));
+        assert_eq!(cfg.defaults.fallback_temperature, Some(0.4));
+        assert_eq!(cfg.tasks.len(), 2);
+        assert!(matches!(&cfg.tasks["chat_companion"].model, ModelSpec::Fixed(m) if m == "p/chat"));
+        assert!(
+            matches!(&cfg.tasks["memory_extraction"].model, ModelSpec::Fixed(m) if m == "p/extract")
+        );
+    }
+
+    #[test]
+    fn from_toml_dir_ignores_dotfiles_subdirs_and_non_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "base.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        // All of these define a conflicting tasks.a — they must be skipped, not merged.
+        write_cfg(tmp.path(), ".hidden.toml", "[tasks.a]\nmodel = \"p/dot\"\n");
+        write_cfg(tmp.path(), "notes.txt", "[tasks.a]\nmodel = \"p/txt\"\n");
+        std::fs::create_dir(tmp.path().join("sub.toml")).unwrap(); // directory named *.toml
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        write_cfg(
+            &tmp.path().join("nested"),
+            "extra.toml",
+            "[tasks.a]\nmodel = \"p/nested\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.tasks.len(), 1);
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+    }
+
+    #[test]
+    fn from_toml_dir_empty_missing_or_no_toml_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty directory.
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Non-toml content only.
+        write_cfg(tmp.path(), "readme.md", "# not config");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Directory does not exist.
+        let err = ModelConfig::from_toml_dir(&tmp.path().join("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dir read failed"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_task_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[tasks.chat_companion]\nmodel = \"p/one\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[tasks.chat_companion]\nmodel = \"p/two\"\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tasks.chat_companion]"), "{err}");
+        assert!(err.contains("a.toml"), "{err}");
+        assert!(err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_defaults_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[defaults]\nfallback_temperature = 0.1\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[defaults]\nfallback_temperature = 0.2\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[defaults]"), "{err}");
+        assert!(err.contains("a.toml") && err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_syntax_error_names_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "good.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        write_cfg(tmp.path(), "broken.toml", "[tasks.b\nmodel = \n");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
     }
 }

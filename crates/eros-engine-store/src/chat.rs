@@ -57,6 +57,11 @@ pub struct ChatMessage {
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
+    /// Conversation-flavor marker (migrations 0030/0034): NULL = normal text
+    /// turn; 'voice' = voice channel; 'product_qa' = out-of-character product
+    /// answer (excluded from companion context).
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Input-filter rewrite of a `role='user'` row: the model-facing effective
     /// text when the user's original was rewritten (NULL otherwise). On
     /// assistant rows this column holds the OPPOSITE direction (the
@@ -89,6 +94,10 @@ pub struct ChatMessageSlim {
     /// instead of parsing the `(打赏 $X)` content marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tips_amount_usd: Option<f64>,
+    /// Conversation-flavor marker: `"product_qa"` = out-of-character product
+    /// answer (excluded from companion context). NULL for normal turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 pub struct ChatRepo<'a> {
@@ -327,7 +336,8 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<Vec<ChatMessageSlim>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
-                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd \
+                    (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
+                    channel \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
@@ -359,6 +369,7 @@ impl<'a> ChatRepo<'a> {
     /// chronologically. Pairs are formed by walking the most-recent rows
     /// chronologically: a `user` or `gift_user` row immediately followed by an
     /// `assistant` row produces one pair; orphan rows are dropped.
+    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
     /// Used by the chat pipeline to inject the `[recent_conversation]` short-
     /// term memory block into the system prompt. Uses the existing
@@ -381,6 +392,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < $2 \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role IN ('user', 'gift_user', 'assistant') \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -422,6 +434,7 @@ impl<'a> ChatRepo<'a> {
     /// timestamp. Looking up the cutoff via subquery avoids a race with
     /// concurrent streams that could insert a row between wall-clock-now and
     /// the read of recent rows.
+    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
     /// Equivalent to `recent_turn_pairs(session_id, msg.sent_at, limit)` but
     /// in a single round-trip. If `message_id` doesn't exist in the session
@@ -440,6 +453,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role IN ('user', 'gift_user', 'assistant') \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -474,13 +488,64 @@ impl<'a> ChatRepo<'a> {
         Ok(pairs)
     }
 
+    /// Up to `limit` recent (question, answer) pairs on the product-QA channel,
+    /// strictly before `message_id`'s sent_at, chronological. Mirrors
+    /// `recent_turn_pairs_before_message` but scoped to `channel='product_qa'`
+    /// rows (both sides of a product-QA exchange carry the marker). Feeds the
+    /// judge's `[最近产品咨询]` block and the executor's follow-up context.
+    pub async fn recent_product_qa_pairs(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+        limit: u8,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let fetch_n: i64 = (limit as i64) * 2 + 2;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 \
+               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
+               AND truncated = FALSE \
+               AND channel = 'product_qa' \
+               AND role IN ('user', 'assistant') \
+             ORDER BY sent_at DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .bind(fetch_n)
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut chrono = rows;
+        chrono.reverse();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < chrono.len() {
+            let (role_a, content_a) = &chrono[i];
+            let (role_b, content_b) = &chrono[i + 1];
+            if role_a == "user" && role_b == "assistant" {
+                pairs.push((content_a.clone(), content_b.clone()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let want = limit as usize;
+        if pairs.len() > want {
+            let drop = pairs.len() - want;
+            pairs.drain(..drop);
+        }
+        Ok(pairs)
+    }
+
     /// Up to `limit` recent assistant `content` rows for the session, with
     /// `truncated = FALSE`, strictly before the current turn's user row
     /// (`before_message_id`). Returned newest-first. The cutoff is resolved
     /// via subquery on the message id — same race-safety as
     /// `recent_turn_pairs_before_message` (a concurrent stream can't leak a
-    /// "future" row into this turn). Used by the chat pipeline to mine
-    /// over-used reply openings for the `[avoid_repetition]` block.
+    /// "future" row into this turn). Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
+    /// Used by the chat pipeline to mine over-used reply openings for the `[avoid_repetition]` block.
     pub async fn recent_assistant_contents(
         &self,
         session_id: Uuid,
@@ -493,6 +558,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role = 'assistant' \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -659,6 +725,24 @@ impl<'a> ChatRepo<'a> {
         sqlx::query(
             "UPDATE engine.chat_messages SET ghost_decision = true \
              WHERE id = $1 AND role = 'user' AND ghost_decision = false",
+        )
+        .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp the current turn's user row as a product-QA question
+    /// (`channel = 'product_qa'`). Idempotent — re-marking is a no-op. Only an
+    /// unmarked (`channel IS NULL`) text row is eligible; voice rows can never
+    /// reach the PDE, so the guard is belt-and-suspenders.
+    pub async fn mark_user_message_product_qa(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET channel = 'product_qa' \
+             WHERE id = $1 AND role = 'user' AND channel IS NULL",
         )
         .bind(user_message_id)
         .execute(self.pool)
@@ -924,6 +1008,42 @@ impl<'a> ChatRepo<'a> {
         .await?;
         Ok(())
     }
+
+    /// Persist an out-of-character product answer: `role='assistant'`,
+    /// `assistant_action_type='reply'`, `channel='product_qa'`. No filter
+    /// audit, no continues_from — product answers are single, whole messages.
+    /// The channel marker keeps the row out of companion context while replay
+    /// and client history serve it normally.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_product_qa_assistant_message(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        id: Uuid,
+        content: &str,
+        model: Option<&str>,
+        usage: Option<&serde_json::Value>,
+        generation_id: Option<&str>,
+        truncated: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+              generation_id, assistant_action_type, channel) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'product_qa')",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(user_message_id)
+        .bind(truncated)
+        .bind(model)
+        .bind(usage)
+        .bind(generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1015,6 +1135,35 @@ mod tests {
         assert_eq!(
             page.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn history_slim_exposes_channel(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let s = repo.create_session(user_id, instance_id).await.unwrap();
+
+        repo.append_message(s.id, "user", "normal turn")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'answer', 'product_qa')",
+        )
+        .bind(s.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let slim = repo.history_slim(s.id, 50, 0).await.unwrap();
+        assert_eq!(slim.len(), 2);
+        assert_eq!(slim[0].channel, None, "normal turn has no channel marker");
+        assert_eq!(
+            slim[1].channel.as_deref(),
+            Some("product_qa"),
+            "product_qa projection must surface the channel column"
         );
     }
 
@@ -2902,6 +3051,45 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn channel_check_accepts_product_qa_and_rejects_unknown(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // product_qa accepted
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'answer', 'product_qa')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("product_qa channel accepted");
+
+        // unknown channel rejected by the named CHECK
+        let err = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'x', 'bogus')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect_err("bogus channel rejected");
+        assert!(err.to_string().contains("chat_messages_channel_check"));
+
+        // ChatMessage projection surfaces the column
+        let rows = repo.history(session_id, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel.as_deref(), Some("product_qa"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn sessions_are_channel_scoped(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let (user_id, instance_id) = (Uuid::new_v4(), Uuid::new_v4());
@@ -2935,5 +3123,202 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed_voice.id, voice.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_user_message_product_qa_stamps_channel_idempotently(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '介绍下这个产品') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        repo.mark_user_message_product_qa(user_id).await.unwrap();
+        repo.mark_user_message_product_qa(user_id).await.unwrap(); // re-mark = no-op
+
+        let ch: Option<String> =
+            sqlx::query_scalar("SELECT channel FROM engine.chat_messages WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ch.as_deref(), Some("product_qa"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_product_qa_assistant_message_round_trips(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'q') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let aid = Uuid::new_v4();
+        let usage = serde_json::json!({"total_tokens": 42});
+        repo.insert_product_qa_assistant_message(
+            session_id,
+            user_id,
+            aid,
+            "产品介绍……",
+            Some("anthropic/claude-haiku-4.5"),
+            Some(&usage),
+            Some("gen_pq_1"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let row: ChatMessage = sqlx::query_as("SELECT * FROM engine.chat_messages WHERE id = $1")
+            .bind(aid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.role, "assistant");
+        assert_eq!(row.channel.as_deref(), Some("product_qa"));
+        assert_eq!(row.assistant_action_type.as_deref(), Some("reply"));
+        assert_eq!(row.user_message_id, Some(user_id));
+        assert_eq!(row.generation_id.as_deref(), Some("gen_pq_1"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_product_qa_pairs_returns_only_marked_pairs_before_cutoff(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // normal pair (must NOT appear)
+        for (role, content) in [("user", "嗨"), ("assistant", "嗨呀")] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1,$2,$3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // product_qa pair (must appear)
+        for (role, content) in [("user", "这产品是什么"), ("assistant", "这是……")] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+                 VALUES ($1,$2,$3,'product_qa')",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // current-turn user row = cutoff
+        let cur: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '那多少钱') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let pairs = repo
+            .recent_product_qa_pairs(session_id, cur, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![("这产品是什么".to_string(), "这是……".to_string())]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn context_readers_exclude_channel_marked_rows(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // one normal pair, one product_qa pair, then cutoff row
+        for (role, content, channel) in [
+            ("user", "嗨", None::<&str>),
+            ("assistant", "嗨呀", None),
+            ("user", "这产品是什么", Some("product_qa")),
+            ("assistant", "这是官方说明……", Some("product_qa")),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+                 VALUES ($1,$2,$3,$4)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(channel)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let cur: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '在吗') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let pairs = repo
+            .recent_turn_pairs_before_message(session_id, cur, 5)
+            .await
+            .unwrap();
+        assert_eq!(pairs, vec![("嗨".to_string(), "嗨呀".to_string())]);
+
+        let pairs2 = repo
+            .recent_turn_pairs(
+                session_id,
+                chrono::Utc::now() + chrono::Duration::seconds(60),
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pairs2, vec![("嗨".to_string(), "嗨呀".to_string())]);
+
+        let openings = repo
+            .recent_assistant_contents(session_id, cur, 6)
+            .await
+            .unwrap();
+        assert!(openings.iter().all(|c| c != "这是官方说明……"));
+        assert!(openings.contains(&"嗨呀".to_string()));
     }
 }

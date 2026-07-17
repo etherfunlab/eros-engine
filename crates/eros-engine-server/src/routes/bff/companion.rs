@@ -43,6 +43,10 @@ pub struct BffHistoryEntry {
     /// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tips_amount_usd: Option<f64>,
+    /// Conversation-flavor marker: `"product_qa"` = out-of-character product
+    /// answer (excluded from companion context). Omitted for normal turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -139,6 +143,7 @@ async fn bff_get_history(
             content: r.content,
             sent_at: r.sent_at,
             tips_amount_usd: r.tips_amount_usd,
+            channel: r.channel,
         })
         .collect();
     let total = messages.len();
@@ -195,6 +200,7 @@ async fn bff_start_chat(
                 content: r.content,
                 sent_at: r.sent_at,
                 tips_amount_usd: r.tips_amount_usd,
+                channel: r.channel,
             })
             .collect()
     };

@@ -78,7 +78,7 @@ eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
 `linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.8.1
+docker pull ghcr.io/etherfunlab/eros-engine:0.8.2
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ Minimal run (you bring Postgres + your own `.env`):
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.8.1 serve
+  ghcr.io/etherfunlab/eros-engine:0.8.2 serve
 ```
 
 The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host. See [Deploying](docs/deploying.md).
@@ -136,7 +136,7 @@ For the full request schema, SSE frame layout (including `delta`, `image_request
 
 Required env vars: `DATABASE_URL`, `OPENROUTER_API_KEY`, `VOYAGE_API_KEY`, and **one** auth source — `SUPABASE_URL` / `SUPABASE_JWKS_URL` (JWKS, the post-2025 Supabase default) **or** `SUPABASE_JWT_SECRET` (legacy HS256). The server refuses to boot if no auth source is set.
 
-Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
+Everything else has sane defaults: model routing (`MODEL_CONFIG_PATH` → `model_config.toml`, or a split config directory via `MODEL_CONFIG_DIR`), OpenRouter attribution headers, the dreaming-lite / snapshot sweepers, the `EMA_INERTIA` relationship-difficulty dial, and debug toggles. The full annotated list lives in [`.env.example`](.env.example); operational guidance is in [Deploying](docs/deploying.md), and model routing in [Model config](docs/model-config.md).
 
 ## Roadmap
 

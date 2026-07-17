@@ -106,6 +106,10 @@ pub struct ChatHistoryEntry {
     pub sent_at: DateTime<Utc>,
     #[schema(value_type = Object)]
     pub extracted_facts: Option<serde_json::Value>,
+    /// Conversation-flavor marker: `"product_qa"` = out-of-character product
+    /// answer (excluded from companion context). Omitted for normal turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -571,6 +575,7 @@ async fn get_history(
             // dropped in migration 0017. The field stays on this canonical
             // DTO (always null) to preserve the documented OSS API contract.
             extracted_facts: None,
+            channel: m.channel,
         })
         .collect();
     let total = entries.len();

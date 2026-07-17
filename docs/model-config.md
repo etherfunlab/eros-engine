@@ -7,10 +7,39 @@ LLM model selection for the engine lives in a TOML file loaded at server start. 
 ## Where it lives
 
 - Default path: `examples/model_config.toml` (relative to the working directory). The file under `examples/` is an illustrative template — adapt it to your own needs (or point `MODEL_CONFIG_PATH` at your own file).
-- Override: `MODEL_CONFIG_PATH` environment variable
-- Loaded once at server start by `eros-engine-server/src/main.rs` (reads `MODEL_CONFIG_PATH` directly, then `ModelConfig::from_toml_str`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same with the same default path (`examples/model_config.toml`).
+- Override: `MODEL_CONFIG_PATH` environment variable (single file), or `MODEL_CONFIG_DIR` (directory mode, below). The two are mutually exclusive — setting both is a boot error.
+- Loaded once at server start by `eros-engine-server/src/main.rs` (`resolve_config_source` → `ModelConfig::from_toml_file` / `from_toml_dir`). For library embedders, `ModelConfig::load()` in `crates/eros-engine-llm/src/model_config.rs` does the same resolution with the same default path (`examples/model_config.toml`).
 - Held as `Arc<ModelConfig>` in `AppState`; shared across all chat / post-process turns
 - The server also calls `dotenvy::dotenv()` at startup, so `cp .env.example .env` works for the quickstart without an explicit `source .env`
+
+## Directory mode
+
+`MODEL_CONFIG_DIR` points at a directory whose `.toml` files are merged into one config at boot — for splitting a large config by section, not for layering:
+
+- Only the directory's top level is read (no recursion); dotfiles and non-`.toml` entries are skipped. A directory with no `.toml` files is a boot error.
+- Files are parsed independently and merged; load order is filename byte order (order can't change the result — duplicates are errors — it only keeps messages deterministic).
+- `[defaults]` and each `[tasks.<name>]` must come from exactly one file. A section defined twice fails boot naming both files: `model_config merge failed: [tasks.chat_companion] in chat.toml already defined in base.toml`. There is no override or precedence between files.
+- On success the server logs the merged file list: `model_config: loaded from dir` with the directory, filenames, and count.
+- The published Docker image bakes `MODEL_CONFIG_PATH` (`docker/Dockerfile`). To use directory mode in that image, clear it alongside your dir: `-e MODEL_CONFIG_PATH= -e MODEL_CONFIG_DIR=/etc/eros/model.d` (an empty value counts as unset).
+
+Example split:
+
+```toml
+# defaults.toml
+[defaults]
+fallback_model       = "x-ai/grok-4-mini"
+fallback_temperature = 0.5
+
+# chat.toml
+[tasks.chat_companion]
+model = "provider/chat-model"
+
+# extraction.toml
+[tasks.insight_extraction]
+model = "provider/extract-model"
+[tasks.memory_extraction]
+model = "provider/extract-model"
+```
 
 ## Schema
 
@@ -301,6 +330,7 @@ input filter has no triggers, timing, or tiers).
 | `chat_image_generation` | `pipeline::stream` (opt-in engine-side image draw executor — the draw endpoint; activated when this task block is present) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (opt-in image-prompt composer; expands the PDE seed subject before image generation; activated when this task block is present) | live (opt-in) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
+| `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
@@ -310,7 +340,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 
@@ -319,7 +349,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. Availability no longer depends on `[tasks.chat_image_generation]`: the chat stream never draws, it emits an `image_request` frame. `[tasks.chat_image_generation]` gates only the separate draw endpoint, `POST /comp/chat/{session_id}/image/stream`.)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. Availability no longer depends on `[tasks.chat_image_generation]`: the chat stream never draws, it emits an `image_request` frame. `[tasks.chat_image_generation]` gates only the separate draw endpoint, `POST /comp/chat/{session_id}/image/stream`. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `tone` (optional): a short delivery directive for this turn's reply — injected into the reply prompt as a `[reply_tone]` section on text-bearing actions; omitted when absent
   - `image_prompt`, `reason`: optional
@@ -467,6 +497,87 @@ first fallback). Pick a vision-capable model; the example uses
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_vision()` in `model_config.rs`.
+
+### `[tasks.chat_product_qa]` — out-of-character product answers (opt-in)
+
+Powers the PDE judge's `product_qa` action: when the end user asks about the
+downstream product itself ("这个 app 是什么？", "怎么收费？", "会员怎么取消？"),
+the judge routes the turn to this task's own model chain instead of
+`chat_companion`. `filter_prompt` (the product documentation + answering
+rules) becomes the executor's **entire** system prompt — no persona is
+folded in, the companion steps fully out of character for the turn.
+
+**Three enablement gates** — all must hold (`resolve_product_qa()` /
+`validate_product_qa_prompt()`):
+
+| Gate | State | Behaviour |
+| --- | --- | --- |
+| `[tasks.pde_decision].filter_prompt` set | off | The rule engine never emits `product_qa` — the action is unreachable without the LLM judge. If `[tasks.chat_product_qa]` is configured anyway, boot logs one WARN (`"model_config: [tasks.chat_product_qa] is configured but the LLM PDE ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"`) and the block stays inert. |
+| `[tasks.chat_product_qa]` block present | absent | Feature off. The judge context carries no product-QA lines; a hallucinated `product_qa` verdict degrades to `reply_text`. |
+| `chat_product_qa.filter_prompt` non-blank | blank | **Refuses to boot** — the same required-prompt contract as `insight_extraction` / `memory_extraction`. Set a prompt, or remove the `[tasks.chat_product_qa]` section entirely to disable the feature. |
+
+```toml
+[tasks.chat_product_qa]
+model        = "anthropic/claude-haiku-4.5"
+fallback     = ["google/gemini-3.1-flash-lite"]
+retry_depth  = 1
+temperature  = 0.3
+max_tokens   = 800
+reasoning    = { enabled = false }
+filter_prompt = """
+你是 XX 产品的官方说明助手。以下是产品资料：
+…（产品定位、功能、价格、会员、退订方式等）…
+只根据资料作答；资料没有的信息明确说不知道，不编造。语气友好简洁，不扮演角色。
+"""
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `model` | `ModelSpec` (string \| array \| table) | — | Primary executor model (same three shapes as `chat_companion.model`). |
+| `fallback` | `String` \| `Array<String>` | `[]` | Sequential retry chain (FallbackSpec), truncated to `retry_depth`. |
+| `retry_depth` | `u32` | `1` | Primary + this many fallbacks. |
+| `temperature` | `f64` | task default | Sampling temperature for the executor call. |
+| `max_tokens` | `u32` | task default | Token cap for the executor call. |
+| `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
+| `filter_prompt` | `String` | — | **Required.** Product docs + answering rules; blank or absent refuses to boot (see the gates table above). |
+
+**Judge-side context.** Only when all three gates pass, the judge context
+(`build_pde_ctx`) gains two lines the prompt can act on:
+
+- `[产品咨询] 本轮可答产品问题=是` — availability line, rendered only when the
+  task is enabled (feature-off deployments see zero prompt drift, zero token
+  cost).
+- `[最近产品咨询]` — the session's most recent **3** product-QA pairs
+  (`channel='product_qa'`), so elliptical follow-ups ("那多少钱一个月？")
+  still route to `product_qa`. Omitted when there are none. The same 3 pairs
+  are reused as the executor's own conversational context — no second store
+  fetch.
+
+**Isolation semantics.** The answer persists as a normal assistant row
+(`role='assistant'`, `assistant_action_type='reply'`) marked
+`channel='product_qa'`. That marker makes the row invisible to the companion
+brain: short-term recall (`recent_turn_pairs` / `recent_turn_pairs_before_message`
+/ `recent_assistant_contents`), conversation signals
+(`compute_signals_for_session`), the dreaming sweeper's session-log pull, the
+judge's own shared companion transcript (`build_input_filter_transcript`),
+and the companion's live message window (`assemble_chat_request`) all filter
+`channel IS NOT NULL` rows out — while the row stays fully visible on the
+live SSE stream, disconnect-replay, and client history (`channel` is exposed
+on both history projections). See [architecture.md](architecture.md) for the
+full `chat_messages.channel` semantics.
+
+**Failure fallback.** If the executor's whole candidate chain (`model` +
+`fallback`) is exhausted without streaming any content, the engine does
+**not** fall back to the in-character companion reply — the companion
+doesn't know the product facts, and improvising is exactly what this feature
+exists to prevent. It instead picks a configured `error_handling` fallback
+phrase (the same DB-backed mechanism the rest of the chat stream uses) and
+persists it **with the `channel='product_qa'` marker**, so replay and
+idempotency still hold; with no fallback phrase configured, the turn ends in
+an `Error` frame instead.
+
+Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
+`resolve_product_qa()` in `model_config.rs`.
 
 ### Enabling / disabling extraction
 

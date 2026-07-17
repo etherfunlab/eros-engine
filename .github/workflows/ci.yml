@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
 
+# All jobs here are read-only checks (fmt / clippy / test / openapi snapshot).
+# Pin the token to the minimum so a compromised action can't write.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -75,6 +80,14 @@ jobs:
   cla:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    # Override the read-only top-level default: the CLA assistant comments on the
+    # PR and sets a commit status. Signature storage uses CLA_BOT_TOKEN, so the
+    # GITHUB_TOKEN only needs PR + status writes (contents stays read).
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+      actions: write
     steps:
       - uses: contributor-assistant/github-action@v2.4.0
         env:
