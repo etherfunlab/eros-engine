@@ -870,6 +870,91 @@ impl ModelConfig {
         Ok(cfg)
     }
 
+    /// Directory mode (`MODEL_CONFIG_DIR`): merge every top-level `*.toml` in
+    /// `dir` into one config. Selection: regular files at the top level only,
+    /// dotfiles skipped, filename byte order (duplicates are errors, so order
+    /// never changes the result — it only makes error messages deterministic).
+    /// Split-by-section semantics: each `tasks.<name>` and every other top-level
+    /// key must come from exactly one file; duplicates fail the load naming both
+    /// files (see Task 4 — added with the conflict tests).
+    pub fn from_toml_dir(dir: &std::path::Path) -> Result<Self, LlmError> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config dir read failed: {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                LlmError::Config(format!(
+                    "model_config dir read failed: {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !path.is_file() || name.starts_with('.') || !name.ends_with(".toml") {
+                continue;
+            }
+            files.push(path);
+        }
+        files.sort();
+        if files.is_empty() {
+            return Err(LlmError::Config(format!(
+                "model_config dir contains no .toml files: {}",
+                dir.display()
+            )));
+        }
+
+        let mut merged = toml::Table::new();
+        let mut file_names: Vec<String> = Vec::new();
+        for file in &files {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string());
+            let text = std::fs::read_to_string(file).map_err(|e| {
+                LlmError::Config(format!("model_config read failed: {}: {e}", file.display()))
+            })?;
+            let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+                LlmError::Config(format!("model_config parse failed: {file_name}: {e}"))
+            })?;
+            for (key, value) in table {
+                if key == "tasks" {
+                    let toml::Value::Table(tasks) = value else {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: `tasks` in {file_name} is not a table"
+                        )));
+                    };
+                    let merged_tasks = merged
+                        .entry("tasks")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .expect("`tasks` is only ever inserted as a table");
+                    for (task_name, task_value) in tasks {
+                        merged_tasks.insert(task_name, task_value);
+                    }
+                } else {
+                    merged.insert(key, value);
+                }
+            }
+            file_names.push(file_name);
+        }
+
+        let cfg: Self = merged.try_into().map_err(|e: toml::de::Error| {
+            LlmError::Config(format!("model_config deserialize failed after merge: {e}"))
+        })?;
+        tracing::info!(
+            dir = %dir.display(),
+            files = ?file_names,
+            count = file_names.len(),
+            "model_config: loaded from dir"
+        );
+        Ok(cfg)
+    }
+
     /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
     /// or fall back to `examples/model_config.toml` to match the
     /// `eros-engine-server` boot default. The server binary itself reads
@@ -3951,5 +4036,73 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_split_load_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "defaults.toml",
+            "[defaults]\nfallback_model = \"p/fall\"\nfallback_temperature = 0.4\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "chat.toml",
+            "[tasks.chat_companion]\nmodel = \"p/chat\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "extraction.toml",
+            "[tasks.memory_extraction]\nmodel = \"p/extract\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.defaults.fallback_model.as_deref(), Some("p/fall"));
+        assert_eq!(cfg.defaults.fallback_temperature, Some(0.4));
+        assert_eq!(cfg.tasks.len(), 2);
+        assert!(matches!(&cfg.tasks["chat_companion"].model, ModelSpec::Fixed(m) if m == "p/chat"));
+        assert!(
+            matches!(&cfg.tasks["memory_extraction"].model, ModelSpec::Fixed(m) if m == "p/extract")
+        );
+    }
+
+    #[test]
+    fn from_toml_dir_ignores_dotfiles_subdirs_and_non_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "base.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        // All of these define a conflicting tasks.a — they must be skipped, not merged.
+        write_cfg(tmp.path(), ".hidden.toml", "[tasks.a]\nmodel = \"p/dot\"\n");
+        write_cfg(tmp.path(), "notes.txt", "[tasks.a]\nmodel = \"p/txt\"\n");
+        std::fs::create_dir(tmp.path().join("sub.toml")).unwrap(); // directory named *.toml
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        write_cfg(
+            &tmp.path().join("nested"),
+            "extra.toml",
+            "[tasks.a]\nmodel = \"p/nested\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.tasks.len(), 1);
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+    }
+
+    #[test]
+    fn from_toml_dir_empty_missing_or_no_toml_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty directory.
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Non-toml content only.
+        write_cfg(tmp.path(), "readme.md", "# not config");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Directory does not exist.
+        let err = ModelConfig::from_toml_dir(&tmp.path().join("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dir read failed"), "{err}");
     }
 }
