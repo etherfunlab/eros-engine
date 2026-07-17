@@ -364,6 +364,7 @@ impl<'a> ChatRepo<'a> {
     /// chronologically. Pairs are formed by walking the most-recent rows
     /// chronologically: a `user` or `gift_user` row immediately followed by an
     /// `assistant` row produces one pair; orphan rows are dropped.
+    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
     /// Used by the chat pipeline to inject the `[recent_conversation]` short-
     /// term memory block into the system prompt. Uses the existing
@@ -386,6 +387,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < $2 \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role IN ('user', 'gift_user', 'assistant') \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -427,6 +429,7 @@ impl<'a> ChatRepo<'a> {
     /// timestamp. Looking up the cutoff via subquery avoids a race with
     /// concurrent streams that could insert a row between wall-clock-now and
     /// the read of recent rows.
+    /// Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
     ///
     /// Equivalent to `recent_turn_pairs(session_id, msg.sent_at, limit)` but
     /// in a single round-trip. If `message_id` doesn't exist in the session
@@ -445,6 +448,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role IN ('user', 'gift_user', 'assistant') \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -535,8 +539,8 @@ impl<'a> ChatRepo<'a> {
     /// (`before_message_id`). Returned newest-first. The cutoff is resolved
     /// via subquery on the message id — same race-safety as
     /// `recent_turn_pairs_before_message` (a concurrent stream can't leak a
-    /// "future" row into this turn). Used by the chat pipeline to mine
-    /// over-used reply openings for the `[avoid_repetition]` block.
+    /// "future" row into this turn). Channel-marked rows ('voice'/'product_qa') are out of companion context and excluded.
+    /// Used by the chat pipeline to mine over-used reply openings for the `[avoid_repetition]` block.
     pub async fn recent_assistant_contents(
         &self,
         session_id: Uuid,
@@ -549,6 +553,7 @@ impl<'a> ChatRepo<'a> {
              WHERE session_id = $1 \
                AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
                AND truncated = FALSE \
+               AND channel IS NULL \
                AND role = 'assistant' \
              ORDER BY sent_at DESC \
              LIMIT $3",
@@ -3218,5 +3223,68 @@ mod tests {
             pairs,
             vec![("这产品是什么".to_string(), "这是……".to_string())]
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn context_readers_exclude_channel_marked_rows(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // one normal pair, one product_qa pair, then cutoff row
+        for (role, content, channel) in [
+            ("user", "嗨", None::<&str>),
+            ("assistant", "嗨呀", None),
+            ("user", "这产品是什么", Some("product_qa")),
+            ("assistant", "这是官方说明……", Some("product_qa")),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+                 VALUES ($1,$2,$3,$4)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(channel)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let cur: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '在吗') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let pairs = repo
+            .recent_turn_pairs_before_message(session_id, cur, 5)
+            .await
+            .unwrap();
+        assert_eq!(pairs, vec![("嗨".to_string(), "嗨呀".to_string())]);
+
+        let pairs2 = repo
+            .recent_turn_pairs(
+                session_id,
+                chrono::Utc::now() + chrono::Duration::seconds(60),
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pairs2, vec![("嗨".to_string(), "嗨呀".to_string())]);
+
+        let openings = repo
+            .recent_assistant_contents(session_id, cur, 6)
+            .await
+            .unwrap();
+        assert!(openings.iter().all(|c| c != "这是官方说明……"));
+        assert!(openings.contains(&"嗨呀".to_string()));
     }
 }
