@@ -824,6 +824,36 @@ impl TaskConfig {
     }
 }
 
+/// Where the model config comes from, resolved from the two env vars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Single TOML file (`MODEL_CONFIG_PATH`, or the compiled-in default).
+    File(String),
+    /// Directory of `.toml` fragments (`MODEL_CONFIG_DIR`), merged at load.
+    Dir(String),
+}
+
+/// Pure resolution of the `MODEL_CONFIG_PATH` / `MODEL_CONFIG_DIR` values —
+/// the caller reads the env so this stays unit-testable. Empty strings count
+/// as unset (a dotenv `VAR=` line is not an opt-in). Both set is a hard
+/// error: no silent precedence between the two mechanisms.
+pub fn resolve_config_source(
+    path: Option<String>,
+    dir: Option<String>,
+) -> Result<ConfigSource, LlmError> {
+    let path = path.filter(|s| !s.is_empty());
+    let dir = dir.filter(|s| !s.is_empty());
+    match (path, dir) {
+        (Some(_), Some(_)) => Err(LlmError::Config(
+            "MODEL_CONFIG_PATH and MODEL_CONFIG_DIR are mutually exclusive; set only one"
+                .to_string(),
+        )),
+        (None, Some(d)) => Ok(ConfigSource::Dir(d)),
+        (Some(p), None) => Ok(ConfigSource::File(p)),
+        (None, None) => Ok(ConfigSource::File("examples/model_config.toml".to_string())),
+    }
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
@@ -3855,5 +3885,42 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.compose_prompt, "compose it");
         assert_eq!(r.retry_depth, 1);
         assert_eq!(r.fallback_model.len(), 1);
+    }
+
+    #[test]
+    fn resolve_config_source_combinations() {
+        // Neither set → compiled-in default single file.
+        assert_eq!(
+            resolve_config_source(None, None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
+        // Path only.
+        assert_eq!(
+            resolve_config_source(Some("my.toml".to_string()), None).unwrap(),
+            ConfigSource::File("my.toml".to_string())
+        );
+        // Dir only.
+        assert_eq!(
+            resolve_config_source(None, Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        // Both set → hard error mentioning both var names.
+        let err = resolve_config_source(Some("my.toml".to_string()), Some("conf.d".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(
+            err.contains("MODEL_CONFIG_PATH") && err.contains("MODEL_CONFIG_DIR"),
+            "{err}"
+        );
+        // Empty string counts as unset (dotenv `VAR=` lines must not trip the exclusion).
+        assert_eq!(
+            resolve_config_source(Some(String::new()), Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        assert_eq!(
+            resolve_config_source(Some(String::new()), None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
     }
 }
