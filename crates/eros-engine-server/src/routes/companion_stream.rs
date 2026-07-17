@@ -386,7 +386,9 @@ fn validate_draw_request(req: &DrawImageRequest) -> Result<(), AppError> {
             `product_qa`. \
             Note the asymmetry: a plain-text `reply_text` turn is reported as `reply` (there is no \
             `reply_text` on the wire), while the text+image variant keeps its full \
-            `reply_text_image` name.", content_type = "text/event-stream"),
+            `reply_text_image` name. `product_qa` marks an out-of-character product answer \
+            (excluded from companion context; also reported on replay). Clients must tolerate \
+            unknown `action_type` values.", content_type = "text/event-stream"),
         (status = 400, body = StreamPreErrorBody),
         (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = StreamPreErrorBody),
