@@ -3666,8 +3666,18 @@ pub fn replay_stream(
             }
             // If every persisted assistant row was truncated, emit the same
             // terminal Error that the original burst emitted so the client
-            // knows retrying is appropriate.
-            if !rows.is_empty() && rows.iter().all(|r| r.truncated) {
+            // knows retrying is appropriate. This is companion multi-candidate
+            // chain semantics (every fallback model exhausted, all truncated).
+            // A product-QA turn persists exactly one assistant row, and a
+            // truncated product-QA answer is still a served answer — the live
+            // burst emits Meta → Delta → Done(truncated:true) → Final, no
+            // Error — so exclude product-QA chains from this rule (chains
+            // never mix companion and product_qa rows under one
+            // user_message_id).
+            let product_qa_chain = rows
+                .iter()
+                .any(|r| r.channel.as_deref() == Some("product_qa"));
+            if !rows.is_empty() && !product_qa_chain && rows.iter().all(|r| r.truncated) {
                 yield ProtocolFrame::Error {
                     code: StreamErrorCode::UpstreamUnavailable,
                     retryable: true,
@@ -4553,6 +4563,85 @@ mod tests {
             ),
             "channel=NULL row must replay as Meta(action_type=reply); got {:?}",
             frames[3]
+        );
+    }
+
+    /// Codex P2: a product-QA turn persists exactly one assistant row, and a
+    /// truncated (finish_reason == "length") product-QA row is still a served
+    /// answer — the live burst emits Meta → Delta → Done(truncated:true) →
+    /// Final, no Error. The pre-existing "every persisted row truncated ⇒
+    /// Error(UpstreamUnavailable)" rule is companion multi-candidate-chain
+    /// semantics (all fallback models exhausted, truncated); it must not fire
+    /// for a single truncated product_qa row, or replay would diverge from
+    /// live by injecting a spurious terminal Error with no Final.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn replay_product_qa_truncated_row_replays_answer_not_error(pool: PgPool) {
+        use futures_util::StreamExt;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let state = std::sync::Arc::new(crate::routes::companion::test_state(pool.clone()));
+
+        let row = eros_engine_store::chat::ChatMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: "assistant".into(),
+            content: "product answer, cut off mid-".into(),
+            sent_at: chrono::Utc::now(),
+            client_msg_id: None,
+            ghost_decision: false,
+            user_message_id: None,
+            continues_from_message_id: None,
+            truncated: true,
+            model: Some("qa/exec".into()),
+            usage: None,
+            generation_id: Some("gen-qa".into()),
+            assistant_action_type: Some("product_qa".into()),
+            channel: Some("product_qa".into()),
+            pre_filter_content: None,
+            metadata: None,
+        };
+
+        let frames: Vec<ProtocolFrame> =
+            replay_stream(state, session_id, user_id, false, vec![row])
+                .collect()
+                .await;
+
+        assert!(
+            matches!(
+                &frames[0],
+                ProtocolFrame::Meta {
+                    action_type: FrameActionType::ProductQa,
+                    ..
+                }
+            ),
+            "first frame must be Meta(action_type=product_qa); got {:?}",
+            frames[0]
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Delta { content, .. } if content == "product answer, cut off mid-"
+            )),
+            "must replay the persisted content as a Delta; got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                ProtocolFrame::Done {
+                    truncated: true,
+                    ..
+                }
+            )),
+            "must replay Done(truncated:true); got {frames:?}"
+        );
+        assert!(
+            matches!(frames.last(), Some(ProtocolFrame::Final { .. })),
+            "terminal frame must be Final, not an Error; got {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "a truncated product_qa row is still a served answer — must not emit Error; got {frames:?}"
         );
     }
 
