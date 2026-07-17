@@ -1409,7 +1409,7 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
 // ── PDE judge primitives ──────────────────────────────────────────────────────
 
 /// Judge verdict action. serde `snake_case` matches the JSON contract
-/// (`reply_text` / `ghost` / `reply_image` / `reply_text_image`).
+/// (`reply_text` / `ghost` / `reply_image` / `reply_text_image` / `product_qa`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PdeAction {
@@ -1417,6 +1417,7 @@ pub(crate) enum PdeAction {
     Ghost,
     ReplyImage,
     ReplyTextImage,
+    ProductQa,
 }
 
 impl PdeAction {
@@ -1426,6 +1427,7 @@ impl PdeAction {
             PdeAction::Ghost => "ghost",
             PdeAction::ReplyImage => "reply_image",
             PdeAction::ReplyTextImage => "reply_text_image",
+            PdeAction::ProductQa => "product_qa",
         }
     }
 }
@@ -1538,7 +1540,7 @@ fn pde_response_format() -> serde_json::Value {
                 "required": ["action", "inner_state", "tone", "image_prompt", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
-                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image"] },
+                        "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
                     "inner_state": { "type": "string" },
                     "tone": { "type": ["string", "null"] },
                     "image_prompt": { "type": ["string", "null"] },
@@ -1680,6 +1682,7 @@ fn guard_action(
     affinity: &eros_engine_core::affinity::Affinity,
     signals: &eros_engine_core::types::ConversationSignals,
     image_executor_available: bool,
+    product_qa_available: bool,
 ) -> ActionType {
     match proposed {
         PdeAction::Ghost => {
@@ -1698,6 +1701,10 @@ fn guard_action(
         PdeAction::ReplyImage if image_executor_available => ActionType::ReplyImage,
         PdeAction::ReplyTextImage if image_executor_available => ActionType::ReplyTextImage,
         PdeAction::ReplyImage | PdeAction::ReplyTextImage => ActionType::ReplyText,
+        PdeAction::ProductQa if product_qa_available => ActionType::ProductQa,
+        // Hallucinated / stale-prompt proposal with the task unconfigured (or
+        // the PDE-off deployment's schema echo): degrade like the image actions.
+        PdeAction::ProductQa => ActionType::ReplyText,
         PdeAction::ReplyText => ActionType::ReplyText,
     }
 }
@@ -1785,11 +1792,27 @@ fn build_persona_brief(persona: &eros_engine_core::persona::CompanionPersona) ->
     lines.join("\n")
 }
 
+/// Render recent product-QA pairs for the judge's `[最近产品咨询]` block and
+/// the executor's follow-up context. Plain 用户/回答 lines, chronological.
+///
+/// Not yet called from production: the caller that fetches persisted
+/// product-QA pairs and wires this into `build_pde_ctx`'s `product_qa_recent`
+/// arg lands in a later task.
+#[allow(dead_code)]
+fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(q, a)| format!("用户: {q}\n回答: {a}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(
     transcript: &str,
     input: &eros_engine_core::types::DecisionInput,
     image_available: bool,
+    product_qa_recent: Option<&str>,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -1811,11 +1834,21 @@ fn build_pde_ctx(
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
+    // Product-QA lines render ONLY when the task is enabled this deployment —
+    // old judge prompts see zero drift and pay zero tokens (unlike 图片能力,
+    // whose negative is itself a signal). `Some("")` = enabled, no history yet.
+    let product_qa_section = match product_qa_recent {
+        None => String::new(),
+        Some("") => "[产品咨询] 本轮可答产品问题=是\n".to_string(),
+        Some(recent) => {
+            format!("[产品咨询] 本轮可答产品问题=是\n[最近产品咨询]\n{recent}\n")
+        }
+    };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
-         [图片能力] 本轮可发图={image_flag}\n\n\
+         [图片能力] 本轮可发图={image_flag}\n{product_qa_section}\n\
          [用户最新消息]\n{latest}",
         a.warmth,
         a.trust,
@@ -2628,7 +2661,8 @@ pub fn run_stream(
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match (is_tip, resolved_pde.as_ref()) {
                 (false, Some(p)) => {
-                    let ctx = build_pde_ctx(&pde_transcript, &input, image_executor_available);
+                    let ctx =
+                        build_pde_ctx(&pde_transcript, &input, image_executor_available, None);
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
@@ -2637,6 +2671,7 @@ pub fn run_stream(
                                 &input.affinity,
                                 &input.signals,
                                 image_executor_available,
+                                false,
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -3694,6 +3729,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_pde_verdict_product_qa_action() {
+        let v =
+            parse_pde_verdict(r#"{"action":"product_qa","inner_state":"想介绍"}"#).expect("parses");
+        assert_eq!(v.action, PdeAction::ProductQa);
+        assert_eq!(PdeAction::ProductQa.as_str(), "product_qa");
+    }
+
+    #[test]
     fn parse_pde_verdict_image_ref_and_aspect() {
         // defaults when omitted (backward compat)
         let v = parse_pde_verdict("{\"action\":\"reply_image\",\"inner_state\":\"ok\"}").unwrap();
@@ -3887,25 +3930,25 @@ mod tests {
         };
         // ghost honoured when permitted
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false),
+            guard_action(PdeAction::Ghost, &a, &sigs(50, Some(5.0)), false, false),
             ActionType::Ghost
         );
         // ghost vetoed by new-relationship floor
         assert_eq!(
-            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false),
+            guard_action(PdeAction::Ghost, &a, &sigs(3, None), false, false),
             ActionType::ReplyText
         );
         // image actions degrade to text when no executor chain
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyImage, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyTextImage, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false),
+            guard_action(PdeAction::ReplyText, &a, &sigs(50, None), false, false),
             ActionType::ReplyText
         );
     }
@@ -3915,20 +3958,34 @@ mod tests {
         let aff = test_affinity();
         let sig = test_signals();
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, true),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, true, false),
             ActionType::ReplyImage
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, true, false),
             ActionType::ReplyTextImage
         );
         // executor unavailable → degrade (today's behaviour)
         assert_eq!(
-            guard_action(PdeAction::ReplyImage, &aff, &sig, false),
+            guard_action(PdeAction::ReplyImage, &aff, &sig, false, false),
             ActionType::ReplyText
         );
         assert_eq!(
-            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false),
+            guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false),
+            ActionType::ReplyText
+        );
+    }
+
+    #[test]
+    fn guard_product_qa_available_passes_unavailable_degrades() {
+        let a = pde_test_affinity();
+        let s = sigs(50, None);
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &s, false, true),
+            ActionType::ProductQa
+        );
+        assert_eq!(
+            guard_action(PdeAction::ProductQa, &a, &s, false, false),
             ActionType::ReplyText
         );
     }
@@ -3957,7 +4014,13 @@ mod tests {
     #[test]
     fn ghost_then_killswitch_yields_reply_with_hints() {
         let input = pde_test_input(); // msg_count=50, cooldown clear → ghost permitted
-        let acted = guard_action(PdeAction::Ghost, &input.affinity, &input.signals, false);
+        let acted = guard_action(
+            PdeAction::Ghost,
+            &input.affinity,
+            &input.signals,
+            false,
+            false,
+        );
         assert_eq!(acted, ActionType::Ghost); // permitted
 
         let hints = vec![sanitize_inner_state("有点想躲")];
@@ -8721,7 +8784,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true);
+        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
         assert!(
@@ -8773,7 +8836,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("", &input, false);
+        let ctx = build_pde_ctx("", &input, false, None);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -8788,6 +8851,24 @@ data: [DONE]\n\n";
             !ctx.contains("本轮可发图=是"),
             "no positive variant when unavailable: {ctx}"
         );
+    }
+
+    #[test]
+    fn pde_ctx_renders_product_qa_blocks_only_when_enabled() {
+        let input = pde_test_input();
+        // feature off → no lines at all
+        let off = build_pde_ctx("t", &input, true, None);
+        assert!(!off.contains("[产品咨询]"));
+        assert!(!off.contains("[最近产品咨询]"));
+        // on, no history → availability line only
+        let on_empty = build_pde_ctx("t", &input, true, Some(""));
+        assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
+        assert!(!on_empty.contains("[最近产品咨询]"));
+        // on, with history → both blocks, before [用户最新消息]
+        let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
+        let on_recent = build_pde_ctx("t", &input, true, Some(&recent));
+        assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
+        assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
 
     // ── Task-4 PDE schema + chain-walk tests ─────────────────────────────────
@@ -8817,7 +8898,11 @@ data: [DONE]\n\n";
         let actions = v["json_schema"]["schema"]["properties"]["action"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(actions.len(), 4, "four actions: {v}");
+        assert_eq!(actions.len(), 5, "five actions: {v}");
+        assert!(
+            actions.iter().any(|x| x == "product_qa"),
+            "product_qa in action enum: {v}"
+        );
     }
 
     fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {
