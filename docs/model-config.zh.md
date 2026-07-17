@@ -20,6 +20,7 @@
 - 每个文件独立解析后合并；加载顺序为文件名字节序（重复即报错，因此顺序不影响结果，只保证报错信息可复现）。
 - `[defaults]` 和每个 `[tasks.<name>]` 只能来自一个文件。同一 section 定义两次会启动失败并点名两个文件：`model_config merge failed: [tasks.chat_companion] in chat.toml already defined in base.toml`。文件之间不存在覆盖或优先级。
 - 合并成功后服务器会记录文件清单日志：`model_config: loaded from dir`（含目录、文件名列表和数量）。
+- 发布的 Docker 镜像内置了 `MODEL_CONFIG_PATH`（`docker/Dockerfile`）。要在该镜像中使用目录模式，需在传入目录的同时清空它：`-e MODEL_CONFIG_PATH= -e MODEL_CONFIG_DIR=/etc/eros/model.d`（空值视为未设置）。
 
 拆分示例：
 

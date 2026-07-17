@@ -865,7 +865,12 @@ impl ModelConfig {
         let text = std::fs::read_to_string(path).map_err(|e| {
             LlmError::Config(format!("model_config read failed: {}: {e}", path.display()))
         })?;
-        let cfg = Self::from_toml_str(&text)?;
+        let cfg = Self::from_toml_str(&text).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config parse failed: {}: {e}",
+                path.display()
+            ))
+        })?;
         tracing::info!(path = %path.display(), "model_config: loaded");
         Ok(cfg)
     }
@@ -4056,6 +4061,14 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope.toml"), "{err}");
+
+        // Malformed TOML: error names the file and says parse failed.
+        write_cfg(tmp.path(), "broken.toml", "[tasks.a\nmodel = \n");
+        let err = ModelConfig::from_toml_file(&tmp.path().join("broken.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
+        assert!(err.contains("parse failed"), "{err}");
     }
 
     #[test]

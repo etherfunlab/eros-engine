@@ -20,6 +20,7 @@ LLM model selection for the engine lives in a TOML file loaded at server start. 
 - Files are parsed independently and merged; load order is filename byte order (order can't change the result — duplicates are errors — it only keeps messages deterministic).
 - `[defaults]` and each `[tasks.<name>]` must come from exactly one file. A section defined twice fails boot naming both files: `model_config merge failed: [tasks.chat_companion] in chat.toml already defined in base.toml`. There is no override or precedence between files.
 - On success the server logs the merged file list: `model_config: loaded from dir` with the directory, filenames, and count.
+- The published Docker image bakes `MODEL_CONFIG_PATH` (`docker/Dockerfile`). To use directory mode in that image, clear it alongside your dir: `-e MODEL_CONFIG_PATH= -e MODEL_CONFIG_DIR=/etc/eros/model.d` (an empty value counts as unset).
 
 Example split:
 
