@@ -824,22 +824,173 @@ impl TaskConfig {
     }
 }
 
+/// Where the model config comes from, resolved from the two env vars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Single TOML file (`MODEL_CONFIG_PATH`, or the compiled-in default).
+    File(String),
+    /// Directory of `.toml` fragments (`MODEL_CONFIG_DIR`), merged at load.
+    Dir(String),
+}
+
+/// Pure resolution of the `MODEL_CONFIG_PATH` / `MODEL_CONFIG_DIR` values —
+/// the caller reads the env so this stays unit-testable. Empty strings count
+/// as unset (a dotenv `VAR=` line is not an opt-in). Both set is a hard
+/// error: no silent precedence between the two mechanisms.
+pub fn resolve_config_source(
+    path: Option<String>,
+    dir: Option<String>,
+) -> Result<ConfigSource, LlmError> {
+    let path = path.filter(|s| !s.is_empty());
+    let dir = dir.filter(|s| !s.is_empty());
+    match (path, dir) {
+        (Some(_), Some(_)) => Err(LlmError::Config(
+            "MODEL_CONFIG_PATH and MODEL_CONFIG_DIR are mutually exclusive; set only one"
+                .to_string(),
+        )),
+        (None, Some(d)) => Ok(ConfigSource::Dir(d)),
+        (Some(p), None) => Ok(ConfigSource::File(p)),
+        (None, None) => Ok(ConfigSource::File("examples/model_config.toml".to_string())),
+    }
+}
+
 impl ModelConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, LlmError> {
         Ok(toml::from_str(text)?)
     }
 
-    /// Library-side convenience: load the config from `MODEL_CONFIG_PATH`,
-    /// or fall back to `examples/model_config.toml` to match the
-    /// `eros-engine-server` boot default. The server binary itself reads
-    /// the file inline via `from_toml_str` rather than calling this; this
-    /// method is provided for embedders who want the same behaviour in
-    /// one call.
+    /// Load a single-file config, logging the resolved path on success.
+    /// `from_toml_str` stays available for callers that already hold the text.
+    pub fn from_toml_file(path: &std::path::Path) -> Result<Self, LlmError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            LlmError::Config(format!("model_config read failed: {}: {e}", path.display()))
+        })?;
+        let cfg = Self::from_toml_str(&text).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config parse failed: {}: {e}",
+                path.display()
+            ))
+        })?;
+        tracing::info!(path = %path.display(), "model_config: loaded");
+        Ok(cfg)
+    }
+
+    /// Directory mode (`MODEL_CONFIG_DIR`): merge every top-level `*.toml` in
+    /// `dir` into one config. Selection: regular files at the top level only,
+    /// dotfiles skipped, filename byte order (duplicates are errors, so order
+    /// never changes the result — it only makes error messages deterministic).
+    /// Split-by-section semantics: each `tasks.<name>` and every other top-level
+    /// key must come from exactly one file; duplicates fail the load naming both
+    /// files.
+    pub fn from_toml_dir(dir: &std::path::Path) -> Result<Self, LlmError> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            LlmError::Config(format!(
+                "model_config dir read failed: {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                LlmError::Config(format!(
+                    "model_config dir read failed: {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !path.is_file() || name.starts_with('.') || !name.ends_with(".toml") {
+                continue;
+            }
+            files.push(path);
+        }
+        files.sort();
+        if files.is_empty() {
+            return Err(LlmError::Config(format!(
+                "model_config dir contains no .toml files: {}",
+                dir.display()
+            )));
+        }
+
+        let mut merged = toml::Table::new();
+        let mut file_names: Vec<String> = Vec::new();
+        // Which file first defined each top-level key (or `tasks.<name>`) — so
+        // duplicate-definition errors can name both files.
+        let mut owners: HashMap<String, String> = HashMap::new();
+        for file in &files {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string());
+            let text = std::fs::read_to_string(file).map_err(|e| {
+                LlmError::Config(format!("model_config read failed: {}: {e}", file.display()))
+            })?;
+            let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+                LlmError::Config(format!("model_config parse failed: {file_name}: {e}"))
+            })?;
+            for (key, value) in table {
+                if key == "tasks" {
+                    let toml::Value::Table(tasks) = value else {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: `tasks` in {file_name} is not a table"
+                        )));
+                    };
+                    let merged_tasks = merged
+                        .entry("tasks")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .expect("`tasks` is only ever inserted as a table");
+                    for (task_name, task_value) in tasks {
+                        let owner_key = format!("tasks.{task_name}");
+                        if let Some(prev) = owners.get(&owner_key) {
+                            return Err(LlmError::Config(format!(
+                                "model_config merge failed: [tasks.{task_name}] in {file_name} already defined in {prev}"
+                            )));
+                        }
+                        owners.insert(owner_key, file_name.clone());
+                        merged_tasks.insert(task_name, task_value);
+                    }
+                } else {
+                    if let Some(prev) = owners.get(&key) {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: [{key}] in {file_name} already defined in {prev}"
+                        )));
+                    }
+                    owners.insert(key.clone(), file_name.clone());
+                    merged.insert(key, value);
+                }
+            }
+            file_names.push(file_name);
+        }
+
+        let cfg: Self = merged.try_into().map_err(|e: toml::de::Error| {
+            LlmError::Config(format!("model_config deserialize failed after merge: {e}"))
+        })?;
+        tracing::info!(
+            dir = %dir.display(),
+            files = ?file_names,
+            count = file_names.len(),
+            "model_config: loaded from dir"
+        );
+        Ok(cfg)
+    }
+
+    /// Library-side convenience: resolve `MODEL_CONFIG_PATH` /
+    /// `MODEL_CONFIG_DIR` (mutually exclusive; neither set falls back to
+    /// `examples/model_config.toml` to match the `eros-engine-server` boot
+    /// default) and load. The server binary does the same resolution in
+    /// `main.rs` via `resolve_config_source`, so embedders and the server
+    /// stay behaviour-identical.
     pub fn load() -> Result<Arc<Self>, LlmError> {
-        let path = std::env::var("MODEL_CONFIG_PATH")
-            .unwrap_or_else(|_| "examples/model_config.toml".to_string());
-        let text = std::fs::read_to_string(&path)?;
-        let cfg = Self::from_toml_str(&text)?;
+        let source = resolve_config_source(
+            std::env::var("MODEL_CONFIG_PATH").ok(),
+            std::env::var("MODEL_CONFIG_DIR").ok(),
+        )?;
+        let cfg = match &source {
+            ConfigSource::File(p) => Self::from_toml_file(std::path::Path::new(p))?,
+            ConfigSource::Dir(d) => Self::from_toml_dir(std::path::Path::new(d))?,
+        };
         Ok(Arc::new(cfg))
     }
 
@@ -3855,5 +4006,188 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.compose_prompt, "compose it");
         assert_eq!(r.retry_depth, 1);
         assert_eq!(r.fallback_model.len(), 1);
+    }
+
+    #[test]
+    fn resolve_config_source_combinations() {
+        // Neither set → compiled-in default single file.
+        assert_eq!(
+            resolve_config_source(None, None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
+        // Path only.
+        assert_eq!(
+            resolve_config_source(Some("my.toml".to_string()), None).unwrap(),
+            ConfigSource::File("my.toml".to_string())
+        );
+        // Dir only.
+        assert_eq!(
+            resolve_config_source(None, Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        // Both set → hard error mentioning both var names.
+        let err = resolve_config_source(Some("my.toml".to_string()), Some("conf.d".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(
+            err.contains("MODEL_CONFIG_PATH") && err.contains("MODEL_CONFIG_DIR"),
+            "{err}"
+        );
+        // Empty string counts as unset (dotenv `VAR=` lines must not trip the exclusion).
+        assert_eq!(
+            resolve_config_source(Some(String::new()), Some("conf.d".to_string())).unwrap(),
+            ConfigSource::Dir("conf.d".to_string())
+        );
+        assert_eq!(
+            resolve_config_source(Some(String::new()), None).unwrap(),
+            ConfigSource::File("examples/model_config.toml".to_string())
+        );
+    }
+
+    fn write_cfg(dir: &std::path::Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn from_toml_file_reads_and_wraps_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "cfg.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        let cfg = ModelConfig::from_toml_file(&tmp.path().join("cfg.toml")).unwrap();
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+
+        // Missing file: error message carries the path.
+        let err = ModelConfig::from_toml_file(&tmp.path().join("nope.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.toml"), "{err}");
+
+        // Malformed TOML: error names the file and says parse failed.
+        write_cfg(tmp.path(), "broken.toml", "[tasks.a\nmodel = \n");
+        let err = ModelConfig::from_toml_file(&tmp.path().join("broken.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
+        assert!(err.contains("parse failed"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_split_load_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "defaults.toml",
+            "[defaults]\nfallback_model = \"p/fall\"\nfallback_temperature = 0.4\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "chat.toml",
+            "[tasks.chat_companion]\nmodel = \"p/chat\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "extraction.toml",
+            "[tasks.memory_extraction]\nmodel = \"p/extract\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.defaults.fallback_model.as_deref(), Some("p/fall"));
+        assert_eq!(cfg.defaults.fallback_temperature, Some(0.4));
+        assert_eq!(cfg.tasks.len(), 2);
+        assert!(matches!(&cfg.tasks["chat_companion"].model, ModelSpec::Fixed(m) if m == "p/chat"));
+        assert!(
+            matches!(&cfg.tasks["memory_extraction"].model, ModelSpec::Fixed(m) if m == "p/extract")
+        );
+    }
+
+    #[test]
+    fn from_toml_dir_ignores_dotfiles_subdirs_and_non_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "base.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        // All of these define a conflicting tasks.a — they must be skipped, not merged.
+        write_cfg(tmp.path(), ".hidden.toml", "[tasks.a]\nmodel = \"p/dot\"\n");
+        write_cfg(tmp.path(), "notes.txt", "[tasks.a]\nmodel = \"p/txt\"\n");
+        std::fs::create_dir(tmp.path().join("sub.toml")).unwrap(); // directory named *.toml
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        write_cfg(
+            &tmp.path().join("nested"),
+            "extra.toml",
+            "[tasks.a]\nmodel = \"p/nested\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        assert_eq!(cfg.tasks.len(), 1);
+        assert!(matches!(&cfg.tasks["a"].model, ModelSpec::Fixed(m) if m == "p/a"));
+    }
+
+    #[test]
+    fn from_toml_dir_empty_missing_or_no_toml_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty directory.
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Non-toml content only.
+        write_cfg(tmp.path(), "readme.md", "# not config");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no .toml files"), "{err}");
+        // Directory does not exist.
+        let err = ModelConfig::from_toml_dir(&tmp.path().join("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dir read failed"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_task_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[tasks.chat_companion]\nmodel = \"p/one\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[tasks.chat_companion]\nmodel = \"p/two\"\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tasks.chat_companion]"), "{err}");
+        assert!(err.contains("a.toml"), "{err}");
+        assert!(err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_defaults_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[defaults]\nfallback_temperature = 0.1\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[defaults]\nfallback_temperature = 0.2\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[defaults]"), "{err}");
+        assert!(err.contains("a.toml") && err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_syntax_error_names_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "good.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        write_cfg(tmp.path(), "broken.toml", "[tasks.b\nmodel = \n");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
     }
 }
