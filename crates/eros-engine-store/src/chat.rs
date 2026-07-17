@@ -479,6 +479,57 @@ impl<'a> ChatRepo<'a> {
         Ok(pairs)
     }
 
+    /// Up to `limit` recent (question, answer) pairs on the product-QA channel,
+    /// strictly before `message_id`'s sent_at, chronological. Mirrors
+    /// `recent_turn_pairs_before_message` but scoped to `channel='product_qa'`
+    /// rows (both sides of a product-QA exchange carry the marker). Feeds the
+    /// judge's `[最近产品咨询]` block and the executor's follow-up context.
+    pub async fn recent_product_qa_pairs(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+        limit: u8,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let fetch_n: i64 = (limit as i64) * 2 + 2;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 \
+               AND sent_at < (SELECT sent_at FROM engine.chat_messages WHERE id = $2) \
+               AND truncated = FALSE \
+               AND channel = 'product_qa' \
+               AND role IN ('user', 'assistant') \
+             ORDER BY sent_at DESC \
+             LIMIT $3",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .bind(fetch_n)
+        .fetch_all(self.pool)
+        .await?;
+
+        let mut chrono = rows;
+        chrono.reverse();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < chrono.len() {
+            let (role_a, content_a) = &chrono[i];
+            let (role_b, content_b) = &chrono[i + 1];
+            if role_a == "user" && role_b == "assistant" {
+                pairs.push((content_a.clone(), content_b.clone()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let want = limit as usize;
+        if pairs.len() > want {
+            let drop = pairs.len() - want;
+            pairs.drain(..drop);
+        }
+        Ok(pairs)
+    }
+
     /// Up to `limit` recent assistant `content` rows for the session, with
     /// `truncated = FALSE`, strictly before the current turn's user row
     /// (`before_message_id`). Returned newest-first. The cutoff is resolved
@@ -664,6 +715,24 @@ impl<'a> ChatRepo<'a> {
         sqlx::query(
             "UPDATE engine.chat_messages SET ghost_decision = true \
              WHERE id = $1 AND role = 'user' AND ghost_decision = false",
+        )
+        .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp the current turn's user row as a product-QA question
+    /// (`channel = 'product_qa'`). Idempotent — re-marking is a no-op. Only an
+    /// unmarked (`channel IS NULL`) text row is eligible; voice rows can never
+    /// reach the PDE, so the guard is belt-and-suspenders.
+    pub async fn mark_user_message_product_qa(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET channel = 'product_qa' \
+             WHERE id = $1 AND role = 'user' AND channel IS NULL",
         )
         .bind(user_message_id)
         .execute(self.pool)
@@ -916,6 +985,42 @@ impl<'a> ChatRepo<'a> {
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
               generation_id, assistant_action_type, channel) \
              VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice')",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(user_message_id)
+        .bind(truncated)
+        .bind(model)
+        .bind(usage)
+        .bind(generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist an out-of-character product answer: `role='assistant'`,
+    /// `assistant_action_type='reply'`, `channel='product_qa'`. No filter
+    /// audit, no continues_from — product answers are single, whole messages.
+    /// The channel marker keeps the row out of companion context while replay
+    /// and client history serve it normally.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_product_qa_assistant_message(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        id: Uuid,
+        content: &str,
+        model: Option<&str>,
+        usage: Option<&serde_json::Value>,
+        generation_id: Option<&str>,
+        truncated: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+             (id, session_id, role, content, user_message_id, truncated, model, usage, \
+              generation_id, assistant_action_type, channel) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'product_qa')",
         )
         .bind(id)
         .bind(session_id)
@@ -2979,5 +3084,139 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed_voice.id, voice.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_user_message_product_qa_stamps_channel_idempotently(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '介绍下这个产品') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        repo.mark_user_message_product_qa(user_id).await.unwrap();
+        repo.mark_user_message_product_qa(user_id).await.unwrap(); // re-mark = no-op
+
+        let ch: Option<String> =
+            sqlx::query_scalar("SELECT channel FROM engine.chat_messages WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ch.as_deref(), Some("product_qa"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_product_qa_assistant_message_round_trips(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'q') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let aid = Uuid::new_v4();
+        let usage = serde_json::json!({"total_tokens": 42});
+        repo.insert_product_qa_assistant_message(
+            session_id,
+            user_id,
+            aid,
+            "产品介绍……",
+            Some("anthropic/claude-haiku-4.5"),
+            Some(&usage),
+            Some("gen_pq_1"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let row: ChatMessage = sqlx::query_as("SELECT * FROM engine.chat_messages WHERE id = $1")
+            .bind(aid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.role, "assistant");
+        assert_eq!(row.channel.as_deref(), Some("product_qa"));
+        assert_eq!(row.assistant_action_type.as_deref(), Some("reply"));
+        assert_eq!(row.user_message_id, Some(user_id));
+        assert_eq!(row.generation_id.as_deref(), Some("gen_pq_1"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_product_qa_pairs_returns_only_marked_pairs_before_cutoff(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // normal pair (must NOT appear)
+        for (role, content) in [("user", "嗨"), ("assistant", "嗨呀")] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1,$2,$3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // product_qa pair (must appear)
+        for (role, content) in [("user", "这产品是什么"), ("assistant", "这是……")] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+                 VALUES ($1,$2,$3,'product_qa')",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // current-turn user row = cutoff
+        let cur: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', '那多少钱') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let pairs = repo
+            .recent_product_qa_pairs(session_id, cur, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![("这产品是什么".to_string(), "这是……".to_string())]
+        );
     }
 }
