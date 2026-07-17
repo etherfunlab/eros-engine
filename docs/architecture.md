@@ -57,6 +57,17 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
+**PDE action list.** The judge's (or rule engine's) per-turn action is one of
+`reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
+Three of these are conditionally available: `reply_image` and
+`reply_text_image` both require an `image` block on the request;
+`product_qa` requires `[tasks.chat_product_qa]` configured (with the LLM PDE
+enabled). Each degrades to `reply_text` when unavailable — never upgrades.
+`product_qa` short-circuits the whole companion chain (no persona prompt, no
+post-process): it routes to an independent product-QA executor instead of
+`ReplyHandler`. See [model-config.md](model-config.md) for the per-action
+gates.
+
 ## Auth
 
 Middleware (`auth::middleware::require_auth`) is layered onto `/comp/*` only. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
@@ -88,6 +99,12 @@ eros-engine-server :8080
 ```
 
 The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
+
+**`chat_messages.channel`**: `NULL` = normal text; `'voice'` = voice channel;
+`'product_qa'` = out-of-character product answer — non-NULL rows are
+excluded from companion context and memory (short-term recall, conversation
+signals, dreaming, affinity evaluation, insight extraction) while staying
+fully visible on the live stream, replay, and client history.
 
 ## Why pure-domain core
 
