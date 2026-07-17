@@ -876,7 +876,7 @@ impl ModelConfig {
     /// never changes the result — it only makes error messages deterministic).
     /// Split-by-section semantics: each `tasks.<name>` and every other top-level
     /// key must come from exactly one file; duplicates fail the load naming both
-    /// files (see Task 4 — added with the conflict tests).
+    /// files.
     pub fn from_toml_dir(dir: &std::path::Path) -> Result<Self, LlmError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             LlmError::Config(format!(
@@ -910,6 +910,9 @@ impl ModelConfig {
 
         let mut merged = toml::Table::new();
         let mut file_names: Vec<String> = Vec::new();
+        // Which file first defined each top-level key (or `tasks.<name>`) — so
+        // duplicate-definition errors can name both files.
+        let mut owners: HashMap<String, String> = HashMap::new();
         for file in &files {
             let file_name = file
                 .file_name()
@@ -934,9 +937,22 @@ impl ModelConfig {
                         .as_table_mut()
                         .expect("`tasks` is only ever inserted as a table");
                     for (task_name, task_value) in tasks {
+                        let owner_key = format!("tasks.{task_name}");
+                        if let Some(prev) = owners.get(&owner_key) {
+                            return Err(LlmError::Config(format!(
+                                "model_config merge failed: [tasks.{task_name}] in {file_name} already defined in {prev}"
+                            )));
+                        }
+                        owners.insert(owner_key, file_name.clone());
                         merged_tasks.insert(task_name, task_value);
                     }
                 } else {
+                    if let Some(prev) = owners.get(&key) {
+                        return Err(LlmError::Config(format!(
+                            "model_config merge failed: [{key}] in {file_name} already defined in {prev}"
+                        )));
+                    }
+                    owners.insert(key.clone(), file_name.clone());
                     merged.insert(key, value);
                 }
             }
@@ -4104,5 +4120,57 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("dir read failed"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_task_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[tasks.chat_companion]\nmodel = \"p/one\"\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[tasks.chat_companion]\nmodel = \"p/two\"\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tasks.chat_companion]"), "{err}");
+        assert!(err.contains("a.toml"), "{err}");
+        assert!(err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_duplicate_defaults_errors_naming_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "a.toml",
+            "[defaults]\nfallback_temperature = 0.1\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "b.toml",
+            "[defaults]\nfallback_temperature = 0.2\n",
+        );
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[defaults]"), "{err}");
+        assert!(err.contains("a.toml") && err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
+    fn from_toml_dir_syntax_error_names_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "good.toml", "[tasks.a]\nmodel = \"p/a\"\n");
+        write_cfg(tmp.path(), "broken.toml", "[tasks.b\nmodel = \n");
+        let err = ModelConfig::from_toml_dir(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken.toml"), "{err}");
     }
 }
