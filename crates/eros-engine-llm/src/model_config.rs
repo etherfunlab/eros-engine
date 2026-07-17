@@ -1210,6 +1210,19 @@ impl ModelConfig {
         })
     }
 
+    /// Side-effect-free availability check for the product-QA task: true iff
+    /// `[tasks.chat_product_qa]` is present with a non-blank `filter_prompt`.
+    /// The judge/guard wiring runs this every turn — unlike
+    /// `resolve_product_qa()` it never touches `resolve()`, so it advances no
+    /// round-robin cursor. Resolve the executor only when the action is
+    /// actually taken (the ProductQa arm).
+    pub fn product_qa_enabled(&self) -> bool {
+        self.tasks
+            .get("chat_product_qa")
+            .and_then(|t| t.filter_prompt.as_deref())
+            .is_some_and(|p| !p.trim().is_empty())
+    }
+
     /// Boot-time validation for the product-QA task: a present section must
     /// carry a usable `filter_prompt` (else `Err`); an absent section means the
     /// feature is simply off (`Ok`). Same contract as
@@ -3324,6 +3337,48 @@ filter_prompt = "只根据产品资料作答。"
         assert_eq!(p.answer_prompt, "只根据产品资料作答。");
         assert_eq!(p.max_tokens, 800);
         assert!(cfg.validate_product_qa_prompt().is_ok());
+    }
+
+    #[test]
+    fn product_qa_enabled_truth_table() {
+        // absent → false
+        let cfg = ModelConfig::from_toml_str(SAMPLE).unwrap();
+        assert!(!cfg.product_qa_enabled());
+        // present, blank filter_prompt → false
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\n")
+                .unwrap();
+        assert!(!cfg.product_qa_enabled());
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(!cfg.product_qa_enabled());
+        // present, non-blank filter_prompt → true
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_product_qa]\nmodel = \"x-ai/grok-4-mini\"\nfilter_prompt = \"只根据产品资料作答。\"\n",
+        )
+        .unwrap();
+        assert!(cfg.product_qa_enabled());
+    }
+
+    #[test]
+    fn product_qa_enabled_advances_no_round_robin_cursor() {
+        let toml = r#"
+[tasks.chat_product_qa]
+model = ["model-a", "model-b"]
+filter_prompt = "只根据产品资料作答。"
+        "#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        // Call the side-effect-free check several times — the round-robin
+        // cursor must not move.
+        assert!(cfg.product_qa_enabled());
+        assert!(cfg.product_qa_enabled());
+        assert!(cfg.product_qa_enabled());
+        // The first real resolve() must still land on the first round-robin
+        // pick — proving enabled() advanced nothing.
+        let p = cfg.resolve_product_qa().expect("resolves");
+        assert_eq!(p.model, "model-a");
     }
 
     #[test]

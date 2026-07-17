@@ -2646,16 +2646,17 @@ pub fn run_stream(
         } else {
             state.model_config.resolve_pde()
         };
-        // product_qa executor: hard-gated on the judge being live (spec §1.1) —
-        // resolve only then, so the availability flag, the judge ctx lines, and
-        // the arm all agree, and no model cursor advances on inert deployments.
-        let resolved_product_qa = if resolved_pde.is_some() {
-            state.model_config.resolve_product_qa()
-        } else {
-            None
-        };
+        // product_qa executor: hard-gated on the judge being live (spec §1.1).
+        // `resolve_product_qa()` advances the chat_product_qa round-robin model
+        // cursor as a side effect (like `resolve_pde()` above) — every judged
+        // turn would consume a cursor position even when the action taken is
+        // ordinary chat, skewing the model sequence actual product-QA
+        // executions see. Use the side-effect-free `product_qa_enabled()` here
+        // for availability; the executor itself is resolved only in the
+        // ProductQa arm below, where the action is actually taken.
+        let product_qa_available = resolved_pde.is_some() && state.model_config.product_qa_enabled();
         // One fetch per enabled turn, reused by judge ctx AND the executor arm.
-        let product_qa_pairs: Vec<(String, String)> = if resolved_product_qa.is_some() {
+        let product_qa_pairs: Vec<(String, String)> = if product_qa_available {
             chat_repo
                 .recent_product_qa_pairs(user_msg.session_id, user_msg.user_message_id, 3)
                 .await
@@ -2666,9 +2667,8 @@ pub fn run_stream(
         } else {
             Vec::new()
         };
-        let product_qa_recent: Option<String> = resolved_product_qa
-            .as_ref()
-            .map(|_| render_product_qa_pairs(&product_qa_pairs));
+        let product_qa_recent: Option<String> =
+            product_qa_available.then(|| render_product_qa_pairs(&product_qa_pairs));
         // Shared history transcript: built once, reused by the judge here AND the
         // input filter below (which previously fetched its own). `resolved_pde` is
         // already None on tip turns, so this only fires for a real judge turn.
@@ -2695,7 +2695,7 @@ pub fn run_stream(
                                 &input.affinity,
                                 &input.signals,
                                 image_executor_available,
-                                resolved_product_qa.is_some(),
+                                product_qa_available,
                             );
                             let hints = {
                                 let s = sanitize_inner_state(&v.inner_state);
@@ -2835,9 +2835,10 @@ pub fn run_stream(
                 // run the dedicated executor, persist with channel='product_qa'.
                 // Skips the entire companion chain — no vision, no input filter, no
                 // persona prompt, no output filter, no post_process.
-                let p = resolved_product_qa
-                    .as_ref()
-                    .expect("guard passed ⇒ chat_product_qa resolved");
+                let p = state
+                    .model_config
+                    .resolve_product_qa()
+                    .expect("guard passed ⇒ chat_product_qa resolvable");
                 if let Err(e) = chat_repo
                     .mark_user_message_product_qa(user_msg.user_message_id)
                     .await
