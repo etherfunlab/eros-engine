@@ -57,6 +57,11 @@ pub struct ChatMessage {
     pub generation_id: Option<String>,
     #[serde(default)]
     pub assistant_action_type: Option<String>,
+    /// Conversation-flavor marker (migrations 0030/0034): NULL = normal text
+    /// turn; 'voice' = voice channel; 'product_qa' = out-of-character product
+    /// answer (excluded from companion context).
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Input-filter rewrite of a `role='user'` row: the model-facing effective
     /// text when the user's original was rewritten (NULL otherwise). On
     /// assistant rows this column holds the OPPOSITE direction (the
@@ -2899,6 +2904,45 @@ mod tests {
             matches!(out, VoiceUserInsert::Duplicate(_)),
             "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn channel_check_accepts_product_qa_and_rejects_unknown(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // product_qa accepted
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'answer', 'product_qa')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("product_qa channel accepted");
+
+        // unknown channel rejected by the named CHECK
+        let err = sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) \
+             VALUES ($1, 'assistant', 'x', 'bogus')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect_err("bogus channel rejected");
+        assert!(err.to_string().contains("chat_messages_channel_check"));
+
+        // ChatMessage projection surfaces the column
+        let rows = repo.history(session_id, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel.as_deref(), Some("product_qa"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
