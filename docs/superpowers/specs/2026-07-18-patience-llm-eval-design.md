@@ -21,8 +21,10 @@ caps for patience only). No new LLM round-trip; no config flag.
   evaluator's JSON schema omits patience; `parse_affinity_eval` force-zeroes it;
   `merge_deltas` therefore keeps the rule value only.
 - **Per-turn rule delta** (`pde.rs::predict_reply_deltas`): long user msg (≥30 chars)
-  `+0.02`, very short (≤3) `−0.02`, stale gap (>24h) `−0.05`; a self-ghost turn applies
-  `−0.05` (`ghost_affinity_deltas`).
+  `+0.02`, very short (≤3) `−0.02`, stale gap (>24h) `−0.05`. Ghost turns compute a
+  *separate* `ghost_affinity_deltas()` (patience `−0.05`) onto the `ActionPlan`, but
+  `persist_affinity` routes Ghost to `record_ghost` instead of `persist_with_event`,
+  which discards it — so patience is **not** actually moved on a Ghost turn (see §1.4).
 - **EMA** (`Affinity::apply_deltas`, default `ema_inertia=0.5`): the combined delta is
   halved before landing, then clamped to `[0,1]`.
 - **Time decay** (`apply_time_decay`): patience **recovers** `+0.005/day` when idle —
@@ -107,11 +109,17 @@ large single-turn value, e.g. `+0.4` — expected, and surfaced on the debug/BFF
 
 ### 1.4 Fallback (no LLM patience read this turn)
 
-When `patience_target` is `None` — Proactive, Ghost (`R=−0.05`), short-user-msg skip,
-empty-assistant skip, eval timeout/error, or the model omitting `patience` — patience
-takes the **existing** path: add `R` through EMA + clamp. Fully backward-compatible;
-this is why **no config flag is needed** (prompt and parser ship together in one
-version, so there is no version skew to gate).
+When `patience_target` is `None` — Proactive, short-user-msg skip, empty-assistant
+skip, eval timeout/error, or the model omitting `patience` — patience takes the
+**existing** path: add `R` through EMA + clamp. Fully backward-compatible; this is why
+**no config flag is needed** (prompt and parser ship together in one version, so there
+is no version skew to gate).
+
+Ghost is **not** part of this fallback. `eval_skip_reason` marks Ghost turns `"ghost"`
+(no eval call is attempted, mirroring today), but that is moot for patience: Ghost
+persists via `record_ghost`, not `persist_with_event`, which discards the computed
+`ghost_affinity_deltas()` entirely. So patience is untouched by any delta or EMA on a
+Ghost turn — only `ghost_streak` / `total_ghosts` / `last_ghost_at` move.
 
 ### 1.5 Data threading (keeps core untouched)
 

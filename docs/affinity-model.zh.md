@@ -13,7 +13,7 @@
 | `trust` | 0.0 ↔ 1.0 | `0.0` | 话题深度，是否愿意暴露自己。Bond 轴。 |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | 好奇心、追问动力，抗 ghost 的主力。Bond 轴。 |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | 内部梗、昵称、回头呼应之前的细节。Chemistry 轴。 |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。规则所有——不参与评估，不计入两条线。 |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。LLM 每轮给绝对值（0~1，每 0.1 档）+ 规则 delta，直接写入（不走 EMA/上限）。不计入两条线。 |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | 推拉、玩闹式的小摩擦、傲娇空间。Chemistry 轴。 |
 
 只有 `warmth` 可以为负值。其余五个都限制在 `[0, 1]`。每次更新都会对六个轴做夹钳（clamp）。
@@ -44,6 +44,18 @@ tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 
 `warmth`、`trust`、`intimacy` 不衰退——它们是"深层"维度。
 
+### Patience：LLM 绝对读数 + 规则 delta
+
+`patience` 不再是纯规则轴。每轮的 `affinity_evaluation`（与其余五轴同一次 LLM 调用，不产生新的往返）中，模型现在会额外给出一个**绝对**的 `patience` 读数（`0.0`–`1.0`，每 `0.1` 一档，代表当前对用户还剩多少耐心，而非变化量）。引擎把模型读数四舍五入到最近的 `0.1` 并夹钳到 `[0, 1]`，记为 `L`。
+
+PDE 仍照常计算这一轮回复/主动消息的规则 delta `R`（`predict_reply_deltas`：长消息 +0.02 / 极短消息 −0.02 / 超过 24 小时未活动 −0.05）——这部分不变。
+
+本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。持久化时，`apply_deltas` 照常先跑一遍（六轴统一走 EMA + 非对称上限），随后 patience 被 `patience_target` **直接覆盖**——绕过 EMA 平滑与 ±0.4/−0.6 上限（那两项上限仍作用于其余五个 delta 轴）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
+
+**兜底：** 当本轮没有 LLM patience 读数时——Proactive、用户消息过短、助手回复为空、或评估调用报错/超时/模型省略了 `patience` 字段——`patience_target` 为 `None`，patience 走**旧路径**：把 `R` 通过 EMA 叠加并夹钳。
+
+**Ghost 走独立路径，不是兜底。** Ghost 回合根本不会进入 `persist_with_event`——`persist_affinity` 把它分派给 `record_ghost`，该函数不接收任何 delta、从不跑 `apply_deltas`/EMA，只递增 `ghost_streak` / `total_ghosts` / `last_ghost_at`（写入的是全零 `effective_deltas`）。PDE 的 `ghost_affinity_deltas()`（patience `−0.05`、tension `+0.05`——与 `predict_reply_deltas` 是不同的函数）会被计算进 `ActionPlan`，但在持久化时被丢弃。因此 Ghost 回合的 `patience` 既不会被任何 delta 移动，也不会经过 EMA——只有 ghost 计数器会变化。
+
 ## 两条衍生线
 
 六个轴会生成两个合成分数。`warm_pos` 是 `warmth.max(0.0)` —— 以 0 为下界，而不是整体平移；因此中性或冷漠的会话贡献为零：
@@ -54,7 +66,7 @@ chemistry = (warm_pos + intimacy + tension)  / 3    ∈ [0, 1]
 ```
 
 `warmth` 会进入两条线：冷漠的回复会同时拉低 Bond 和 Chemistry。
-`patience` 不计入任何一条线，因为它由规则所有，不参与每轮评估。
+`patience` 不计入任何一条线——它由 LLM 绝对读数 + 规则 delta 维护，直接写入；两条线仍不含 patience（设计如此）。
 
 以默认种子（`warmth 0.1`，`trust/intrigue/tension 0`）开始，新会话的
 bond ≈ chemistry ≈ 0.033——两条线均在第 1 档（陌生人）。
