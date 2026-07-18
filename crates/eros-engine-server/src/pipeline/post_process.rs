@@ -269,6 +269,7 @@ async fn persist_affinity(
                     event_type,
                     context,
                     meta.as_ref(),
+                    None,
                 )
                 .await
             {

@@ -228,6 +228,8 @@ impl<'a> AffinityRepo<'a> {
     /// bug the six-axis activation makes real — design spec §6.2). Time
     /// decay is computed from the locked row, not a pre-read snapshot.
     /// Mutates `affinity` in place to reflect the persisted state.
+    /// `patience_target: Some(p)` overwrites patience with `p` directly after `apply_deltas`, bypassing EMA and the caps; `None` keeps the EMA path.
+    #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern; patience_target is the odd one out
     pub async fn persist_with_event(
         &self,
         affinity: &mut Affinity,
@@ -236,6 +238,7 @@ impl<'a> AffinityRepo<'a> {
         event_type: &str,
         context: serde_json::Value,
         meta: Option<&crate::OpenRouterCallMeta>,
+        patience_target: Option<f64>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -262,6 +265,16 @@ impl<'a> AffinityRepo<'a> {
         };
 
         current.apply_deltas(deltas, ema_inertia);
+
+        // patience is LLM-owned as an ABSOLUTE this turn: overwrite the EMA'd
+        // value with the target (L + rule_delta), bypassing EMA + the ±caps.
+        // L and the rule delta are both independent of the current value, so
+        // this direct set is race-safe. `apply_deltas` is left unchanged; its
+        // EMA'd patience from above is simply discarded here.
+        if let Some(p) = patience_target {
+            current.patience = p.clamp(0.0, 1.0);
+        }
+
         let label = current.legacy_relationship_label();
         current.relationship_label = Some(label);
 
@@ -433,6 +446,7 @@ mod tests {
             "message",
             serde_json::json!({ "source": "test" }),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -494,9 +508,17 @@ mod tests {
             warmth: 0.4,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.8, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.8,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let row: (serde_json::Value, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT deltas, effective_deltas FROM engine.companion_affinity_events \
@@ -533,9 +555,17 @@ mod tests {
             trust: 5.0,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let eff: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT effective_deltas FROM engine.companion_affinity_events WHERE affinity_id = $1",
@@ -606,6 +636,7 @@ mod tests {
                 "message",
                 serde_json::json!({}),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -622,6 +653,7 @@ mod tests {
                 0.0,
                 "message",
                 serde_json::json!({}),
+                None,
                 None,
             )
             .await
@@ -666,9 +698,17 @@ mod tests {
             tension: 0.3,  // 0.1 -> 0.4
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(
             reloaded.relationship_label,
@@ -949,9 +989,17 @@ mod tests {
             patience: 0.0,
             tension: 0.2,
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let (bond, chemistry): (f64, f64) =
             sqlx::query_as("SELECT bond, chemistry FROM engine.companion_affinity WHERE id = $1")
                 .bind(a.id)
@@ -978,13 +1026,100 @@ mod tests {
             tension: 0.9,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(
             reloaded.relationship_label,
             Some(RelationshipLabel::Romantic)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_patience_target_sets_directly_bypassing_ema(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        assert!(
+            (a.patience - 0.5).abs() < 1e-9,
+            "fresh seed patience is 0.5"
+        );
+
+        // A rule delta that WOULD (via EMA 0.8 → blend 0.2) move patience to
+        // 0.5 + 0.2*0.4 = 0.58, plus an absolute target of 0.9. The target must
+        // win: patience lands on 0.9, NOT 0.58.
+        let deltas = AffinityDeltas {
+            patience: 0.4,
+            ..Default::default()
+        };
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.8,
+            "message",
+            serde_json::json!({}),
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        assert!(
+            (reloaded.patience - 0.9).abs() < 1e-9,
+            "patience_target set directly, bypassing EMA; got {}",
+            reloaded.patience
+        );
+        assert!((a.patience - 0.9).abs() < 1e-9, "in-memory mutated too");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_patience_none_keeps_ema_path(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let deltas = AffinityDeltas {
+            patience: 0.4,
+            ..Default::default()
+        };
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.8,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        // EMA blend 0.2 * 0.4 = 0.08 → 0.5 + 0.08 = 0.58.
+        assert!(
+            (reloaded.patience - 0.58).abs() < 1e-9,
+            "None → normal EMA path; got {}",
+            reloaded.patience
         );
     }
 
@@ -1004,9 +1139,17 @@ mod tests {
             intrigue: 0.9,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         // Flat turn crosses nothing.
         repo.persist_with_event(
             &mut a,
@@ -1014,6 +1157,7 @@ mod tests {
             0.0,
             "message",
             serde_json::json!({}),
+            None,
             None,
         )
         .await
@@ -1051,9 +1195,17 @@ mod tests {
             warmth: -0.4,
             ..Default::default()
         };
-        repo.persist_with_event(&mut a, &deltas, 0.0, "message", serde_json::json!({}), None)
-            .await
-            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &deltas,
+            0.0,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         // before: warmth 0.1, bond=(0.1+0+0)/3=0.0333 ; after: warmth -0.3 → floored 0 → bond 0.
         // exact line delta = 0 - 0.0333 = -0.0333 (a raw fold would give -0.4/3 = -0.133).
         let line: serde_json::Value = sqlx::query_scalar(
@@ -1102,6 +1254,7 @@ mod tests {
             "message",
             serde_json::json!({}),
             Some(&meta),
+            None,
         )
         .await
         .unwrap();
