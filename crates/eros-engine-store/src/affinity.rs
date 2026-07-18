@@ -228,7 +228,7 @@ impl<'a> AffinityRepo<'a> {
     /// bug the six-axis activation makes real — design spec §6.2). Time
     /// decay is computed from the locked row, not a pre-read snapshot.
     /// Mutates `affinity` in place to reflect the persisted state.
-    /// `patience_target: Some(p)` overwrites patience with `p` directly after `apply_deltas`, bypassing EMA and the caps; `None` keeps the EMA path.
+    /// `patience_target: Some(p)` overwrites patience with `p` directly after `apply_deltas`, bypassing EMA smoothing (the value is still `[0,1]`-clamped); `None` keeps the EMA path.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern; patience_target is the odd one out
     pub async fn persist_with_event(
         &self,
@@ -267,7 +267,10 @@ impl<'a> AffinityRepo<'a> {
         current.apply_deltas(deltas, ema_inertia);
 
         // patience is LLM-owned as an ABSOLUTE this turn: overwrite the EMA'd
-        // value with the target (L + rule_delta), bypassing EMA + the ±caps.
+        // value with the target (L + rule_delta), bypassing EMA smoothing (the
+        // value is still clamped to [0,1] below). The ±0.4/−0.6 caps never
+        // applied to patience in the first place — they're per-axis in
+        // parse_affinity_eval, on the five LLM delta axes only.
         // L and the rule delta are both independent of the current value, so
         // this direct set is race-safe. `apply_deltas` is left unchanged; its
         // EMA'd patience from above is simply discarded here.
@@ -1085,6 +1088,19 @@ mod tests {
             reloaded.patience
         );
         assert!((a.patience - 0.9).abs() < 1e-9, "in-memory mutated too");
+
+        let eff: (Option<serde_json::Value>,) = sqlx::query_as(
+            "SELECT effective_deltas FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let effective = eff.0.expect("effective_deltas present");
+        assert!(
+            (effective["patience"].as_f64().unwrap() - 0.4).abs() < 1e-9,
+            "effective patience = target(0.9) − before(0.5) = 0.4, got {effective}"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

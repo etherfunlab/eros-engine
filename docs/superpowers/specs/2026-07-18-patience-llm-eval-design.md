@@ -7,8 +7,9 @@ moves at a meaningful pace. Today `patience` is **rule-owned** — the affinity
 evaluator is told not to touch it, and it drifts only by tiny deterministic nudges
 (±0.02 / ±0.05 raw, then halved by EMA), so it crawls. This spec has the existing
 `affinity_evaluation` LLM emit an **absolute** patience level, combines it with the
-PDE rule delta, and writes the result **directly** (bypassing EMA and the per-axis
-caps for patience only). No new LLM round-trip; no config flag.
+PDE rule delta, and writes the result **directly** (bypassing EMA for patience only;
+patience was never subject to the ±0.4 / −0.6 per-axis caps to begin with). No new
+LLM round-trip; no config flag.
 
 ---
 
@@ -84,19 +85,21 @@ patience_target = clamp(L + R, 0, 1)
   re-snapped** — snapping it would round `R` away and defeat "再加规则 delta". The 0.1
   quantisation constrains the LLM read only, not the stored value.
 
-### 1.3 Write it directly (bypass EMA + caps for patience)
+### 1.3 Write it directly (bypass EMA for patience)
 
 In `persist_with_event`, after the row is locked and time-decayed and the pre-delta
 baseline snapshotted:
 
-1. `apply_deltas(deltas, ema_inertia)` runs **unchanged** — it applies all six axes
-   through EMA + the ±0.4 / −0.6 asymmetric caps (patience included, harmlessly, since
-   it is overwritten next).
+1. `apply_deltas(deltas, ema_inertia)` runs **unchanged** — it applies EMA smoothing
+   and the `[0,1]` clamp to all six axes (patience included, harmlessly, since it is
+   overwritten next). The ±0.4 / −0.6 asymmetric caps were already applied earlier, in
+   `parse_affinity_eval`, to the five LLM delta axes only — patience is never subject
+   to them.
 2. When `patience_target.is_some()`, **patience is overwritten** with `patience_target`
-   directly — no EMA, no cap (the EMA'd rule application from step 1 is discarded, so
-   there is no double count). This is the "全量落地" behaviour: patience lands on the
-   LLM read (± rule nudge) this turn. `apply_deltas` itself is **not** modified to skip
-   patience.
+   directly — no EMA (the EMA'd rule application from step 1 is discarded, so there is
+   no double count); the value is still clamped to `[0,1]`. This is the "全量落地"
+   behaviour: patience lands on the LLM read (± rule nudge) this turn. `apply_deltas`
+   itself is **not** modified to skip patience.
 
 **Race-safety.** `L` (an absolute LLM read of the snapshot) and `R` (a rule delta) are
 both **independent of the current patience value**. `patience_target = L + R` is an
@@ -110,7 +113,8 @@ large single-turn value, e.g. `+0.4` — expected, and surfaced on the debug/BFF
 ### 1.4 Fallback (no LLM patience read this turn)
 
 When `patience_target` is `None` — Proactive, short-user-msg skip, empty-assistant
-skip, eval timeout/error, or the model omitting `patience` — patience takes the
+skip, `no_persona_or_affinity` (persona load fails or no affinity row exists), eval
+timeout/error, or the model omitting `patience` — patience takes the
 **existing** path: add `R` through EMA + clamp. Fully backward-compatible; this is why
 **no config flag is needed** (prompt and parser ship together in one version, so there
 is no version skew to gate).

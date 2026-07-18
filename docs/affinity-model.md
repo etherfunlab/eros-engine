@@ -15,7 +15,7 @@ for scores, labels, and per-turn label transitions.
 | `trust` | 0.0 ↔ 1.0 | `0.0` | Topic depth, willingness to disclose self. Bond axis. |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | Curiosity, follow-up questions, anti-ghost driver. Bond axis. |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | Inside jokes, nicknames, callbacks to earlier details. Chemistry axis. |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. The LLM gives an absolute read each turn (0–1, 0.1 steps) + a rule delta, written directly (bypasses EMA/caps). Excluded from both lines. |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. The LLM gives an absolute read each turn (0–1, 0.1 steps) + a rule delta, written directly (bypasses EMA; still `[0,1]`-clamped). Excluded from both lines. |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | Push-pull, playful friction, tsundere affordance. Chemistry axis. |
 
 `warmth` is the only axis that can go negative. The other five are bounded to
@@ -65,17 +65,19 @@ The PDE still computes the reply/proactive-turn rule delta `R` as before
 
 The turn's target is `patience_target = clamp(L + R, 0, 1)`; the sum is **not**
 re-rounded to the `0.1` grid (the grid constrains the LLM read only, so `R` can nudge
-the result off-grid). On persist, `apply_deltas` still runs first as usual (all six
-axes go through EMA + the asymmetric caps), and patience is then **overwritten
-directly** with `patience_target` — bypassing EMA smoothing and the ±0.4/−0.6 caps
-(those caps still apply to the other five delta axes). Because both `L` and `R` are
-independent of the currently stored value, this write is race-safe with no
+the result off-grid). The ±0.4/−0.6 asymmetric caps are applied earlier, in
+`parse_affinity_eval`, to the five LLM delta axes only — patience is never subject to
+them. On persist, `apply_deltas` still runs first as usual (all six axes go through
+EMA smoothing + the `[0,1]` clamp), and patience is then **overwritten directly** with
+`patience_target` — bypassing EMA smoothing (still `[0,1]`-clamped). Because both `L`
+and `R` are independent of the currently stored value, this write is race-safe with no
 read-modify-write needed.
 
 **Fallback:** when there is no LLM patience read this turn — Proactive, a short user
-message, an empty assistant reply, or the eval call erroring, timing out, or the
-model omitting the `patience` field — `patience_target` is `None` and patience takes
-the **old** path: `R` is added through EMA and clamped.
+message, an empty assistant reply, `no_persona_or_affinity` (persona load fails or no
+affinity row exists), or the eval call erroring, timing out, or the model omitting the
+`patience` field — `patience_target` is `None` and patience takes the **old** path: `R`
+is added through EMA and clamped.
 
 **Ghost is a separate path, not a fallback.** A Ghost turn never reaches
 `persist_with_event` — `persist_affinity` dispatches it to `record_ghost` instead,
