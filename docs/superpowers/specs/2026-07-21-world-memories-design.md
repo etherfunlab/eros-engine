@@ -24,9 +24,11 @@ director output; implemented after this spec).
   `user_id` and `owner_uid` are the same value. All world tables key on
   `owner_uid`.
 - **Memory-feedback evolution.** Each director round reads the previous seed +
-  persona genome summaries + recent **extracted** relationship-layer
-  `companion_memories` (dreaming-lite output — never raw chat), so the world
-  echoes what the user actually talked about.
+  persona genome summaries + recent **extracted** `companion_memories`
+  (dreaming-lite's categorised profile-layer output — never raw chat), so the
+  world echoes what the user actually talked about. The relationship layer
+  stores raw per-turn user lines, so it is deliberately NOT fed to the
+  director.
 - **The user is off-stage but mentionable.** Scripts describe persona↔persona
   life; personas may naturally reference the user (based on fed-back memories)
   but the director must never invent user actions.
@@ -159,8 +161,9 @@ One structured call per claimed owner. Prompt inputs:
    `persona_genomes` + `art_metadata`, for the owner's `status = 'active'`
    instances. **Cap 8 instances** (earliest-created wins); truncation emits a
    `tracing::warn`.
-3. Memory feedback: the most recent **K=5** relationship-layer
-   `companion_memories` rows per instance (extracted content only).
+3. Memory feedback: the owner's most recent **K=15** extracted profile-layer
+   `companion_memories` rows (`category IS NOT NULL` — dreaming-lite output;
+   the relationship layer holds raw user lines and is never sent).
 4. Fixed rules: user is off-stage, may be referenced, never fabricate user
    actions; fragments must be self-contained sentences suitable for standalone
    recall.
