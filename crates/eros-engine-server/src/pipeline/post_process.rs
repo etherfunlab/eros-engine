@@ -125,7 +125,7 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (llm_deltas, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
+        let (llm_deltas, patience_abs, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
             let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
             let persona_name = match persona_repo.load_companion(instance_id).await {
@@ -149,6 +149,7 @@ pub async fn run(
                 }
                 _ => (
                     eros_engine_core::affinity::AffinityDeltas::default(),
+                    None,
                     String::new(),
                     None,
                     Some("no_persona_or_affinity"),
@@ -157,6 +158,7 @@ pub async fn run(
         } else {
             (
                 eros_engine_core::affinity::AffinityDeltas::default(),
+                None,
                 String::new(),
                 None,
                 pre_skip,
@@ -164,6 +166,7 @@ pub async fn run(
         };
 
         let combined = merge_deltas(&plan.affinity_deltas, &llm_deltas);
+        let patience_tgt = patience_target(patience_abs, combined.patience);
         let context = build_affinity_context(&reason, skip_reason);
 
         persist_affinity(
@@ -175,6 +178,7 @@ pub async fn run(
             combined,
             context,
             affinity_meta,
+            patience_tgt,
         )
         .await;
     };
@@ -208,6 +212,7 @@ async fn persist_affinity(
     deltas: eros_engine_core::affinity::AffinityDeltas,
     context: serde_json::Value,
     meta: Option<eros_engine_store::OpenRouterCallMeta>,
+    patience_target: Option<f64>,
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -269,6 +274,7 @@ async fn persist_affinity(
                     event_type,
                     context,
                     meta.as_ref(),
+                    patience_target,
                 )
                 .await
             {
@@ -422,9 +428,9 @@ pub(crate) fn find_json_block(raw: &str) -> Option<&str> {
 const LLM_AXIS_POS_CAP: f64 = 0.4;
 const LLM_AXIS_NEG_CAP: f64 = -0.6;
 
-/// Raw shape of the affinity evaluator's JSON output. `patience` is
-/// intentionally absent — it is rule-owned, so any `patience` the model
-/// emits is dropped by serde (unknown field). Missing axes default to 0.
+/// Raw shape of the affinity evaluator's JSON output. Missing axes default to 0.
+/// `patience` is read as an absolute (snapped to 0.1), separate from the rule-owned
+/// per-axis deltas, and parsed leniently (see `de_lenient_patience`).
 #[derive(Debug, Default, serde::Deserialize)]
 struct LlmAffinityEval {
     #[serde(default)]
@@ -437,23 +443,63 @@ struct LlmAffinityEval {
     intimacy: f64,
     #[serde(default)]
     tension: f64,
+    #[serde(default, deserialize_with = "de_lenient_patience")]
+    patience: Option<f64>,
     #[serde(default)]
     reason: String,
+}
+
+/// Lenient deserializer for the optional absolute `patience` read. A quoted
+/// number (`"patience":"0.5"`) is a common LLM formatting slip; without this,
+/// serde would fail the *entire* `LlmAffinityEval` parse on it and drop the five
+/// valid delta axes too. Accepts a JSON number or a *finite* numeric string →
+/// `Some`; null / bool / any other shape / a non-finite string (`"NaN"`,
+/// `"inf"`, which `f64::from_str` otherwise accepts) → `None`. Never errors, so
+/// a malformed patience value can only affect patience — never the deltas — and
+/// a non-finite value can never reach `snap_patience`/`clamp` (they preserve
+/// NaN) or be persisted as a patience target.
+fn de_lenient_patience<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(de)?;
+    Ok(match v {
+        // JSON numbers cannot encode NaN/inf, so the number path is finite by construction.
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    })
+}
+
+/// Snap the LLM's absolute patience read to the nearest 0.1 step, clamped to
+/// [0,1]. The 0.1 quantisation is a spec contract on the read only — a model
+/// that emits 0.83 is snapped to 0.8.
+fn snap_patience(v: f64) -> f64 {
+    ((v * 10.0).round() / 10.0).clamp(0.0, 1.0)
 }
 
 /// Parse + per-axis clamp the evaluator output into rule-mergeable deltas.
 /// Any failure (non-JSON, no object) → all-zero deltas + empty reason, so
 /// the rule deltas still persist and the affinity write never fails because
-/// the evaluator failed. `patience` is forced to 0 (rule-owned).
-fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas, String) {
+/// the evaluator failed. Returns a 3-tuple: (deltas, snapped_patience, reason).
+/// `patience` is read as an absolute (snapped to 0.1) and returned separately;
+/// the deltas.patience stays 0.0 (rule-owned channel).
+fn parse_affinity_eval(
+    raw: &str,
+) -> (
+    eros_engine_core::affinity::AffinityDeltas,
+    Option<f64>,
+    String,
+) {
     use eros_engine_core::affinity::AffinityDeltas;
     let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
         .ok()
         .or_else(|| find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
     let Some(e) = parsed else {
-        return (AffinityDeltas::default(), String::new());
+        return (AffinityDeltas::default(), None, String::new());
     };
     let cap = |v: f64| v.clamp(LLM_AXIS_NEG_CAP, LLM_AXIS_POS_CAP);
+    let patience_abs = e.patience.map(snap_patience);
     (
         AffinityDeltas {
             warmth: cap(e.warmth),
@@ -463,8 +509,17 @@ fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AffinityDeltas
             tension: cap(e.tension),
             patience: 0.0,
         },
+        patience_abs,
         e.reason,
     )
+}
+
+/// Combine the LLM's absolute patience read `L` with the PDE rule delta into
+/// the turn's absolute patience target. `None` (no LLM read) → the caller
+/// falls back to the rule-delta-through-EMA path. The sum is NOT re-snapped —
+/// the 0.1 grid constrains the LLM read only, so the rule nudge survives.
+fn patience_target(patience_abs: Option<f64>, rule_delta: f64) -> Option<f64> {
+    patience_abs.map(|l| (l + rule_delta).clamp(0.0, 1.0))
 }
 
 /// Sum the rule (behavioral) and LLM (semantic) contributions per axis.
@@ -608,9 +663,11 @@ fn build_affinity_context(reason: &str, skip_reason: Option<&str>) -> serde_json
 }
 
 /// Run the haiku affinity evaluator for one Reply turn. Returns the clamped
-/// per-axis LLM deltas + the model's reason. Any failure (LLM error,
-/// non-JSON) yields all-zero deltas + empty reason so the rule deltas still
-/// persist and the affinity write never fails because the evaluator failed.
+/// per-axis LLM deltas, the snapped absolute patience read (`None` when the
+/// model omitted it), and the model's reason. Any failure (LLM error,
+/// non-JSON) yields all-zero deltas + no patience read + empty reason so the
+/// rule deltas still persist and the affinity write never fails because the
+/// evaluator failed.
 async fn evaluate_affinity(
     state: &AppState,
     session_id: Uuid,
@@ -621,6 +678,7 @@ async fn evaluate_affinity(
     audit_user: Option<&str>,
 ) -> (
     eros_engine_core::affinity::AffinityDeltas,
+    Option<f64>,
     String,
     Option<eros_engine_store::OpenRouterCallMeta>,
     Option<&'static str>,
@@ -659,6 +717,7 @@ async fn evaluate_affinity(
                 tracing::warn!("affinity eval LLM call failed: {e}");
                 return (
                     AffinityDeltas::default(),
+                    None,
                     String::new(),
                     None,
                     Some("eval_error"),
@@ -670,6 +729,7 @@ async fn evaluate_affinity(
             );
                 return (
                     AffinityDeltas::default(),
+                    None,
                     String::new(),
                     None,
                     Some("eval_timeout"),
@@ -677,12 +737,12 @@ async fn evaluate_affinity(
             }
         };
 
-    let (deltas, reason) = parse_affinity_eval(&raw);
+    let (deltas, patience_abs, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
     // Eval ran, but a salvaged response can still lack a generation_id — mark it
     // so a NULL audit join key is never left unexplained.
     let skip = meta.as_ref().and_then(meta_skip_reason);
-    (deltas, reason, meta, skip)
+    (deltas, patience_abs, reason, meta, skip)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -1112,7 +1172,7 @@ mod tests {
     #[test]
     fn parse_affinity_eval_valid_clamps_and_keeps_reason() {
         let raw = r#"{"warmth":0.08,"trust":0.03,"intimacy":0.06,"intrigue":0.02,"tension":-0.01,"reason":"暖"}"#;
-        let (d, reason) = parse_affinity_eval(raw);
+        let (d, _p, reason) = parse_affinity_eval(raw);
         assert!((d.warmth - 0.08).abs() < 1e-9);
         assert!((d.trust - 0.03).abs() < 1e-9);
         assert!((d.intimacy - 0.06).abs() < 1e-9);
@@ -1125,22 +1185,113 @@ mod tests {
     #[test]
     fn parse_affinity_eval_clamps_out_of_range() {
         let raw = r#"{"warmth":5.0,"trust":-2.0,"reason":"x"}"#;
-        let (d, _) = parse_affinity_eval(raw);
+        let (d, _p, _) = parse_affinity_eval(raw);
         assert!((d.warmth - 0.4).abs() < 1e-9, "warmth caps at +0.4");
         assert!((d.trust - (-0.6)).abs() < 1e-9, "trust delta caps at -0.6");
     }
 
     #[test]
-    fn parse_affinity_eval_ignores_patience_field() {
-        let raw = r#"{"warmth":0.1,"patience":0.99,"reason":"x"}"#;
-        let (d, _) = parse_affinity_eval(raw);
-        assert_eq!(d.patience, 0.0, "patience from the model is ignored");
+    fn parse_affinity_eval_reads_patience_as_absolute_snapped() {
+        // 0.83 snaps to the nearest 0.1 → 0.8; the five delta axes are unaffected.
+        let raw = r#"{"warmth":0.1,"patience":0.83,"reason":"x"}"#;
+        let (d, p, _) = parse_affinity_eval(raw);
+        assert_eq!(
+            d.patience, 0.0,
+            "AffinityDeltas.patience stays 0 (rule-only channel)"
+        );
         assert!((d.warmth - 0.1).abs() < 1e-9);
+        assert_eq!(p, Some(0.8), "patience is read as a snapped absolute");
+    }
+
+    #[test]
+    fn parse_affinity_eval_patience_clamped() {
+        assert_eq!(parse_affinity_eval(r#"{"patience":1.4}"#).1, Some(1.0));
+        assert_eq!(parse_affinity_eval(r#"{"patience":-0.3}"#).1, Some(0.0));
+    }
+
+    #[test]
+    fn parse_affinity_eval_absent_patience_is_none() {
+        let (_d, p, _) = parse_affinity_eval(r#"{"warmth":0.1,"reason":"x"}"#);
+        assert_eq!(p, None, "model omitting patience → None → fallback path");
+    }
+
+    #[test]
+    fn parse_affinity_eval_garbage_patience_none() {
+        let (_d, p, _) = parse_affinity_eval("not json at all");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_affinity_eval_quoted_patience_salvaged_deltas_survive() {
+        // A quoted number ("0.5") is a common LLM slip. It must NOT fail the
+        // whole struct parse (which would zero the five valid delta axes too):
+        // the deltas survive AND the numeric string is salvaged + snapped.
+        let raw = r#"{"warmth":0.1,"trust":0.05,"patience":"0.5","reason":"x"}"#;
+        let (d, p, _) = parse_affinity_eval(raw);
+        assert!(
+            (d.warmth - 0.1).abs() < 1e-9,
+            "warmth survives a bad patience"
+        );
+        assert!(
+            (d.trust - 0.05).abs() < 1e-9,
+            "trust survives a bad patience"
+        );
+        assert_eq!(p, Some(0.5), "quoted numeric patience is salvaged");
+    }
+
+    #[test]
+    fn parse_affinity_eval_malformed_patience_ignored_deltas_survive() {
+        // Non-numeric / wrong-typed patience → None, but the five deltas still
+        // parse (the regression codex flagged: one bad optional field must not
+        // discard the whole turn's affinity update).
+        for raw in [
+            r#"{"warmth":0.2,"patience":"abc","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":true,"reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":{"v":1},"reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":null,"reason":"x"}"#,
+            // Non-finite quoted strings: `f64::from_str` accepts these, but they
+            // must NOT leak (NaN survives snap/clamp and would poison scoring).
+            r#"{"warmth":0.2,"patience":"NaN","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"inf","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"-inf","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"infinity","reason":"x"}"#,
+        ] {
+            let (d, p, _) = parse_affinity_eval(raw);
+            assert!((d.warmth - 0.2).abs() < 1e-9, "warmth survives: {raw}");
+            assert_eq!(p, None, "malformed patience → None: {raw}");
+        }
+    }
+
+    #[test]
+    fn patience_target_combines_absolute_and_rule_delta() {
+        // L 0.9 + rule delta 0.03 = 0.93, no snap on the sum. Float arithmetic →
+        // compare with a tolerance, NOT assert_eq! on the raw f64 (0.9+0.03 is
+        // not bit-identical to the 0.93 literal).
+        let t = patience_target(Some(0.9), 0.03).expect("Some");
+        assert!((t - 0.93).abs() < 1e-9, "got {t}");
+        // clamps land on exact bound literals → assert_eq is safe here.
+        assert_eq!(patience_target(Some(1.0), 0.05), Some(1.0)); // ceiling clamp
+        assert_eq!(patience_target(Some(0.0), -0.05), Some(0.0)); // floor clamp
+                                                                  // no LLM read → None (fallback path)
+        assert_eq!(patience_target(None, -0.02), None);
+    }
+
+    #[test]
+    fn snap_patience_rounds_to_nearest_tenth_and_clamps() {
+        assert_eq!(snap_patience(0.83), 0.8);
+        assert_eq!(snap_patience(0.86), 0.9); // rounds up to the nearest 0.1
+        assert_eq!(snap_patience(0.84), 0.8); // rounds down
+        assert_eq!(snap_patience(0.04), 0.0);
+        assert_eq!(snap_patience(1.4), 1.0);
+        assert_eq!(snap_patience(-0.2), 0.0);
+        // NOTE: 0.85 is intentionally NOT tested — as an f64 it is 8.4999…×10,
+        // so it snaps to 0.8, not 0.9; the exact half-point is representation-
+        // dependent and a poor test anchor.
     }
 
     #[test]
     fn parse_affinity_eval_garbage_returns_default() {
-        let (d, reason) = parse_affinity_eval("not json at all");
+        let (d, _p, reason) = parse_affinity_eval("not json at all");
         assert_eq!(d.warmth, 0.0);
         assert_eq!(d.trust, 0.0);
         assert_eq!(d.intrigue, 0.0);
@@ -1153,7 +1304,7 @@ mod tests {
     #[test]
     fn parse_affinity_eval_missing_fields_default_zero() {
         let raw = r#"{"warmth":0.1,"reason":"only warmth"}"#;
-        let (d, _) = parse_affinity_eval(raw);
+        let (d, _p, _) = parse_affinity_eval(raw);
         assert!((d.warmth - 0.1).abs() < 1e-9);
         assert_eq!(d.trust, 0.0);
         assert_eq!(d.intimacy, 0.0);
@@ -1162,7 +1313,7 @@ mod tests {
     #[test]
     fn parse_affinity_eval_extracts_from_fenced_block() {
         let raw = "```json\n{\"warmth\":0.05,\"reason\":\"fenced\"}\n```";
-        let (d, reason) = parse_affinity_eval(raw);
+        let (d, _p, reason) = parse_affinity_eval(raw);
         assert!((d.warmth - 0.05).abs() < 1e-9);
         assert_eq!(reason, "fenced");
     }
@@ -1824,6 +1975,60 @@ mod tests {
             (patience - 0.48).abs() < 1e-9,
             "rule delta (-0.02 patience) still applied even though the reply \
              was empty; got {patience}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn persist_affinity_sets_patience_from_target(pool: sqlx::PgPool) {
+        use eros_engine_store::affinity::AffinityRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // persist_affinity calls load_or_create, but seeding the row first is
+        // explicit and lets us assert against a known 0.5 seed.
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // test_state has ema_inertia = 0.0, so the None path would land patience
+        // at 0.5 + 0.03 = 0.53. Passing Some(0.93) must win → 0.93.
+        let state = crate::routes::companion::test_state(pool.clone());
+        let deltas = eros_engine_core::affinity::AffinityDeltas {
+            patience: 0.03, // the rule delta R (also present in `deltas`)
+            ..Default::default()
+        };
+        persist_affinity(
+            &state,
+            session_id,
+            user_id,
+            instance_id,
+            ActionType::ReplyText,
+            deltas,
+            serde_json::json!({}),
+            None,
+            Some(0.93), // patience_target = clamp(L 0.9 + R 0.03)
+        )
+        .await;
+
+        let patience: f64 = sqlx::query_scalar(
+            "SELECT patience FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (patience - 0.93).abs() < 1e-9,
+            "patience_target set directly through the server layer (not 0.53); got {patience}"
         );
     }
 }
