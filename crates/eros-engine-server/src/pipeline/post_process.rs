@@ -452,17 +452,21 @@ struct LlmAffinityEval {
 /// Lenient deserializer for the optional absolute `patience` read. A quoted
 /// number (`"patience":"0.5"`) is a common LLM formatting slip; without this,
 /// serde would fail the *entire* `LlmAffinityEval` parse on it and drop the five
-/// valid delta axes too. Accepts a JSON number or a numeric string → `Some`;
-/// null / bool / any other shape → `None`. Never errors, so a malformed patience
-/// value can only affect patience — never the deltas.
+/// valid delta axes too. Accepts a JSON number or a *finite* numeric string →
+/// `Some`; null / bool / any other shape / a non-finite string (`"NaN"`,
+/// `"inf"`, which `f64::from_str` otherwise accepts) → `None`. Never errors, so
+/// a malformed patience value can only affect patience — never the deltas — and
+/// a non-finite value can never reach `snap_patience`/`clamp` (they preserve
+/// NaN) or be persisted as a patience target.
 fn de_lenient_patience<'de, D>(de: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let v = <serde_json::Value as serde::Deserialize>::deserialize(de)?;
     Ok(match v {
+        // JSON numbers cannot encode NaN/inf, so the number path is finite by construction.
         serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
         _ => None,
     })
 }
@@ -1245,6 +1249,12 @@ mod tests {
             r#"{"warmth":0.2,"patience":true,"reason":"x"}"#,
             r#"{"warmth":0.2,"patience":{"v":1},"reason":"x"}"#,
             r#"{"warmth":0.2,"patience":null,"reason":"x"}"#,
+            // Non-finite quoted strings: `f64::from_str` accepts these, but they
+            // must NOT leak (NaN survives snap/clamp and would poison scoring).
+            r#"{"warmth":0.2,"patience":"NaN","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"inf","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"-inf","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":"infinity","reason":"x"}"#,
         ] {
             let (d, p, _) = parse_affinity_eval(raw);
             assert!((d.warmth - 0.2).abs() < 1e-9, "warmth survives: {raw}");
