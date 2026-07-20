@@ -430,7 +430,7 @@ const LLM_AXIS_NEG_CAP: f64 = -0.6;
 
 /// Raw shape of the affinity evaluator's JSON output. Missing axes default to 0.
 /// `patience` is read as an absolute (snapped to 0.1), separate from the rule-owned
-/// per-axis deltas.
+/// per-axis deltas, and parsed leniently (see `de_lenient_patience`).
 #[derive(Debug, Default, serde::Deserialize)]
 struct LlmAffinityEval {
     #[serde(default)]
@@ -443,10 +443,28 @@ struct LlmAffinityEval {
     intimacy: f64,
     #[serde(default)]
     tension: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_patience")]
     patience: Option<f64>,
     #[serde(default)]
     reason: String,
+}
+
+/// Lenient deserializer for the optional absolute `patience` read. A quoted
+/// number (`"patience":"0.5"`) is a common LLM formatting slip; without this,
+/// serde would fail the *entire* `LlmAffinityEval` parse on it and drop the five
+/// valid delta axes too. Accepts a JSON number or a numeric string → `Some`;
+/// null / bool / any other shape → `None`. Never errors, so a malformed patience
+/// value can only affect patience — never the deltas.
+fn de_lenient_patience<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(de)?;
+    Ok(match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    })
 }
 
 /// Snap the LLM's absolute patience read to the nearest 0.1 step, clamped to
@@ -1197,6 +1215,41 @@ mod tests {
     fn parse_affinity_eval_garbage_patience_none() {
         let (_d, p, _) = parse_affinity_eval("not json at all");
         assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_affinity_eval_quoted_patience_salvaged_deltas_survive() {
+        // A quoted number ("0.5") is a common LLM slip. It must NOT fail the
+        // whole struct parse (which would zero the five valid delta axes too):
+        // the deltas survive AND the numeric string is salvaged + snapped.
+        let raw = r#"{"warmth":0.1,"trust":0.05,"patience":"0.5","reason":"x"}"#;
+        let (d, p, _) = parse_affinity_eval(raw);
+        assert!(
+            (d.warmth - 0.1).abs() < 1e-9,
+            "warmth survives a bad patience"
+        );
+        assert!(
+            (d.trust - 0.05).abs() < 1e-9,
+            "trust survives a bad patience"
+        );
+        assert_eq!(p, Some(0.5), "quoted numeric patience is salvaged");
+    }
+
+    #[test]
+    fn parse_affinity_eval_malformed_patience_ignored_deltas_survive() {
+        // Non-numeric / wrong-typed patience → None, but the five deltas still
+        // parse (the regression codex flagged: one bad optional field must not
+        // discard the whole turn's affinity update).
+        for raw in [
+            r#"{"warmth":0.2,"patience":"abc","reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":true,"reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":{"v":1},"reason":"x"}"#,
+            r#"{"warmth":0.2,"patience":null,"reason":"x"}"#,
+        ] {
+            let (d, p, _) = parse_affinity_eval(raw);
+            assert!((d.warmth - 0.2).abs() < 1e-9, "warmth survives: {raw}");
+            assert_eq!(p, None, "malformed patience → None: {raw}");
+        }
     }
 
     #[test]
