@@ -422,4 +422,30 @@ mod migration_tests {
             "persona comment without source must violate CHECK"
         );
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0037_reply_window_schema(pool: PgPool) {
+        // Nullable timestamptz column landed.
+        let (data_type, is_nullable): (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'world_posts' \
+               AND column_name = 'last_user_comment_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("last_user_comment_at column exists");
+        assert_eq!(data_type, "timestamp with time zone");
+        assert_eq!(is_nullable, "YES");
+
+        // Partial reply index exists.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes \
+             WHERE schemaname = 'engine' AND tablename = 'world_posts' \
+               AND indexname = 'idx_world_posts_reply'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "missing idx_world_posts_reply");
+    }
 }

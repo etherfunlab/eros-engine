@@ -511,6 +511,7 @@ max_tokens = 1024
 debounce_secs = 90
 thread_cooldown_secs = 600
 daily_cap = 20
+reply_window_secs = 604800
 filter_prompt = """
 你是贴文作者本人，在自己的贴文评论区回复用户的留言。
 保持角色口吻，简短口语化，只输出评论正文。

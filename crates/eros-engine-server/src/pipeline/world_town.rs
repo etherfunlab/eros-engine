@@ -109,10 +109,11 @@ async fn run_tick(
         }
     }
     if let Some(resolved) = reply {
+        let window = std::time::Duration::from_secs(resolved.reply_window_secs);
         let debounce = std::time::Duration::from_secs(resolved.debounce_secs);
         let cooldown = std::time::Duration::from_secs(resolved.thread_cooldown_secs);
         match repo
-            .list_reply_candidates(debounce, cooldown, TOWN_REPLY_BATCH)
+            .list_reply_candidates(window, debounce, cooldown, TOWN_REPLY_BATCH)
             .await
         {
             Ok(cands) => {
@@ -250,7 +251,7 @@ async fn run_reply(
     let repo = WorldTownRepo { pool: &state.pool };
     // Count-then-claim is deliberately NOT atomic with the insert: under
     // concurrent sweepers the cap can overshoot by ~1 per instance — an
-    // accepted trade-off (spec §3.3 gate 2), further narrowed by the
+    // accepted trade-off (spec §3.3 gate 3), further narrowed by the
     // one-candidate-per-owner scan batching.
     let spent = repo
         .count_replies_today(cand.owner_uid)
@@ -655,7 +656,7 @@ mod tests {
             .await
             .expect("cap skip ok");
 
-        // Verify the second post's cooldown was not burned (spec §3.3 gate 2).
+        // Verify the second post's cooldown was not burned (spec §3.3 gate 3).
         let last_reply_at: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("SELECT last_reply_at FROM engine.world_posts WHERE id = $1")
                 .bind(post2)

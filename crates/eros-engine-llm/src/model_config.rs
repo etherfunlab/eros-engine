@@ -567,6 +567,12 @@ pub struct TaskConfig {
     /// world_reply-only: responder comments per owner per UTC day. Default 20.
     #[serde(default)]
     pub daily_cap: Option<u32>,
+    /// world_reply-only: reply-eligibility window in seconds after a user
+    /// comment. Default 604800 (7d); floored strictly above the resolved
+    /// debounce (a window <= debounce leaves no eligible range). Bounds the
+    /// reply scan so its cost is independent of total post count (issue #176).
+    #[serde(default)]
+    pub reply_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -870,6 +876,7 @@ pub struct ResolvedWorldReply {
     pub debounce_secs: u64,
     pub thread_cooldown_secs: u64,
     pub daily_cap: u32,
+    pub reply_window_secs: u64,
 }
 
 /// Resolved image-generation task (`chat_image_generation`). `model` is optional:
@@ -1668,6 +1675,7 @@ impl ModelConfig {
             return None;
         }
         let m = self.resolve("world_reply", None);
+        let debounce_secs = task_cfg.debounce_secs.unwrap_or(90);
         Some(ResolvedWorldReply {
             model: m.model,
             fallback_model: m.fallback_model,
@@ -1676,9 +1684,13 @@ impl ModelConfig {
             reply_prompt,
             retry_depth: m.retry_depth,
             reasoning: m.reasoning,
-            debounce_secs: task_cfg.debounce_secs.unwrap_or(90),
+            debounce_secs,
             thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
             daily_cap: task_cfg.daily_cap.unwrap_or(20),
+            reply_window_secs: task_cfg
+                .reply_window_secs
+                .unwrap_or(604_800)
+                .max(debounce_secs + 1),
         })
     }
 
@@ -4451,6 +4463,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.debounce_secs, 90);
         assert_eq!(r.thread_cooldown_secs, 600);
         assert_eq!(r.daily_cap, 20);
+        assert_eq!(r.reply_window_secs, 604_800, "default 7 days");
 
         let cfg = ModelConfig::from_toml_str(
             "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
@@ -4461,6 +4474,30 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.debounce_secs, 30);
         assert_eq!(r.thread_cooldown_secs, 120);
         assert_eq!(r.daily_cap, 5);
+
+        // reply_window_secs override.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             reply_window_secs = 259200\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().reply_window_secs,
+            259_200
+        );
+
+        // A window <= debounce leaves no eligible range ⇒ clamped strictly
+        // above the resolved debounce.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             debounce_secs = 100\nreply_window_secs = 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().reply_window_secs,
+            101,
+            "clamped to debounce + 1"
+        );
     }
 
     #[test]
