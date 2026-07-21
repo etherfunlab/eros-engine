@@ -619,13 +619,43 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1);
 
-        // At cap: silent skip, no LLM call (expect(1) still holds), and no
-        // cooldown stamp burned beyond the first.
+        // At cap with a cooldown-fresh post: silent skip due to daily cap,
+        // no LLM call (expect(1) still holds), and the fresh post's last_reply_at
+        // remains NULL—proving the cap gate ran BEFORE the cooldown CAS.
+        // If gate order were swapped (cooldown checked first), this post would
+        // get a cooldown stamp despite being capped, making last_reply_at non-NULL.
+        let post2: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.world_posts \
+                 (owner_uid, instance_id, content, scheduled_at, published_at) \
+             VALUES ($1,$2,'月亮圆圆',now(),now()) RETURNING id",
+        )
+        .bind(owner)
+        .bind(author)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cand2 = ReplyCandidate {
+            post_id: post2,
+            owner_uid: owner,
+            author_instance_id: author,
+        };
         let mut capped = resolved.clone();
         capped.daily_cap = 1;
-        run_reply(&state, &capped, &cand)
+        run_reply(&state, &capped, &cand2)
             .await
             .expect("cap skip ok");
+
+        // Verify the second post's cooldown was not burned (spec §3.3 gate 2).
+        let last_reply_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT last_reply_at FROM engine.world_posts WHERE id = $1")
+                .bind(post2)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            last_reply_at, None,
+            "cap skip should not burn cooldown on fresh post"
+        );
     }
 
     #[test]
