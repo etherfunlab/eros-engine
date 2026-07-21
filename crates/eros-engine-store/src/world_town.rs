@@ -235,18 +235,23 @@ impl<'a> WorldTownRepo<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Posts whose LATEST user comment has settled past the debounce with no
-    /// persona comment after it (spec §3.3). Consecutive user comments
-    /// collapse onto the newest one. Author must still be active (§6).
-    /// Cooldown is filtered here (excludes posts still inside
-    /// `last_reply_at`'s cooldown window) and the scan returns AT MOST ONE
-    /// candidate per owner via `DISTINCT ON`, oldest-first across owners —
-    /// fairness under cap pressure, so a capped owner with many pending
-    /// threads occupies at most one batch slot per tick instead of starving
-    /// every other owner. The daily cap itself stays in the pipeline (single
-    /// source of truth in `count_replies_today`).
+    /// Posts whose `last_user_comment_at` stamp has settled past the
+    /// debounce, within the activity window, with no persona comment after
+    /// it (spec §3.3, issue #176). The stamp IS the latest-user-comment time
+    /// (kept current by `insert_user_comment`), so no LATERAL probe is
+    /// needed here; `window` bounds the scan to recently active threads —
+    /// index-driven via `idx_world_posts_reply` — instead of walking every
+    /// published post ever. Author must still be active (§6). Cooldown is
+    /// filtered here (excludes posts still inside `last_reply_at`'s cooldown
+    /// window) and the scan returns AT MOST ONE candidate per owner via
+    /// `DISTINCT ON`, oldest-first across owners — fairness under cap
+    /// pressure, so a capped owner with many pending threads occupies at
+    /// most one batch slot per tick instead of starving every other owner.
+    /// The daily cap itself stays in the pipeline (single source of truth in
+    /// `count_replies_today`).
     pub async fn list_reply_candidates(
         &self,
+        window: Duration,
         debounce: Duration,
         cooldown: Duration,
         limit: i64,
@@ -255,29 +260,26 @@ impl<'a> WorldTownRepo<'a> {
             "SELECT post_id, owner_uid, author_instance_id FROM ( \
                  SELECT DISTINCT ON (p.owner_uid) \
                         p.id AS post_id, p.owner_uid, p.instance_id AS author_instance_id, \
-                        u.last_user_at \
+                        p.last_user_comment_at \
                  FROM engine.world_posts p \
                  JOIN engine.world_enrollments we \
                    ON we.owner_uid = p.owner_uid AND we.town_enabled \
                  JOIN engine.persona_instances pi \
                    ON pi.id = p.instance_id AND pi.status = 'active' \
-                 JOIN LATERAL ( \
-                     SELECT max(created_at) AS last_user_at \
-                     FROM engine.world_post_comments \
-                     WHERE post_id = p.id AND author_instance_id IS NULL \
-                 ) u ON u.last_user_at IS NOT NULL \
-                 WHERE p.published_at IS NOT NULL \
-                   AND (p.last_reply_at IS NULL OR p.last_reply_at < now() - make_interval(secs => $2)) \
-                   AND u.last_user_at <= now() - make_interval(secs => $1) \
+                 WHERE p.last_user_comment_at > now() - make_interval(secs => $1) \
+                   AND p.last_user_comment_at <= now() - make_interval(secs => $2) \
+                   AND (p.last_reply_at IS NULL \
+                        OR p.last_reply_at < now() - make_interval(secs => $3)) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM engine.world_post_comments a \
                        WHERE a.post_id = p.id AND a.author_instance_id IS NOT NULL \
-                         AND a.created_at > u.last_user_at) \
-                 ORDER BY p.owner_uid, u.last_user_at ASC \
+                         AND a.created_at > p.last_user_comment_at) \
+                 ORDER BY p.owner_uid, p.last_user_comment_at ASC \
              ) sub \
-             ORDER BY last_user_at ASC \
-             LIMIT $3",
+             ORDER BY last_user_comment_at ASC \
+             LIMIT $4",
         )
+        .bind(window.as_secs_f64())
         .bind(debounce.as_secs_f64())
         .bind(cooldown.as_secs_f64())
         .bind(limit)
@@ -665,60 +667,61 @@ mod tests {
         let (owner, inst) = seed_town_owner(&pool).await;
         let post = seed_post(&pool, owner, inst, "hello", true).await;
         let repo = WorldTownRepo { pool: &pool };
+        let window = std::time::Duration::from_secs(604_800);
         let debounce = std::time::Duration::from_secs(90);
         let cooldown = std::time::Duration::from_secs(600);
 
         // No user comment yet ⇒ no candidate.
         assert!(repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap()
             .is_empty());
 
-        // Fresh user comment (inside debounce) ⇒ still no candidate.
+        // Fresh user comment (stamp = now(), inside debounce) ⇒ still no candidate.
         repo.insert_user_comment(owner, post, "在吗")
             .await
             .unwrap()
             .unwrap();
         assert!(repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap()
             .is_empty());
 
-        // Age it past the debounce ⇒ candidate appears.
+        // Age the STAMP past the debounce ⇒ candidate appears.
         sqlx::query(
-            "UPDATE engine.world_post_comments SET created_at = now() - interval '3 minutes' \
-             WHERE post_id = $1",
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
         )
         .bind(post)
         .execute(&pool)
         .await
         .unwrap();
         let cands = repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].post_id, post);
         assert_eq!(cands[0].author_instance_id, inst);
 
-        // Persona comment after the user comment clears the candidate.
+        // Persona reply after the user comment clears the candidate.
         repo.insert_reply_comment(post, inst, "在的").await.unwrap();
         assert!(repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap()
             .is_empty());
 
-        // A NEWER user comment re-arms only after ITS debounce (consecutive
-        // user comments collapse onto the latest one).
+        // A NEWER user comment re-stamps to now() ⇒ back inside debounce ⇒
+        // no candidate until it ages again.
         repo.insert_user_comment(owner, post, "又来")
             .await
             .unwrap()
             .unwrap();
         assert!(repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap()
             .is_empty());
@@ -825,6 +828,7 @@ mod tests {
         let post1 = seed_post(&pool, owner_a, inst_a, "post1", true).await;
         let post2 = seed_post(&pool, owner_a, inst_a, "post2", true).await;
         let repo = WorldTownRepo { pool: &pool };
+        let window = std::time::Duration::from_secs(604_800);
         let debounce = std::time::Duration::from_secs(90);
         let cooldown = std::time::Duration::from_secs(600);
 
@@ -833,9 +837,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // post1 (owner A) — oldest.
         sqlx::query(
-            "UPDATE engine.world_post_comments SET created_at = now() - interval '10 minutes' \
-             WHERE post_id = $1",
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '10 minutes' \
+             WHERE id = $1",
         )
         .bind(post1)
         .execute(&pool)
@@ -845,9 +850,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // post2 (owner A).
         sqlx::query(
-            "UPDATE engine.world_post_comments SET created_at = now() - interval '3 minutes' \
-             WHERE post_id = $1",
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
         )
         .bind(post2)
         .execute(&pool)
@@ -856,7 +862,7 @@ mod tests {
 
         // Only ONE candidate surfaces for owner A: the older thread (post1).
         let cands = repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap();
         assert_eq!(cands.len(), 1, "one candidate per owner");
@@ -866,7 +872,7 @@ mod tests {
         // other pending thread (post2) surfaces instead — never both.
         assert!(repo.claim_reply_cooldown(post1, cooldown).await.unwrap());
         let cands = repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap();
         assert_eq!(cands.len(), 1);
@@ -879,9 +885,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // post_b (owner B) — between the two.
         sqlx::query(
-            "UPDATE engine.world_post_comments SET created_at = now() - interval '5 minutes' \
-             WHERE post_id = $1",
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '5 minutes' \
+             WHERE id = $1",
         )
         .bind(post_b)
         .execute(&pool)
@@ -890,7 +897,7 @@ mod tests {
 
         // Both owners get exactly one slot each, oldest thread first overall.
         let cands = repo
-            .list_reply_candidates(debounce, cooldown, 10)
+            .list_reply_candidates(window, debounce, cooldown, 10)
             .await
             .unwrap();
         assert_eq!(cands.len(), 2, "one candidate per owner, both eligible");
@@ -898,6 +905,111 @@ mod tests {
         assert_eq!(cands[0].owner_uid, owner_b);
         assert_eq!(cands[1].post_id, post2);
         assert_eq!(cands[1].owner_uid, owner_a);
+    }
+
+    #[sqlx::test]
+    async fn reply_scan_excludes_posts_outside_window(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        let post = seed_post(&pool, owner, inst, "old", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+        let window = std::time::Duration::from_secs(604_800); // 7d
+        let debounce = std::time::Duration::from_secs(90);
+        let cooldown = std::time::Duration::from_secs(600);
+
+        repo.insert_user_comment(owner, post, "old comment")
+            .await
+            .unwrap()
+            .unwrap();
+        // Stamp older than the window ⇒ dropped (the new bound).
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '8 days' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.list_reply_candidates(window, debounce, cooldown, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "user comment older than the window drops out of the scan"
+        );
+
+        // A fresh user comment re-stamps to now() (re-enters the window); aged
+        // past debounce ⇒ candidate again. Proves the window keys off recent
+        // user activity, not post age.
+        repo.insert_user_comment(owner, post, "fresh comment")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cands = repo
+            .list_reply_candidates(window, debounce, cooldown, 10)
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].post_id, post);
+    }
+
+    #[sqlx::test]
+    async fn reply_scan_suppressed_by_round_comment_after_user(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        // A second active instance to author the round comment.
+        let g2: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('Rin','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let commenter: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(g2)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let post = seed_post(&pool, owner, inst, "hello", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+        let window = std::time::Duration::from_secs(604_800);
+        let debounce = std::time::Duration::from_secs(90);
+        let cooldown = std::time::Duration::from_secs(600);
+
+        repo.insert_user_comment(owner, post, "在吗")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A ROUND comment (source='round', NOT tracked by last_reply_at) lands
+        // after the user comment. It must suppress the reply — enforced by the
+        // NOT EXISTS check, NOT by last_reply_at.
+        repo.insert_round_comment_unchecked_for_test(post, commenter, "round", "round after user")
+            .await;
+        assert!(
+            repo.list_reply_candidates(window, debounce, cooldown, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a round comment after the user comment suppresses the reply"
+        );
     }
 
     // Test-only impl block for helper methods used in tests.
