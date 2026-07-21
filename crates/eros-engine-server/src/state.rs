@@ -75,7 +75,6 @@ pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathB
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
 /// injection off, 300-second sweep cadence.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct WorldConfig {
     pub disabled: bool,        // WORLD_DISABLED — master switch
     pub prompt_disabled: bool, // WORLD_PROMPT_DISABLED — injection-only valve
@@ -190,7 +189,6 @@ pub struct ServerConfig {
     /// raw chat content — operator-only; point it at a volume you control.
     pub prompt_log_dir: Option<std::path::PathBuf>,
     /// World memories subsystem configuration.
-    #[allow(dead_code)]
     pub world: WorldConfig,
 }
 
