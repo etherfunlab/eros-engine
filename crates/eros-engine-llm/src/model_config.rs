@@ -1580,7 +1580,10 @@ impl ModelConfig {
             retry_depth: m.retry_depth,
             reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
-            interval_hours: task_cfg.interval_hours.unwrap_or(24),
+            // .max(1): 0 would make the director eligible every sweeper tick
+            // (~288 calls/owner/day at the default 300s tick) — a cost footgun,
+            // not a meaningful "run continuously" setting.
+            interval_hours: task_cfg.interval_hours.unwrap_or(24).max(1),
             retention_days: task_cfg.retention_days.unwrap_or(30),
         })
     }
@@ -4274,6 +4277,15 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(r.interval_hours, 6);
         assert_eq!(r.retention_days, 7);
         assert!(!r.structured_output);
+
+        // interval_hours = 0 is a cost footgun (director would be eligible
+        // every sweeper tick) — floored to 1, not passed through.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"p\"\ninterval_hours = 0\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().unwrap();
+        assert_eq!(r.interval_hours, 1, "0 must be floored to 1");
     }
 
     #[test]

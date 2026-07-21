@@ -68,6 +68,10 @@ pub async fn sweeper(state: AppState) {
         return;
     };
     let tick_interval = state.config.world.tick;
+    if tick_interval.is_zero() {
+        tracing::info!("world sweeper disabled (WORLD_TICK_SECS=0)");
+        return;
+    }
     tracing::info!(
         ?tick_interval,
         interval_hours = resolved.interval_hours,
@@ -450,6 +454,16 @@ mod tests {
 
         let repo = eros_engine_store::world::WorldRepo { pool: &pool };
         repo.ensure_states_for_enrollments().await.unwrap();
+        // Claim the owner so claimed_at is actually SET before direct_world
+        // runs persist_round — otherwise the `assert!(claimed.is_none())`
+        // below is vacuous (never-claimed rows are already NULL).
+        repo.claim_due(
+            std::time::Duration::from_secs(24 * 3600),
+            std::time::Duration::from_secs(1800),
+            5,
+        )
+        .await
+        .unwrap();
 
         direct_world(&state, &resolved, owner)
             .await

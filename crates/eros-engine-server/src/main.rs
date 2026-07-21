@@ -333,6 +333,11 @@ async fn run_server() -> Result<()> {
             .with_ignore_providers(model_config.defaults.ignore_providers.clone()),
     );
 
+    // Computed once at boot, before model_config is moved into the state
+    // struct: gates fetch_world_context so an unconfigured deployment (no
+    // [tasks.world_director] section) never runs the world JOIN per reply.
+    let world_configured = model_config.resolve_world_director().is_some();
+
     let state = AppState {
         pool,
         auth,
@@ -342,6 +347,7 @@ async fn run_server() -> Result<()> {
         model_config,
         output_regex,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
+        world_configured,
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth

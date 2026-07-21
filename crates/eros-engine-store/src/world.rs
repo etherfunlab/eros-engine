@@ -490,6 +490,12 @@ mod tests {
         let owner = Uuid::new_v4();
         enroll(&pool, owner).await;
         repo.ensure_states_for_enrollments().await.unwrap();
+        // Claim the owner so claimed_at is actually SET before persist_round
+        // runs — otherwise the `assert!(claimed.is_none())` below is vacuous
+        // (never-claimed rows are already NULL).
+        repo.claim_due(Duration::from_secs(24 * 3600), Duration::from_secs(1800), 5)
+            .await
+            .unwrap();
         let instance = seed_instance(&pool, owner, "P", "active").await;
         let today = Utc::now().date_naive();
 

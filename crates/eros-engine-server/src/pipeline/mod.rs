@@ -329,4 +329,13 @@ mod tests {
     fn find_json_block_returns_none_when_no_object() {
         assert!(super::find_json_block("no json here").is_none());
     }
+
+    #[test]
+    fn find_json_block_balanced_with_nested_object() {
+        let raw = r#"prefix {"a":"b}c","d":{"e":1}} trailing"#;
+        let block = super::find_json_block(raw).unwrap();
+        let v: serde_json::Value = serde_json::from_str(block).unwrap();
+        assert_eq!(v["a"], "b}c");
+        assert_eq!(v["d"]["e"], 1);
+    }
 }

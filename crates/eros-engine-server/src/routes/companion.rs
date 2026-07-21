@@ -726,6 +726,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         model_config: Arc::new(eros_engine_llm::model_config::ModelConfig::default()),
         output_regex: std::sync::Arc::new(Vec::new()),
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
+        world_configured: false,
     }
 }
 

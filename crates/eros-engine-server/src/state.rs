@@ -18,6 +18,13 @@ pub struct AppState {
     /// (fail-fast). Empty when none configured. Read by `drive_chat_burst`.
     pub output_regex: Arc<Vec<eros_engine_llm::model_config::CompiledRegexRule>>,
     pub stream_slots: Arc<StreamSlots>,
+    /// Whether `[tasks.world_director]` resolves to `Some` (a usable
+    /// filter_prompt is present), computed once at boot. Gates
+    /// `fetch_world_context` so a deployment with the section absent never
+    /// pays the `world_states`/`world_enrollments` JOIN on the reply path —
+    /// distinct from `config.world.disabled` / `prompt_disabled`, which are
+    /// operator env-var kill switches for a subsystem that IS configured.
+    pub world_configured: bool,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -387,6 +394,14 @@ mod tests {
         assert_eq!(
             parse_world_config(None, None, Some("not-a-number")).tick,
             Duration::from_secs(300)
+        );
+        // "0" parses fine here — Duration::ZERO is a legitimate value from the
+        // parser's point of view. It's the sweeper (pipeline::world::sweeper)
+        // that treats a zero tick as "disabled" and returns before building a
+        // tokio::time::interval (which would panic on Duration::ZERO).
+        assert_eq!(
+            parse_world_config(None, None, Some("0")).tick,
+            Duration::from_secs(0)
         );
     }
 }

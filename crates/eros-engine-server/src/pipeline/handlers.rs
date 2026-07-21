@@ -609,7 +609,8 @@ async fn fetch_world_context(
     instance_id: Uuid,
     query_embedding: Option<&[f32]>,
 ) -> Option<crate::prompt::WorldContext> {
-    if state.config.world.disabled || state.config.world.prompt_disabled {
+    if state.config.world.disabled || state.config.world.prompt_disabled || !state.world_configured
+    {
         return None;
     }
     let repo = eros_engine_store::world::WorldRepo { pool: &state.pool };
@@ -2106,7 +2107,11 @@ mod tests {
         .await
         .unwrap();
 
-        let state = crate::routes::companion::test_state(pool.clone());
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // test_state defaults world_configured=false (pins the unconfigured-
+        // deployment gate, see below); flip it on so this test exercises the
+        // enrollment/flag gating instead.
+        state.world_configured = true;
 
         // No enrollment, no state ⇒ None.
         assert!(fetch_world_context(&state, owner, instance, None)
@@ -2133,6 +2138,14 @@ mod tests {
             .expect("enrolled with digest ⇒ Some");
         assert_eq!(ctx.digest, "小圈子近况");
         assert!(ctx.fragments.is_empty(), "no embedding ⇒ digest-only");
+
+        // world_configured=false (no [tasks.world_director] section) ⇒ None
+        // even when enrolled+digest present — the unconfigured-deployment gate.
+        let mut unconfigured = state.clone();
+        unconfigured.world_configured = false;
+        assert!(fetch_world_context(&unconfigured, owner, instance, None)
+            .await
+            .is_none());
 
         // WORLD_PROMPT_DISABLED ⇒ None even when data exists.
         let mut muted = state.clone();
@@ -2201,7 +2214,8 @@ mod tests {
         .await
         .unwrap();
 
-        let state = crate::routes::companion::test_state(pool.clone());
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.world_configured = true;
         let ctx = fetch_world_context(&state, owner, instance, Some(&emb))
             .await
             .expect("Some");
