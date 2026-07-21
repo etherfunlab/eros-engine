@@ -80,19 +80,23 @@ ALTER TABLE engine.world_states     ADD COLUMN last_comment_round_at TIMESTAMPTZ
 Both new tables get the 0013 lockdown treatment (REVOKE + RLS, drift test
 extended).
 
-### 1.3 Retention (v1: none — deliberate)
+### 1.3 Reply-scan activity window (no retention)
 
 Unlike `world_memories` (pruned by `retention_days` inside every director
-round), `world_posts` and `world_post_comments` have **no retention in v1**:
-rows accumulate for as long as the world exists. This is accepted at current
-scale — the feed reads through a keyset index so old rows don't tax the hot
-path — but the reply-responder scan (§3.3) walks all published posts, so
-growth degrades it linearly. Tracked follow-up (post-merge issue): a
-retention sweep for both tables plus an index-driven bound on the reply scan
-(partial index on user comments, or a `last_user_comment_at` stamp on
-posts). Note the deliberate interaction with §6: unenroll/`town_enabled =
-false` keeps rows by design; retention is the only mechanism that may ever
-delete town content.
+round), `world_posts` and `world_post_comments` have **no retention**: rows
+accumulate for as long as the world exists. The feed already reads through a
+keyset index so old rows don't tax the hot path. The reply-responder scan
+(§3.3) — which would otherwise walk every published post — is instead bounded
+by a `last_user_comment_at` stamp on `world_posts` (migration 0037) plus the
+partial index `idx_world_posts_reply` (only posts that ever received a user
+comment enter it), so its cost is a function of "posts with a user comment in
+the last `reply_window_secs`," independent of total published-post count.
+This is a scan bound, not a delete: **rows are kept forever — no retention
+adopted.** If a disk-management retention knob is ever wanted, it is a
+**separate mechanism, decoupled from the sweeper**
+(`2026-07-21-world-town-reply-window-design.md` §0). Note the deliberate
+interaction with §6: unenroll/`town_enabled = false` keeps rows by design;
+there is currently no mechanism that deletes town content.
 
 ---
 
@@ -182,22 +186,36 @@ acceptable, threads catch up an hour later).
 
 ### 3.3 Reply responder (near-immediate, rate-limited)
 
-Scan for threads needing a response: posts of `town_enabled` owners where the
-latest **user** comment (`author_instance_id IS NULL`) is older than the
-debounce window and has no persona comment after it. Per matched post, apply
-gates in order:
+Every user comment insert (`insert_user_comment`) stamps
+`world_posts.last_user_comment_at = now()` atomically with the comment, in the
+same statement (migration 0037; §1.3). The scan for threads needing a
+response drives off that stamp instead of walking all published posts: posts
+of `town_enabled` owners where `last_user_comment_at` falls inside the
+activity window, has settled past the debounce, and has no persona comment
+after it. The stamp *is* the latest-user-comment time, so the LATERAL
+`max(created_at)` probe used pre-window is dropped — debounce is now a plain
+comparison on the same column. The "no persona comment after it" check stays
+a `NOT EXISTS` on `world_post_comments` rather than a comparison against
+`last_reply_at`: `last_reply_at` only tracks `source = 'reply'` (the cooldown
+CAS below), not `source = 'round'`, so a round comment landing after the user
+comment would otherwise go unnoticed and the responder would fire a duplicate
+reply. Per matched post, apply gates in order:
 
-1. **Debounce** — `debounce_secs` (default 90): latest user comment must be at
-   least this old; consecutive user comments collapse into one response
+1. **Activity window** — `reply_window_secs` (default 604800 / 7d):
+   `last_user_comment_at > now() - reply_window_secs`. Bounds the scan to
+   `idx_world_posts_reply`; a post whose latest user comment falls outside the
+   window drops out regardless of the other gates.
+2. **Debounce** — `debounce_secs` (default 90): `last_user_comment_at <= now()
+   - debounce_secs`; consecutive user comments collapse into one response
    (the response sees the whole thread).
-2. **Daily cap** — `daily_cap` (default 20) per owner per UTC day, checked
+3. **Daily cap** — `daily_cap` (default 20) per owner per UTC day, checked
    BEFORE the cooldown CAS so hitting the cap never burns a cooldown stamp:
    `SELECT count(*) FROM world_post_comments c JOIN world_posts p ON p.id = c.post_id
    WHERE p.owner_uid = $1 AND c.source = 'reply' AND c.created_at >= date_trunc('day', now())`.
    At cap: skip silently (no failure state surfaces on the feed). The
    count-then-claim ordering can overshoot by 1 under multi-instance
    concurrency; accepted.
-3. **Thread cooldown + claim** — CAS on the post row, doubling as the
+4. **Thread cooldown + claim** — CAS on the post row, doubling as the
    multi-instance claim:
    ```sql
    UPDATE engine.world_posts SET last_reply_at = now()
@@ -226,6 +244,7 @@ filter_prompt = "..."       # system instruction for the reply responder
 debounce_secs = 90          # task-specific: user-comment settle window
 thread_cooldown_secs = 600  # task-specific: min gap between responses per post
 daily_cap = 20              # task-specific: reply responses per owner per UTC day
+reply_window_secs = 604800  # task-specific: reply-eligibility window after a user comment (default 7d)
 ```
 
 Missing section → that path is disabled (mirrors the "no `[tasks.world_director]`
@@ -275,7 +294,10 @@ director). `docs/llm-audit.md` gains both rows.
   only while `town_enabled` — flipped off, the feed returns empty but rows are
   kept.
 - **User comments on an old post**: nothing special — debounce/cooldown/cap
-  apply; the hourly round may also weave it in.
+  apply; the hourly round may also weave it in. The `last_user_comment_at`
+  stamp (§1.3, §3.3) is what preserves this: a fresh user comment on a
+  months-old post re-stamps it, re-entering the reply-scan activity window
+  regardless of how long the post had been quiet.
 - **Clock skew between engine instances**: all gates compare DB `now()` inside
   single statements; no cross-statement time math.
 
