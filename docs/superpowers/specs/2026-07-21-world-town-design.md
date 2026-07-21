@@ -80,6 +80,20 @@ ALTER TABLE engine.world_states     ADD COLUMN last_comment_round_at TIMESTAMPTZ
 Both new tables get the 0013 lockdown treatment (REVOKE + RLS, drift test
 extended).
 
+### 1.3 Retention (v1: none — deliberate)
+
+Unlike `world_memories` (pruned by `retention_days` inside every director
+round), `world_posts` and `world_post_comments` have **no retention in v1**:
+rows accumulate for as long as the world exists. This is accepted at current
+scale — the feed reads through a keyset index so old rows don't tax the hot
+path — but the reply-responder scan (§3.3) walks all published posts, so
+growth degrades it linearly. Tracked follow-up (post-merge issue): a
+retention sweep for both tables plus an index-driven bound on the reply scan
+(partial index on user comments, or a `last_user_comment_at` stamp on
+posts). Note the deliberate interaction with §6: unenroll/`town_enabled =
+false` keeps rows by design; retention is the only mechanism that may ever
+delete town content.
+
 ---
 
 ## 2. Director output extension
