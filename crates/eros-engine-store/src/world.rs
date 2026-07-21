@@ -29,6 +29,13 @@ pub struct FragmentInsert {
     pub embedding: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PostInsert {
+    pub instance_id: Uuid,
+    pub content: String,
+    pub scheduled_at: DateTime<Utc>,
+}
+
 pub struct WorldRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -138,6 +145,17 @@ impl<'a> WorldRepo<'a> {
             .await
     }
 
+    /// Whether this owner has opted into the town feed. Unenrolled ⇒ false.
+    pub async fn town_enabled(&self, owner_uid: Uuid) -> Result<bool, sqlx::Error> {
+        let v: Option<bool> = sqlx::query_scalar(
+            "SELECT town_enabled FROM engine.world_enrollments WHERE owner_uid = $1",
+        )
+        .bind(owner_uid)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(v.unwrap_or(false))
+    }
+
     /// The owner's active persona roster (earliest-created first) joined to
     /// genome display data. Caller passes cap+1 and truncates so it can log
     /// the spec's roster-cap warning.
@@ -181,16 +199,19 @@ impl<'a> WorldRepo<'a> {
     }
 
     /// Persist one director round in a single transaction (spec §2.4):
-    /// retention delete + fragment inserts + state update (seed_version++,
-    /// last_run_at=now, claimed_at=NULL). All-or-nothing: any failure rolls
-    /// back and the caller releases the claim.
+    /// retention delete + fragment inserts + scheduled-post inserts + state
+    /// update (seed_version++, last_run_at=now, claimed_at=NULL).
+    /// All-or-nothing: any failure rolls back and the caller releases the
+    /// claim. `posts` (town-enabled owners only; empty otherwise) ride the
+    /// same transaction and the same claim-ownership-token guard as
+    /// everything else here.
     ///
     /// `claimed_at` is the ownership token from `claim_due`. The final state
     /// update is guarded on it (`AND claimed_at = $N`); if a newer sweeper
     /// has since reclaimed this owner the guard matches zero rows and we
     /// return `Err(RowNotFound)` BEFORE committing — the transaction is
-    /// dropped, which rolls back the retention delete and fragment inserts
-    /// too, so a lost-claim round writes nothing.
+    /// dropped, which rolls back the retention delete, fragment inserts, and
+    /// post inserts too, so a lost-claim round writes nothing.
     #[allow(clippy::too_many_arguments)]
     pub async fn persist_round(
         &self,
@@ -198,6 +219,7 @@ impl<'a> WorldRepo<'a> {
         seed: &serde_json::Value,
         digests: &serde_json::Value,
         fragments: &[FragmentInsert],
+        posts: &[PostInsert],
         script_date: NaiveDate,
         retention_days: u32,
         claimed_at: DateTime<Utc>,
@@ -220,6 +242,19 @@ impl<'a> WorldRepo<'a> {
             .bind(&frag.content)
             .bind(format_vector(&frag.embedding))
             .bind(script_date)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for post in posts {
+            sqlx::query(
+                "INSERT INTO engine.world_posts \
+                     (owner_uid, instance_id, content, scheduled_at) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(owner_uid)
+            .bind(post.instance_id)
+            .bind(&post.content)
+            .bind(post.scheduled_at)
             .execute(&mut *tx)
             .await?;
         }
@@ -605,7 +640,7 @@ mod tests {
             content: "P 试营业当天把咖啡机弄坏了".into(),
             embedding: unit_embedding(7),
         }];
-        repo.persist_round(owner, &seed, &digests, &frags, today, 30, token)
+        repo.persist_round(owner, &seed, &digests, &frags, &[], today, 30, token)
             .await
             .unwrap();
 
@@ -666,6 +701,7 @@ mod tests {
                 &seed,
                 &serde_json::json!({}),
                 &frags,
+                &[],
                 today,
                 30,
                 token1,
@@ -691,6 +727,71 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n, 0, "fragment insert must roll back too");
+    }
+
+    #[sqlx::test]
+    async fn town_enabled_reflects_enrollment_flag(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let repo = WorldRepo { pool: &pool };
+        assert!(
+            !repo.town_enabled(owner).await.unwrap(),
+            "unenrolled ⇒ false"
+        );
+        enroll(&pool, owner).await;
+        assert!(!repo.town_enabled(owner).await.unwrap(), "default false");
+        sqlx::query("UPDATE engine.world_enrollments SET town_enabled = true WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.town_enabled(owner).await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn persist_round_inserts_scheduled_posts(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "P", "active").await;
+        enroll(&pool, owner).await;
+        let repo = WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        let at = Utc::now() + chrono::Duration::hours(3);
+        let posts = vec![PostInsert {
+            instance_id: inst,
+            content: "今天试了新的拉花".into(),
+            scheduled_at: at,
+        }];
+        repo.persist_round(
+            owner,
+            &serde_json::json!({"arc": "a"}),
+            &serde_json::json!({}),
+            &[],
+            &posts,
+            Utc::now().date_naive(),
+            30,
+            token,
+        )
+        .await
+        .unwrap();
+
+        let (content, published_at): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT content, published_at FROM engine.world_posts WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "今天试了新的拉花");
+        assert!(published_at.is_none(), "inserted unpublished");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -758,6 +859,7 @@ mod tests {
             &serde_json::json!({}),
             &serde_json::json!({}),
             &frags,
+            &[],
             today,
             30,
             token,
