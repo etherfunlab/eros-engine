@@ -378,6 +378,11 @@ async fn run_server() -> Result<()> {
     // [tasks.world_director] is absent/blank (spec §2.1).
     tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
 
+    // World Town sweeper (posts feed). Inert when the world subsystem is off,
+    // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
+    // posts can exist without the director (town spec §3).
+    tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))
