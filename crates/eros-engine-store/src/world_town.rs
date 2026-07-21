@@ -129,7 +129,8 @@ impl<'a> WorldTownRepo<'a> {
                  WHERE p.id = $1 AND p.owner_uid = $2 AND p.published_at IS NOT NULL \
                  RETURNING id, post_id, author_instance_id, content, created_at \
              ), upd AS ( \
-                 UPDATE engine.world_posts SET last_user_comment_at = now() \
+                 UPDATE engine.world_posts \
+                 SET last_user_comment_at = GREATEST(last_user_comment_at, now()) \
                  WHERE id = (SELECT post_id FROM ins) \
              ) \
              SELECT id AS comment_id, post_id, author_instance_id, \
@@ -781,6 +782,51 @@ mod tests {
                 .await
                 .unwrap();
         assert!(stamp3.is_none(), "unpublished post never gets a stamp");
+    }
+
+    #[sqlx::test]
+    async fn user_comment_stamp_never_moves_backwards(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        let post = seed_post(&pool, owner, inst, "hello", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+
+        repo.insert_user_comment(owner, post, "first")
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate a later comment having already stamped a NEWER time before
+        // an earlier-started statement's UPDATE runs: force the stamp forward.
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() + interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ahead: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(post)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // A new user comment whose now() is BEHIND the current stamp must not
+        // move it backwards (GREATEST keeps the newer value).
+        repo.insert_user_comment(owner, post, "second")
+            .await
+            .unwrap()
+            .unwrap();
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(post)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, ahead,
+            "stamp is monotonic — a user comment never regresses it"
+        );
     }
 
     #[sqlx::test]
