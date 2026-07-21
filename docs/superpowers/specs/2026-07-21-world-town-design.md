@@ -98,12 +98,21 @@ When the claimed owner has `town_enabled`, the director's JSON schema gains a
 ```
 
 The script decides frequency and timing per persona (some personas may post
-zero times). The engine validates each `publish_at` and clamps it into the
-window `(now, now + interval_hours]`; malformed entries are dropped with a
-`tracing::warn`. Rows are inserted as unpublished (`published_at IS NULL`) in
-the same persist transaction as the world-memories writes. Owners without
-`town_enabled` omit the `posts` field from the schema entirely (smaller
-prompt, no dead output).
+zero times). Each entry is validated the way the implemented director round
+validates `personas`: `instance_id` must be in the claimed active-roster set
+(unknown → drop + `tracing::warn`), `publish_at` is clamped into the window
+`(now, now + interval_hours]`, and malformed entries are dropped with a warn.
+Rows are inserted as unpublished (`published_at IS NULL`) inside the same
+`persist_round(…, token)` transaction as the world-memories writes, so they
+inherit the claim-ownership-token guard (a worker that outlived
+`WORLD_CLAIM_STALE` can never write posts under a newer claim). Owners
+without `town_enabled` omit `posts` both from the JSON schema
+(`world_director_response_format()` gains a town arm — the schema is only
+attached when `structured_output` is set) **and** from the fixed
+`WORLD_DIRECTOR_RULES` text, which is what non-structured models act on
+(smaller prompt, no dead output either way). Parsing stays lenient via
+`pipeline::find_json_block`; `posts` is `#[serde(default)]` so
+memories-only owners keep parsing unchanged.
 
 ---
 
@@ -111,8 +120,12 @@ prompt, no dead output).
 
 One additional sweeper (`pipeline/world_town.rs`), spawned only when world
 memories runs (§2.1 of the memories spec) **and** `WORLD_TOWN_DISABLED` is not
-set (`true`/`1`, same parsing). Tick = 30s code constant (`TOWN_TICK`). All
-paths filter on `town_enabled` owners. Three paths per tick:
+set (`"1"`/`"true"`, the `DREAMING_DISABLED` convention — parsed into
+`WorldConfig` alongside the existing flags). Tick = 30s code constant
+(`TOWN_TICK`), deliberately faster than the director's env-tunable
+`WORLD_TICK_SECS` (default 300s): publish precision and the reply responder's
+debounce need finer granularity, and every town path is a cheap indexed scan.
+All paths filter on `town_enabled` owners. Three paths per tick:
 
 ### 3.1 Publish (pure SQL, zero LLM)
 
@@ -141,9 +154,12 @@ RETURNING old.prev;
 previous round's stamp, read before the overwrite) defines the activity
 window: an owner is a candidate only when posts were published or user
 comments created after `prev` (NULL `prev` → everything counts). One structured
-`[tasks.world_comment]` call per candidate owner: input = seed relationships +
-newly published posts + existing threads (including user comments); output =
-0-N comments `{ post_id, author_instance_id, content }`. Authors must be
+`[tasks.world_comment]` call per candidate owner, wired like the director:
+`filter_prompt` is the system instruction, `response_format: json_schema`
+attached only when `structured_output` is set, lenient parse fallback via
+`pipeline::find_json_block`. Input = seed relationships + newly published
+posts + existing threads (including user comments); output = 0-N comments
+`{ post_id, author_instance_id, content }`. Authors must be
 active instances of the world and not the post's author replying to
 themselves via this path; invalid rows are dropped with a warn. Inserted with
 `source = 'round'`. Call or parse failure: warn and move on — the next round
@@ -176,7 +192,8 @@ gates in order:
    `thread_cooldown_secs` default 600.
 
 Responder = the post's author persona. `[tasks.world_reply]` call (plain-text
-completion): input = seed relationships + post + full thread; output = one
+completion, `filter_prompt` as system instruction — no schema needed): input =
+seed relationships + post + full thread; output = one
 comment body, inserted with `source = 'reply'`. Failure: warn; the thread is
 retried next tick (the CAS stamp means retry waits out the cooldown — an
 accepted trade for simplicity).
@@ -186,17 +203,23 @@ accepted trade for simplicity).
 ```toml
 [tasks.world_comment]
 model = "..."
+filter_prompt = "..."       # system instruction for the batched comment round
 round_secs = 3600           # task-specific: comment round cadence
 
 [tasks.world_reply]
 model = "..."
+filter_prompt = "..."       # system instruction for the reply responder
 debounce_secs = 90          # task-specific: user-comment settle window
 thread_cooldown_secs = 600  # task-specific: min gap between responses per post
 daily_cap = 20              # task-specific: reply responses per owner per UTC day
 ```
 
 Missing section → that path is disabled (mirrors the "no `[tasks.world_director]`
-→ no sweeper" rule). Resolvers: `resolve_world_comment()`, `resolve_world_reply()`.
+→ no sweeper" rule). As landed for the director, `filter_prompt` doubles as the
+task's system instruction: absent/blank prompt → resolver returns `None` → path
+disabled, and the boot-time check (`validate_world_director_prompt`) extends to
+both sections — present-but-blank refuses to boot, skipped under
+`WORLD_DISABLED`. Resolvers: `resolve_world_comment()`, `resolve_world_reply()`.
 
 ---
 
@@ -246,16 +269,19 @@ director). `docs/llm-audit.md` gains both rows.
 
 ## 7. Testing
 
-- Parser tests: `WORLD_TOWN_DISABLED`.
+- Parser tests: `WORLD_TOWN_DISABLED` (in `parse_world_config`).
 - `model_config` tests: the four task-specific fields' defaults/overrides +
-  both resolvers; missing-section-disables-path behavior.
+  both resolvers; missing-section and blank-`filter_prompt` disable the path;
+  boot validation errs on present-but-blank for both new sections.
 - Store (sqlx): publish flip; comment-round CAS (due/not-due/contended);
   reply-responder scan query (debounce boundary, persona-comment-after-user
   exclusion); cooldown CAS; daily-cap count with mixed `source` values;
   feed keyset pagination.
 - Route tests: auth (`user_id` vs JWT sub), 404 on foreign/unpublished post,
   length cap, empty feed for unenrolled users.
-- Director output extension: `publish_at` clamp + malformed-entry drop.
+- Director output extension: `publish_at` clamp, malformed-entry drop,
+  non-roster `instance_id` drop, `posts` omitted from schema/rules for
+  memories-only owners, missing-`posts` field still parses.
 
 ---
 
