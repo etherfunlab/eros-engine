@@ -716,6 +716,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
                 tz: chrono_tz::Asia::Singapore,
             },
             prompt_log_dir: None,
+            world: crate::state::parse_world_config(None, None, None),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
