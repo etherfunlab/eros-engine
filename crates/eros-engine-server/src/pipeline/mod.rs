@@ -9,6 +9,8 @@ pub mod post_process;
 pub mod snapshot;
 pub mod stream;
 pub mod voice;
+pub mod world;
+pub mod world_town;
 
 use uuid::Uuid;
 
@@ -52,6 +54,43 @@ pub(super) fn log_openrouter_usage(
         cost = ?cost,
         "openrouter: call completed"
     );
+}
+
+/// Walk forward from the first `{` and return the substring up to its
+/// balanced `}`, ignoring braces inside string literals. Shared by the
+/// background LLM-output parsers (dreaming memory extraction, post-process
+/// affinity eval, world director) — they wrap model JSON that is sometimes
+/// fenced or prose-prefixed.
+pub(super) fn find_json_block(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&raw[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub async fn compute_signals_for_session(
@@ -276,5 +315,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(signals.message_count, 1); // the product_qa question doesn't count
+    }
+
+    #[test]
+    fn find_json_block_balanced_with_string_braces() {
+        let raw = r#"prefix {"a": "b}c", "d": 1} trailing"#;
+        let block = super::find_json_block(raw).unwrap();
+        let v: serde_json::Value = serde_json::from_str(block).unwrap();
+        assert_eq!(v["a"], "b}c");
+        assert_eq!(v["d"], 1);
+    }
+
+    #[test]
+    fn find_json_block_returns_none_when_no_object() {
+        assert!(super::find_json_block("no json here").is_none());
+    }
+
+    #[test]
+    fn find_json_block_balanced_with_nested_object() {
+        let raw = r#"prefix {"a":"b}c","d":{"e":1}} trailing"#;
+        let block = super::find_json_block(raw).unwrap();
+        let v: serde_json::Value = serde_json::from_str(block).unwrap();
+        assert_eq!(v["a"], "b}c");
+        assert_eq!(v["d"]["e"], 1);
     }
 }

@@ -16,13 +16,15 @@ Two supported paths, in order of effort:
 
 ## Subcommands
 
-The binary has three modes (dispatched by `argv[1]`):
+The binary has five modes (dispatched by `argv[1]`):
 
 | Subcommand | Purpose |
 |------------|---------|
 | `serve` (default) | Run the HTTP server on `BIND_ADDR` |
 | `migrate` | Apply pending sqlx migrations and exit |
 | `seed-personas <dir>` | Read every `*.toml` in `<dir>` and upsert as a persona genome |
+| `backfill-human-insights` | One-off projection of every `companion_insights` row into `engine.human_insights` (idempotent; manual only) |
+| `print-openapi` | Dump the OpenAPI spec to stdout and exit (no DB, no env; used by the CI drift check) |
 
 `seed-personas` is idempotent — re-runs update existing rows in place (matched by `name`), preserving UUIDs and FK references in `persona_instances`.
 
@@ -195,6 +197,33 @@ PROMPT_LOG_DIR = "/data/prompt-logs"
 ```
 
 There is no built-in rotation or retention — manage the volume yourself.
+
+### World system (experimental, optional)
+
+The [World system](world-system.md) (World Memories simulation + World Town
+feed) is fully off by default: without a `[tasks.world_director]` model-config
+section it spawns no sweepers and runs zero per-turn queries. Turning it on is
+a config + data decision, not a deploy change:
+
+1. Add the `[tasks.world_*]` sections to your model config (see
+   [`examples/model_config.toml`](../examples/model_config.toml)).
+2. Enroll owners by inserting rows into `engine.world_enrollments` over a
+   `service_role` / owner connection (the engine only reads this table); set
+   `town_enabled = true` per owner to also enable the feed.
+
+Operational switches, all optional:
+
+| Variable | Effect |
+|----------|--------|
+| `WORLD_DISABLED=true` | Master off: no sweepers, no prompt injection, zero cost |
+| `WORLD_PROMPT_DISABLED=true` | Simulate + accumulate, but don't touch chat prompts (staged-rollout valve) |
+| `WORLD_TICK_SECS` | Director sweeper tick (default 300; `0` disables) |
+| `WORLD_TOWN_DISABLED=true` | Town only: no post generation, no town sweeper; memories keep running |
+
+Cost shape: one director call per enrolled owner per `interval_hours`, plus
+(town only) activity-gated hourly comment rounds and per-owner-capped replies.
+A world nobody interacts with costs exactly the director call. Details,
+data model, and the boot-validation rules are in [World system](world-system.md).
 
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The OpenAPI JSON is at `/api-docs/openapi.json`.

@@ -544,6 +544,35 @@ pub struct TaskConfig {
     /// docs/superpowers/specs/2026-07-11-voice-tts-audio-tags-design.md.
     #[serde(default)]
     pub tts_audio_tags: Option<bool>,
+    /// world_director-only: hours between per-owner director rounds. Read only
+    /// on `[tasks.world_director]` (like `ghosting` on pde_decision). Default 24.
+    #[serde(default)]
+    pub interval_hours: Option<u32>,
+    /// world_director-only: days of world_memories script retention. Default 30.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+    /// world_comment-only: seconds between hourly comment rounds. Read only
+    /// on `[tasks.world_comment]`. Default 3600, floor 60 (0 would fire a
+    /// round every sweeper tick — cost footgun, same rationale as
+    /// `interval_hours.max(1)`).
+    #[serde(default)]
+    pub round_secs: Option<u64>,
+    /// world_reply-only: user-comment settle window in seconds. Default 90.
+    #[serde(default)]
+    pub debounce_secs: Option<u64>,
+    /// world_reply-only: min seconds between responder comments per post.
+    /// Default 600.
+    #[serde(default)]
+    pub thread_cooldown_secs: Option<u64>,
+    /// world_reply-only: responder comments per owner per UTC day. Default 20.
+    #[serde(default)]
+    pub daily_cap: Option<u32>,
+    /// world_reply-only: reply-eligibility window in seconds after a user
+    /// comment. Default 604800 (7d); floored strictly above the resolved
+    /// debounce (a window <= debounce leaves no eligible range). Bounds the
+    /// reply scan so its cost is independent of total post count (issue #176).
+    #[serde(default)]
+    pub reply_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -798,6 +827,56 @@ pub struct ResolvedExtract {
     pub extract_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved world-director task (`world_director`). The configured `filter_prompt`
+/// is the system instruction (director_prompt); the server assembles the world payload
+/// as a separate user message. Model selection mirrors the generic `resolve()` exactly.
+#[derive(Debug, Clone)]
+pub struct ResolvedWorldDirector {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub director_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub structured_output: bool,
+    pub interval_hours: u32,
+    pub retention_days: u32,
+}
+
+/// Resolved world-town comment-round task (`world_comment`). The configured
+/// `filter_prompt` is the system instruction; the server assembles the
+/// round payload as a separate user message.
+#[derive(Debug, Clone)]
+pub struct ResolvedWorldComment {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub comment_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub structured_output: bool,
+    pub round_secs: u64,
+}
+
+/// Resolved world-town reply-responder task (`world_reply`). Plain-text
+/// completion; `filter_prompt` is the system instruction.
+#[derive(Debug, Clone)]
+pub struct ResolvedWorldReply {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub reply_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub debounce_secs: u64,
+    pub thread_cooldown_secs: u64,
+    pub daily_cap: u32,
+    pub reply_window_secs: u64,
 }
 
 /// Resolved image-generation task (`chat_image_generation`). `model` is optional:
@@ -1538,6 +1617,83 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
+    /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
+    pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
+        let task_cfg = self.tasks.get("world_director")?;
+        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if director_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve("world_director", None);
+        Some(ResolvedWorldDirector {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            director_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
+            structured_output: task_cfg.structured_output.unwrap_or(true),
+            // .max(1): 0 would make the director eligible every sweeper tick
+            // (~288 calls/owner/day at the default 300s tick) — a cost footgun,
+            // not a meaningful "run continuously" setting.
+            interval_hours: task_cfg.interval_hours.unwrap_or(24).max(1),
+            retention_days: task_cfg.retention_days.unwrap_or(30),
+        })
+    }
+
+    /// Resolve the world-town comment-round bundle. `None` when
+    /// `[tasks.world_comment]` is absent OR its `filter_prompt` is blank —
+    /// the comment-round path goes inert.
+    pub fn resolve_world_comment(&self) -> Option<ResolvedWorldComment> {
+        let task_cfg = self.tasks.get("world_comment")?;
+        let comment_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if comment_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve("world_comment", None);
+        Some(ResolvedWorldComment {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            comment_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
+            structured_output: task_cfg.structured_output.unwrap_or(true),
+            round_secs: task_cfg.round_secs.unwrap_or(3600).max(60),
+        })
+    }
+
+    /// Resolve the world-town reply-responder bundle. `None` when
+    /// `[tasks.world_reply]` is absent OR its `filter_prompt` is blank.
+    pub fn resolve_world_reply(&self) -> Option<ResolvedWorldReply> {
+        let task_cfg = self.tasks.get("world_reply")?;
+        let reply_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if reply_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve("world_reply", None);
+        let debounce_secs = task_cfg.debounce_secs.unwrap_or(90);
+        Some(ResolvedWorldReply {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            reply_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
+            debounce_secs,
+            thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
+            daily_cap: task_cfg.daily_cap.unwrap_or(20),
+            reply_window_secs: task_cfg
+                .reply_window_secs
+                .unwrap_or(604_800)
+                .max(debounce_secs + 1),
+        })
+    }
+
     /// Boot-time validation for the two extraction tasks. A task **section that
     /// is present** must carry a usable `filter_prompt` (else `Err`); an
     /// **absent section** means that extraction is simply off (`Ok`). Returns a
@@ -1552,6 +1708,32 @@ impl ModelConfig {
                     "[tasks.{name}] is present but its filter_prompt is unset — eros-engine \
                      refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
                      section to disable {name}."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Boot gate, mirroring `validate_extraction_prompts`: any present world
+    /// task section (`world_director` / `world_comment` / `world_reply`) must
+    /// carry a usable `filter_prompt`. `world_director` is always checked;
+    /// the two town sections (`world_comment` / `world_reply`) are checked
+    /// only when `include_town` is true. `include_town = false`
+    /// (WORLD_TOWN_DISABLED) skips the two town sections so a staged/broken
+    /// town config cannot block boot — same isolation rationale as
+    /// WORLD_DISABLED for the whole block.
+    pub fn validate_world_prompts(&self, include_town: bool) -> Result<(), String> {
+        let mut checks = vec![("world_director", self.resolve_world_director().is_none())];
+        if include_town {
+            checks.push(("world_comment", self.resolve_world_comment().is_none()));
+            checks.push(("world_reply", self.resolve_world_reply().is_none()));
+        }
+        for (name, unresolved) in checks {
+            if self.tasks.contains_key(name) && unresolved {
+                return Err(format!(
+                    "[tasks.{name}] is present but its filter_prompt is unset — eros-engine \
+                     refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
+                     section to disable it."
                 ));
             }
         }
@@ -4189,5 +4371,176 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("broken.toml"), "{err}");
+    }
+
+    #[test]
+    fn resolve_world_director_defaults_and_overrides() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"direct the world\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().expect("configured");
+        assert_eq!(r.model, "w/m");
+        assert_eq!(r.director_prompt, "direct the world");
+        assert_eq!(r.interval_hours, 24, "spec default");
+        assert_eq!(r.retention_days, 30, "spec default");
+        assert!(r.structured_output, "defaults on");
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"p\"\n\
+             interval_hours = 6\nretention_days = 7\nstructured_output = false\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().unwrap();
+        assert_eq!(r.interval_hours, 6);
+        assert_eq!(r.retention_days, 7);
+        assert!(!r.structured_output);
+
+        // interval_hours = 0 is a cost footgun (director would be eligible
+        // every sweeper tick) — floored to 1, not passed through.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"p\"\ninterval_hours = 0\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().unwrap();
+        assert_eq!(r.interval_hours, 1, "0 must be floored to 1");
+    }
+
+    #[test]
+    fn resolve_world_director_none_when_absent_or_blank_prompt() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(
+            cfg.resolve_world_director().is_none(),
+            "absent section ⇒ off"
+        );
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"  \"\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.resolve_world_director().is_none(),
+            "blank prompt ⇒ None"
+        );
+    }
+
+    #[test]
+    fn resolve_world_comment_defaults_and_overrides() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_comment]\nmodel = \"w/c\"\nfilter_prompt = \"comment round\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_comment().expect("configured");
+        assert_eq!(r.model, "w/c");
+        assert_eq!(r.comment_prompt, "comment round");
+        assert!(r.structured_output, "default on");
+        assert_eq!(r.round_secs, 3600, "default hourly");
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_comment]\nmodel = \"w/c\"\nfilter_prompt = \"p\"\n\
+             round_secs = 7200\nstructured_output = false\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_comment().unwrap();
+        assert_eq!(r.round_secs, 7200);
+        assert!(!r.structured_output);
+
+        // round_secs = 0 would fire every sweeper tick — clamped to 60.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_comment]\nmodel = \"w/c\"\nfilter_prompt = \"p\"\nround_secs = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_world_comment().unwrap().round_secs, 60);
+    }
+
+    #[test]
+    fn resolve_world_reply_defaults_and_overrides() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"reply\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_reply().expect("configured");
+        assert_eq!(r.reply_prompt, "reply");
+        assert_eq!(r.debounce_secs, 90);
+        assert_eq!(r.thread_cooldown_secs, 600);
+        assert_eq!(r.daily_cap, 20);
+        assert_eq!(r.reply_window_secs, 604_800, "default 7 days");
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             debounce_secs = 30\nthread_cooldown_secs = 120\ndaily_cap = 5\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_reply().unwrap();
+        assert_eq!(r.debounce_secs, 30);
+        assert_eq!(r.thread_cooldown_secs, 120);
+        assert_eq!(r.daily_cap, 5);
+
+        // reply_window_secs override.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             reply_window_secs = 259200\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().reply_window_secs,
+            259_200
+        );
+
+        // A window <= debounce leaves no eligible range ⇒ clamped strictly
+        // above the resolved debounce.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             debounce_secs = 100\nreply_window_secs = 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().reply_window_secs,
+            101,
+            "clamped to debounce + 1"
+        );
+    }
+
+    #[test]
+    fn resolve_world_town_tasks_none_when_absent_or_blank_prompt() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.resolve_world_comment().is_none());
+        assert!(cfg.resolve_world_reply().is_none());
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_comment]\nmodel = \"w/c\"\nfilter_prompt = \"  \"\n\
+             [tasks.world_reply]\nmodel = \"w/r\"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_world_comment().is_none(), "blank prompt ⇒ None");
+        assert!(cfg.resolve_world_reply().is_none(), "missing prompt ⇒ None");
+    }
+
+    #[test]
+    fn validate_world_prompts_gates_all_three_sections() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.validate_world_prompts(true).is_ok(), "absent ⇒ Ok");
+        assert!(cfg.validate_world_prompts(false).is_ok(), "absent ⇒ Ok");
+
+        // world_director errs regardless of include_town (never town-gated).
+        let cfg = ModelConfig::from_toml_str("[tasks.world_director]\nmodel = \"w/m\"\n").unwrap();
+        for include_town in [true, false] {
+            let err = cfg.validate_world_prompts(include_town).unwrap_err();
+            assert!(
+                err.contains("world_director"),
+                "error names the section: {err}"
+            );
+        }
+
+        // world_comment / world_reply only err when include_town is true —
+        // WORLD_TOWN_DISABLED isolates a staged/broken town section.
+        for section in ["world_comment", "world_reply"] {
+            let cfg = ModelConfig::from_toml_str(&format!("[tasks.{section}]\nmodel = \"w/m\"\n"))
+                .unwrap();
+            let err = cfg.validate_world_prompts(true).unwrap_err();
+            assert!(err.contains(section), "error names the section: {err}");
+            assert!(
+                cfg.validate_world_prompts(false).is_ok(),
+                "include_town=false skips {section}"
+            );
+        }
     }
 }

@@ -33,6 +33,8 @@ const RELATIONSHIP_RECALL_K: i32 = 3;
 /// Five categories × 2 = at most 10 lines of grouped profile context;
 /// kept small so the prompt doesn't bloat once classification fills in.
 const K_PER_CATEGORY: i32 = 2;
+/// World-memories fragment recall size (spec §3.2).
+const WORLD_RECALL_K: i32 = 3;
 
 /// Task key used by all chat handlers. Matches the gateway's task router.
 const CHAT_TASK: &str = "chat_companion";
@@ -291,10 +293,13 @@ pub(crate) fn compose_image_prompt(
 // ─── Memory recall + insight injection helpers ────────────────────
 
 /// Embed `query_text` once, then delegate to `recall_memory_with_embedding`.
-/// Returns (empty, empty) without hitting Voyage when both layers are off or
-/// the query is blank. Voyage failure also degrades silently to (empty, empty)
-/// — recall failure must never block a chat reply (the persona just looks
-/// slightly less "with it" for that turn).
+/// Returns (empty, empty, None) without hitting Voyage when both layers are
+/// off or the query is blank. Voyage failure also degrades silently to
+/// (empty, empty, None) — recall failure must never block a chat reply (the
+/// persona just looks slightly less "with it" for that turn). The third
+/// element is the computed query embedding (`Some` only on success), reused
+/// by `fetch_world_context` so world-fragment recall doesn't pay a second
+/// Voyage call.
 async fn recall_memory(
     state: &AppState,
     user_id: Uuid,
@@ -302,15 +307,15 @@ async fn recall_memory(
     query_text: &str,
     x_on: bool,
     y_on: bool,
-) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+) -> (Vec<(String, Vec<String>)>, Vec<String>, Option<Vec<f32>>) {
     if (!x_on && !y_on) || query_text.trim().is_empty() {
-        return (vec![], vec![]);
+        return (vec![], vec![], None);
     }
     let embedding = match state.voyage.embed_query(query_text).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("voyage embed_query failed: {e}");
-            return (vec![], vec![]);
+            return (vec![], vec![], None);
         }
     };
     tracing::debug!(
@@ -321,7 +326,10 @@ async fn recall_memory(
         y_on,
         "recall_memory: embedded query, dispatching pgvector search"
     );
-    recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding, x_on, y_on).await
+    let (profile_groups, relationship) =
+        recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding, x_on, y_on)
+            .await;
+    (profile_groups, relationship, Some(embedding))
 }
 
 /// Pure-DB inner half of memory recall. Takes a pre-computed embedding and
@@ -588,6 +596,45 @@ async fn load_human_insight_bullets(
     }
 }
 
+/// World-memories chat-time fetch (spec §3.2). Returns `None` — and the
+/// prompt stays byte-identical — when the subsystem or injection is
+/// disabled, the owner isn't enrolled, or this persona has no digest yet.
+/// Fragment recall REUSES the query embedding computed by the standard
+/// memory recall; when that path was skipped, world degrades to digest-only
+/// rather than paying a second Voyage call. Any DB error degrades to `None`
+/// with a warn — world data must never block a chat reply.
+async fn fetch_world_context(
+    state: &AppState,
+    user_id: Uuid,
+    instance_id: Uuid,
+    query_embedding: Option<&[f32]>,
+) -> Option<crate::prompt::WorldContext> {
+    if state.config.world.disabled || state.config.world.prompt_disabled || !state.world_configured
+    {
+        return None;
+    }
+    let repo = eros_engine_store::world::WorldRepo { pool: &state.pool };
+    let digest = match repo.fetch_digest(user_id, instance_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("world digest fetch failed: {e}");
+            return None;
+        }
+    };
+    let digest = digest?; // unenrolled / no state / no entry ⇒ no injection
+    let fragments = match query_embedding {
+        Some(emb) => repo
+            .search_fragments(user_id, instance_id, emb, WORLD_RECALL_K)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("world fragment search failed: {e}");
+                vec![]
+            }),
+        None => vec![],
+    };
+    Some(crate::prompt::WorldContext { digest, fragments })
+}
+
 // ─── Reply ──────────────────────────────────────────────────────────
 
 /// Build a ChatRequest for the Reply action. Called by the streaming
@@ -656,7 +703,7 @@ pub(super) async fn build_reply_request(
         );
     }
 
-    let (mut profile_groups, relationship_facts) =
+    let (mut profile_groups, relationship_facts, query_embedding) =
         recall_memory(state, user_id, instance_id, &query_text, x_on, y_on).await;
 
     let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
@@ -722,6 +769,8 @@ pub(super) async fn build_reply_request(
     let (profile_groups, relationship_facts) =
         crate::memory_hygiene::prune_recalled(profile_groups, relationship_facts);
 
+    let world = fetch_world_context(state, user_id, instance_id, query_embedding.as_deref()).await;
+
     let mut system_prompt = build_prompt(
         &input.persona,
         &profile_groups,
@@ -735,6 +784,7 @@ pub(super) async fn build_reply_request(
         &recent_turns,
         &avoid_patterns,
         &emotional_context,
+        world.as_ref(),
     );
 
     if let Event::UserMessage {
@@ -2033,5 +2083,156 @@ mod tests {
             history_fetch_for(HistoryAnchor::DropHistory),
             HistoryFetch::Anchored(None),
         );
+    }
+
+    // ─── fetch_world_context ────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fetch_world_context_gates_on_enrollment_and_flags(pool: sqlx::PgPool) {
+        let owner = uuid::Uuid::new_v4();
+        let genome_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('H','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // test_state defaults world_configured=false (pins the unconfigured-
+        // deployment gate, see below); flip it on so this test exercises the
+        // enrollment/flag gating instead.
+        state.world_configured = true;
+
+        // No enrollment, no state ⇒ None.
+        assert!(fetch_world_context(&state, owner, instance, None)
+            .await
+            .is_none());
+
+        // Enrolled + digest present ⇒ Some, digest-only without an embedding.
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_states (owner_uid, seed, digests) \
+             VALUES ($1, '{}'::jsonb, $2)",
+        )
+        .bind(owner)
+        .bind(serde_json::json!({ instance.to_string(): "小圈子近况" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ctx = fetch_world_context(&state, owner, instance, None)
+            .await
+            .expect("enrolled with digest ⇒ Some");
+        assert_eq!(ctx.digest, "小圈子近况");
+        assert!(ctx.fragments.is_empty(), "no embedding ⇒ digest-only");
+
+        // world_configured=false (no [tasks.world_director] section) ⇒ None
+        // even when enrolled+digest present — the unconfigured-deployment gate.
+        let mut unconfigured = state.clone();
+        unconfigured.world_configured = false;
+        assert!(fetch_world_context(&unconfigured, owner, instance, None)
+            .await
+            .is_none());
+
+        // WORLD_PROMPT_DISABLED ⇒ None even when data exists.
+        let mut muted = state.clone();
+        muted.config.world.prompt_disabled = true;
+        assert!(fetch_world_context(&muted, owner, instance, None)
+            .await
+            .is_none());
+
+        // WORLD_DISABLED ⇒ None.
+        let mut off = state.clone();
+        off.config.world.disabled = true;
+        assert!(fetch_world_context(&off, owner, instance, None)
+            .await
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fetch_world_context_recalls_fragments_with_embedding(pool: sqlx::PgPool) {
+        let owner = uuid::Uuid::new_v4();
+        let genome_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('F','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_states (owner_uid, seed, digests) \
+             VALUES ($1, '{}'::jsonb, $2)",
+        )
+        .bind(owner)
+        .bind(serde_json::json!({ instance.to_string(): "d" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut emb = vec![0.0_f32; 512];
+        emb[42] = 1.0;
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        // Claim first so persist_round's ownership-token guard has a real
+        // claimed_at to match (the row above was inserted directly, so
+        // claimed_at is still NULL).
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+        repo.persist_round(
+            owner,
+            &serde_json::json!({}),
+            &serde_json::json!({ instance.to_string(): "d" }),
+            &[eros_engine_store::world::FragmentInsert {
+                instance_id: instance,
+                content: "剧本片段A".into(),
+                embedding: emb.clone(),
+            }],
+            &[],
+            chrono::Utc::now().date_naive(),
+            30,
+            token,
+        )
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.world_configured = true;
+        let ctx = fetch_world_context(&state, owner, instance, Some(&emb))
+            .await
+            .expect("Some");
+        assert_eq!(ctx.fragments, vec!["剧本片段A".to_string()]);
     }
 }

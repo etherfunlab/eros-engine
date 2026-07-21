@@ -98,6 +98,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 - [亲密度模型](docs/affinity-model.zh.md)——六个维度、EMA、时间衰减、关系标签。
 - [ghost 机制](docs/ghost-mechanics.zh.md)——评分公式、保护规则、示例。
 - [记忆分层](docs/memory-layers.zh.md)——画像记忆 vs 关系记忆、Voyage、pgvector 检索。
+- [世界系统](docs/world-system.zh.md)——实验性的按 owner 角色世界：World Memories 模拟 + 召回注入，以及 World Town 社交动态流。
 - [模型配置](docs/model-config.zh.md)——`model_config.toml` schema、各任务（chat、vision、图像生成、PDE、过滤器、抽取）、选模型规则、0.x 稳定性承诺。
 - [Prompt traits](docs/prompt-traits.zh.md)——按请求注入系统 prompt 与 tier 白名单。
 - [LLM / OpenRouter 审计](docs/llm-audit.zh.md)——按用户 / 按会话的归因透传。

@@ -307,6 +307,18 @@ async fn run_server() -> Result<()> {
     if let Err(msg) = model_config.validate_product_qa_prompt() {
         anyhow::bail!(msg);
     }
+
+    // Skip when the master switch is off — WORLD_DISABLED must be able to
+    // isolate a staged/incomplete [tasks.world_director] section (the sweeper
+    // won't spawn and injection is gated too, so a blank prompt is harmless).
+    // WORLD_TOWN_DISABLED isolates the two town sections
+    // ([tasks.world_comment] / [tasks.world_reply]) the same way: the town
+    // sweeper won't spawn, so a staged/broken town config must not block boot.
+    if !cfg.world.disabled {
+        if let Err(msg) = model_config.validate_world_prompts(!cfg.world.town_disabled) {
+            anyhow::bail!(msg);
+        }
+    }
     // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
     // LLM PDE off the action is unreachable — warn once and stay inert rather
     // than refusing to boot ("此功能不启用").
@@ -329,6 +341,11 @@ async fn run_server() -> Result<()> {
             .with_ignore_providers(model_config.defaults.ignore_providers.clone()),
     );
 
+    // Computed once at boot, before model_config is moved into the state
+    // struct: gates fetch_world_context so an unconfigured deployment (no
+    // [tasks.world_director] section) never runs the world JOIN per reply.
+    let world_configured = model_config.resolve_world_director().is_some();
+
     let state = AppState {
         pool,
         auth,
@@ -338,6 +355,7 @@ async fn run_server() -> Result<()> {
         model_config,
         output_regex,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
+        world_configured,
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth
@@ -358,6 +376,15 @@ async fn run_server() -> Result<()> {
     // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
     // chat path is unaffected by snapshot misconfig.
     tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
+
+    // World Memories director sweeper. Inert when WORLD_DISABLED=1/true or
+    // [tasks.world_director] is absent/blank (spec §2.1).
+    tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
+
+    // World Town sweeper (posts feed). Inert when the world subsystem is off,
+    // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
+    // posts can exist without the director (town spec §3).
+    tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
 
     let app: Router = open_router
         .with_state(state)

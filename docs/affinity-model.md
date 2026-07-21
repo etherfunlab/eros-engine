@@ -15,7 +15,7 @@ for scores, labels, and per-turn label transitions.
 | `trust` | 0.0 ↔ 1.0 | `0.0` | Topic depth, willingness to disclose self. Bond axis. |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | Curiosity, follow-up questions, anti-ghost driver. Bond axis. |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | Inside jokes, nicknames, callbacks to earlier details. Chemistry axis. |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. Rule-owned — never scored by the evaluator; excluded from both lines. |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. The LLM gives an absolute read each turn (0–1, 0.1 steps) + a rule delta, written directly (bypasses EMA; still `[0,1]`-clamped). Excluded from both lines. |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | Push-pull, playful friction, tsundere affordance. Chemistry axis. |
 
 `warmth` is the only axis that can go negative. The other five are bounded to
@@ -51,6 +51,43 @@ tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 
 `warmth`, `trust`, and `intimacy` do not decay — they are "deep" dimensions.
 
+### Patience: LLM absolute read + rule delta
+
+`patience` is no longer a purely rule-owned axis. Each turn's `affinity_evaluation`
+call (the same LLM call that produces the other five axes — no new round-trip) now
+also emits an **absolute** `patience` read (`0.0`–`1.0`, in `0.1` steps, representing
+how much patience remains for this user right now, not a change). The engine rounds
+the model's read to the nearest `0.1` and clamps to `[0, 1]` — call this `L`.
+
+The PDE still computes the reply/proactive-turn rule delta `R` as before
+(`predict_reply_deltas`: long user message `+0.02` / very short `−0.02` / stale gap
+>24h `−0.05`) — unchanged.
+
+The turn's target is `patience_target = clamp(L + R, 0, 1)`; the sum is **not**
+re-rounded to the `0.1` grid (the grid constrains the LLM read only, so `R` can nudge
+the result off-grid). The ±0.4/−0.6 asymmetric caps are applied earlier, in
+`parse_affinity_eval`, to the five LLM delta axes only — patience is never subject to
+them. On persist, `apply_deltas` still runs first as usual (all six axes go through
+EMA smoothing + the `[0,1]` clamp), and patience is then **overwritten directly** with
+`patience_target` — bypassing EMA smoothing (still `[0,1]`-clamped). Because both `L`
+and `R` are independent of the currently stored value, this write is race-safe with no
+read-modify-write needed.
+
+**Fallback:** when there is no LLM patience read this turn — Proactive, a short user
+message, an empty assistant reply, `no_persona_or_affinity` (persona load fails or no
+affinity row exists), or the eval call erroring, timing out, or the model omitting the
+`patience` field — `patience_target` is `None` and patience takes the **old** path: `R`
+is added through EMA and clamped.
+
+**Ghost is a separate path, not a fallback.** A Ghost turn never reaches
+`persist_with_event` — `persist_affinity` dispatches it to `record_ghost` instead,
+which takes no deltas, never runs `apply_deltas`/EMA, and only bumps `ghost_streak` /
+`total_ghosts` / `last_ghost_at` (it writes an all-zero `effective_deltas`). The
+PDE's `ghost_affinity_deltas()` (patience `−0.05`, tension `+0.05` — a function
+separate from `predict_reply_deltas`) is computed onto the `ActionPlan` but discarded
+at persist time. So on a Ghost turn `patience` is moved by neither a delta nor EMA —
+only the ghost counters change.
+
 ## The two derived lines
 
 The six axes produce two composite scores. `warm_pos` is `warmth.max(0.0)` —
@@ -62,8 +99,8 @@ chemistry = (warm_pos + intimacy + tension)  / 3    ∈ [0, 1]
 ```
 
 `warmth` feeds both lines: cold replies reduce both Bond and Chemistry.
-`patience` is excluded from both because it is rule-owned and never evaluated
-per-turn.
+`patience` is excluded from both — it is maintained by an LLM absolute read + rule
+delta and written directly; both lines still omit patience (by design).
 
 With the default seed (`warmth 0.1`, `trust/intrigue/tension 0`), a fresh
 session starts at bond ≈ chemistry ≈ 0.033 — both in tier 1 (stranger).

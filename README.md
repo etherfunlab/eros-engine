@@ -66,9 +66,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.7"
-eros-engine-store = "0.7"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.8"
+eros-engine-store = "0.8"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.8"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` is intentionally not published to crates.io — run it as a Docker image (below).
@@ -78,7 +78,7 @@ eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
 `linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.8.2
+docker pull ghcr.io/etherfunlab/eros-engine:0.8.3
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ Minimal run (you bring Postgres + your own `.env`):
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.8.2 serve
+  ghcr.io/etherfunlab/eros-engine:0.8.3 serve
 ```
 
 The `docker/Dockerfile` is the same artifact used to build this image. Deploy it on any container host. See [Deploying](docs/deploying.md).
@@ -98,6 +98,7 @@ The `docker/Dockerfile` is the same artifact used to build this image. Deploy it
 - [Affinity model](docs/affinity-model.md) — six dimensions, EMA, time decay, relationship labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
 - [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
+- [World system](docs/world-system.md) — experimental per-owner persona worlds: World Memories simulation + recall injection, and the World Town social feed.
 - [Model config](docs/model-config.md) — `model_config.toml` schema, every task (chat, vision, image generation, PDE, filters, extraction), model selection, 0.x stability commitments.
 - [Prompt traits](docs/prompt-traits.md) — per-request system-prompt injection and tier allow-lists.
 - [LLM / OpenRouter audit](docs/llm-audit.md) — per-user / per-session attribution passthrough.

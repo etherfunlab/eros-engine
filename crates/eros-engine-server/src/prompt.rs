@@ -31,6 +31,14 @@ use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_core::types::ReplyStyle;
 
+/// World-memories injection payload: the persona's resident digest plus
+/// recalled script fragments (spec §3.3).
+#[derive(Debug, Clone, Default)]
+pub struct WorldContext {
+    pub digest: String,
+    pub fragments: Vec<String>,
+}
+
 /// Constant in-character clause re-appended after every persona's authored
 /// `system_prompt`. It was moved OUT of personas' `system_prompt`, so the engine
 /// must re-inject it deterministically or user-authored personas drift out of
@@ -188,9 +196,9 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
 /// Build the per-turn affinity-evaluation prompt for the post-process LLM
 /// scorer. Asks the model to rate how this single exchange should move the
 /// LLM-owned axes (warmth/trust/intimacy + content nudges to
-/// intrigue/tension) as small per-turn *changes*, not absolute values.
-/// All six current values are shown for context, but `patience` is
-/// rule-owned and is deliberately excluded from the requested output.
+/// intrigue/tension) as small per-turn *changes* (deltas), while `patience`
+/// is requested separately as an *absolute* 0~1 read (0.1 steps), not a
+/// delta. All six current values are shown for context.
 /// Called by the post-process affinity evaluator.
 pub fn affinity_eval_prompt(
     persona_name: &str,
@@ -205,7 +213,7 @@ pub fn affinity_eval_prompt(
          - trust 信任（0~1）：当前 {trust:.2}。自我袒露、言行一致会提升。\n\
          - intrigue 好奇（0~1）：当前 {intrigue:.2}。话题新鲜、有内容会提升。\n\
          - intimacy 亲密（0~1）：当前 {intimacy:.2}。情感或身体上的靠近会提升。\n\
-         - patience 耐心（0~1）：当前 {patience:.2}。由规则维护，请勿评估。\n\
+         - patience 耐心（0~1）：当前 {patience:.2}。请给【绝对值】，不是变化量。\n\
          - tension 张力（0~1）：当前 {tension:.2}。调情、暧昧或冲突会提升。\n\
          \n\
          本轮对话：\n\
@@ -213,14 +221,17 @@ pub fn affinity_eval_prompt(
          {persona_name}：{assistant_msg}\n\
          \n\
          判断这一轮应让 warmth、trust、intrigue、intimacy、tension 各变化多少\
-         （是【变化量】，不是绝对值；patience 不要输出）。\n\
+         （warmth、trust、intrigue、intimacy、tension 是【变化量】。）\n\
          绝大多数普通对话、寒暄、附和都给 0（就是数字 0，不是小数）。\n\
          只有出现真正推进关系的时刻（真诚的温暖、自我袒露、脆弱、成功的调情暧昧）\
          才给正分；这种时刻不常见，但一旦出现可以给较大正分（每个维度最高约 +0.4）。\n\
          负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）要更敢扣、也更常见，\
          扣分可以更大（每个维度最低约 -0.6）。\n\
+         patience 耐心请另外给一个【绝对值】（0~1，每 0.1 一档，如 0.0/0.1/…/1.0），\
+         代表你现在对这个用户还有多少耐心、愿意继续搭理的程度。用户投入、认真、\
+         有来有回、被尊重会拉高；敷衍、重复、命令式、越界、晾着不理、粗鲁会拉低。\n\
          严格只输出 JSON，reason 用一句中文简述：\n\
-         {{\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"tension\": 0.0, \"reason\": \"...\"}}",
+         {{\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"patience\": 0.5, \"tension\": 0.0, \"reason\": \"...\"}}",
         warmth = affinity.warmth,
         trust = affinity.trust,
         intrigue = affinity.intrigue,
@@ -352,6 +363,10 @@ pub fn build_prompt(
     // Recent affinity-evaluation reasons, oldest→newest. Empty ⇒ the
     // `[emotional_context]` block is omitted.
     emotional_context: &[String],
+    // World-memories injection (spec §3.3). `None` or empty ⇒ the
+    // [world_memories] block is omitted and the prompt is byte-identical
+    // to the pre-world layout.
+    world: Option<&WorldContext>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -515,6 +530,30 @@ pub fn build_prompt(
         format!("\n[emotional_context]（最近几轮的情感走向，仅供参考，别照搬）\n{bullets}")
     };
 
+    // World-memories injection (spec §3.3): the persona's resident digest plus
+    // recalled script fragments from the shared "world" the companion lives in.
+    // `None` or an empty digest+fragments ⇒ omitted, prompt byte-identical to
+    // the pre-world layout.
+    let world_section = match world {
+        Some(w) if !w.digest.trim().is_empty() || !w.fragments.is_empty() => {
+            let mut s = String::from(
+                "\n\n[world_memories]\n（你所在小圈子的近况，可自然提及；\
+                 用户不在场，但通过你们的交流知道这些事）",
+            );
+            let digest = w.digest.trim();
+            if !digest.is_empty() {
+                s.push('\n');
+                s.push_str(digest);
+            }
+            for f in &w.fragments {
+                s.push_str("\n- ");
+                s.push_str(f);
+            }
+            s
+        }
+        _ => String::new(),
+    };
+
     // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     let gender_rule = if is_binary_gender(persona) {
@@ -555,7 +594,7 @@ pub fn build_prompt(
          \n\
          [user_profile]\n{profile_str}\n\
          \n\
-         [shared_memories]\n{rel_str}\
+         [shared_memories]\n{rel_str}{world_section}\
          {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}\n\
          \n\
          [now]\n{tc}\n\
@@ -728,6 +767,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -765,6 +805,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -797,6 +838,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -822,6 +864,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(p.contains("[reply_tone]"), "section present: {p}");
         assert!(
@@ -853,6 +896,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                None,
             );
             assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
         }
@@ -873,6 +917,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
         let order = [
@@ -920,6 +965,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -951,6 +997,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -979,6 +1026,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         // Guard present, sits before identity (stable prefix).
         assert!(s.contains("never an AI, model, bot, or program"), "{s}");
@@ -1015,6 +1063,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -1037,6 +1086,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             s.contains("你是 Aria，non-binary，24 岁"),
@@ -1064,6 +1114,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -1086,6 +1137,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         // blank gender must not produce a double comma or a ⑧ rule
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
@@ -1113,6 +1165,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -1137,6 +1190,7 @@ mod tests {
             &pairs,
             &[],
             &[],
+            None,
         );
         let header = s.find("[recent_conversation]").expect("header present");
         let iron = s.find("[iron_rules").expect("iron-rules header present");
@@ -1190,6 +1244,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -1212,6 +1267,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let z = s.find("⓪").expect("⓪ rule must render");
         let o = s.find("①").expect("① rule must render");
@@ -1237,6 +1293,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             s.contains("自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない"),
@@ -1279,6 +1336,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1294,6 +1352,7 @@ mod tests {
             &[],
             &["我看着你".to_string()],
             &["最近聊得不错".to_string()],
+            None,
         );
         let cut = a.find("[turn_style]").expect("turn-style header present");
         assert_eq!(
@@ -1329,6 +1388,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let b = build_prompt(
             &p,
@@ -1343,6 +1403,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         let cut = a
             .find("[additional_guidance]")
@@ -1370,6 +1431,7 @@ mod tests {
             &[],
             &["我看着你".to_string(), "我盯着你".to_string()],
             &[],
+            None,
         );
         assert!(s.contains("[avoid_repetition]"), "{s}");
         assert!(s.contains("我看着你"), "{s}");
@@ -1401,6 +1463,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -1425,6 +1488,7 @@ mod tests {
             &[],
             &[],
             &reasons,
+            None,
         );
         assert!(s.contains("[emotional_context]"), "{s}");
         let oldest = s.find("刚认识有点拘谨").expect("oldest present");
@@ -1460,8 +1524,77 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
+    }
+
+    #[test]
+    fn build_prompt_renders_world_memories_block() {
+        let world = WorldContext {
+            digest: "你最近和 Kenji 闹了别扭".into(),
+            fragments: vec!["昨天你把咖啡机弄坏了".into(), "Aria 帮你圆了场".into()],
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            Some(&world),
+        );
+        let block_at = p.find("[world_memories]").expect("block present");
+        assert!(p.contains("你最近和 Kenji 闹了别扭"));
+        assert!(p.contains("- 昨天你把咖啡机弄坏了"));
+        assert!(p.contains("- Aria 帮你圆了场"));
+        // Placement: after [shared_memories], before [now] (spec §3.3).
+        assert!(p.find("[shared_memories]").unwrap() < block_at);
+        assert!(block_at < p.find("[now]").unwrap());
+    }
+
+    #[test]
+    fn build_prompt_omits_world_block_when_none_or_empty() {
+        let without = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert!(!without.contains("[world_memories]"));
+        // Empty context must also omit the block AND be byte-identical.
+        let empty = WorldContext::default();
+        let with_empty = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            Some(&empty),
+        );
+        assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
     }
 
     #[test]
@@ -1552,10 +1685,14 @@ mod tests {
         for v in ["0.42", "0.31", "0.55", "0.22", "0.66", "0.13"] {
             assert!(p.contains(v), "missing current value {v} in prompt");
         }
-        // patience must NOT be a requested output key
+        // patience IS now a requested output key (absolute read)
         assert!(
-            !p.contains("\"patience\""),
-            "patience is rule-owned and must not be in the JSON output schema"
+            p.contains("\"patience\""),
+            "patience IS now in the JSON output schema (absolute read)"
+        );
+        assert!(
+            p.contains("绝对值"),
+            "the prompt frames patience as an absolute, not a delta"
         );
         // axis-to-label binding: the labeled line must carry the correct value
         assert!(
@@ -1566,12 +1703,12 @@ mod tests {
             p.contains("patience 耐心（0~1）：当前 0.66"),
             "patience display value must render"
         );
-        // five-axis JSON output schema (+reason) must be present
+        // six-axis JSON output schema (+reason) must be present (including patience)
         assert!(
             p.contains(
-                r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "tension": 0.0, "reason": "..."}"#
+                r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.5, "tension": 0.0, "reason": "..."}"#
             ),
-            "five-axis JSON output schema (+reason) must be present"
+            "six-axis JSON output schema (+reason) with patience must be present"
         );
         // new sparse/asymmetric scoring guidance present
         assert!(p.contains("+0.4"), "positive cap guidance present");
@@ -1688,6 +1825,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -1713,6 +1851,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(!p.contains("[feelings]"));
         assert!(!p.contains("[mood]"));
@@ -1780,6 +1919,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         );
         assert!(
             s.contains("别开口就自述动作或凝视"),
