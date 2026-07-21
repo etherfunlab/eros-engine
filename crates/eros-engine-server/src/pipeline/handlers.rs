@@ -735,6 +735,8 @@ pub(super) async fn build_reply_request(
         &recent_turns,
         &avoid_patterns,
         &emotional_context,
+        // Task 9 wires real WorldContext here; not yet plumbed.
+        None,
     );
 
     if let Event::UserMessage {
