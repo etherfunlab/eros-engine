@@ -109,10 +109,11 @@ async fn run_tick(
         }
     }
     if let Some(resolved) = reply {
+        let window = std::time::Duration::from_secs(resolved.reply_window_secs);
         let debounce = std::time::Duration::from_secs(resolved.debounce_secs);
         let cooldown = std::time::Duration::from_secs(resolved.thread_cooldown_secs);
         match repo
-            .list_reply_candidates(debounce, cooldown, TOWN_REPLY_BATCH)
+            .list_reply_candidates(window, debounce, cooldown, TOWN_REPLY_BATCH)
             .await
         {
             Ok(cands) => {
