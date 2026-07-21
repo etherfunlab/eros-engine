@@ -288,7 +288,7 @@ impl<'a> WorldTownRepo<'a> {
     }
 
     /// Reply-responder comments spent today (UTC day) for this owner —
-    /// counts ONLY source = 'reply' rows (spec §3.3 gate 2).
+    /// counts ONLY source = 'reply' rows (spec §3.3 gate 3).
     pub async fn count_replies_today(&self, owner_uid: Uuid) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(
             "SELECT count(*) FROM engine.world_post_comments c \
@@ -302,7 +302,7 @@ impl<'a> WorldTownRepo<'a> {
     }
 
     /// Thread-cooldown CAS doubling as the multi-instance claim (spec §3.3
-    /// gate 3). `true` = this instance owns the response.
+    /// gate 4). `true` = this instance owns the response.
     pub async fn claim_reply_cooldown(
         &self,
         post_id: Uuid,
