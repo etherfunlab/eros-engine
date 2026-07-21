@@ -248,6 +248,10 @@ async fn run_reply(
     cand: &ReplyCandidate,
 ) -> Result<(), String> {
     let repo = WorldTownRepo { pool: &state.pool };
+    // Count-then-claim is deliberately NOT atomic with the insert: under
+    // concurrent sweepers the cap can overshoot by ~1 per instance — an
+    // accepted trade-off (spec §3.3 gate 2), further narrowed by the
+    // one-candidate-per-owner scan batching.
     let spent = repo
         .count_replies_today(cand.owner_uid)
         .await
