@@ -1,0 +1,582 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! World Memories director sweeper (spec §2).
+//!
+//! Per tick: backfill state rows for new enrollments, claim due owners
+//! (SKIP LOCKED, dreaming-style), and run one structured LLM round per
+//! claimed owner: previous seed + active roster + extracted memory feedback
+//! → new seed + per-persona digests + script fragments. Persistence is a
+//! single transaction; ANY failure releases the claim and the owner retries
+//! at its next due scan. No retry queue, no partial writes.
+
+use serde::Deserialize;
+use uuid::Uuid;
+
+use eros_engine_llm::model_config::ResolvedWorldDirector;
+use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::world::{FragmentInsert, RosterEntry, WorldRepo};
+
+use crate::state::AppState;
+
+const WORLD_TASK: &str = "world_director";
+/// Sentinel OpenRouter `user` for world-subsystem background calls. Distinct
+/// from dreaming's `...111` so OpenRouter spend is attributable per subsystem
+/// (spec §2.6). Not a real auth UUID; cannot collide with a real user.
+pub(crate) const WORLD_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111112";
+/// Max owners claimed per tick.
+const WORLD_PICK_BATCH: i64 = 5;
+/// Claim considered crashed after this (spec §2.2).
+const WORLD_CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Roster cap per world (spec §2.3): earliest-created wins, warn on truncation.
+const WORLD_ROSTER_CAP: usize = 8;
+/// Memory-feedback rows per round (spec §2.3).
+const WORLD_FEEDBACK_K: i64 = 15;
+/// Defensive cap on fragments accepted per persona per round.
+const WORLD_FRAGMENTS_PER_PERSONA_CAP: usize = 6;
+
+/// Fixed engine-owned rules appended to every director payload. The
+/// operator-owned filter_prompt carries tone/genre; these are the floor.
+const WORLD_DIRECTOR_RULES: &str = "规则：\
+1) 用户是场外人：可以被角色们自然提及，但绝不能编造用户做过的事或说过的话。\
+2) seed 描述角色之间的关系图与剧情弧线，供下一轮延续。\
+3) 每个角色输出 digest（该角色视角的世界近况摘要，1-2 句）和 script_fragments\
+（当期发生的具体事件片段，每条一句、自成一体、适合单独召回）。\
+4) 只使用给出的 instance_id。";
+
+#[derive(Debug, Deserialize)]
+struct DirectorOutput {
+    seed: serde_json::Value,
+    personas: Vec<DirectorPersona>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectorPersona {
+    instance_id: Uuid,
+    digest: String,
+    #[serde(default)]
+    script_fragments: Vec<String>,
+}
+
+/// Run forever; spawn once at boot. Inert when WORLD_DISABLED is set or
+/// `[tasks.world_director]` is absent/blank.
+pub async fn sweeper(state: AppState) {
+    if state.config.world.disabled {
+        tracing::info!("world sweeper disabled (WORLD_DISABLED)");
+        return;
+    }
+    let Some(resolved) = state.model_config.resolve_world_director() else {
+        tracing::info!("world_director not configured — world sweeper inert");
+        return;
+    };
+    let tick_interval = state.config.world.tick;
+    if tick_interval.is_zero() {
+        tracing::info!("world sweeper disabled (WORLD_TICK_SECS=0)");
+        return;
+    }
+    tracing::info!(
+        ?tick_interval,
+        interval_hours = resolved.interval_hours,
+        retention_days = resolved.retention_days,
+        "world sweeper starting"
+    );
+    let mut tick = tokio::time::interval(tick_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match run_round(&state, &resolved).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(processed = n, "world: director rounds completed"),
+            Err(e) => tracing::warn!("world: round scan failed: {e}"),
+        }
+    }
+}
+
+/// One tick: backfill + claim + per-owner rounds. Per-owner failures release
+/// that owner's claim and continue with the rest.
+async fn run_round(
+    state: &AppState,
+    resolved: &ResolvedWorldDirector,
+) -> Result<usize, sqlx::Error> {
+    let repo = WorldRepo { pool: &state.pool };
+    repo.ensure_states_for_enrollments().await?;
+    let interval = std::time::Duration::from_secs(u64::from(resolved.interval_hours) * 3600);
+    let owners = repo
+        .claim_due(interval, WORLD_CLAIM_STALE, WORLD_PICK_BATCH)
+        .await?;
+    let mut count = 0;
+    for (owner, token) in owners {
+        match direct_world(state, resolved, owner, token).await {
+            Ok(()) => count += 1,
+            Err(e) => {
+                tracing::warn!(%owner, "world: director round failed: {e}");
+                if let Err(re) = repo.release_claim(owner, token).await {
+                    tracing::warn!(%owner, "world: release_claim failed: {re}");
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// One owner's round (spec §2.3–§2.4). Any Err ⇒ caller releases the claim;
+/// nothing has been written (persist_round is transactional). `token` is the
+/// ownership timestamp from `claim_due`, threaded through to every write so a
+/// round that outlives WORLD_CLAIM_STALE can't clobber a newer claim.
+async fn direct_world(
+    state: &AppState,
+    resolved: &ResolvedWorldDirector,
+    owner: Uuid,
+    token: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let repo = WorldRepo { pool: &state.pool };
+
+    let mut roster = repo
+        .list_active_roster(owner, (WORLD_ROSTER_CAP + 1) as i64)
+        .await
+        .map_err(|e| format!("roster load failed: {e}"))?;
+    if roster.is_empty() {
+        // Nothing to simulate; stamp the run so the owner isn't re-claimed
+        // every tick until the interval passes.
+        return repo
+            .mark_ran(owner, token)
+            .await
+            .map_err(|e| format!("mark_ran (empty roster) failed: {e}"));
+    }
+    if roster.len() > WORLD_ROSTER_CAP {
+        tracing::warn!(%owner, cap = WORLD_ROSTER_CAP, "world: roster truncated");
+        roster.truncate(WORLD_ROSTER_CAP);
+    }
+
+    let seed = repo
+        .load_seed(owner)
+        .await
+        .map_err(|e| format!("seed load failed: {e}"))?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let memories = repo
+        .recent_extracted_memories(owner, WORLD_FEEDBACK_K)
+        .await
+        .map_err(|e| format!("memory feedback load failed: {e}"))?;
+
+    let payload = director_user_payload(&seed, &roster, &memories);
+    let req = ChatRequest {
+        model: resolved.model.clone(),
+        fallback_model: resolved.fallback_model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.director_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: payload,
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        user: Some(WORLD_AUDIT_USER.into()),
+        reasoning: resolved.reasoning.clone(),
+        response_format: resolved
+            .structured_output
+            .then(world_director_response_format),
+        ..Default::default()
+    };
+    let raw = state
+        .openrouter
+        .execute(req)
+        .await
+        .map_err(|e| format!("world_director LLM call failed: {e}"))?;
+    super::log_openrouter_usage(WORLD_TASK, None, &raw);
+
+    let output = parse_director_output(&raw.reply)
+        .ok_or_else(|| "world_director output did not parse".to_string())?;
+
+    // Keep only personas that exist in THIS roster; cap fragments per persona.
+    let roster_ids: std::collections::HashSet<Uuid> =
+        roster.iter().map(|r| r.instance_id).collect();
+    let mut digests = serde_json::Map::new();
+    let mut fragments: Vec<(Uuid, String)> = Vec::new();
+    for p in output.personas {
+        if !roster_ids.contains(&p.instance_id) {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: unknown instance dropped");
+            continue;
+        }
+        if !p.digest.trim().is_empty() {
+            digests.insert(
+                p.instance_id.to_string(),
+                serde_json::Value::String(p.digest.trim().to_string()),
+            );
+        }
+        let mut frags: Vec<String> = p
+            .script_fragments
+            .into_iter()
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        if frags.len() > WORLD_FRAGMENTS_PER_PERSONA_CAP {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: fragments truncated");
+            frags.truncate(WORLD_FRAGMENTS_PER_PERSONA_CAP);
+        }
+        fragments.extend(frags.into_iter().map(|f| (p.instance_id, f)));
+    }
+
+    // Batch-embed all fragments in one Voyage call (order-preserving).
+    let texts: Vec<&str> = fragments.iter().map(|(_, f)| f.as_str()).collect();
+    let embeddings = state
+        .voyage
+        .embed_documents(&texts)
+        .await
+        .map_err(|e| format!("voyage embed_documents failed: {e}"))?;
+    let inserts: Vec<FragmentInsert> = fragments
+        .into_iter()
+        .zip(embeddings)
+        .map(|((instance_id, content), embedding)| FragmentInsert {
+            instance_id,
+            content,
+            embedding,
+        })
+        .collect();
+
+    let script_date = chrono::Utc::now().date_naive();
+    repo.persist_round(
+        owner,
+        &output.seed,
+        &serde_json::Value::Object(digests),
+        &inserts,
+        script_date,
+        resolved.retention_days,
+        token,
+    )
+    .await
+    .map_err(|e| format!("persist_round failed: {e}"))
+}
+
+/// Assemble the director's user message: framing header + structured JSON of
+/// previous seed / roster / memory feedback + the fixed rules.
+fn director_user_payload(
+    seed: &serde_json::Value,
+    roster: &[RosterEntry],
+    memories: &[String],
+) -> String {
+    let is_init = seed.as_object().map(|o| o.is_empty()).unwrap_or(false);
+    let personas: Vec<serde_json::Value> = roster
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "instance_id": r.instance_id,
+                "name": r.name,
+                "personality": r.tip_personality,
+                "profile": r.art_metadata,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "previous_seed": if is_init { serde_json::Value::Null } else { seed.clone() },
+        "personas": personas,
+        "recent_user_memories": memories,
+    });
+    let header = if is_init {
+        "初始化这个世界：根据下列角色设定推演他们之间的初始关系（seed），并生成当期剧本。"
+    } else {
+        "延续这个世界：在 previous_seed 的基础上推演关系发展，并生成当期剧本。"
+    };
+    format!(
+        "{header}\n\n{}\n\n{WORLD_DIRECTOR_RULES}",
+        serde_json::to_string_pretty(&data).unwrap_or_default()
+    )
+}
+
+/// OpenRouter `response_format` for the director round. `strict` is false —
+/// `seed` is deliberately free-form (the engine stores it opaquely).
+fn world_director_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "world_director_round",
+            "strict": false,
+            "schema": {
+                "type": "object",
+                "required": ["seed", "personas"],
+                "properties": {
+                    "seed": { "type": "object" },
+                    "personas": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["instance_id", "digest", "script_fragments"],
+                            "properties": {
+                                "instance_id": { "type": "string" },
+                                "digest": { "type": "string" },
+                                "script_fragments": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Lenient parse: direct JSON first, then the shared balanced-brace block
+/// extractor (`super::find_json_block`, in pipeline/mod.rs) for models that
+/// wrap JSON in prose/fences.
+fn parse_director_output(raw: &str) -> Option<DirectorOutput> {
+    if let Ok(v) = serde_json::from_str::<DirectorOutput>(raw) {
+        return Some(v);
+    }
+    let block = super::find_json_block(raw)?;
+    serde_json::from_str::<DirectorOutput>(block).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_audit_user_is_distinct_from_dreaming() {
+        assert_eq!(WORLD_AUDIT_USER, "11111111-1111-1111-1111-111111111112");
+        assert!(WORLD_AUDIT_USER.ends_with('2'));
+    }
+
+    #[test]
+    fn parse_director_output_handles_clean_and_fenced_json() {
+        let id = Uuid::new_v4();
+        let clean = format!(
+            r#"{{"seed":{{"arc":"x"}},"personas":[{{"instance_id":"{id}","digest":"d","script_fragments":["f1","f2"]}}]}}"#
+        );
+        let out = parse_director_output(&clean).expect("clean parses");
+        assert_eq!(out.personas.len(), 1);
+        assert_eq!(out.personas[0].script_fragments, vec!["f1", "f2"]);
+
+        let fenced = format!("好的：\n```json\n{clean}\n```");
+        assert!(parse_director_output(&fenced).is_some(), "fenced parses");
+
+        assert!(parse_director_output("no json at all").is_none());
+        assert!(
+            parse_director_output(r#"{"personas": []}"#).is_none(),
+            "missing seed ⇒ None"
+        );
+    }
+
+    #[test]
+    fn director_payload_flags_init_vs_continuation() {
+        let roster = vec![RosterEntry {
+            instance_id: Uuid::new_v4(),
+            name: "Aria".into(),
+            tip_personality: Some("温柔".into()),
+            art_metadata: serde_json::json!({"backstory": "咖啡店店主"}),
+        }];
+        let init = director_user_payload(&serde_json::json!({}), &roster, &[]);
+        assert!(init.contains("初始化这个世界"));
+        assert!(init.contains("\"previous_seed\": null"));
+        assert!(init.contains("Aria"));
+        assert!(init.contains("用户是场外人"), "fixed rules always present");
+
+        let cont = director_user_payload(
+            &serde_json::json!({"arc": "opening"}),
+            &roster,
+            &["用户喜欢旅行".into()],
+        );
+        assert!(cont.contains("延续这个世界"));
+        assert!(cont.contains("\"arc\": \"opening\""));
+        assert!(cont.contains("用户喜欢旅行"));
+    }
+
+    #[test]
+    fn world_director_response_format_shape() {
+        let v = world_director_response_format();
+        assert_eq!(v["type"], "json_schema");
+        assert_eq!(v["json_schema"]["strict"], false);
+        let required = v["json_schema"]["schema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "seed"));
+        assert!(required.iter().any(|r| r == "personas"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_persists_seed_and_digests_without_fragments(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        // Claim the owner so claimed_at is actually SET before direct_world
+        // runs persist_round — otherwise the `assert!(claimed.is_none())`
+        // below is vacuous (never-claimed rows are already NULL).
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let (seed, digests, version, claimed): (
+            serde_json::Value,
+            serde_json::Value,
+            i32,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT seed, digests, seed_version, claimed_at \
+             FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+        assert_eq!(version, 2);
+        assert!(claimed.is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_parse_failure_writes_nothing(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('X','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2)")
+            .bind(genome_id)
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-bad", "model": "w/m",
+                "choices": [{"message": {"content": "这不是 JSON"}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        let err = direct_world(&state, &resolved, owner, token)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not parse"));
+
+        // Nothing persisted: version still 1, seed still {}, no memories.
+        let (seed, version): (serde_json::Value, i32) = sqlx::query_as(
+            "SELECT seed, seed_version FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seed, serde_json::json!({}));
+        assert_eq!(version, 1);
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0);
+    }
+}

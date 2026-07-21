@@ -18,6 +18,13 @@ pub struct AppState {
     /// (fail-fast). Empty when none configured. Read by `drive_chat_burst`.
     pub output_regex: Arc<Vec<eros_engine_llm::model_config::CompiledRegexRule>>,
     pub stream_slots: Arc<StreamSlots>,
+    /// Whether `[tasks.world_director]` resolves to `Some` (a usable
+    /// filter_prompt is present), computed once at boot. Gates
+    /// `fetch_world_context` so a deployment with the section absent never
+    /// pays the `world_states`/`world_enrollments` JOIN on the reply path —
+    /// distinct from `config.world.disabled` / `prompt_disabled`, which are
+    /// operator env-var kill switches for a subsystem that IS configured.
+    pub world_configured: bool,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -70,6 +77,30 @@ pub(crate) fn parse_snapshot_config(
 /// Any non-empty value is the destination directory for raw prompt logs.
 pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathBuf> {
     raw.filter(|s| !s.is_empty()).map(std::path::PathBuf::from)
+}
+
+/// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
+/// injection off, 300-second sweep cadence.
+#[derive(Clone, Debug)]
+pub struct WorldConfig {
+    pub disabled: bool,        // WORLD_DISABLED — master switch
+    pub prompt_disabled: bool, // WORLD_PROMPT_DISABLED — injection-only valve
+    pub tick: Duration,        // WORLD_TICK_SECS, default 300
+}
+
+/// Pure parser for the three world-memories env vars (spec §3.1).
+/// Booleans accept "1"/"true" — the DREAMING_DISABLED convention.
+pub(crate) fn parse_world_config(
+    disabled_raw: Option<&str>,
+    prompt_disabled_raw: Option<&str>,
+    tick_raw: Option<&str>,
+) -> WorldConfig {
+    let flag = |raw: Option<&str>| raw.map(|v| v == "1" || v == "true").unwrap_or(false);
+    WorldConfig {
+        disabled: flag(disabled_raw),
+        prompt_disabled: flag(prompt_disabled_raw),
+        tick: Duration::from_secs(tick_raw.and_then(|v| v.parse().ok()).unwrap_or(300)),
+    }
 }
 
 /// Per-user in-flight SSE stream counter. Used by the
@@ -164,6 +195,8 @@ pub struct ServerConfig {
     /// `Some`, each reply turn writes one human-readable file here. Contains
     /// raw chat content — operator-only; point it at a volume you control.
     pub prompt_log_dir: Option<std::path::PathBuf>,
+    /// World memories subsystem configuration.
+    pub world: WorldConfig,
 }
 
 impl ServerConfig {
@@ -222,6 +255,11 @@ impl ServerConfig {
             ),
             snapshot,
             prompt_log_dir: parse_prompt_log_dir(std::env::var("PROMPT_LOG_DIR").ok().as_deref()),
+            world: parse_world_config(
+                std::env::var("WORLD_DISABLED").ok().as_deref(),
+                std::env::var("WORLD_PROMPT_DISABLED").ok().as_deref(),
+                std::env::var("WORLD_TICK_SECS").ok().as_deref(),
+            ),
         }
     }
 }
@@ -324,6 +362,46 @@ mod tests {
         assert_eq!(
             parse_prompt_log_dir(Some("/data/prompt-logs")),
             Some(std::path::PathBuf::from("/data/prompt-logs")),
+        );
+    }
+
+    #[test]
+    fn world_config_defaults_when_env_unset() {
+        let cfg = parse_world_config(None, None, None);
+        assert!(!cfg.disabled);
+        assert!(!cfg.prompt_disabled);
+        assert_eq!(cfg.tick, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn world_config_accepts_true_and_one() {
+        for v in ["1", "true"] {
+            let cfg = parse_world_config(Some(v), Some(v), None);
+            assert!(cfg.disabled, "{v} must disable");
+            assert!(cfg.prompt_disabled, "{v} must disable injection");
+        }
+        let cfg = parse_world_config(Some("false"), Some("0"), None);
+        assert!(!cfg.disabled);
+        assert!(!cfg.prompt_disabled);
+    }
+
+    #[test]
+    fn world_config_parses_tick_and_falls_back_on_garbage() {
+        assert_eq!(
+            parse_world_config(None, None, Some("60")).tick,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_world_config(None, None, Some("not-a-number")).tick,
+            Duration::from_secs(300)
+        );
+        // "0" parses fine here — Duration::ZERO is a legitimate value from the
+        // parser's point of view. It's the sweeper (pipeline::world::sweeper)
+        // that treats a zero tick as "disabled" and returns before building a
+        // tokio::time::interval (which would panic on Duration::ZERO).
+        assert_eq!(
+            parse_world_config(None, None, Some("0")).tick,
+            Duration::from_secs(0)
         );
     }
 }

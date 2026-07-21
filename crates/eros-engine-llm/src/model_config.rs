@@ -544,6 +544,13 @@ pub struct TaskConfig {
     /// docs/superpowers/specs/2026-07-11-voice-tts-audio-tags-design.md.
     #[serde(default)]
     pub tts_audio_tags: Option<bool>,
+    /// world_director-only: hours between per-owner director rounds. Read only
+    /// on `[tasks.world_director]` (like `ghosting` on pde_decision). Default 24.
+    #[serde(default)]
+    pub interval_hours: Option<u32>,
+    /// world_director-only: days of world_memories script retention. Default 30.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -798,6 +805,23 @@ pub struct ResolvedExtract {
     pub extract_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Resolved world-director task (`world_director`). The configured `filter_prompt`
+/// is the system instruction (director_prompt); the server assembles the world payload
+/// as a separate user message. Model selection mirrors the generic `resolve()` exactly.
+#[derive(Debug, Clone)]
+pub struct ResolvedWorldDirector {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub director_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub structured_output: bool,
+    pub interval_hours: u32,
+    pub retention_days: u32,
 }
 
 /// Resolved image-generation task (`chat_image_generation`). `model` is optional:
@@ -1538,6 +1562,32 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
+    /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
+    pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
+        let task_cfg = self.tasks.get("world_director")?;
+        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if director_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve("world_director", None);
+        Some(ResolvedWorldDirector {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            director_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
+            structured_output: task_cfg.structured_output.unwrap_or(true),
+            // .max(1): 0 would make the director eligible every sweeper tick
+            // (~288 calls/owner/day at the default 300s tick) — a cost footgun,
+            // not a meaningful "run continuously" setting.
+            interval_hours: task_cfg.interval_hours.unwrap_or(24).max(1),
+            retention_days: task_cfg.retention_days.unwrap_or(30),
+        })
+    }
+
     /// Boot-time validation for the two extraction tasks. A task **section that
     /// is present** must carry a usable `filter_prompt` (else `Err`); an
     /// **absent section** means that extraction is simply off (`Ok`). Returns a
@@ -1554,6 +1604,20 @@ impl ModelConfig {
                      section to disable {name}."
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Boot gate, mirroring `validate_extraction_prompts`: a present
+    /// `[tasks.world_director]` must carry a usable `filter_prompt`.
+    pub fn validate_world_director_prompt(&self) -> Result<(), String> {
+        if self.tasks.contains_key("world_director") && self.resolve_world_director().is_none() {
+            return Err(
+                "[tasks.world_director] is present but its filter_prompt is unset — eros-engine \
+                 refuses to boot. Set a filter_prompt, or remove the [tasks.world_director] \
+                 section to disable world memories."
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -4189,5 +4253,66 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("broken.toml"), "{err}");
+    }
+
+    #[test]
+    fn resolve_world_director_defaults_and_overrides() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"direct the world\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().expect("configured");
+        assert_eq!(r.model, "w/m");
+        assert_eq!(r.director_prompt, "direct the world");
+        assert_eq!(r.interval_hours, 24, "spec default");
+        assert_eq!(r.retention_days, 30, "spec default");
+        assert!(r.structured_output, "defaults on");
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"p\"\n\
+             interval_hours = 6\nretention_days = 7\nstructured_output = false\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().unwrap();
+        assert_eq!(r.interval_hours, 6);
+        assert_eq!(r.retention_days, 7);
+        assert!(!r.structured_output);
+
+        // interval_hours = 0 is a cost footgun (director would be eligible
+        // every sweeper tick) — floored to 1, not passed through.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"p\"\ninterval_hours = 0\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_director().unwrap();
+        assert_eq!(r.interval_hours, 1, "0 must be floored to 1");
+    }
+
+    #[test]
+    fn resolve_world_director_none_when_absent_or_blank_prompt() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(
+            cfg.resolve_world_director().is_none(),
+            "absent section ⇒ off"
+        );
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_director]\nmodel = \"w/m\"\nfilter_prompt = \"  \"\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.resolve_world_director().is_none(),
+            "blank prompt ⇒ None"
+        );
+    }
+
+    #[test]
+    fn validate_world_director_prompt_gates_present_but_blank() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.validate_world_director_prompt().is_ok(), "absent ⇒ Ok");
+        let cfg = ModelConfig::from_toml_str("[tasks.world_director]\nmodel = \"w/m\"\n").unwrap();
+        assert!(
+            cfg.validate_world_director_prompt().is_err(),
+            "present+blank ⇒ boot error"
+        );
     }
 }

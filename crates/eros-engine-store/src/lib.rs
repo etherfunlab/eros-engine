@@ -10,6 +10,7 @@ pub mod insight;
 pub mod memory;
 pub mod persona;
 pub mod pool;
+pub mod world;
 
 pub use sqlx::PgPool;
 
@@ -244,6 +245,76 @@ mod migration_tests {
             .await
             .unwrap();
             assert!(exists, "persona_genomes.{col} must survive migration 0024");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0035_world_tables_schema(pool: PgPool) {
+        // All three tables exist with RLS enabled (0013-style lockdown).
+        for tbl in ["world_enrollments", "world_states", "world_memories"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'engine' AND table_name = $1)",
+            )
+            .bind(tbl)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(exists, "engine.{tbl} must be created by migration 0035");
+            let rls: bool = sqlx::query_scalar(&format!(
+                "SELECT relrowsecurity FROM pg_class WHERE oid = 'engine.{tbl}'::regclass"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(rls, "RLS must be enabled on engine.{tbl}");
+        }
+
+        // world_states column identity/order.
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'world_states' \
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                "owner_uid",
+                "seed",
+                "digests",
+                "seed_version",
+                "last_run_at",
+                "claimed_at",
+                "updated_at"
+            ],
+        );
+
+        // world_memories embedding is a 512-dim vector and the two indexes exist.
+        let emb_type: String = sqlx::query_scalar(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 'engine.world_memories'::regclass AND attname = 'embedding'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(emb_type, "vector(512)");
+        for idx in [
+            "idx_world_memories_owner_instance",
+            "idx_world_memories_embedding",
+        ] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'engine' AND tablename = 'world_memories' \
+                   AND indexname = $1)",
+            )
+            .bind(idx)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(exists, "{idx} must exist");
         }
     }
 }

@@ -383,44 +383,6 @@ async fn embed_and_upsert(
 
 // ─── Insight extraction ────────────────────────────────────────────
 
-/// Locate the first balanced `{...}` block in `raw`. Returned as a borrowed
-/// slice. Replaces the gateway's `regex::Regex::new(r"(?s)\{.*\}")` so the
-/// OSS server crate doesn't pick up a `regex` dependency just for this.
-pub(crate) fn find_json_block(raw: &str) -> Option<&str> {
-    let bytes = raw.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-    // Walk forward, tracking nesting depth + string state, to find the
-    // paired close brace. Mirrors the greedy `\{.*\}` behaviour but stays
-    // balanced rather than running to EOF.
-    let mut depth = 0_i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&raw[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Per-axis safety caps on the LLM's raw delta, applied before the pacing gain.
 /// Asymmetric by design (spec §4.5): losses may be larger and fire more readily
 /// than gains, so a single bad turn can bite while gains stay earned.
@@ -494,7 +456,7 @@ fn parse_affinity_eval(
     use eros_engine_core::affinity::AffinityDeltas;
     let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
         .ok()
-        .or_else(|| find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
+        .or_else(|| super::find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
     let Some(e) = parsed else {
         return (AffinityDeltas::default(), None, String::new());
     };
@@ -933,7 +895,7 @@ async fn extract_facts(
     // Parse once; distinguish parse_error (no JSON at all) from empty/ok.
     let parsed = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .or_else(|| find_json_block(&raw).and_then(|b| serde_json::from_str(b).ok()));
+        .or_else(|| super::find_json_block(&raw).and_then(|b| serde_json::from_str(b).ok()));
     match parsed {
         Some(v) => {
             let facts = extract_facts_array(&v);
@@ -1022,7 +984,7 @@ async fn extract_structured_insights(
         .ok()
         .filter(|v| v.is_object())
         .or_else(|| {
-            find_json_block(&raw)
+            super::find_json_block(&raw)
                 .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
                 .filter(|v| v.is_object())
         });
@@ -1125,21 +1087,6 @@ mod tests {
     fn client_id_from_event_none_for_non_user_message() {
         let event = Event::ProactiveTrigger;
         assert_eq!(client_id_from_event(&event), None);
-    }
-
-    #[test]
-    fn find_json_block_balanced_with_nested_string_braces() {
-        // The `}` inside the string literal must not close the outer block.
-        let raw = r#"prefix {"a": "b}c", "d": {"e": 1}} trailing"#;
-        let block = find_json_block(raw).unwrap();
-        let v: serde_json::Value = serde_json::from_str(block).unwrap();
-        assert_eq!(v["a"], "b}c");
-        assert_eq!(v["d"]["e"], 1);
-    }
-
-    #[test]
-    fn find_json_block_returns_none_when_no_object() {
-        assert!(find_json_block("no json here").is_none());
     }
 
     #[test]

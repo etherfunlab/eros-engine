@@ -282,47 +282,11 @@ async fn mark_classified(pool: &sqlx::PgPool, session_id: Uuid) -> Result<(), sq
     Ok(())
 }
 
-/// Walk forward from the first `{` and return the substring up to its
-/// balanced `}`, ignoring braces inside string literals. Mirrors the
-/// helper in `post_process.rs`; kept private to this module so the
-/// extraction-vs-classification parsing stays decoupled.
-fn find_json_block(raw: &str) -> Option<&str> {
-    let bytes = raw.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-    let mut depth = 0_i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&raw[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn parse_memory_candidates(raw: &str) -> Vec<MemoryCandidate> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
         return extract_memory_array(&v);
     }
-    if let Some(block) = find_json_block(raw) {
+    if let Some(block) = super::find_json_block(raw) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
             return extract_memory_array(&v);
         }
@@ -446,15 +410,6 @@ mod tests {
         assert_eq!(normalise_category("opinion"), "fact");
         assert_eq!(normalise_category(""), "fact");
         assert_eq!(normalise_category("分类"), "fact");
-    }
-
-    #[test]
-    fn find_json_block_balanced_with_string_braces() {
-        let raw = r#"prefix {"a": "b}c", "d": 1} trailing"#;
-        let block = find_json_block(raw).unwrap();
-        let v: serde_json::Value = serde_json::from_str(block).unwrap();
-        assert_eq!(v["a"], "b}c");
-        assert_eq!(v["d"], 1);
     }
 
     #[test]

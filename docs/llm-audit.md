@@ -86,13 +86,20 @@ Behaviour:
   its members).
 - Unset or empty → today's pass-through behaviour.
 
-Background paths (`pipeline::dreaming`, `pipeline::post_process`) emit
-usage only as `tracing::info!` fields:
+Background paths (`pipeline::dreaming`, `pipeline::post_process`,
+`pipeline::world_director`) emit usage only as `tracing::info!` fields:
 
 ```
 openrouter: call completed session=… generation_id=… model=…
 prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 ```
+
+- `world_director` — World Memories director sweeper (background). One call
+  per enrolled owner per `interval_hours`. `user` =
+  `11111111-1111-1111-1111-111111111112` (world subsystem sentinel, distinct
+  from dreaming's `11111111-1111-1111-1111-111111111111`). Usage/cost emitted
+  as tracing fields via `log_openrouter_usage("world_director", None, …)`;
+  nothing on any client frame.
 
 ## App-attribution headers
 
