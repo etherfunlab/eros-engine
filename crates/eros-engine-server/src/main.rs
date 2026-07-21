@@ -311,8 +311,11 @@ async fn run_server() -> Result<()> {
     // Skip when the master switch is off — WORLD_DISABLED must be able to
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
+    // WORLD_TOWN_DISABLED isolates the two town sections
+    // ([tasks.world_comment] / [tasks.world_reply]) the same way: the town
+    // sweeper won't spawn, so a staged/broken town config must not block boot.
     if !cfg.world.disabled {
-        if let Err(msg) = model_config.validate_world_prompts() {
+        if let Err(msg) = model_config.validate_world_prompts(!cfg.world.town_disabled) {
             anyhow::bail!(msg);
         }
     }

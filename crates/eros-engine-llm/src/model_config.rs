@@ -1704,13 +1704,18 @@ impl ModelConfig {
 
     /// Boot gate, mirroring `validate_extraction_prompts`: any present world
     /// task section (`world_director` / `world_comment` / `world_reply`) must
-    /// carry a usable `filter_prompt`.
-    pub fn validate_world_prompts(&self) -> Result<(), String> {
-        let checks = [
-            ("world_director", self.resolve_world_director().is_none()),
-            ("world_comment", self.resolve_world_comment().is_none()),
-            ("world_reply", self.resolve_world_reply().is_none()),
-        ];
+    /// carry a usable `filter_prompt`. `world_director` is always checked;
+    /// the two town sections (`world_comment` / `world_reply`) are checked
+    /// only when `include_town` is true. `include_town = false`
+    /// (WORLD_TOWN_DISABLED) skips the two town sections so a staged/broken
+    /// town config cannot block boot — same isolation rationale as
+    /// WORLD_DISABLED for the whole block.
+    pub fn validate_world_prompts(&self, include_town: bool) -> Result<(), String> {
+        let mut checks = vec![("world_director", self.resolve_world_director().is_none())];
+        if include_town {
+            checks.push(("world_comment", self.resolve_world_comment().is_none()));
+            checks.push(("world_reply", self.resolve_world_reply().is_none()));
+        }
         for (name, unresolved) in checks {
             if self.tasks.contains_key(name) && unresolved {
                 return Err(format!(
@@ -4475,12 +4480,30 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn validate_world_prompts_gates_all_three_sections() {
         let cfg = ModelConfig::from_toml_str("").unwrap();
-        assert!(cfg.validate_world_prompts().is_ok(), "absent ⇒ Ok");
-        for section in ["world_director", "world_comment", "world_reply"] {
+        assert!(cfg.validate_world_prompts(true).is_ok(), "absent ⇒ Ok");
+        assert!(cfg.validate_world_prompts(false).is_ok(), "absent ⇒ Ok");
+
+        // world_director errs regardless of include_town (never town-gated).
+        let cfg = ModelConfig::from_toml_str("[tasks.world_director]\nmodel = \"w/m\"\n").unwrap();
+        for include_town in [true, false] {
+            let err = cfg.validate_world_prompts(include_town).unwrap_err();
+            assert!(
+                err.contains("world_director"),
+                "error names the section: {err}"
+            );
+        }
+
+        // world_comment / world_reply only err when include_town is true —
+        // WORLD_TOWN_DISABLED isolates a staged/broken town section.
+        for section in ["world_comment", "world_reply"] {
             let cfg = ModelConfig::from_toml_str(&format!("[tasks.{section}]\nmodel = \"w/m\"\n"))
                 .unwrap();
-            let err = cfg.validate_world_prompts().unwrap_err();
+            let err = cfg.validate_world_prompts(true).unwrap_err();
             assert!(err.contains(section), "error names the section: {err}");
+            assert!(
+                cfg.validate_world_prompts(false).is_ok(),
+                "include_town=false skips {section}"
+            );
         }
     }
 }
