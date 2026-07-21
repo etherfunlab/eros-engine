@@ -307,6 +307,10 @@ async fn run_server() -> Result<()> {
     if let Err(msg) = model_config.validate_product_qa_prompt() {
         anyhow::bail!(msg);
     }
+
+    if let Err(msg) = model_config.validate_world_director_prompt() {
+        anyhow::bail!(msg);
+    }
     // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
     // LLM PDE off the action is unreachable — warn once and stay inert rather
     // than refusing to boot ("此功能不启用").
@@ -358,6 +362,10 @@ async fn run_server() -> Result<()> {
     // SNAPSHOT_DISABLED=1 or the cron expression fails to parse, so the
     // chat path is unaffected by snapshot misconfig.
     tokio::spawn(crate::pipeline::snapshot::sweeper(state.clone()));
+
+    // World Memories director sweeper. Inert when WORLD_DISABLED=1/true or
+    // [tasks.world_director] is absent/blank (spec §2.1).
+    tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
 
     let app: Router = open_router
         .with_state(state)

@@ -1403,7 +1403,7 @@ fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
     serde_json::from_str::<InputFilterVerdict>(text)
         .ok()
         .or_else(|| {
-            super::post_process::find_json_block(text)
+            super::find_json_block(text)
                 .and_then(|b| serde_json::from_str::<InputFilterVerdict>(b).ok())
         })
 }
@@ -1459,8 +1459,7 @@ pub(crate) struct PdeVerdict {
 /// (mirrors `parse_input_filter_verdict`).
 fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
     serde_json::from_str::<PdeVerdict>(text).ok().or_else(|| {
-        super::post_process::find_json_block(text)
-            .and_then(|b| serde_json::from_str::<PdeVerdict>(b).ok())
+        super::find_json_block(text).and_then(|b| serde_json::from_str::<PdeVerdict>(b).ok())
     })
 }
 
@@ -1925,8 +1924,7 @@ struct ImageVision {
 /// embedded in prose (mirrors `parse_input_filter_verdict`).
 fn parse_image_vision(text: &str) -> Option<ImageVision> {
     serde_json::from_str::<ImageVision>(text).ok().or_else(|| {
-        super::post_process::find_json_block(text)
-            .and_then(|b| serde_json::from_str::<ImageVision>(b).ok())
+        super::find_json_block(text).and_then(|b| serde_json::from_str::<ImageVision>(b).ok())
     })
 }
 
