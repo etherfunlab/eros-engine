@@ -103,12 +103,12 @@ async fn run_round(
         .claim_due(interval, WORLD_CLAIM_STALE, WORLD_PICK_BATCH)
         .await?;
     let mut count = 0;
-    for owner in owners {
-        match direct_world(state, resolved, owner).await {
+    for (owner, token) in owners {
+        match direct_world(state, resolved, owner, token).await {
             Ok(()) => count += 1,
             Err(e) => {
                 tracing::warn!(%owner, "world: director round failed: {e}");
-                if let Err(re) = repo.release_claim(owner).await {
+                if let Err(re) = repo.release_claim(owner, token).await {
                     tracing::warn!(%owner, "world: release_claim failed: {re}");
                 }
             }
@@ -118,11 +118,14 @@ async fn run_round(
 }
 
 /// One owner's round (spec §2.3–§2.4). Any Err ⇒ caller releases the claim;
-/// nothing has been written (persist_round is transactional).
+/// nothing has been written (persist_round is transactional). `token` is the
+/// ownership timestamp from `claim_due`, threaded through to every write so a
+/// round that outlives WORLD_CLAIM_STALE can't clobber a newer claim.
 async fn direct_world(
     state: &AppState,
     resolved: &ResolvedWorldDirector,
     owner: Uuid,
+    token: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let repo = WorldRepo { pool: &state.pool };
 
@@ -134,7 +137,7 @@ async fn direct_world(
         // Nothing to simulate; stamp the run so the owner isn't re-claimed
         // every tick until the interval passes.
         return repo
-            .mark_ran(owner)
+            .mark_ran(owner, token)
             .await
             .map_err(|e| format!("mark_ran (empty roster) failed: {e}"));
     }
@@ -240,6 +243,7 @@ async fn direct_world(
         &inserts,
         script_date,
         resolved.retention_days,
+        token,
     )
     .await
     .map_err(|e| format!("persist_round failed: {e}"))
@@ -457,15 +461,17 @@ mod tests {
         // Claim the owner so claimed_at is actually SET before direct_world
         // runs persist_round — otherwise the `assert!(claimed.is_none())`
         // below is vacuous (never-claimed rows are already NULL).
-        repo.claim_due(
-            std::time::Duration::from_secs(24 * 3600),
-            std::time::Duration::from_secs(1800),
-            5,
-        )
-        .await
-        .unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
 
-        direct_world(&state, &resolved, owner)
+        direct_world(&state, &resolved, owner, token)
             .await
             .expect("round ok");
 
@@ -540,8 +546,19 @@ mod tests {
         let resolved = state.model_config.resolve_world_director().unwrap();
         let repo = eros_engine_store::world::WorldRepo { pool: &pool };
         repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
 
-        let err = direct_world(&state, &resolved, owner).await.unwrap_err();
+        let err = direct_world(&state, &resolved, owner, token)
+            .await
+            .unwrap_err();
         assert!(err.contains("did not parse"));
 
         // Nothing persisted: version still 1, seed still {}, no memories.

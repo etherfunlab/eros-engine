@@ -50,19 +50,23 @@ impl<'a> WorldRepo<'a> {
 
     /// Atomically claim up to `batch` due owners (enrolled AND past their
     /// interval AND not freshly claimed). Same statement shape as the
-    /// dreaming picker: concurrent sweepers see disjoint sets.
+    /// dreaming picker: concurrent sweepers see disjoint sets. Returns each
+    /// owner alongside the `claimed_at` timestamp just written — the caller's
+    /// ownership token, threaded back into `release_claim`/`mark_ran`/
+    /// `persist_round` so a worker that outlives the stale window can never
+    /// clobber a newer sweeper's claim on the same owner.
     pub async fn claim_due(
         &self,
         interval: Duration,
         stale: Duration,
         batch: i64,
-    ) -> Result<Vec<Uuid>, sqlx::Error> {
+    ) -> Result<Vec<(Uuid, DateTime<Utc>)>, sqlx::Error> {
         let now = Utc::now();
         let due_cutoff: DateTime<Utc> =
             now - chrono::Duration::from_std(interval).unwrap_or_default();
         let stale_cutoff: DateTime<Utc> =
             now - chrono::Duration::from_std(stale).unwrap_or_default();
-        sqlx::query_scalar(
+        sqlx::query_as(
             "UPDATE engine.world_states SET claimed_at = now() \
              WHERE owner_uid IN ( \
                  SELECT ws.owner_uid FROM engine.world_states ws \
@@ -73,7 +77,7 @@ impl<'a> WorldRepo<'a> {
                  LIMIT $3 \
                  FOR UPDATE SKIP LOCKED \
              ) \
-             RETURNING owner_uid",
+             RETURNING owner_uid, claimed_at",
         )
         .bind(due_cutoff)
         .bind(stale_cutoff)
@@ -83,24 +87,41 @@ impl<'a> WorldRepo<'a> {
     }
 
     /// Reset the claim after a failed round so the owner retries at the next
-    /// due scan instead of waiting out the stale window.
-    pub async fn release_claim(&self, owner_uid: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE engine.world_states SET claimed_at = NULL WHERE owner_uid = $1")
-            .bind(owner_uid)
-            .execute(self.pool)
-            .await?;
+    /// due scan instead of waiting out the stale window. Guarded on the
+    /// ownership token: if a newer sweeper has since reclaimed this owner
+    /// (past `WORLD_CLAIM_STALE`), `claimed_at` no longer matches and this is
+    /// a no-op — we must not clear a claim we no longer hold.
+    pub async fn release_claim(
+        &self,
+        owner_uid: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.world_states SET claimed_at = NULL \
+             WHERE owner_uid = $1 AND claimed_at = $2",
+        )
+        .bind(owner_uid)
+        .bind(claimed_at)
+        .execute(self.pool)
+        .await?;
         Ok(())
     }
 
     /// Stamp a round that produced nothing to persist (e.g. empty roster):
     /// advances last_run_at and clears the claim without touching the seed.
-    pub async fn mark_ran(&self, owner_uid: Uuid) -> Result<(), sqlx::Error> {
+    /// Guarded on the ownership token — see `release_claim`.
+    pub async fn mark_ran(
+        &self,
+        owner_uid: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE engine.world_states \
              SET last_run_at = now(), claimed_at = NULL, updated_at = now() \
-             WHERE owner_uid = $1",
+             WHERE owner_uid = $1 AND claimed_at = $2",
         )
         .bind(owner_uid)
+        .bind(claimed_at)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -163,6 +184,14 @@ impl<'a> WorldRepo<'a> {
     /// retention delete + fragment inserts + state update (seed_version++,
     /// last_run_at=now, claimed_at=NULL). All-or-nothing: any failure rolls
     /// back and the caller releases the claim.
+    ///
+    /// `claimed_at` is the ownership token from `claim_due`. The final state
+    /// update is guarded on it (`AND claimed_at = $N`); if a newer sweeper
+    /// has since reclaimed this owner the guard matches zero rows and we
+    /// return `Err(RowNotFound)` BEFORE committing — the transaction is
+    /// dropped, which rolls back the retention delete and fragment inserts
+    /// too, so a lost-claim round writes nothing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn persist_round(
         &self,
         owner_uid: Uuid,
@@ -171,6 +200,7 @@ impl<'a> WorldRepo<'a> {
         fragments: &[FragmentInsert],
         script_date: NaiveDate,
         retention_days: u32,
+        claimed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let retention_cutoff = script_date - chrono::Days::new(u64::from(retention_days));
@@ -193,17 +223,24 @@ impl<'a> WorldRepo<'a> {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE engine.world_states \
              SET seed = $2, digests = $3, seed_version = seed_version + 1, \
                  last_run_at = now(), claimed_at = NULL, updated_at = now() \
-             WHERE owner_uid = $1",
+             WHERE owner_uid = $1 AND claimed_at = $4",
         )
         .bind(owner_uid)
         .bind(seed)
         .bind(digests)
+        .bind(claimed_at)
         .execute(&mut *tx)
         .await?;
+        if res.rows_affected() == 0 {
+            // Lost the claim mid-round (a newer sweeper reclaimed this owner
+            // past WORLD_CLAIM_STALE). Do not commit — drop `tx` so the
+            // retention delete + fragment inserts above roll back too.
+            return Err(sqlx::Error::RowNotFound);
+        }
         tx.commit().await
     }
 
@@ -315,7 +352,11 @@ mod tests {
         repo.ensure_states_for_enrollments().await.unwrap();
 
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
-        assert_eq!(claimed, vec![owner], "never-run world is due");
+        assert_eq!(
+            claimed.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![owner],
+            "never-run world is due"
+        );
 
         // Immediately re-claiming yields nothing (claimed_at is fresh).
         let again = repo.claim_due(DAY, STALE, 5).await.unwrap();
@@ -367,7 +408,11 @@ mod tests {
         .unwrap();
 
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
-        assert_eq!(claimed, vec![owner], "stale claim must be recovered");
+        assert_eq!(
+            claimed.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![owner],
+            "stale claim must be recovered"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -377,12 +422,50 @@ mod tests {
         enroll(&pool, owner).await;
         repo.ensure_states_for_enrollments().await.unwrap();
 
-        assert_eq!(repo.claim_due(DAY, STALE, 5).await.unwrap(), vec![owner]);
-        repo.release_claim(owner).await.unwrap();
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (o, token) = claimed[0];
+        assert_eq!(o, owner);
+        repo.release_claim(owner, token).await.unwrap();
+        let reclaimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         assert_eq!(
-            repo.claim_due(DAY, STALE, 5).await.unwrap(),
+            reclaimed.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
             vec![owner],
             "released claim must be immediately re-claimable"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn release_claim_only_clears_matching_token(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token1) = claimed[0];
+
+        // Simulate a reclaim by a newer sweeper: bump claimed_at forward.
+        sqlx::query(
+            "UPDATE engine.world_states SET claimed_at = now() + interval '1 second' \
+             WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The stale worker's release, using the OLD token, must be a no-op.
+        repo.release_claim(owner, token1).await.unwrap();
+
+        let claimed_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT claimed_at FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            claimed_at.is_some(),
+            "stale worker must not clear the newer sweeper's claim"
         );
     }
 
@@ -392,9 +475,10 @@ mod tests {
         let owner = Uuid::new_v4();
         enroll(&pool, owner).await;
         repo.ensure_states_for_enrollments().await.unwrap();
-        repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token) = claimed[0];
 
-        repo.mark_ran(owner).await.unwrap();
+        repo.mark_ran(owner, token).await.unwrap();
         let (last_run, claimed): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT last_run_at, claimed_at FROM engine.world_states WHERE owner_uid = $1",
         )
@@ -493,9 +577,11 @@ mod tests {
         // Claim the owner so claimed_at is actually SET before persist_round
         // runs — otherwise the `assert!(claimed.is_none())` below is vacuous
         // (never-claimed rows are already NULL).
-        repo.claim_due(Duration::from_secs(24 * 3600), Duration::from_secs(1800), 5)
+        let claimed = repo
+            .claim_due(Duration::from_secs(24 * 3600), Duration::from_secs(1800), 5)
             .await
             .unwrap();
+        let (_o, token) = claimed[0];
         let instance = seed_instance(&pool, owner, "P", "active").await;
         let today = Utc::now().date_naive();
 
@@ -519,7 +605,7 @@ mod tests {
             content: "P 试营业当天把咖啡机弄坏了".into(),
             embedding: unit_embedding(7),
         }];
-        repo.persist_round(owner, &seed, &digests, &frags, today, 30)
+        repo.persist_round(owner, &seed, &digests, &frags, today, 30, token)
             .await
             .unwrap();
 
@@ -544,6 +630,67 @@ mod tests {
         assert!(last_run.is_some());
         assert!(claimed.is_none());
         assert_eq!(repo.load_seed(owner).await.unwrap().unwrap(), seed);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_aborts_when_claim_lost(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let instance = seed_instance(&pool, owner, "P", "active").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token1) = claimed[0];
+
+        // A newer sweeper reclaims this owner (simulating WORLD_CLAIM_STALE
+        // having elapsed) before the original worker's round finishes.
+        sqlx::query(
+            "UPDATE engine.world_states SET claimed_at = now() + interval '1 second' \
+             WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let seed = serde_json::json!({"x": 1});
+        let frags = vec![FragmentInsert {
+            instance_id: instance,
+            content: "late fragment".into(),
+            embedding: unit_embedding(3),
+        }];
+        let today = Utc::now().date_naive();
+        let result = repo
+            .persist_round(
+                owner,
+                &seed,
+                &serde_json::json!({}),
+                &frags,
+                today,
+                30,
+                token1,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "stale worker's persist must abort once its token no longer matches"
+        );
+
+        let version: i32 =
+            sqlx::query_scalar("SELECT seed_version FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 1, "state update must roll back");
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "fragment insert must roll back too");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -586,6 +733,8 @@ mod tests {
         let a = seed_instance(&pool, owner, "A", "active").await;
         let b = seed_instance(&pool, owner, "B", "active").await;
         let today = Utc::now().date_naive();
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token) = claimed[0];
 
         let frags = vec![
             FragmentInsert {
@@ -611,6 +760,7 @@ mod tests {
             &frags,
             today,
             30,
+            token,
         )
         .await
         .unwrap();

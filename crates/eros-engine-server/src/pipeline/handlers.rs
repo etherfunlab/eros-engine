@@ -2199,6 +2199,18 @@ mod tests {
         let mut emb = vec![0.0_f32; 512];
         emb[42] = 1.0;
         let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        // Claim first so persist_round's ownership-token guard has a real
+        // claimed_at to match (the row above was inserted directly, so
+        // claimed_at is still NULL).
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
         repo.persist_round(
             owner,
             &serde_json::json!({}),
@@ -2210,6 +2222,7 @@ mod tests {
             }],
             chrono::Utc::now().date_naive(),
             30,
+            token,
         )
         .await
         .unwrap();

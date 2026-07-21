@@ -308,8 +308,13 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
-    if let Err(msg) = model_config.validate_world_director_prompt() {
-        anyhow::bail!(msg);
+    // Skip when the master switch is off — WORLD_DISABLED must be able to
+    // isolate a staged/incomplete [tasks.world_director] section (the sweeper
+    // won't spawn and injection is gated too, so a blank prompt is harmless).
+    if !cfg.world.disabled {
+        if let Err(msg) = model_config.validate_world_director_prompt() {
+            anyhow::bail!(msg);
+        }
     }
     // Hard prerequisite (spec §1.1): product_qa is judge-routed only. With the
     // LLM PDE off the action is unreachable — warn once and stay inert rather
