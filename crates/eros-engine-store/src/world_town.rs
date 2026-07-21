@@ -120,14 +120,20 @@ impl<'a> WorldTownRepo<'a> {
         content: &str,
     ) -> Result<Option<FeedComment>, sqlx::Error> {
         sqlx::query_as(
-            "INSERT INTO engine.world_post_comments (post_id, author_instance_id, source, content) \
-             SELECT p.id, NULL, NULL, $3 \
-             FROM engine.world_posts p \
-             JOIN engine.world_enrollments we \
-               ON we.owner_uid = p.owner_uid AND we.town_enabled \
-             WHERE p.id = $1 AND p.owner_uid = $2 AND p.published_at IS NOT NULL \
-             RETURNING id AS comment_id, post_id, author_instance_id, \
-                       NULL::text AS author_name, content, created_at",
+            "WITH ins AS ( \
+                 INSERT INTO engine.world_post_comments (post_id, author_instance_id, source, content) \
+                 SELECT p.id, NULL, NULL, $3 \
+                 FROM engine.world_posts p \
+                 JOIN engine.world_enrollments we \
+                   ON we.owner_uid = p.owner_uid AND we.town_enabled \
+                 WHERE p.id = $1 AND p.owner_uid = $2 AND p.published_at IS NOT NULL \
+                 RETURNING id, post_id, author_instance_id, content, created_at \
+             ), upd AS ( \
+                 UPDATE engine.world_posts SET last_user_comment_at = now() \
+                 WHERE id = (SELECT post_id FROM ins) \
+             ) \
+             SELECT id AS comment_id, post_id, author_instance_id, \
+                    NULL::text AS author_name, content, created_at FROM ins",
         )
         .bind(post_id)
         .bind(owner_uid)
@@ -716,6 +722,62 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[sqlx::test]
+    async fn user_comment_stamps_last_user_comment_at(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        let post = seed_post(&pool, owner, inst, "hello", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+
+        let stamp0: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(post)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamp0.is_none(), "no user comment ⇒ NULL stamp");
+
+        repo.insert_user_comment(owner, post, "在吗")
+            .await
+            .unwrap()
+            .unwrap();
+        let stamp1: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(post)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamp1.is_some(), "user comment sets the stamp");
+
+        // Persona comments (round + reply) must NOT move the stamp.
+        repo.insert_round_comment_unchecked_for_test(post, inst, "round", "r")
+            .await;
+        repo.insert_reply_comment(post, inst, "reply")
+            .await
+            .unwrap();
+        let stamp2: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(post)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stamp2, stamp1, "persona comments leave the stamp untouched");
+
+        // Not-visible (unpublished) post ⇒ None and no stamp side effect.
+        let unpub = seed_post(&pool, owner, inst, "unpub", false).await;
+        assert!(repo
+            .insert_user_comment(owner, unpub, "x")
+            .await
+            .unwrap()
+            .is_none());
+        let stamp3: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
+                .bind(unpub)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamp3.is_none(), "unpublished post never gets a stamp");
     }
 
     #[sqlx::test]
