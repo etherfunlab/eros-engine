@@ -22,6 +22,7 @@ pub mod debug;
 pub mod dto;
 pub mod health;
 pub mod voice;
+pub mod world_town;
 
 /// Compose the full app router with auth layers attached.
 ///
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(voice::router())
         .merge(debug::router(state.config.expose_affinity_debug))
         .merge(bff::router())
+        .merge(world_town::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
@@ -54,4 +56,5 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(voice::router())
         .merge(debug::router(expose_affinity_debug))
         .merge(bff::router())
+        .merge(world_town::router())
 }

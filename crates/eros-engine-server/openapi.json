@@ -857,6 +857,142 @@
           }
         }
       }
+    },
+    "/world/town/{user_id}/feed": {
+      "get": {
+        "tags": [
+          "world_town"
+        ],
+        "summary": "Published town feed for the user's world, newest first. Unenrolled or\ntown-disabled users get an empty feed, not an error (spec §4).",
+        "operationId": "get_feed",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, default 20, max 50",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page's next_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed cursor"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/world/town/{user_id}/posts/{post_id}/comments": {
+      "post": {
+        "tags": [
+          "world_town"
+        ],
+        "summary": "Add a user comment to a published post in the user's own town.",
+        "operationId": "create_comment",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "post_id",
+            "in": "path",
+            "description": "Target post id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCommentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedCommentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "empty content or over 1000 chars"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          },
+          "404": {
+            "description": "post not visible to this user"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -1347,6 +1483,17 @@
           }
         }
       },
+      "CreateCommentRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
       "DrawImageRequest": {
         "type": "object",
         "description": "Body of the engine draw endpoint. Echoes the `image_request` frame contents\nback plus the draw-time knobs. The engine draws `composed_prompt` verbatim —\nno re-compose, no persona load, no persistence.",
@@ -1398,6 +1545,104 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "FeedCommentDto": {
+        "type": "object",
+        "required": [
+          "comment_id",
+          "content",
+          "created_at"
+        ],
+        "properties": {
+          "author_instance_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "NULL = the user themselves."
+          },
+          "author_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comment_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "FeedPostDto": {
+        "type": "object",
+        "required": [
+          "post_id",
+          "instance_id",
+          "author_name",
+          "content",
+          "published_at",
+          "comments"
+        ],
+        "properties": {
+          "author_name": {
+            "type": "string"
+          },
+          "comments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedCommentDto"
+            }
+          },
+          "content": {
+            "type": "string"
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "post_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "published_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "FeedResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "posts"
+        ],
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when another page may exist; feed it back as `cursor`."
+          },
+          "posts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedPostDto"
+            }
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
