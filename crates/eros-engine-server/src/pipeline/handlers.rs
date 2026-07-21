@@ -2220,6 +2220,7 @@ mod tests {
                 content: "剧本片段A".into(),
                 embedding: emb.clone(),
             }],
+            &[],
             chrono::Utc::now().date_naive(),
             30,
             token,

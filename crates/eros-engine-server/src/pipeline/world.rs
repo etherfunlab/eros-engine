@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use eros_engine_llm::model_config::ResolvedWorldDirector;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
-use eros_engine_store::world::{FragmentInsert, RosterEntry, WorldRepo};
+use eros_engine_store::world::{FragmentInsert, PostInsert, RosterEntry, WorldRepo};
 
 use crate::state::AppState;
 
@@ -42,10 +42,18 @@ const WORLD_DIRECTOR_RULES: &str = "规则：\
 （当期发生的具体事件片段，每条一句、自成一体、适合单独召回）。\
 4) 只使用给出的 instance_id。";
 
+/// Appended to WORLD_DIRECTOR_RULES only for town-enabled owners.
+const WORLD_TOWN_POST_RULES: &str = "\
+5) posts：为部分角色生成朋友圈式贴文（不是每个角色都要发；没有合适内容就输出空数组）。\
+每条含 instance_id、content（贴文正文，第一人称）、publish_at（ISO-8601 时间戳，\
+安排在未来一个周期内的自然时刻）。";
+
 #[derive(Debug, Deserialize)]
 struct DirectorOutput {
     seed: serde_json::Value,
     personas: Vec<DirectorPersona>,
+    #[serde(default)]
+    posts: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +62,13 @@ struct DirectorPersona {
     digest: String,
     #[serde(default)]
     script_fragments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectorPost {
+    instance_id: Uuid,
+    content: String,
+    publish_at: String,
 }
 
 /// Run forever; spawn once at boot. Inert when WORLD_DISABLED is set or
@@ -145,6 +160,11 @@ async fn direct_world(
         tracing::warn!(%owner, cap = WORLD_ROSTER_CAP, "world: roster truncated");
         roster.truncate(WORLD_ROSTER_CAP);
     }
+    let town = !state.config.world.town_disabled
+        && repo
+            .town_enabled(owner)
+            .await
+            .map_err(|e| format!("town_enabled load failed: {e}"))?;
 
     let seed = repo
         .load_seed(owner)
@@ -156,7 +176,7 @@ async fn direct_world(
         .await
         .map_err(|e| format!("memory feedback load failed: {e}"))?;
 
-    let payload = director_user_payload(&seed, &roster, &memories);
+    let payload = director_user_payload(&seed, &roster, &memories, town);
     let req = ChatRequest {
         model: resolved.model.clone(),
         fallback_model: resolved.fallback_model.clone(),
@@ -176,7 +196,7 @@ async fn direct_world(
         reasoning: resolved.reasoning.clone(),
         response_format: resolved
             .structured_output
-            .then(world_director_response_format),
+            .then(|| world_director_response_format(town)),
         ..Default::default()
     };
     let raw = state
@@ -235,12 +255,25 @@ async fn direct_world(
         })
         .collect();
 
+    let posts = if town {
+        validate_director_posts(
+            &output.posts,
+            &roster_ids,
+            chrono::Utc::now(),
+            resolved.interval_hours,
+            owner,
+        )
+    } else {
+        Vec::new()
+    };
+
     let script_date = chrono::Utc::now().date_naive();
     repo.persist_round(
         owner,
         &output.seed,
         &serde_json::Value::Object(digests),
         &inserts,
+        &posts,
         script_date,
         resolved.retention_days,
         token,
@@ -250,11 +283,14 @@ async fn direct_world(
 }
 
 /// Assemble the director's user message: framing header + structured JSON of
-/// previous seed / roster / memory feedback + the fixed rules.
+/// previous seed / roster / memory feedback + the fixed rules. `town` appends
+/// `WORLD_TOWN_POST_RULES` (the posts rule) for town-enabled owners only —
+/// memories-only owners see no mention of posts.
 fn director_user_payload(
     seed: &serde_json::Value,
     roster: &[RosterEntry],
     memories: &[String],
+    town: bool,
 ) -> String {
     let is_init = seed.as_object().map(|o| o.is_empty()).unwrap_or(false);
     let personas: Vec<serde_json::Value> = roster
@@ -278,16 +314,23 @@ fn director_user_payload(
     } else {
         "延续这个世界：在 previous_seed 的基础上推演关系发展，并生成当期剧本。"
     };
+    let rules = if town {
+        format!("{WORLD_DIRECTOR_RULES}{WORLD_TOWN_POST_RULES}")
+    } else {
+        WORLD_DIRECTOR_RULES.to_string()
+    };
     format!(
-        "{header}\n\n{}\n\n{WORLD_DIRECTOR_RULES}",
+        "{header}\n\n{}\n\n{rules}",
         serde_json::to_string_pretty(&data).unwrap_or_default()
     )
 }
 
 /// OpenRouter `response_format` for the director round. `strict` is false —
-/// `seed` is deliberately free-form (the engine stores it opaquely).
-fn world_director_response_format() -> serde_json::Value {
-    serde_json::json!({
+/// `seed` is deliberately free-form (the engine stores it opaquely). `town`
+/// attaches the `posts` array (schema + required) only for town-enabled
+/// owners — memories-only owners get no posts key in the schema at all.
+fn world_director_response_format(town: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
         "type": "json_schema",
         "json_schema": {
             "name": "world_director_round",
@@ -315,7 +358,23 @@ fn world_director_response_format() -> serde_json::Value {
                 }
             }
         }
-    })
+    });
+    if town {
+        v["json_schema"]["schema"]["properties"]["posts"] = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["instance_id", "content", "publish_at"],
+                "properties": {
+                    "instance_id": { "type": "string" },
+                    "content": { "type": "string" },
+                    "publish_at": { "type": "string" }
+                }
+            }
+        });
+        v["json_schema"]["schema"]["required"] = serde_json::json!(["seed", "personas", "posts"]);
+    }
+    v
 }
 
 /// Lenient parse: direct JSON first, then the shared balanced-brace block
@@ -327,6 +386,47 @@ fn parse_director_output(raw: &str) -> Option<DirectorOutput> {
     }
     let block = super::find_json_block(raw)?;
     serde_json::from_str::<DirectorOutput>(block).ok()
+}
+
+/// Validate + clamp the director's raw `posts` entries (spec town §2): keep
+/// only roster instances with non-blank content and a parseable ISO-8601
+/// publish_at, clamped into `[now, now + horizon_hours]`. Malformed entries
+/// are dropped with a warn, mirroring unknown-persona handling.
+fn validate_director_posts(
+    raw: &[serde_json::Value],
+    roster_ids: &std::collections::HashSet<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+    horizon_hours: u32,
+    owner: Uuid,
+) -> Vec<PostInsert> {
+    let max_at = now + chrono::Duration::hours(i64::from(horizon_hours));
+    let mut out = Vec::new();
+    for entry in raw {
+        let Ok(p) = serde_json::from_value::<DirectorPost>(entry.clone()) else {
+            tracing::warn!(%owner, "world: malformed post entry dropped");
+            continue;
+        };
+        if !roster_ids.contains(&p.instance_id) {
+            tracing::warn!(%owner, instance = %p.instance_id, "world: post for unknown instance dropped");
+            continue;
+        }
+        let content = p.content.trim().to_string();
+        if content.is_empty() {
+            tracing::warn!(%owner, "world: blank post content dropped");
+            continue;
+        }
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&p.publish_at) else {
+            tracing::warn!(%owner, publish_at = %p.publish_at, "world: unparseable publish_at dropped");
+            continue;
+        };
+        let scheduled_at = at.with_timezone(&chrono::Utc).clamp(now, max_at);
+        out.push(PostInsert {
+            instance_id: p.instance_id,
+            content,
+            scheduled_at,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -348,6 +448,10 @@ mod tests {
         let out = parse_director_output(&clean).expect("clean parses");
         assert_eq!(out.personas.len(), 1);
         assert_eq!(out.personas[0].script_fragments, vec!["f1", "f2"]);
+        assert!(
+            out.posts.is_empty(),
+            "clean sample has no posts key — #[serde(default)] must still parse"
+        );
 
         let fenced = format!("好的：\n```json\n{clean}\n```");
         assert!(parse_director_output(&fenced).is_some(), "fenced parses");
@@ -367,7 +471,7 @@ mod tests {
             tip_personality: Some("温柔".into()),
             art_metadata: serde_json::json!({"backstory": "咖啡店店主"}),
         }];
-        let init = director_user_payload(&serde_json::json!({}), &roster, &[]);
+        let init = director_user_payload(&serde_json::json!({}), &roster, &[], false);
         assert!(init.contains("初始化这个世界"));
         assert!(init.contains("\"previous_seed\": null"));
         assert!(init.contains("Aria"));
@@ -377,6 +481,7 @@ mod tests {
             &serde_json::json!({"arc": "opening"}),
             &roster,
             &["用户喜欢旅行".into()],
+            false,
         );
         assert!(cont.contains("延续这个世界"));
         assert!(cont.contains("\"arc\": \"opening\""));
@@ -385,12 +490,80 @@ mod tests {
 
     #[test]
     fn world_director_response_format_shape() {
-        let v = world_director_response_format();
+        let v = world_director_response_format(false);
         assert_eq!(v["type"], "json_schema");
         assert_eq!(v["json_schema"]["strict"], false);
         let required = v["json_schema"]["schema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|r| r == "seed"));
         assert!(required.iter().any(|r| r == "personas"));
+    }
+
+    #[test]
+    fn director_posts_validated_clamped_and_dropped() {
+        let inst = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let roster_ids: std::collections::HashSet<Uuid> = [inst].into_iter().collect();
+        let now = chrono::Utc::now();
+        let horizon_hours = 24u32;
+        let raw = serde_json::json!([
+            // valid, inside window
+            {"instance_id": inst, "content": "去了海边", "publish_at": (now + chrono::Duration::hours(2)).to_rfc3339()},
+            // beyond window ⇒ clamped to now + horizon
+            {"instance_id": inst, "content": "远期计划", "publish_at": (now + chrono::Duration::hours(100)).to_rfc3339()},
+            // past ⇒ clamped up to now
+            {"instance_id": inst, "content": "旧闻", "publish_at": (now - chrono::Duration::hours(5)).to_rfc3339()},
+            // unknown instance ⇒ dropped
+            {"instance_id": stranger, "content": "x", "publish_at": now.to_rfc3339()},
+            // malformed timestamp ⇒ dropped
+            {"instance_id": inst, "content": "y", "publish_at": "not-a-date"},
+            // blank content ⇒ dropped
+            {"instance_id": inst, "content": "  ", "publish_at": now.to_rfc3339()},
+        ]);
+        let posts = validate_director_posts(
+            raw.as_array().unwrap(),
+            &roster_ids,
+            now,
+            horizon_hours,
+            Uuid::new_v4(),
+        );
+        assert_eq!(posts.len(), 3);
+        let max_at = now + chrono::Duration::hours(i64::from(horizon_hours));
+        assert!(posts
+            .iter()
+            .all(|p| p.scheduled_at >= now && p.scheduled_at <= max_at));
+        assert_eq!(posts[2].scheduled_at, now, "past publish_at clamps to now");
+    }
+
+    #[test]
+    fn world_director_response_format_town_arm() {
+        let base = world_director_response_format(false);
+        assert!(base["json_schema"]["schema"]["properties"]["posts"].is_null());
+        let town = world_director_response_format(true);
+        assert_eq!(
+            town["json_schema"]["schema"]["properties"]["posts"]["type"],
+            "array"
+        );
+        let required = town["json_schema"]["schema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|r| r == "posts"));
+    }
+
+    #[test]
+    fn director_payload_mentions_posts_only_for_town() {
+        let roster = vec![RosterEntry {
+            instance_id: Uuid::new_v4(),
+            name: "Aria".into(),
+            tip_personality: None,
+            art_metadata: serde_json::json!({}),
+        }];
+        let plain = director_user_payload(&serde_json::json!({}), &roster, &[], false);
+        assert!(!plain.contains("posts"), "no posts rule for memories-only");
+        let town = director_user_payload(&serde_json::json!({}), &roster, &[], true);
+        assert!(
+            town.contains("posts"),
+            "town payload carries the posts rule"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -578,5 +751,115 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_skips_posts_when_town_disabled(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Owner is town-enrolled at the DB level — the kill-switch must win
+        // over this, not just gate on it.
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, town_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }],
+            "posts": [{
+                "instance_id": instance_id,
+                "content": "开业啦",
+                "publish_at": chrono::Utc::now().to_rfc3339()
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.world.town_disabled = true;
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let posts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_posts WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            posts, 0,
+            "town_disabled must suppress posts even when town_enabled=true"
+        );
+
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
     }
 }

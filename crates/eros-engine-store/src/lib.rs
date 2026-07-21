@@ -11,6 +11,7 @@ pub mod memory;
 pub mod persona;
 pub mod pool;
 pub mod world;
+pub mod world_town;
 
 pub use sqlx::PgPool;
 
@@ -288,7 +289,8 @@ mod migration_tests {
                 "seed_version",
                 "last_run_at",
                 "claimed_at",
-                "updated_at"
+                "updated_at",
+                "last_comment_round_at"
             ],
         );
 
@@ -316,5 +318,108 @@ mod migration_tests {
             .unwrap();
             assert!(exists, "{idx} must exist");
         }
+    }
+
+    #[sqlx::test]
+    async fn migration_0036_world_town_schema(pool: PgPool) {
+        // Both town tables exist with RLS enabled (0013-style lockdown).
+        for tbl in ["world_posts", "world_post_comments"] {
+            let rls: bool = sqlx::query_scalar(
+                "SELECT relrowsecurity FROM pg_class \
+                 WHERE oid = ('engine.' || $1)::regclass",
+            )
+            .bind(tbl)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(rls, "{tbl} must have RLS enabled");
+        }
+
+        // Column adds landed.
+        let town_enabled_type: String = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'world_enrollments' \
+               AND column_name = 'town_enabled'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(town_enabled_type, "boolean");
+        let round_col: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'engine' AND table_name = 'world_states' \
+               AND column_name = 'last_comment_round_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(round_col, 1);
+
+        // Feed + due + thread indexes exist.
+        for (tbl, idx) in [
+            ("world_posts", "idx_world_posts_due"),
+            ("world_posts", "idx_world_posts_feed"),
+            ("world_post_comments", "idx_world_post_comments_thread"),
+        ] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_indexes \
+                 WHERE schemaname = 'engine' AND tablename = $1 AND indexname = $2",
+            )
+            .bind(tbl)
+            .bind(idx)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "missing index {idx}");
+        }
+
+        // source/author coupling CHECK: user row (NULL, NULL) ok; persona row
+        // with NULL source rejected.
+        let owner = uuid::Uuid::new_v4();
+        let genome: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('T','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let inst: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let post: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.world_posts (owner_uid, instance_id, content, scheduled_at) \
+             VALUES ($1,$2,'hello',now()) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_post_comments (post_id, author_instance_id, source, content) \
+             VALUES ($1, NULL, NULL, 'user says hi')",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .expect("user comment row inserts");
+        let err = sqlx::query(
+            "INSERT INTO engine.world_post_comments (post_id, author_instance_id, source, content) \
+             VALUES ($1, $2, NULL, 'bad')",
+        )
+        .bind(post)
+        .bind(inst)
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "persona comment without source must violate CHECK"
+        );
     }
 }

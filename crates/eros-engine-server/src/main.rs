@@ -311,8 +311,11 @@ async fn run_server() -> Result<()> {
     // Skip when the master switch is off — WORLD_DISABLED must be able to
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
+    // WORLD_TOWN_DISABLED isolates the two town sections
+    // ([tasks.world_comment] / [tasks.world_reply]) the same way: the town
+    // sweeper won't spawn, so a staged/broken town config must not block boot.
     if !cfg.world.disabled {
-        if let Err(msg) = model_config.validate_world_director_prompt() {
+        if let Err(msg) = model_config.validate_world_prompts(!cfg.world.town_disabled) {
             anyhow::bail!(msg);
         }
     }
@@ -377,6 +380,11 @@ async fn run_server() -> Result<()> {
     // World Memories director sweeper. Inert when WORLD_DISABLED=1/true or
     // [tasks.world_director] is absent/blank (spec §2.1).
     tokio::spawn(crate::pipeline::world::sweeper(state.clone()));
+
+    // World Town sweeper (posts feed). Inert when the world subsystem is off,
+    // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
+    // posts can exist without the director (town spec §3).
+    tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
 
     let app: Router = open_router
         .with_state(state)

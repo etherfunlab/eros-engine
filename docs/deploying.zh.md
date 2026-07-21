@@ -16,13 +16,15 @@
 
 ## 子命令
 
-二進制文件有三種模式（按 `argv[1]` 分派）：
+二進制文件有五種模式（按 `argv[1]` 分派）：
 
 | 子命令 | 用途 |
 |---|---|
 | `serve`（默認） | 在 `BIND_ADDR` 上跑 HTTP 服務器 |
 | `migrate` | 應用待處理的 sqlx migrations 然後退出 |
 | `seed-personas <dir>` | 讀 `<dir>` 裡每個 `*.toml` 文件，upsert 為人格基因 |
+| `backfill-human-insights` | 一次性把每行 `companion_insights` 投影进 `engine.human_insights`（幂等；仅手动执行） |
+| `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
 
@@ -193,6 +195,31 @@ PROMPT_LOG_DIR = "/data/prompt-logs"
 ```
 
 引擎不内置轮转或保留策略——卷由你自行管理。
+
+### 世界系统（实验特性，可选）
+
+[世界系统](world-system.zh.md)（World Memories 模拟 + World Town 动态）默认
+完全关闭：模型配置里没有 `[tasks.world_director]` section 时，不会起任何
+sweeper，每回合零查询。开启它是配置 + 数据层面的决定，不需要改部署：
+
+1. 在模型配置中加入 `[tasks.world_*]` section（见
+   [`examples/model_config.toml`](../examples/model_config.toml)）。
+2. 通过 `service_role` / owner 连接往 `engine.world_enrollments` 插行来注册
+   owner（引擎只读这张表）；对需要动态流的 owner 把 `town_enabled` 设为
+   `true`。
+
+运维开关，均可选：
+
+| 变量 | 作用 |
+|------|------|
+| `WORLD_DISABLED=true` | 总关：不起 sweeper、不注入 prompt、零成本 |
+| `WORLD_PROMPT_DISABLED=true` | 照常模拟积累，但不动聊天 prompt（灰度阀门） |
+| `WORLD_TICK_SECS` | 导演 sweeper tick（默认 300；`0` 关停） |
+| `WORLD_TOWN_DISABLED=true` | 仅小镇：不生成贴文、不起小镇 sweeper；记忆照常运行 |
+
+成本形状：每个注册 owner 每 `interval_hours` 一次导演调用，外加（仅小镇）按
+活动触发的每小时评论轮和按 owner 限额的回复。没人互动的世界恰好只花导演那一
+次调用。细节、数据模型与启动校验规则见[世界系统](world-system.zh.md)。
 
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。OpenAPI JSON 在 `/api-docs/openapi.json`。

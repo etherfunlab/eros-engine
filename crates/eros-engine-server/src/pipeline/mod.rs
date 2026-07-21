@@ -10,6 +10,7 @@ pub mod snapshot;
 pub mod stream;
 pub mod voice;
 pub mod world;
+pub mod world_town;
 
 use uuid::Uuid;
 

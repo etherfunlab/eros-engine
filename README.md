@@ -98,6 +98,7 @@ The `docker/Dockerfile` is the same artifact used to build this image. Deploy it
 - [Affinity model](docs/affinity-model.md) — six dimensions, EMA, time decay, relationship labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — score formula, protection rules, examples.
 - [Memory layers](docs/memory-layers.md) — profile vs relationship memory, Voyage, pgvector retrieval.
+- [World system](docs/world-system.md) — experimental per-owner persona worlds: World Memories simulation + recall injection, and the World Town social feed.
 - [Model config](docs/model-config.md) — `model_config.toml` schema, every task (chat, vision, image generation, PDE, filters, extraction), model selection, 0.x stability commitments.
 - [Prompt traits](docs/prompt-traits.md) — per-request system-prompt injection and tier allow-lists.
 - [LLM / OpenRouter audit](docs/llm-audit.md) — per-user / per-session attribution passthrough.
