@@ -160,10 +160,11 @@ async fn direct_world(
         tracing::warn!(%owner, cap = WORLD_ROSTER_CAP, "world: roster truncated");
         roster.truncate(WORLD_ROSTER_CAP);
     }
-    let town = repo
-        .town_enabled(owner)
-        .await
-        .map_err(|e| format!("town_enabled load failed: {e}"))?;
+    let town = !state.config.world.town_disabled
+        && repo
+            .town_enabled(owner)
+            .await
+            .map_err(|e| format!("town_enabled load failed: {e}"))?;
 
     let seed = repo
         .load_seed(owner)
@@ -750,5 +751,115 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_skips_posts_when_town_disabled(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Owner is town-enrolled at the DB level — the kill-switch must win
+        // over this, not just gate on it.
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, town_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }],
+            "posts": [{
+                "instance_id": instance_id,
+                "content": "开业啦",
+                "publish_at": chrono::Utc::now().to_rfc3339()
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.world.town_disabled = true;
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (_o, token) = claimed[0];
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let posts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_posts WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            posts, 0,
+            "town_disabled must suppress posts even when town_enabled=true"
+        );
+
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
     }
 }

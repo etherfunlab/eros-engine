@@ -63,6 +63,10 @@ pub async fn sweeper(state: AppState) {
         tracing::info!("world_director not configured — world_town sweeper inert");
         return;
     }
+    if state.config.world.tick.is_zero() {
+        tracing::info!("world sweeper disabled (WORLD_TICK_SECS=0) — world_town sweeper inert");
+        return;
+    }
     let comment = state.model_config.resolve_world_comment();
     let reply = state.model_config.resolve_world_reply();
     tracing::info!(
@@ -505,7 +509,6 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn comment_round_inserts_valid_and_drops_invalid(pool: sqlx::PgPool) {
         let (owner, author, commenter) = seed_town_world(&pool).await;
-        let repo = WorldTownRepo { pool: &pool };
         let post: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.world_posts \
                  (owner_uid, instance_id, content, scheduled_at, published_at) \
@@ -560,7 +563,6 @@ mod tests {
         run_comment_round(&state, &resolved, owner)
             .await
             .expect("noop ok");
-        let _ = repo;
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

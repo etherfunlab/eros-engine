@@ -140,14 +140,14 @@ impl<'a> WorldTownRepo<'a> {
     /// the round cadence. The per-owner CAS (`claim_comment_round`) is the
     /// authoritative claim; this list is just the scan.
     pub async fn list_round_candidates(&self, round: Duration) -> Result<Vec<Uuid>, sqlx::Error> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(round).unwrap_or_default();
         sqlx::query_scalar(
             "SELECT ws.owner_uid FROM engine.world_states ws \
              JOIN engine.world_enrollments we USING (owner_uid) \
              WHERE we.town_enabled \
-               AND (ws.last_comment_round_at IS NULL OR ws.last_comment_round_at < $1)",
+               AND (ws.last_comment_round_at IS NULL \
+                    OR ws.last_comment_round_at < now() - make_interval(secs => $1))",
         )
-        .bind(cutoff)
+        .bind(round.as_secs_f64())
         .fetch_all(self.pool)
         .await
     }
@@ -161,17 +161,16 @@ impl<'a> WorldTownRepo<'a> {
         owner_uid: Uuid,
         round: Duration,
     ) -> Result<Option<Option<DateTime<Utc>>>, sqlx::Error> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(round).unwrap_or_default();
         sqlx::query_scalar(
             "UPDATE engine.world_states ws SET last_comment_round_at = now() \
              FROM (SELECT owner_uid, last_comment_round_at AS prev \
                    FROM engine.world_states WHERE owner_uid = $1 FOR UPDATE) old \
              WHERE ws.owner_uid = old.owner_uid \
-               AND (old.prev IS NULL OR old.prev < $2) \
+               AND (old.prev IS NULL OR old.prev < now() - make_interval(secs => $2)) \
              RETURNING old.prev",
         )
         .bind(owner_uid)
-        .bind(cutoff)
+        .bind(round.as_secs_f64())
         .fetch_optional(self.pool)
         .await
     }
@@ -238,7 +237,6 @@ impl<'a> WorldTownRepo<'a> {
         debounce: Duration,
         limit: i64,
     ) -> Result<Vec<ReplyCandidate>, sqlx::Error> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(debounce).unwrap_or_default();
         sqlx::query_as(
             "SELECT p.id AS post_id, p.owner_uid, p.instance_id AS author_instance_id \
              FROM engine.world_posts p \
@@ -252,14 +250,15 @@ impl<'a> WorldTownRepo<'a> {
                  WHERE post_id = p.id AND author_instance_id IS NULL \
              ) u ON u.last_user_at IS NOT NULL \
              WHERE p.published_at IS NOT NULL \
-               AND u.last_user_at <= $1 \
+               AND u.last_user_at <= now() - make_interval(secs => $1) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM engine.world_post_comments a \
                    WHERE a.post_id = p.id AND a.author_instance_id IS NOT NULL \
                      AND a.created_at > u.last_user_at) \
+             ORDER BY u.last_user_at ASC \
              LIMIT $2",
         )
-        .bind(cutoff)
+        .bind(debounce.as_secs_f64())
         .bind(limit)
         .fetch_all(self.pool)
         .await
@@ -272,7 +271,7 @@ impl<'a> WorldTownRepo<'a> {
             "SELECT count(*) FROM engine.world_post_comments c \
              JOIN engine.world_posts p ON p.id = c.post_id \
              WHERE p.owner_uid = $1 AND c.source = 'reply' \
-               AND c.created_at >= date_trunc('day', now())",
+               AND c.created_at >= (date_trunc('day', now() AT TIME ZONE 'utc') AT TIME ZONE 'utc')",
         )
         .bind(owner_uid)
         .fetch_one(self.pool)
@@ -286,13 +285,12 @@ impl<'a> WorldTownRepo<'a> {
         post_id: Uuid,
         cooldown: Duration,
     ) -> Result<bool, sqlx::Error> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(cooldown).unwrap_or_default();
         let res = sqlx::query(
             "UPDATE engine.world_posts SET last_reply_at = now() \
-             WHERE id = $1 AND (last_reply_at IS NULL OR last_reply_at < $2)",
+             WHERE id = $1 AND (last_reply_at IS NULL OR last_reply_at < now() - make_interval(secs => $2))",
         )
         .bind(post_id)
-        .bind(cutoff)
+        .bind(cooldown.as_secs_f64())
         .execute(self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
