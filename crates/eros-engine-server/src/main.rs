@@ -312,7 +312,7 @@ async fn run_server() -> Result<()> {
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
     if !cfg.world.disabled {
-        if let Err(msg) = model_config.validate_world_director_prompt() {
+        if let Err(msg) = model_config.validate_world_prompts() {
             anyhow::bail!(msg);
         }
     }
