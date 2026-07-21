@@ -488,6 +488,34 @@ filter_prompt = """
                "script_fragments": ["当期事件片段，每条一句"]}]}
 """
 
+# World Town（实验特性，依赖 world_director）：贴文的评论轮 + 用户留言回复。
+# 缺任一 section 即关闭对应路径。Spec:
+# docs/superpowers/specs/2026-07-21-world-town-design.md
+[tasks.world_comment]
+model = "anthropic/claude-haiku-4.5"
+description = "world town: hourly batched persona comment round"
+temperature = 0.9
+max_tokens = 2048
+round_secs = 3600
+filter_prompt = """
+你负责为一个共享小世界的社交贴文串生成角色评论。
+根据世界种子（seed）里的角色关系、贴文内容和已有评论，
+以各角色的口吻写出自然、简短的互动评论。
+"""
+
+[tasks.world_reply]
+model = "anthropic/claude-haiku-4.5"
+description = "world town: post author replies to user comments"
+temperature = 0.9
+max_tokens = 1024
+debounce_secs = 90
+thread_cooldown_secs = 600
+daily_cap = 20
+filter_prompt = """
+你是贴文作者本人，在自己的贴文评论区回复用户的留言。
+保持角色口吻，简短口语化，只输出评论正文。
+"""
+
 # Reserved — not consumed by current code. `VoyageClient` reads
 # `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
 # This entry exists for future generalisation if we ever support a

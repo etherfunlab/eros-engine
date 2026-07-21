@@ -88,6 +88,15 @@ openrouter: call completed session=… generation_id=… model=…
 prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 ```
 
+- `world_comment` —— World Town 每小时评论轮（后台）。每个有新动态的 owner
+  批量调一次。`user` = `11111111-1111-1111-1111-111111111112`（world 子系统
+  共享哨兵）。Usage/cost 通过 tracing 字段输出，走
+  `log_openrouter_usage("world_comment", None, …)`；不出现在任何 client 帧上。
+- `world_reply` —— World Town 回复响应器（后台）。每条经防抖的用户留言调一
+  次，按 owner 每 UTC 自然日封顶。同一个哨兵 user；usage/cost 通过 tracing
+  字段输出，走 `log_openrouter_usage("world_reply", None, …)`；不出现在任何
+  client 帧上。
+
 ## App-attribution headers
 
 三个可选环境变量给每次出站 OpenRouter 调用加 header：

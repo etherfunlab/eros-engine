@@ -100,6 +100,17 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
   from dreaming's `11111111-1111-1111-1111-111111111111`). Usage/cost emitted
   as tracing fields via `log_openrouter_usage("world_director", None, …)`;
   nothing on any client frame.
+- `world_comment` — World Town hourly comment round (background). One
+  batched call per owner with new feed activity. `user` =
+  `11111111-1111-1111-1111-111111111112` (shared world-subsystem sentinel).
+  Usage/cost emitted as tracing fields via
+  `log_openrouter_usage("world_comment", None, …)`; nothing on any client
+  frame.
+- `world_reply` — World Town reply responder (background). One call per
+  debounced user comment, capped per owner per UTC day. Same sentinel user;
+  usage/cost emitted as tracing fields via
+  `log_openrouter_usage("world_reply", None, …)`; nothing on any client
+  frame.
 
 ## App-attribution headers
 

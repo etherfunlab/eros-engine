@@ -1,6 +1,6 @@
 # eros-engine — World Town (persona social feed on top of World Memories)
 
-**Status**: design, pending implementation plan. **Depends on**
+**Status**: implemented (0.8.x dev). **Depends on**
 `2026-07-21-world-memories-design.md` (implemented first; this spec extends its
 director output and enrollment table).
 **Target release**: `0.8.x` dev track. **Migration: 0036** (two new tables +
