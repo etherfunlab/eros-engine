@@ -466,6 +466,28 @@ fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
 temperature = 0.3
 max_tokens = 400
 
+# World Memories director (experimental). Absent section = subsystem off.
+# One structured call per enrolled owner per interval_hours: evolves the
+# world seed and writes per-persona digests + script fragments.
+# Spec: docs/superpowers/specs/2026-07-21-world-memories-design.md
+[tasks.world_director]
+model = "anthropic/claude-haiku-4.5"
+description = "world memories: per-owner world seed + daily scripts"
+temperature = 0.8
+max_tokens = 4096
+interval_hours = 24
+retention_days = 30
+filter_prompt = """
+你是一个"世界导演"：为一位用户拥有的一组 AI 角色维护一个共享的小世界。
+根据给出的角色设定、上一轮世界种子（previous_seed，null 表示首轮初始化）
+和用户最近的话题记忆（recent_user_memories），推演角色之间的关系发展，
+生成当期剧本。世界要有连续性：延续既有关系与剧情弧线，让最近的用户话题
+自然渗入角色的生活。输出 JSON：
+{"seed": {...自由结构，描述关系图与剧情弧线...},
+ "personas": [{"instance_id": "...", "digest": "该角色视角近况摘要(1-2句)",
+               "script_fragments": ["当期事件片段，每条一句"]}]}
+"""
+
 # Reserved — not consumed by current code. `VoyageClient` reads
 # `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
 # This entry exists for future generalisation if we ever support a
