@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 /// Format an `&[f32]` as the pgvector textual representation, e.g.
 /// `"[0.1,0.2,0.3]"`. Bound as `String` and cast with `$N::vector` in SQL.
-fn format_vector(values: &[f32]) -> String {
+pub(crate) fn format_vector(values: &[f32]) -> String {
     let mut out = String::with_capacity(values.len() * 8 + 2);
     out.push('[');
     for (i, v) in values.iter().enumerate() {
