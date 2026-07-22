@@ -641,6 +641,10 @@ fn drive_chat_burst(
                 // sent then superseded, same as the raw deltas already were.
                 let scrub_tail = scrubber.finish();
                 if !scrub_tail.is_empty() {
+                    // For a short reply fully held until now (head transform
+                    // holds ≤64 chars; Opaque buffers all), this tail is the
+                    // FIRST client-visible content — record ttft here too.
+                    ttft_ms.get_or_insert_with(|| attempt_started.elapsed().as_millis() as u64);
                     yield ProtocolFrame::Delta {
                         message_id: ulid_string(msg_ulid),
                         content: scrub_tail,
