@@ -542,7 +542,15 @@ fn drive_chat_burst(
                                     }
                                     if c.usage.is_some()         { last_usage = c.usage; }
                                     if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                    if matches!(c.finish_reason.as_deref(), Some("length")) {
+                                    // "content_filter" = mid-generation safety cut
+                                    // (Gemini/OpenAI): the text is incomplete, so it
+                                    // rides the same truncation → chain-advance path
+                                    // as "length" (parity with the sync path's
+                                    // filter_output_invalidity gate).
+                                    if matches!(
+                                        c.finish_reason.as_deref(),
+                                        Some("length") | Some("content_filter")
+                                    ) {
                                         truncated = true;
                                     }
                                 }
@@ -788,7 +796,7 @@ fn drive_chat_burst(
                                 if let Some(content) = c.content { acc.push_str(&content); }
                                 if c.usage.is_some() { last_usage = c.usage; }
                                 if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                if matches!(c.finish_reason.as_deref(), Some("length")) { truncated = true; }
+                                if matches!(c.finish_reason.as_deref(), Some("length") | Some("content_filter")) { truncated = true; }
                             }
                             Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
                         }
@@ -2921,7 +2929,7 @@ pub fn run_stream(
                                         content: text,
                                     };
                                 }
-                                if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                                if matches!(chunk.finish_reason.as_deref(), Some("length") | Some("content_filter")) { truncated = true; }
                             }
                             Some(Err(e)) => {
                                 tracing::warn!(model = %model_id, error = %e, "product_qa: mid-stream error");
@@ -9309,6 +9317,144 @@ data: [DONE]\n\n";
             "only the accepted fallback remains in produced; got {produced:?}"
         );
         assert_eq!(produced[0].full_text, "hi there");
+    }
+
+    /// Stream-hardening A1: a mid-generation `finish_reason:"content_filter"`
+    /// (Gemini/OpenAI safety cut) is an incomplete reply. It must ride the same
+    /// truncation → chain-advance path as "length" — never persist as a clean
+    /// success — restoring parity with the sync path's filter_output_invalidity
+    /// gate (production chat is 100% streaming).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_content_filter_finish_advances_chain_as_truncated(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "cf/x" streams partial text then a content_filter cut;
+        // fallback "f/x" streams clean text.
+        let cut = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"部分回\"}}],",
+            "\"id\":\"gen-cf\",\"model\":\"cf/x\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "cf/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(cut, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JCONTENTFILTER00000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "cf/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let dones: Vec<(bool, bool)> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Done {
+                    truncated,
+                    ghost_fallback,
+                    ..
+                } => Some((*truncated, *ghost_fallback)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 2, "one Done per attempt: {frames:?}");
+        assert_eq!(
+            dones[0],
+            (true, false),
+            "content_filter cut must be truncated (replace-me), not a clean success: {frames:?}"
+        );
+        assert_eq!(
+            dones[1],
+            (false, false),
+            "the clean fallback is a normal accepted reply: {frames:?}"
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback feeds post-process; got {produced:?}"
+        );
+        assert_eq!(
+            produced[0].full_text, "hi there",
+            "the safety-cut partial must never reach memory/insight/affinity"
+        );
     }
 
     /// Codex P2 (PR #141, round 3): the FILTERED empty-completion ghost fallback

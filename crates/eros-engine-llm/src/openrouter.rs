@@ -483,6 +483,17 @@ struct WireStreamChoice {
     finish_reason: Option<String>,
 }
 
+/// Top-level `error` object OpenRouter embeds in an HTTP-200 SSE data frame
+/// when a provider fails mid-stream (docs: "API Streaming — error handling").
+/// `code` is upstream-defined (int or string) — kept opaque.
+#[derive(Debug, Deserialize)]
+struct WireStreamError {
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireStreamFrame {
     #[serde(default)]
@@ -493,6 +504,8 @@ struct WireStreamFrame {
     usage: Option<UsageBlock>,
     #[serde(default)]
     choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    error: Option<WireStreamError>,
 }
 
 /// App-Attribution headers sent on every outbound OpenRouter call.
@@ -1094,7 +1107,26 @@ impl OpenRouterClient {
                         }
                         match serde_json::from_str::<WireStreamFrame>(&e.data) {
                             Ok(frame) => {
+                                // A mid-stream provider failure arrives as a
+                                // normal-looking 200 SSE frame with a top-level
+                                // `error` (and/or finish_reason:"error"). It
+                                // must fail the attempt so the pipeline's
+                                // fallback chain runs — NOT parse as an
+                                // all-None chunk that lets a partial reply
+                                // persist as a clean success.
+                                if let Some(err) = frame.error {
+                                    return Some(Err(LlmError::Provider(format!(
+                                        "openrouter mid-stream error: code={:?}: {}",
+                                        err.code, err.message
+                                    ))));
+                                }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    return Some(Err(LlmError::Provider(
+                                        "openrouter stream terminated with finish_reason=error"
+                                            .into(),
+                                    )));
+                                }
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
                                     finish_reason: choice.finish_reason,
@@ -1985,6 +2017,107 @@ data: [DONE]\n\n";
         assert!(
             matches!(item, Err(LlmError::StreamParse(_))),
             "expected StreamParse error, got {item:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_mid_stream_error_frame() {
+        use futures_util::StreamExt;
+        // OpenRouter signals a mid-stream provider failure on an HTTP-200 SSE
+        // stream as a data frame with a top-level `error` object (plus a
+        // finish_reason:"error" choice). It must surface as Err, not parse as
+        // an all-None chunk that lets a partial reply persist as success.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"id\":\"gen-1\",\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}],\"error\":{\"code\":502,\"message\":\"provider disconnected\"}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("delta arrives");
+        let chunk = first.expect("first frame is a normal delta");
+        assert_eq!(chunk.content.as_deref(), Some("部分"));
+
+        let second = stream.next().await.expect("error frame arrives");
+        match second {
+            Err(LlmError::Provider(msg)) => {
+                assert!(
+                    msg.contains("provider disconnected"),
+                    "error message carries the upstream detail: {msg}"
+                );
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_finish_reason_error_without_error_object() {
+        use futures_util::StreamExt;
+        // Some providers set finish_reason:"error" without the top-level error
+        // object; that terminal frame must also fail the attempt.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let item = stream.next().await.expect("terminal frame arrives");
+        assert!(
+            matches!(item, Err(LlmError::Provider(_))),
+            "finish_reason=error must surface as Provider error, got {item:?}"
         );
     }
 
