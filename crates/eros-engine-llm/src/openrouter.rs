@@ -1341,9 +1341,13 @@ impl OpenRouterClient {
                                 // all-None chunk that lets a partial reply
                                 // persist as a clean success.
                                 if let Some(err) = frame.error {
+                                    // body_preview: err.message is provider-
+                                    // controlled — keep the logged error bounded
+                                    // and single-line like every other body.
                                     return Some(Err(LlmError::Provider(format!(
                                         "openrouter mid-stream error: code={:?}: {}",
-                                        err.code, err.message
+                                        err.code,
+                                        body_preview(&err.message)
                                     ))));
                                 }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();

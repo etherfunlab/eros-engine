@@ -55,10 +55,13 @@ Work is split into four batches, landed in order:
 - **The regex streaming applier governs the wire only; persistence always
   re-runs the existing whole-text `apply_output_regex`.** The DB row and the
   regex audit are byte-identical to today's buffered behavior in every case;
-  only what streams to the client is scrubbed incrementally. In the one
-  pathological fail-open case (unclosed `[` span exceeding the holdback cap)
-  the wire may briefly show what the persisted row stripped — accepted, the
-  cap is far above the real artifact length.
+  only what streams to the client is scrubbed incrementally. Hardened after
+  the pre-release series review (fix PR following #184): the scrubber holds
+  text while a match is still viable and releases it only once decided
+  (applied / provably dead / end-of-stream) — the wire can NEVER show text
+  the whole-text apply would strip. There are no fixed holdback caps; held
+  memory is bounded by the reply (max_tokens-capped), and the latency cost of
+  a long hold falls only on pathological inputs (e.g. a lone unclosed `[`).
 - **Provider routing exposes `sort` only, boot-level, off by default.**
   Mirrors the existing `ignore_providers` plumbing. `preferred_max_latency`
   is NOT adopted until verified against current OpenRouter docs (the external
@@ -303,9 +306,9 @@ live mode is dead code in production. The active patterns:
 
 | pattern | anchor | streaming strategy |
 |---|---|---|
-| `\[[^\]]*\]` | anywhere | span holdback: emit freely until `[`, hold from `[` until `]` (strip span) or 256-char cap (flush, fail-open) |
-| `^嗯(?:\.{3,6}\|…{1,2})\s*` | prefix | head holdback: buffer first 64 chars, apply once, then passthrough |
-| `^(?:[(（][^)）]*[)）]\|\.{3,6}\s*\|…{1,2}\s*)` | prefix | same head holdback |
+| `\[[^\]]*\]` | anywhere | span hold: emit freely until `[`, hold from `[` until `]` (strip span) or end-of-stream (flush verbatim — unclosed can't match) |
+| `^嗯(?:\.{3,6}\|…{1,2})\s*` | prefix | head hold-until-decided: apply once the leading match completes or is provably dead, then passthrough |
+| `^(?:[(（][^)）]*[)）]\|\.{3,6}\s*\|…{1,2}\s*)` | prefix | same head discipline |
 
 ### 5.2 `StreamScrubber` (new, `eros-engine-llm`)
 
@@ -323,11 +326,13 @@ impl StreamScrubber {
 ```
 
 - **Classification** (`classify(pattern) -> RuleShape`, via `regex-syntax`'s
-  HIR — a direct dep pinned to `regex`'s minor): a rule whose HIR
-  `look_set_prefix` contains `Look::Start` is **`Head`**; a rule whose HIR is
-  exactly `Concat[Literal(open), Repetition(_), Literal(close)]` with distinct
-  single-char `open`/`close` is **`Span { open, close }`** (this matches
-  `\[[^\]]*\]`); anything else is **`Opaque`**.
+  HIR — a direct dep pinned to `regex`'s minor): a rule whose whole
+  `look_set()` is exactly `{Look::Start}` (start-anchored, and NO `$`/`\z`/`\b`
+  anywhere — those make matches depend on where the haystack ends or on the
+  next char, undecidable mid-stream) is **`Head`**; a rule whose HIR is
+  exactly `Concat[Literal(open), Repetition{min:0,max:∞}([^close]), Literal(close)]`
+  with distinct single-char `open`/`close` is **`Span { open, close }`** (this
+  matches `\[[^\]]*\]`); anything else is **`Opaque`**.
 - **Transform pipeline (not a phase-split).** Each matching rule becomes a
   small streaming `Transform`, and the transforms are chained **in declaration
   order** — the composition is exactly `apply_output_regex`'s sequential
@@ -337,13 +342,20 @@ impl StreamScrubber {
   head-then-span phase-split would miss this, since the raw head starts with
   `[`). `push` feeds a delta through the chain; `finish` cascades each
   transform's flush into the next.
-  - **`HeadTransform`:** hold the first `HEAD_HOLDBACK = 64` chars, apply the
-    regex once (a start-anchored rule matches at most the leading prefix),
-    then pass the rest through. A head match longer than 64 chars is not
-    caught on the wire (fail-open; persist re-applies).
+  - **`HeadTransform`:** hold input until the leading match is *decided*:
+    a match ending strictly before the buffer end ⇒ apply + passthrough (with
+    `look_set == {Start}` and leftmost-first semantics, later input cannot
+    alter it); no match with the buffer past `head_decision_bound` (max match
+    length after stripping trailing nullable elements like `\s*` — an anchored
+    core match must lie within that many bytes) ⇒ provably dead, emit
+    verbatim; a match reaching exactly the buffer end stays held (it may
+    grow); end-of-stream ⇒ apply. Never emits a prefix of a still-viable
+    match.
   - **`SpanTransform`:** pass through until an `open`; hold from there; on
-    `close` emit the replacement (drop the span); if `SPAN_HOLDBACK_CAP = 256`
-    chars accumulate with no `close`, flush verbatim (fail-open, a lone `[`).
+    `close` run the rule regex over the span (replacement expansion exact);
+    at end-of-stream flush an unclosed hold verbatim (it can never match).
+    Deliberately NO holdback cap — a cap would leak a still-viable long
+    span's prefix to the wire. Held memory ≤ the reply (max_tokens-capped).
   - **`OpaqueTransform`:** buffer everything, apply at `finish` — preserves
     today's full-buffering behavior for any exotic pattern (no TTFT win, no
     correctness loss).
@@ -378,11 +390,12 @@ impl StreamScrubber {
 ### 5.4 Invariants preserved (test-gated)
 
 1. Persisted content, regex audit rows, and ghost/suppression decisions are
-   byte-identical to today's buffered mode for every input (modulo the
-   documented span-cap fail-open, which affects the wire only).
+   byte-identical to today's buffered mode for every input.
 2. Concatenated emitted deltas == `apply_output_regex(raw)` for all
    classifiable rules, across arbitrary chunk splits.
 3. A reply that strips to empty emits no non-whitespace delta.
+4. The wire never shows text the whole-text apply would strip (hold-until-
+   decided; no fixed holdback caps).
 
 ## 6. Batch D — tuning
 
@@ -452,9 +465,11 @@ field on the `provider` object accepting `"price"` / `"throughput"` /
 - **C (the big matrix):** `StreamScrubber` unit tests — every production
   pattern × chunk splits at every char boundary (property-style loop, not
   hand-picked splits) asserting invariant 5.4-2; artifact-only reply ⇒
-  everything held, `finish` returns empty; span-cap overflow ⇒ fail-open
-  flush; non-classifiable rule ⇒ degenerate buffering equals
-  `apply_output_regex`. Burst-level (wiremock): regex model streams live
+  everything held, `finish` returns empty; long valid span (>any old cap) ⇒
+  stripped with zero interior chars on the wire (invariant 5.4-4); unclosed
+  span ⇒ held to end-of-stream then verbatim; `^…$`/`\b` rules ⇒ Opaque;
+  dead head prefix ⇒ streams promptly via the decision bound;
+  non-classifiable rule ⇒ degenerate buffering equals `apply_output_regex`. Burst-level (wiremock): regex model streams live
   (Delta frames arrive before `[DONE]`), marker stripped on the wire,
   persisted row + audit identical to the pre-change buffered run;
   strip-to-empty ⇒ ghost fallback frames.
