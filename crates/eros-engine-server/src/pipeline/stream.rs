@@ -527,10 +527,28 @@ fn drive_chat_burst(
                 per_model_req.model = model_id.clone();
                 per_model_req.fallback_model = Vec::new();
 
-                match state.openrouter.execute_stream(per_model_req).await {
-                    Ok(mut s) => {
+                match tokio::time::timeout(
+                    STREAM_OPEN_TIMEOUT,
+                    state.openrouter.execute_stream(per_model_req),
+                )
+                .await
+                {
+                    Ok(Ok(mut s)) => {
                         use futures_util::StreamExt as _;
-                        while let Some(item) = s.next().await {
+                        let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
+                        loop {
+                            let item = match tokio::time::timeout_at(deadline, s.next()).await {
+                                Ok(Some(item)) => item,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "stream: total timeout ({}s), advancing chain",
+                                        STREAM_TOTAL_TIMEOUT.as_secs()
+                                    );
+                                    truncated = true;
+                                    break;
+                                }
+                            };
                             match item {
                                 Ok(c) => {
                                     if let Some(content) = c.content {
@@ -565,8 +583,15 @@ fn drive_chat_burst(
                             empty_completion = true;
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("stream: upstream open err: {e}");
+                        truncated = true;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "stream: open timeout ({}s), advancing chain",
+                            STREAM_OPEN_TIMEOUT.as_secs()
+                        );
                         truncated = true;
                     }
                 }
@@ -787,10 +812,28 @@ fn drive_chat_burst(
             let mut per_model_req = req.clone();
             per_model_req.model = model_id.clone();
             per_model_req.fallback_model = Vec::new();
-            match state.openrouter.execute_stream(per_model_req).await {
-                Ok(mut s) => {
+            match tokio::time::timeout(
+                STREAM_OPEN_TIMEOUT,
+                state.openrouter.execute_stream(per_model_req),
+            )
+            .await
+            {
+                Ok(Ok(mut s)) => {
                     use futures_util::StreamExt as _;
-                    while let Some(item) = s.next().await {
+                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
+                    loop {
+                        let item = match tokio::time::timeout_at(deadline, s.next()).await {
+                            Ok(Some(item)) => item,
+                            Ok(None) => break,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "stream(filtered): total timeout ({}s), advancing chain",
+                                    STREAM_TOTAL_TIMEOUT.as_secs()
+                                );
+                                truncated = true;
+                                break;
+                            }
+                        };
                         match item {
                             Ok(c) => {
                                 if let Some(content) = c.content { acc.push_str(&content); }
@@ -803,7 +846,14 @@ fn drive_chat_burst(
                     }
                     if !truncated && acc.is_empty() { empty_completion = true; }
                 }
-                Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+                Ok(Err(e)) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+                Err(_) => {
+                    tracing::warn!(
+                        "stream(filtered): open timeout ({}s), advancing chain",
+                        STREAM_OPEN_TIMEOUT.as_secs()
+                    );
+                    truncated = true;
+                }
             }
 
             if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
@@ -1292,6 +1342,15 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 
 /// Per-model timeout for a single filter LLM call.
 const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Max wait for a chat stream to OPEN (connect + queue + response headers).
+/// A provider that accepts the socket but never sends headers must not hold
+/// the turn — timeout ⇒ attempt fails ⇒ chain advances.
+const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Hard per-attempt cap on one model's whole generation (spec §1.5's 120s).
+/// Byte-level idle liveness is bounded upstream in the llm client; this caps
+/// a stream that keeps trickling forever.
+const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Run the output-filter LLM over `original`, walking the (already
 /// depth-capped) fallback chain one model at a time.  After each successful
@@ -2906,18 +2965,44 @@ pub fn run_stream(
                         reasoning: p.reasoning.clone(),
                         ..Default::default()
                     };
-                    let stream = match state.openrouter.execute_stream(req).await {
-                        Ok(s) => s,
-                        Err(e) => {
+                    let stream = match tokio::time::timeout(
+                        STREAM_OPEN_TIMEOUT,
+                        state.openrouter.execute_stream(req),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
                             tracing::warn!(model = %model_id, error = %e, "product_qa: open stream failed");
+                            if acc.is_empty() { continue 'candidates; }
+                            truncated = true;
+                            break 'candidates;
+                        }
+                        Err(_) => {
+                            tracing::warn!(model = %model_id, "product_qa: open timeout");
                             if acc.is_empty() { continue 'candidates; }
                             truncated = true;
                             break 'candidates;
                         }
                     };
                     futures_util::pin_mut!(stream);
+                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
                     loop {
-                        match futures_util::StreamExt::next(&mut stream).await {
+                        let item = match tokio::time::timeout_at(
+                            deadline,
+                            futures_util::StreamExt::next(&mut stream),
+                        )
+                        .await
+                        {
+                            Ok(item) => item,
+                            Err(_) => {
+                                tracing::warn!(model = %model_id, "product_qa: total timeout");
+                                if acc.is_empty() { continue 'candidates; }
+                                truncated = true;
+                                break 'candidates;
+                            }
+                        };
+                        match item {
                             Some(Ok(chunk)) => {
                                 if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
                                 if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }

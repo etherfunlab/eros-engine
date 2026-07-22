@@ -11,6 +11,40 @@ use crate::model_config::ReasoningConfig;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Max TCP+TLS establishment time for any OpenRouter call.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an idle pooled connection is kept for reuse.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Max gap between SSE *bytes* before a live stream is declared dead.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Gap-bound a fallible stream: an idle period longer than `idle` between
+/// items becomes an io TimedOut error item. Applied to the raw BYTES stream
+/// (before SSE parsing) deliberately: OpenRouter's `: OPENROUTER PROCESSING`
+/// comment keepalives count as bytes and reset the timer, so a reasoning
+/// model thinking for minutes stays alive while a dead peer trips it.
+fn idle_bounded<S, T, E>(
+    s: S,
+    idle: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<T, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use tokio_stream::StreamExt as _;
+    s.timeout(idle).map(move |r| match r {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "openrouter stream idle timeout: no bytes for {}s",
+                idle.as_secs()
+            ),
+        )),
+    })
+}
+
 /// OpenRouter app-attribution header names. Pinned to the current
 /// `https://openrouter.ai/docs/app-attribution` spec. If OpenRouter
 /// renames either header in the future, update the value here; today's
@@ -587,8 +621,14 @@ impl OpenRouterClient {
                 ),
             }
         }
+        // connect/pool bounds only — deliberately NO global `.timeout()` or
+        // client-level read timeout: both would also bound non-streaming calls
+        // (image generation legitimately spends its whole wall-time before the
+        // first body byte). Stream liveness is `idle_bounded`'s job.
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("reqwest client build never fails with empty config");
         Self {
@@ -1096,8 +1136,7 @@ impl OpenRouterClient {
             return Err(LlmError::Status(status, text));
         }
 
-        let stream = resp
-            .bytes_stream()
+        let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
             .eventsource()
             .filter_map(|ev| async move {
                 match ev {
@@ -2018,6 +2057,39 @@ data: [DONE]\n\n";
             matches!(item, Err(LlmError::StreamParse(_))),
             "expected StreamParse error, got {item:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_times_out_on_stalled_stream() {
+        use futures_util::StreamExt;
+        // One item arrives, then the stream stalls forever: the watchdog must
+        // pass the item through, then yield a TimedOut error (paused tokio
+        // time auto-advances, so this runs in microseconds).
+        let inner = futures_util::stream::iter([Ok::<_, std::convert::Infallible>("chunk")])
+            .chain(futures_util::stream::pending());
+        let mut s = std::pin::pin!(idle_bounded(
+            inner,
+            std::time::Duration::from_millis(50)
+        ));
+        let first = s.next().await.expect("first item");
+        assert_eq!(first.expect("passthrough"), "chunk");
+        let second = s.next().await.expect("watchdog fires");
+        let err = second.expect_err("stalled gap must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("idle timeout"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_passes_healthy_stream_untouched() {
+        use futures_util::StreamExt;
+        let inner =
+            futures_util::stream::iter(["a", "b", "c"].map(Ok::<_, std::convert::Infallible>));
+        let s = std::pin::pin!(idle_bounded(
+            inner,
+            std::time::Duration::from_millis(50)
+        ));
+        let items: Vec<&str> = s.map(|r| r.expect("no timeout on a live stream")).collect().await;
+        assert_eq!(items, vec!["a", "b", "c"]);
     }
 
     #[tokio::test]
