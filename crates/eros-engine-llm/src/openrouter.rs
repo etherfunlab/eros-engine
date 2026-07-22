@@ -1203,15 +1203,32 @@ impl OpenRouterClient {
     }
 
     /// Open a streaming chat completion against a single model. Fallback
-    /// chain handling is the caller's responsibility (pipeline layer).
+    /// chain handling is the caller's responsibility (pipeline layer). Owns
+    /// its `ChatRequest`; retained as the stable public entry point. In-tree
+    /// fallback loops use [`execute_stream_as`](Self::execute_stream_as) to
+    /// avoid re-cloning the prompt per attempt.
     pub async fn execute_stream(&self, req: ChatRequest) -> Result<DeltaStream, LlmError> {
+        let model = req.model.clone();
+        self.execute_stream_as(&req, &model).await
+    }
+
+    /// Like [`execute_stream`](Self::execute_stream) but borrows the request and
+    /// takes the served `model` separately, so a fallback chain can retry the
+    /// same (large) prompt against each candidate without deep-cloning it per
+    /// attempt. `req.model` / `req.fallback_model` are ignored — `model` is the
+    /// one actually sent.
+    pub async fn execute_stream_as(
+        &self,
+        req: &ChatRequest,
+        model: &str,
+    ) -> Result<DeltaStream, LlmError> {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
         }
-        if req.model.is_empty() {
+        if model.is_empty() {
             return Err(LlmError::Config(
                 "openrouter: execute_stream requires a non-empty model".into(),
             ));
@@ -1222,7 +1239,7 @@ impl OpenRouterClient {
         // rejects (400 "expected string, received null"). Sharing WireRequest
         // keeps the skip-None behaviour and stops the two paths from drifting.
         let wire = WireRequest {
-            model: &req.model,
+            model,
             messages: &req.messages,
             temperature: req.temperature,
             top_p: req.top_p,
@@ -1259,7 +1276,7 @@ impl OpenRouterClient {
         // logged — only the model id and timing.
         tracing::debug!(
             target: "openrouter_stream",
-            model = %req.model,
+            model = %model,
             headers_ms = started.elapsed().as_millis() as u64,
             http_version = ?resp.version(),
             "stream opened"
@@ -2565,6 +2582,48 @@ data: [DONE]\n\n";
             matches!(item, Err(LlmError::Provider(_))),
             "finish_reason=error must surface as Provider error, got {item:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_as_sends_the_passed_model_not_req_model() {
+        use futures_util::StreamExt;
+        // The borrowed request's own `model` is ignored — the `model` argument
+        // is what reaches the wire (the fallback-chain contract).
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "actual/served", "stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let req = ChatRequest {
+            model: "ignored/primary".into(),
+            fallback_model: vec!["also/ignored".into()],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let mut stream = client
+            .execute_stream_as(&req, "actual/served")
+            .await
+            .expect("stream opens");
+        // Drain (single [DONE]).
+        while stream.next().await.is_some() {}
     }
 
     // ─── B1: X-Generation-Id header capture ─────────────────────────────────

@@ -536,19 +536,17 @@ fn drive_chat_burst(
                     continues_from: continues_from.map(ulid_string),
                 };
 
-                let mut per_model_req = req.clone();
-                per_model_req.model = model_id.clone();
-                per_model_req.fallback_model = Vec::new();
-
                 // Per-attempt latency observability (spec §4.2). ttft = call →
                 // first content delta; outcome is the terminal disposition.
                 let attempt_started = std::time::Instant::now();
                 let mut ttft_ms: Option<u64> = None;
                 let mut attempt_outcome: &'static str = "served";
 
+                // Borrow the shared request; only the served model differs per
+                // attempt, so no per-fallback clone of the (large) prompt.
                 match tokio::time::timeout(
                     STREAM_OPEN_TIMEOUT,
-                    state.openrouter.execute_stream(per_model_req),
+                    state.openrouter.execute_stream_as(&req, model_id),
                 )
                 .await
                 {
@@ -918,10 +916,6 @@ fn drive_chat_burst(
             let mut truncated = false;
             let mut empty_completion = false;
 
-            let mut per_model_req = req.clone();
-            per_model_req.model = model_id.clone();
-            per_model_req.fallback_model = Vec::new();
-
             // Per-attempt observability (spec §4.2). In filtered mode the client
             // sees nothing until the whole reply is rewritten, so ttft_ms here is
             // time-to-first-UPSTREAM-token (still useful to compare model speed),
@@ -929,9 +923,10 @@ fn drive_chat_burst(
             let attempt_started = std::time::Instant::now();
             let mut ttft_ms: Option<u64> = None;
             let mut attempt_outcome: &'static str = "served";
+            // Borrow the shared request; no per-fallback prompt clone.
             match tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
-                state.openrouter.execute_stream(per_model_req),
+                state.openrouter.execute_stream_as(&req, model_id),
             )
             .await
             {
@@ -3105,22 +3100,23 @@ pub fn run_stream(
                 let mut last_gen_id: Option<String> = None;
                 let mut served_model: Option<String> = None;
                 let mut truncated = false;
+                // Built once; only the served model differs per candidate, so
+                // execute_stream_as borrows it (no per-candidate prompt clone).
+                let qa_req = eros_engine_llm::openrouter::ChatRequest {
+                    messages,
+                    temperature: p.temperature as f32,
+                    max_tokens: p.max_tokens,
+                    reasoning: p.reasoning.clone(),
+                    ..Default::default()
+                };
                 'candidates: for model_id in candidates {
                     last_usage = None;
                     last_gen_id = None;
                     served_model = None;
                     truncated = false;
-                    let req = eros_engine_llm::openrouter::ChatRequest {
-                        model: model_id.clone(),
-                        messages: messages.clone(),
-                        temperature: p.temperature as f32,
-                        max_tokens: p.max_tokens,
-                        reasoning: p.reasoning.clone(),
-                        ..Default::default()
-                    };
                     let stream = match tokio::time::timeout(
                         STREAM_OPEN_TIMEOUT,
-                        state.openrouter.execute_stream(req),
+                        state.openrouter.execute_stream_as(&qa_req, &model_id),
                     )
                     .await
                     {
