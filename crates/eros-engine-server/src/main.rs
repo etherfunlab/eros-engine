@@ -334,11 +334,13 @@ async fn run_server() -> Result<()> {
         Err(msg) => anyhow::bail!(msg),
     };
 
-    // OpenRouter client is constructed after model_config so we can wire in
-    // the global provider exclusion list from [defaults].ignore_providers.
+    // OpenRouter client is constructed after model_config so we can wire in the
+    // global provider routing prefs from [defaults]: the exclusion list and the
+    // optional sort preference (both off by default).
     let openrouter = Arc::new(
         eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key, attribution)
-            .with_ignore_providers(model_config.defaults.ignore_providers.clone()),
+            .with_ignore_providers(model_config.defaults.ignore_providers.clone())
+            .with_provider_sort(model_config.defaults.provider_sort.clone()),
     );
 
     // Computed once at boot, before model_config is moved into the state

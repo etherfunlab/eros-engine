@@ -12,8 +12,15 @@
 # on every call; allow_fallbacks stays true so the model is still served by a
 # healthy provider. Find the offending slug via OpenRouter's generation API.
 # Empty/unset = no exclusion.
+#
+# `provider_sort` (optional) sets OpenRouter's provider routing sort on EVERY
+# task: "price" | "throughput" | "latency". Unset (default) keeps OpenRouter's
+# price-based load balancing. Setting it trades cost for the chosen axis —
+# "latency" favours TTFT for chat; note it disables price load-balancing, so
+# watch cost and success rate separately.
 #[defaults]
 #ignore_providers = ["some-bad-provider-slug"]
+#provider_sort = "latency"
 #
 # One-off repair of rows already persisted with byte-BPE garble (run manually,
 # NOT a migration — the engine refuses to own downstream prod data). Repairs the

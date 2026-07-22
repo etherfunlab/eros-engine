@@ -475,12 +475,18 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// OpenRouter provider routing preferences. Only `ignore` is used today;
-/// `allow_fallbacks` is omitted so OpenRouter applies its default (true),
-/// i.e. the model is still served by a healthy provider.
+/// OpenRouter provider routing preferences. `allow_fallbacks` is omitted so
+/// OpenRouter applies its default (true), i.e. the model is still served by a
+/// healthy provider. `sort` is opt-in and off by default: an explicit sort
+/// disables OpenRouter's price-based load balancing (a cost decision the
+/// deployer owns), so when unset the field is omitted and the wire body is
+/// byte-identical to before.
 #[derive(Debug, Serialize)]
 struct ProviderPrefs<'a> {
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     ignore: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -661,6 +667,11 @@ pub struct OpenRouterClient {
     /// OpenRouter provider slugs sent as `provider.ignore` on every call.
     /// Empty by default; set at boot via [`OpenRouterClient::with_ignore_providers`].
     ignore_providers: Vec<String>,
+    /// OpenRouter `provider.sort` preference (`"price"` / `"throughput"` /
+    /// `"latency"`). `None` by default; set at boot via
+    /// [`OpenRouterClient::with_provider_sort`]. When `None` the field is
+    /// omitted, preserving OpenRouter's default price-based load balancing.
+    provider_sort: Option<String>,
 }
 
 impl OpenRouterClient {
@@ -728,6 +739,7 @@ impl OpenRouterClient {
             api_key,
             base_url,
             ignore_providers: Vec::new(),
+            provider_sort: None,
         }
     }
 
@@ -739,14 +751,26 @@ impl OpenRouterClient {
         self
     }
 
-    /// Build the `ProviderPrefs` for a wire body, or `None` when the exclusion
-    /// list is empty (so the `provider` key is omitted entirely).
+    /// Set the global `provider.sort` routing preference (`"price"` /
+    /// `"throughput"` / `"latency"`). Consuming builder, chainable at boot.
+    /// `None` (default) omits the field. Passed through verbatim — OpenRouter
+    /// validates. NOTE: an explicit sort disables OpenRouter's default
+    /// price-based load balancing, a cost/latency tradeoff the deployer owns.
+    pub fn with_provider_sort(mut self, sort: Option<String>) -> Self {
+        self.provider_sort = sort.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Build the `ProviderPrefs` for a wire body, or `None` when neither the
+    /// exclusion list nor a sort preference is set (so the `provider` key is
+    /// omitted entirely and the body is byte-identical to the no-prefs case).
     fn provider_prefs(&self) -> Option<ProviderPrefs<'_>> {
-        if self.ignore_providers.is_empty() {
+        if self.ignore_providers.is_empty() && self.provider_sort.is_none() {
             None
         } else {
             Some(ProviderPrefs {
                 ignore: &self.ignore_providers,
+                sort: self.provider_sort.as_deref(),
             })
         }
     }
@@ -2806,11 +2830,49 @@ data: [DONE]\n\n";
             session_id: None,
             metadata: None,
             reasoning: None,
-            provider: Some(ProviderPrefs { ignore: &ignore }),
+            provider: Some(ProviderPrefs {
+                ignore: &ignore,
+                sort: None,
+            }),
             response_format: None,
         };
         let body = serde_json::to_value(&wire).unwrap();
         assert_eq!(body["provider"]["ignore"][0], "BadHost");
+        assert!(
+            body["provider"].get("sort").is_none(),
+            "sort omitted when None"
+        );
+    }
+
+    #[test]
+    fn wire_request_emits_provider_sort_when_set_without_ignore() {
+        // sort-only: `ignore` is empty so it is omitted; only `sort` appears.
+        let empty: Vec<String> = Vec::new();
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: Some(ProviderPrefs {
+                ignore: &empty,
+                sort: Some("latency"),
+            }),
+            response_format: None,
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert_eq!(body["provider"]["sort"], "latency");
+        assert!(
+            body["provider"].get("ignore").is_none(),
+            "empty ignore omitted"
+        );
     }
 
     #[test]
@@ -2823,6 +2885,42 @@ data: [DONE]\n\n";
         .with_ignore_providers(vec!["BadHost".into()]);
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
+        assert!(prefs.sort.is_none());
+    }
+
+    #[test]
+    fn with_provider_sort_sets_prefs_and_composes_with_ignore() {
+        // sort alone → prefs present.
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_provider_sort(Some("throughput".into()));
+        let prefs = c.provider_prefs().expect("prefs present for sort-only");
+        assert_eq!(prefs.sort, Some("throughput"));
+        assert!(prefs.ignore.is_empty());
+
+        // empty string sort → treated as unset (no prefs when nothing else set).
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_provider_sort(Some(String::new()));
+        assert!(c.provider_prefs().is_none(), "empty sort is unset");
+
+        // ignore + sort compose into one prefs object.
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_ignore_providers(vec!["BadHost".into()])
+        .with_provider_sort(Some("latency".into()));
+        let prefs = c.provider_prefs().expect("prefs present");
+        assert_eq!(prefs.ignore, ["BadHost"]);
+        assert_eq!(prefs.sort, Some("latency"));
     }
 
     /// Garbled string used in garble-guard tests. `Ġ`/`Ċ` density is 2/12 ≈ 16.7 % >> 3 % threshold.

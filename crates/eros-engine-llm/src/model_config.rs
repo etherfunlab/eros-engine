@@ -369,6 +369,12 @@ pub struct DefaultConfig {
     /// client reads this once at boot. Empty = no exclusion.
     #[serde(default)]
     pub ignore_providers: Vec<String>,
+    /// OpenRouter `provider.sort` routing preference applied on EVERY task:
+    /// `"price"` / `"throughput"` / `"latency"`. `None` (absent) omits the
+    /// field, keeping OpenRouter's default price-based load balancing. Setting
+    /// it trades cost for the chosen axis — a deployer decision, off by default.
+    #[serde(default)]
+    pub provider_sort: Option<String>,
 }
 
 fn default_model_spec() -> ModelSpec {
@@ -3805,6 +3811,25 @@ filter_prompt = "只根据产品资料作答。"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert!(cfg.defaults.ignore_providers.is_empty());
+    }
+
+    #[test]
+    fn defaults_provider_sort_parses_and_defaults_none() {
+        let with = r#"
+            [defaults]
+            provider_sort = "latency"
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(with).expect("parse");
+        assert_eq!(cfg.defaults.provider_sort.as_deref(), Some("latency"));
+
+        let without = r#"
+            [tasks.chat_companion]
+            model = "x/y"
+        "#;
+        let cfg = ModelConfig::from_toml_str(without).expect("parse");
+        assert!(cfg.defaults.provider_sort.is_none());
     }
 
     #[test]
