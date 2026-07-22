@@ -558,6 +558,11 @@ fn drive_chat_burst(
                             };
                             match item {
                                 Ok(c) => {
+                                    // `execute_stream` filters empty deltas to None
+                                    // (openrouter.rs `.filter(|s| !s.is_empty())`),
+                                    // so a present `content` is always non-empty —
+                                    // ttft records the first *real* token, not a
+                                    // role/terminal empty delta.
                                     if let Some(content) = c.content {
                                         ttft_ms.get_or_insert_with(|| {
                                             attempt_started.elapsed().as_millis() as u64
@@ -872,6 +877,10 @@ fn drive_chat_burst(
                         };
                         match item {
                             Ok(c) => {
+                                // Empty deltas are already filtered to None by
+                                // execute_stream, so a present `content` is a real
+                                // upstream token — ttft is not tripped by role/
+                                // terminal empty frames.
                                 if let Some(content) = c.content {
                                     ttft_ms.get_or_insert_with(|| {
                                         attempt_started.elapsed().as_millis() as u64
