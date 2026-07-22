@@ -20,7 +20,7 @@
 //! degrade to full buffering (correct for any rule, just no TTFT win), so a
 //! downstream deployment with an exotic pattern loses nothing versus today.
 
-use regex_syntax::hir::{Hir, HirKind, Look};
+use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::model_config::CompiledRegexRule;
 
@@ -57,6 +57,23 @@ fn single_char_literal(hir: &Hir) -> Option<char> {
     None
 }
 
+/// True iff `hir` is exactly the Unicode class `[^close]` — every scalar except
+/// `close`. Verified by negating the class and checking the result is precisely
+/// the single char `close`. This is what makes `SpanTransform`'s `open`→`close`
+/// scan equivalent to the regex: the run between the delimiters must be
+/// "anything but the close char" (not `.`, which excludes newline, and not a
+/// bounded/other class).
+fn class_is_not_char(hir: &Hir, close: char) -> bool {
+    if let HirKind::Class(Class::Unicode(cls)) = hir.kind() {
+        let mut negated = cls.clone();
+        negated.negate();
+        let ranges = negated.ranges();
+        ranges.len() == 1 && ranges[0].start() == close && ranges[0].end() == close
+    } else {
+        false
+    }
+}
+
 /// Classify a rule's regex pattern into a streaming strategy. Uses the parsed
 /// HIR so the decision is structural, not string-guessing.
 pub fn classify(pattern: &str) -> RuleShape {
@@ -67,15 +84,23 @@ pub fn classify(pattern: &str) -> RuleShape {
     if hir.properties().look_set_prefix().contains(Look::Start) {
         return RuleShape::Head;
     }
-    // `open [^close]* close` decodes to Concat[Literal(open), Repetition, Literal(close)].
+    // A span rule must be EXACTLY `open [^close]* close`: Concat of a literal
+    // open, a `*` (min 0, unbounded) repetition of the negated-close class, and
+    // a literal close. Anything looser (`a.+b`, `a.*b`, a bounded `{2,5}`, a
+    // capture group) is NOT what SpanTransform implements, so it stays Opaque
+    // (buffered) rather than risk diverging from apply_output_regex on the wire.
     if let HirKind::Concat(parts) = hir.kind() {
         if parts.len() == 3 {
-            if let (Some(open), HirKind::Repetition(_), Some(close)) = (
+            if let (Some(open), HirKind::Repetition(rep), Some(close)) = (
                 single_char_literal(&parts[0]),
                 parts[1].kind(),
                 single_char_literal(&parts[2]),
             ) {
-                if open != close {
+                if open != close
+                    && rep.min == 0
+                    && rep.max.is_none()
+                    && class_is_not_char(&rep.sub, close)
+                {
                     return RuleShape::Span { open, close };
                 }
             }
@@ -134,6 +159,9 @@ impl Transform for HeadTransform {
 /// [`SPAN_HOLDBACK_CAP`] chars accumulate with no close (flush the held text
 /// verbatim — a lone unterminated `open`).
 struct SpanTransform {
+    /// The full rule regex, run on the completed span so any replacement
+    /// (including `$0`/capture expansion) matches apply_output_regex exactly.
+    regex: regex::Regex,
     open: char,
     close: char,
     replacement: String,
@@ -148,9 +176,12 @@ impl SpanTransform {
         for ch in input.chars() {
             if self.in_span {
                 if ch == self.close {
-                    // Complete span: emit the replacement, drop the held region.
-                    out.push_str(&self.replacement);
-                    self.held.clear();
+                    // Complete span: run the regex over the matched text so the
+                    // replacement is expanded exactly as replace_all would, then
+                    // drop the held region.
+                    let mut full = std::mem::take(&mut self.held);
+                    full.push(ch);
+                    out.push_str(&self.regex.replace(&full, self.replacement.as_str()));
                     self.in_span = false;
                 } else {
                     self.held.push(ch);
@@ -232,6 +263,7 @@ impl StreamScrubber {
                     done: false,
                 }),
                 RuleShape::Span { open, close } => Box::new(SpanTransform {
+                    regex: rule.regex.clone(),
                     open,
                     close,
                     replacement: rule.replacement.clone(),
@@ -313,6 +345,48 @@ mod tests {
         );
         assert_eq!(classify(r"(?s)<think>.*?</think>\s*"), RuleShape::Opaque);
         assert_eq!(classify(r"foo"), RuleShape::Opaque);
+    }
+
+    #[test]
+    fn classify_rejects_non_span_three_part_concats() {
+        // `.+` / `.*` are NOT `[^close]*` (a.+b needs ≥1 char; `.` excludes \n),
+        // a bounded repetition is not `*`, and a capture group breaks the shape.
+        // All must be Opaque so SpanTransform never mis-strips them.
+        assert_eq!(classify(r"a.+b"), RuleShape::Opaque);
+        assert_eq!(classify(r"a.*b"), RuleShape::Opaque);
+        assert_eq!(classify(r"\[[^\]]{2,5}\]"), RuleShape::Opaque);
+        assert_eq!(classify(r"\[([^\]]*)\]"), RuleShape::Opaque);
+        // But the exact production shape stays Span.
+        assert_eq!(
+            classify(r"\[[^\]]*\]"),
+            RuleShape::Span {
+                open: '[',
+                close: ']'
+            }
+        );
+    }
+
+    #[test]
+    fn span_replacement_expansion_matches_whole_text_apply() {
+        // A span rule with a non-empty $0-expanding replacement must stream the
+        // same text apply_output_regex produces (the whole match, wrapped).
+        let rules = vec![CompiledRegexRule {
+            models: vec!["m".to_string()],
+            regex: regex::Regex::new(r"\[[^\]]*\]").unwrap(),
+            replacement: "<$0>".to_string(),
+        }];
+        let text = "a[x]b[y]c";
+        let expected = apply_output_regex(&rules, "m", text).cleaned;
+        for split in 0..=text.chars().count() {
+            let chars: Vec<char> = text.chars().collect();
+            let mut s = StreamScrubber::new(&rules, "m");
+            let a: String = chars[..split].iter().collect();
+            let b: String = chars[split..].iter().collect();
+            let mut got = s.push(&a);
+            got.push_str(&s.push(&b));
+            got.push_str(&s.finish());
+            assert_eq!(got, expected, "split={split}");
+        }
     }
 
     /// The load-bearing guarantee: for every chunk-split point, the scrubbed
