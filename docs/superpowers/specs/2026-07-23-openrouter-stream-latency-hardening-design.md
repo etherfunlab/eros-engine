@@ -322,26 +322,34 @@ impl StreamScrubber {
 }
 ```
 
-- **Classification** (at `Self::new`, via `regex-syntax`'s HIR — already a
-  transitive dep of `regex`): a rule whose HIR is start-anchored
-  (`look_set_prefix` contains `Look::Start`) is a **head rule**; a rule whose
-  possible matches all start with a literal `[` (prefix-literal extraction)
-  is a **span rule** with open `[` / close `]`. Any other shape makes the
-  scrubber **degenerate to full buffering** for this attempt (emit nothing
-  from `push`, everything from `finish` after a whole-text
-  `apply_output_regex`) — correct for arbitrary rules, just without the TTFT
-  win; downstream deployments with exotic patterns lose nothing vs today.
-- **Head phase:** hold the first `HEAD_HOLDBACK = 64` chars; once exceeded
-  (or at `finish`), apply the head rules to the held prefix once, emit, and
-  leave head phase permanently.
-- **Span phase (steady state):** emit passthrough until an un-emitted `[`
-  appears; hold from there; on `]`, run the span rule over the held segment,
-  emit the cleaned remainder; if `SPAN_HOLDBACK_CAP = 256` chars accumulate
-  with no `]`, flush held text verbatim (fail-open) and resume scanning
-  *after* it.
-- Char-boundary safe (operates on `char` indices, never splits a CJK
-  scalar); a marker straddling any chunk boundary must be stripped
-  identically to the whole-text result (test matrix below).
+- **Classification** (`classify(pattern) -> RuleShape`, via `regex-syntax`'s
+  HIR — a direct dep pinned to `regex`'s minor): a rule whose HIR
+  `look_set_prefix` contains `Look::Start` is **`Head`**; a rule whose HIR is
+  exactly `Concat[Literal(open), Repetition(_), Literal(close)]` with distinct
+  single-char `open`/`close` is **`Span { open, close }`** (this matches
+  `\[[^\]]*\]`); anything else is **`Opaque`**.
+- **Transform pipeline (not a phase-split).** Each matching rule becomes a
+  small streaming `Transform`, and the transforms are chained **in declaration
+  order** — the composition is exactly `apply_output_regex`'s sequential
+  `replace_all`-per-rule. This is what makes rule *order* correct: a leading
+  `[artifact]嗯…` has the span transform strip the bracket first, so the
+  downstream `^嗯` head transform sees the exposed `嗢…` (a naive
+  head-then-span phase-split would miss this, since the raw head starts with
+  `[`). `push` feeds a delta through the chain; `finish` cascades each
+  transform's flush into the next.
+  - **`HeadTransform`:** hold the first `HEAD_HOLDBACK = 64` chars, apply the
+    regex once (a start-anchored rule matches at most the leading prefix),
+    then pass the rest through. A head match longer than 64 chars is not
+    caught on the wire (fail-open; persist re-applies).
+  - **`SpanTransform`:** pass through until an `open`; hold from there; on
+    `close` emit the replacement (drop the span); if `SPAN_HOLDBACK_CAP = 256`
+    chars accumulate with no `close`, flush verbatim (fail-open, a lone `[`).
+  - **`OpaqueTransform`:** buffer everything, apply at `finish` — preserves
+    today's full-buffering behavior for any exotic pattern (no TTFT win, no
+    correctness loss).
+- Char-boundary safe (iterates `char`s, never splits a scalar); a marker
+  straddling any chunk boundary strips identically to the whole-text result
+  (property test below).
 
 ### 5.3 Pipeline rewiring (`stream.rs`)
 
@@ -351,15 +359,17 @@ impl StreamScrubber {
   accumulates the **raw** text; `ProtocolFrame::Delta` carries the scrubbed
   `emit` (skip the frame when empty). After the loop, `scrubber.finish()`
   emits the tail.
-- Persist path (unchanged semantics, new location): before the
-  `AssistantInsert`, run the existing whole-text
-  `apply_output_regex(&state.output_regex, model_id, &acc)`; persist
-  `cleaned`, carry the regex audit exactly as the filtered path does today
-  (raw on the audit field when rules matched), and port the
-  **strip-to-empty ⇒ ghost-fallback** branch (`ghost_fallback_metadata`
-  with the regex reason) into the live burst. The whitespace-only-deltas
-  edge (raw `"\n\n[...]"` streams two blank deltas, then strips to empty ⇒
-  ghost) is accepted — clients render nothing for whitespace.
+- Persist path: run `apply_output_regex(&state.output_regex, model_id, &acc)`
+  **only on the served attempt** (`!truncated`) — a truncated/superseded
+  partial must not match a rule and mislabel the turn (same guard the filtered
+  burst uses). Persist `cleaned`, write the regex audit (`filter_model =
+  "<regex>"`, `{regex: indices}`, raw on `pre_filter_content`), feed `cleaned`
+  to `produced`, and set `filtered = true` when a rule fired. An artifact-only
+  reply (`cleaned` empty after a match) is a **terminal** served ghost
+  (`ghost_fallback_metadata(.., "regex_strip")`, does not advance the chain) —
+  matching the filtered burst. The whitespace-only-deltas edge (raw
+  `"\n\n[...]"` streams blank deltas, then persist strips to empty ⇒ ghost) is
+  accepted — clients render nothing for whitespace.
 - Filtered burst (LLM output_filter armed): completely unchanged — it
   already buffers for the rewrite and applies regex on the buffered text.
 - Beta-tier turns (output_filter trigger passing) therefore still buffer —
