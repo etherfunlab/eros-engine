@@ -302,7 +302,10 @@ fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
         .and_then(|v| v.get("error").cloned())
         .is_some();
     if is_api_error {
-        LlmError::Provider(format!("openrouter 200 error body: {}", scrub_error_body(body)))
+        LlmError::Provider(format!(
+            "openrouter 200 error body: {}",
+            scrub_error_body(body)
+        ))
     } else {
         LlmError::Decode(err)
     }
@@ -1824,7 +1827,11 @@ mod tests {
         assert_eq!(body_preview("  hi\nthere\r "), "hi\\nthere");
         let long: String = "x".repeat(ERROR_PREVIEW_MAX + 50);
         let out = body_preview(&long);
-        assert_eq!(out.chars().count(), ERROR_PREVIEW_MAX + 1, "capped + ellipsis");
+        assert_eq!(
+            out.chars().count(),
+            ERROR_PREVIEW_MAX + 1,
+            "capped + ellipsis"
+        );
         assert!(out.ends_with('…'));
     }
 
@@ -1845,10 +1852,19 @@ mod tests {
         })
         .to_string();
         let out = scrub_error_body(&raw);
-        assert!(!out.contains("SECRET USER PROMPT TEXT"), "flagged_input leaked: {out}");
+        assert!(
+            !out.contains("SECRET USER PROMPT TEXT"),
+            "flagged_input leaked: {out}"
+        );
         assert!(out.contains("code=\"moderation\""), "keeps code: {out}");
-        assert!(out.contains("provider=SomeProvider"), "keeps provider: {out}");
-        assert!(out.contains("moderation_reasons=sexual"), "keeps reasons: {out}");
+        assert!(
+            out.contains("provider=SomeProvider"),
+            "keeps provider: {out}"
+        );
+        assert!(
+            out.contains("moderation_reasons=sexual"),
+            "keeps reasons: {out}"
+        );
     }
 
     #[test]
@@ -1861,14 +1877,19 @@ mod tests {
         // Non-envelope junk falls back to a bounded preview.
         let junk: String = "boom ".repeat(100);
         let out = scrub_error_body(&junk);
-        assert!(out.chars().count() <= ERROR_PREVIEW_MAX + 1, "bounded: {}", out.len());
+        assert!(
+            out.chars().count() <= ERROR_PREVIEW_MAX + 1,
+            "bounded: {}",
+            out.len()
+        );
     }
 
     #[test]
     fn decode_or_api_error_surfaces_embedded_error() {
         // A 200 body that is really an error envelope → Provider (chain advances
         // with a useful, redacted reason), not a bare Decode.
-        let body = serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
+        let body =
+            serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
         let err = serde_json::from_str::<WireResponse>(&body).expect_err("no choices");
         match decode_or_api_error(&body, err) {
             LlmError::Provider(msg) => assert!(msg.contains("bad request"), "{msg}"),
@@ -1877,7 +1898,10 @@ mod tests {
         // Genuine junk stays a Decode error (no body leak — Display is a serde offset).
         let junk = "not json at all";
         let err = serde_json::from_str::<WireResponse>(junk).expect_err("bad json");
-        assert!(matches!(decode_or_api_error(junk, err), LlmError::Decode(_)));
+        assert!(matches!(
+            decode_or_api_error(junk, err),
+            LlmError::Decode(_)
+        ));
     }
 
     #[tokio::test]
@@ -1904,7 +1928,10 @@ mod tests {
         let err = client
             .execute(ChatRequest {
                 model: "m".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -1912,7 +1939,10 @@ mod tests {
             .await
             .expect_err("403 fails the chain");
         let shown = err.to_string();
-        assert!(!shown.contains("RAW USER CHAT"), "flagged_input leaked into error: {shown}");
+        assert!(
+            !shown.contains("RAW USER CHAT"),
+            "flagged_input leaked into error: {shown}"
+        );
         assert!(shown.contains("moderation_reasons=harassment"), "{shown}");
     }
 
@@ -1924,14 +1954,18 @@ mod tests {
         // Primary returns 200 with finish_reason:"error" (mid-generation death);
         // fallback returns a clean reply.
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "p"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{ "message": { "content": "partial" }, "finish_reason": "error" }]
             })))
             .mount(&server)
             .await;
         Mock::given(path("/api/v1/chat/completions"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "f"})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .mount(&server)
             .await;
@@ -1944,14 +1978,20 @@ mod tests {
             .execute(ChatRequest {
                 model: "p".into(),
                 fallback_model: vec!["f".into()],
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
             })
             .await
             .expect("fallback serves the clean reply");
-        assert_eq!(resp.reply, "ok", "the finish_reason=error partial must not be returned");
+        assert_eq!(
+            resp.reply, "ok",
+            "the finish_reason=error partial must not be returned"
+        );
     }
 
     // ─── B-err3: 200 body that is an error envelope ─────────────────────────
@@ -1973,7 +2013,10 @@ mod tests {
         let err = client
             .execute(ChatRequest {
                 model: "m".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -2524,16 +2567,26 @@ data: [DONE]\n\n";
         let mut stream = client
             .execute_stream(ChatRequest {
                 model: "x-ai/grok-4-fast".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
             })
             .await
             .unwrap();
-        let first = stream.next().await.expect("synthetic first chunk").expect("ok");
+        let first = stream
+            .next()
+            .await
+            .expect("synthetic first chunk")
+            .expect("ok");
         assert_eq!(first.generation_id.as_deref(), Some("gen-hdr-1"));
-        assert!(first.content.is_none(), "synthetic chunk carries no content");
+        assert!(
+            first.content.is_none(),
+            "synthetic chunk carries no content"
+        );
     }
 
     #[tokio::test]
@@ -2559,7 +2612,10 @@ data: [DONE]\n\n";
         let mut stream = client
             .execute_stream(ChatRequest {
                 model: "x-ai/grok-4-fast".into(),
-                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
                 temperature: 0.0,
                 max_tokens: 16,
                 ..Default::default()
@@ -2567,7 +2623,11 @@ data: [DONE]\n\n";
             .await
             .unwrap();
         let first = stream.next().await.expect("first chunk").expect("ok");
-        assert_eq!(first.content.as_deref(), Some("hi"), "first chunk is the real delta");
+        assert_eq!(
+            first.content.as_deref(),
+            Some("hi"),
+            "first chunk is the real delta"
+        );
     }
 
     #[test]
