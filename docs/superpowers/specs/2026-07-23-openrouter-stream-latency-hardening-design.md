@@ -222,6 +222,75 @@ tracing::info!(
 
 `outcome` is a `&'static str` assigned where each condition is detected
 (the existing `warn!` lines stay; this event is the aggregate-friendly one).
+The live burst also carries `ttft_ms` as true time-to-client; the filtered
+burst carries it as time-to-first-*upstream*-token (the client sees nothing
+until the rewrite completes) and tags the event `filtered = true`. Scope: the
+event is emitted in the two **companion** bursts (live + filtered) — the
+TTFT-critical paths and Batch C's optimization target. The out-of-character
+**product-QA** executor (a low-volume path Batch C does not touch, with a
+labeled-`continue`/`break` chain walk) keeps its existing per-attempt `warn`
+logs rather than a fragile multi-exit-point structured emit.
+
+### 4.3 Error-body bounding & redaction (riders folded into B)
+
+Two independent investigations of the reference SDK
+`realmorrisliu/openrouter-rs` (its `ApiErrorContext` / `is_retryable` /
+`ApiErrorKind` normalization) concluded **PARTIAL**: eros-engine's pipeline is
+*uniform-advance* — the server crate holds **zero** `LlmError` references and
+consumes errors only as a `Display` string in `tracing` logs, so a normalized
+error taxonomy nobody branches on is dead weight, and wiring moderation as a
+"terminal" kind would actively *regress* companion fallback (a laxer model
+down the chain is exactly what you want). Rejected: `ApiErrorContext`,
+`is_retryable`, `ApiErrorKind` control flow, `api_code`, `x-request-id`
+header, `normalize_error_status`, `merge_top_level_metadata`. Adopted here is
+only the subset that closes a **real privacy defect** or a small correctness
+gap. All changes are inside `eros-engine-llm`; `LlmError::Status`'s
+`(StatusCode, String)` shape is unchanged (its existing tests match on status
+only), so nothing in the server crate moves.
+
+**The defect:** `LlmError::Status`'s `Display` is `"non-success status {0}:
+{1}"` where `{1}` is the **full, unbounded provider body**, logged verbatim on
+the chain-advance path (`openrouter.rs` `execute` warn lines; `stream.rs`
+`"upstream open err: {e}"`). OpenRouter's *moderation* error body carries
+`metadata.flagged_input` — an excerpt of the user's flagged message — so today
+a slice of raw user chat content lands in ordinary logs, unbounded. Direct
+violation of the "never echo NSFW content" rule.
+
+- **B-err1 — bound + scrub at the `LlmError::Status` construction sites**
+  (`call_once`, `execute_stream`, `execute_vision`). New helpers in
+  `openrouter.rs`:
+  - `body_preview(&str) -> String`: flatten `\r`/`\n`, cap `ERROR_PREVIEW_MAX
+    = 200` chars with an ellipsis marker.
+  - `scrub_error_body(raw) -> String`: best-effort parse the OpenRouter
+    `{"error":{code,message,metadata}}` envelope; keep `code` (as
+    `serde_json::Value` — satisfies the non-i64 requirement, and is *better*
+    than the reference's `Option<i64>`), a `body_preview`'d `message`, and —
+    from moderation metadata — only `provider_name` + `reasons`, **never
+    `flagged_input`**. Non-envelope bodies fall back to `body_preview(raw)`.
+    Store the scrubbed string in `Status`, so every downstream `%e`/`{e}` log
+    is bounded and redacted with no log-site edits.
+- **B-err2 — close the non-streaming `finish_reason == "error"` gap.** Batch A
+  fixed only the streaming path; `call_once` still returns `Ok` with
+  `finish_reason: Some("error")`, so non-stream callers (PDE / output-filter /
+  affinity / world) accept a partial reply from a mid-generation provider
+  death. Add: `finish_reason == "error"` ⇒ `Err(LlmError::Provider(..))` so
+  `execute`'s chain advances (mirror of the Batch A stream fix), placed before
+  the garble check.
+- **B-err3 — surface an embedded error on a 200-decode failure.** A 200 body
+  that is actually `{"error":...}` with no `choices` currently fails as
+  `Decode("missing field choices")`, discarding the provider's message. In
+  `call_once` and `execute_vision`, read the body as text, `from_str`; on
+  parse failure route through `decode_or_api_error(status, body, err)`: if the
+  body contains a top-level `error` object ⇒ `Provider(scrub_error_body(body))`
+  (chain advances with a useful, redacted reason); otherwise the existing
+  `Decode(err)` (its `Display` carries only a serde offset, not the body — no
+  leak, no new variant).
+
+Skipped from the reference (no consumer / would regress): the whole
+`ApiErrorContext` struct, `is_retryable`/`is_client_error`/`is_server_error`,
+`ApiErrorKind` as control flow, `x-request-id` capture (different key from the
+audit's `generation_id`, which §4.1 already captures), `normalize_error_status`,
+and moderation-as-terminal.
 
 ## 5. Batch C — streaming-safe `output_regex` (the TTFT lever)
 

@@ -527,6 +527,12 @@ fn drive_chat_burst(
                 per_model_req.model = model_id.clone();
                 per_model_req.fallback_model = Vec::new();
 
+                // Per-attempt latency observability (spec §4.2). ttft = call →
+                // first content delta; outcome is the terminal disposition.
+                let attempt_started = std::time::Instant::now();
+                let mut ttft_ms: Option<u64> = None;
+                let mut attempt_outcome: &'static str = "served";
+
                 match tokio::time::timeout(
                     STREAM_OPEN_TIMEOUT,
                     state.openrouter.execute_stream(per_model_req),
@@ -546,12 +552,21 @@ fn drive_chat_burst(
                                         STREAM_TOTAL_TIMEOUT.as_secs()
                                     );
                                     truncated = true;
+                                    attempt_outcome = "total_timeout";
                                     break;
                                 }
                             };
                             match item {
                                 Ok(c) => {
+                                    // `execute_stream` filters empty deltas to None
+                                    // (openrouter.rs `.filter(|s| !s.is_empty())`),
+                                    // so a present `content` is always non-empty —
+                                    // ttft records the first *real* token, not a
+                                    // role/terminal empty delta.
                                     if let Some(content) = c.content {
+                                        ttft_ms.get_or_insert_with(|| {
+                                            attempt_started.elapsed().as_millis() as u64
+                                        });
                                         acc.push_str(&content);
                                         yield ProtocolFrame::Delta {
                                             message_id: ulid_string(msg_ulid),
@@ -565,27 +580,32 @@ fn drive_chat_burst(
                                     // rides the same truncation → chain-advance path
                                     // as "length" (parity with the sync path's
                                     // filter_output_invalidity gate).
-                                    if matches!(
-                                        c.finish_reason.as_deref(),
-                                        Some("length") | Some("content_filter")
-                                    ) {
-                                        truncated = true;
+                                    match c.finish_reason.as_deref() {
+                                        Some("length") => { truncated = true; attempt_outcome = "length"; }
+                                        Some("content_filter") => {
+                                            truncated = true;
+                                            attempt_outcome = "content_filter";
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!("stream: upstream chunk err: {e}");
                                     truncated = true;
+                                    attempt_outcome = "chunk_error";
                                     break;
                                 }
                             }
                         }
                         if !truncated && acc.is_empty() {
                             empty_completion = true;
+                            attempt_outcome = "empty";
                         }
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("stream: upstream open err: {e}");
                         truncated = true;
+                        attempt_outcome = "open_error";
                     }
                     Err(_) => {
                         tracing::warn!(
@@ -593,6 +613,7 @@ fn drive_chat_burst(
                             STREAM_OPEN_TIMEOUT.as_secs()
                         );
                         truncated = true;
+                        attempt_outcome = "open_timeout";
                     }
                 }
 
@@ -616,10 +637,21 @@ fn drive_chat_burst(
                     tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
                     acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
                     truncated = true;
+                    attempt_outcome = "garbled";
                     if !truncated_before_garble {
                         last_complete_garble = Some(acc.clone());
                     }
                 }
+
+                tracing::info!(
+                    target: "stream_metrics",
+                    model = %model_id,
+                    attempt = idx,
+                    ttft_ms,
+                    total_ms = attempt_started.elapsed().as_millis() as u64,
+                    outcome = attempt_outcome,
+                    "chat stream attempt"
+                );
 
                 // Disposition, computed once up front (spec §5.3): a non-last
                 // empty completion advances to the next model below; only the
@@ -812,6 +844,14 @@ fn drive_chat_burst(
             let mut per_model_req = req.clone();
             per_model_req.model = model_id.clone();
             per_model_req.fallback_model = Vec::new();
+
+            // Per-attempt observability (spec §4.2). In filtered mode the client
+            // sees nothing until the whole reply is rewritten, so ttft_ms here is
+            // time-to-first-UPSTREAM-token (still useful to compare model speed),
+            // not time-to-client.
+            let attempt_started = std::time::Instant::now();
+            let mut ttft_ms: Option<u64> = None;
+            let mut attempt_outcome: &'static str = "served";
             match tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
                 state.openrouter.execute_stream(per_model_req),
@@ -831,34 +871,59 @@ fn drive_chat_burst(
                                     STREAM_TOTAL_TIMEOUT.as_secs()
                                 );
                                 truncated = true;
+                                attempt_outcome = "total_timeout";
                                 break;
                             }
                         };
                         match item {
                             Ok(c) => {
-                                if let Some(content) = c.content { acc.push_str(&content); }
+                                // Empty deltas are already filtered to None by
+                                // execute_stream, so a present `content` is a real
+                                // upstream token — ttft is not tripped by role/
+                                // terminal empty frames.
+                                if let Some(content) = c.content {
+                                    ttft_ms.get_or_insert_with(|| {
+                                        attempt_started.elapsed().as_millis() as u64
+                                    });
+                                    acc.push_str(&content);
+                                }
                                 if c.usage.is_some() { last_usage = c.usage; }
                                 if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                if matches!(c.finish_reason.as_deref(), Some("length") | Some("content_filter")) { truncated = true; }
+                                match c.finish_reason.as_deref() {
+                                    Some("length") => { truncated = true; attempt_outcome = "length"; }
+                                    Some("content_filter") => { truncated = true; attempt_outcome = "content_filter"; }
+                                    _ => {}
+                                }
                             }
-                            Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
+                            Err(e) => {
+                                tracing::warn!("stream(filtered): chunk err: {e}");
+                                truncated = true;
+                                attempt_outcome = "chunk_error";
+                                break;
+                            }
                         }
                     }
-                    if !truncated && acc.is_empty() { empty_completion = true; }
+                    if !truncated && acc.is_empty() { empty_completion = true; attempt_outcome = "empty"; }
                 }
-                Ok(Err(e)) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+                Ok(Err(e)) => {
+                    tracing::warn!("stream(filtered): open err: {e}");
+                    truncated = true;
+                    attempt_outcome = "open_error";
+                }
                 Err(_) => {
                     tracing::warn!(
                         "stream(filtered): open timeout ({}s), advancing chain",
                         STREAM_OPEN_TIMEOUT.as_secs()
                     );
                     truncated = true;
+                    attempt_outcome = "open_timeout";
                 }
             }
 
             if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
                 tracing::error!(model = %model_id, "stream(filtered): byte-BPE garbled completion (issue #84)");
                 acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                attempt_outcome = "garbled";
                 // Nothing has been streamed to the client yet, so a COMPLETE garble
                 // is salvaged immediately: the repaired (clean) text flows through
                 // the output filter + persist below. We deliberately do NOT force a
@@ -866,6 +931,17 @@ fn drive_chat_burst(
                 // the later attempt failed. An INCOMPLETE garble is already
                 // `truncated` (length / transport) and handled by the block below.
             }
+
+            tracing::info!(
+                target: "stream_metrics",
+                model = %model_id,
+                attempt = idx,
+                ttft_ms,
+                total_ms = attempt_started.elapsed().as_millis() as u64,
+                outcome = attempt_outcome,
+                filtered = true,
+                "chat stream attempt"
+            );
 
             if empty_completion {
                 if idx + 1 == chain.len() {
