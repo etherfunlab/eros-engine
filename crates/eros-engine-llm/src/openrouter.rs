@@ -224,6 +224,90 @@ fn cap_provider_message(s: &str) -> String {
     }
 }
 
+/// Max chars kept from a raw provider error body in ordinary logs. Short by
+/// design: logs are for triage, not forensics — full error forensics live in
+/// OpenRouter's own logs, joined on `generation_id`.
+const ERROR_PREVIEW_MAX: usize = 200;
+
+/// Flatten newlines and cap a string to [`ERROR_PREVIEW_MAX`] chars so it is a
+/// single bounded log line. An ellipsis marks truncation.
+fn body_preview(s: &str) -> String {
+    let flat = s.trim().replace('\r', "\\r").replace('\n', "\\n");
+    if flat.chars().count() <= ERROR_PREVIEW_MAX {
+        flat
+    } else {
+        flat.chars().take(ERROR_PREVIEW_MAX).collect::<String>() + "…"
+    }
+}
+
+/// Turn a raw provider error body into a bounded, redacted one-line string safe
+/// for ordinary logs. Best-effort parses the OpenRouter
+/// `{"error":{code,message,metadata}}` envelope and keeps only `code`
+/// (as `serde_json::Value` — codes are sometimes strings, not ints), a
+/// length-capped `message`, and — from a moderation `metadata` block —
+/// `provider_name` + `reasons`. It deliberately DROPS `metadata.flagged_input`,
+/// which is an excerpt of the user's flagged prompt that a moderation rejection
+/// echoes back (logging it would leak raw chat content). Non-envelope bodies
+/// fall back to a plain length-capped preview.
+fn scrub_error_body(raw: &str) -> String {
+    #[derive(Deserialize)]
+    struct Env {
+        error: ErrBody,
+    }
+    #[derive(Deserialize)]
+    struct ErrBody {
+        #[serde(default)]
+        code: Option<serde_json::Value>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
+    }
+    let Ok(env) = serde_json::from_str::<Env>(raw) else {
+        return body_preview(raw);
+    };
+    let code = env
+        .error
+        .code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut out = format!(
+        "code={code}: {}",
+        body_preview(env.error.message.as_deref().unwrap_or(""))
+    );
+    // Provider identity + moderation reasons are safe to surface; flagged_input
+    // (the user's prompt excerpt) is never read.
+    if let Some(meta) = env.error.metadata.as_ref() {
+        if let Some(provider) = meta.get("provider_name").and_then(|v| v.as_str()) {
+            out.push_str(&format!(" [provider={provider}]"));
+        }
+        if let Some(reasons) = meta.get("reasons").and_then(|v| v.as_array()) {
+            let rs: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
+            if !rs.is_empty() {
+                out.push_str(&format!(" [moderation_reasons={}]", rs.join(",")));
+            }
+        }
+    }
+    out
+}
+
+/// A 200 body that failed to decode as a chat/vision completion: if it is in
+/// fact an OpenRouter error envelope (`{"error":...}` with no `choices`),
+/// surface its scrubbed message as a `Provider` error so the candidate chain
+/// advances with a useful, redacted reason; otherwise the ordinary `Decode`
+/// error (whose `Display` carries only a serde offset, never the body).
+fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
+    let is_api_error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .is_some();
+    if is_api_error {
+        LlmError::Provider(format!("openrouter 200 error body: {}", scrub_error_body(body)))
+    } else {
+        LlmError::Decode(err)
+    }
+}
+
 /// One-shot image-generation request. The model is expected to return
 /// generated images in `message.images[]` on the wire response.
 #[derive(Debug, Clone, Default)]
@@ -818,14 +902,23 @@ impl OpenRouterClient {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
-                last_err = Some(LlmError::Status(status, text));
+                last_err = Some(LlmError::Status(status, scrub_error_body(&text)));
                 continue;
             }
-            let parsed: WireResponse = match resp.json().await {
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let parsed: WireResponse = match serde_json::from_str::<WireResponse>(&body) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (decode); next");
-                    last_err = Some(e.into());
+                    let err = decode_or_api_error(&body, e);
+                    tracing::warn!(model = %model, error = %err, "openrouter: vision attempt failed (decode); next");
+                    last_err = Some(err);
                     continue;
                 }
             };
@@ -1054,16 +1147,32 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, text));
+            return Err(LlmError::Status(status, scrub_error_body(&text)));
         }
 
-        let parsed: WireResponse = resp.json().await?;
+        // Read as text so a 200 body that is actually an error envelope
+        // (`{"error":...}` with no `choices`) surfaces the provider message
+        // instead of a bare "missing field choices" decode error.
+        let body = resp.text().await?;
+        let parsed: WireResponse = match serde_json::from_str::<WireResponse>(&body) {
+            Ok(p) => p,
+            Err(e) => return Err(decode_or_api_error(&body, e)),
+        };
         let first_choice = parsed.choices.into_iter().next();
         let raw = first_choice
             .as_ref()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
         let finish_reason = first_choice.and_then(|c| c.finish_reason);
+        // A non-stream completion that finished with finish_reason="error" is a
+        // mid-generation provider death (Batch A fixed the streaming path only).
+        // Fail the attempt so `execute`'s chain advances rather than returning a
+        // partial reply that callers' validity gates would accept as complete.
+        if finish_reason.as_deref() == Some("error") {
+            return Err(LlmError::Provider(
+                "openrouter: non-stream completion finished with finish_reason=error".into(),
+            ));
+        }
         if crate::byte_bpe::looks_byte_garbled(&raw) {
             tracing::error!(
                 model,
@@ -1133,7 +1242,7 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, text));
+            return Err(LlmError::Status(status, scrub_error_body(&text)));
         }
 
         let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
@@ -1676,6 +1785,175 @@ mod tests {
         assert!(
             matches!(err, LlmError::Status(s, _) if s.as_u16() == 500),
             "expected last 500, got {err:?}"
+        );
+    }
+
+    // ─── B-err1: bounded + redacted provider error body ─────────────────────
+
+    #[test]
+    fn body_preview_caps_and_flattens() {
+        assert_eq!(body_preview("  hi\nthere\r "), "hi\\nthere");
+        let long: String = "x".repeat(ERROR_PREVIEW_MAX + 50);
+        let out = body_preview(&long);
+        assert_eq!(out.chars().count(), ERROR_PREVIEW_MAX + 1, "capped + ellipsis");
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn scrub_error_body_drops_moderation_flagged_input() {
+        // The user's flagged prompt excerpt must never survive into the log line.
+        let raw = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "flagged",
+                "metadata": {
+                    "reasons": ["sexual"],
+                    "flagged_input": "SECRET USER PROMPT TEXT",
+                    "provider_name": "SomeProvider",
+                    "model_slug": "some/model",
+                }
+            }
+        })
+        .to_string();
+        let out = scrub_error_body(&raw);
+        assert!(!out.contains("SECRET USER PROMPT TEXT"), "flagged_input leaked: {out}");
+        assert!(out.contains("code=\"moderation\""), "keeps code: {out}");
+        assert!(out.contains("provider=SomeProvider"), "keeps provider: {out}");
+        assert!(out.contains("moderation_reasons=sexual"), "keeps reasons: {out}");
+    }
+
+    #[test]
+    fn scrub_error_body_handles_numeric_code_and_non_envelope() {
+        // Numeric code (Value, not i64-restricted) round-trips.
+        let raw = serde_json::json!({"error": {"code": 402, "message": "no credits"}}).to_string();
+        let out = scrub_error_body(&raw);
+        assert!(out.contains("code=402"), "{out}");
+        assert!(out.contains("no credits"), "{out}");
+        // Non-envelope junk falls back to a bounded preview.
+        let junk: String = "boom ".repeat(100);
+        let out = scrub_error_body(&junk);
+        assert!(out.chars().count() <= ERROR_PREVIEW_MAX + 1, "bounded: {}", out.len());
+    }
+
+    #[test]
+    fn decode_or_api_error_surfaces_embedded_error() {
+        // A 200 body that is really an error envelope → Provider (chain advances
+        // with a useful, redacted reason), not a bare Decode.
+        let body = serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
+        let err = serde_json::from_str::<WireResponse>(&body).expect_err("no choices");
+        match decode_or_api_error(&body, err) {
+            LlmError::Provider(msg) => assert!(msg.contains("bad request"), "{msg}"),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+        // Genuine junk stays a Decode error (no body leak — Display is a serde offset).
+        let junk = "not json at all";
+        let err = serde_json::from_str::<WireResponse>(junk).expect_err("bad json");
+        assert!(matches!(decode_or_api_error(junk, err), LlmError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn call_once_status_body_is_scrubbed_in_error() {
+        // A moderation 403 with flagged_input must reach the caller's error
+        // (hence logs) with the prompt excerpt stripped.
+        let server = MockServer::start().await;
+        let moderation = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "input flagged",
+                "metadata": { "reasons": ["harassment"], "flagged_input": "RAW USER CHAT" }
+            }
+        });
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(moderation))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("403 fails the chain");
+        let shown = err.to_string();
+        assert!(!shown.contains("RAW USER CHAT"), "flagged_input leaked into error: {shown}");
+        assert!(shown.contains("moderation_reasons=harassment"), "{shown}");
+    }
+
+    // ─── B-err2: non-stream finish_reason=="error" fails the attempt ─────────
+
+    #[tokio::test]
+    async fn call_once_finish_reason_error_advances_chain() {
+        let server = MockServer::start().await;
+        // Primary returns 200 with finish_reason:"error" (mid-generation death);
+        // fallback returns a clean reply.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "p"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "partial" }, "finish_reason": "error" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({"model": "f"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f".into()],
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback serves the clean reply");
+        assert_eq!(resp.reply, "ok", "the finish_reason=error partial must not be returned");
+    }
+
+    // ─── B-err3: 200 body that is an error envelope ─────────────────────────
+
+    #[tokio::test]
+    async fn call_once_200_error_envelope_becomes_provider_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": 500, "message": "provider exploded" }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 200 error envelope must fail, not decode-silently");
+        assert!(
+            matches!(&err, LlmError::Provider(m) if m.contains("provider exploded")),
+            "expected Provider with the embedded message, got {err:?}"
         );
     }
 
