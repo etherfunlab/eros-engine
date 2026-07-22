@@ -222,6 +222,14 @@ tracing::info!(
 
 `outcome` is a `&'static str` assigned where each condition is detected
 (the existing `warn!` lines stay; this event is the aggregate-friendly one).
+The live burst also carries `ttft_ms` as true time-to-client; the filtered
+burst carries it as time-to-first-*upstream*-token (the client sees nothing
+until the rewrite completes) and tags the event `filtered = true`. Scope: the
+event is emitted in the two **companion** bursts (live + filtered) — the
+TTFT-critical paths and Batch C's optimization target. The out-of-character
+**product-QA** executor (a low-volume path Batch C does not touch, with a
+labeled-`continue`/`break` chain walk) keeps its existing per-attempt `warn`
+logs rather than a fragile multi-exit-point structured emit.
 
 ### 4.3 Error-body bounding & redaction (riders folded into B)
 
