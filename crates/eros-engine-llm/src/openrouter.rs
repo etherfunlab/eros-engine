@@ -11,6 +11,40 @@ use crate::model_config::ReasoningConfig;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Max TCP+TLS establishment time for any OpenRouter call.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an idle pooled connection is kept for reuse.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Max gap between SSE *bytes* before a live stream is declared dead.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Gap-bound a fallible stream: an idle period longer than `idle` between
+/// items becomes an io TimedOut error item. Applied to the raw BYTES stream
+/// (before SSE parsing) deliberately: OpenRouter's `: OPENROUTER PROCESSING`
+/// comment keepalives count as bytes and reset the timer, so a reasoning
+/// model thinking for minutes stays alive while a dead peer trips it.
+fn idle_bounded<S, T, E>(
+    s: S,
+    idle: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<T, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use tokio_stream::StreamExt as _;
+    s.timeout(idle).map(move |r| match r {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "openrouter stream idle timeout: no bytes for {}s",
+                idle.as_secs()
+            ),
+        )),
+    })
+}
+
 /// OpenRouter app-attribution header names. Pinned to the current
 /// `https://openrouter.ai/docs/app-attribution` spec. If OpenRouter
 /// renames either header in the future, update the value here; today's
@@ -190,6 +224,98 @@ fn cap_provider_message(s: &str) -> String {
     }
 }
 
+/// Max chars kept from a raw provider error body in ordinary logs. Short by
+/// design: logs are for triage, not forensics — full error forensics live in
+/// OpenRouter's own logs, joined on `generation_id`.
+const ERROR_PREVIEW_MAX: usize = 200;
+
+/// Flatten newlines and cap a string to [`ERROR_PREVIEW_MAX`] chars so it is a
+/// single bounded log line. An ellipsis marks truncation.
+fn body_preview(s: &str) -> String {
+    let flat = s.trim().replace('\r', "\\r").replace('\n', "\\n");
+    if flat.chars().count() <= ERROR_PREVIEW_MAX {
+        flat
+    } else {
+        flat.chars().take(ERROR_PREVIEW_MAX).collect::<String>() + "…"
+    }
+}
+
+/// Turn a raw provider error body into a bounded, redacted one-line string safe
+/// for ordinary logs. Best-effort parses the OpenRouter
+/// `{"error":{code,message,metadata}}` envelope and keeps only `code`
+/// (as `serde_json::Value` — codes are sometimes strings, not ints), a
+/// length-capped `message`, and — from a moderation `metadata` block —
+/// `provider_name` + `reasons`. It deliberately DROPS `metadata.flagged_input`,
+/// which is an excerpt of the user's flagged prompt that a moderation rejection
+/// echoes back (logging it would leak raw chat content). Non-envelope bodies
+/// fall back to a plain length-capped preview.
+fn scrub_error_body(raw: &str) -> String {
+    #[derive(Deserialize)]
+    struct Env {
+        error: ErrBody,
+    }
+    #[derive(Deserialize)]
+    struct ErrBody {
+        #[serde(default)]
+        code: Option<serde_json::Value>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
+    }
+    let Ok(env) = serde_json::from_str::<Env>(raw) else {
+        return body_preview(raw);
+    };
+    let code = env
+        .error
+        .code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".into());
+    // Assemble the raw parts, then run the WHOLE string through body_preview
+    // once. provider_name / reasons are provider-controlled and could carry
+    // newlines or be arbitrarily long, so the single final flatten+cap is what
+    // upholds the "bounded, single-line" guarantee for every field — not just
+    // the message.
+    let mut out = format!(
+        "code={code}: {}",
+        env.error.message.as_deref().unwrap_or("")
+    );
+    // Provider identity + moderation reasons are safe to surface; flagged_input
+    // (the user's prompt excerpt) is never read.
+    if let Some(meta) = env.error.metadata.as_ref() {
+        if let Some(provider) = meta.get("provider_name").and_then(|v| v.as_str()) {
+            out.push_str(&format!(" [provider={provider}]"));
+        }
+        if let Some(reasons) = meta.get("reasons").and_then(|v| v.as_array()) {
+            let rs: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
+            if !rs.is_empty() {
+                out.push_str(&format!(" [moderation_reasons={}]", rs.join(",")));
+            }
+        }
+    }
+    body_preview(&out)
+}
+
+/// A 200 body that failed to decode as a chat/vision completion: if it is in
+/// fact an OpenRouter error envelope (`{"error":...}` with no `choices`),
+/// surface its scrubbed message as a `Provider` error so the candidate chain
+/// advances with a useful, redacted reason; otherwise the ordinary `Decode`
+/// error (whose `Display` carries only a serde offset, never the body).
+fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
+    let is_api_error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .is_some();
+    if is_api_error {
+        LlmError::Provider(format!(
+            "openrouter 200 error body: {}",
+            scrub_error_body(body)
+        ))
+    } else {
+        LlmError::Decode(err)
+    }
+}
+
 /// One-shot image-generation request. The model is expected to return
 /// generated images in `message.images[]` on the wire response.
 #[derive(Debug, Clone, Default)]
@@ -349,12 +475,18 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// OpenRouter provider routing preferences. Only `ignore` is used today;
-/// `allow_fallbacks` is omitted so OpenRouter applies its default (true),
-/// i.e. the model is still served by a healthy provider.
+/// OpenRouter provider routing preferences. `allow_fallbacks` is omitted so
+/// OpenRouter applies its default (true), i.e. the model is still served by a
+/// healthy provider. `sort` is opt-in and off by default: an explicit sort
+/// disables OpenRouter's price-based load balancing (a cost decision the
+/// deployer owns), so when unset the field is omitted and the wire body is
+/// byte-identical to before.
 #[derive(Debug, Serialize)]
 struct ProviderPrefs<'a> {
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     ignore: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +615,17 @@ struct WireStreamChoice {
     finish_reason: Option<String>,
 }
 
+/// Top-level `error` object OpenRouter embeds in an HTTP-200 SSE data frame
+/// when a provider fails mid-stream (docs: "API Streaming — error handling").
+/// `code` is upstream-defined (int or string) — kept opaque.
+#[derive(Debug, Deserialize)]
+struct WireStreamError {
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireStreamFrame {
     #[serde(default)]
@@ -493,6 +636,8 @@ struct WireStreamFrame {
     usage: Option<UsageBlock>,
     #[serde(default)]
     choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    error: Option<WireStreamError>,
 }
 
 /// App-Attribution headers sent on every outbound OpenRouter call.
@@ -522,6 +667,11 @@ pub struct OpenRouterClient {
     /// OpenRouter provider slugs sent as `provider.ignore` on every call.
     /// Empty by default; set at boot via [`OpenRouterClient::with_ignore_providers`].
     ignore_providers: Vec<String>,
+    /// OpenRouter `provider.sort` preference (`"price"` / `"throughput"` /
+    /// `"latency"`). `None` by default; set at boot via
+    /// [`OpenRouterClient::with_provider_sort`]. When `None` the field is
+    /// omitted, preserving OpenRouter's default price-based load balancing.
+    provider_sort: Option<String>,
 }
 
 impl OpenRouterClient {
@@ -574,8 +724,14 @@ impl OpenRouterClient {
                 ),
             }
         }
+        // connect/pool bounds only — deliberately NO global `.timeout()` or
+        // client-level read timeout: both would also bound non-streaming calls
+        // (image generation legitimately spends its whole wall-time before the
+        // first body byte). Stream liveness is `idle_bounded`'s job.
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("reqwest client build never fails with empty config");
         Self {
@@ -583,6 +739,7 @@ impl OpenRouterClient {
             api_key,
             base_url,
             ignore_providers: Vec::new(),
+            provider_sort: None,
         }
     }
 
@@ -594,14 +751,26 @@ impl OpenRouterClient {
         self
     }
 
-    /// Build the `ProviderPrefs` for a wire body, or `None` when the exclusion
-    /// list is empty (so the `provider` key is omitted entirely).
+    /// Set the global `provider.sort` routing preference (`"price"` /
+    /// `"throughput"` / `"latency"`). Consuming builder, chainable at boot.
+    /// `None` (default) omits the field. Passed through verbatim — OpenRouter
+    /// validates. NOTE: an explicit sort disables OpenRouter's default
+    /// price-based load balancing, a cost/latency tradeoff the deployer owns.
+    pub fn with_provider_sort(mut self, sort: Option<String>) -> Self {
+        self.provider_sort = sort.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Build the `ProviderPrefs` for a wire body, or `None` when neither the
+    /// exclusion list nor a sort preference is set (so the `provider` key is
+    /// omitted entirely and the body is byte-identical to the no-prefs case).
     fn provider_prefs(&self) -> Option<ProviderPrefs<'_>> {
-        if self.ignore_providers.is_empty() {
+        if self.ignore_providers.is_empty() && self.provider_sort.is_none() {
             None
         } else {
             Some(ProviderPrefs {
                 ignore: &self.ignore_providers,
+                sort: self.provider_sort.as_deref(),
             })
         }
     }
@@ -765,14 +934,23 @@ impl OpenRouterClient {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
-                last_err = Some(LlmError::Status(status, text));
+                last_err = Some(LlmError::Status(status, scrub_error_body(&text)));
                 continue;
             }
-            let parsed: WireResponse = match resp.json().await {
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let parsed: WireResponse = match serde_json::from_str::<WireResponse>(&body) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (decode); next");
-                    last_err = Some(e.into());
+                    let err = decode_or_api_error(&body, e);
+                    tracing::warn!(model = %model, error = %err, "openrouter: vision attempt failed (decode); next");
+                    last_err = Some(err);
                     continue;
                 }
             };
@@ -1001,16 +1179,32 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, text));
+            return Err(LlmError::Status(status, scrub_error_body(&text)));
         }
 
-        let parsed: WireResponse = resp.json().await?;
+        // Read as text so a 200 body that is actually an error envelope
+        // (`{"error":...}` with no `choices`) surfaces the provider message
+        // instead of a bare "missing field choices" decode error.
+        let body = resp.text().await?;
+        let parsed: WireResponse = match serde_json::from_str::<WireResponse>(&body) {
+            Ok(p) => p,
+            Err(e) => return Err(decode_or_api_error(&body, e)),
+        };
         let first_choice = parsed.choices.into_iter().next();
         let raw = first_choice
             .as_ref()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
         let finish_reason = first_choice.and_then(|c| c.finish_reason);
+        // A non-stream completion that finished with finish_reason="error" is a
+        // mid-generation provider death (Batch A fixed the streaming path only).
+        // Fail the attempt so `execute`'s chain advances rather than returning a
+        // partial reply that callers' validity gates would accept as complete.
+        if finish_reason.as_deref() == Some("error") {
+            return Err(LlmError::Provider(
+                "openrouter: non-stream completion finished with finish_reason=error".into(),
+            ));
+        }
         if crate::byte_bpe::looks_byte_garbled(&raw) {
             tracing::error!(
                 model,
@@ -1033,15 +1227,32 @@ impl OpenRouterClient {
     }
 
     /// Open a streaming chat completion against a single model. Fallback
-    /// chain handling is the caller's responsibility (pipeline layer).
+    /// chain handling is the caller's responsibility (pipeline layer). Owns
+    /// its `ChatRequest`; retained as the stable public entry point. In-tree
+    /// fallback loops use [`execute_stream_as`](Self::execute_stream_as) to
+    /// avoid re-cloning the prompt per attempt.
     pub async fn execute_stream(&self, req: ChatRequest) -> Result<DeltaStream, LlmError> {
+        let model = req.model.clone();
+        self.execute_stream_as(&req, &model).await
+    }
+
+    /// Like [`execute_stream`](Self::execute_stream) but borrows the request and
+    /// takes the served `model` separately, so a fallback chain can retry the
+    /// same (large) prompt against each candidate without deep-cloning it per
+    /// attempt. `req.model` / `req.fallback_model` are ignored — `model` is the
+    /// one actually sent.
+    pub async fn execute_stream_as(
+        &self,
+        req: &ChatRequest,
+        model: &str,
+    ) -> Result<DeltaStream, LlmError> {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
         if self.api_key.is_empty() {
             return Err(LlmError::Config("openrouter: api key not set".into()));
         }
-        if req.model.is_empty() {
+        if model.is_empty() {
             return Err(LlmError::Config(
                 "openrouter: execute_stream requires a non-empty model".into(),
             ));
@@ -1052,7 +1263,7 @@ impl OpenRouterClient {
         // rejects (400 "expected string, received null"). Sharing WireRequest
         // keeps the skip-None behaviour and stops the two paths from drifting.
         let wire = WireRequest {
-            model: &req.model,
+            model,
             messages: &req.messages,
             temperature: req.temperature,
             top_p: req.top_p,
@@ -1068,6 +1279,7 @@ impl OpenRouterClient {
             response_format: None,
         };
 
+        let started = std::time::Instant::now();
         let resp = self
             .http
             .post(&self.base_url)
@@ -1080,11 +1292,38 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, text));
+            return Err(LlmError::Status(status, scrub_error_body(&text)));
         }
 
-        let stream = resp
-            .bytes_stream()
+        // Observability: connect+headers latency and the negotiated HTTP
+        // version (should read HTTP/2.0 post-Batch-A3). Prompt content is never
+        // logged — only the model id and timing.
+        tracing::debug!(
+            target: "openrouter_stream",
+            model = %model,
+            headers_ms = started.elapsed().as_millis() as u64,
+            http_version = ?resp.version(),
+            "stream opened"
+        );
+
+        // Capture the authoritative generation id from the X-Generation-Id
+        // header the moment headers arrive, so a stream that dies before its
+        // first id-bearing body chunk still yields an audit handle. Prepended
+        // as a synthetic first chunk; the pipeline's "latest non-None wins"
+        // accumulation adopts it, and a later body `id` (identical) overwrites.
+        let header_gen_id = resp
+            .headers()
+            .get("x-generation-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let head = futures_util::stream::iter(header_gen_id.map(|id| {
+            Ok(DeltaChunk {
+                generation_id: Some(id),
+                ..Default::default()
+            })
+        }));
+
+        let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
             .eventsource()
             .filter_map(|ev| async move {
                 match ev {
@@ -1094,7 +1333,30 @@ impl OpenRouterClient {
                         }
                         match serde_json::from_str::<WireStreamFrame>(&e.data) {
                             Ok(frame) => {
+                                // A mid-stream provider failure arrives as a
+                                // normal-looking 200 SSE frame with a top-level
+                                // `error` (and/or finish_reason:"error"). It
+                                // must fail the attempt so the pipeline's
+                                // fallback chain runs — NOT parse as an
+                                // all-None chunk that lets a partial reply
+                                // persist as a clean success.
+                                if let Some(err) = frame.error {
+                                    // body_preview: err.message is provider-
+                                    // controlled — keep the logged error bounded
+                                    // and single-line like every other body.
+                                    return Some(Err(LlmError::Provider(format!(
+                                        "openrouter mid-stream error: code={:?}: {}",
+                                        err.code,
+                                        body_preview(&err.message)
+                                    ))));
+                                }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    return Some(Err(LlmError::Provider(
+                                        "openrouter stream terminated with finish_reason=error"
+                                            .into(),
+                                    )));
+                                }
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
                                     finish_reason: choice.finish_reason,
@@ -1112,7 +1374,7 @@ impl OpenRouterClient {
                 }
             });
 
-        Ok(DeltaStream(stream.boxed()))
+        Ok(DeltaStream(head.chain(stream).boxed()))
     }
 }
 
@@ -1608,6 +1870,237 @@ mod tests {
         );
     }
 
+    // ─── B-err1: bounded + redacted provider error body ─────────────────────
+
+    #[test]
+    fn body_preview_caps_and_flattens() {
+        assert_eq!(body_preview("  hi\nthere\r "), "hi\\nthere");
+        let long: String = "x".repeat(ERROR_PREVIEW_MAX + 50);
+        let out = body_preview(&long);
+        assert_eq!(
+            out.chars().count(),
+            ERROR_PREVIEW_MAX + 1,
+            "capped + ellipsis"
+        );
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn scrub_error_body_drops_moderation_flagged_input() {
+        // The user's flagged prompt excerpt must never survive into the log line.
+        let raw = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "flagged",
+                "metadata": {
+                    "reasons": ["sexual"],
+                    "flagged_input": "SECRET USER PROMPT TEXT",
+                    "provider_name": "SomeProvider",
+                    "model_slug": "some/model",
+                }
+            }
+        })
+        .to_string();
+        let out = scrub_error_body(&raw);
+        assert!(
+            !out.contains("SECRET USER PROMPT TEXT"),
+            "flagged_input leaked: {out}"
+        );
+        assert!(out.contains("code=\"moderation\""), "keeps code: {out}");
+        assert!(
+            out.contains("provider=SomeProvider"),
+            "keeps provider: {out}"
+        );
+        assert!(
+            out.contains("moderation_reasons=sexual"),
+            "keeps reasons: {out}"
+        );
+    }
+
+    #[test]
+    fn scrub_error_body_bounds_and_flattens_hostile_metadata() {
+        // provider_name/reasons are provider-controlled: a newline-laden, very
+        // long value must not defeat the single-line, bounded guarantee.
+        let evil = format!("{}\n{}", "A".repeat(300), "B".repeat(300));
+        let raw = serde_json::json!({
+            "error": {
+                "code": 500,
+                "message": "boom",
+                "metadata": { "provider_name": evil, "reasons": ["x\ny"] }
+            }
+        })
+        .to_string();
+        let out = scrub_error_body(&raw);
+        assert!(!out.contains('\n'), "must be single-line: {out:?}");
+        assert!(
+            out.chars().count() <= ERROR_PREVIEW_MAX + 1,
+            "must be bounded, got {} chars",
+            out.chars().count()
+        );
+    }
+
+    #[test]
+    fn scrub_error_body_handles_numeric_code_and_non_envelope() {
+        // Numeric code (Value, not i64-restricted) round-trips.
+        let raw = serde_json::json!({"error": {"code": 402, "message": "no credits"}}).to_string();
+        let out = scrub_error_body(&raw);
+        assert!(out.contains("code=402"), "{out}");
+        assert!(out.contains("no credits"), "{out}");
+        // Non-envelope junk falls back to a bounded preview.
+        let junk: String = "boom ".repeat(100);
+        let out = scrub_error_body(&junk);
+        assert!(
+            out.chars().count() <= ERROR_PREVIEW_MAX + 1,
+            "bounded: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn decode_or_api_error_surfaces_embedded_error() {
+        // A 200 body that is really an error envelope → Provider (chain advances
+        // with a useful, redacted reason), not a bare Decode.
+        let body =
+            serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
+        let err = serde_json::from_str::<WireResponse>(&body).expect_err("no choices");
+        match decode_or_api_error(&body, err) {
+            LlmError::Provider(msg) => assert!(msg.contains("bad request"), "{msg}"),
+            other => panic!("expected Provider, got {other:?}"),
+        }
+        // Genuine junk stays a Decode error (no body leak — Display is a serde offset).
+        let junk = "not json at all";
+        let err = serde_json::from_str::<WireResponse>(junk).expect_err("bad json");
+        assert!(matches!(
+            decode_or_api_error(junk, err),
+            LlmError::Decode(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_once_status_body_is_scrubbed_in_error() {
+        // A moderation 403 with flagged_input must reach the caller's error
+        // (hence logs) with the prompt excerpt stripped.
+        let server = MockServer::start().await;
+        let moderation = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "input flagged",
+                "metadata": { "reasons": ["harassment"], "flagged_input": "RAW USER CHAT" }
+            }
+        });
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(moderation))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("403 fails the chain");
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("RAW USER CHAT"),
+            "flagged_input leaked into error: {shown}"
+        );
+        assert!(shown.contains("moderation_reasons=harassment"), "{shown}");
+    }
+
+    // ─── B-err2: non-stream finish_reason=="error" fails the attempt ─────────
+
+    #[tokio::test]
+    async fn call_once_finish_reason_error_advances_chain() {
+        let server = MockServer::start().await;
+        // Primary returns 200 with finish_reason:"error" (mid-generation death);
+        // fallback returns a clean reply.
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "partial" }, "finish_reason": "error" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "f"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "p".into(),
+                fallback_model: vec!["f".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback serves the clean reply");
+        assert_eq!(
+            resp.reply, "ok",
+            "the finish_reason=error partial must not be returned"
+        );
+    }
+
+    // ─── B-err3: 200 body that is an error envelope ─────────────────────────
+
+    #[tokio::test]
+    async fn call_once_200_error_envelope_becomes_provider_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": 500, "message": "provider exploded" }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 200 error envelope must fail, not decode-silently");
+        assert!(
+            matches!(&err, LlmError::Provider(m) if m.contains("provider exploded")),
+            "expected Provider with the embedded message, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn execute_returns_config_err_when_chain_empty() {
         // No mocks — empty primary + empty fallback chain must short-circuit
@@ -1988,6 +2481,269 @@ data: [DONE]\n\n";
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_times_out_on_stalled_stream() {
+        use futures_util::StreamExt;
+        // One item arrives, then the stream stalls forever: the watchdog must
+        // pass the item through, then yield a TimedOut error (paused tokio
+        // time auto-advances, so this runs in microseconds).
+        let inner = futures_util::stream::iter([Ok::<_, std::convert::Infallible>("chunk")])
+            .chain(futures_util::stream::pending());
+        let mut s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
+        let first = s.next().await.expect("first item");
+        assert_eq!(first.expect("passthrough"), "chunk");
+        let second = s.next().await.expect("watchdog fires");
+        let err = second.expect_err("stalled gap must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("idle timeout"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_passes_healthy_stream_untouched() {
+        use futures_util::StreamExt;
+        let inner =
+            futures_util::stream::iter(["a", "b", "c"].map(Ok::<_, std::convert::Infallible>));
+        let s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
+        let items: Vec<&str> = s
+            .map(|r| r.expect("no timeout on a live stream"))
+            .collect()
+            .await;
+        assert_eq!(items, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_mid_stream_error_frame() {
+        use futures_util::StreamExt;
+        // OpenRouter signals a mid-stream provider failure on an HTTP-200 SSE
+        // stream as a data frame with a top-level `error` object (plus a
+        // finish_reason:"error" choice). It must surface as Err, not parse as
+        // an all-None chunk that lets a partial reply persist as success.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"id\":\"gen-1\",\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}],\"error\":{\"code\":502,\"message\":\"provider disconnected\"}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("delta arrives");
+        let chunk = first.expect("first frame is a normal delta");
+        assert_eq!(chunk.content.as_deref(), Some("部分"));
+
+        let second = stream.next().await.expect("error frame arrives");
+        match second {
+            Err(LlmError::Provider(msg)) => {
+                assert!(
+                    msg.contains("provider disconnected"),
+                    "error message carries the upstream detail: {msg}"
+                );
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_finish_reason_error_without_error_object() {
+        use futures_util::StreamExt;
+        // Some providers set finish_reason:"error" without the top-level error
+        // object; that terminal frame must also fail the attempt.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let item = stream.next().await.expect("terminal frame arrives");
+        assert!(
+            matches!(item, Err(LlmError::Provider(_))),
+            "finish_reason=error must surface as Provider error, got {item:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_as_sends_the_passed_model_not_req_model() {
+        use futures_util::StreamExt;
+        // The borrowed request's own `model` is ignored — the `model` argument
+        // is what reaches the wire (the fallback-chain contract).
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "actual/served", "stream": true}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let req = ChatRequest {
+            model: "ignored/primary".into(),
+            fallback_model: vec!["also/ignored".into()],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let mut stream = client
+            .execute_stream_as(&req, "actual/served")
+            .await
+            .expect("stream opens");
+        // Drain (single [DONE]).
+        while stream.next().await.is_some() {}
+    }
+
+    // ─── B1: X-Generation-Id header capture ─────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_stream_prepends_generation_id_from_header() {
+        use futures_util::StreamExt;
+        // Header carries the id; the body frames carry none. The synthetic first
+        // chunk must surface the header id so audit has a handle even if the
+        // stream dies before any body id.
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-generation-id", "gen-hdr-1")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("synthetic first chunk")
+            .expect("ok");
+        assert_eq!(first.generation_id.as_deref(), Some("gen-hdr-1"));
+        assert!(
+            first.content.is_none(),
+            "synthetic chunk carries no content"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_no_header_no_synthetic_chunk() {
+        use futures_util::StreamExt;
+        // Without the header, the first chunk is the real body delta (no
+        // spurious empty synthetic chunk).
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let first = stream.next().await.expect("first chunk").expect("ok");
+        assert_eq!(
+            first.content.as_deref(),
+            Some("hi"),
+            "first chunk is the real delta"
+        );
+    }
+
     #[test]
     fn wire_request_serializes_response_format_only_when_present() {
         let messages: Vec<ChatMessage> = vec![];
@@ -2078,11 +2834,49 @@ data: [DONE]\n\n";
             session_id: None,
             metadata: None,
             reasoning: None,
-            provider: Some(ProviderPrefs { ignore: &ignore }),
+            provider: Some(ProviderPrefs {
+                ignore: &ignore,
+                sort: None,
+            }),
             response_format: None,
         };
         let body = serde_json::to_value(&wire).unwrap();
         assert_eq!(body["provider"]["ignore"][0], "BadHost");
+        assert!(
+            body["provider"].get("sort").is_none(),
+            "sort omitted when None"
+        );
+    }
+
+    #[test]
+    fn wire_request_emits_provider_sort_when_set_without_ignore() {
+        // sort-only: `ignore` is empty so it is omitted; only `sort` appears.
+        let empty: Vec<String> = Vec::new();
+        let wire = WireRequest {
+            model: "x/y",
+            messages: &[],
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 100,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            provider: Some(ProviderPrefs {
+                ignore: &empty,
+                sort: Some("latency"),
+            }),
+            response_format: None,
+        };
+        let body = serde_json::to_value(&wire).unwrap();
+        assert_eq!(body["provider"]["sort"], "latency");
+        assert!(
+            body["provider"].get("ignore").is_none(),
+            "empty ignore omitted"
+        );
     }
 
     #[test]
@@ -2095,6 +2889,42 @@ data: [DONE]\n\n";
         .with_ignore_providers(vec!["BadHost".into()]);
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
+        assert!(prefs.sort.is_none());
+    }
+
+    #[test]
+    fn with_provider_sort_sets_prefs_and_composes_with_ignore() {
+        // sort alone → prefs present.
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_provider_sort(Some("throughput".into()));
+        let prefs = c.provider_prefs().expect("prefs present for sort-only");
+        assert_eq!(prefs.sort, Some("throughput"));
+        assert!(prefs.ignore.is_empty());
+
+        // empty string sort → treated as unset (no prefs when nothing else set).
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_provider_sort(Some(String::new()));
+        assert!(c.provider_prefs().is_none(), "empty sort is unset");
+
+        // ignore + sort compose into one prefs object.
+        let c = OpenRouterClient::with_base_url(
+            "k".into(),
+            AppAttribution::default(),
+            "http://localhost".into(),
+        )
+        .with_ignore_providers(vec!["BadHost".into()])
+        .with_provider_sort(Some("latency".into()));
+        let prefs = c.provider_prefs().expect("prefs present");
+        assert_eq!(prefs.ignore, ["BadHost"]);
+        assert_eq!(prefs.sort, Some("latency"));
     }
 
     /// Garbled string used in garble-guard tests. `Ġ`/`Ċ` density is 2/12 ≈ 16.7 % >> 3 % threshold.

@@ -457,17 +457,18 @@ fn drive_chat_burst(
         }
 
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
-        // A turn buffers (no live deltas) if the LLM output_filter's turn-level
-        // predicates pass, OR any output_regex rule targets a model in this
-        // turn's resolved chain (so the artifact can be stripped before emit).
-        let regex_targets_chain = chain.iter().any(|m| {
-            state.output_regex.iter().any(|r| r.models.iter().any(|rm| rm == m))
-        });
+        // A turn buffers (no live deltas) ONLY when the LLM output_filter's
+        // turn-level predicates pass — an LLM rewrite is inherently un-streamable
+        // (the filtered text must be produced before any of it is safe to send).
+        // `output_regex` no longer forces buffering: the live burst streams
+        // through the rules incrementally with a bounded holdback
+        // (`StreamScrubber`), so a regex-only chain (the common production case)
+        // now gets true streaming TTFT instead of full-generation buffering.
         let llm_filter_arms = filter
             .as_ref()
             .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
-        let filtered_mode = llm_filter_arms || regex_targets_chain;
+        let filtered_mode = llm_filter_arms;
 
         // Build the assistant row metadata bag: always includes prompt_traits +
         // resolved memory_scope / affinity_scope (the POST-resolve values
@@ -500,7 +501,12 @@ fn drive_chat_burst(
         };
 
         if !filtered_mode {
-            // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
+            // ===== LIVE MODE =====
+            // Streams deltas as they arrive, scrubbing output_regex artifacts
+            // incrementally via StreamScrubber (bounded holdback). `acc` keeps
+            // the RAW text; the wire carries the scrubbed text; the served
+            // attempt's persist re-runs the whole-text apply_output_regex so the
+            // DB row + regex audit are byte-identical to the old buffered path.
             let mut continues_from: Option<Ulid> = None;
             // Repaired text of the latest COMPLETE garbled attempt seen across the
             // whole chain. Used as the last-resort replacement when the chain
@@ -515,6 +521,13 @@ fn drive_chat_burst(
                 let mut last_gen_id: Option<String> = None;
                 let mut truncated = false;
                 let mut empty_completion = false;
+                // Scrubs output_regex artifacts out of the wire deltas as they
+                // stream; `acc` still accumulates the raw text for the persist
+                // apply below. Empty rule set ⇒ pure passthrough.
+                let mut scrubber = eros_engine_llm::stream_scrub::StreamScrubber::new(
+                    &state.output_regex,
+                    model_id,
+                );
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
@@ -523,44 +536,117 @@ fn drive_chat_burst(
                     continues_from: continues_from.map(ulid_string),
                 };
 
-                let mut per_model_req = req.clone();
-                per_model_req.model = model_id.clone();
-                per_model_req.fallback_model = Vec::new();
+                // Per-attempt latency observability (spec §4.2). ttft = call →
+                // first content delta; outcome is the terminal disposition.
+                let attempt_started = std::time::Instant::now();
+                let mut ttft_ms: Option<u64> = None;
+                let mut attempt_outcome: &'static str = "served";
 
-                match state.openrouter.execute_stream(per_model_req).await {
-                    Ok(mut s) => {
+                // Borrow the shared request; only the served model differs per
+                // attempt, so no per-fallback clone of the (large) prompt.
+                match tokio::time::timeout(
+                    STREAM_OPEN_TIMEOUT,
+                    state.openrouter.execute_stream_as(&req, model_id),
+                )
+                .await
+                {
+                    Ok(Ok(mut s)) => {
                         use futures_util::StreamExt as _;
-                        while let Some(item) = s.next().await {
+                        let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
+                        loop {
+                            let item = match tokio::time::timeout_at(deadline, s.next()).await {
+                                Ok(Some(item)) => item,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "stream: total timeout ({}s), advancing chain",
+                                        STREAM_TOTAL_TIMEOUT.as_secs()
+                                    );
+                                    truncated = true;
+                                    attempt_outcome = "total_timeout";
+                                    break;
+                                }
+                            };
                             match item {
                                 Ok(c) => {
+                                    // `execute_stream` filters empty deltas to None
+                                    // (openrouter.rs `.filter(|s| !s.is_empty())`),
+                                    // so a present `content` is always a real token.
                                     if let Some(content) = c.content {
                                         acc.push_str(&content);
-                                        yield ProtocolFrame::Delta {
-                                            message_id: ulid_string(msg_ulid),
-                                            content,
-                                        };
+                                        // Scrub artifacts before they hit the wire;
+                                        // ttft counts the first *client-visible*
+                                        // token (a leading artifact is held, so the
+                                        // first emit can lag the first raw token).
+                                        let emit = scrubber.push(&content);
+                                        if !emit.is_empty() {
+                                            ttft_ms.get_or_insert_with(|| {
+                                                attempt_started.elapsed().as_millis() as u64
+                                            });
+                                            yield ProtocolFrame::Delta {
+                                                message_id: ulid_string(msg_ulid),
+                                                content: emit,
+                                            };
+                                        }
                                     }
                                     if c.usage.is_some()         { last_usage = c.usage; }
                                     if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                    if matches!(c.finish_reason.as_deref(), Some("length")) {
-                                        truncated = true;
+                                    // "content_filter" = mid-generation safety cut
+                                    // (Gemini/OpenAI): the text is incomplete, so it
+                                    // rides the same truncation → chain-advance path
+                                    // as "length" (parity with the sync path's
+                                    // filter_output_invalidity gate).
+                                    match c.finish_reason.as_deref() {
+                                        Some("length") => { truncated = true; attempt_outcome = "length"; }
+                                        Some("content_filter") => {
+                                            truncated = true;
+                                            attempt_outcome = "content_filter";
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!("stream: upstream chunk err: {e}");
                                     truncated = true;
+                                    attempt_outcome = "chunk_error";
                                     break;
                                 }
                             }
                         }
                         if !truncated && acc.is_empty() {
                             empty_completion = true;
+                            attempt_outcome = "empty";
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("stream: upstream open err: {e}");
                         truncated = true;
+                        attempt_outcome = "open_error";
                     }
+                    Err(_) => {
+                        tracing::warn!(
+                            "stream: open timeout ({}s), advancing chain",
+                            STREAM_OPEN_TIMEOUT.as_secs()
+                        );
+                        truncated = true;
+                        attempt_outcome = "open_timeout";
+                    }
+                }
+
+                // Flush any text the scrubber held at end-of-stream (a completed
+                // prefix under the head window, or a trailing unterminated span).
+                // Empty scrubber ⇒ "". On a truncated attempt this partial is
+                // sent then superseded, same as the raw deltas already were.
+                let scrub_tail = scrubber.finish();
+                if !scrub_tail.is_empty() {
+                    // For a short reply fully held until now (head transform
+                    // holds ≤64 chars; Opaque buffers all), this tail is the
+                    // FIRST client-visible content — record ttft here too.
+                    ttft_ms.get_or_insert_with(|| attempt_started.elapsed().as_millis() as u64);
+                    yield ProtocolFrame::Delta {
+                        message_id: ulid_string(msg_ulid),
+                        content: scrub_tail,
+                    };
                 }
 
                 // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
@@ -583,10 +669,21 @@ fn drive_chat_burst(
                     tracing::error!(model = %model_id, "stream: byte-BPE garbled completion (issue #84)");
                     acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
                     truncated = true;
+                    attempt_outcome = "garbled";
                     if !truncated_before_garble {
                         last_complete_garble = Some(acc.clone());
                     }
                 }
+
+                tracing::info!(
+                    target: "stream_metrics",
+                    model = %model_id,
+                    attempt = idx,
+                    ttft_ms,
+                    total_ms = attempt_started.elapsed().as_millis() as u64,
+                    outcome = attempt_outcome,
+                    "chat stream attempt"
+                );
 
                 // Disposition, computed once up front (spec §5.3): a non-last
                 // empty completion advances to the next model below; only the
@@ -602,19 +699,56 @@ fn drive_chat_burst(
                     truncated = true;
                 }
 
+                // Layer 0: apply output_regex to the RAW acc, but ONLY for the
+                // attempt actually served (`!truncated`). A truncated/superseded
+                // partial must not match a rule and mislabel the turn (mirrors the
+                // filtered burst's same guard). The wire already emitted this same
+                // scrubbed text incrementally; here it governs the persisted row +
+                // regex audit + the strip-to-empty ghost, byte-identical to the
+                // old buffered path.
+                let (persist_content, filter_audit, regex_ghost) = if truncated {
+                    (acc.clone(), None, false)
+                } else {
+                    let strip = eros_engine_llm::model_config::apply_output_regex(
+                        &state.output_regex,
+                        model_id,
+                        &acc,
+                    );
+                    let audit = if strip.matched_rules.is_empty() {
+                        None
+                    } else {
+                        outcome.lock().unwrap().filtered = true;
+                        Some(eros_engine_store::chat::FilterAudit {
+                            pre_filter_content: acc.clone(),
+                            filter_model: "<regex>".to_string(),
+                            filter_triggers: serde_json::json!({ "regex": strip.matched_rules }),
+                            f_client_msg_id: format!("f_{}", Ulid::new()),
+                            f_generation_id: None,
+                        })
+                    };
+                    // Artifact-only reply: the strip emptied a non-empty completion.
+                    // Terminal ghost (does NOT advance the chain), matching the
+                    // filtered burst's regex-strip-to-empty semantics.
+                    let ghost = !strip.matched_rules.is_empty() && strip.cleaned.is_empty();
+                    (strip.cleaned, audit, ghost)
+                };
+                let effective_ghost = is_ghost_fallback || regex_ghost;
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
-                    content: acc.clone(),
+                    content: persist_content.clone(),
                     assistant_action_type: persist_action.into(),
                     continues_from_message_id: continues_from.map(Into::into),
                     truncated,
                     model: Some(model_id.clone()),
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
-                    filter_audit: None,
+                    filter_audit,
                     metadata: if is_ghost_fallback {
                         ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                    } else if regex_ghost {
+                        ghost_fallback_metadata(build_metadata(None), "regex_strip")
                     } else {
                         build_metadata(None)
                     },
@@ -627,7 +761,7 @@ fn drive_chat_burst(
                 }
                 outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
                     message_id: msg_uuid,
-                    full_text: acc.clone(),
+                    full_text: persist_content.clone(),
                     action: plan_action,
                 });
 
@@ -641,7 +775,7 @@ fn drive_chat_burst(
                     truncated,
                     usage: wire_usage,
                     generation_id: last_gen_id,
-                    ghost_fallback: is_ghost_fallback,
+                    ghost_fallback: effective_ghost,
                 };
 
                 if is_ghost_fallback {
@@ -673,6 +807,12 @@ fn drive_chat_burst(
                     // state alongside the reply the user actually saw.
                     o.produced.retain(|m| m.message_id == msg_uuid);
                     o.retries_chat = idx as u32;
+                    // An artifact-only reply (regex stripped to empty) is a served
+                    // ghost: keep affinity's ghost accounting consistent with the
+                    // Done frame's ghost_fallback and the filtered burst.
+                    if regex_ghost {
+                        o.ghost_fallback = true;
+                    }
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -776,31 +916,86 @@ fn drive_chat_burst(
             let mut truncated = false;
             let mut empty_completion = false;
 
-            let mut per_model_req = req.clone();
-            per_model_req.model = model_id.clone();
-            per_model_req.fallback_model = Vec::new();
-            match state.openrouter.execute_stream(per_model_req).await {
-                Ok(mut s) => {
+            // Per-attempt observability (spec §4.2). In filtered mode the client
+            // sees nothing until the whole reply is rewritten, so ttft_ms here is
+            // time-to-first-UPSTREAM-token (still useful to compare model speed),
+            // not time-to-client.
+            let attempt_started = std::time::Instant::now();
+            let mut ttft_ms: Option<u64> = None;
+            let mut attempt_outcome: &'static str = "served";
+            // Borrow the shared request; no per-fallback prompt clone.
+            match tokio::time::timeout(
+                STREAM_OPEN_TIMEOUT,
+                state.openrouter.execute_stream_as(&req, model_id),
+            )
+            .await
+            {
+                Ok(Ok(mut s)) => {
                     use futures_util::StreamExt as _;
-                    while let Some(item) = s.next().await {
+                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
+                    loop {
+                        let item = match tokio::time::timeout_at(deadline, s.next()).await {
+                            Ok(Some(item)) => item,
+                            Ok(None) => break,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "stream(filtered): total timeout ({}s), advancing chain",
+                                    STREAM_TOTAL_TIMEOUT.as_secs()
+                                );
+                                truncated = true;
+                                attempt_outcome = "total_timeout";
+                                break;
+                            }
+                        };
                         match item {
                             Ok(c) => {
-                                if let Some(content) = c.content { acc.push_str(&content); }
+                                // Empty deltas are already filtered to None by
+                                // execute_stream, so a present `content` is a real
+                                // upstream token — ttft is not tripped by role/
+                                // terminal empty frames.
+                                if let Some(content) = c.content {
+                                    ttft_ms.get_or_insert_with(|| {
+                                        attempt_started.elapsed().as_millis() as u64
+                                    });
+                                    acc.push_str(&content);
+                                }
                                 if c.usage.is_some() { last_usage = c.usage; }
                                 if c.generation_id.is_some() { last_gen_id = c.generation_id; }
-                                if matches!(c.finish_reason.as_deref(), Some("length")) { truncated = true; }
+                                match c.finish_reason.as_deref() {
+                                    Some("length") => { truncated = true; attempt_outcome = "length"; }
+                                    Some("content_filter") => { truncated = true; attempt_outcome = "content_filter"; }
+                                    _ => {}
+                                }
                             }
-                            Err(e) => { tracing::warn!("stream(filtered): chunk err: {e}"); truncated = true; break; }
+                            Err(e) => {
+                                tracing::warn!("stream(filtered): chunk err: {e}");
+                                truncated = true;
+                                attempt_outcome = "chunk_error";
+                                break;
+                            }
                         }
                     }
-                    if !truncated && acc.is_empty() { empty_completion = true; }
+                    if !truncated && acc.is_empty() { empty_completion = true; attempt_outcome = "empty"; }
                 }
-                Err(e) => { tracing::warn!("stream(filtered): open err: {e}"); truncated = true; }
+                Ok(Err(e)) => {
+                    tracing::warn!("stream(filtered): open err: {e}");
+                    truncated = true;
+                    attempt_outcome = "open_error";
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "stream(filtered): open timeout ({}s), advancing chain",
+                        STREAM_OPEN_TIMEOUT.as_secs()
+                    );
+                    truncated = true;
+                    attempt_outcome = "open_timeout";
+                }
             }
 
             if eros_engine_llm::byte_bpe::looks_byte_garbled(&acc) {
                 tracing::error!(model = %model_id, "stream(filtered): byte-BPE garbled completion (issue #84)");
                 acc = eros_engine_llm::byte_bpe::repair_byte_bpe(&acc);
+                attempt_outcome = "garbled";
                 // Nothing has been streamed to the client yet, so a COMPLETE garble
                 // is salvaged immediately: the repaired (clean) text flows through
                 // the output filter + persist below. We deliberately do NOT force a
@@ -808,6 +1003,17 @@ fn drive_chat_burst(
                 // the later attempt failed. An INCOMPLETE garble is already
                 // `truncated` (length / transport) and handled by the block below.
             }
+
+            tracing::info!(
+                target: "stream_metrics",
+                model = %model_id,
+                attempt = idx,
+                ttft_ms,
+                total_ms = attempt_started.elapsed().as_millis() as u64,
+                outcome = attempt_outcome,
+                filtered = true,
+                "chat stream attempt"
+            );
 
             if empty_completion {
                 if idx + 1 == chain.len() {
@@ -1284,6 +1490,15 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 
 /// Per-model timeout for a single filter LLM call.
 const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Max wait for a chat stream to OPEN (connect + queue + response headers).
+/// A provider that accepts the socket but never sends headers must not hold
+/// the turn — timeout ⇒ attempt fails ⇒ chain advances.
+const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Hard per-attempt cap on one model's whole generation (spec §1.5's 120s).
+/// Byte-level idle liveness is bounded upstream in the llm client; this caps
+/// a stream that keeps trickling forever.
+const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Run the output-filter LLM over `original`, walking the (already
 /// depth-capped) fallback chain one model at a time.  After each successful
@@ -2885,31 +3100,58 @@ pub fn run_stream(
                 let mut last_gen_id: Option<String> = None;
                 let mut served_model: Option<String> = None;
                 let mut truncated = false;
+                // Built once; only the served model differs per candidate, so
+                // execute_stream_as borrows it (no per-candidate prompt clone).
+                let qa_req = eros_engine_llm::openrouter::ChatRequest {
+                    messages,
+                    temperature: p.temperature as f32,
+                    max_tokens: p.max_tokens,
+                    reasoning: p.reasoning.clone(),
+                    ..Default::default()
+                };
                 'candidates: for model_id in candidates {
                     last_usage = None;
                     last_gen_id = None;
                     served_model = None;
                     truncated = false;
-                    let req = eros_engine_llm::openrouter::ChatRequest {
-                        model: model_id.clone(),
-                        messages: messages.clone(),
-                        temperature: p.temperature as f32,
-                        max_tokens: p.max_tokens,
-                        reasoning: p.reasoning.clone(),
-                        ..Default::default()
-                    };
-                    let stream = match state.openrouter.execute_stream(req).await {
-                        Ok(s) => s,
-                        Err(e) => {
+                    let stream = match tokio::time::timeout(
+                        STREAM_OPEN_TIMEOUT,
+                        state.openrouter.execute_stream_as(&qa_req, &model_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
                             tracing::warn!(model = %model_id, error = %e, "product_qa: open stream failed");
+                            if acc.is_empty() { continue 'candidates; }
+                            truncated = true;
+                            break 'candidates;
+                        }
+                        Err(_) => {
+                            tracing::warn!(model = %model_id, "product_qa: open timeout");
                             if acc.is_empty() { continue 'candidates; }
                             truncated = true;
                             break 'candidates;
                         }
                     };
                     futures_util::pin_mut!(stream);
+                    let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
                     loop {
-                        match futures_util::StreamExt::next(&mut stream).await {
+                        let item = match tokio::time::timeout_at(
+                            deadline,
+                            futures_util::StreamExt::next(&mut stream),
+                        )
+                        .await
+                        {
+                            Ok(item) => item,
+                            Err(_) => {
+                                tracing::warn!(model = %model_id, "product_qa: total timeout");
+                                if acc.is_empty() { continue 'candidates; }
+                                truncated = true;
+                                break 'candidates;
+                            }
+                        };
+                        match item {
                             Some(Ok(chunk)) => {
                                 if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
                                 if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
@@ -2921,7 +3163,7 @@ pub fn run_stream(
                                         content: text,
                                     };
                                 }
-                                if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                                if matches!(chunk.finish_reason.as_deref(), Some("length") | Some("content_filter")) { truncated = true; }
                             }
                             Some(Err(e)) => {
                                 tracing::warn!(model = %model_id, error = %e, "product_qa: mid-stream error");
@@ -9311,6 +9553,144 @@ data: [DONE]\n\n";
         assert_eq!(produced[0].full_text, "hi there");
     }
 
+    /// Stream-hardening A1: a mid-generation `finish_reason:"content_filter"`
+    /// (Gemini/OpenAI safety cut) is an incomplete reply. It must ride the same
+    /// truncation → chain-advance path as "length" — never persist as a clean
+    /// success — restoring parity with the sync path's filter_output_invalidity
+    /// gate (production chat is 100% streaming).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn live_content_filter_finish_advances_chain_as_truncated(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Primary "cf/x" streams partial text then a content_filter cut;
+        // fallback "f/x" streams clean text.
+        let cut = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"部分回\"}}],",
+            "\"id\":\"gen-cf\",\"model\":\"cf/x\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"f/x\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "cf/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(cut, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "f/x"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JCONTENTFILTER00000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "cf/x".into(),
+            fallback_model: vec!["f/x".into()],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None,
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let dones: Vec<(bool, bool)> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Done {
+                    truncated,
+                    ghost_fallback,
+                    ..
+                } => Some((*truncated, *ghost_fallback)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 2, "one Done per attempt: {frames:?}");
+        assert_eq!(
+            dones[0],
+            (true, false),
+            "content_filter cut must be truncated (replace-me), not a clean success: {frames:?}"
+        );
+        assert_eq!(
+            dones[1],
+            (false, false),
+            "the clean fallback is a normal accepted reply: {frames:?}"
+        );
+        let produced = &outcome.lock().unwrap().produced;
+        assert_eq!(
+            produced.len(),
+            1,
+            "only the accepted fallback feeds post-process; got {produced:?}"
+        );
+        assert_eq!(
+            produced[0].full_text, "hi there",
+            "the safety-cut partial must never reach memory/insight/affinity"
+        );
+    }
+
     /// Codex P2 (PR #141, round 3): the FILTERED empty-completion ghost fallback
     /// must retain an (empty) produced row like the live/regex-strip paths —
     /// otherwise a ReplyTextImage turn's trailing image_request (gated on
@@ -9828,11 +10208,16 @@ data: [DONE]\n\n";
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // ── 1. Mock OpenRouter: returns "hello world" for model "mock/euryale" ──
+        // ── 1. Mock OpenRouter: returns "hello world" across TWO deltas ──
         let mock = MockServer::start().await;
-        // SSE body: one delta with "hello world", then a usage chunk, then [DONE].
+        // Two separate content deltas. `\bNOPE\b` is a complex pattern (word
+        // boundaries → Opaque in StreamScrubber), so the turn still buffers: a
+        // multi-chunk stream must collapse to exactly ONE Delta bubble. (A
+        // stream-safe pattern would emit per-chunk here — see
+        // `regex_span_pattern_streams_live_across_chunks`.)
         let chat_body = "\
-data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}],\
+data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}],\"id\":\"gen-t5\",\"model\":\"mock/euryale\"}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}],\
 \"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\
 \"id\":\"gen-t5\",\"model\":\"mock/euryale\"}\n\n\
 data: [DONE]\n\n";
@@ -9956,14 +10341,16 @@ data: [DONE]\n\n";
             !deltas.is_empty(),
             "regex-targeted turn must produce a Reply bubble (ghosting disabled); got {frames:?}",
         );
-        // Buffered mode emits exactly ONE Delta bubble (the whole reply at once),
-        // proving the turn buffered rather than streaming live per-chunk.
+        // `\bNOPE\b` is Opaque (word boundaries), so the turn buffers: the two
+        // upstream deltas must collapse to exactly ONE Delta bubble. A
+        // stream-safe pattern would have emitted two here — that divergence is
+        // exactly what this asserts.
         assert_eq!(
             deltas.len(),
             1,
-            "buffered mode must emit exactly one Delta bubble; got {deltas:?}",
+            "an Opaque-pattern turn must buffer to one Delta bubble; got {deltas:?}",
         );
-        // Content is the raw reply, unchanged (no strip yet — Task 6).
+        // Content is the raw reply, unchanged (pattern doesn't match).
         assert_eq!(
             deltas[0], "hello world",
             "unmatched regex must not alter the reply; got {:?}",
@@ -9990,6 +10377,187 @@ data: [DONE]\n\n";
             pre_filter.is_none(),
             "pre_filter_content must be NULL for a regex-only buffered turn (no LLM filter ran); \
              got {pre_filter:?}",
+        );
+    }
+
+    /// Batch C: a stream-safe SPAN pattern (the production `\[[^\]]*\]`) streams
+    /// LIVE — the client gets multiple Delta bubbles as pre-artifact text
+    /// arrives, the bracketed artifact is stripped mid-stream (no delta for it),
+    /// and the persisted row + regex audit are byte-identical to the old
+    /// buffered path. This is the whole point of Batch C: regex-targeted chat
+    /// turns get TTFT back instead of buffering the whole reply.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_span_pattern_streams_live_across_chunks(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Four separate content deltas; the third is the whole bracket artifact.
+        let chat_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"呀\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片：海边]\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"今天如何\"}}],",
+            "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":6,\"total_tokens\":8},",
+            "\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Production span pattern (unanchored bracket) → StreamScrubber Span.
+        // Single-quoted TOML literal: backslashes reach `regex` verbatim, so the
+        // Rust `\\` (one backslash) is exactly the regex escape wanted.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/euryale\"]\n\
+             pattern='\\[[^\\]]*\\]'\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("span pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JSPANSTREAM0000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "mock/euryale".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None, // regex-only turn
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let deltas: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // LIVE: more than one Delta bubble (a buffered turn would emit exactly
+        // one) — the pre-artifact text streamed per-chunk.
+        assert!(
+            deltas.len() > 1,
+            "a span-pattern turn must stream multiple Delta bubbles, not buffer; got {deltas:?}",
+        );
+        // The bracket artifact never reaches the client; the visible text is the
+        // cleaned reply.
+        assert_eq!(
+            deltas.concat(),
+            "你好呀今天如何",
+            "concatenated deltas must equal the artifact-stripped reply; got {deltas:?}",
+        );
+        assert!(
+            !deltas.iter().any(|d| d.contains('[')),
+            "no delta may carry the bracket artifact; got {deltas:?}",
+        );
+
+        // produced (extract/memory input) is the cleaned text.
+        {
+            let o = outcome.lock().unwrap();
+            assert_eq!(
+                o.produced.len(),
+                1,
+                "one produced message; got {:?}",
+                o.produced
+            );
+            assert_eq!(o.produced[0].full_text, "你好呀今天如何");
+            assert!(
+                o.filtered,
+                "outcome.filtered must be true when a rule fired"
+            );
+        }
+
+        // DB row: cleaned content, raw on pre_filter_content, regex audit.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            content, "你好呀今天如何",
+            "persisted content is the stripped text"
+        );
+        assert_eq!(
+            pre_filter.as_deref(),
+            Some("你好呀[你给对方发送了一张照片：海边]今天如何"),
+            "pre_filter_content is the raw original",
+        );
+        assert_eq!(filter_model.as_deref(), Some("<regex>"));
+        assert_eq!(
+            filter_triggers,
+            Some(serde_json::json!({ "regex": [0usize] }))
         );
     }
 
