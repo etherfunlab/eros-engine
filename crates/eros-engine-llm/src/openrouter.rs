@@ -11,6 +11,40 @@ use crate::model_config::ReasoningConfig;
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Max TCP+TLS establishment time for any OpenRouter call.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an idle pooled connection is kept for reuse.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Max gap between SSE *bytes* before a live stream is declared dead.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Gap-bound a fallible stream: an idle period longer than `idle` between
+/// items becomes an io TimedOut error item. Applied to the raw BYTES stream
+/// (before SSE parsing) deliberately: OpenRouter's `: OPENROUTER PROCESSING`
+/// comment keepalives count as bytes and reset the timer, so a reasoning
+/// model thinking for minutes stays alive while a dead peer trips it.
+fn idle_bounded<S, T, E>(
+    s: S,
+    idle: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<T, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use tokio_stream::StreamExt as _;
+    s.timeout(idle).map(move |r| match r {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "openrouter stream idle timeout: no bytes for {}s",
+                idle.as_secs()
+            ),
+        )),
+    })
+}
+
 /// OpenRouter app-attribution header names. Pinned to the current
 /// `https://openrouter.ai/docs/app-attribution` spec. If OpenRouter
 /// renames either header in the future, update the value here; today's
@@ -483,6 +517,17 @@ struct WireStreamChoice {
     finish_reason: Option<String>,
 }
 
+/// Top-level `error` object OpenRouter embeds in an HTTP-200 SSE data frame
+/// when a provider fails mid-stream (docs: "API Streaming — error handling").
+/// `code` is upstream-defined (int or string) — kept opaque.
+#[derive(Debug, Deserialize)]
+struct WireStreamError {
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireStreamFrame {
     #[serde(default)]
@@ -493,6 +538,8 @@ struct WireStreamFrame {
     usage: Option<UsageBlock>,
     #[serde(default)]
     choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    error: Option<WireStreamError>,
 }
 
 /// App-Attribution headers sent on every outbound OpenRouter call.
@@ -574,8 +621,14 @@ impl OpenRouterClient {
                 ),
             }
         }
+        // connect/pool bounds only — deliberately NO global `.timeout()` or
+        // client-level read timeout: both would also bound non-streaming calls
+        // (image generation legitimately spends its whole wall-time before the
+        // first body byte). Stream liveness is `idle_bounded`'s job.
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("reqwest client build never fails with empty config");
         Self {
@@ -1083,8 +1136,7 @@ impl OpenRouterClient {
             return Err(LlmError::Status(status, text));
         }
 
-        let stream = resp
-            .bytes_stream()
+        let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
             .eventsource()
             .filter_map(|ev| async move {
                 match ev {
@@ -1094,7 +1146,26 @@ impl OpenRouterClient {
                         }
                         match serde_json::from_str::<WireStreamFrame>(&e.data) {
                             Ok(frame) => {
+                                // A mid-stream provider failure arrives as a
+                                // normal-looking 200 SSE frame with a top-level
+                                // `error` (and/or finish_reason:"error"). It
+                                // must fail the attempt so the pipeline's
+                                // fallback chain runs — NOT parse as an
+                                // all-None chunk that lets a partial reply
+                                // persist as a clean success.
+                                if let Some(err) = frame.error {
+                                    return Some(Err(LlmError::Provider(format!(
+                                        "openrouter mid-stream error: code={:?}: {}",
+                                        err.code, err.message
+                                    ))));
+                                }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
+                                if choice.finish_reason.as_deref() == Some("error") {
+                                    return Some(Err(LlmError::Provider(
+                                        "openrouter stream terminated with finish_reason=error"
+                                            .into(),
+                                    )));
+                                }
                                 Some(Ok(DeltaChunk {
                                     content: choice.delta.content.filter(|s| !s.is_empty()),
                                     finish_reason: choice.finish_reason,
@@ -1985,6 +2056,137 @@ data: [DONE]\n\n";
         assert!(
             matches!(item, Err(LlmError::StreamParse(_))),
             "expected StreamParse error, got {item:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_times_out_on_stalled_stream() {
+        use futures_util::StreamExt;
+        // One item arrives, then the stream stalls forever: the watchdog must
+        // pass the item through, then yield a TimedOut error (paused tokio
+        // time auto-advances, so this runs in microseconds).
+        let inner = futures_util::stream::iter([Ok::<_, std::convert::Infallible>("chunk")])
+            .chain(futures_util::stream::pending());
+        let mut s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
+        let first = s.next().await.expect("first item");
+        assert_eq!(first.expect("passthrough"), "chunk");
+        let second = s.next().await.expect("watchdog fires");
+        let err = second.expect_err("stalled gap must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("idle timeout"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_passes_healthy_stream_untouched() {
+        use futures_util::StreamExt;
+        let inner =
+            futures_util::stream::iter(["a", "b", "c"].map(Ok::<_, std::convert::Infallible>));
+        let s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
+        let items: Vec<&str> = s
+            .map(|r| r.expect("no timeout on a live stream"))
+            .collect()
+            .await;
+        assert_eq!(items, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_mid_stream_error_frame() {
+        use futures_util::StreamExt;
+        // OpenRouter signals a mid-stream provider failure on an HTTP-200 SSE
+        // stream as a data frame with a top-level `error` object (plus a
+        // finish_reason:"error" choice). It must surface as Err, not parse as
+        // an all-None chunk that lets a partial reply persist as success.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"id\":\"gen-1\",\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}],\"error\":{\"code\":502,\"message\":\"provider disconnected\"}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("delta arrives");
+        let chunk = first.expect("first frame is a normal delta");
+        assert_eq!(chunk.content.as_deref(), Some("部分"));
+
+        let second = stream.next().await.expect("error frame arrives");
+        match second {
+            Err(LlmError::Provider(msg)) => {
+                assert!(
+                    msg.contains("provider disconnected"),
+                    "error message carries the upstream detail: {msg}"
+                );
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_surfaces_finish_reason_error_without_error_object() {
+        use futures_util::StreamExt;
+        // Some providers set finish_reason:"error" without the top-level error
+        // object; that terminal frame must also fail the attempt.
+        let server = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let item = stream.next().await.expect("terminal frame arrives");
+        assert!(
+            matches!(item, Err(LlmError::Provider(_))),
+            "finish_reason=error must surface as Provider error, got {item:?}"
         );
     }
 

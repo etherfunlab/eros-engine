@@ -30,5 +30,5 @@ async-stream       = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = "3"
