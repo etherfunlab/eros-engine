@@ -5,6 +5,7 @@ pub mod byte_bpe;
 pub mod error;
 pub mod model_config;
 pub mod openrouter;
+pub mod stream_scrub;
 pub mod voyage;
 
 pub use error::LlmError;
