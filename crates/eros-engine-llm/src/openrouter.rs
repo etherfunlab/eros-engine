@@ -2067,10 +2067,7 @@ data: [DONE]\n\n";
         // time auto-advances, so this runs in microseconds).
         let inner = futures_util::stream::iter([Ok::<_, std::convert::Infallible>("chunk")])
             .chain(futures_util::stream::pending());
-        let mut s = std::pin::pin!(idle_bounded(
-            inner,
-            std::time::Duration::from_millis(50)
-        ));
+        let mut s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
         let first = s.next().await.expect("first item");
         assert_eq!(first.expect("passthrough"), "chunk");
         let second = s.next().await.expect("watchdog fires");
@@ -2084,11 +2081,11 @@ data: [DONE]\n\n";
         use futures_util::StreamExt;
         let inner =
             futures_util::stream::iter(["a", "b", "c"].map(Ok::<_, std::convert::Infallible>));
-        let s = std::pin::pin!(idle_bounded(
-            inner,
-            std::time::Duration::from_millis(50)
-        ));
-        let items: Vec<&str> = s.map(|r| r.expect("no timeout on a live stream")).collect().await;
+        let s = std::pin::pin!(idle_bounded(inner, std::time::Duration::from_millis(50)));
+        let items: Vec<&str> = s
+            .map(|r| r.expect("no timeout on a live stream"))
+            .collect()
+            .await;
         assert_eq!(items, vec!["a", "b", "c"]);
     }
 
