@@ -530,6 +530,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.6",
  "regex",
+ "regex-syntax",
  "reqwest",
  "serde",
  "serde_json",

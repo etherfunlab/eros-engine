@@ -457,17 +457,18 @@ fn drive_chat_burst(
         }
 
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
-        // A turn buffers (no live deltas) if the LLM output_filter's turn-level
-        // predicates pass, OR any output_regex rule targets a model in this
-        // turn's resolved chain (so the artifact can be stripped before emit).
-        let regex_targets_chain = chain.iter().any(|m| {
-            state.output_regex.iter().any(|r| r.models.iter().any(|rm| rm == m))
-        });
+        // A turn buffers (no live deltas) ONLY when the LLM output_filter's
+        // turn-level predicates pass — an LLM rewrite is inherently un-streamable
+        // (the filtered text must be produced before any of it is safe to send).
+        // `output_regex` no longer forces buffering: the live burst streams
+        // through the rules incrementally with a bounded holdback
+        // (`StreamScrubber`), so a regex-only chain (the common production case)
+        // now gets true streaming TTFT instead of full-generation buffering.
         let llm_filter_arms = filter
             .as_ref()
             .map(|f| f.trigger.turn_level_pass(random_draw, &tag_refs))
             .unwrap_or(false);
-        let filtered_mode = llm_filter_arms || regex_targets_chain;
+        let filtered_mode = llm_filter_arms;
 
         // Build the assistant row metadata bag: always includes prompt_traits +
         // resolved memory_scope / affinity_scope (the POST-resolve values
@@ -500,7 +501,12 @@ fn drive_chat_burst(
         };
 
         if !filtered_mode {
-            // ===== LIVE MODE (preserved verbatim from the pre-filter burst) =====
+            // ===== LIVE MODE =====
+            // Streams deltas as they arrive, scrubbing output_regex artifacts
+            // incrementally via StreamScrubber (bounded holdback). `acc` keeps
+            // the RAW text; the wire carries the scrubbed text; the served
+            // attempt's persist re-runs the whole-text apply_output_regex so the
+            // DB row + regex audit are byte-identical to the old buffered path.
             let mut continues_from: Option<Ulid> = None;
             // Repaired text of the latest COMPLETE garbled attempt seen across the
             // whole chain. Used as the last-resort replacement when the chain
@@ -515,6 +521,13 @@ fn drive_chat_burst(
                 let mut last_gen_id: Option<String> = None;
                 let mut truncated = false;
                 let mut empty_completion = false;
+                // Scrubs output_regex artifacts out of the wire deltas as they
+                // stream; `acc` still accumulates the raw text for the persist
+                // apply below. Empty rule set ⇒ pure passthrough.
+                let mut scrubber = eros_engine_llm::stream_scrub::StreamScrubber::new(
+                    &state.output_regex,
+                    model_id,
+                );
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
@@ -560,18 +573,23 @@ fn drive_chat_burst(
                                 Ok(c) => {
                                     // `execute_stream` filters empty deltas to None
                                     // (openrouter.rs `.filter(|s| !s.is_empty())`),
-                                    // so a present `content` is always non-empty —
-                                    // ttft records the first *real* token, not a
-                                    // role/terminal empty delta.
+                                    // so a present `content` is always a real token.
                                     if let Some(content) = c.content {
-                                        ttft_ms.get_or_insert_with(|| {
-                                            attempt_started.elapsed().as_millis() as u64
-                                        });
                                         acc.push_str(&content);
-                                        yield ProtocolFrame::Delta {
-                                            message_id: ulid_string(msg_ulid),
-                                            content,
-                                        };
+                                        // Scrub artifacts before they hit the wire;
+                                        // ttft counts the first *client-visible*
+                                        // token (a leading artifact is held, so the
+                                        // first emit can lag the first raw token).
+                                        let emit = scrubber.push(&content);
+                                        if !emit.is_empty() {
+                                            ttft_ms.get_or_insert_with(|| {
+                                                attempt_started.elapsed().as_millis() as u64
+                                            });
+                                            yield ProtocolFrame::Delta {
+                                                message_id: ulid_string(msg_ulid),
+                                                content: emit,
+                                            };
+                                        }
                                     }
                                     if c.usage.is_some()         { last_usage = c.usage; }
                                     if c.generation_id.is_some() { last_gen_id = c.generation_id; }
@@ -615,6 +633,22 @@ fn drive_chat_burst(
                         truncated = true;
                         attempt_outcome = "open_timeout";
                     }
+                }
+
+                // Flush any text the scrubber held at end-of-stream (a completed
+                // prefix under the head window, or a trailing unterminated span).
+                // Empty scrubber ⇒ "". On a truncated attempt this partial is
+                // sent then superseded, same as the raw deltas already were.
+                let scrub_tail = scrubber.finish();
+                if !scrub_tail.is_empty() {
+                    // For a short reply fully held until now (head transform
+                    // holds ≤64 chars; Opaque buffers all), this tail is the
+                    // FIRST client-visible content — record ttft here too.
+                    ttft_ms.get_or_insert_with(|| attempt_started.elapsed().as_millis() as u64);
+                    yield ProtocolFrame::Delta {
+                        message_id: ulid_string(msg_ulid),
+                        content: scrub_tail,
+                    };
                 }
 
                 // Byte-BPE garble guard (issue #84). A high Ġ/Ċ density means the
@@ -667,19 +701,56 @@ fn drive_chat_burst(
                     truncated = true;
                 }
 
+                // Layer 0: apply output_regex to the RAW acc, but ONLY for the
+                // attempt actually served (`!truncated`). A truncated/superseded
+                // partial must not match a rule and mislabel the turn (mirrors the
+                // filtered burst's same guard). The wire already emitted this same
+                // scrubbed text incrementally; here it governs the persisted row +
+                // regex audit + the strip-to-empty ghost, byte-identical to the
+                // old buffered path.
+                let (persist_content, filter_audit, regex_ghost) = if truncated {
+                    (acc.clone(), None, false)
+                } else {
+                    let strip = eros_engine_llm::model_config::apply_output_regex(
+                        &state.output_regex,
+                        model_id,
+                        &acc,
+                    );
+                    let audit = if strip.matched_rules.is_empty() {
+                        None
+                    } else {
+                        outcome.lock().unwrap().filtered = true;
+                        Some(eros_engine_store::chat::FilterAudit {
+                            pre_filter_content: acc.clone(),
+                            filter_model: "<regex>".to_string(),
+                            filter_triggers: serde_json::json!({ "regex": strip.matched_rules }),
+                            f_client_msg_id: format!("f_{}", Ulid::new()),
+                            f_generation_id: None,
+                        })
+                    };
+                    // Artifact-only reply: the strip emptied a non-empty completion.
+                    // Terminal ghost (does NOT advance the chain), matching the
+                    // filtered burst's regex-strip-to-empty semantics.
+                    let ghost = !strip.matched_rules.is_empty() && strip.cleaned.is_empty();
+                    (strip.cleaned, audit, ghost)
+                };
+                let effective_ghost = is_ghost_fallback || regex_ghost;
+
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
-                    content: acc.clone(),
+                    content: persist_content.clone(),
                     assistant_action_type: persist_action.into(),
                     continues_from_message_id: continues_from.map(Into::into),
                     truncated,
                     model: Some(model_id.clone()),
                     usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                     generation_id: last_gen_id.clone(),
-                    filter_audit: None,
+                    filter_audit,
                     metadata: if is_ghost_fallback {
                         ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                    } else if regex_ghost {
+                        ghost_fallback_metadata(build_metadata(None), "regex_strip")
                     } else {
                         build_metadata(None)
                     },
@@ -692,7 +763,7 @@ fn drive_chat_burst(
                 }
                 outcome.lock().unwrap().produced.push(crate::pipeline::post_process::ProducedMessage {
                     message_id: msg_uuid,
-                    full_text: acc.clone(),
+                    full_text: persist_content.clone(),
                     action: plan_action,
                 });
 
@@ -706,7 +777,7 @@ fn drive_chat_burst(
                     truncated,
                     usage: wire_usage,
                     generation_id: last_gen_id,
-                    ghost_fallback: is_ghost_fallback,
+                    ghost_fallback: effective_ghost,
                 };
 
                 if is_ghost_fallback {
@@ -738,6 +809,12 @@ fn drive_chat_burst(
                     // state alongside the reply the user actually saw.
                     o.produced.retain(|m| m.message_id == msg_uuid);
                     o.retries_chat = idx as u32;
+                    // An artifact-only reply (regex stripped to empty) is a served
+                    // ghost: keep affinity's ghost accounting consistent with the
+                    // Done frame's ghost_fallback and the filtered burst.
+                    if regex_ghost {
+                        o.ghost_fallback = true;
+                    }
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -10135,11 +10212,16 @@ data: [DONE]\n\n";
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // ── 1. Mock OpenRouter: returns "hello world" for model "mock/euryale" ──
+        // ── 1. Mock OpenRouter: returns "hello world" across TWO deltas ──
         let mock = MockServer::start().await;
-        // SSE body: one delta with "hello world", then a usage chunk, then [DONE].
+        // Two separate content deltas. `\bNOPE\b` is a complex pattern (word
+        // boundaries → Opaque in StreamScrubber), so the turn still buffers: a
+        // multi-chunk stream must collapse to exactly ONE Delta bubble. (A
+        // stream-safe pattern would emit per-chunk here — see
+        // `regex_span_pattern_streams_live_across_chunks`.)
         let chat_body = "\
-data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}],\
+data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}],\"id\":\"gen-t5\",\"model\":\"mock/euryale\"}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}],\
 \"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\
 \"id\":\"gen-t5\",\"model\":\"mock/euryale\"}\n\n\
 data: [DONE]\n\n";
@@ -10263,14 +10345,16 @@ data: [DONE]\n\n";
             !deltas.is_empty(),
             "regex-targeted turn must produce a Reply bubble (ghosting disabled); got {frames:?}",
         );
-        // Buffered mode emits exactly ONE Delta bubble (the whole reply at once),
-        // proving the turn buffered rather than streaming live per-chunk.
+        // `\bNOPE\b` is Opaque (word boundaries), so the turn buffers: the two
+        // upstream deltas must collapse to exactly ONE Delta bubble. A
+        // stream-safe pattern would have emitted two here — that divergence is
+        // exactly what this asserts.
         assert_eq!(
             deltas.len(),
             1,
-            "buffered mode must emit exactly one Delta bubble; got {deltas:?}",
+            "an Opaque-pattern turn must buffer to one Delta bubble; got {deltas:?}",
         );
-        // Content is the raw reply, unchanged (no strip yet — Task 6).
+        // Content is the raw reply, unchanged (pattern doesn't match).
         assert_eq!(
             deltas[0], "hello world",
             "unmatched regex must not alter the reply; got {:?}",
@@ -10297,6 +10381,187 @@ data: [DONE]\n\n";
             pre_filter.is_none(),
             "pre_filter_content must be NULL for a regex-only buffered turn (no LLM filter ran); \
              got {pre_filter:?}",
+        );
+    }
+
+    /// Batch C: a stream-safe SPAN pattern (the production `\[[^\]]*\]`) streams
+    /// LIVE — the client gets multiple Delta bubbles as pre-artifact text
+    /// arrives, the bracketed artifact is stripped mid-stream (no delta for it),
+    /// and the persisted row + regex audit are byte-identical to the old
+    /// buffered path. This is the whole point of Batch C: regex-targeted chat
+    /// turns get TTFT back instead of buffering the whole reply.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn regex_span_pattern_streams_live_across_chunks(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Four separate content deltas; the third is the whole bracket artifact.
+        let chat_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"呀\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片：海边]\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"今天如何\"}}],",
+            "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":6,\"total_tokens\":8},",
+            "\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = uuid::Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Production span pattern (unanchored bracket) → StreamScrubber Span.
+        // Single-quoted TOML literal: backslashes reach `regex` verbatim, so the
+        // Rust `\\` (one backslash) is exactly the regex escape wanted.
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
+             [[tasks.chat_companion.output_regex]]\n\
+             models=[\"mock/euryale\"]\n\
+             pattern='\\[[^\\]]*\\]'\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("span pattern compiles"),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JSPANSTREAM0000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let req = eros_engine_llm::openrouter::ChatRequest {
+            model: "mock/euryale".into(),
+            fallback_model: vec![],
+            messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
+        let burst = drive_chat_burst(
+            state.clone(),
+            session_id,
+            user_message_id,
+            FrameActionType::Reply,
+            "reply",
+            ActionType::ReplyText,
+            req,
+            None,
+            None, // regex-only turn
+            vec![],
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+            outcome.clone(),
+        );
+        let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
+
+        let deltas: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // LIVE: more than one Delta bubble (a buffered turn would emit exactly
+        // one) — the pre-artifact text streamed per-chunk.
+        assert!(
+            deltas.len() > 1,
+            "a span-pattern turn must stream multiple Delta bubbles, not buffer; got {deltas:?}",
+        );
+        // The bracket artifact never reaches the client; the visible text is the
+        // cleaned reply.
+        assert_eq!(
+            deltas.concat(),
+            "你好呀今天如何",
+            "concatenated deltas must equal the artifact-stripped reply; got {deltas:?}",
+        );
+        assert!(
+            !deltas.iter().any(|d| d.contains('[')),
+            "no delta may carry the bracket artifact; got {deltas:?}",
+        );
+
+        // produced (extract/memory input) is the cleaned text.
+        {
+            let o = outcome.lock().unwrap();
+            assert_eq!(
+                o.produced.len(),
+                1,
+                "one produced message; got {:?}",
+                o.produced
+            );
+            assert_eq!(o.produced[0].full_text, "你好呀今天如何");
+            assert!(
+                o.filtered,
+                "outcome.filtered must be true when a rule fired"
+            );
+        }
+
+        // DB row: cleaned content, raw on pre_filter_content, regex audit.
+        let (content, pre_filter, filter_model, filter_triggers): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, pre_filter_content, filter_model, filter_triggers \
+             FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            content, "你好呀今天如何",
+            "persisted content is the stripped text"
+        );
+        assert_eq!(
+            pre_filter.as_deref(),
+            Some("你好呀[你给对方发送了一张照片：海边]今天如何"),
+            "pre_filter_content is the raw original",
+        );
+        assert_eq!(filter_model.as_deref(), Some("<regex>"));
+        assert_eq!(
+            filter_triggers,
+            Some(serde_json::json!({ "regex": [0usize] }))
         );
     }
 
