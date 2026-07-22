@@ -410,17 +410,24 @@ cleared `fallback_model`). The three burst loops switch to
 
 ### 6.2 D2: provider routing `sort` (opt-in)
 
-- `ProviderPrefs` gains `#[serde(skip_serializing_if = "Option::is_none")] sort: Option<&'a str>`.
-- Plumbed like `ignore_providers`: a boot-time
-  `OpenRouterClient::with_provider_sort(Option<String>)` consuming builder,
-  sourced from the same engine config that supplies the exclusion list;
-  absent ⇒ wire body byte-identical to today.
-- Accepted values passed through verbatim (`"latency"` / `"throughput"` /
-  `"price"`); OpenRouter validates. Documented tradeoff: any explicit sort
-  disables OpenRouter's default price load-balancing.
-- Field name/shape verified against the live provider-routing docs at
-  implementation time; if the API differs, adjust to the documented schema
-  rather than this sketch.
+Verified against the live provider-routing docs: `provider.sort` is a top-level
+field on the `provider` object accepting `"price"` / `"throughput"` /
+`"latency"`. Implemented as:
+
+- `ProviderPrefs` gains `#[serde(skip_serializing_if = "Option::is_none")] sort:
+  Option<&'a str>`, and `ignore` gains `skip_serializing_if =
+  "<[String]>::is_empty"` so a sort-only prefs object omits `ignore`. The
+  ignore-only wire body stays byte-identical (ignore is present iff non-empty,
+  as before).
+- Plumbed like `ignore_providers`: `[defaults].provider_sort: Option<String>`
+  in the config, threaded through a boot-time
+  `OpenRouterClient::with_provider_sort(Option<String>)` consuming builder (an
+  empty string is treated as unset). `provider_prefs()` returns `Some` when
+  either the exclusion list is non-empty or a sort is set; absent both ⇒
+  `provider` key omitted, wire body byte-identical to today.
+- Value passed through verbatim; OpenRouter validates. Documented tradeoff (in
+  code and `examples/model_config.toml`): any explicit sort disables
+  OpenRouter's default price-based load balancing.
 
 ## 7. Testing
 
