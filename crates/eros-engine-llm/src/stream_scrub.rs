@@ -7,14 +7,20 @@
 //! targeted by the bracket-strip rule, so *every* chat turn buffered and TTFT
 //! became full-generation time.
 //!
-//! This module streams through those rules with a bounded holdback. Each rule
-//! becomes a small streaming [`Transform`]; the transforms are chained in
-//! declaration order, so the composition is exactly the sequential
-//! `replace_all`-per-rule that `apply_output_regex` performs — respecting rule
-//! order (e.g. a leading `[artifact]嗯…` has the bracket stripped first, then
-//! the `^嗯` head rule sees the exposed `嗢…`). The load-bearing guarantee is
-//! that concatenating everything a scrubber emits equals `apply_output_regex`
-//! over the same full text; see the property test in this module.
+//! This module streams through those rules with a hold-until-decidable
+//! discipline. Each rule becomes a small streaming [`Transform`]; the
+//! transforms are chained in declaration order, so the composition is exactly
+//! the sequential `replace_all`-per-rule that `apply_output_regex` performs —
+//! respecting rule order (e.g. a leading `[artifact]嗯…` has the bracket
+//! stripped first, then the `^嗯` head rule sees the exposed `嗢…`).
+//!
+//! The load-bearing guarantee is twofold: (1) concatenating everything a
+//! scrubber emits equals `apply_output_regex` over the same full text (the
+//! property test in this module), and (2) the wire NEVER shows text the
+//! whole-text apply would strip — text is held while a match is still viable
+//! and released only once the match is decided (applied, provably dead, or
+//! end-of-stream). Holds are bounded by the reply itself (max_tokens-capped);
+//! there is no fixed cap that could flush a still-viable match to the client.
 //!
 //! Rules whose shape isn't a recognized head-anchored or bracket-span pattern
 //! degrade to full buffering (correct for any rule, just no TTFT win), so a
@@ -23,15 +29,6 @@
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::model_config::CompiledRegexRule;
-
-/// First-N chars held while a `^`-anchored (head) rule might still match. A
-/// head match longer than this streams before the rule can fire — the persist
-/// path re-runs the whole-text apply, so only the wire briefly shows it
-/// (fail-open, same philosophy as [`SPAN_HOLDBACK_CAP`]).
-const HEAD_HOLDBACK: usize = 64;
-/// Max chars held across an unterminated span open delimiter before flushing it
-/// verbatim (a lone `[` in prose, never closed). Bounds the holdback window.
-const SPAN_HOLDBACK_CAP: usize = 256;
 
 /// The streaming strategy inferred for one compiled rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,14 +71,43 @@ fn class_is_not_char(hir: &Hir, close: char) -> bool {
     }
 }
 
+/// Max match length (bytes) after which a `^`-anchored rule's matchability is
+/// fully decided, computed by stripping TRAILING nullable elements (e.g. a
+/// trailing `\s*`) from the top-level concat and taking the remainder's
+/// `maximum_len`. Rationale: the stripped tail matches empty, so a match
+/// exists iff the bounded "core" matches — and an anchored core match lies
+/// entirely within the first `bound` bytes. `None` = matchability can stay
+/// open-ended (e.g. an inner unbounded class); the transform then holds until
+/// a match completes or end-of-stream.
+fn head_decision_bound(hir: &Hir) -> Option<usize> {
+    if let HirKind::Concat(parts) = hir.kind() {
+        let mut end = parts.len();
+        while end > 0 && parts[end - 1].properties().minimum_len() == Some(0) {
+            end -= 1;
+        }
+        Hir::concat(parts[..end].to_vec())
+            .properties()
+            .maximum_len()
+    } else {
+        hir.properties().maximum_len()
+    }
+}
+
 /// Classify a rule's regex pattern into a streaming strategy. Uses the parsed
-/// HIR so the decision is structural, not string-guessing.
+/// HIR so the decision is structural, not string-guessing. Head additionally
+/// reports the decision bound (see [`head_decision_bound`]).
 pub fn classify(pattern: &str) -> RuleShape {
     let Ok(hir) = regex_syntax::parse(pattern) else {
         return RuleShape::Opaque;
     };
-    // A `^` (non-multiline) anchors every match to the start of the haystack.
-    if hir.properties().look_set_prefix().contains(Look::Start) {
+    // Head: every match is anchored to the start of the haystack, and the
+    // pattern contains NO other look-around (`$`/`\z` would make matches
+    // depend on where the haystack ENDS — undecidable mid-stream; `\b` at the
+    // tail flips when the next char arrives). `look_set()` == {Start} exactly.
+    let looks = hir.properties().look_set();
+    if looks == regex_syntax::hir::LookSet::singleton(Look::Start)
+        && hir.properties().look_set_prefix().contains(Look::Start)
+    {
         return RuleShape::Head;
     }
     // A span rule must be EXACTLY `open [^close]* close`: Concat of a literal
@@ -118,12 +144,28 @@ trait Transform: Send {
     fn finish(&mut self) -> String;
 }
 
-/// `^`-anchored rule: hold the first [`HEAD_HOLDBACK`] chars, apply once (a
-/// start-anchored rule matches at most the leading prefix), then pass the rest
-/// through untouched.
+/// `^`-anchored rule (whole `look_set` is exactly {Start}): hold input until
+/// the leading match is DECIDED, then apply once and pass everything after
+/// through untouched. A decision is reached when:
+///
+/// - a match exists and ends strictly BEFORE the buffer end (greedy/lazy
+///   extension already stopped at a real char, alternation preference is
+///   structural, and with no `$`/`\b` in the pattern no later input can alter
+///   the leftmost-first anchored match) → apply + emit; or
+/// - no match exists and the buffer exceeds [`head_decision_bound`] (an
+///   anchored core match would have to lie entirely within that many bytes)
+///   → provably dead, emit verbatim; or
+/// - end-of-stream → apply to whatever is held.
+///
+/// A match that reaches exactly the buffer end stays held (it may still grow —
+/// e.g. a trailing `\s*` mid-run). Never emits a prefix of a still-viable
+/// match, so the wire can never show text the whole-text apply would strip.
 struct HeadTransform {
     regex: regex::Regex,
     replacement: String,
+    /// Byte bound past which no-match is final; `None` = only a completed
+    /// match or end-of-stream decides.
+    decision_bound: Option<usize>,
     head: String,
     done: bool,
 }
@@ -134,13 +176,24 @@ impl Transform for HeadTransform {
             return input.to_string();
         }
         self.head.push_str(input);
-        if self.head.chars().count() < HEAD_HOLDBACK {
-            return String::new();
+        match self.regex.find(&self.head) {
+            Some(m) if m.end() < self.head.len() => {
+                self.done = true;
+                self.regex
+                    .replace_all(&std::mem::take(&mut self.head), self.replacement.as_str())
+                    .into_owned()
+            }
+            Some(_) => String::new(), // match may still grow — keep holding
+            None => {
+                if self.decision_bound.is_some_and(|b| self.head.len() > b) {
+                    // Anchored core can no longer match: dead, stream verbatim.
+                    self.done = true;
+                    std::mem::take(&mut self.head)
+                } else {
+                    String::new()
+                }
+            }
         }
-        self.done = true;
-        self.regex
-            .replace_all(&std::mem::take(&mut self.head), self.replacement.as_str())
-            .into_owned()
     }
 
     fn finish(&mut self) -> String {
@@ -154,10 +207,14 @@ impl Transform for HeadTransform {
     }
 }
 
-/// `open [^close]* close` rule: pass through until an `open`, then hold until the
-/// matching `close` (emit the replacement for the whole span) or until
-/// [`SPAN_HOLDBACK_CAP`] chars accumulate with no close (flush the held text
-/// verbatim — a lone unterminated `open`).
+/// `open [^close]* close` rule: pass through until an `open`, then hold until
+/// the matching `close` (emit the replacement for the whole span) or
+/// end-of-stream (flush verbatim — the regex requires a close, so an
+/// unterminated open can never match). There is deliberately NO holdback cap:
+/// a cap would flush the prefix of a still-viable long span to the client that
+/// the whole-text apply strips — a wire leak. Held memory is bounded by the
+/// reply itself (max_tokens-capped); the latency cost hits only the
+/// pathological lone-`open` reply, whose tail is delayed to end-of-stream.
 struct SpanTransform {
     /// The full rule regex, run on the completed span so any replacement
     /// (including `$0`/capture expansion) matches apply_output_regex exactly.
@@ -185,13 +242,6 @@ impl SpanTransform {
                     self.in_span = false;
                 } else {
                     self.held.push(ch);
-                    if self.held.chars().count() > SPAN_HOLDBACK_CAP {
-                        // Unterminated: fail open — flush the held text verbatim
-                        // and resume scanning (a later `open` can start a span).
-                        out.push_str(&self.held);
-                        self.held.clear();
-                        self.in_span = false;
-                    }
                 }
             } else if ch == self.open {
                 self.in_span = true;
@@ -259,6 +309,10 @@ impl StreamScrubber {
                 RuleShape::Head => Box::new(HeadTransform {
                     regex: rule.regex.clone(),
                     replacement: rule.replacement.clone(),
+                    decision_bound: regex_syntax::parse(rule.regex.as_str())
+                        .ok()
+                        .as_ref()
+                        .and_then(head_decision_bound),
                     head: String::new(),
                     done: false,
                 }),
@@ -441,16 +495,127 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_bracket_flushes_verbatim() {
+    fn unterminated_bracket_flushes_verbatim_at_finish() {
         let rules = production_rules();
-        // A lone `[` with a very long tail and no `]` must fail open, not hang.
-        let text = format!("start[{}", "x".repeat(SPAN_HOLDBACK_CAP + 50));
+        // A lone `[` with a very long tail and no `]`: held to end-of-stream
+        // (it could still close), then flushed verbatim — never a mis-strip.
+        let text = format!("start[{}", "x".repeat(400));
         let expected = apply_output_regex(&rules, "m", &text).cleaned;
         let mut s = StreamScrubber::new(&rules, "m");
         let mut got = s.push(&text);
         got.push_str(&s.finish());
         assert_eq!(got, expected);
         assert!(got.contains('['), "unterminated open flushes verbatim");
+    }
+
+    #[test]
+    fn long_span_is_stripped_never_leaked() {
+        // Codex series-review P1: a VALID span longer than any fixed cap must
+        // be stripped on the wire exactly like the whole-text apply — a cap
+        // that flushed its prefix leaked strippable content to the client.
+        let rules = production_rules();
+        let text = format!("前文[{}]后文", "藏".repeat(300));
+        let expected = apply_output_regex(&rules, "m", &text).cleaned;
+        assert_eq!(expected, "前文后文", "sanity: whole-text apply strips it");
+        // Feed char-by-char — worst-case chunking.
+        let mut s = StreamScrubber::new(&rules, "m");
+        let mut got = String::new();
+        for ch in text.chars() {
+            got.push_str(&s.push(&ch.to_string()));
+            assert!(
+                !got.contains('藏'),
+                "span interior must never reach the wire"
+            );
+        }
+        got.push_str(&s.finish());
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn end_anchored_head_pattern_is_opaque() {
+        // Codex series-review P1: `^...$` matches depend on where the haystack
+        // ENDS — undecidable mid-stream. Must classify Opaque (full buffering),
+        // not Head (the old 64-char finalize mis-stripped a 64-char prefix that
+        // happened to look like a whole-reply artifact).
+        assert_eq!(classify(r"^\s*\[[^\]]*\]\s*$"), RuleShape::Opaque);
+        assert_eq!(classify(r"^foo$"), RuleShape::Opaque);
+        assert_eq!(classify(r"^foo\b"), RuleShape::Opaque);
+        // And the equivalence holds via the Opaque path on a long reply whose
+        // 64-char prefix WOULD have mis-matched under the old finalize.
+        let rules = compile(&[r"^\s*\[[^\]]*\]\s*$"]);
+        let text = format!("[{}]还有正文在后面", "x".repeat(80));
+        let expected = apply_output_regex(&rules, "m", &text).cleaned;
+        assert_eq!(expected, text, "sanity: whole-text apply does NOT match");
+        let mut s = StreamScrubber::new(&rules, "m");
+        let mut got = s.push(&text);
+        got.push_str(&s.finish());
+        assert_eq!(got, expected, "no mid-stream mis-strip");
+    }
+
+    #[test]
+    fn head_long_match_strips_exactly() {
+        // A head match extending far past the old 64-char holdback must still
+        // strip exactly (the old finalize left the excess whitespace on the
+        // wire). Also covers the >64-char paren action marker.
+        let rules = production_rules();
+        let cases = [
+            format!("嗯...{}正文继续", " ".repeat(80)),
+            format!("（{}）好了", "很长的动作描写".repeat(15)),
+        ];
+        for text in &cases {
+            let expected = apply_output_regex(&rules, "m", text).cleaned;
+            let chars: Vec<char> = text.chars().collect();
+            for split in [0, 1, 5, 40, 70, chars.len()] {
+                let split = split.min(chars.len());
+                let mut s = StreamScrubber::new(&rules, "m");
+                let a: String = chars[..split].iter().collect();
+                let b: String = chars[split..].iter().collect();
+                let mut got = s.push(&a);
+                got.push_str(&s.push(&b));
+                got.push_str(&s.finish());
+                assert_eq!(&got, &expected, "text={text:?} split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn head_dead_prefix_streams_promptly() {
+        // "嗯嗯..." has a viable first char but the pattern dies at the second
+        // 嗯 (needs dots). The decision bound must release it during streaming,
+        // not hold the whole reply to end-of-stream.
+        let rules = compile(&[r"^嗯(?:\.{3,6}|…{1,2})\s*"]);
+        let mut s = StreamScrubber::new(&rules, "m");
+        let mut streamed = String::new();
+        // 40 chars, pushed in 4 chunks — decision bound for the stripped core
+        // (嗯 + 6 ascii dots ≈ 9 bytes) is crossed within the first chunk.
+        for chunk in ["嗯嗯今天天气不错吧", "我们出去走走", "怎么样呢", "好不好呀"]
+        {
+            streamed.push_str(&s.push(chunk));
+        }
+        assert!(
+            !streamed.is_empty(),
+            "dead head prefix must stream before end-of-stream"
+        );
+        streamed.push_str(&s.finish());
+        assert_eq!(streamed, "嗯嗯今天天气不错吧我们出去走走怎么样呢好不好呀");
+    }
+
+    #[test]
+    fn head_bounded_pattern_decides_past_bound() {
+        // `^a{100}` (bounded, no trailing nullable): no match at 64 chars must
+        // NOT finalize (the old code did, then bypassed the strip). With 100
+        // a's + tail, the match completes and strips exactly.
+        let rules = compile(&[r"^a{100}"]);
+        let text = format!("{}tail", "a".repeat(100));
+        let expected = apply_output_regex(&rules, "m", &text).cleaned;
+        assert_eq!(expected, "tail");
+        let mut s = StreamScrubber::new(&rules, "m");
+        let mut got = String::new();
+        for ch in text.chars() {
+            got.push_str(&s.push(&ch.to_string()));
+        }
+        got.push_str(&s.finish());
+        assert_eq!(got, expected);
     }
 
     #[test]
