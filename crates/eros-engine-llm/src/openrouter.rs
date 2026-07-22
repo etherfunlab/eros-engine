@@ -271,9 +271,14 @@ fn scrub_error_body(raw: &str) -> String {
         .code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "?".into());
+    // Assemble the raw parts, then run the WHOLE string through body_preview
+    // once. provider_name / reasons are provider-controlled and could carry
+    // newlines or be arbitrarily long, so the single final flatten+cap is what
+    // upholds the "bounded, single-line" guarantee for every field — not just
+    // the message.
     let mut out = format!(
         "code={code}: {}",
-        body_preview(env.error.message.as_deref().unwrap_or(""))
+        env.error.message.as_deref().unwrap_or("")
     );
     // Provider identity + moderation reasons are safe to surface; flagged_input
     // (the user's prompt excerpt) is never read.
@@ -288,7 +293,7 @@ fn scrub_error_body(raw: &str) -> String {
             }
         }
     }
-    out
+    body_preview(&out)
 }
 
 /// A 200 body that failed to decode as a chat/vision completion: if it is in
@@ -1864,6 +1869,28 @@ mod tests {
         assert!(
             out.contains("moderation_reasons=sexual"),
             "keeps reasons: {out}"
+        );
+    }
+
+    #[test]
+    fn scrub_error_body_bounds_and_flattens_hostile_metadata() {
+        // provider_name/reasons are provider-controlled: a newline-laden, very
+        // long value must not defeat the single-line, bounded guarantee.
+        let evil = format!("{}\n{}", "A".repeat(300), "B".repeat(300));
+        let raw = serde_json::json!({
+            "error": {
+                "code": 500,
+                "message": "boom",
+                "metadata": { "provider_name": evil, "reasons": ["x\ny"] }
+            }
+        })
+        .to_string();
+        let out = scrub_error_body(&raw);
+        assert!(!out.contains('\n'), "must be single-line: {out:?}");
+        assert!(
+            out.chars().count() <= ERROR_PREVIEW_MAX + 1,
+            "must be bounded, got {} chars",
+            out.chars().count()
         );
     }
 
