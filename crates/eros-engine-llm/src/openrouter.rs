@@ -1230,6 +1230,7 @@ impl OpenRouterClient {
             response_format: None,
         };
 
+        let started = std::time::Instant::now();
         let resp = self
             .http
             .post(&self.base_url)
@@ -1244,6 +1245,34 @@ impl OpenRouterClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(LlmError::Status(status, scrub_error_body(&text)));
         }
+
+        // Observability: connect+headers latency and the negotiated HTTP
+        // version (should read HTTP/2.0 post-Batch-A3). Prompt content is never
+        // logged — only the model id and timing.
+        tracing::debug!(
+            target: "openrouter_stream",
+            model = %req.model,
+            headers_ms = started.elapsed().as_millis() as u64,
+            http_version = ?resp.version(),
+            "stream opened"
+        );
+
+        // Capture the authoritative generation id from the X-Generation-Id
+        // header the moment headers arrive, so a stream that dies before its
+        // first id-bearing body chunk still yields an audit handle. Prepended
+        // as a synthetic first chunk; the pipeline's "latest non-None wins"
+        // accumulation adopts it, and a later body `id` (identical) overwrites.
+        let header_gen_id = resp
+            .headers()
+            .get("x-generation-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let head = futures_util::stream::iter(header_gen_id.map(|id| {
+            Ok(DeltaChunk {
+                generation_id: Some(id),
+                ..Default::default()
+            })
+        }));
 
         let stream = idle_bounded(resp.bytes_stream(), STREAM_IDLE_TIMEOUT)
             .eventsource()
@@ -1292,7 +1321,7 @@ impl OpenRouterClient {
                 }
             });
 
-        Ok(DeltaStream(stream.boxed()))
+        Ok(DeltaStream(head.chain(stream).boxed()))
     }
 }
 
@@ -2466,6 +2495,79 @@ data: [DONE]\n\n";
             matches!(item, Err(LlmError::Provider(_))),
             "finish_reason=error must surface as Provider error, got {item:?}"
         );
+    }
+
+    // ─── B1: X-Generation-Id header capture ─────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_stream_prepends_generation_id_from_header() {
+        use futures_util::StreamExt;
+        // Header carries the id; the body frames carry none. The synthetic first
+        // chunk must surface the header id so audit has a handle even if the
+        // stream dies before any body id.
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-generation-id", "gen-hdr-1")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let first = stream.next().await.expect("synthetic first chunk").expect("ok");
+        assert_eq!(first.generation_id.as_deref(), Some("gen-hdr-1"));
+        assert!(first.content.is_none(), "synthetic chunk carries no content");
+    }
+
+    #[tokio::test]
+    async fn execute_stream_no_header_no_synthetic_chunk() {
+        use futures_util::StreamExt;
+        // Without the header, the first chunk is the real body delta (no
+        // spurious empty synthetic chunk).
+        let server = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let mut stream = client
+            .execute_stream(ChatRequest {
+                model: "x-ai/grok-4-fast".into(),
+                messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let first = stream.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.content.as_deref(), Some("hi"), "first chunk is the real delta");
     }
 
     #[test]
