@@ -284,9 +284,13 @@ impl<'a> StoryRepo<'a> {
 
     /// Cross-session chat evidence for the pair, `window_days` back, capped at
     /// `cap_turns` most-recent complete user→assistant pairs, chronological.
-    /// Same role/channel/truncation filters and pairing walk as
-    /// `ChatRepo::recent_turn_pairs`, but scoped to (owner, instance) across
-    /// sessions instead of one session.
+    /// Evidence is gathered across all of the pair's sessions, but pairing
+    /// itself is session-scoped: a user turn only pairs with an assistant
+    /// reply in the SAME `session_id`, so two overlapping sessions with the
+    /// same persona can never produce a fabricated cross-session pair. Same
+    /// role/channel/truncation filters and single-session pairing semantics
+    /// (consecutive users collapse to the latest, lone assistants drop) as
+    /// `ChatRepo::recent_turn_pairs`.
     pub async fn chat_evidence(
         &self,
         owner_uid: Uuid,
@@ -295,8 +299,8 @@ impl<'a> StoryRepo<'a> {
         cap_turns: u8,
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
         let fetch_n: i64 = (cap_turns as i64) * 2 + 2;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT cm.role, cm.content \
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT cm.session_id, cm.role, cm.content \
              FROM engine.chat_messages cm \
              JOIN engine.chat_sessions cs ON cs.id = cm.session_id \
              WHERE cs.user_id = $1 AND cs.instance_id = $2 \
@@ -315,16 +319,17 @@ impl<'a> StoryRepo<'a> {
         .await?;
         let mut chrono_rows = rows;
         chrono_rows.reverse();
+        use std::collections::HashMap;
+        let mut pending: HashMap<Uuid, String> = HashMap::new(); // session_id -> latest unpaired user content
         let mut pairs: Vec<(String, String)> = Vec::new();
-        let mut i = 0;
-        while i + 1 < chrono_rows.len() {
-            let (role_a, content_a) = &chrono_rows[i];
-            let (role_b, content_b) = &chrono_rows[i + 1];
-            if (role_a == "user" || role_a == "gift_user") && role_b == "assistant" {
-                pairs.push((content_a.clone(), content_b.clone()));
-                i += 2;
+        for (session_id, role, content) in chrono_rows {
+            if role == "user" || role == "gift_user" {
+                pending.insert(session_id, content); // consecutive users collapse to the latest, matching recent_turn_pairs
             } else {
-                i += 1;
+                // role == "assistant"
+                if let Some(user_content) = pending.remove(&session_id) {
+                    pairs.push((user_content, content));
+                }
             }
         }
         let want = cap_turns as usize;
@@ -856,6 +861,64 @@ mod tests {
         assert_eq!(
             pairs,
             vec![("你今天忙吗".to_string(), "在准备开店的事".to_string())]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_evidence_never_pairs_across_sessions(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s1: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let s2: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Global time order (decreasing "mins ago"): t0 S2-user, t1 S1-user,
+        // t2 S2-assistant, t3 S1-assistant. A naive global walk pairs
+        // S1-user↔S2-assistant at (t1,t2) — the bug. A session-scoped walk
+        // must instead produce S1-user↔S1-assistant and S2-user↔S2-assistant.
+        for (session, role, content, mins_ago) in [
+            (s2, "user", "S2问题", 40),
+            (s1, "user", "S1问题", 30),
+            (s2, "assistant", "S2回答", 20),
+            (s1, "assistant", "S1回答", 10),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, $2, $3, now() - make_interval(mins => $4))",
+            )
+            .bind(session)
+            .bind(role)
+            .bind(content)
+            .bind(mins_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
+        assert!(
+            pairs.contains(&("S1问题".to_string(), "S1回答".to_string())),
+            "same-session S1 pair must survive"
+        );
+        assert!(
+            pairs.contains(&("S2问题".to_string(), "S2回答".to_string())),
+            "same-session S2 pair must survive"
+        );
+        assert!(
+            !pairs.iter().any(|(u, a)| u == "S1问题" && a == "S2回答"),
+            "must not pair across sessions"
         );
     }
 
