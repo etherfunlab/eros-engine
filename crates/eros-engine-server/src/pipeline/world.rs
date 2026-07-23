@@ -57,6 +57,12 @@ const WORLD_TOWN_POST_RULES: &str = "\
 /// (spec §4): scripts must stay consistent with each persona's recent_life;
 /// persona↔user relationship states come from recent_life; the WM-layer
 /// user-grounding rule is restated so the stories doorway can't erode it.
+///
+/// Numbered 6) — the town rule 5) (`WORLD_TOWN_POST_RULES`) is only
+/// conditionally appended, so a stories-active town-disabled owner sees
+/// rules 1,2,3,4,6 (no 5). Harmless: the numbers are cosmetic labels for
+/// the model, not referenced elsewhere. Do not dynamically renumber —
+/// that would alter the payload string for no behavioral gain.
 const WORLD_STORIES_WM_RULES: &str = "\
 6) 各角色的个人生活以其 recent_life 为准，剧本必须与之一致，不可矛盾；\
 角色与用户的关系状态以 recent_life 为准，其他角色可以自然提及，\

@@ -641,7 +641,10 @@ async fn fetch_world_context(
 /// ladder as `fetch_world_context`: disabled/unconfigured/unflagged/no-digest
 /// ⇒ `None` and the prompt stays byte-identical; episode recall reuses the
 /// turn's query embedding (digest-only when absent); any DB error degrades
-/// with a warn — story data must never block a reply.
+/// with a warn — story data must never block a reply. Also requires the
+/// World Memories base (`world_configured`), mirroring how the story
+/// sweeper itself refuses to run without `[tasks.world_director]`
+/// configured — stories are an add-on layer on top of WM, not standalone.
 async fn fetch_stories_context(
     state: &AppState,
     user_id: Uuid,
@@ -651,6 +654,7 @@ async fn fetch_stories_context(
     if state.config.world.disabled
         || state.config.world.stories_disabled
         || state.config.world.stories_prompt_disabled
+        || !state.world_configured
         || !state.stories_configured
     {
         return None;
@@ -2322,6 +2326,7 @@ mod tests {
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.stories_configured = true;
+        state.world_configured = true;
         let ctx = fetch_stories_context(&state, owner, instance, None)
             .await
             .expect("some");
@@ -2331,12 +2336,14 @@ mod tests {
         // Gating matrix ⇒ None:
         let mut unconfigured = crate::routes::companion::test_state(pool.clone());
         unconfigured.stories_configured = false;
+        unconfigured.world_configured = true;
         assert!(fetch_stories_context(&unconfigured, owner, instance, None)
             .await
             .is_none());
 
         let mut off = crate::routes::companion::test_state(pool.clone());
         off.stories_configured = true;
+        off.world_configured = true;
         off.config.world.stories_disabled = true;
         assert!(fetch_stories_context(&off, owner, instance, None)
             .await
@@ -2344,6 +2351,7 @@ mod tests {
 
         let mut muted = crate::routes::companion::test_state(pool.clone());
         muted.stories_configured = true;
+        muted.world_configured = true;
         muted.config.world.stories_prompt_disabled = true;
         assert!(fetch_stories_context(&muted, owner, instance, None)
             .await
@@ -2351,10 +2359,24 @@ mod tests {
 
         let mut world_off = crate::routes::companion::test_state(pool.clone());
         world_off.stories_configured = true;
+        world_off.world_configured = true;
         world_off.config.world.disabled = true;
         assert!(fetch_stories_context(&world_off, owner, instance, None)
             .await
             .is_none());
+
+        // stories_configured=true but world_configured=false ⇒ None: stories
+        // injection requires the WM base, mirroring the sweeper's
+        // [tasks.world_director] prerequisite.
+        let mut wm_off = crate::routes::companion::test_state(pool.clone());
+        wm_off.stories_configured = true;
+        wm_off.world_configured = false;
+        assert!(
+            fetch_stories_context(&wm_off, owner, instance, None)
+                .await
+                .is_none(),
+            "stories injection requires the world-memories base (world_configured)"
+        );
 
         // stories_enabled=false ⇒ None (digest query's JOIN filters it).
         sqlx::query(

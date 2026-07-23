@@ -314,6 +314,9 @@ async fn run_server() -> Result<()> {
     // WORLD_TOWN_DISABLED isolates the two town sections
     // ([tasks.world_comment] / [tasks.world_reply]) the same way: the town
     // sweeper won't spawn, so a staged/broken town config must not block boot.
+    // WORLD_STORIES_DISABLED isolates the world_stories_director section the
+    // same way: the story sweeper won't spawn and stories injection is gated
+    // too, so a staged/broken stories config must not block boot.
     if !cfg.world.disabled {
         if let Err(msg) = model_config
             .validate_world_prompts(!cfg.world.town_disabled, !cfg.world.stories_disabled)
