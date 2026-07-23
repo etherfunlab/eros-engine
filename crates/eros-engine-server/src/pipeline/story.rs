@@ -9,45 +9,29 @@
 use serde::Deserialize;
 use uuid::Uuid;
 
-use eros_engine_store::story::{StoryAffinity, StoryInsight, StoryInsightRow, StoryPersona};
+use eros_engine_llm::model_config::ResolvedWorldStories;
+use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::story::{
+    StoryAffinity, StoryEventInsert, StoryInsight, StoryInsightRow, StoryPersona, StoryRepo,
+};
 
-// NOTE(task-7 scaffold): `eros_engine_llm::model_config::ResolvedWorldStories`,
-// `eros_engine_llm::openrouter::{ChatMessage, ChatRequest}`,
-// `eros_engine_store::story::{StoryEventInsert, StoryRepo}`, and
-// `crate::state::AppState` are the runner's (Task 8) dependencies. They are
-// intentionally not imported here — this module is the pure layer only — and
-// will be added back when the runner (`sweeper`/`direct_story`) lands.
+use crate::state::AppState;
 
-// NOTE(task-7 scaffold): only the pure layer lands in this task — the
-// runner (Task 8: `sweeper`/`direct_story`) is the real consumer of most of
-// what follows. In this crate's binary target (no lib — see Cargo.toml),
-// items reachable only from `#[cfg(test)]` still read as dead code in the
-// non-test build, so each is individually `#[allow(dead_code)]`d until Task
-// 8 wires it in; none of the allows suppress anything the unit tests below
-// don't already exercise.
-#[allow(dead_code)]
 const STORY_TASK: &str = "world_stories_director";
 /// Sentinel OpenRouter `user` for story-subsystem calls. dreaming=…111,
 /// world=…112 — stories continue the sequence for per-subsystem attribution.
-#[allow(dead_code)]
 pub(crate) const STORY_AUDIT_USER: &str = "11111111-1111-1111-1111-111111111113";
-#[allow(dead_code)]
 const STORY_PICK_BATCH: i64 = 8;
-#[allow(dead_code)]
 const STORY_CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
 /// Defensive cap on events accepted per round.
-#[allow(dead_code)]
 const STORY_EVENTS_CAP: usize = 6;
 /// Recent events fed back for continuity + repetition guard.
-#[allow(dead_code)]
 const STORY_RECENT_EVENTS: i64 = 12;
 /// Max chat turns fed as evidence (inside the context_days window).
-#[allow(dead_code)]
 const STORY_CHAT_TURNS_CAP: u8 = 60;
 
 /// Fixed engine-owned rules (spec §3.3). The operator filter_prompt carries
 /// tone / genre / category vocabulary / per-field richness; these are the floor.
-#[allow(dead_code)]
 const STORY_DIRECTOR_RULES: &str = "规则：\
 1) 用户在场：感情线应当包含用户，但用户的言行只能取自聊天记录，绝不编造用户做过的事或说过的话。\
 2) 关系定性以聊天记录为准（例：用户明确告白且角色答应，才能视为情侣）；亲密度数值仅供参考。\
@@ -64,7 +48,6 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 /// pre-flattened). The field LIST is the engine's contract — the operator
 /// filter_prompt may steer richness, never the list. Kept in lockstep with
 /// `STORY_INSIGHT_FIELDS` + the 0038 DDL (tested).
-#[allow(dead_code)]
 pub const PERSONA_STORY_INSIGHTS_SCHEMA: &str = r#"
 persona_story_insights schema（角色人生底座；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
@@ -97,7 +80,6 @@ persona_story_insights schema（角色人生底座；所有字段可选；只输
 "#;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields read by Task 8's persist_round call; tests only check a subset
 struct StoryOutput {
     insight: StoryInsight,
     digest: String,
@@ -106,14 +88,12 @@ struct StoryOutput {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // consumed by Task 8's cap_events / persist_round wiring
 struct StoryEventOut {
     category: String,
     content: String,
 }
 
 /// Assemble the story director's user message.
-#[allow(dead_code)]
 fn story_user_payload(
     now: chrono::DateTime<chrono::Utc>,
     persona: &StoryPersona,
@@ -168,7 +148,6 @@ fn story_user_payload(
 
 /// OpenRouter response_format for the story round. strict=false — `insight`
 /// keys are validated engine-side by the typed deserialize.
-#[allow(dead_code)]
 fn story_response_format() -> serde_json::Value {
     serde_json::json!({
         "type": "json_schema",
@@ -201,7 +180,6 @@ fn story_response_format() -> serde_json::Value {
 /// Lenient parse: direct JSON, then the shared balanced-brace extractor.
 /// Warns (once per round) on unknown insight keys — the fixed field list is
 /// the contract; unknown keys are dropped by the typed deserialize.
-#[allow(dead_code)]
 fn parse_story_output(raw: &str) -> Option<StoryOutput> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .ok()
@@ -220,7 +198,6 @@ fn parse_story_output(raw: &str) -> Option<StoryOutput> {
 }
 
 /// Trim, drop blanks, cap at STORY_EVENTS_CAP (warn on truncation).
-#[allow(dead_code)]
 fn cap_events(events: Vec<StoryEventOut>, instance: Uuid) -> Vec<StoryEventOut> {
     let mut out: Vec<StoryEventOut> = events
         .into_iter()
@@ -235,6 +212,150 @@ fn cap_events(events: Vec<StoryEventOut>, instance: Uuid) -> Vec<StoryEventOut> 
         out.truncate(STORY_EVENTS_CAP);
     }
     out
+}
+
+/// One tick's story phase: backfill + claim + per-instance rounds.
+/// Per-instance failures release that claim and continue.
+pub(crate) async fn run_stories_scan(
+    state: &AppState,
+    resolved: &ResolvedWorldStories,
+) -> Result<usize, sqlx::Error> {
+    let repo = StoryRepo { pool: &state.pool };
+    repo.ensure_insight_rows(super::world::WORLD_ROSTER_CAP as i64)
+        .await?;
+    let interval = std::time::Duration::from_secs(u64::from(resolved.interval_hours) * 3600);
+    let window = std::time::Duration::from_secs(u64::from(resolved.active_window_hours) * 3600);
+    let claimed = repo
+        .claim_due(interval, STORY_CLAIM_STALE, window, STORY_PICK_BATCH)
+        .await?;
+    let mut count = 0;
+    for (instance, owner, token) in claimed {
+        match direct_story(state, resolved, instance, owner, token).await {
+            Ok(()) => count += 1,
+            Err(e) => {
+                tracing::warn!(%owner, %instance, "story: round failed: {e}");
+                if let Err(re) = repo.release_claim(instance, token).await {
+                    tracing::warn!(%instance, "story: release_claim failed: {re}");
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// One instance's round (spec §3.3-§3.4). Any Err ⇒ caller releases the claim;
+/// persist_round is transactional and token-guarded.
+async fn direct_story(
+    state: &AppState,
+    resolved: &ResolvedWorldStories,
+    instance: Uuid,
+    owner: Uuid,
+    token: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let repo = StoryRepo { pool: &state.pool };
+    let Some(persona) = repo
+        .instance_persona(instance)
+        .await
+        .map_err(|e| format!("persona load failed: {e}"))?
+    else {
+        // Instance vanished between claim and load — stamp and move on.
+        return repo
+            .mark_ran(instance, token)
+            .await
+            .map_err(|e| format!("mark_ran (gone) failed: {e}"));
+    };
+    let Some(row) = repo
+        .load_insight_row(instance)
+        .await
+        .map_err(|e| format!("insight load failed: {e}"))?
+    else {
+        return Err("story row missing after claim".into());
+    };
+    let recent = repo
+        .recent_events(instance, STORY_RECENT_EVENTS)
+        .await
+        .map_err(|e| format!("recent events load failed: {e}"))?;
+    let affinity = repo
+        .affinity_snapshot(owner, instance)
+        .await
+        .map_err(|e| format!("affinity load failed: {e}"))?;
+    let chat = repo
+        .chat_evidence(owner, instance, resolved.context_days, STORY_CHAT_TURNS_CAP)
+        .await
+        .map_err(|e| format!("chat evidence load failed: {e}"))?;
+
+    let payload = story_user_payload(
+        chrono::Utc::now(),
+        &persona,
+        &row,
+        &recent,
+        affinity.as_ref(),
+        &chat,
+    );
+    let req = ChatRequest {
+        model: resolved.model.clone(),
+        fallback_model: resolved.fallback_model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.director_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: payload,
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        user: Some(STORY_AUDIT_USER.into()),
+        reasoning: resolved.reasoning.clone(),
+        response_format: resolved.structured_output.then(story_response_format),
+        ..Default::default()
+    };
+    let raw = state
+        .openrouter
+        .execute(req)
+        .await
+        .map_err(|e| format!("world_stories_director LLM call failed: {e}"))?;
+    super::log_openrouter_usage(STORY_TASK, None, &raw);
+
+    let output = parse_story_output(&raw.reply)
+        .ok_or_else(|| "world_stories_director output did not parse".to_string())?;
+    let events = cap_events(output.events, instance);
+
+    let texts: Vec<&str> = events.iter().map(|e| e.content.as_str()).collect();
+    let embeddings = if texts.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .voyage
+            .embed_documents(&texts)
+            .await
+            .map_err(|e| format!("voyage embed_documents failed: {e}"))?
+    };
+    let inserts: Vec<StoryEventInsert> = events
+        .into_iter()
+        .zip(embeddings)
+        .map(|(e, embedding)| StoryEventInsert {
+            category: e.category,
+            content: e.content,
+            embedding,
+        })
+        .collect();
+
+    let digest = output.digest.trim().to_string();
+    repo.persist_round(
+        instance,
+        owner,
+        &output.insight,
+        &digest,
+        &inserts,
+        chrono::Utc::now().date_naive(),
+        resolved.retention_days,
+        token,
+    )
+    .await
+    .map_err(|e| format!("story persist_round failed: {e}"))
 }
 
 #[cfg(test)]
@@ -349,5 +470,229 @@ mod tests {
     fn story_audit_user_is_distinct() {
         assert_eq!(STORY_AUDIT_USER, "11111111-1111-1111-1111-111111111113");
         assert_ne!(STORY_AUDIT_USER, crate::pipeline::world::WORLD_AUDIT_USER);
+    }
+
+    // NOTE: both integration tests below mock `world_stories_director` with an
+    // EMPTY `events: []` array. The runner's `texts.is_empty()` guard in
+    // `direct_story` then skips the Voyage call entirely (mirrors world.rs's
+    // `direct_world_persists_seed_and_digests_without_fragments`, which dodges
+    // Voyage the same way via empty script_fragments). `test_state`'s default
+    // `VoyageClient::new("stub")` is kept and never invoked — `VoyageClient`
+    // has no `with_base_url` constructor to mock against (only `new`), unlike
+    // `OpenRouterClient`, which does and is wiremocked normally below.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_story_persists_full_round(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S','p','{\"backstory\":\"bs\"}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let inst: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2)")
+            .bind(owner)
+            .bind(inst)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let reply = serde_json::json!({
+            "insight": {"occupation": "咖啡店店主", "user_relationship": "暧昧升温"},
+            "digest": "开店倒计时一周",
+            "events": []
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-story", "model": "w/s",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_world_stories_director().unwrap();
+        let repo = StoryRepo { pool: &pool };
+        repo.ensure_insight_rows(8).await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(8 * 3600),
+                std::time::Duration::from_secs(1800),
+                std::time::Duration::from_secs(72 * 3600),
+                8,
+            )
+            .await
+            .unwrap();
+        let (i, o, token) = claimed[0];
+        assert_eq!((i, o), (inst, owner));
+
+        direct_story(&state, &resolved, inst, owner, token)
+            .await
+            .expect("round ok");
+
+        let (occ, digest, version): (Option<String>, String, i32) = sqlx::query_as(
+            "SELECT occupation, digest, insight_version FROM engine.persona_story_insights \
+             WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(occ.as_deref(), Some("咖啡店店主"));
+        assert_eq!(digest, "开店倒计时一周");
+        assert_eq!(version, 2);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_memories WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "empty events ⇒ no memory rows");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_story_parse_failure_writes_nothing(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S','p','{\"backstory\":\"bs\"}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let inst: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2)")
+            .bind(owner)
+            .bind(inst)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-story-bad", "model": "w/s",
+                "choices": [{"message": {"content": "这不是 JSON"}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_world_stories_director().unwrap();
+        let repo = StoryRepo { pool: &pool };
+        repo.ensure_insight_rows(8).await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(8 * 3600),
+                std::time::Duration::from_secs(1800),
+                std::time::Duration::from_secs(72 * 3600),
+                8,
+            )
+            .await
+            .unwrap();
+        let (i, o, token) = claimed[0];
+        assert_eq!((i, o), (inst, owner));
+
+        let err = direct_story(&state, &resolved, inst, owner, token)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not parse"));
+
+        let (digest, version): (String, i32) = sqlx::query_as(
+            "SELECT digest, insight_version FROM engine.persona_story_insights \
+             WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(digest, "", "nothing persisted ⇒ digest still blank");
+        assert_eq!(version, 1, "insight_version stays 1 on parse failure");
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_events WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
+        let memories: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_memories WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(memories, 0);
     }
 }

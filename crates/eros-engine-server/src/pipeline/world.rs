@@ -27,7 +27,9 @@ const WORLD_PICK_BATCH: i64 = 5;
 /// Claim considered crashed after this (spec §2.2).
 const WORLD_CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
 /// Roster cap per world (spec §2.3): earliest-created wins, warn on truncation.
-const WORLD_ROSTER_CAP: usize = 8;
+/// `pub(crate)`: also the story sweeper's `ensure_insight_rows` backfill cap
+/// (spec §3: same roster, same cap, same order as the WM roster).
+pub(crate) const WORLD_ROSTER_CAP: usize = 8;
 /// Memory-feedback rows per round (spec §2.3).
 const WORLD_FEEDBACK_K: i64 = 15;
 /// Defensive cap on fragments accepted per persona per round.
@@ -93,6 +95,16 @@ pub async fn sweeper(state: AppState) {
         retention_days = resolved.retention_days,
         "world sweeper starting"
     );
+    let stories = if state.config.world.stories_disabled {
+        tracing::info!("world stories disabled (WORLD_STORIES_DISABLED)");
+        None
+    } else {
+        let r = state.model_config.resolve_world_stories_director();
+        if r.is_none() {
+            tracing::info!("world_stories_director not configured — stories inert");
+        }
+        r
+    };
     let mut tick = tokio::time::interval(tick_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -101,6 +113,13 @@ pub async fn sweeper(state: AppState) {
             Ok(0) => {}
             Ok(n) => tracing::info!(processed = n, "world: director rounds completed"),
             Err(e) => tracing::warn!("world: round scan failed: {e}"),
+        }
+        if let Some(s) = &stories {
+            match super::story::run_stories_scan(&state, s).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(processed = n, "world: story rounds completed"),
+                Err(e) => tracing::warn!("world: story scan failed: {e}"),
+            }
         }
     }
 }
