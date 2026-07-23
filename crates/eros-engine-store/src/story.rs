@@ -6,7 +6,7 @@
 //! `persona_story_events` is the append-only progression log;
 //! `persona_story_memories` its 1:1 embedded recall mirror.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -102,6 +102,13 @@ pub struct StoryAffinity {
     pub bond: f64,
     pub chemistry: f64,
     pub relationship_label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoryEventInsert {
+    pub category: String,
+    pub content: String,
+    pub embedding: Vec<f32>,
 }
 
 pub struct StoryRepo<'a> {
@@ -347,6 +354,190 @@ impl<'a> StoryRepo<'a> {
         .bind(instance_id)
         .fetch_optional(self.pool)
         .await
+    }
+
+    /// Persist one story round in a single transaction: retention prune on
+    /// BOTH tables + event inserts + 1:1 memory inserts (event_id linked) +
+    /// token-guarded full-column insight/digest update. Any failure rolls
+    /// back completely — semantics copied from `WorldRepo::persist_round`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_round(
+        &self,
+        instance_id: Uuid,
+        owner_uid: Uuid,
+        insight: &StoryInsight,
+        digest: &str,
+        events: &[StoryEventInsert],
+        story_date: NaiveDate,
+        retention_days: u32,
+        claimed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let cutoff = story_date - chrono::Days::new(u64::from(retention_days));
+        sqlx::query(
+            "DELETE FROM engine.persona_story_memories WHERE instance_id = $1 AND story_date < $2",
+        )
+        .bind(instance_id)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM engine.persona_story_events WHERE instance_id = $1 AND story_date < $2",
+        )
+        .bind(instance_id)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+        for ev in events {
+            let event_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.persona_story_events \
+                     (owner_uid, instance_id, category, content, story_date) \
+                 VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            )
+            .bind(owner_uid)
+            .bind(instance_id)
+            .bind(&ev.category)
+            .bind(&ev.content)
+            .bind(story_date)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO engine.persona_story_memories \
+                     (owner_uid, instance_id, event_id, content, embedding, story_date) \
+                 VALUES ($1, $2, $3, $4, $5::vector, $6)",
+            )
+            .bind(owner_uid)
+            .bind(instance_id)
+            .bind(event_id)
+            .bind(&ev.content)
+            .bind(crate::memory::format_vector(&ev.embedding))
+            .bind(story_date)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let res = sqlx::query(
+            "UPDATE engine.persona_story_insights SET \
+                 city = $2, location = $3, hometown = $4, nationality = $5, \
+                 occupation = $6, mbti_guess = $7, love_values = $8, \
+                 emotional_needs = $9, life_rhythm = $10, education = $11, \
+                 family = $12, relationship_history = $13, social_pattern = $14, \
+                 future_plans = $15, finance_status = $16, interests = $17, \
+                 personality_traits = $18, preferred_gender = $19, age_min = $20, \
+                 age_max = $21, deal_breakers = $22, work_history = $23, \
+                 romance_history = $24, family_of_origin = $25, user_relationship = $26, \
+                 digest = $27, insight_version = insight_version + 1, \
+                 last_run_at = now(), claimed_at = NULL, updated_at = now() \
+             WHERE instance_id = $1 AND claimed_at = $28",
+        )
+        .bind(instance_id)
+        .bind(&insight.city)
+        .bind(&insight.location)
+        .bind(&insight.hometown)
+        .bind(&insight.nationality)
+        .bind(&insight.occupation)
+        .bind(&insight.mbti_guess)
+        .bind(&insight.love_values)
+        .bind(&insight.emotional_needs)
+        .bind(&insight.life_rhythm)
+        .bind(&insight.education)
+        .bind(&insight.family)
+        .bind(&insight.relationship_history)
+        .bind(&insight.social_pattern)
+        .bind(&insight.future_plans)
+        .bind(&insight.finance_status)
+        .bind(&insight.interests)
+        .bind(&insight.personality_traits)
+        .bind(&insight.preferred_gender)
+        .bind(insight.age_min)
+        .bind(insight.age_max)
+        .bind(&insight.deal_breakers)
+        .bind(&insight.work_history)
+        .bind(&insight.romance_history)
+        .bind(&insight.family_of_origin)
+        .bind(&insight.user_relationship)
+        .bind(digest)
+        .bind(claimed_at)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            // Lost the claim mid-round — drop tx so everything rolls back.
+            return Err(sqlx::Error::RowNotFound);
+        }
+        tx.commit().await
+    }
+
+    /// Chat-time resident digest; single query that also performs the
+    /// enrollment + stories_enabled check. Blank digest ⇒ None.
+    pub async fn fetch_story_digest(
+        &self,
+        owner_uid: Uuid,
+        instance_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT psi.digest FROM engine.persona_story_insights psi \
+             JOIN engine.world_enrollments we \
+               ON we.owner_uid = psi.owner_uid AND we.stories_enabled \
+             WHERE psi.owner_uid = $1 AND psi.instance_id = $2",
+        )
+        .bind(owner_uid)
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.filter(|d| !d.trim().is_empty()))
+    }
+
+    /// Cosine top-k story memories for one instance.
+    pub async fn search_story_memories(
+        &self,
+        owner_uid: Uuid,
+        instance_id: Uuid,
+        query_embedding: &[f32],
+        k: i32,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT content FROM engine.persona_story_memories \
+             WHERE owner_uid = $1 AND instance_id = $2 \
+             ORDER BY embedding <=> $3::vector \
+             LIMIT $4",
+        )
+        .bind(owner_uid)
+        .bind(instance_id)
+        .bind(crate::memory::format_vector(query_embedding))
+        .bind(k as i64)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// Recent-life feed for the WM director: per-instance events since
+    /// `since`, capped at `cap_per_instance` newest per instance,
+    /// chronological within each instance.
+    pub async fn events_since(
+        &self,
+        owner_uid: Uuid,
+        since: DateTime<Utc>,
+        cap_per_instance: usize,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<(String, String)>>, sqlx::Error> {
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT instance_id, category, content FROM engine.persona_story_events \
+             WHERE owner_uid = $1 AND created_at > $2 \
+             ORDER BY created_at ASC",
+        )
+        .bind(owner_uid)
+        .bind(since)
+        .fetch_all(self.pool)
+        .await?;
+        let mut map: std::collections::HashMap<Uuid, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for (inst, category, content) in rows {
+            map.entry(inst).or_default().push((category, content));
+        }
+        for v in map.values_mut() {
+            if v.len() > cap_per_instance {
+                let drop = v.len() - cap_per_instance;
+                v.drain(..drop);
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -704,5 +895,305 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snap.relationship_label.as_deref(), Some("挚友"));
         assert!(snap.bond >= 0.0 && snap.chemistry >= 0.0);
+    }
+
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_writes_events_memories_and_insight(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_stories(&pool, owner).await;
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        touch_activity(&pool, owner, inst, "1 hour").await;
+        repo.ensure_insight_rows(8).await.unwrap();
+        let (_i, _o, token) = repo.claim_due(EIGHT_H, STALE, WINDOW, 8).await.unwrap()[0];
+        let today = Utc::now().date_naive();
+
+        // Pre-existing OLD event+memory (41d, retention 30) → both pruned.
+        let old_event: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'life', 'ancient', $3) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .bind(today - chrono::Days::new(41))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_memories \
+             (owner_uid, instance_id, event_id, content, embedding, story_date) \
+             VALUES ($1, $2, $3, 'ancient', $4::vector, $5)",
+        )
+        .bind(owner)
+        .bind(inst)
+        .bind(old_event)
+        .bind(crate::memory::format_vector(&unit_embedding(9)))
+        .bind(today - chrono::Days::new(41))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let insight = StoryInsight {
+            occupation: Some("咖啡店店主".into()),
+            user_relationship: Some("刚确认恋爱关系".into()),
+            ..Default::default()
+        };
+        let events = vec![StoryEventInsert {
+            category: "work".into(),
+            content: "试营业当天把咖啡机弄坏了".into(),
+            embedding: unit_embedding(7),
+        }];
+        repo.persist_round(
+            inst,
+            owner,
+            &insight,
+            "开店进入倒计时",
+            &events,
+            today,
+            30,
+            token,
+        )
+        .await
+        .unwrap();
+
+        let (occ, digest, version, claimed): (Option<String>, String, i32, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT occupation, digest, insight_version, claimed_at \
+                 FROM engine.persona_story_insights WHERE instance_id = $1",
+            )
+            .bind(inst)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(occ.as_deref(), Some("咖啡店店主"));
+        assert_eq!(digest, "开店进入倒计时");
+        assert_eq!(version, 2);
+        assert!(claimed.is_none());
+
+        let events_left: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM engine.persona_story_events WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events_left,
+            vec!["试营业当天把咖啡机弄坏了"],
+            "old pruned, new inserted"
+        );
+
+        let (mem_content, linked): (String, Uuid) = sqlx::query_as(
+            "SELECT m.content, m.event_id FROM engine.persona_story_memories m \
+             WHERE m.owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mem_content, "试营业当天把咖啡机弄坏了", "1:1 mirror");
+        let linked_ok: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM engine.persona_story_events WHERE id = $1 AND content = $2)",
+        )
+        .bind(linked)
+        .bind("试营业当天把咖啡机弄坏了")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(linked_ok, "event_id links the mirror row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_aborts_when_claim_lost(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_stories(&pool, owner).await;
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        touch_activity(&pool, owner, inst, "1 hour").await;
+        repo.ensure_insight_rows(8).await.unwrap();
+        let (_i, _o, token) = repo.claim_due(EIGHT_H, STALE, WINDOW, 8).await.unwrap()[0];
+        sqlx::query(
+            "UPDATE engine.persona_story_insights SET claimed_at = now() + interval '1 second' \
+             WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = vec![StoryEventInsert {
+            category: "life".into(),
+            content: "late".into(),
+            embedding: unit_embedding(3),
+        }];
+        let res = repo
+            .persist_round(
+                inst,
+                owner,
+                &StoryInsight::default(),
+                "d",
+                &events,
+                Utc::now().date_naive(),
+                30,
+                token,
+            )
+            .await;
+        assert!(res.is_err(), "stale token must abort");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_events WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "event insert must roll back");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_story_digest_requires_flag_and_nonblank(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        // Enrolled but stories_enabled=false ⇒ None even with a digest present.
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_insights (instance_id, owner_uid, digest) \
+             VALUES ($1, $2, '近况')",
+        )
+        .bind(inst)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo
+            .fetch_story_digest(owner, inst)
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query(
+            "UPDATE engine.world_enrollments SET stories_enabled = true WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.fetch_story_digest(owner, inst)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("近况")
+        );
+        sqlx::query(
+            "UPDATE engine.persona_story_insights SET digest = '  ' WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.fetch_story_digest(owner, inst)
+                .await
+                .unwrap()
+                .is_none(),
+            "blank ⇒ None"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_story_memories_scopes_and_orders(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_stories(&pool, owner).await;
+        let a = seed_instance(&pool, owner, "A", "active").await;
+        let b = seed_instance(&pool, owner, "B", "active").await;
+        touch_activity(&pool, owner, a, "1 hour").await;
+        touch_activity(&pool, owner, b, "1 hour").await;
+        repo.ensure_insight_rows(8).await.unwrap();
+        let claimed = repo.claim_due(EIGHT_H, STALE, WINDOW, 8).await.unwrap();
+        for (inst, token) in claimed.iter().map(|(i, _o, t)| (*i, *t)) {
+            let (near, far) = if inst == a {
+                ("near-a", "far-a")
+            } else {
+                ("near-b", "far-b")
+            };
+            let events = vec![
+                StoryEventInsert {
+                    category: "life".into(),
+                    content: near.into(),
+                    embedding: unit_embedding(42),
+                },
+                StoryEventInsert {
+                    category: "life".into(),
+                    content: far.into(),
+                    embedding: unit_embedding(400),
+                },
+            ];
+            repo.persist_round(
+                inst,
+                owner,
+                &StoryInsight::default(),
+                "d",
+                &events,
+                Utc::now().date_naive(),
+                30,
+                token,
+            )
+            .await
+            .unwrap();
+        }
+        let hits = repo
+            .search_story_memories(owner, a, &unit_embedding(42), 3)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "only A's memories");
+        assert_eq!(hits[0], "near-a", "cosine order");
+        assert!(!hits.contains(&"near-b".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn events_since_windows_and_caps_per_instance(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let a = seed_instance(&pool, owner, "A", "active").await;
+        let b = seed_instance(&pool, owner, "B", "active").await;
+        for (inst, content, mins_ago) in [
+            (a, "a-old", 2000_i32),
+            (a, "a-1", 30),
+            (a, "a-2", 20),
+            (b, "b-1", 10),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.persona_story_events \
+                 (owner_uid, instance_id, category, content, story_date, created_at) \
+                 VALUES ($1, $2, 'life', $3, current_date, now() - make_interval(mins => $4))",
+            )
+            .bind(owner)
+            .bind(inst)
+            .bind(content)
+            .bind(mins_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let since = Utc::now() - chrono::Duration::hours(24);
+        let map = repo.events_since(owner, since, 1).await.unwrap();
+        assert_eq!(
+            map[&a].iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["a-2"],
+            "cap keeps the newest, window drops a-old"
+        );
+        assert_eq!(map[&b].len(), 1);
     }
 }
