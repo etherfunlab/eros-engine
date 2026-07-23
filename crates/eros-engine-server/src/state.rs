@@ -30,11 +30,7 @@ pub struct AppState {
     /// `world_configured` but for the world-stories subsystem — distinct from
     /// `config.world.stories_disabled` / `stories_prompt_disabled`, which are
     /// operator env-var kill switches for a subsystem that IS configured.
-    // Not yet read outside this module — the consumer (`fetch_stories_context`
-    // gating) lands in a later task. This crate is bin-only (no lib target),
-    // so an unread `pub` field is flagged as dead code even though it's part
-    // of AppState's public shape.
-    #[allow(dead_code)]
+    /// Read by `fetch_stories_context`'s gating.
     pub stories_configured: bool,
 }
 
@@ -99,13 +95,9 @@ pub struct WorldConfig {
     pub prompt_disabled: bool,  // WORLD_PROMPT_DISABLED — injection-only valve
     pub town_disabled: bool,    // WORLD_TOWN_DISABLED — town sweeper switch
     pub stories_disabled: bool, // WORLD_STORIES_DISABLED — stories rounds + injection off
-    // Not yet read outside this module — the consumer (`fetch_stories_context`
-    // prompt-injection gating) lands in a later task. This crate is bin-only
-    // (no lib target), so an unread `pub` field is flagged as dead code even
-    // though it's part of the parser's public shape.
-    #[allow(dead_code)]
+    // Read by `fetch_stories_context`'s prompt-injection gating.
     pub stories_prompt_disabled: bool, // WORLD_STORIES_PROMPT_DISABLED — injection-only valve
-    pub tick: Duration, // WORLD_TICK_SECS, default 300
+    pub tick: Duration,                // WORLD_TICK_SECS, default 300
 }
 
 /// Pure parser for the six world-memories env vars (spec §3.1).

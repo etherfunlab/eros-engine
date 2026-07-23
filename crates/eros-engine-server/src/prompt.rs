@@ -39,6 +39,14 @@ pub struct WorldContext {
     pub fragments: Vec<String>,
 }
 
+/// World-stories injection payload: the persona's own-life digest plus
+/// recalled story episodes (stories spec §5.4).
+#[derive(Debug, Clone, Default)]
+pub struct StoriesContext {
+    pub digest: String,
+    pub episodes: Vec<String>,
+}
+
 /// Constant in-character clause re-appended after every persona's authored
 /// `system_prompt`. It was moved OUT of personas' `system_prompt`, so the engine
 /// must re-inject it deterministically or user-authored personas drift out of
@@ -367,6 +375,9 @@ pub fn build_prompt(
     // [world_memories] block is omitted and the prompt is byte-identical
     // to the pre-world layout.
     world: Option<&WorldContext>,
+    // World-stories injection (stories spec §5.4). `None` or empty ⇒ the
+    // [world_stories] block is omitted, prompt byte-identical.
+    stories: Option<&StoriesContext>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -554,6 +565,29 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
+    // World-stories injection (stories spec §5.4): the persona's OWN life.
+    // Resident digest = load-bearing current state; recalled episodes = past
+    // color, possibly predating the digest. Empty ⇒ omitted, byte-identical.
+    let stories_section = match stories {
+        Some(s) if !s.digest.trim().is_empty() || !s.episodes.is_empty() => {
+            let mut sec = String::from(
+                "\n\n[world_stories]\n（你自己的生活：第一行是当前近况，\
+                 其余是你经历过的事，时间可能较早；可自然提及）",
+            );
+            let digest = s.digest.trim();
+            if !digest.is_empty() {
+                sec.push('\n');
+                sec.push_str(digest);
+            }
+            for e in &s.episodes {
+                sec.push_str("\n- ");
+                sec.push_str(e);
+            }
+            sec
+        }
+        _ => String::new(),
+    };
+
     // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     let gender_rule = if is_binary_gender(persona) {
@@ -594,7 +628,7 @@ pub fn build_prompt(
          \n\
          [user_profile]\n{profile_str}\n\
          \n\
-         [shared_memories]\n{rel_str}{world_section}\
+         [shared_memories]\n{rel_str}{world_section}{stories_section}\
          {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}\n\
          \n\
          [now]\n{tc}\n\
@@ -768,6 +802,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -806,6 +841,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -839,6 +875,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -864,6 +901,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(p.contains("[reply_tone]"), "section present: {p}");
@@ -897,6 +935,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                None,
             );
             assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
         }
@@ -917,6 +956,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         let pos = |h: &str| s.find(h).unwrap_or_else(|| panic!("missing {h} in:\n{s}"));
@@ -966,6 +1006,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -998,6 +1039,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1026,6 +1068,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         // Guard present, sits before identity (stable prefix).
@@ -1064,6 +1107,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
@@ -1086,6 +1130,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(
@@ -1115,6 +1160,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -1137,6 +1183,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         // blank gender must not produce a double comma or a ⑧ rule
@@ -1166,6 +1213,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -1190,6 +1238,7 @@ mod tests {
             &pairs,
             &[],
             &[],
+            None,
             None,
         );
         let header = s.find("[recent_conversation]").expect("header present");
@@ -1245,6 +1294,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -1267,6 +1317,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         let z = s.find("⓪").expect("⓪ rule must render");
@@ -1293,6 +1344,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(
@@ -1337,6 +1389,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1352,6 +1405,7 @@ mod tests {
             &[],
             &["我看着你".to_string()],
             &["最近聊得不错".to_string()],
+            None,
             None,
         );
         let cut = a.find("[turn_style]").expect("turn-style header present");
@@ -1389,6 +1443,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         let b = build_prompt(
             &p,
@@ -1403,6 +1458,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         let cut = a
@@ -1431,6 +1487,7 @@ mod tests {
             &[],
             &["我看着你".to_string(), "我盯着你".to_string()],
             &[],
+            None,
             None,
         );
         assert!(s.contains("[avoid_repetition]"), "{s}");
@@ -1464,6 +1521,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -1488,6 +1546,7 @@ mod tests {
             &[],
             &[],
             &reasons,
+            None,
             None,
         );
         assert!(s.contains("[emotional_context]"), "{s}");
@@ -1525,6 +1584,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -1549,6 +1609,7 @@ mod tests {
             &[],
             &[],
             Some(&world),
+            None,
         );
         let block_at = p.find("[world_memories]").expect("block present");
         assert!(p.contains("你最近和 Kenji 闹了别扭"));
@@ -1575,6 +1636,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -1593,8 +1655,77 @@ mod tests {
             &[],
             &[],
             Some(&empty),
+            None,
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
+    }
+
+    #[test]
+    fn build_prompt_renders_world_stories_block() {
+        let stories = StoriesContext {
+            digest: "开店倒计时一周".into(),
+            episodes: vec!["定了开业日期".into(), "上周修好了咖啡机".into()],
+        };
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            Some(&stories),
+        );
+        let at = p.find("[world_stories]").expect("block present");
+        assert!(p[at..].contains("开店倒计时一周"));
+        assert!(p[at..].contains("- 定了开业日期"));
+        assert!(p[at..].contains("你自己的生活"));
+        // Ordering: stories block sits after world block position, before [now].
+        assert!(at < p.find("[now]").unwrap());
+    }
+
+    #[test]
+    fn build_prompt_omits_stories_block_when_none_or_empty() {
+        let without = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+        );
+        assert!(!without.contains("[world_stories]"));
+        let with_empty = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            Some(&StoriesContext::default()),
+        );
+        assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
 
     #[test]
@@ -1826,6 +1957,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -1851,6 +1983,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(!p.contains("[feelings]"));
@@ -1919,6 +2052,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(
