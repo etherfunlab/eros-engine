@@ -76,6 +76,34 @@ pub struct StoryInsight {
     pub user_relationship: Option<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StoryPersona {
+    pub name: String,
+    pub tip_personality: Option<String>,
+    pub art_metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoryInsightRow {
+    pub insight: StoryInsight,
+    pub digest: String,
+    pub insight_version: i32,
+    pub last_run_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StoryAffinity {
+    pub warmth: f64,
+    pub trust: f64,
+    pub intrigue: f64,
+    pub intimacy: f64,
+    pub patience: f64,
+    pub tension: f64,
+    pub bond: f64,
+    pub chemistry: f64,
+    pub relationship_label: Option<String>,
+}
+
 pub struct StoryRepo<'a> {
     pub pool: &'a PgPool,
 }
@@ -181,6 +209,144 @@ impl<'a> StoryRepo<'a> {
         .execute(self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Genome display data for one instance (story payload header).
+    pub async fn instance_persona(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<StoryPersona>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT pg.name, pg.tip_personality, pg.art_metadata \
+             FROM engine.persona_instances pi \
+             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             WHERE pi.id = $1",
+        )
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// The instance's full story row. `last_run_at IS NULL` ⇒ init branch.
+    pub async fn load_insight_row(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Option<StoryInsightRow>, sqlx::Error> {
+        #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
+        let row: Option<(
+            sqlx::types::Json<StoryInsight>,
+            String,
+            i32,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            "SELECT to_jsonb(psi.*) - 'instance_id' - 'owner_uid' - 'digest' \
+                        - 'insight_version' - 'last_run_at' - 'claimed_at' - 'updated_at', \
+                        digest, insight_version, last_run_at \
+                 FROM engine.persona_story_insights psi WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(
+            |(insight, digest, insight_version, last_run_at)| StoryInsightRow {
+                insight: insight.0,
+                digest,
+                insight_version,
+                last_run_at,
+            },
+        ))
+    }
+
+    /// Latest `limit` events, returned oldest→newest (payload order).
+    pub async fn recent_events(
+        &self,
+        instance_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let mut rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT category, content FROM engine.persona_story_events \
+             WHERE instance_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(instance_id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Cross-session chat evidence for the pair, `window_days` back, capped at
+    /// `cap_turns` most-recent complete user→assistant pairs, chronological.
+    /// Same role/channel/truncation filters and pairing walk as
+    /// `ChatRepo::recent_turn_pairs`, but scoped to (owner, instance) across
+    /// sessions instead of one session.
+    pub async fn chat_evidence(
+        &self,
+        owner_uid: Uuid,
+        instance_id: Uuid,
+        window_days: u32,
+        cap_turns: u8,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let fetch_n: i64 = (cap_turns as i64) * 2 + 2;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT cm.role, cm.content \
+             FROM engine.chat_messages cm \
+             JOIN engine.chat_sessions cs ON cs.id = cm.session_id \
+             WHERE cs.user_id = $1 AND cs.instance_id = $2 \
+               AND cm.sent_at > now() - make_interval(days => $3) \
+               AND cm.truncated = FALSE \
+               AND cm.channel IS NULL \
+               AND cm.role IN ('user', 'gift_user', 'assistant') \
+             ORDER BY cm.sent_at DESC \
+             LIMIT $4",
+        )
+        .bind(owner_uid)
+        .bind(instance_id)
+        .bind(window_days as i32)
+        .bind(fetch_n)
+        .fetch_all(self.pool)
+        .await?;
+        let mut chrono_rows = rows;
+        chrono_rows.reverse();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < chrono_rows.len() {
+            let (role_a, content_a) = &chrono_rows[i];
+            let (role_b, content_b) = &chrono_rows[i + 1];
+            if (role_a == "user" || role_a == "gift_user") && role_b == "assistant" {
+                pairs.push((content_a.clone(), content_b.clone()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let want = cap_turns as usize;
+        if pairs.len() > want {
+            let drop = pairs.len() - want;
+            pairs.drain(..drop);
+        }
+        Ok(pairs)
+    }
+
+    /// Current affinity for the pair via its latest-active session. Advisory
+    /// input only (spec rule 2: chat records are the relationship ground truth).
+    pub async fn affinity_snapshot(
+        &self,
+        owner_uid: Uuid,
+        instance_id: Uuid,
+    ) -> Result<Option<StoryAffinity>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT ca.warmth, ca.trust, ca.intrigue, ca.intimacy, ca.patience, ca.tension, \
+                    ca.bond, ca.chemistry, ca.relationship_label \
+             FROM engine.companion_affinity ca \
+             JOIN engine.chat_sessions cs ON cs.id = ca.session_id \
+             WHERE ca.user_id = $1 AND ca.instance_id = $2 \
+             ORDER BY cs.last_active_at DESC LIMIT 1",
+        )
+        .bind(owner_uid)
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await
     }
 }
 
@@ -384,5 +550,159 @@ mod tests {
         .await
         .unwrap();
         assert!(still.is_some(), "old token must not clear newer claim");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_insight_row_roundtrips_columns(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_stories(&pool, owner).await;
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        repo.ensure_insight_rows(8).await.unwrap();
+        sqlx::query(
+            "UPDATE engine.persona_story_insights \
+             SET occupation = '咖啡店店主', interests = ARRAY['手冲咖啡'], age_min = 25, \
+                 digest = '正在筹备开店', last_run_at = now() \
+             WHERE instance_id = $1",
+        )
+        .bind(inst)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = repo.load_insight_row(inst).await.unwrap().expect("row");
+        assert_eq!(row.insight.occupation.as_deref(), Some("咖啡店店主"));
+        assert_eq!(row.insight.interests, vec!["手冲咖啡"]);
+        assert_eq!(row.insight.age_min, Some(25));
+        assert_eq!(row.digest, "正在筹备开店");
+        assert!(row.last_run_at.is_some());
+        assert!(repo
+            .load_insight_row(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn instance_persona_joins_genome(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "Aria", "active").await;
+        let p = repo.instance_persona(inst).await.unwrap().expect("persona");
+        assert_eq!(p.name, "Aria");
+        assert_eq!(p.art_metadata["backstory"], "bs");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recent_events_chronological_and_limited(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        for (i, c) in ["e1", "e2", "e3"].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO engine.persona_story_events \
+                 (owner_uid, instance_id, category, content, story_date, created_at) \
+                 VALUES ($1, $2, 'life', $3, current_date, now() - make_interval(mins => $4))",
+            )
+            .bind(owner)
+            .bind(inst)
+            .bind(c)
+            .bind((3 - i as i32) * 10)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ev = repo.recent_events(inst, 2).await.unwrap();
+        assert_eq!(
+            ev.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["e2", "e3"],
+            "latest 2, oldest→newest"
+        );
+        assert_eq!(ev[0].0, "life");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_evidence_windows_pairs_and_scopes(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let other = seed_instance(&pool, owner, "B", "active").await;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(inst)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let other_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(other)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // In-window pair + out-of-window pair + other-instance pair.
+        for (s, u, a, ago_days) in [
+            (session, "你今天忙吗", "在准备开店的事", 1),
+            (session, "老掉牙", "旧回复", 10),
+            (other_session, "别的角色", "别的回复", 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, 'user', $2, now() - make_interval(days => $4, mins => 1)), \
+                        ($1, 'assistant', $3, now() - make_interval(days => $4))",
+            )
+            .bind(s)
+            .bind(u)
+            .bind(a)
+            .bind(ago_days)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let pairs = repo.chat_evidence(owner, inst, 7, 60).await.unwrap();
+        assert_eq!(
+            pairs,
+            vec![("你今天忙吗".to_string(), "在准备开店的事".to_string())]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn affinity_snapshot_uses_latest_active_session(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        assert!(repo.affinity_snapshot(owner, inst).await.unwrap().is_none());
+        for (label, ago) in [("旧识", "10 days"), ("挚友", "1 hour")] {
+            let s: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at) \
+                 VALUES ($1, $2, now() - $3::interval) RETURNING id",
+            )
+            .bind(owner)
+            .bind(inst)
+            .bind(ago)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO engine.companion_affinity \
+                 (session_id, user_id, instance_id, relationship_label) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(s)
+            .bind(owner)
+            .bind(inst)
+            .bind(label)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let snap = repo
+            .affinity_snapshot(owner, inst)
+            .await
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(snap.relationship_label.as_deref(), Some("挚友"));
+        assert!(snap.bond >= 0.0 && snap.chemistry >= 0.0);
     }
 }
