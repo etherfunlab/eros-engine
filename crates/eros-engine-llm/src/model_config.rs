@@ -579,6 +579,15 @@ pub struct TaskConfig {
     /// reply scan so its cost is independent of total post count (issue #176).
     #[serde(default)]
     pub reply_window_secs: Option<u64>,
+    /// world_stories_director-only: activity gate — a story instance is only
+    /// claimed when its (owner, instance) chatted within this many hours.
+    /// Default 72, floor 1.
+    #[serde(default)]
+    pub active_window_hours: Option<u32>,
+    /// world_stories_director-only: chat/affinity evidence window in days fed
+    /// to each story round. Default 7, floor 1.
+    #[serde(default)]
+    pub context_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -883,6 +892,25 @@ pub struct ResolvedWorldReply {
     pub thread_cooldown_secs: u64,
     pub daily_cap: u32,
     pub reply_window_secs: u64,
+}
+
+/// Resolved world-stories task (`world_stories_director`). The configured
+/// `filter_prompt` is the system instruction; the server assembles the
+/// per-instance story payload as a separate user message.
+#[derive(Debug, Clone)]
+pub struct ResolvedWorldStories {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub director_prompt: String,
+    pub retry_depth: u32,
+    pub reasoning: Option<ReasoningConfig>,
+    pub structured_output: bool,
+    pub interval_hours: u32,
+    pub retention_days: u32,
+    pub active_window_hours: u32,
+    pub context_days: u32,
 }
 
 /// Resolved image-generation task (`chat_image_generation`). `model` is optional:
@@ -1700,6 +1728,34 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the world-stories bundle. `None` when
+    /// `[tasks.world_stories_director]` is absent OR its `filter_prompt` is
+    /// blank — the story claim path goes inert.
+    pub fn resolve_world_stories_director(&self) -> Option<ResolvedWorldStories> {
+        let task_cfg = self.tasks.get("world_stories_director")?;
+        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        if director_prompt.trim().is_empty() {
+            return None;
+        }
+        let m = self.resolve("world_stories_director", None);
+        Some(ResolvedWorldStories {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            director_prompt,
+            retry_depth: m.retry_depth,
+            reasoning: m.reasoning,
+            structured_output: task_cfg.structured_output.unwrap_or(true),
+            // .max(1) floors mirror world_director: 0 would fire every tick /
+            // empty the evidence window — cost/behavior footguns, not settings.
+            interval_hours: task_cfg.interval_hours.unwrap_or(8).max(1),
+            retention_days: task_cfg.retention_days.unwrap_or(30),
+            active_window_hours: task_cfg.active_window_hours.unwrap_or(72).max(1),
+            context_days: task_cfg.context_days.unwrap_or(7).max(1),
+        })
+    }
+
     /// Boot-time validation for the two extraction tasks. A task **section that
     /// is present** must carry a usable `filter_prompt` (else `Err`); an
     /// **absent section** means that extraction is simply off (`Ok`). Returns a
@@ -1721,18 +1777,31 @@ impl ModelConfig {
     }
 
     /// Boot gate, mirroring `validate_extraction_prompts`: any present world
-    /// task section (`world_director` / `world_comment` / `world_reply`) must
-    /// carry a usable `filter_prompt`. `world_director` is always checked;
-    /// the two town sections (`world_comment` / `world_reply`) are checked
-    /// only when `include_town` is true. `include_town = false`
-    /// (WORLD_TOWN_DISABLED) skips the two town sections so a staged/broken
-    /// town config cannot block boot — same isolation rationale as
-    /// WORLD_DISABLED for the whole block.
-    pub fn validate_world_prompts(&self, include_town: bool) -> Result<(), String> {
+    /// task section (`world_director` / `world_comment` / `world_reply` /
+    /// `world_stories_director`) must carry a usable `filter_prompt`.
+    /// `world_director` is always checked; the two town sections
+    /// (`world_comment` / `world_reply`) are checked only when `include_town`
+    /// is true. `include_town = false` (WORLD_TOWN_DISABLED) skips the two
+    /// town sections so a staged/broken town config cannot block boot — same
+    /// isolation rationale as WORLD_DISABLED for the whole block.
+    /// `world_stories_director` is checked only when `include_stories` is
+    /// true — `include_stories = false` (WORLD_STORIES_DISABLED) isolates a
+    /// staged/broken stories config the same way.
+    pub fn validate_world_prompts(
+        &self,
+        include_town: bool,
+        include_stories: bool,
+    ) -> Result<(), String> {
         let mut checks = vec![("world_director", self.resolve_world_director().is_none())];
         if include_town {
             checks.push(("world_comment", self.resolve_world_comment().is_none()));
             checks.push(("world_reply", self.resolve_world_reply().is_none()));
+        }
+        if include_stories {
+            checks.push((
+                "world_stories_director",
+                self.resolve_world_stories_director().is_none(),
+            ));
         }
         for (name, unresolved) in checks {
             if self.tasks.contains_key(name) && unresolved {
@@ -4542,13 +4611,20 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn validate_world_prompts_gates_all_three_sections() {
         let cfg = ModelConfig::from_toml_str("").unwrap();
-        assert!(cfg.validate_world_prompts(true).is_ok(), "absent ⇒ Ok");
-        assert!(cfg.validate_world_prompts(false).is_ok(), "absent ⇒ Ok");
+        assert!(
+            cfg.validate_world_prompts(true, true).is_ok(),
+            "absent ⇒ Ok"
+        );
+        assert!(
+            cfg.validate_world_prompts(false, false).is_ok(),
+            "absent ⇒ Ok"
+        );
 
-        // world_director errs regardless of include_town (never town-gated).
+        // world_director errs regardless of include_town/include_stories
+        // (never town/stories-gated).
         let cfg = ModelConfig::from_toml_str("[tasks.world_director]\nmodel = \"w/m\"\n").unwrap();
         for include_town in [true, false] {
-            let err = cfg.validate_world_prompts(include_town).unwrap_err();
+            let err = cfg.validate_world_prompts(include_town, false).unwrap_err();
             assert!(
                 err.contains("world_director"),
                 "error names the section: {err}"
@@ -4560,12 +4636,86 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         for section in ["world_comment", "world_reply"] {
             let cfg = ModelConfig::from_toml_str(&format!("[tasks.{section}]\nmodel = \"w/m\"\n"))
                 .unwrap();
-            let err = cfg.validate_world_prompts(true).unwrap_err();
+            let err = cfg.validate_world_prompts(true, false).unwrap_err();
             assert!(err.contains(section), "error names the section: {err}");
             assert!(
-                cfg.validate_world_prompts(false).is_ok(),
+                cfg.validate_world_prompts(false, false).is_ok(),
                 "include_town=false skips {section}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_world_stories_defaults_and_overrides() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_stories_director]\nmodel = \"w/s\"\nfilter_prompt = \"live a life\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_stories_director().expect("configured");
+        assert_eq!(r.model, "w/s");
+        assert_eq!(r.director_prompt, "live a life");
+        assert!(r.structured_output, "default true");
+        assert_eq!(r.interval_hours, 8, "stories default cadence is 8h");
+        assert_eq!(r.retention_days, 30);
+        assert_eq!(r.active_window_hours, 72);
+        assert_eq!(r.context_days, 7);
+
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_stories_director]\nmodel = \"w/s\"\nfilter_prompt = \"p\"\n\
+             interval_hours = 4\nretention_days = 14\nactive_window_hours = 24\ncontext_days = 3\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_stories_director().unwrap();
+        assert_eq!(r.interval_hours, 4);
+        assert_eq!(r.retention_days, 14);
+        assert_eq!(r.active_window_hours, 24);
+        assert_eq!(r.context_days, 3);
+
+        // 0 floors: interval/window/context of 0 would fire every tick or empty the evidence.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_stories_director]\nmodel = \"w/s\"\nfilter_prompt = \"p\"\n\
+             interval_hours = 0\nactive_window_hours = 0\ncontext_days = 0\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_world_stories_director().unwrap();
+        assert_eq!(r.interval_hours, 1);
+        assert_eq!(r.active_window_hours, 1);
+        assert_eq!(r.context_days, 1);
+    }
+
+    #[test]
+    fn resolve_world_stories_none_when_absent_or_blank_prompt() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(
+            cfg.resolve_world_stories_director().is_none(),
+            "absent ⇒ None"
+        );
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_stories_director]\nmodel = \"w/s\"\nfilter_prompt = \"  \"\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.resolve_world_stories_director().is_none(),
+            "blank ⇒ None"
+        );
+    }
+
+    #[test]
+    fn validate_world_prompts_checks_stories_only_when_included() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_stories_director]\nmodel = \"w/s\"\nfilter_prompt = \"\"\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.validate_world_prompts(false, true).is_err(),
+            "blank stories prompt refuses boot"
+        );
+        assert!(
+            cfg.validate_world_prompts(false, false).is_ok(),
+            "WORLD_STORIES_DISABLED skips the stories check"
+        );
+        // No stories section at all ⇒ fine either way.
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.validate_world_prompts(true, true).is_ok());
     }
 }

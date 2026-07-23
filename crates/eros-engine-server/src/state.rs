@@ -25,6 +25,17 @@ pub struct AppState {
     /// distinct from `config.world.disabled` / `prompt_disabled`, which are
     /// operator env-var kill switches for a subsystem that IS configured.
     pub world_configured: bool,
+    /// Whether `[tasks.world_stories_director]` resolves to `Some` (a usable
+    /// filter_prompt is present), computed once at boot. Mirrors
+    /// `world_configured` but for the world-stories subsystem — distinct from
+    /// `config.world.stories_disabled` / `stories_prompt_disabled`, which are
+    /// operator env-var kill switches for a subsystem that IS configured.
+    // Not yet read outside this module — the consumer (`fetch_stories_context`
+    // gating) lands in a later task. This crate is bin-only (no lib target),
+    // so an unread `pub` field is flagged as dead code even though it's part
+    // of AppState's public shape.
+    #[allow(dead_code)]
+    pub stories_configured: bool,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -80,18 +91,18 @@ pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathB
 }
 
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
-/// injection off, town disabled off, 300-second sweep cadence.
+/// injection off, town disabled off, stories disabled off, stories-prompt
+/// injection off, 300-second sweep cadence.
 #[derive(Clone, Debug)]
 pub struct WorldConfig {
-    pub disabled: bool,        // WORLD_DISABLED — master switch
-    pub prompt_disabled: bool, // WORLD_PROMPT_DISABLED — injection-only valve
-    pub town_disabled: bool,   // WORLD_TOWN_DISABLED — town sweeper switch
-    // Not yet read outside this module — the consumer (`stories_configured`
-    // resolution + `fetch_stories_context` gating) lands in the next task.
-    // This crate is bin-only (no lib target), so an unread `pub` field is
-    // flagged as dead code even though it's part of the parser's public shape.
-    #[allow(dead_code)]
+    pub disabled: bool,         // WORLD_DISABLED — master switch
+    pub prompt_disabled: bool,  // WORLD_PROMPT_DISABLED — injection-only valve
+    pub town_disabled: bool,    // WORLD_TOWN_DISABLED — town sweeper switch
     pub stories_disabled: bool, // WORLD_STORIES_DISABLED — stories rounds + injection off
+    // Not yet read outside this module — the consumer (`fetch_stories_context`
+    // prompt-injection gating) lands in a later task. This crate is bin-only
+    // (no lib target), so an unread `pub` field is flagged as dead code even
+    // though it's part of the parser's public shape.
     #[allow(dead_code)]
     pub stories_prompt_disabled: bool, // WORLD_STORIES_PROMPT_DISABLED — injection-only valve
     pub tick: Duration, // WORLD_TICK_SECS, default 300
