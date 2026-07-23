@@ -7,6 +7,7 @@ pub mod dreaming;
 pub mod handlers;
 pub mod post_process;
 pub mod snapshot;
+pub mod story;
 pub mod stream;
 pub mod voice;
 pub mod world;
