@@ -78,7 +78,7 @@ LIMIT $3;
 
 Relationship-layer search adds `instance_id = $4`. The `1 - distance` lets you sort or threshold on similarity directly without remembering pgvector's distance-not-similarity convention.
 
-`lists = 100` is a balanced default for small-to-medium tables (≲ 1M rows). Tune up for larger corpuses (rule of thumb: `lists ≈ √rows`).
+`lists = 100` is a balanced default for small-to-medium tables (≲ 1M rows). Tune up for larger corpora (rule of thumb: `lists ≈ √rows`).
 
 ## What gets embedded
 
