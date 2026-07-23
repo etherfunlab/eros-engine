@@ -970,4 +970,137 @@ mod tests {
         assert_eq!(seed["arc"], "第一幕");
         assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
     }
+
+    /// End-to-end wiring proof for the DB-driven `stories_active` branch
+    /// (spec §4): a real `persona_story_events` row for a stories-enabled
+    /// owner must reach the director's actual OpenRouter payload via
+    /// `StoryRepo::events_since` + `director_user_payload`, not just the
+    /// pure-layer unit test's hand-built HashMap.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_injects_recent_life_when_stories_active(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // last_run_at stays NULL for this never-run owner — direct_world's
+        // `since` fallback (now() - 24h) is what must pick up this event.
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '刚拿到新工作的offer', current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n\
+                 [tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        assert!(
+            state
+                .model_config
+                .resolve_world_stories_director()
+                .is_some(),
+            "world_stories_director must resolve for stories_active to be true"
+        );
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (owner_claimed, token) = claimed[0];
+        assert_eq!(owner_claimed, owner);
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        // The key assertion: the real DB-driven recent_life glue must have
+        // put the story event's content into the actual LLM request body —
+        // not just a hand-built HashMap in the pure-layer unit test.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("recent_life"),
+            "payload must carry the recent_life key when stories-active"
+        );
+        assert!(
+            body.contains("刚拿到新工作的offer"),
+            "the story event content must reach the director payload"
+        );
+
+        // And the round completed successfully end-to-end.
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+    }
 }
