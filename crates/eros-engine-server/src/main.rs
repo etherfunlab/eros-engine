@@ -314,8 +314,13 @@ async fn run_server() -> Result<()> {
     // WORLD_TOWN_DISABLED isolates the two town sections
     // ([tasks.world_comment] / [tasks.world_reply]) the same way: the town
     // sweeper won't spawn, so a staged/broken town config must not block boot.
+    // WORLD_STORIES_DISABLED isolates the world_stories_director section the
+    // same way: the story sweeper won't spawn and stories injection is gated
+    // too, so a staged/broken stories config must not block boot.
     if !cfg.world.disabled {
-        if let Err(msg) = model_config.validate_world_prompts(!cfg.world.town_disabled) {
+        if let Err(msg) = model_config
+            .validate_world_prompts(!cfg.world.town_disabled, !cfg.world.stories_disabled)
+        {
             anyhow::bail!(msg);
         }
     }
@@ -347,6 +352,7 @@ async fn run_server() -> Result<()> {
     // struct: gates fetch_world_context so an unconfigured deployment (no
     // [tasks.world_director] section) never runs the world JOIN per reply.
     let world_configured = model_config.resolve_world_director().is_some();
+    let stories_configured = model_config.resolve_world_stories_director().is_some();
 
     let state = AppState {
         pool,
@@ -358,6 +364,7 @@ async fn run_server() -> Result<()> {
         output_regex,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
         world_configured,
+        stories_configured,
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth

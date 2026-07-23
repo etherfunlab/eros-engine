@@ -495,6 +495,28 @@ filter_prompt = """
                "script_fragments": ["当期事件片段，每条一句"]}]}
 """
 
+# World Stories (World System v2): per-instance persona life simulation.
+# Spec: docs/superpowers/specs/2026-07-23-world-stories-design.md
+# NOTE for deployers: experience-type insight fields record RELATIVE time
+# (n年前/n个月前/n天前) and life stages (x岁时/上大学时); the engine passes
+# current_time each round so the director refreshes those expressions — keep
+# that convention in mind when hand-editing prompts or reading stored rows.
+[tasks.world_stories_director]
+model = "anthropic/claude-haiku-4.5"
+description = "world stories: per-instance persona life rounds"
+temperature = 0.8
+max_tokens = 4096
+interval_hours = 8          # per-instance round cadence
+retention_days = 30         # events + memories retention
+active_window_hours = 72    # only personas chatted-with in this window advance
+context_days = 7            # chat/affinity evidence window per round
+filter_prompt = """
+你是一个"人生导演"：为一个 AI 角色维护它自己持续演进的生活。
+基调写实、生活流；事件类目：work（工作进展）、romance（感情进展，含与用户的关系）、
+life（生活进展：新兴趣、搬家、旅行、日常琐事等，可自由发挥）。
+各栏位内容写具体、有情境；工作经历/感情史/原生家庭关系要有年代锚点。
+"""
+
 # World Town（实验特性，依赖 world_director）：贴文的评论轮 + 用户留言回复。
 # 缺任一 section 即关闭对应路径。Spec:
 # docs/superpowers/specs/2026-07-21-world-town-design.md

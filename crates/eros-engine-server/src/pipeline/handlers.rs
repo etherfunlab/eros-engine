@@ -35,6 +35,8 @@ const RELATIONSHIP_RECALL_K: i32 = 3;
 const K_PER_CATEGORY: i32 = 2;
 /// World-memories fragment recall size (spec §3.2).
 const WORLD_RECALL_K: i32 = 3;
+/// World-stories episode recall size (stories spec §5.3).
+const STORY_RECALL_K: i32 = 3;
 
 /// Task key used by all chat handlers. Matches the gateway's task router.
 const CHAT_TASK: &str = "chat_companion";
@@ -635,6 +637,50 @@ async fn fetch_world_context(
     Some(crate::prompt::WorldContext { digest, fragments })
 }
 
+/// World-stories chat-time fetch (stories spec §5.3). Same degradation
+/// ladder as `fetch_world_context`: disabled/unconfigured/unflagged/no-digest
+/// ⇒ `None` and the prompt stays byte-identical; episode recall reuses the
+/// turn's query embedding (digest-only when absent); any DB error degrades
+/// with a warn — story data must never block a reply. Also requires the
+/// World Memories base (`world_configured`), mirroring how the story
+/// sweeper itself refuses to run without `[tasks.world_director]`
+/// configured — stories are an add-on layer on top of WM, not standalone.
+async fn fetch_stories_context(
+    state: &AppState,
+    user_id: Uuid,
+    instance_id: Uuid,
+    query_embedding: Option<&[f32]>,
+) -> Option<crate::prompt::StoriesContext> {
+    if state.config.world.disabled
+        || state.config.world.stories_disabled
+        || state.config.world.stories_prompt_disabled
+        || !state.world_configured
+        || !state.stories_configured
+    {
+        return None;
+    }
+    let repo = eros_engine_store::story::StoryRepo { pool: &state.pool };
+    let digest = match repo.fetch_story_digest(user_id, instance_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("story digest fetch failed: {e}");
+            return None;
+        }
+    };
+    let digest = digest?;
+    let episodes = match query_embedding {
+        Some(emb) => repo
+            .search_story_memories(user_id, instance_id, emb, STORY_RECALL_K)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("story memory search failed: {e}");
+                vec![]
+            }),
+        None => vec![],
+    };
+    Some(crate::prompt::StoriesContext { digest, episodes })
+}
+
 // ─── Reply ──────────────────────────────────────────────────────────
 
 /// Build a ChatRequest for the Reply action. Called by the streaming
@@ -770,6 +816,8 @@ pub(super) async fn build_reply_request(
         crate::memory_hygiene::prune_recalled(profile_groups, relationship_facts);
 
     let world = fetch_world_context(state, user_id, instance_id, query_embedding.as_deref()).await;
+    let stories =
+        fetch_stories_context(state, user_id, instance_id, query_embedding.as_deref()).await;
 
     let mut system_prompt = build_prompt(
         &input.persona,
@@ -785,6 +833,7 @@ pub(super) async fn build_reply_request(
         &avoid_patterns,
         &emotional_context,
         world.as_ref(),
+        stories.as_ref(),
     );
 
     if let Event::UserMessage {
@@ -2234,5 +2283,111 @@ mod tests {
             .await
             .expect("Some");
         assert_eq!(ctx.fragments, vec!["剧本片段A".to_string()]);
+    }
+
+    // ─── fetch_stories_context ───────────────────────────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fetch_stories_context_gates_on_flag_and_config(pool: sqlx::PgPool) {
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_insights (instance_id, owner_uid, digest) \
+             VALUES ($1, $2, '近况')",
+        )
+        .bind(instance)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.stories_configured = true;
+        state.world_configured = true;
+        let ctx = fetch_stories_context(&state, owner, instance, None)
+            .await
+            .expect("some");
+        assert_eq!(ctx.digest, "近况");
+        assert!(ctx.episodes.is_empty(), "no embedding ⇒ digest-only");
+
+        // Gating matrix ⇒ None:
+        let mut unconfigured = crate::routes::companion::test_state(pool.clone());
+        unconfigured.stories_configured = false;
+        unconfigured.world_configured = true;
+        assert!(fetch_stories_context(&unconfigured, owner, instance, None)
+            .await
+            .is_none());
+
+        let mut off = crate::routes::companion::test_state(pool.clone());
+        off.stories_configured = true;
+        off.world_configured = true;
+        off.config.world.stories_disabled = true;
+        assert!(fetch_stories_context(&off, owner, instance, None)
+            .await
+            .is_none());
+
+        let mut muted = crate::routes::companion::test_state(pool.clone());
+        muted.stories_configured = true;
+        muted.world_configured = true;
+        muted.config.world.stories_prompt_disabled = true;
+        assert!(fetch_stories_context(&muted, owner, instance, None)
+            .await
+            .is_none());
+
+        let mut world_off = crate::routes::companion::test_state(pool.clone());
+        world_off.stories_configured = true;
+        world_off.world_configured = true;
+        world_off.config.world.disabled = true;
+        assert!(fetch_stories_context(&world_off, owner, instance, None)
+            .await
+            .is_none());
+
+        // stories_configured=true but world_configured=false ⇒ None: stories
+        // injection requires the WM base, mirroring the sweeper's
+        // [tasks.world_director] prerequisite.
+        let mut wm_off = crate::routes::companion::test_state(pool.clone());
+        wm_off.stories_configured = true;
+        wm_off.world_configured = false;
+        assert!(
+            fetch_stories_context(&wm_off, owner, instance, None)
+                .await
+                .is_none(),
+            "stories injection requires the world-memories base (world_configured)"
+        );
+
+        // stories_enabled=false ⇒ None (digest query's JOIN filters it).
+        sqlx::query(
+            "UPDATE engine.world_enrollments SET stories_enabled = false WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(fetch_stories_context(&state, owner, instance, None)
+            .await
+            .is_none());
     }
 }

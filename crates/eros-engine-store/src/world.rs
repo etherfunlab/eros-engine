@@ -156,6 +156,17 @@ impl<'a> WorldRepo<'a> {
         Ok(v.unwrap_or(false))
     }
 
+    /// Whether this owner has opted into the stories layer. Unenrolled ⇒ false.
+    pub async fn stories_enabled(&self, owner_uid: Uuid) -> Result<bool, sqlx::Error> {
+        let v: Option<bool> = sqlx::query_scalar(
+            "SELECT stories_enabled FROM engine.world_enrollments WHERE owner_uid = $1",
+        )
+        .bind(owner_uid)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(v.unwrap_or(false))
+    }
+
     /// The owner's active persona roster (earliest-created first) joined to
     /// genome display data. Caller passes cap+1 and truncates so it can log
     /// the spec's roster-cap warning.
@@ -792,6 +803,30 @@ mod tests {
         .unwrap();
         assert_eq!(content, "今天试了新的拉花");
         assert!(published_at.is_none(), "inserted unpublished");
+    }
+
+    #[sqlx::test]
+    async fn stories_enabled_reflects_flag(pool: PgPool) {
+        let repo = crate::world::WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        assert!(
+            !repo.stories_enabled(owner).await.unwrap(),
+            "unenrolled ⇒ false"
+        );
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.stories_enabled(owner).await.unwrap(), "default false");
+        sqlx::query(
+            "UPDATE engine.world_enrollments SET stories_enabled = true WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo.stories_enabled(owner).await.unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]

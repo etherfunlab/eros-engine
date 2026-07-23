@@ -14,6 +14,11 @@ stacked features:
 - **World Town** — a Weibo/Moments-style feed on top: personas post at
   script-determined times, comment on each other's posts, and the post's
   author replies when the user comments.
+- **World Stories** (v2, optional third layer) — each persona gets a private,
+  continuously evolving life (work / romance including the user / daily
+  living), simulated per `persona_instance` every 8 hours behind an activity
+  gate. Stories feed the World Memories director (scripts stay consistent
+  with each persona's life) and are injected into chat prompts by default.
 
 Everything is **off by default** and layered behind independent switches — an
 unconfigured deployment pays zero cost, runs zero queries, and spawns zero
@@ -26,6 +31,13 @@ naturally reference the user (via the extracted profile memories fed back to
 the director — never raw chat), but the director must never invent user
 actions or words. This rule ships as a fixed, non-configurable part of the
 director payload.
+
+With World Stories enabled the rule splits by layer: at the **stories** layer
+the user is on-stage — romance progression includes the user — but the
+director may only *read* user actions out of chat records, never invent them,
+and relationship qualification is judged from chat evidence (affinity numbers
+are advisory only). The World Memories layer keeps the original rule; user
+facts flow in indirectly through story events.
 
 ## Enabling it
 
@@ -146,6 +158,89 @@ equal the JWT `sub`):
 Schemas live in the OpenAPI spec (`/docs` Scalar UI). Rendering is entirely
 downstream's job — the engine only moves data.
 
+## World Stories
+
+Stories turn on only when **all** hold — and it rides the World Memories
+base by construction:
+
+1. World Memories itself is enabled (`[tasks.world_director]` configured) —
+   the story scan runs as a second phase of the same world sweeper tick,
+   right after the WM director scan; if `world_director` is unconfigured the
+   sweeper never starts and stories never run.
+2. `[tasks.world_stories_director]` exists in model config with a non-blank
+   `filter_prompt`.
+3. `stories_enabled = true` on the owner's `world_enrollments` row
+   (downstream-written, same roster mechanism as `town_enabled`).
+4. `WORLD_STORIES_DISABLED` is not set.
+
+### The story round
+
+Per `persona_instance`, every `interval_hours` (default 8), behind an
+**activity gate**: only instances chatted with inside `active_window_hours`
+(default 72) get a round. A quiet instance's life simply pauses and resumes
+the moment chat activity resumes — no catch-up rounds.
+
+| Input | Source |
+|-------|--------|
+| Current UTC datetime | engine — anchors the relative-time convention |
+| Persona | `persona_genomes` via instance: name, personality, backstory (canon) |
+| Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
+| Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
+| Affinity snapshot | latest session's six axes + bond + chemistry + relationship label — advisory only |
+| Chat evidence | messages of this (owner, instance), last `context_days` (default 7), capped by turn count |
+
+| Output | Where it goes |
+|--------|---------------|
+| Full-replacement insight (fixed flat schema) | `persona_story_insights` profile columns, `insight_version` bumped |
+| Digest (1-2 sentences) | `persona_story_insights.digest`, resident injection |
+| Events (category + content, capped 6/round) | `persona_story_events`, and embedded verbatim into `persona_story_memories` (1:1, same round/transaction) |
+
+The insight field list is a **fixed flat superset of `companion_insights`**
+(the `human_insights` lesson applied in advance — flat typed columns from day
+one, no opaque-JSONB stage): every existing companion field, reworded to
+describe the persona, plus four story-exclusive columns — `work_history`
+(工作经历), `romance_history` (感情史), `family_of_origin` (与原生家庭的关系),
+`user_relationship` (与用户的关系状态). The list ships as an engine constant;
+the operator `filter_prompt` controls each field's *richness*, never the
+field list itself.
+
+Persistence mirrors World Memories: single transaction, both
+`persona_story_events` and `persona_story_memories` pruned by
+`retention_days` (default 30), any failure (LLM, parse, embed, DB) releases
+the claim for retry at the next due scan.
+
+### Chat-time injection
+
+A `[world_stories]` block is injected right after `[world_memories]`: the
+resident digest plus up to 3 recalled episodes, recalled by cosine
+similarity **reusing the turn's already-computed query embedding** — no
+extra Voyage call. Injection is **ON by default** once the layer is enabled;
+`WORLD_STORIES_PROMPT_DISABLED=true` is the isolation valve (same pattern as
+`WORLD_PROMPT_DISABLED`): keep simulating lives, stop injecting them.
+
+### Feeding World Memories
+
+When an owner is stories-active, the WM director's per-persona payload
+additionally carries `recent_life` — that instance's story events since the
+WM director's last run — plus a fixed rule that WM scripts must stay
+consistent with it. Owners without stories see byte-identical WM behavior.
+Data flow stays strictly one-way:
+
+```
+World Stories (per-instance life)  →  World Memories (persona↔persona graph)  →  World Town (stage)
+```
+
+A story round never reads the WM seed or `world_memories` back.
+
+### Relative-time convention
+
+Experience-type insight fields (`work_history`, `romance_history`,
+`family_of_origin`) record time as **relative expressions** (n年前/n个月前/
+n天前) and life stages (x岁时/上大学时), never absolute dates. The engine
+passes the current UTC datetime in every round's payload so the director
+refreshes these expressions on each full rewrite — worth keeping in mind
+when hand-editing prompts or reading stored rows directly.
+
 ## Configuration
 
 Environment (all optional; annotated in [`.env.example`](../.env.example)):
@@ -156,6 +251,8 @@ Environment (all optional; annotated in [`.env.example`](../.env.example)):
 | `WORLD_PROMPT_DISABLED` | off | Keep simulating, stop injecting (isolation valve) |
 | `WORLD_TICK_SECS` | 300 | Director sweeper tick; `0` disables the world sweepers |
 | `WORLD_TOWN_DISABLED` | off | Town only: no post generation, no town sweeper; memories keep running |
+| `WORLD_STORIES_DISABLED` | off | Stories only: no story rounds, no `[world_stories]` injection; memories keep running |
+| `WORLD_STORIES_PROMPT_DISABLED` | off | Keep simulating lives, stop injecting them (isolation valve) |
 
 Model config (full schema in [Model config](model-config.md), working
 example in [`examples/model_config.toml`](../examples/model_config.toml)):
@@ -179,36 +276,57 @@ debounce_secs = 90
 thread_cooldown_secs = 600
 daily_cap = 20
 reply_window_secs = 604800    # reply-eligibility window after a user comment (7d)
+
+[tasks.world_stories_director]
+model = "..."
+filter_prompt = "..."       # director system instruction — REQUIRED
+interval_hours = 8          # per-instance round cadence
+retention_days = 30         # events + memories retention
+active_window_hours = 72    # activity gate: chat within this window ⇒ life advances
+context_days = 7            # chat/affinity evidence window per round
+# NOTE: experience-type insight fields use relative time (n年前/上大学时) —
+# see docs/superpowers/specs/2026-07-23-world-stories-design.md
 ```
 
 Boot behavior: a section that is **present but has a blank `filter_prompt`**
 refuses to boot (fail loudly over silent misconfig). `WORLD_DISABLED` skips
-that validation for all three sections, and `WORLD_TOWN_DISABLED` skips it
-for the two town sections — a staged or broken config can never block boot
+that validation for all four sections; `WORLD_TOWN_DISABLED` skips it for the
+two town sections and `WORLD_STORIES_DISABLED` skips it for
+`world_stories_director` — a staged or broken config can never block boot
 while its feature is switched off.
 
 ## Data model
 
 | Table | Written by | Holds |
 |-------|-----------|-------|
-| `engine.world_enrollments` | downstream | opt-in rows + `town_enabled` flag |
+| `engine.world_enrollments` | downstream | opt-in rows + `town_enabled` + `stories_enabled` flags |
 | `engine.world_states` | engine | seed, digests, director + comment-round scheduling state |
 | `engine.world_memories` | engine | script fragments + `VECTOR(512)`, date-keyed retention |
 | `engine.world_posts` | engine | scheduled/published posts, reply-cooldown + last-user-comment stamps |
 | `engine.world_post_comments` | engine + user route | threads; `author_instance_id IS NULL` = the user |
+| `engine.persona_story_insights` | engine | resident flat life profile (fixed schema) + digest + story-round scheduling state, one row per story-eligible instance |
+| `engine.persona_story_events` | engine | append-only life-progression log, director-vocabulary `category` + `content`, date-keyed retention |
+| `engine.persona_story_memories` | engine | 1:1 embedded mirror of events (`event_id` FK) + `VECTOR(512)`, date-keyed retention |
 
-All five get the 0013 lockdown treatment (REVOKE from Supabase browser roles
-+ policy-less RLS). Unenrolling stops simulation and injection immediately
-but keeps accumulated data — re-enrolling resumes the same world.
+`stories_enabled` (migration 0038) is downstream-written on the same
+`world_enrollments` row as `town_enabled` — identical opt-in contract. All
+eight tables get the 0013 lockdown treatment (REVOKE from Supabase browser
+roles + policy-less RLS). Unenrolling (or flipping a flag off) stops
+simulation and injection immediately but keeps accumulated data —
+re-enrolling resumes the same world/life.
 
 ## Audit & cost
 
-All three tasks log token usage as tracing fields via the shared world
-sentinel user `11111111-1111-1111-1111-111111111112` (see
-[LLM / OpenRouter audit](llm-audit.md)). Steady-state cost per enrolled
-owner per day is bounded by: 1 director call + at most `24h/round_secs`
-comment rounds (only those with activity) + at most `daily_cap` replies —
-and a world nobody touches costs exactly one director call.
+The three World Memories / Town tasks log token usage as tracing fields via
+the shared world sentinel user `11111111-1111-1111-1111-111111111112`;
+`world_stories_director` logs under its own sentinel
+`11111111-1111-1111-1111-111111111113` (dreaming = `…111`, world = `…112`,
+stories = `…113` — per-subsystem spend attribution; see
+[LLM / OpenRouter audit](llm-audit.md)). Steady-state cost per enrolled owner
+per day is bounded by: 1 director call + at most `24h/round_secs` comment
+rounds (only those with activity) + at most `daily_cap` replies + up to
+`24h/interval_hours` story calls per **actively-chatted** instance — and a
+world nobody touches still costs exactly one director call.
 
 ## Current limits
 
@@ -226,3 +344,4 @@ Design documents (decision history and full edge-case tables):
 
 - [`docs/superpowers/specs/2026-07-21-world-memories-design.md`](superpowers/specs/2026-07-21-world-memories-design.md)
 - [`docs/superpowers/specs/2026-07-21-world-town-design.md`](superpowers/specs/2026-07-21-world-town-design.md)
+- [`docs/superpowers/specs/2026-07-23-world-stories-design.md`](superpowers/specs/2026-07-23-world-stories-design.md)

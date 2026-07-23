@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use eros_engine_llm::model_config::ResolvedWorldDirector;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+use eros_engine_store::story::StoryRepo;
 use eros_engine_store::world::{FragmentInsert, PostInsert, RosterEntry, WorldRepo};
 
 use crate::state::AppState;
@@ -27,11 +28,15 @@ const WORLD_PICK_BATCH: i64 = 5;
 /// Claim considered crashed after this (spec §2.2).
 const WORLD_CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
 /// Roster cap per world (spec §2.3): earliest-created wins, warn on truncation.
-const WORLD_ROSTER_CAP: usize = 8;
+/// `pub(crate)`: also the story sweeper's `ensure_insight_rows` backfill cap
+/// (spec §3: same roster, same cap, same order as the WM roster).
+pub(crate) const WORLD_ROSTER_CAP: usize = 8;
 /// Memory-feedback rows per round (spec §2.3).
 const WORLD_FEEDBACK_K: i64 = 15;
 /// Defensive cap on fragments accepted per persona per round.
 const WORLD_FRAGMENTS_PER_PERSONA_CAP: usize = 6;
+/// Recent story events fed into the WM director per persona (spec §4).
+const WM_STORY_EVENTS_PER_PERSONA: usize = 10;
 
 /// Fixed engine-owned rules appended to every director payload. The
 /// operator-owned filter_prompt carries tone/genre; these are the floor.
@@ -47,6 +52,21 @@ const WORLD_TOWN_POST_RULES: &str = "\
 5) posts：为部分角色生成朋友圈式贴文（不是每个角色都要发；没有合适内容就输出空数组）。\
 每条含 instance_id、content（贴文正文，第一人称）、publish_at（ISO-8601 时间戳，\
 安排在未来一个周期内的自然时刻）。";
+
+/// Appended to WORLD_DIRECTOR_RULES only when the owner is stories-active
+/// (spec §4): scripts must stay consistent with each persona's recent_life;
+/// persona↔user relationship states come from recent_life; the WM-layer
+/// user-grounding rule is restated so the stories doorway can't erode it.
+///
+/// Numbered 6) — the town rule 5) (`WORLD_TOWN_POST_RULES`) is only
+/// conditionally appended, so a stories-active town-disabled owner sees
+/// rules 1,2,3,4,6 (no 5). Harmless: the numbers are cosmetic labels for
+/// the model, not referenced elsewhere. Do not dynamically renumber —
+/// that would alter the payload string for no behavioral gain.
+const WORLD_STORIES_WM_RULES: &str = "\
+6) 各角色的个人生活以其 recent_life 为准，剧本必须与之一致，不可矛盾；\
+角色与用户的关系状态以 recent_life 为准，其他角色可以自然提及，\
+但仍绝不编造用户的言行。";
 
 #[derive(Debug, Deserialize)]
 struct DirectorOutput {
@@ -93,6 +113,16 @@ pub async fn sweeper(state: AppState) {
         retention_days = resolved.retention_days,
         "world sweeper starting"
     );
+    let stories = if state.config.world.stories_disabled {
+        tracing::info!("world stories disabled (WORLD_STORIES_DISABLED)");
+        None
+    } else {
+        let r = state.model_config.resolve_world_stories_director();
+        if r.is_none() {
+            tracing::info!("world_stories_director not configured — stories inert");
+        }
+        r
+    };
     let mut tick = tokio::time::interval(tick_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -101,6 +131,13 @@ pub async fn sweeper(state: AppState) {
             Ok(0) => {}
             Ok(n) => tracing::info!(processed = n, "world: director rounds completed"),
             Err(e) => tracing::warn!("world: round scan failed: {e}"),
+        }
+        if let Some(s) = &stories {
+            match super::story::run_stories_scan(&state, s).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(processed = n, "world: story rounds completed"),
+                Err(e) => tracing::warn!("world: story scan failed: {e}"),
+            }
         }
     }
 }
@@ -166,6 +203,35 @@ async fn direct_world(
             .await
             .map_err(|e| format!("town_enabled load failed: {e}"))?;
 
+    let stories_active = !state.config.world.stories_disabled
+        && state
+            .model_config
+            .resolve_world_stories_director()
+            .is_some()
+        && repo
+            .stories_enabled(owner)
+            .await
+            .map_err(|e| format!("stories_enabled load failed: {e}"))?;
+    let recent_life = if stories_active {
+        let last_run: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT last_run_at FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| format!("world last_run load failed: {e}"))?
+                .flatten();
+        let since = last_run.unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
+        let story_repo = StoryRepo { pool: &state.pool };
+        Some(
+            story_repo
+                .events_since(owner, since, WM_STORY_EVENTS_PER_PERSONA)
+                .await
+                .map_err(|e| format!("recent_life load failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     let seed = repo
         .load_seed(owner)
         .await
@@ -176,7 +242,7 @@ async fn direct_world(
         .await
         .map_err(|e| format!("memory feedback load failed: {e}"))?;
 
-    let payload = director_user_payload(&seed, &roster, &memories, town);
+    let payload = director_user_payload(&seed, &roster, &memories, town, recent_life.as_ref());
     let req = ChatRequest {
         model: resolved.model.clone(),
         fallback_model: resolved.fallback_model.clone(),
@@ -285,23 +351,40 @@ async fn direct_world(
 /// Assemble the director's user message: framing header + structured JSON of
 /// previous seed / roster / memory feedback + the fixed rules. `town` appends
 /// `WORLD_TOWN_POST_RULES` (the posts rule) for town-enabled owners only —
-/// memories-only owners see no mention of posts.
+/// memories-only owners see no mention of posts. `recent_life` is `Some` only
+/// for stories-active owners (World System v2, spec §4): each persona's JSON
+/// entry gains a `recent_life` array and `WORLD_STORIES_WM_RULES` is
+/// appended. `None` reproduces the v1 payload byte-for-byte — no `recent_life`
+/// key anywhere, no stories rule.
 fn director_user_payload(
     seed: &serde_json::Value,
     roster: &[RosterEntry],
     memories: &[String],
     town: bool,
+    recent_life: Option<&std::collections::HashMap<Uuid, Vec<(String, String)>>>,
 ) -> String {
     let is_init = seed.as_object().map(|o| o.is_empty()).unwrap_or(false);
     let personas: Vec<serde_json::Value> = roster
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut p = serde_json::json!({
                 "instance_id": r.instance_id,
                 "name": r.name,
                 "personality": r.tip_personality,
                 "profile": r.art_metadata,
-            })
+            });
+            if let Some(life) = recent_life {
+                let events: Vec<serde_json::Value> = life
+                    .get(&r.instance_id)
+                    .map(|evs| {
+                        evs.iter()
+                            .map(|(cat, c)| serde_json::json!({"category": cat, "content": c}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                p["recent_life"] = serde_json::Value::Array(events);
+            }
+            p
         })
         .collect();
     let data = serde_json::json!({
@@ -314,11 +397,13 @@ fn director_user_payload(
     } else {
         "延续这个世界：在 previous_seed 的基础上推演关系发展，并生成当期剧本。"
     };
-    let rules = if town {
-        format!("{WORLD_DIRECTOR_RULES}{WORLD_TOWN_POST_RULES}")
-    } else {
-        WORLD_DIRECTOR_RULES.to_string()
-    };
+    let mut rules = WORLD_DIRECTOR_RULES.to_string();
+    if town {
+        rules.push_str(WORLD_TOWN_POST_RULES);
+    }
+    if recent_life.is_some() {
+        rules.push_str(WORLD_STORIES_WM_RULES);
+    }
     format!(
         "{header}\n\n{}\n\n{rules}",
         serde_json::to_string_pretty(&data).unwrap_or_default()
@@ -471,7 +556,7 @@ mod tests {
             tip_personality: Some("温柔".into()),
             art_metadata: serde_json::json!({"backstory": "咖啡店店主"}),
         }];
-        let init = director_user_payload(&serde_json::json!({}), &roster, &[], false);
+        let init = director_user_payload(&serde_json::json!({}), &roster, &[], false, None);
         assert!(init.contains("初始化这个世界"));
         assert!(init.contains("\"previous_seed\": null"));
         assert!(init.contains("Aria"));
@@ -482,10 +567,39 @@ mod tests {
             &roster,
             &["用户喜欢旅行".into()],
             false,
+            None,
         );
         assert!(cont.contains("延续这个世界"));
         assert!(cont.contains("\"arc\": \"opening\""));
         assert!(cont.contains("用户喜欢旅行"));
+    }
+
+    #[test]
+    fn director_payload_recent_life_only_when_stories_active() {
+        let inst = Uuid::new_v4();
+        let roster = vec![RosterEntry {
+            instance_id: inst,
+            name: "Aria".into(),
+            tip_personality: None,
+            art_metadata: serde_json::json!({}),
+        }];
+        let v1 = director_user_payload(&serde_json::json!({}), &roster, &[], false, None);
+        assert!(
+            !v1.contains("recent_life"),
+            "v1 payload has no stories trace"
+        );
+        assert!(!v1.contains("个人生活"), "no stories rule for v1");
+
+        let mut life = std::collections::HashMap::new();
+        life.insert(inst, vec![("work".to_string(), "定了开业日期".to_string())]);
+        let v2 = director_user_payload(&serde_json::json!({}), &roster, &[], false, Some(&life));
+        assert!(v2.contains("recent_life"));
+        assert!(v2.contains("定了开业日期"));
+        assert!(v2.contains("各角色的个人生活"), "stories rule appended");
+        assert!(
+            v2.contains("绝不编造用户的言行"),
+            "user-grounding kept at WM layer"
+        );
     }
 
     #[test]
@@ -557,9 +671,9 @@ mod tests {
             tip_personality: None,
             art_metadata: serde_json::json!({}),
         }];
-        let plain = director_user_payload(&serde_json::json!({}), &roster, &[], false);
+        let plain = director_user_payload(&serde_json::json!({}), &roster, &[], false, None);
         assert!(!plain.contains("posts"), "no posts rule for memories-only");
-        let town = director_user_payload(&serde_json::json!({}), &roster, &[], true);
+        let town = director_user_payload(&serde_json::json!({}), &roster, &[], true, None);
         assert!(
             town.contains("posts"),
             "town payload carries the posts rule"
@@ -853,6 +967,139 @@ mod tests {
             "town_disabled must suppress posts even when town_enabled=true"
         );
 
+        let (seed, digests): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seed["arc"], "第一幕");
+        assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+    }
+
+    /// End-to-end wiring proof for the DB-driven `stories_active` branch
+    /// (spec §4): a real `persona_story_events` row for a stories-enabled
+    /// owner must reach the director's actual OpenRouter payload via
+    /// `StoryRepo::events_since` + `director_user_payload`, not just the
+    /// pure-layer unit test's hand-built HashMap.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_injects_recent_life_when_stories_active(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // last_run_at stays NULL for this never-run owner — direct_world's
+        // `since` fallback (now() - 24h) is what must pick up this event.
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '刚拿到新工作的offer', current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n\
+                 [tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        assert!(
+            state
+                .model_config
+                .resolve_world_stories_director()
+                .is_some(),
+            "world_stories_director must resolve for stories_active to be true"
+        );
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (owner_claimed, token) = claimed[0];
+        assert_eq!(owner_claimed, owner);
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        // The key assertion: the real DB-driven recent_life glue must have
+        // put the story event's content into the actual LLM request body —
+        // not just a hand-built HashMap in the pure-layer unit test.
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("recent_life"),
+            "payload must carry the recent_life key when stories-active"
+        );
+        assert!(
+            body.contains("刚拿到新工作的offer"),
+            "the story event content must reach the director payload"
+        );
+
+        // And the round completed successfully end-to-end.
         let (seed, digests): (serde_json::Value, serde_json::Value) =
             sqlx::query_as("SELECT seed, digests FROM engine.world_states WHERE owner_uid = $1")
                 .bind(owner)

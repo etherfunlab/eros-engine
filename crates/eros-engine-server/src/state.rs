@@ -25,6 +25,13 @@ pub struct AppState {
     /// distinct from `config.world.disabled` / `prompt_disabled`, which are
     /// operator env-var kill switches for a subsystem that IS configured.
     pub world_configured: bool,
+    /// Whether `[tasks.world_stories_director]` resolves to `Some` (a usable
+    /// filter_prompt is present), computed once at boot. Mirrors
+    /// `world_configured` but for the world-stories subsystem — distinct from
+    /// `config.world.stories_disabled` / `stories_prompt_disabled`, which are
+    /// operator env-var kill switches for a subsystem that IS configured.
+    /// Read by `fetch_stories_context`'s gating.
+    pub stories_configured: bool,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -80,21 +87,27 @@ pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathB
 }
 
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
-/// injection off, town disabled off, 300-second sweep cadence.
+/// injection off, town disabled off, stories disabled off, stories-prompt
+/// injection off, 300-second sweep cadence.
 #[derive(Clone, Debug)]
 pub struct WorldConfig {
-    pub disabled: bool,        // WORLD_DISABLED — master switch
-    pub prompt_disabled: bool, // WORLD_PROMPT_DISABLED — injection-only valve
-    pub town_disabled: bool,   // WORLD_TOWN_DISABLED — town sweeper switch
-    pub tick: Duration,        // WORLD_TICK_SECS, default 300
+    pub disabled: bool,         // WORLD_DISABLED — master switch
+    pub prompt_disabled: bool,  // WORLD_PROMPT_DISABLED — injection-only valve
+    pub town_disabled: bool,    // WORLD_TOWN_DISABLED — town sweeper switch
+    pub stories_disabled: bool, // WORLD_STORIES_DISABLED — stories rounds + injection off
+    // Read by `fetch_stories_context`'s prompt-injection gating.
+    pub stories_prompt_disabled: bool, // WORLD_STORIES_PROMPT_DISABLED — injection-only valve
+    pub tick: Duration,                // WORLD_TICK_SECS, default 300
 }
 
-/// Pure parser for the four world-memories env vars (spec §3.1).
+/// Pure parser for the six world-memories env vars (spec §3.1).
 /// Booleans accept "1"/"true" — the DREAMING_DISABLED convention.
 pub(crate) fn parse_world_config(
     disabled_raw: Option<&str>,
     prompt_disabled_raw: Option<&str>,
     town_disabled_raw: Option<&str>,
+    stories_disabled_raw: Option<&str>,
+    stories_prompt_disabled_raw: Option<&str>,
     tick_raw: Option<&str>,
 ) -> WorldConfig {
     let flag = |raw: Option<&str>| raw.map(|v| v == "1" || v == "true").unwrap_or(false);
@@ -102,6 +115,8 @@ pub(crate) fn parse_world_config(
         disabled: flag(disabled_raw),
         prompt_disabled: flag(prompt_disabled_raw),
         town_disabled: flag(town_disabled_raw),
+        stories_disabled: flag(stories_disabled_raw),
+        stories_prompt_disabled: flag(stories_prompt_disabled_raw),
         tick: Duration::from_secs(tick_raw.and_then(|v| v.parse().ok()).unwrap_or(300)),
     }
 }
@@ -262,6 +277,10 @@ impl ServerConfig {
                 std::env::var("WORLD_DISABLED").ok().as_deref(),
                 std::env::var("WORLD_PROMPT_DISABLED").ok().as_deref(),
                 std::env::var("WORLD_TOWN_DISABLED").ok().as_deref(),
+                std::env::var("WORLD_STORIES_DISABLED").ok().as_deref(),
+                std::env::var("WORLD_STORIES_PROMPT_DISABLED")
+                    .ok()
+                    .as_deref(),
                 std::env::var("WORLD_TICK_SECS").ok().as_deref(),
             ),
         }
@@ -371,7 +390,7 @@ mod tests {
 
     #[test]
     fn world_config_defaults_when_env_unset() {
-        let cfg = parse_world_config(None, None, None, None);
+        let cfg = parse_world_config(None, None, None, None, None, None);
         assert!(!cfg.disabled);
         assert!(!cfg.prompt_disabled);
         assert!(!cfg.town_disabled);
@@ -381,11 +400,11 @@ mod tests {
     #[test]
     fn world_config_accepts_true_and_one() {
         for v in ["1", "true"] {
-            let cfg = parse_world_config(Some(v), Some(v), None, None);
+            let cfg = parse_world_config(Some(v), Some(v), None, None, None, None);
             assert!(cfg.disabled, "{v} must disable");
             assert!(cfg.prompt_disabled, "{v} must disable injection");
         }
-        let cfg = parse_world_config(Some("false"), Some("0"), None, None);
+        let cfg = parse_world_config(Some("false"), Some("0"), None, None, None, None);
         assert!(!cfg.disabled);
         assert!(!cfg.prompt_disabled);
     }
@@ -393,11 +412,11 @@ mod tests {
     #[test]
     fn world_config_parses_tick_and_falls_back_on_garbage() {
         assert_eq!(
-            parse_world_config(None, None, None, Some("60")).tick,
+            parse_world_config(None, None, None, None, None, Some("60")).tick,
             Duration::from_secs(60)
         );
         assert_eq!(
-            parse_world_config(None, None, None, Some("not-a-number")).tick,
+            parse_world_config(None, None, None, None, None, Some("not-a-number")).tick,
             Duration::from_secs(300)
         );
         // "0" parses fine here — Duration::ZERO is a legitimate value from the
@@ -405,20 +424,33 @@ mod tests {
         // that treats a zero tick as "disabled" and returns before building a
         // tokio::time::interval (which would panic on Duration::ZERO).
         assert_eq!(
-            parse_world_config(None, None, None, Some("0")).tick,
+            parse_world_config(None, None, None, None, None, Some("0")).tick,
             Duration::from_secs(0)
         );
     }
 
     #[test]
     fn parse_world_config_town_disabled_flag() {
-        let c = parse_world_config(None, None, None, None);
+        let c = parse_world_config(None, None, None, None, None, None);
         assert!(!c.town_disabled, "default off");
-        let c = parse_world_config(None, None, Some("true"), None);
+        let c = parse_world_config(None, None, Some("true"), None, None, None);
         assert!(c.town_disabled);
-        let c = parse_world_config(None, None, Some("1"), None);
+        let c = parse_world_config(None, None, Some("1"), None, None, None);
         assert!(c.town_disabled);
-        let c = parse_world_config(None, None, Some("0"), None);
+        let c = parse_world_config(None, None, Some("0"), None, None, None);
         assert!(!c.town_disabled);
+    }
+
+    #[test]
+    fn parse_world_config_stories_flags() {
+        let c = parse_world_config(None, None, None, None, None, None);
+        assert!(!c.stories_disabled, "default off");
+        assert!(!c.stories_prompt_disabled, "default: inject");
+        let c = parse_world_config(None, None, None, Some("1"), Some("true"), None);
+        assert!(c.stories_disabled);
+        assert!(c.stories_prompt_disabled);
+        let c = parse_world_config(None, None, None, Some("yes"), Some("0"), None);
+        assert!(!c.stories_disabled, "only 1/true count");
+        assert!(!c.stories_prompt_disabled);
     }
 }

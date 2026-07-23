@@ -10,6 +10,7 @@ pub mod insight;
 pub mod memory;
 pub mod persona;
 pub mod pool;
+pub mod story;
 pub mod world;
 pub mod world_town;
 

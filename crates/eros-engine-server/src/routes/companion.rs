@@ -716,7 +716,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
                 tz: chrono_tz::Asia::Singapore,
             },
             prompt_log_dir: None,
-            world: crate::state::parse_world_config(None, None, None, None),
+            world: crate::state::parse_world_config(None, None, None, None, None, None),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
@@ -727,6 +727,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         output_regex: std::sync::Arc::new(Vec::new()),
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
         world_configured: false,
+        stories_configured: false,
     }
 }
 
