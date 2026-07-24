@@ -1703,6 +1703,14 @@ impl ModelConfig {
     /// Resolve the world-town reply-responder bundle. `None` when
     /// `[tasks.world_reply]` is absent OR its `filter_prompt` is blank.
     pub fn resolve_world_reply(&self) -> Option<ResolvedWorldReply> {
+        // Minimum width of the reply-eligibility band (`window - debounce`),
+        // pinned to one town-sweeper tick (`TOWN_TICK` in
+        // eros-engine-server/src/pipeline/world_town.rs). A narrower band
+        // falls between two 30s scans, so a misconfigured
+        // `reply_window_secs <= debounce_secs` would silently near-disable
+        // replies instead of surfacing the misconfig (issue #180).
+        const MIN_BAND_SECS: u64 = 30;
+
         let task_cfg = self.tasks.get("world_reply")?;
         let reply_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
         if reply_prompt.trim().is_empty() {
@@ -1710,6 +1718,19 @@ impl ModelConfig {
         }
         let m = self.resolve("world_reply", None);
         let debounce_secs = task_cfg.debounce_secs.unwrap_or(90);
+        let configured_window = task_cfg.reply_window_secs.unwrap_or(604_800);
+        let reply_window_secs = configured_window.max(debounce_secs + MIN_BAND_SECS);
+        if reply_window_secs != configured_window {
+            tracing::warn!(
+                configured_window,
+                debounce_secs,
+                clamped_to = reply_window_secs,
+                "world_reply: reply_window_secs leaves an eligibility band \
+                 narrower than one 30s sweeper tick — clamped; fix \
+                 [tasks.world_reply].reply_window_secs (must exceed \
+                 debounce_secs by at least 30s)"
+            );
+        }
         Some(ResolvedWorldReply {
             model: m.model,
             fallback_model: m.fallback_model,
@@ -1721,10 +1742,7 @@ impl ModelConfig {
             debounce_secs,
             thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
             daily_cap: task_cfg.daily_cap.unwrap_or(20),
-            reply_window_secs: task_cfg
-                .reply_window_secs
-                .unwrap_or(604_800)
-                .max(debounce_secs + 1),
+            reply_window_secs,
         })
     }
 
@@ -4580,8 +4598,11 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             259_200
         );
 
-        // A window <= debounce leaves no eligible range ⇒ clamped strictly
-        // above the resolved debounce.
+        // A window <= debounce leaves no eligible range ⇒ clamped to at least
+        // one town-sweeper tick above the resolved debounce, so the eligible
+        // band can never be narrower than the 30s tick that samples it
+        // (issue #180: a +1s floor was almost always missed by the sweeper —
+        // replies silently near-disabled instead of loudly misconfigured).
         let cfg = ModelConfig::from_toml_str(
             "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
              debounce_secs = 100\nreply_window_secs = 50\n",
@@ -4589,9 +4610,25 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         .unwrap();
         assert_eq!(
             cfg.resolve_world_reply().unwrap().reply_window_secs,
-            101,
-            "clamped to debounce + 1"
+            130,
+            "clamped to debounce + one 30s town tick"
         );
+
+        // A window inside the tick-wide band is floored too.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             debounce_secs = 100\nreply_window_secs = 110\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_world_reply().unwrap().reply_window_secs, 130);
+
+        // A sane window (> debounce + tick) is untouched.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.world_reply]\nmodel = \"w/r\"\nfilter_prompt = \"p\"\n\
+             debounce_secs = 100\nreply_window_secs = 131\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_world_reply().unwrap().reply_window_secs, 131);
     }
 
     #[test]
