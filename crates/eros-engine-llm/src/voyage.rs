@@ -79,8 +79,9 @@ impl VoyageClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            tracing::warn!("voyage: status={status} body={text}");
-            return Err(LlmError::Status(status, text));
+            let err = status_error(status, &text);
+            tracing::warn!("voyage: {err}");
+            return Err(err);
         }
 
         let parsed: EmbedResponse = resp.json().await?;
@@ -116,11 +117,21 @@ impl VoyageClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            tracing::warn!("voyage: status={status} body={text}");
-            return Err(LlmError::Status(status, text));
+            let err = status_error(status, &text);
+            tracing::warn!("voyage: {err}");
+            return Err(err);
         }
         parse_embed_batch(&text, texts.len())
     }
+}
+
+/// Build the bounded `LlmError::Status` for a non-success Voyage response.
+/// The raw body never reaches the error (or the log line that mirrors it):
+/// provider bodies are unbounded and may echo input, so they are scrubbed /
+/// capped first — the same bounded-log guarantee the chat client upholds
+/// (issue #188).
+fn status_error(status: reqwest::StatusCode, body: &str) -> LlmError {
+    LlmError::Status(status, crate::openrouter::scrub_error_body(body))
 }
 
 /// Parse a Voyage batch response body into ordered vectors, enforcing that
@@ -180,5 +191,40 @@ mod tests {
     #[test]
     fn parse_embed_batch_rejects_garbage() {
         assert!(parse_embed_batch("not json", 1).is_err());
+    }
+
+    #[test]
+    fn status_error_bounds_and_scrubs_provider_body() {
+        // The stored error body must be bounded and stripped of any echoed
+        // input (issue #188 item 4 — the bounded-log guarantee the v0.8.4
+        // hardening established elsewhere extends to the embedding client).
+        let huge = format!(
+            r#"{{"error":{{"code":400,"message":"{}","metadata":{{"flagged_input":"SECRET"}}}}}}"#,
+            "x".repeat(5000)
+        );
+        let e = status_error(reqwest::StatusCode::BAD_REQUEST, &huge);
+        let LlmError::Status(status, msg) = e else {
+            panic!("expected Status, got {e:?}");
+        };
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            msg.chars().count() <= 220,
+            "must be bounded, got {} chars",
+            msg.chars().count()
+        );
+        assert!(
+            !msg.contains("SECRET"),
+            "echoed input must be dropped: {msg}"
+        );
+
+        // A plain non-JSON body still comes through, just capped.
+        let e = status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream exploded",
+        );
+        let LlmError::Status(_, msg) = e else {
+            panic!("expected Status, got {e:?}");
+        };
+        assert_eq!(msg, "upstream exploded");
     }
 }

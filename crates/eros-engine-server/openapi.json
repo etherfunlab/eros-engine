@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.9.0"
+    "version": "0.9.1"
   },
   "servers": [
     {
@@ -21,7 +21,7 @@
         "tags": [
           "bff-companion"
         ],
-        "summary": "Latest user-turn affinity delta (post-EMA). For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked.",
+        "summary": "Latest user-turn affinity delta (post-EMA). For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
         "operationId": "bff_get_affinity_delta",
         "parameters": [
           {
@@ -32,6 +32,33 @@
             "schema": {
               "type": "string",
               "format": "uuid"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Long-poll baseline: the `event_id` the caller already has. While the\nsession's latest turn event still matches (or none exists yet), the\nrequest is held until a newer event lands or `wait` elapses — the\ntimed-out response returns the unchanged state, same shape as the\nimmediate path. Absent ⇒ return the latest immediately (pre-#147\nbehavior, unchanged).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "How long to hold the request open, in milliseconds. Only meaningful\nwith `after`. Default 10000, server-capped at 25000.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
             }
           }
         ],

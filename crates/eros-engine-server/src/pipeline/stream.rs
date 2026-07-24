@@ -608,7 +608,7 @@ fn drive_chat_burst(
                                 Err(e) => {
                                     tracing::warn!("stream: upstream chunk err: {e}");
                                     truncated = true;
-                                    attempt_outcome = "chunk_error";
+                                    attempt_outcome = chunk_err_outcome(&e);
                                     break;
                                 }
                             }
@@ -970,7 +970,7 @@ fn drive_chat_burst(
                             Err(e) => {
                                 tracing::warn!("stream(filtered): chunk err: {e}");
                                 truncated = true;
-                                attempt_outcome = "chunk_error";
+                                attempt_outcome = chunk_err_outcome(&e);
                                 break;
                             }
                         }
@@ -1493,12 +1493,31 @@ const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Max wait for a chat stream to OPEN (connect + queue + response headers).
 /// A provider that accepts the socket but never sends headers must not hold
-/// the turn — timeout ⇒ attempt fails ⇒ chain advances.
-const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// the turn — timeout ⇒ attempt fails ⇒ chain advances. `pub(crate)`: the
+/// voice path applies the same caps (issue #188).
+pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Hard per-attempt cap on one model's whole generation (spec §1.5's 120s).
 /// Byte-level idle liveness is bounded upstream in the llm client; this caps
 /// a stream that keeps trickling forever.
-const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Spec §4.2 outcome label for an `Err` item mid-consume. Provider error
+/// frames (`LlmError::Provider`) and the byte-level idle watchdog are their
+/// own failure modes — folding them into `"chunk_error"` made dashboards
+/// undercount idle timeouts and blend provider failures into transport drops
+/// (issue #188). Everything else (transport reset, parse) stays
+/// `"chunk_error"`.
+fn chunk_err_outcome(e: &eros_engine_llm::LlmError) -> &'static str {
+    match e {
+        eros_engine_llm::LlmError::Provider(_) => "error_frame",
+        eros_engine_llm::LlmError::Stream(msg)
+            if msg.contains(eros_engine_llm::openrouter::STREAM_IDLE_TIMEOUT_MSG) =>
+        {
+            "idle_timeout"
+        }
+        _ => "chunk_error",
+    }
+}
 
 /// Run the output-filter LLM over `original`, walking the (already
 /// depth-capped) fallback chain one model at a time.  After each successful
@@ -3936,6 +3955,38 @@ pub fn replay_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_err_outcome_separates_error_frame_and_idle_timeout() {
+        use eros_engine_llm::LlmError;
+        // Provider error frames (a 200 SSE frame carrying `error`) are their
+        // own failure mode, distinct from transport drops (spec §4.2).
+        assert_eq!(
+            chunk_err_outcome(&LlmError::Provider(
+                "openrouter mid-stream error: code=Some(502): upstream".into()
+            )),
+            "error_frame"
+        );
+        // The byte-level idle watchdog's io::Error rides through
+        // eventsource-stream's `Transport error: {inner}` Display into
+        // LlmError::Stream; the shared marker constant is the contract.
+        let idle = LlmError::Stream(format!(
+            "Transport error: {}: no bytes for 45s",
+            eros_engine_llm::openrouter::STREAM_IDLE_TIMEOUT_MSG
+        ));
+        assert_eq!(chunk_err_outcome(&idle), "idle_timeout");
+        // Everything else stays the generic transport/parse label.
+        assert_eq!(
+            chunk_err_outcome(&LlmError::Stream(
+                "Transport error: connection reset by peer".into()
+            )),
+            "chunk_error"
+        );
+        assert_eq!(
+            chunk_err_outcome(&LlmError::StreamParse("not a delta".into())),
+            "chunk_error"
+        );
+    }
 
     #[test]
     fn meta_frame_serializes_with_required_fields() {

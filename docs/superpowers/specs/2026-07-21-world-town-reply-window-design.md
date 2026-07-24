@@ -150,15 +150,24 @@ daily_cap = 20
 reply_window_secs = 604800   # NEW: reply-eligibility window after a user comment (default 7d)
 ```
 
-- **Default 604800 (7 days).** The only post the window can permanently drop is
+- **Default 604800 (7 days).** The main post the window can permanently drop is
   one whose user comment never got answered *and* then stayed silent past the
   window — which happens only when `daily_cap` / cooldown deferred the reply.
   `daily_cap` resets each UTC day, so a capped post waits at most ~1 day for
   fresh budget; 7 days leaves comfortable margin while pinning the scan to
-  "posts with a user comment in the last week."
+  "posts with a user comment in the last week." A pending reply is also
+  permanently dropped when the deferral *spans the whole window* for other
+  reasons: the post's author instance goes inactive (`status != 'active'`) and
+  is only reactivated past the window, `town_enabled` is toggled off then back
+  on across it, or the engine is down longer than the window. All of these are
+  preferable to firing a stale necro-reply, so they are accepted, not guarded
+  against (issue #180).
 - **Floored above the debounce window.** A `reply_window_secs <= debounce_secs`
   would make the eligible range (`> now()-window AND <= now()-debounce`) empty;
-  the resolver clamps it to strictly exceed the resolved `debounce_secs`.
+  the resolver clamps the window to `debounce_secs + 30` — at least one
+  town-sweeper tick (`TOWN_TICK`) wide, so the band can never be narrower than
+  the scan that samples it — and `warn!`s when the clamp engages (issue #180;
+  originally `debounce_secs + 1`, a band the 30s sweeper almost always missed).
 - Added to `ResolvedWorldReply` and `resolve_world_reply()` in
   `model_config.rs`, alongside the existing three.
 
