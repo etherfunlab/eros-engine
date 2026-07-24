@@ -356,6 +356,14 @@ pub struct TierConfig {
     pub retry_depth: Option<u32>,
 }
 
+/// The `[defaults]` section — cross-task fallbacks and provider routing.
+///
+/// **Construct with struct-update syntax** — `DefaultConfig { ignore_providers:
+/// vec![…], ..Default::default() }` — never a bare exhaustive literal. New
+/// optional fields are added here in minor releases (`ignore_providers`
+/// pre-v0.6.1, `provider_sort` v0.8.4) and a bare literal breaks on every such
+/// upgrade; `..Default::default()` is the supported construction pattern
+/// (issue #188).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultConfig {
     #[serde(default)]

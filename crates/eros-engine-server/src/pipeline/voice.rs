@@ -15,7 +15,9 @@ use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::persona::PersonaRepo;
 
-use crate::pipeline::stream::{ulid_string, ProtocolFrame, StreamErrorCode};
+use crate::pipeline::stream::{
+    ulid_string, ProtocolFrame, StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
+};
 use crate::state::AppState;
 
 /// Assemble the thin voice system prompt: persona + voice directive + one
@@ -149,6 +151,19 @@ pub fn run_voice_turn(
         let mut served_model: Option<String> = None;
         let mut truncated = false;
 
+        // Chain-shared request: `execute_stream_as` borrows it and sends each
+        // candidate's model id, so the prompt is never cloned per attempt
+        // (issue #188 — parity with the text pipeline's loops). `model` here
+        // is a placeholder `execute_stream_as` ignores.
+        let req = ChatRequest {
+            model: String::new(),
+            messages,
+            temperature: resolved.temperature as f32,
+            max_tokens: resolved.max_tokens,
+            reasoning: resolved.reasoning.clone(),
+            ..Default::default()
+        };
+
         'candidates: for model_id in candidates {
             // Per-attempt metadata: reset so an abandoned candidate's usage / gen_id /
             // model / truncated never leaks onto a later fallback's reply.
@@ -156,26 +171,55 @@ pub fn run_voice_turn(
             last_gen_id = None;
             served_model = None;
             truncated = false;
-            let req = ChatRequest {
-                model: model_id.clone(),
-                messages: messages.clone(),
-                temperature: resolved.temperature as f32,
-                max_tokens: resolved.max_tokens,
-                reasoning: resolved.reasoning.clone(),
-                ..Default::default()
-            };
-            let stream = match state.openrouter.execute_stream(req).await {
-                Ok(s) => s,
-                Err(e) => {
+            // Bound the open: a provider that accepts the socket but never
+            // sends response headers must not hold the turn (issue #188 —
+            // the same caps as the text pipeline).
+            let stream = match tokio::time::timeout(
+                STREAM_OPEN_TIMEOUT,
+                state.openrouter.execute_stream_as(&req, &model_id),
+            ).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     tracing::warn!(model = %model_id, error = %e, "voice: open stream failed");
+                    if acc.is_empty() { continue 'candidates; }
+                    truncated = true;
+                    break 'candidates;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        "voice: open timeout ({}s)",
+                        STREAM_OPEN_TIMEOUT.as_secs()
+                    );
                     if acc.is_empty() { continue 'candidates; }
                     truncated = true;
                     break 'candidates;
                 }
             };
             futures_util::pin_mut!(stream);
+            // Hard per-attempt cap: byte-level idle liveness is bounded in the
+            // llm client; this caps a stream that keeps trickling forever.
+            let deadline = tokio::time::Instant::now() + STREAM_TOTAL_TIMEOUT;
             loop {
-                match futures_util::StreamExt::next(&mut stream).await {
+                let item = match tokio::time::timeout_at(
+                    deadline,
+                    futures_util::StreamExt::next(&mut stream),
+                )
+                .await
+                {
+                    Ok(item) => item,
+                    Err(_) => {
+                        tracing::warn!(
+                            model = %model_id,
+                            "voice: total timeout ({}s)",
+                            STREAM_TOTAL_TIMEOUT.as_secs()
+                        );
+                        if acc.is_empty() { continue 'candidates; }
+                        truncated = true;
+                        break 'candidates;
+                    }
+                };
+                match item {
                     Some(Ok(chunk)) => {
                         if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
                         if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
@@ -184,7 +228,16 @@ pub fn run_voice_turn(
                             acc.push_str(&text);
                             yield ProtocolFrame::Delta { message_id: message_id.clone(), content: text };
                         }
-                        if chunk.finish_reason.as_deref() == Some("length") { truncated = true; }
+                        // "content_filter" = mid-generation safety cut: the
+                        // text is incomplete, so it carries the same
+                        // truncation signal as "length" (issue #188 — parity
+                        // with the text pipeline's gates).
+                        if matches!(
+                            chunk.finish_reason.as_deref(),
+                            Some("length") | Some("content_filter")
+                        ) {
+                            truncated = true;
+                        }
                     }
                     Some(Err(e)) => {
                         tracing::warn!(model = %model_id, error = %e, "voice: mid-stream error");
@@ -925,6 +978,103 @@ data: [DONE]\n\n";
         assert_eq!(
             persisted_usage["cost"], 0.01,
             "DB row must keep the FULL unfiltered usage; got {persisted_usage}"
+        );
+    }
+
+    /// Issue #188 item 1: `content_filter` is a mid-generation safety cut —
+    /// the text is incomplete, so the voice path must mark the turn truncated
+    /// exactly like `length` (parity with the text pipeline's handling).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_content_filter_finish_marks_truncated(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"cut short\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}],\"id\":\"gen-cf\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance + session.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC8")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_message_id: umid,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        let truncated = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Done { truncated, .. } => Some(*truncated),
+                _ => None,
+            })
+            .expect("a Done frame");
+        assert!(
+            truncated,
+            "content_filter finish must mark the voice turn truncated; frames={frames:?}"
         );
     }
 
