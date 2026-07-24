@@ -18,6 +18,13 @@ const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Max gap between SSE *bytes* before a live stream is declared dead.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Marker prefix of the idle-watchdog error message. Pub so the pipeline's
+/// stream-metrics outcome mapping can recognize an idle timeout after the
+/// message has been stringified through the SSE layer's `Transport error:`
+/// wrapper into `LlmError::Stream` (issue #188 — spec §4.2 lists
+/// `"idle_timeout"` as its own outcome, distinct from `"chunk_error"`).
+pub const STREAM_IDLE_TIMEOUT_MSG: &str = "openrouter stream idle timeout";
+
 /// Gap-bound a fallible stream: an idle period longer than `idle` between
 /// items becomes an io TimedOut error item. Applied to the raw BYTES stream
 /// (before SSE parsing) deliberately: OpenRouter's `: OPENROUTER PROCESSING`
@@ -38,7 +45,7 @@ where
         Err(_elapsed) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!(
-                "openrouter stream idle timeout: no bytes for {}s",
+                "{STREAM_IDLE_TIMEOUT_MSG}: no bytes for {}s",
                 idle.as_secs()
             ),
         )),
@@ -213,17 +220,6 @@ impl std::fmt::Display for ImageGenError {
 }
 impl std::error::Error for ImageGenError {}
 
-/// Cap a provider error body to a bounded length for persistence/logs.
-fn cap_provider_message(s: &str) -> String {
-    const MAX: usize = 600;
-    let t = s.trim();
-    if t.chars().count() <= MAX {
-        t.to_string()
-    } else {
-        t.chars().take(MAX).collect::<String>() + "…"
-    }
-}
-
 /// Max chars kept from a raw provider error body in ordinary logs. Short by
 /// design: logs are for triage, not forensics — full error forensics live in
 /// OpenRouter's own logs, joined on `generation_id`.
@@ -249,7 +245,11 @@ fn body_preview(s: &str) -> String {
 /// which is an excerpt of the user's flagged prompt that a moderation rejection
 /// echoes back (logging it would leak raw chat content). Non-envelope bodies
 /// fall back to a plain length-capped preview.
-fn scrub_error_body(raw: &str) -> String {
+///
+/// `pub(crate)`: the voyage client reuses this for its own status-error
+/// bodies (issue #188) — the envelope parse simply falls through to the
+/// capped preview for non-OpenRouter shapes.
+pub(crate) fn scrub_error_body(raw: &str) -> String {
     #[derive(Deserialize)]
     struct Env {
         error: ErrBody,
@@ -1087,7 +1087,9 @@ impl OpenRouterClient {
                     variant,
                     outcome: AttemptOutcome::Status {
                         status: status.as_u16(),
-                        message: cap_provider_message(&text),
+                        // scrub, not just cap: a moderation body echoes the
+                        // flagged prompt back (issue #188).
+                        message: scrub_error_body(&text),
                     },
                 });
                 continue;
@@ -3470,5 +3472,47 @@ data: [DONE]\n\n";
         assert_eq!(seen.len(), 2, "on_attempt fires once per planned attempt");
         assert_eq!(seen[0], ("m1".to_string(), PromptVariant::Single, 1, 2));
         assert_eq!(seen[1], ("m2".to_string(), PromptVariant::Single, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn execute_image_inner_scrubs_flagged_input_from_status_attempts() {
+        // A moderation 403 echoes the user's flagged prompt back in
+        // `metadata.flagged_input`; the recorded attempt must keep the code /
+        // provider / reasons but never that excerpt (issue #188 item 4 —
+        // parity with the chat paths' scrub_error_body).
+        let server = MockServer::start().await;
+        let body = r#"{"error":{"code":403,"message":"prompt flagged","metadata":{"provider_name":"prov","reasons":["sexual"],"flagged_input":"SECRET_USER_PROMPT"}}}"#;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            AppAttribution::default(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let req = ImageGenRequest {
+            model: "m1".into(),
+            prompt: "a cat".into(),
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let result = client.execute_image_inner(req, |_| {}).await;
+        let Err(ImageGenError::ChainExhausted { attempts }) = result else {
+            panic!("expected ChainExhausted, got {result:?}");
+        };
+        let AttemptOutcome::Status { status, message } = &attempts[0].outcome else {
+            panic!("expected Status outcome, got {:?}", attempts[0].outcome);
+        };
+        assert_eq!(*status, 403);
+        assert!(
+            !message.contains("SECRET_USER_PROMPT"),
+            "flagged_input must be scrubbed from the attempt record: {message}"
+        );
+        assert!(
+            message.contains("sexual"),
+            "moderation reasons stay visible for triage: {message}"
+        );
     }
 }
