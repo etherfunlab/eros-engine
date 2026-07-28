@@ -139,10 +139,11 @@ impl<'a> StoryRepo<'a> {
     }
 
     /// Claim up to `batch` due instances. Due = past `interval`, not freshly
-    /// claimed, owner still stories-enabled, instance still active, AND the
-    /// activity gate: the pair chatted within `active_window`. Returns
-    /// (instance_id, owner_uid, claimed_at token) — token semantics identical
-    /// to `WorldRepo::claim_due`.
+    /// claimed, owner still stories-enabled, instance still active, owner has
+    /// a non-blank worldview (stories inherit the WM prerequisite — no
+    /// worldview, no story rounds; spec §3), AND the activity gate: the pair
+    /// chatted within `active_window`. Returns (instance_id, owner_uid,
+    /// claimed_at token) — token semantics identical to `WorldRepo::claim_due`.
     pub async fn claim_due(
         &self,
         interval: Duration,
@@ -160,6 +161,8 @@ impl<'a> StoryRepo<'a> {
                  SELECT psi.instance_id FROM engine.persona_story_insights psi \
                  JOIN engine.world_enrollments we \
                    ON we.owner_uid = psi.owner_uid AND we.stories_enabled \
+                 JOIN engine.world_worldviews ww \
+                   ON ww.owner_uid = psi.owner_uid AND btrim(ww.content) <> '' \
                  JOIN engine.persona_instances pi \
                    ON pi.id = psi.instance_id AND pi.status = 'active' \
                  WHERE (psi.last_run_at IS NULL OR psi.last_run_at < $1) \
@@ -579,6 +582,13 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_instance(pool: &PgPool, owner: Uuid, name: &str, status: &str) -> Uuid {
@@ -701,6 +711,46 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_due_skips_owner_without_worldview(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        // Raw enrollment — deliberately NOT enroll_stories, which (after
+        // this task) also provides a worldview.
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        touch_activity(&pool, owner, inst, "1 hour").await;
+        repo.ensure_insight_rows(8).await.unwrap();
+
+        assert!(
+            repo.claim_due(EIGHT_H, STALE, WINDOW, 8)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no worldview ⇒ story round never claims"
+        );
+
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let claimed = repo.claim_due(EIGHT_H, STALE, WINDOW, 8).await.unwrap();
+        assert_eq!(
+            claimed.iter().map(|(i, o, _)| (*i, *o)).collect::<Vec<_>>(),
+            vec![(inst, owner)],
+            "worldview present ⇒ claimable again"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -508,6 +508,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2)")
             .bind(owner)
             .bind(inst)
@@ -609,6 +616,13 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
         )
         .bind(owner)
         .execute(&pool)
