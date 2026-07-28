@@ -709,6 +709,49 @@ mod tests {
         );
     }
 
+    /// The trigger must stamp `clock_timestamp()`, not `now()`. `now()` is
+    /// transaction-stable (pinned to this transaction's START), so a
+    /// long-running UPDATE (e.g. one that blocked on `persist_round`'s
+    /// `FOR SHARE` guard and only proceeds after that transaction commits)
+    /// would stamp a time from BEFORE it actually ran, potentially earlier
+    /// than the just-committed `last_run_at` — defeating touch-dueness
+    /// again. `pg_sleep` inside the transaction makes the two clocks
+    /// diverge deterministically: with `clock_timestamp()`, `updated_at` is
+    /// stamped AFTER the sleep and so is later than `now()` (pinned before
+    /// the sleep); with the old `now()` they would be equal and this
+    /// assertion would fail.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn worldview_trigger_stamps_wall_clock_time(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        enroll_without_worldview(&pool, owner).await;
+        set_worldview(&pool, owner, "现代都市").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_sleep(0.05)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine.world_worldviews SET content = '科幻星际' WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let stamped_after_now: bool = sqlx::query_scalar(
+            "SELECT updated_at > now() FROM engine.world_worldviews WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            stamped_after_now,
+            "trigger must use clock_timestamp() (wall clock at execution time), \
+             not now() (pinned to transaction start) — otherwise a blocked \
+             UPDATE stamps a time from before it actually ran"
+        );
+        tx.rollback().await.unwrap();
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn count_enrolled_missing_worldview_counts_absent_and_blank(pool: PgPool) {
         let repo = WorldRepo { pool: &pool };

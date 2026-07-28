@@ -26,11 +26,21 @@ CREATE TABLE engine.world_worldviews (
 -- claim query uses it to detect "worldview touched since last round".
 -- Bump ONLY on content change — content-identical UPDATEs (or explicit
 -- updated_at writes, e.g. in tests) must not register as a touch.
+--
+-- Uses clock_timestamp(), NOT now(): now() is transaction-stable (pinned to
+-- the calling transaction's START), so an UPDATE that blocks on
+-- persist_round's `FOR SHARE` guard and then proceeds after that
+-- transaction commits would otherwise stamp a time from BEFORE the block —
+-- possibly earlier than the just-committed `last_run_at` — silently
+-- defeating claim_due's touch-dueness check (`ww.updated_at >
+-- ws.last_run_at`) a second time. clock_timestamp() reads the actual wall
+-- clock at trigger-execution time, i.e. after the block clears, so the
+-- stamp always reflects when the change really took effect.
 CREATE OR REPLACE FUNCTION engine.touch_world_worldviews()
 RETURNS trigger LANGUAGE plpgsql AS $fn$
 BEGIN
     IF NEW.content IS DISTINCT FROM OLD.content THEN
-        NEW.updated_at := now();
+        NEW.updated_at := clock_timestamp();
     END IF;
     RETURN NEW;
 END
