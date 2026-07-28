@@ -55,13 +55,18 @@ impl<'a> WorldRepo<'a> {
         Ok(res.rows_affected())
     }
 
-    /// Atomically claim up to `batch` due owners (enrolled AND past their
-    /// interval AND not freshly claimed). Same statement shape as the
-    /// dreaming picker: concurrent sweepers see disjoint sets. Returns each
-    /// owner alongside the `claimed_at` timestamp just written — the caller's
-    /// ownership token, threaded back into `release_claim`/`mark_ran`/
-    /// `persist_round` so a worker that outlives the stale window can never
-    /// clobber a newer sweeper's claim on the same owner.
+    /// Atomically claim up to `batch` due owners: enrolled AND has a
+    /// non-blank worldview AND (past their interval OR the worldview was
+    /// touched since the last run) AND not freshly claimed. Same statement
+    /// shape as the dreaming picker: concurrent sweepers see disjoint sets.
+    /// A content-identical touch (trigger only bumps `updated_at` on real
+    /// change, see Task 1) still costs at most one extra normal round —
+    /// `mark_ran`/`persist_round` advance `last_run_at` past it, so it
+    /// converges. Returns each owner alongside the `claimed_at` timestamp
+    /// just written — the caller's ownership token, threaded back into
+    /// `release_claim`/`mark_ran`/`persist_round` so a worker that outlives
+    /// the stale window can never clobber a newer sweeper's claim on the
+    /// same owner.
     pub async fn claim_due(
         &self,
         interval: Duration,
@@ -78,7 +83,10 @@ impl<'a> WorldRepo<'a> {
              WHERE owner_uid IN ( \
                  SELECT ws.owner_uid FROM engine.world_states ws \
                  JOIN engine.world_enrollments we USING (owner_uid) \
-                 WHERE (ws.last_run_at IS NULL OR ws.last_run_at < $1) \
+                 JOIN engine.world_worldviews ww USING (owner_uid) \
+                 WHERE btrim(ww.content) <> '' \
+                   AND (ws.last_run_at IS NULL OR ws.last_run_at < $1 \
+                        OR ww.updated_at > ws.last_run_at) \
                    AND (ws.claimed_at IS NULL OR ws.claimed_at < $2) \
                  ORDER BY ws.last_run_at ASC NULLS FIRST \
                  LIMIT $3 \
@@ -165,6 +173,42 @@ impl<'a> WorldRepo<'a> {
         .fetch_optional(self.pool)
         .await?;
         Ok(v.unwrap_or(false))
+    }
+
+    /// The owner's current worldview (trimmed) plus the hash recorded by the
+    /// last completed round. `None` = no usable worldview (absent row or
+    /// blank content): the caller must not run any World System LLM round
+    /// for this owner (spec §1).
+    pub async fn worldview_state(
+        &self,
+        owner_uid: Uuid,
+    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT ww.content, ws.worldview_hash \
+             FROM engine.world_worldviews ww \
+             JOIN engine.world_states ws USING (owner_uid) \
+             WHERE ww.owner_uid = $1",
+        )
+        .bind(owner_uid)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.and_then(|(content, hash)| {
+            let trimmed = content.trim().to_string();
+            (!trimmed.is_empty()).then_some((trimmed, hash))
+        }))
+    }
+
+    /// Enrolled owners with no usable worldview — the sweeper's aggregate
+    /// warn counter (spec §3). Worldview-less owners are excluded from every
+    /// claim/candidate query, so this count is the only place they surface.
+    pub async fn count_enrolled_missing_worldview(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_enrollments we \
+             LEFT JOIN engine.world_worldviews ww USING (owner_uid) \
+             WHERE ww.owner_uid IS NULL OR btrim(ww.content) = ''",
+        )
+        .fetch_one(self.pool)
+        .await
     }
 
     /// The owner's active persona roster (earliest-created first) joined to
@@ -342,6 +386,28 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        set_worldview(pool, owner, "现代都市").await;
+    }
+
+    /// Enrollment WITHOUT a worldview — the skip case (spec §1).
+    async fn enroll_without_worldview(pool: &PgPool, owner: Uuid) {
+        sqlx::query("INSERT INTO engine.world_enrollments (owner_uid) VALUES ($1)")
+            .bind(owner)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn set_worldview(pool: &PgPool, owner: Uuid, content: &str) {
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, $2) \
+             ON CONFLICT (owner_uid) DO UPDATE SET content = EXCLUDED.content",
+        )
+        .bind(owner)
+        .bind(content)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -425,6 +491,16 @@ mod tests {
         // Enrolled but ran 1h ago with a 24h interval → not due.
         let recent = Uuid::new_v4();
         enroll(&pool, recent).await;
+        // Pin the worldview BEFORE the last run so this owner tests pure
+        // time-dueness, not the worldview-touch path.
+        sqlx::query(
+            "UPDATE engine.world_worldviews SET updated_at = now() - interval '2 hours' \
+             WHERE owner_uid = $1",
+        )
+        .bind(recent)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO engine.world_states (owner_uid, seed, digests, last_run_at) \
              VALUES ($1, '{}'::jsonb, '{}'::jsonb, now() - interval '1 hour')",
@@ -436,6 +512,108 @@ mod tests {
 
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         assert!(claimed.is_empty(), "orphan + not-due must both be skipped");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_due_skips_enrolled_owner_without_worldview(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_without_worldview(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+
+        assert!(
+            repo.claim_due(DAY, STALE, 5).await.unwrap().is_empty(),
+            "no worldview ⇒ never claimed"
+        );
+        // Blank (whitespace-only) content passes the DDL CHECK but must
+        // still be treated as missing.
+        set_worldview(&pool, owner, "  ").await;
+        assert!(
+            repo.claim_due(DAY, STALE, 5).await.unwrap().is_empty(),
+            "blank worldview ⇒ never claimed"
+        );
+        // Providing one self-heals on the next scan.
+        set_worldview(&pool, owner, "古代仙侠").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_due_treats_worldview_touch_as_due(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        // Ran 1h ago (24h interval ⇒ not time-due), worldview from before
+        // that run ⇒ not due at all.
+        sqlx::query(
+            "INSERT INTO engine.world_states (owner_uid, seed, digests, last_run_at) \
+             VALUES ($1, '{}'::jsonb, '{}'::jsonb, now() - interval '1 hour')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE engine.world_worldviews SET updated_at = now() - interval '2 hours' \
+             WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo.claim_due(DAY, STALE, 5).await.unwrap().is_empty());
+
+        // Touch the worldview (trigger bumps updated_at past last_run_at)
+        // ⇒ due ahead of the interval (spec §3: change lands within one tick).
+        set_worldview(&pool, owner, "科幻星际").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        assert_eq!(
+            claimed.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![owner],
+            "worldview touched after last run ⇒ immediately due"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn worldview_state_trims_and_carries_hash(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_without_worldview(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+
+        assert!(repo.worldview_state(owner).await.unwrap().is_none());
+        set_worldview(&pool, owner, "  古代宫廷  ").await;
+        let (content, hash) = repo.worldview_state(owner).await.unwrap().unwrap();
+        assert_eq!(content, "古代宫廷", "content is trimmed");
+        assert!(hash.is_none(), "no round yet ⇒ no stored hash");
+
+        sqlx::query("UPDATE engine.world_states SET worldview_hash = 'abc' WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, hash) = repo.worldview_state(owner).await.unwrap().unwrap();
+        assert_eq!(hash.as_deref(), Some("abc"));
+
+        set_worldview(&pool, owner, "   ").await;
+        assert!(
+            repo.worldview_state(owner).await.unwrap().is_none(),
+            "blank content reads as missing"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn count_enrolled_missing_worldview_counts_absent_and_blank(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let with = Uuid::new_v4();
+        let without = Uuid::new_v4();
+        let blank = Uuid::new_v4();
+        enroll(&pool, with).await;
+        enroll_without_worldview(&pool, without).await;
+        enroll_without_worldview(&pool, blank).await;
+        set_worldview(&pool, blank, " ").await;
+
+        assert_eq!(repo.count_enrolled_missing_worldview().await.unwrap(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
