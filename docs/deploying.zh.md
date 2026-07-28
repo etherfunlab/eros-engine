@@ -255,7 +255,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 本。没人互动的世界恰好只花导演那一次调用。细节、数据模型与启动校验规则见
 [世界系统](world-system.zh.md)。
 
-- **环境变量：**大部分运维环境变量在 [`.env.example`](../.env.example) 里带注释列出——OpenRouter 归因头、usage 字段过滤、EMA 惯性旋钮、世界系统开关、调试开关。
+- **环境变量：**完整带注释的清单在 [`.env.example`](../.env.example)——OpenRouter 归因头、usage 字段过滤、EMA 惯性旋钮、sweeper 开关（dreaming / snapshot / world）、调试开关。
 - **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）和 insight 快照两个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` 关掉，不影响聊天路径。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。

@@ -262,7 +262,7 @@ and cost nothing. A world nobody interacts with costs exactly the director
 call. Details, data model, and the boot-validation rules are in
 [World system](world-system.md).
 
-- **Env vars:** most operational env vars are annotated in [`.env.example`](../.env.example) — OpenRouter attribution headers, usage-key filtering, EMA inertia dials, world-system switches, debug toggles.
+- **Env vars:** the full annotated list lives in [`.env.example`](../.env.example) — OpenRouter attribution headers, usage-key filtering, EMA inertia dials, sweeper switches (dreaming / snapshot / world), debug toggles.
 - **Background sweepers:** `serve` also runs the dreaming-lite (session-end memory classifier) and insight-snapshot sweepers. Both are optional: `DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` turn them off without affecting the chat path.
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The raw OpenAPI JSON is not served over HTTP — dump it with the `print-openapi` subcommand.
