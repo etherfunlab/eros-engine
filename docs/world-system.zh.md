@@ -48,6 +48,32 @@ World Town 额外需要**全部**满足：
    独立可选——缺哪个 section 就只关哪条路径）。
 6. 未设置 `WORLD_TOWN_DISABLED`。
 
+## 世界观（Worldview）
+
+每个世界都运行在一份 per-owner 的**世界观**里——一段自由文本的背景设定
+（科幻、现代、古代……），存放于 `engine.world_worldviews`（`owner_uid`
+主键，`content` 1..=10000 字符，`updated_at`）。与 `world_enrollments`
+一样，这张表**由下游管理**：引擎只做 SELECT；下游通过 service_role/owner
+连接执行 INSERT/UPDATE/DELETE。**引擎不内置任何默认世界观**——提供默认
+文本、或强制用户填写，完全是下游的职责。
+
+语义：
+
+- **缺失/空白世界观 = 世界系统零 LLM 活动。** 已入世但没有可用世界观的
+  用户，会被 WM director、故事轮、小镇评论/回复扫描全部排除；只要存在
+  这样的用户，world sweeper 每个 tick 记录一条聚合 warn。回填表数据后
+  下一个 tick 即自愈。
+- **变更 = 重置。** 引擎每轮记录内容的 SHA-256（`world_states.
+  worldview_hash`）。世界观变更会让该用户在一个 tick 内到期，并把下一轮
+  变成 init 式重置：seed 重新推演，剧本片段、故事数据（insights/events/
+  memories）、**未发布**贴文全部清除。已发布贴文及其评论保留为只读历史，
+  但 AI 活动（评论轮、回复）只会作用于当前纪元起点（`world_states.
+  worldview_set_at`）之后发布的贴文。
+- **Payload。** WM director、故事 director、小镇评论/回复的 payload 都
+  原样携带世界观全文，并附一条固定规则：一切设定（时代、科技、地点、
+  职业、事件）必须与之相符。聊天 prompt 不变——世界观只通过剧本片段
+  间接进入聊天。
+
 ## World Memories
 
 ### 导演回合

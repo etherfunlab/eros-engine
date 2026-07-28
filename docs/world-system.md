@@ -59,6 +59,38 @@ World Town additionally needs **all** of:
    individually optional — a missing section disables just that path).
 6. `WORLD_TOWN_DISABLED` is not set.
 
+## Worldview
+
+Every world runs inside a per-owner **worldview** — a free-text setting
+document (sci-fi, modern, ancient, …) stored in `engine.world_worldviews`
+(`owner_uid` PK, `content` 1..=10000 chars, `updated_at`). Like
+`world_enrollments`, the table is **downstream-managed**: the engine only
+ever SELECTs it; downstream INSERTs/UPDATEs/DELETEs rows over the
+service_role/owner connection. **The engine ships no default worldview** —
+providing one (a deployment default, or forcing the user to write their own)
+is entirely the downstream's job.
+
+Semantics:
+
+- **Missing/blank worldview = no World System LLM activity.** An enrolled
+  owner without a usable worldview is excluded from WM director rounds,
+  story rounds, and town comment/reply scans; the world sweeper logs one
+  aggregate warn per tick while any such owner exists. Backfilling the
+  table self-heals on the next tick.
+- **Change = reset.** The engine stores the SHA-256 of the content each
+  round (`world_states.worldview_hash`). A changed worldview makes the
+  owner due within one tick and turns the next round into an init-style
+  reset: fresh seed, purged script fragments, purged story data
+  (insights/events/memories), purged *unpublished* posts. Published posts
+  and their comments are kept as read-only feed history, but AI activity
+  (comment rounds, replies) only ever targets posts published after the
+  current era start (`world_states.worldview_set_at`).
+- **Payloads.** The WM director, stories director, and town comment/reply
+  payloads all carry the worldview verbatim plus a fixed rule binding all
+  settings (era, technology, places, occupations, events) to it. The chat
+  prompt is unchanged — chat inherits the worldview through script
+  fragments only.
+
 ## World Memories
 
 ### The director round

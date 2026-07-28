@@ -211,6 +211,12 @@ a config + data decision, not a deploy change:
    `service_role` / owner connection (the engine only reads this table); set
    `town_enabled = true` per owner to also enable the feed.
 
+- `engine.world_worldviews` — per-owner worldview text (1..=10000 chars).
+  Downstream-written, engine-read. The engine ships no default: enrolled
+  owners without a row (or with blank content) get **no** World System LLM
+  activity until one is provided. Updating the content resets that owner's
+  world on the next tick (published town posts are kept as history).
+
 Operational switches, all optional:
 
 | Variable | Effect |
