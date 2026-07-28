@@ -66,19 +66,19 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.7"
-eros-engine-store = "0.7"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.9"
+eros-engine-store = "0.9"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.9"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` は意図的に crates.io では公開していません。Docker イメージとして実行してください（下記参照）。
 
 ## Docker イメージとして実行する
 
-`eros-engine-server` の `linux/amd64` イメージは、`v*` タグごとに GitHub Container Registry へ公開されます（arm64 が必要な場合は、`docker/Dockerfile` からビルドしてください）。
+`eros-engine-server` のマルチアーキテクチャイメージ（`linux/amd64` + `linux/arm64`）は、`v*` タグごとに GitHub Container Registry へ公開されます。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.6.8
+docker pull ghcr.io/etherfunlab/eros-engine:0.9.2
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ docker pull ghcr.io/etherfunlab/eros-engine:latest
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.6.8 serve
+  ghcr.io/etherfunlab/eros-engine:0.9.2 serve
 ```
 
 このイメージのビルドには、同じ `docker/Dockerfile` が使われています。任意のコンテナホストにデプロイできます。詳細は [Deploying](docs/deploying.md) を参照してください。
@@ -119,7 +119,7 @@ cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-サーバーはデフォルトで `0.0.0.0:8080` で待ち受けます。Scalar API ドキュメントは `/docs`、OpenAPI JSON は `/api-docs/openapi.json` にあります。公式の Eros Chat Web クライアントはクローズドソースです。独自の UI を用意するか、crate を別のサービスへ組み込んでください。
+サーバーはデフォルトで `0.0.0.0:8080` で待ち受けます。Scalar API ドキュメントは `/docs` にあります。生の OpenAPI JSON は `print-openapi` サブコマンドで出力してください。公式の Eros Chat Web クライアントはクローズドソースです。独自の UI を用意するか、crate を別のサービスへ組み込んでください。
 
 ## API 概要
 

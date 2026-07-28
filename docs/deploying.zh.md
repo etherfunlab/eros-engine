@@ -4,8 +4,8 @@
 
 兩條支持的路徑，按工作量排：
 
-1. **Docker compose 自托管**——單機 VPS，自帶 Postgres+pgvector。
-2. **作為庫嵌入**——`core + llm + store` 進你自己的服務，不要 HTTP 層。
+1. **Docker 自托管**——拉取预构建的 GHCR 镜像（或从 `docker/Dockerfile` 自己构建）；单机 VPS 自带 Postgres+pgvector。
+2. **作為庫嵌入**——从 crates.io 把 `core + llm + store` 嵌进你自己的服務，不要 HTTP 層。
 
 ## 兩種方式都需要的前置
 
@@ -22,67 +22,89 @@
 |---|---|
 | `serve`（默認） | 在 `BIND_ADDR` 上跑 HTTP 服務器 |
 | `migrate` | 應用待處理的 sqlx migrations 然後退出 |
-| `seed-personas <dir>` | 讀 `<dir>` 裡每個 `*.toml` 文件，upsert 為人格基因 |
+| `seed-personas [dir]` | 读 `[dir]` 里每个 `*.toml` 文件（默认 `/etc/eros-engine/personas`——Docker 镜像里烧的示例），upsert 为人格基因 |
 | `backfill-human-insights` | 一次性把每行 `companion_insights` 投影进 `engine.human_insights`（幂等；仅手动执行） |
 | `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。
 
-## 路徑 1：Docker compose 自托管
+## 路径 1：Docker 自托管
 
-單機 VPS 部署，把 Postgres+pgvector 跟引擎一起放進同一個 compose stack：
+每个 `v*` tag 都会往 GitHub Container Registry 发布 `eros-engine-server` 的多架构镜像（`linux/amd64` + `linux/arm64`；想自己构建的话 `docker/Dockerfile` 就是同一份产物）：
+
+```bash
+docker pull ghcr.io/etherfunlab/eros-engine:latest   # 或钉一个版本 tag
+```
+
+单机 VPS 部署，把 Postgres+pgvector 跟引擎放进同一个 compose stack，大致长这样（仓库不带 compose 文件——自己写一份；按需要调端口、卷、env）：
 
 ```yaml
-# docker/docker-compose.yml（草圖——按需要調端口、捲、env）
+# compose.yml（草图）
 services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: eros_engine
-    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
     volumes:
       - eros_pg:/var/lib/postgresql/data
 
   engine:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    depends_on: [postgres]
+    image: ghcr.io/etherfunlab/eros-engine:latest  # 生产环境钉一个版本 tag
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/eros_engine
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       VOYAGE_API_KEY: ${VOYAGE_API_KEY}
-      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
-      EXPOSE_AFFINITY_DEBUG: "true"
+      SUPABASE_URL: ${SUPABASE_URL}   # JWKS 校验——2025 之后 Supabase 的默认方式
+      # SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}   # 旧版 HS256 备选
     ports: ["8080:8080"]
 
 volumes:
   eros_pg:
 ```
 
-`docker compose -f docker/docker-compose.yml up` 跑起來。第一次 boot 會走 `migrate` 子命令入口跑遷移；之後重啟跳過已應用的遷移。
+没有任何东西会自动迁移——第一次 `serve` 之前、以及每次升级镜像之后，都要手动跑一次 `migrate` 子命令：
 
-这份 compose 只接了旧版的 `SUPABASE_JWT_SECRET`，所以 `up` 之前要先导出一个非空值。空或未设置、又没有 JWKS 来源时，引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。若想改用非对称 JWKS 校验，在 `environment:` 块里加上 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`）。
+```bash
+docker compose up -d postgres
+docker compose run --rm engine migrate
+docker compose run --rm engine seed-personas /etc/eros-engine/personas  # 可选：示例人格（手动步骤——按 name upsert）
+docker compose up -d engine
+```
+
+至少要接一个 auth 来源——非对称 JWKS 校验用 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`），或者一个非空的旧版 `SUPABASE_JWT_SECRET`。两者都没有时引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。
+
+**模型配置：**镜像把脱敏过的 `examples/model_config.toml` 烧在 `/etc/eros-engine/model_config.toml`，并预设了 `MODEL_CONFIG_PATH` 指向它，所以容器开箱即可启动。注意烧进去的示例带有生效的 `[tasks.world_*]` section——零注册时无害（不会有 LLM 调用），但世界 sweeper 会跑起来；想让[世界系统](world-system.zh.md)完全不动就设 `WORLD_DISABLED=true`。真实部署时挂载你自己的配置并把 `MODEL_CONFIG_PATH` 指过去——或者设 `MODEL_CONFIG_DIR` 指向一个挂载目录，里面的 `.toml` 片段会在启动时合并。两者互斥，而镜像预设了 `MODEL_CONFIG_PATH`，所以走目录路线要显式清掉它（`MODEL_CONFIG_PATH=`——空值等同未设置）。见[模型配置](model-config.zh.md)。
 
 前面放個真正的 Caddy / Traefik / Cloudflare 做 HTTPS 終止。
 
 ## 路徑 2：作為庫嵌入
 
-如果你不需要 HTTP 層——比如你在這個基礎上搞另一個產品——直接跳過 `eros-engine-server`：
+如果你不需要 HTTP 層——比如你在這個基礎上搞另一個產品——直接跳過 `eros-engine-server`。三个库 crate 都发布在 crates.io 上：
 
 ```toml
 [dependencies]
-eros-engine-core  = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
-eros-engine-llm   = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
-eros-engine-store = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
+eros-engine-core  = "0.9"
+eros-engine-llm   = "0.9"
+eros-engine-store = "0.9"
 ```
+
+（要跟未发布的开发进度，改用 `{ git = "https://github.com/etherfunlab/eros-engine", branch = "main" }`。）
 
 然後構造 pool、倉儲、LLM 客戶端，寫你自己的分派層：
 
 ```rust
 let pool = eros_engine_store::pool::build(&database_url).await?;
-let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(or_key);
+let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(
+    or_key,
+    eros_engine_llm::openrouter::AppAttribution::default(),
+);
 let voyage = eros_engine_llm::voyage::VoyageClient::new(voyage_key);
 
 let affinity_repo = eros_engine_store::affinity::AffinityRepo { pool: &pool };
@@ -97,11 +119,11 @@ match eros_engine_core::ghost::decide(&affinity, signals) {
 }
 ```
 
-遷移文件 `crates/eros-engine-store/migrations/` 隨 crate 發佈；用 `sqlx::migrate!()` 對你的 pool 跑就行，方式跟 `eros-engine-server` 一樣。
+迁移文件随 `eros-engine-store` crate 发布（`migrations/` 目录）；把 `sqlx::migrate!("<path>")` 指向该目录、对你的 pool 跑。这个宏要编译期路径，所以要么 vendor 这个目录、要么用 path 依赖——server 自己用的是 `sqlx::migrate!("../eros-engine-store/migrations")`。
 
 ## 自帶 Auth
 
-默認 JWT 驗證器是 Supabase HS256。換別的 IdP 就實現這個 trait：
+默认 JWT 验证器是 Supabase——通过 `SUPABASE_URL` / `SUPABASE_JWKS_URL` 走 JWKS 非对称校验（ES256/RS256/EdDSA），另有旧版 HS256 共享密钥回退（`SUPABASE_JWT_SECRET`）。換別的 IdP 就實現這個 trait：
 
 ```rust
 use async_trait::async_trait;
@@ -119,6 +141,8 @@ impl AuthValidator for MyValidator {
 ```
 
 然後把你的實例注入 `AppState.auth: Arc<dyn AuthValidator>`。中間件（`auth::middleware::require_auth`）對你提供的任何驗證器都通用。
+
+（`eros-engine-server` 有意不作为库发布，所以这一节是给 fork server 跑的人看的。路径 2 的嵌入方完全跳过 HTTP auth 层，自己做鉴权。）
 
 ## 自帶 Postgres
 
@@ -198,15 +222,21 @@ PROMPT_LOG_DIR = "/data/prompt-logs"
 
 ### 世界系统（实验特性，可选）
 
-[世界系统](world-system.zh.md)（World Memories 模拟 + World Town 动态）默认
-完全关闭：模型配置里没有 `[tasks.world_director]` section 时，不会起任何
-sweeper，每回合零查询。开启它是配置 + 数据层面的决定，不需要改部署：
+[世界系统](world-system.zh.md)（World Memories 模拟 + World Town 动态 +
+World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
+`[tasks.world_director]` section 时，不会起任何 sweeper，每回合零查询。开启
+它是配置 + 数据层面的决定，不需要改部署：
 
 1. 在模型配置中加入 `[tasks.world_*]` section（见
    [`examples/model_config.toml`](../examples/model_config.toml)）。
 2. 通过 `service_role` / owner 连接往 `engine.world_enrollments` 插行来注册
    owner（引擎只读这张表）；对需要动态流的 owner 把 `town_enabled` 设为
-   `true`。
+   `true`，要 World Stories 的再把 `stories_enabled` 设为 `true`。
+
+- `engine.world_worldviews`——每 owner 的世界观文本（1..=10000 字符）。
+  下游写、引擎读。引擎不带默认值：已注册但没有这行（或内容为空）的 owner
+  **不会**有任何世界系统 LLM 活动，直到提供为止。更新内容会在下一个 tick
+  重置该 owner 的世界（已发布的小镇贴文保留为历史）。
 
 运维开关，均可选：
 
@@ -216,19 +246,25 @@ sweeper，每回合零查询。开启它是配置 + 数据层面的决定，不�
 | `WORLD_PROMPT_DISABLED=true` | 照常模拟积累，但不动聊天 prompt（灰度阀门） |
 | `WORLD_TICK_SECS` | 导演 sweeper tick（默认 300；`0` 关停） |
 | `WORLD_TOWN_DISABLED=true` | 仅小镇：不生成贴文、不起小镇 sweeper；记忆照常运行 |
+| `WORLD_STORIES_DISABLED=true` | 仅故事：不跑生活轮、不注入 `[world_stories]`；记忆照常运行 |
+| `WORLD_STORIES_PROMPT_DISABLED=true` | 生活照常模拟，但不动聊天 prompt（灰度阀门） |
 
-成本形状：每个注册 owner 每 `interval_hours` 一次导演调用，外加（仅小镇）按
-活动触发的每小时评论轮和按 owner 限额的回复。没人互动的世界恰好只花导演那一
-次调用。细节、数据模型与启动校验规则见[世界系统](world-system.zh.md)。
+成本形状：每个**有可用世界观**的注册 owner 每 `interval_hours` 一次导演调
+用，外加（仅小镇）按活动触发的每小时评论轮和按 owner 限额的回复，外加（仅
+故事）按各自节奏跑的按实例生活轮。没有世界观的 owner（见上）整个跳过、零成
+本。没人互动的世界恰好只花导演那一次调用。细节、数据模型与启动校验规则见
+[世界系统](world-system.zh.md)。
 
+- **环境变量：**大部分运维环境变量在 [`.env.example`](../.env.example) 里带注释列出——OpenRouter 归因头、usage 字段过滤、EMA 惯性旋钮、世界系统开关、调试开关。
+- **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）和 insight 快照两个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` 关掉，不影响聊天路径。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
-- **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。OpenAPI JSON 在 `/api-docs/openapi.json`。
+- **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
 - **Affinity debug：** `GET /comp/affinity/{session_id}` 受 `EXPOSE_AFFINITY_DEBUG=true` 控制。生產部署一般關掉；如果你的前端要實時畫好感度雷達圖，再打開。
 - **日誌：** `RUST_LOG=info` 是默認。`RUST_LOG=debug,sqlx=warn` 看到除 SQLx 查詢噪音以外的一切。
 - **成本：** OSS 部署默认 chat 使用一个快速廉价的模型、insight 抽取使用一个高质量抽取模型（当前默认值见 `examples/model_config.toml`）。一轮典型对话花费 ≪ $0.001 美元 token 成本，加上一个 Voyage embedding 调用（每个值得记住的事实约 $0.000003）。10000 轮对话花个位数美元。
 
 ## 源碼
 
-- `docker/Dockerfile`——多階段構建（Rust 1.88 構建器 → debian:bookworm-slim 運行時）
-- `docker/docker-compose.yml`——自托管 stack
-- `crates/eros-engine-server/src/main.rs`——三個子命令
+- `docker/Dockerfile`——多阶段构建（Rust 1.88 构建器 → debian:bookworm-slim 运行时）；`ghcr.io/etherfunlab/eros-engine` 就是用它构建的同一份产物
+- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那五种模式）
+- [`.env.example`](../.env.example)——运维环境变量的带注释清单

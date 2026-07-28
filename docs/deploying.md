@@ -4,8 +4,8 @@
 
 Two supported paths, in order of effort:
 
-1. **Docker compose self-host** — single-host VPS, brings its own Postgres+pgvector.
-2. **Embed as a library** — `core + llm + store` into your own service, no HTTP layer.
+1. **Docker self-host** — pull the prebuilt GHCR image (or build from `docker/Dockerfile`); single-host VPS brings its own Postgres+pgvector.
+2. **Embed as a library** — `core + llm + store` from crates.io into your own service, no HTTP layer.
 
 ## Prerequisites in all cases
 
@@ -22,67 +22,89 @@ The binary has five modes (dispatched by `argv[1]`):
 |------------|---------|
 | `serve` (default) | Run the HTTP server on `BIND_ADDR` |
 | `migrate` | Apply pending sqlx migrations and exit |
-| `seed-personas <dir>` | Read every `*.toml` in `<dir>` and upsert as a persona genome |
+| `seed-personas [dir]` | Read every `*.toml` in `[dir]` (default `/etc/eros-engine/personas` — the examples baked into the Docker image) and upsert as a persona genome |
 | `backfill-human-insights` | One-off projection of every `companion_insights` row into `engine.human_insights` (idempotent; manual only) |
 | `print-openapi` | Dump the OpenAPI spec to stdout and exit (no DB, no env; used by the CI drift check) |
 
 `seed-personas` is idempotent — re-runs update existing rows in place (matched by `name`), preserving UUIDs and FK references in `persona_instances`.
 
-## Path 1: Docker compose self-host
+## Path 1: Docker self-host
 
-For a single-VPS deployment that runs Postgres+pgvector inside the same compose stack:
+Multi-arch (`linux/amd64` + `linux/arm64`) images of `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (`docker/Dockerfile` builds the same artifact if you'd rather build your own):
+
+```bash
+docker pull ghcr.io/etherfunlab/eros-engine:latest   # or pin a version tag
+```
+
+For a single-VPS deployment that runs Postgres+pgvector next to the engine, a compose file along these lines works (the repo ships no compose file — write your own; adjust ports, volumes, env):
 
 ```yaml
-# docker/docker-compose.yml (sketch — adjust ports, volumes, env)
+# compose.yml (sketch)
 services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: eros_engine
-    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
     volumes:
       - eros_pg:/var/lib/postgresql/data
 
   engine:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    depends_on: [postgres]
+    image: ghcr.io/etherfunlab/eros-engine:latest  # pin a version tag in production
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/eros_engine
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       VOYAGE_API_KEY: ${VOYAGE_API_KEY}
-      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
-      EXPOSE_AFFINITY_DEBUG: "true"
+      SUPABASE_URL: ${SUPABASE_URL}   # JWKS auth — the post-2025 Supabase default
+      # SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}   # legacy HS256 alternative
     ports: ["8080:8080"]
 
 volumes:
   eros_pg:
 ```
 
-Run with `docker compose -f docker/docker-compose.yml up`. The first boot will run migrations via the `migrate` subcommand entry; subsequent reboots skip already-applied migrations.
+Nothing migrates automatically — run the `migrate` subcommand before the first `serve` and again after every image upgrade:
 
-This compose file wires only the legacy `SUPABASE_JWT_SECRET`, so export a non-empty value before `up`. An empty or unset secret with no JWKS source makes the engine refuse to boot — by design, so a misconfigured deploy fails loudly instead of silently rejecting every request. For asymmetric JWKS validation instead, add `SUPABASE_URL` (or `SUPABASE_JWKS_URL`) to the `environment:` block.
+```bash
+docker compose up -d postgres
+docker compose run --rm engine migrate
+docker compose run --rm engine seed-personas /etc/eros-engine/personas  # optional: example personas (manual step — upserts by name)
+docker compose up -d engine
+```
+
+At least one auth source must be wired — `SUPABASE_URL` (or `SUPABASE_JWKS_URL`) for asymmetric JWKS validation, or a non-empty legacy `SUPABASE_JWT_SECRET`. With neither, the engine refuses to boot — by design, so a misconfigured deploy fails loudly instead of silently rejecting every request.
+
+**Model config:** the image bakes the sanitized `examples/model_config.toml` at `/etc/eros-engine/model_config.toml` and presets `MODEL_CONFIG_PATH` to it, so the container boots as-is. Note the baked example includes live `[tasks.world_*]` sections — harmless with zero world enrollments (no LLM calls), but the world sweepers do run; set `WORLD_DISABLED=true` if you want the [World system](world-system.md) fully inert. For a real deployment, mount your own config and point `MODEL_CONFIG_PATH` at it — or set `MODEL_CONFIG_DIR` to a mounted directory of `.toml` fragments merged at boot. The two are mutually exclusive, and the image presets `MODEL_CONFIG_PATH`, so going the directory route means clearing it explicitly (`MODEL_CONFIG_PATH=` — empty counts as unset). See [Model config](model-config.md).
 
 Place a real Caddy / Traefik / Cloudflare in front for HTTPS termination.
 
 ## Path 2: Embed as a library
 
-If you don't need the HTTP layer — say you're building a different product on top of the affinity + memory pipeline — skip `eros-engine-server` entirely:
+If you don't need the HTTP layer — say you're building a different product on top of the affinity + memory pipeline — skip `eros-engine-server` entirely. The three library crates are published on crates.io:
 
 ```toml
 [dependencies]
-eros-engine-core  = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
-eros-engine-llm   = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
-eros-engine-store = { git = "https://github.com/etherfunlab/eros-engine", branch = "main" }
+eros-engine-core  = "0.9"
+eros-engine-llm   = "0.9"
+eros-engine-store = "0.9"
 ```
+
+(To track unreleased work, use `{ git = "https://github.com/etherfunlab/eros-engine", branch = "main" }` instead.)
 
 Then construct a pool, repos, LLM clients, and write your own dispatch layer:
 
 ```rust
 let pool = eros_engine_store::pool::build(&database_url).await?;
-let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(or_key);
+let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(
+    or_key,
+    eros_engine_llm::openrouter::AppAttribution::default(),
+);
 let voyage = eros_engine_llm::voyage::VoyageClient::new(voyage_key);
 
 let affinity_repo = eros_engine_store::affinity::AffinityRepo { pool: &pool };
@@ -97,11 +119,11 @@ match eros_engine_core::ghost::decide(&affinity, signals) {
 }
 ```
 
-The migrations file `crates/eros-engine-store/migrations/` ships with the crate; run `sqlx::migrate!()` against your pool the same way `eros-engine-server` does.
+The migration files ship with the `eros-engine-store` crate under `migrations/`; point `sqlx::migrate!("<path>")` at that directory and run it against your pool. The macro needs a compile-time path, so vendor the directory or use a path dependency — the server itself does `sqlx::migrate!("../eros-engine-store/migrations")`.
 
 ## Bring-your-own auth
 
-The default JWT validator is Supabase HS256. Plug another IdP by implementing the trait:
+The default JWT validator is Supabase — JWKS asymmetric (ES256/RS256/EdDSA) via `SUPABASE_URL` / `SUPABASE_JWKS_URL`, with a legacy HS256 shared-secret fallback (`SUPABASE_JWT_SECRET`). Plug another IdP by implementing the trait:
 
 ```rust
 use async_trait::async_trait;
@@ -119,6 +141,8 @@ impl AuthValidator for MyValidator {
 ```
 
 Then inject your impl into `AppState.auth: Arc<dyn AuthValidator>`. The middleware (`auth::middleware::require_auth`) is generic over whatever validator you provide.
+
+(`eros-engine-server` is intentionally not published as a library, so this is guidance for running a fork of the server. Path 2 embedders skip the HTTP auth layer entirely and enforce their own.)
 
 ## Bring-your-own Postgres
 
@@ -201,15 +225,17 @@ There is no built-in rotation or retention — manage the volume yourself.
 ### World system (experimental, optional)
 
 The [World system](world-system.md) (World Memories simulation + World Town
-feed) is fully off by default: without a `[tasks.world_director]` model-config
-section it spawns no sweepers and runs zero per-turn queries. Turning it on is
-a config + data decision, not a deploy change:
+feed + World Stories per-instance life simulation) is fully off by default:
+without a `[tasks.world_director]` model-config section it spawns no sweepers
+and runs zero per-turn queries. Turning it on is a config + data decision, not
+a deploy change:
 
 1. Add the `[tasks.world_*]` sections to your model config (see
    [`examples/model_config.toml`](../examples/model_config.toml)).
 2. Enroll owners by inserting rows into `engine.world_enrollments` over a
    `service_role` / owner connection (the engine only reads this table); set
-   `town_enabled = true` per owner to also enable the feed.
+   `town_enabled = true` per owner to also enable the feed, and
+   `stories_enabled = true` to also enable World Stories.
 
 - `engine.world_worldviews` — per-owner worldview text (1..=10000 chars).
   Downstream-written, engine-read. The engine ships no default: enrolled
@@ -225,22 +251,27 @@ Operational switches, all optional:
 | `WORLD_PROMPT_DISABLED=true` | Simulate + accumulate, but don't touch chat prompts (staged-rollout valve) |
 | `WORLD_TICK_SECS` | Director sweeper tick (default 300; `0` disables) |
 | `WORLD_TOWN_DISABLED=true` | Town only: no post generation, no town sweeper; memories keep running |
+| `WORLD_STORIES_DISABLED=true` | Stories only: no life rounds, no `[world_stories]` injection; memories keep running |
+| `WORLD_STORIES_PROMPT_DISABLED=true` | Keep simulating lives, but don't touch chat prompts (staged-rollout valve) |
 
 Cost shape: one director call per enrolled owner **with a usable worldview**
 per `interval_hours`, plus (town only) activity-gated hourly comment rounds
-and per-owner-capped replies. Owners without a worldview (see above) are
-skipped entirely and cost nothing. A world nobody interacts with costs
-exactly the director call. Details,
-data model, and the boot-validation rules are in [World system](world-system.md).
+and per-owner-capped replies, plus (stories only) per-instance life rounds on
+their own cadence. Owners without a worldview (see above) are skipped entirely
+and cost nothing. A world nobody interacts with costs exactly the director
+call. Details, data model, and the boot-validation rules are in
+[World system](world-system.md).
 
+- **Env vars:** most operational env vars are annotated in [`.env.example`](../.env.example) — OpenRouter attribution headers, usage-key filtering, EMA inertia dials, world-system switches, debug toggles.
+- **Background sweepers:** `serve` also runs the dreaming-lite (session-end memory classifier) and insight-snapshot sweepers. Both are optional: `DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` turn them off without affecting the chat path.
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
-- **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The OpenAPI JSON is at `/api-docs/openapi.json`.
+- **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The raw OpenAPI JSON is not served over HTTP — dump it with the `print-openapi` subcommand.
 - **Affinity debug:** `GET /comp/affinity/{session_id}` is gated by `EXPOSE_AFFINITY_DEBUG=true`. Production deploys typically leave it off; turn it on if your frontend renders a live radar of the affinity vector.
 - **Logs:** `RUST_LOG=info` is the default. Set `RUST_LOG=debug,sqlx=warn` to see everything except SQLx query churn.
 - **Cost:** the OSS deployment defaults to a fast, cheap model for chat and a capable extraction model for insight extraction (see `examples/model_config.toml` for current defaults). A typical chat turn costs ≪ $0.001 in token spend plus a Voyage embedding call (~$0.000003 for a memory-worthy fact). 10k chat turns costs single-digit dollars.
 
 ## Source
 
-- `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime)
-- `docker/docker-compose.yml` — self-host stack
-- `crates/eros-engine-server/src/main.rs` — the three subcommands
+- `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
+- `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the five modes above)
+- [`.env.example`](../.env.example) — annotated operational env-var list

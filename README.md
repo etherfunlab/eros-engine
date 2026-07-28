@@ -66,16 +66,16 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.8"
-eros-engine-store = "0.8"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.8"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.9"
+eros-engine-store = "0.9"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.9"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` is intentionally not published to crates.io — run it as a Docker image (below).
 
 ## Run as a Docker image
 
-`linux/amd64` images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag (need arm64? Build it yourself from `docker/Dockerfile`):
+Multi-arch (`linux/amd64` + `linux/arm64`) images for `eros-engine-server` are published to GitHub Container Registry for every `v*` tag:
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:0.9.2
@@ -119,7 +119,7 @@ cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`; the OpenAPI JSON is at `/api-docs/openapi.json`. The official Eros Chat web client is closed-source — bring your own UI or embed the crates in another service.
+The server listens on `0.0.0.0:8080` by default. Scalar API docs are available at `/docs`; dump the raw OpenAPI JSON with the `print-openapi` subcommand. The official Eros Chat web client is closed-source — bring your own UI or embed the crates in another service.
 
 ## API surface
 

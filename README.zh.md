@@ -66,19 +66,19 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "0.7"
-eros-engine-store = "0.7"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "0.7"   # only if you want the OpenRouter + Voyage clients
+eros-engine-core  = "0.9"
+eros-engine-store = "0.9"   # only if you want the Postgres + pgvector layer
+eros-engine-llm   = "0.9"   # only if you want the OpenRouter + Voyage clients
 ```
 
 `eros-engine-server` 有意不发布到 crates.io——请使用 Docker 镜像运行（见下文）。
 
 ## 作为 Docker 镜像运行
 
-每个 `v*` tag 都会将 `eros-engine-server` 的 `linux/amd64` 镜像发布到 GitHub Container Registry（需要 arm64？请使用 `docker/Dockerfile` 自行构建）：
+每个 `v*` tag 都会将 `eros-engine-server` 的多架构镜像（`linux/amd64` + `linux/arm64`）发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:0.6.8
+docker pull ghcr.io/etherfunlab/eros-engine:0.9.2
 # or track the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
@@ -87,7 +87,7 @@ docker pull ghcr.io/etherfunlab/eros-engine:latest
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:0.6.8 serve
+  ghcr.io/etherfunlab/eros-engine:0.9.2 serve
 ```
 
 构建此镜像使用的正是 `docker/Dockerfile`，可将其部署到任意容器托管平台。请参阅[部署](docs/deploying.zh.md)。
@@ -119,7 +119,7 @@ cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-服务默认监听 `0.0.0.0:8080`。Scalar API 文档位于 `/docs`，OpenAPI JSON 位于 `/api-docs/openapi.json`。官方 Eros Chat Web 客户端并未开源——请自行提供 UI，或将这些 crate 嵌入其他服务。
+服务默认监听 `0.0.0.0:8080`。Scalar API 文档位于 `/docs`；原始 OpenAPI JSON 用 `print-openapi` 子命令导出。官方 Eros Chat Web 客户端并未开源——请自行提供 UI，或将这些 crate 嵌入其他服务。
 
 ## API 一览
 
