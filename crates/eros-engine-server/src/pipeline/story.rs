@@ -41,7 +41,9 @@ backstory 是 canon，不可与之冲突。每轮输出更新后的完整 insigh
 每轮根据 current_time 刷新相对时间表述。\
 5) events：当期发生的具体生活事件（工作进展、感情进展、生活进展等，类目见系统指示），\
 每条一句、自成一体、适合单独召回；避免与近期事件重复。\
-6) digest：1-2 句该角色当前人生近况。";
+6) digest：1-2 句该角色当前人生近况。\
+7) 一切生活设定（职业、居所、日常事件）必须发生在 worldview 描述的世界观内，\
+不得引入与其冲突的元素。";
 
 /// Persona-side life-base schema: superset of COMPANION_INSIGHTS_SCHEMA
 /// (prompt.rs), reworded for the persona, flat (matching preferences
@@ -101,6 +103,7 @@ fn story_user_payload(
     recent_events: &[(String, String)],
     affinity: Option<&StoryAffinity>,
     chat_pairs: &[(String, String)],
+    worldview: &str,
 ) -> String {
     let is_init = row.last_run_at.is_none();
     let header = if is_init {
@@ -122,6 +125,7 @@ fn story_user_payload(
         .collect();
     let data = serde_json::json!({
         "current_time": now.to_rfc3339(),
+        "worldview": worldview,
         "persona": {
             "name": persona.name,
             "personality": persona.tip_personality,
@@ -271,6 +275,16 @@ async fn direct_story(
     else {
         return Err("story row missing after claim".into());
     };
+    let world_repo = eros_engine_store::world::WorldRepo { pool: &state.pool };
+    let Some((worldview, _)) = world_repo
+        .worldview_state(owner)
+        .await
+        .map_err(|e| format!("worldview load failed: {e}"))?
+    else {
+        // claim_due (story gate, Task 4) required a worldview; it vanished
+        // between claim and round — release and wait for it to reappear.
+        return Err("worldview missing at story round time".into());
+    };
     let recent = repo
         .recent_events(instance, STORY_RECENT_EVENTS)
         .await
@@ -291,6 +305,7 @@ async fn direct_story(
         &recent,
         affinity.as_ref(),
         &chat,
+        &worldview,
     );
     let req = ChatRequest {
         model: resolved.model.clone(),
@@ -405,6 +420,7 @@ mod tests {
             &[],
             None,
             &[],
+            "现代都市",
         );
         assert!(init.contains("初始化这个角色的人生"));
         assert!(init.contains("咖啡店店主"), "backstory in payload");
@@ -420,10 +436,30 @@ mod tests {
             &[("work".into(), "上周修好了咖啡机".into())],
             None,
             &[("最近好吗".into(), "在忙开店".into())],
+            "现代都市",
         );
         assert!(cont.contains("延续这个角色的人生"));
         assert!(cont.contains("上周修好了咖啡机"));
         assert!(cont.contains("最近好吗"));
+    }
+
+    #[test]
+    fn payload_carries_worldview_and_rule() {
+        let p = story_user_payload(
+            chrono::Utc::now(),
+            &fixture_persona(),
+            &fixture_row(false),
+            &[],
+            None,
+            &[],
+            "古代宫廷",
+        );
+        assert!(p.contains("\"worldview\""));
+        assert!(p.contains("古代宫廷"));
+        assert!(
+            p.contains("必须发生在 worldview"),
+            "worldview rule appended"
+        );
     }
 
     #[test]
@@ -510,6 +546,17 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // direct_story now fetches WorldRepo::worldview_state, which JOINs
+        // world_states — in production `ensure_states_for_enrollments` backfills
+        // this row every tick before run_stories_scan runs (world.rs), so seed it
+        // here too.
+        sqlx::query(
+            "INSERT INTO engine.world_states (owner_uid, seed, digests) VALUES ($1, '{}', '{}')",
         )
         .bind(owner)
         .execute(&pool)
@@ -623,6 +670,17 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // direct_story now fetches WorldRepo::worldview_state, which JOINs
+        // world_states — in production `ensure_states_for_enrollments` backfills
+        // this row every tick before run_stories_scan runs (world.rs), so seed it
+        // here too.
+        sqlx::query(
+            "INSERT INTO engine.world_states (owner_uid, seed, digests) VALUES ($1, '{}', '{}')",
         )
         .bind(owner)
         .execute(&pool)
