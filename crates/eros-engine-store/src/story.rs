@@ -162,7 +162,7 @@ impl<'a> StoryRepo<'a> {
                  JOIN engine.world_enrollments we \
                    ON we.owner_uid = psi.owner_uid AND we.stories_enabled \
                  JOIN engine.world_worldviews ww \
-                   ON ww.owner_uid = psi.owner_uid AND btrim(ww.content) <> '' \
+                   ON ww.owner_uid = psi.owner_uid AND btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                  JOIN engine.persona_instances pi \
                    ON pi.id = psi.instance_id AND pi.status = 'active' \
                  WHERE (psi.last_run_at IS NULL OR psi.last_run_at < $1) \

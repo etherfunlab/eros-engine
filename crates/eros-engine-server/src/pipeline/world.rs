@@ -400,8 +400,9 @@ async fn direct_world(
 /// owners only — memories-only owners see no mention of posts. `recent_life`
 /// is `Some` only for stories-active owners (World System v2, spec §4): each
 /// persona's JSON entry gains a `recent_life` array and
-/// `WORLD_STORIES_WM_RULES` is appended. `None` reproduces the v1 payload
-/// byte-for-byte — no `recent_life` key anywhere, no stories rule.
+/// `WORLD_STORIES_WM_RULES` is appended. `None` adds no `recent_life` key
+/// anywhere and no stories rule — the stories dimension only; every payload
+/// still carries `worldview` and rule 5 regardless (see below).
 /// `worldview` (spec §3) always rides the `data` JSON's `worldview` key and
 /// rule 5 always applies — there is no v1-shaped "no worldview" branch.
 fn director_user_payload(
@@ -1440,5 +1441,145 @@ mod tests {
                 .unwrap();
         assert_eq!(seed["arc"], "第一幕");
         assert_eq!(digests[instance_id.to_string()], "W 在筹备开店");
+    }
+
+    /// spec §7 coverage gap: `recent_life` must be suppressed on a reset
+    /// round even when stories are active and a real `persona_story_events`
+    /// row exists — `direct_world`'s `stories_active && !reset` guard, not
+    /// just the pure-layer unit test's hand-built HashMap. The reset purges
+    /// story data in the same transaction (spec §2 reset inventory), so
+    /// feeding the pre-reset event into this round's payload would leak
+    /// old-era content into the new world.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn direct_world_reset_suppresses_recent_life(pool: sqlx::PgPool) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let owner = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('W','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_enrollments (owner_uid, stories_enabled) VALUES ($1, true)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events \
+             (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '刚拿到新工作的offer', current_date)",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reply = serde_json::json!({
+            "seed": {"arc": "第一幕"},
+            "personas": [{
+                "instance_id": instance_id,
+                "digest": "W 在筹备开店",
+                "script_fragments": []
+            }]
+        });
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-world", "model": "w/m",
+                "choices": [{"message": {"content": reply.to_string()}}],
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.world_director]\nmodel=\"w/m\"\nfilter_prompt=\"direct\"\n\
+                 [tasks.world_stories_director]\nmodel=\"w/s\"\nfilter_prompt=\"live\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                Default::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_world_director().unwrap();
+        assert!(
+            state
+                .model_config
+                .resolve_world_stories_director()
+                .is_some(),
+            "world_stories_director must resolve for stories_active to be true"
+        );
+
+        let repo = eros_engine_store::world::WorldRepo { pool: &pool };
+        repo.ensure_states_for_enrollments().await.unwrap();
+        // Stamp a DIFFERENT worldview hash than the current content's — this
+        // round must compute a mismatch and take the reset path.
+        sqlx::query("UPDATE engine.world_states SET worldview_hash = $2 WHERE owner_uid = $1")
+            .bind(owner)
+            .bind(worldview_sha256_hex("旧世界观"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = repo
+            .claim_due(
+                std::time::Duration::from_secs(24 * 3600),
+                std::time::Duration::from_secs(1800),
+                5,
+            )
+            .await
+            .unwrap();
+        let (owner_claimed, token) = claimed[0];
+        assert_eq!(owner_claimed, owner);
+
+        direct_world(&state, &resolved, owner, token)
+            .await
+            .expect("round ok");
+
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("初始化这个世界"),
+            "reset forces the init header"
+        );
+        assert!(
+            !body.contains("recent_life"),
+            "reset must suppress recent_life even though stories are active \
+             and a persona_story_events row exists"
+        );
+        assert!(
+            !body.contains("刚拿到新工作的offer"),
+            "the suppressed pre-reset event's content must not leak into the payload"
+        );
     }
 }

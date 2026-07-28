@@ -84,7 +84,7 @@ impl<'a> WorldRepo<'a> {
                  SELECT ws.owner_uid FROM engine.world_states ws \
                  JOIN engine.world_enrollments we USING (owner_uid) \
                  JOIN engine.world_worldviews ww USING (owner_uid) \
-                 WHERE btrim(ww.content) <> '' \
+                 WHERE btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                    AND (ws.last_run_at IS NULL OR ws.last_run_at < $1 \
                         OR ww.updated_at > ws.last_run_at) \
                    AND (ws.claimed_at IS NULL OR ws.claimed_at < $2) \
@@ -193,7 +193,9 @@ impl<'a> WorldRepo<'a> {
         .fetch_optional(self.pool)
         .await?;
         Ok(row.and_then(|(content, hash)| {
-            let trimmed = content.trim().to_string();
+            let trimmed = content
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_string();
             (!trimmed.is_empty()).then_some((trimmed, hash))
         }))
     }
@@ -205,7 +207,7 @@ impl<'a> WorldRepo<'a> {
         sqlx::query_scalar(
             "SELECT count(*) FROM engine.world_enrollments we \
              LEFT JOIN engine.world_worldviews ww USING (owner_uid) \
-             WHERE ww.owner_uid IS NULL OR btrim(ww.content) = ''",
+             WHERE ww.owner_uid IS NULL OR btrim(ww.content, E' \\t\\r\\n\\f\\v') = ''",
         )
         .fetch_one(self.pool)
         .await
@@ -661,6 +663,69 @@ mod tests {
         set_worldview(&pool, blank, " ").await;
 
         assert_eq!(repo.count_enrolled_missing_worldview().await.unwrap(), 2);
+    }
+
+    /// SQL `btrim` and Rust `str::trim_matches(is_ascii_whitespace)` must
+    /// agree on what "blank" means — otherwise content like a lone "\n"
+    /// passes the DDL CHECK and claim_due's plain `btrim(...) <> ''` gate
+    /// (which only strips spaces) while `worldview_state`'s old `.trim()`
+    /// (which strips all Unicode whitespace) reads it as missing: per-tick
+    /// claim churn plus a `worldview missing at round time` warn that the
+    /// aggregate count also misses. Both sides now use the same ASCII
+    /// whitespace charset (space, tab, CR, LF, FF), so a Unicode-only
+    /// whitespace character like U+3000 (outside that charset) is
+    /// consistently treated as PRESENT content on both sides.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn blank_worldview_definition_agrees_between_sql_and_rust(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll_without_worldview(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+
+        // A lone newline passes the DDL CHECK (non-empty) but is blank under
+        // the ASCII-whitespace definition on both sides.
+        set_worldview(&pool, owner, "\n").await;
+        assert!(
+            repo.claim_due(DAY, STALE, 5).await.unwrap().is_empty(),
+            "newline-only content must not be claimable"
+        );
+        assert_eq!(
+            repo.count_enrolled_missing_worldview().await.unwrap(),
+            1,
+            "newline-only content must count toward the aggregate warn"
+        );
+        assert!(
+            repo.worldview_state(owner).await.unwrap().is_none(),
+            "newline-only content must read as no worldview"
+        );
+
+        // Real content self-heals immediately.
+        set_worldview(&pool, owner, "现代都市").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        assert_eq!(claimed.len(), 1, "real content becomes claimable");
+        let (_, token) = claimed[0];
+        assert_eq!(repo.count_enrolled_missing_worldview().await.unwrap(), 0);
+        // Release so the next claim_due call below isn't blocked by the
+        // fresh claim just taken — this test checks claimability, not the
+        // claim-token lifecycle (covered elsewhere).
+        repo.release_claim(owner, token).await.unwrap();
+
+        // Full-width space (U+3000) IS Unicode whitespace but is outside the
+        // ASCII charset both sides now trim on — it must read as PRESENT,
+        // not blank, consistently.
+        set_worldview(&pool, owner, "\u{3000}").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "full-width-space-only content is claimable (treated as present)"
+        );
+        let (content, _hash) = repo
+            .worldview_state(owner)
+            .await
+            .unwrap()
+            .expect("full-width-space-only content must read as PRESENT");
+        assert_eq!(content, "\u{3000}");
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -184,7 +184,7 @@ impl<'a> WorldTownRepo<'a> {
              JOIN engine.world_enrollments we USING (owner_uid) \
              JOIN engine.world_worldviews ww USING (owner_uid) \
              WHERE we.town_enabled \
-               AND btrim(ww.content) <> '' \
+               AND btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                AND (ws.last_comment_round_at IS NULL \
                     OR ws.last_comment_round_at < now() - make_interval(secs => $1))",
         )
@@ -303,7 +303,7 @@ impl<'a> WorldTownRepo<'a> {
                    ON pi.id = p.instance_id AND pi.status = 'active' \
                  JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
                  JOIN engine.world_worldviews ww \
-                   ON ww.owner_uid = p.owner_uid AND btrim(ww.content) <> '' \
+                   ON ww.owner_uid = p.owner_uid AND btrim(ww.content, E' \\t\\r\\n\\f\\v') <> '' \
                  WHERE p.last_user_comment_at > now() - make_interval(secs => $1) \
                    AND p.last_user_comment_at <= now() - make_interval(secs => $2) \
                    AND (p.last_reply_at IS NULL \
