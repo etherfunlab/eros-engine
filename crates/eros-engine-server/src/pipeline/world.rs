@@ -342,6 +342,9 @@ async fn direct_world(
         &posts,
         script_date,
         resolved.retention_days,
+        // Placeholder until the worldview round flow lands (plan Task 6).
+        "",
+        false,
         token,
     )
     .await

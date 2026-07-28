@@ -254,19 +254,28 @@ impl<'a> WorldRepo<'a> {
     }
 
     /// Persist one director round in a single transaction (spec §2.4):
-    /// retention delete + fragment inserts + scheduled-post inserts + state
-    /// update (seed_version++, last_run_at=now, claimed_at=NULL).
-    /// All-or-nothing: any failure rolls back and the caller releases the
-    /// claim. `posts` (town-enabled owners only; empty otherwise) ride the
-    /// same transaction and the same claim-ownership-token guard as
-    /// everything else here.
+    /// reset purge (if `reset`) + retention delete + fragment inserts +
+    /// scheduled-post inserts + state update (seed_version++, last_run_at=
+    /// now, claimed_at=NULL, worldview_hash stamped, worldview_set_at
+    /// stamped iff `reset`). All-or-nothing: any failure rolls back and the
+    /// caller releases the claim. `posts` (town-enabled owners only; empty
+    /// otherwise) ride the same transaction and the same claim-ownership-
+    /// token guard as everything else here.
+    ///
+    /// `worldview_hash` is stamped onto `world_states` every round (spec
+    /// §2). `reset` is true exactly when this round's worldview hash
+    /// differs from the previously stored one (or none was stored) —
+    /// caller's job (Task 6); this method just executes the purge + era
+    /// stamp for whatever `reset` it is given. When `reset`, the purge below
+    /// runs first in the same transaction, and `worldview_set_at` is bumped
+    /// to `now()` to mark the new era's start.
     ///
     /// `claimed_at` is the ownership token from `claim_due`. The final state
     /// update is guarded on it (`AND claimed_at = $N`); if a newer sweeper
     /// has since reclaimed this owner the guard matches zero rows and we
     /// return `Err(RowNotFound)` BEFORE committing — the transaction is
-    /// dropped, which rolls back the retention delete, fragment inserts, and
-    /// post inserts too, so a lost-claim round writes nothing.
+    /// dropped, which rolls back the reset purge, retention delete, fragment
+    /// inserts, and post inserts too, so a lost-claim round writes nothing.
     #[allow(clippy::too_many_arguments)]
     pub async fn persist_round(
         &self,
@@ -277,9 +286,43 @@ impl<'a> WorldRepo<'a> {
         posts: &[PostInsert],
         script_date: NaiveDate,
         retention_days: u32,
+        worldview_hash: &str,
+        reset: bool,
         claimed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        if reset {
+            // Worldview changed (spec §2 reset inventory): the fictional
+            // world restarts. Old fragments must stop injecting into chat;
+            // scheduled-but-unpublished posts carry stale-era content and
+            // must not surface; published posts + comments stay as the
+            // feed's history. Story rows purge so lives re-derive under the
+            // new worldview — deleting a claimed persona_story_insights row
+            // mid-story-round is safe: that round's token-guarded UPDATE
+            // then matches zero rows and rolls itself back.
+            sqlx::query("DELETE FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner_uid)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "DELETE FROM engine.world_posts WHERE owner_uid = $1 AND published_at IS NULL",
+            )
+            .bind(owner_uid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM engine.persona_story_memories WHERE owner_uid = $1")
+                .bind(owner_uid)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM engine.persona_story_events WHERE owner_uid = $1")
+                .bind(owner_uid)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM engine.persona_story_insights WHERE owner_uid = $1")
+                .bind(owner_uid)
+                .execute(&mut *tx)
+                .await?;
+        }
         let retention_cutoff = script_date - chrono::Days::new(u64::from(retention_days));
         sqlx::query("DELETE FROM engine.world_memories WHERE owner_uid = $1 AND script_date < $2")
             .bind(owner_uid)
@@ -316,13 +359,17 @@ impl<'a> WorldRepo<'a> {
         let res = sqlx::query(
             "UPDATE engine.world_states \
              SET seed = $2, digests = $3, seed_version = seed_version + 1, \
-                 last_run_at = now(), claimed_at = NULL, updated_at = now() \
+                 last_run_at = now(), claimed_at = NULL, updated_at = now(), \
+                 worldview_hash = $5, \
+                 worldview_set_at = CASE WHEN $6 THEN now() ELSE worldview_set_at END \
              WHERE owner_uid = $1 AND claimed_at = $4",
         )
         .bind(owner_uid)
         .bind(seed)
         .bind(digests)
         .bind(claimed_at)
+        .bind(worldview_hash)
+        .bind(reset)
         .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
@@ -829,9 +876,20 @@ mod tests {
             content: "P 试营业当天把咖啡机弄坏了".into(),
             embedding: unit_embedding(7),
         }];
-        repo.persist_round(owner, &seed, &digests, &frags, &[], today, 30, token)
-            .await
-            .unwrap();
+        repo.persist_round(
+            owner,
+            &seed,
+            &digests,
+            &frags,
+            &[],
+            today,
+            30,
+            "h",
+            false,
+            token,
+        )
+        .await
+        .unwrap();
 
         let contents: Vec<String> =
             sqlx::query_scalar("SELECT content FROM engine.world_memories WHERE owner_uid = $1")
@@ -893,6 +951,8 @@ mod tests {
                 &[],
                 today,
                 30,
+                "h",
+                false,
                 token1,
             )
             .await;
@@ -916,6 +976,245 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n, 0, "fragment insert must roll back too");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_reset_purges_world_and_story_data_keeps_published_posts(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let inst = seed_instance(&pool, owner, "P", "active").await;
+        let today = Utc::now().date_naive();
+
+        // Old-era data of every purgeable kind.
+        sqlx::query(
+            "INSERT INTO engine.world_memories (owner_uid, instance_id, content, embedding, script_date) \
+             VALUES ($1, $2, '旧剧本', $3::vector, $4)",
+        )
+        .bind(owner).bind(inst).bind(format_vector(&unit_embedding(1))).bind(today)
+        .execute(&pool).await.unwrap();
+        let published: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.world_posts (owner_uid, instance_id, content, scheduled_at, published_at) \
+             VALUES ($1, $2, '旧贴文', now() - interval '1 day', now() - interval '1 day') RETURNING id",
+        )
+        .bind(owner).bind(inst).fetch_one(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_post_comments (post_id, author_instance_id, source, content) \
+             VALUES ($1, NULL, NULL, '用户旧评论')",
+        )
+        .bind(published).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_posts (owner_uid, instance_id, content, scheduled_at) \
+             VALUES ($1, $2, '未发布贴文', now() + interval '1 hour')",
+        )
+        .bind(owner)
+        .bind(inst)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // persona_story_insights is a flat typed table (no opaque JSONB
+        // stage, per 0038's own comment) — no `insight` column exists.
+        sqlx::query(
+            "INSERT INTO engine.persona_story_insights (instance_id, owner_uid, digest) \
+             VALUES ($1, $2, '旧近况')",
+        )
+        .bind(inst)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let old_event: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_story_events (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '旧事件', current_date) RETURNING id",
+        )
+        .bind(owner).bind(inst).fetch_one(&pool).await.unwrap();
+        // persona_story_memories.event_id is NOT NULL (FK to
+        // persona_story_events) — thread the row just inserted above.
+        sqlx::query(
+            "INSERT INTO engine.persona_story_memories (owner_uid, instance_id, event_id, content, embedding, story_date) \
+             VALUES ($1, $2, $3, '旧记忆', $4::vector, current_date)",
+        )
+        .bind(owner).bind(inst).bind(old_event).bind(format_vector(&unit_embedding(2)))
+        .execute(&pool).await.unwrap();
+
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token) = claimed[0];
+        let frags = vec![FragmentInsert {
+            instance_id: inst,
+            content: "新世界第一幕".into(),
+            embedding: unit_embedding(7),
+        }];
+        repo.persist_round(
+            owner,
+            &serde_json::json!({"arc": "新"}),
+            &serde_json::json!({}),
+            &frags,
+            &[],
+            today,
+            30,
+            "newhash",
+            true,
+            token,
+        )
+        .await
+        .unwrap();
+
+        let frag_contents: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            frag_contents,
+            vec!["新世界第一幕".to_string()],
+            "old fragments purged, new kept"
+        );
+
+        let posts: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM engine.world_posts WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            posts,
+            vec!["旧贴文".to_string()],
+            "published kept, unpublished purged"
+        );
+        let comments: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_post_comments WHERE post_id = $1",
+        )
+        .bind(published)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(comments, 1, "user comment on published post kept");
+
+        for table in [
+            "persona_story_insights",
+            "persona_story_events",
+            "persona_story_memories",
+        ] {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM engine.{table} WHERE owner_uid = $1"
+            ))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 0, "{table} purged on reset");
+        }
+
+        let (hash, set_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT worldview_hash, worldview_set_at FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hash.as_deref(), Some("newhash"));
+        assert!(set_at.is_some(), "reset stamps the era start");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_normal_stamps_hash_without_purge_or_era(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let inst = seed_instance(&pool, owner, "P", "active").await;
+        let today = Utc::now().date_naive();
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '既有事件', current_date)",
+        )
+        .bind(owner).bind(inst).execute(&pool).await.unwrap();
+
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token) = claimed[0];
+        repo.persist_round(
+            owner,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            &[],
+            &[],
+            today,
+            30,
+            "h1",
+            false,
+            token,
+        )
+        .await
+        .unwrap();
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_events WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "normal round purges nothing");
+        let (hash, set_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT worldview_hash, worldview_set_at FROM engine.world_states WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hash.as_deref(), Some("h1"), "hash stamped every round");
+        assert!(set_at.is_none(), "era untouched on normal rounds");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_reset_rolls_back_purge_on_lost_claim(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let inst = seed_instance(&pool, owner, "P", "active").await;
+        sqlx::query(
+            "INSERT INTO engine.persona_story_events (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'work', '必须幸存', current_date)",
+        )
+        .bind(owner).bind(inst).execute(&pool).await.unwrap();
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token1) = claimed[0];
+        // A newer sweeper reclaims mid-round.
+        sqlx::query(
+            "UPDATE engine.world_states SET claimed_at = now() + interval '1 second' \
+             WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = repo
+            .persist_round(
+                owner,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &[],
+                &[],
+                Utc::now().date_naive(),
+                30,
+                "h",
+                true,
+                token1,
+            )
+            .await;
+        assert!(result.is_err(), "lost claim must abort the reset");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.persona_story_events WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "the purge must roll back with the transaction");
     }
 
     #[sqlx::test]
@@ -967,6 +1266,8 @@ mod tests {
             &posts,
             Utc::now().date_naive(),
             30,
+            "h",
+            false,
             token,
         )
         .await
@@ -1075,6 +1376,8 @@ mod tests {
             &[],
             today,
             30,
+            "h",
+            false,
             token,
         )
         .await

@@ -2279,6 +2279,8 @@ mod tests {
             &[],
             chrono::Utc::now().date_naive(),
             30,
+            "h",
+            false,
             token,
         )
         .await
