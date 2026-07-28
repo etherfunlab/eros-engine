@@ -176,15 +176,19 @@ impl<'a> WorldRepo<'a> {
     }
 
     /// The owner's current worldview (trimmed) plus the hash recorded by the
-    /// last completed round. `None` = no usable worldview (absent row or
-    /// blank content): the caller must not run any World System LLM round
-    /// for this owner (spec §1).
+    /// last completed round, plus the worldview row's own `updated_at`.
+    /// `None` = no usable worldview (absent row or blank content): the
+    /// caller must not run any World System LLM round for this owner (spec
+    /// §1). The caller that runs a director round must thread
+    /// `updated_at` back into `persist_round`'s `worldview_updated_at` —
+    /// that guard is what keeps a mid-round downstream update from
+    /// committing stale output (see `persist_round`).
     pub async fn worldview_state(
         &self,
         owner_uid: Uuid,
-    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT ww.content, ws.worldview_hash \
+    ) -> Result<Option<(String, Option<String>, DateTime<Utc>)>, sqlx::Error> {
+        let row: Option<(String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT ww.content, ws.worldview_hash, ww.updated_at \
              FROM engine.world_worldviews ww \
              JOIN engine.world_states ws USING (owner_uid) \
              WHERE ww.owner_uid = $1",
@@ -192,11 +196,11 @@ impl<'a> WorldRepo<'a> {
         .bind(owner_uid)
         .fetch_optional(self.pool)
         .await?;
-        Ok(row.and_then(|(content, hash)| {
+        Ok(row.and_then(|(content, hash, updated_at)| {
             let trimmed = content
                 .trim_matches(|c: char| c.is_ascii_whitespace())
                 .to_string();
-            (!trimmed.is_empty()).then_some((trimmed, hash))
+            (!trimmed.is_empty()).then_some((trimmed, hash, updated_at))
         }))
     }
 
@@ -278,6 +282,27 @@ impl<'a> WorldRepo<'a> {
     /// return `Err(RowNotFound)` BEFORE committing — the transaction is
     /// dropped, which rolls back the reset purge, retention delete, fragment
     /// inserts, and post inserts too, so a lost-claim round writes nothing.
+    ///
+    /// `worldview_updated_at` is the worldview row's `updated_at` as read by
+    /// the caller alongside the content that produced this round's output
+    /// (`WorldRepo::worldview_state`). Before doing any purge/insert work,
+    /// this method re-checks — `FOR SHARE`, inside this same transaction —
+    /// that the worldview row still has that exact `updated_at`. If it
+    /// doesn't (the worldview changed, or the row vanished, between the
+    /// caller's read and this commit), the round's output was generated
+    /// from now-stale content: we abort with `Err(RowNotFound)` and never
+    /// commit. This matters because `persist_round` also stamps
+    /// `last_run_at = now()`; if a stale round were allowed to commit,
+    /// `last_run_at` would land AFTER the new worldview's `updated_at`, so
+    /// `claim_due`'s touch-dueness condition (`ww.updated_at >
+    /// ws.last_run_at`) would never fire and the fresh worldview would sit
+    /// unprocessed for up to a full `interval_hours`. Aborting instead
+    /// leaves `last_run_at` untouched, so the owner re-claims on the very
+    /// next tick and picks up the new content. `FOR SHARE` also closes the
+    /// race window itself: it blocks a concurrent downstream `UPDATE` on
+    /// that row from committing until this transaction ends, so there is no
+    /// gap between "we checked" and "we committed" for a change to sneak
+    /// through.
     #[allow(clippy::too_many_arguments)]
     pub async fn persist_round(
         &self,
@@ -290,9 +315,26 @@ impl<'a> WorldRepo<'a> {
         retention_days: u32,
         worldview_hash: &str,
         reset: bool,
+        worldview_updated_at: DateTime<Utc>,
         claimed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let still_fresh: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM engine.world_worldviews \
+             WHERE owner_uid = $1 AND updated_at = $2 FOR SHARE",
+        )
+        .bind(owner_uid)
+        .bind(worldview_updated_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if still_fresh.is_none() {
+            // The worldview changed (or the row vanished) between the
+            // caller's `worldview_state` read and now: this round's output
+            // is stale. Drop `tx` uncommitted — see the doc comment above
+            // for why aborting here (rather than committing) is what keeps
+            // touch-dueness correct.
+            return Err(sqlx::Error::RowNotFound);
+        }
         if reset {
             // Worldview changed (spec §2 reset inventory): the fictional
             // world restarts. Old fragments must stop injecting into chat;
@@ -457,6 +499,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// `persist_round`'s freshness guard needs the worldview row's current
+    /// `updated_at` — tests fetch it right after `enroll`/`set_worldview` so
+    /// the value they pass in matches what a real caller would have read
+    /// via `worldview_state` moments earlier.
+    async fn worldview_updated_at(pool: &PgPool, owner: Uuid) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT updated_at FROM engine.world_worldviews WHERE owner_uid = $1")
+            .bind(owner)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -632,7 +686,7 @@ mod tests {
 
         assert!(repo.worldview_state(owner).await.unwrap().is_none());
         set_worldview(&pool, owner, "  古代宫廷  ").await;
-        let (content, hash) = repo.worldview_state(owner).await.unwrap().unwrap();
+        let (content, hash, updated_at1) = repo.worldview_state(owner).await.unwrap().unwrap();
         assert_eq!(content, "古代宫廷", "content is trimmed");
         assert!(hash.is_none(), "no round yet ⇒ no stored hash");
 
@@ -641,8 +695,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let (_, hash) = repo.worldview_state(owner).await.unwrap().unwrap();
+        let (_, hash, updated_at2) = repo.worldview_state(owner).await.unwrap().unwrap();
         assert_eq!(hash.as_deref(), Some("abc"));
+        assert_eq!(
+            updated_at2, updated_at1,
+            "worldview_hash lives on world_states, not the worldview row — updated_at is untouched"
+        );
 
         set_worldview(&pool, owner, "   ").await;
         assert!(
@@ -720,7 +778,7 @@ mod tests {
             1,
             "full-width-space-only content is claimable (treated as present)"
         );
-        let (content, _hash) = repo
+        let (content, _hash, _updated_at) = repo
             .worldview_state(owner)
             .await
             .unwrap()
@@ -918,6 +976,7 @@ mod tests {
             .await
             .unwrap();
         let (_o, token) = claimed[0];
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let instance = seed_instance(&pool, owner, "P", "active").await;
         let today = Utc::now().date_naive();
 
@@ -951,6 +1010,7 @@ mod tests {
             30,
             "h",
             false,
+            wv_at,
             token,
         )
         .await
@@ -986,6 +1046,7 @@ mod tests {
         enroll(&pool, owner).await;
         repo.ensure_states_for_enrollments().await.unwrap();
         let instance = seed_instance(&pool, owner, "P", "active").await;
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         let (_o, token1) = claimed[0];
 
@@ -1018,6 +1079,7 @@ mod tests {
                 30,
                 "h",
                 false,
+                wv_at,
                 token1,
             )
             .await;
@@ -1103,6 +1165,7 @@ mod tests {
         .bind(owner).bind(inst).bind(old_event).bind(format_vector(&unit_embedding(2)))
         .execute(&pool).await.unwrap();
 
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         let (_o, token) = claimed[0];
         let frags = vec![FragmentInsert {
@@ -1120,6 +1183,7 @@ mod tests {
             30,
             "newhash",
             true,
+            wv_at,
             token,
         )
         .await
@@ -1197,6 +1261,7 @@ mod tests {
         )
         .bind(owner).bind(inst).execute(&pool).await.unwrap();
 
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         let (_o, token) = claimed[0];
         repo.persist_round(
@@ -1209,6 +1274,7 @@ mod tests {
             30,
             "h1",
             false,
+            wv_at,
             token,
         )
         .await
@@ -1245,6 +1311,7 @@ mod tests {
              VALUES ($1, $2, 'work', '必须幸存', current_date)",
         )
         .bind(owner).bind(inst).execute(&pool).await.unwrap();
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         let (_o, token1) = claimed[0];
         // A newer sweeper reclaims mid-round.
@@ -1268,6 +1335,7 @@ mod tests {
                 30,
                 "h",
                 true,
+                wv_at,
                 token1,
             )
             .await;
@@ -1280,6 +1348,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 1, "the purge must roll back with the transaction");
+    }
+
+    /// The P1 fix: a downstream worldview UPDATE that lands between the
+    /// caller's `worldview_state` read and `persist_round`'s commit must
+    /// abort the round rather than commit stale output — and, crucially,
+    /// must leave `last_run_at` untouched so `claim_due`'s touch-dueness
+    /// condition (`ww.updated_at > ws.last_run_at`) fires on the very next
+    /// scan instead of waiting out the full interval.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_round_aborts_when_worldview_touched_mid_round(pool: PgPool) {
+        let repo = WorldRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        enroll(&pool, owner).await;
+        repo.ensure_states_for_enrollments().await.unwrap();
+        let inst = seed_instance(&pool, owner, "P", "active").await;
+        let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        let (_o, token) = claimed[0];
+        // The stale value: what a caller would have read at round start,
+        // BEFORE the downstream update below.
+        let stale_wv_at = worldview_updated_at(&pool, owner).await;
+
+        // Downstream changes the worldview mid-round (trigger bumps
+        // updated_at because content actually changed).
+        set_worldview(&pool, owner, "科幻星际").await;
+        let fresh_wv_at = worldview_updated_at(&pool, owner).await;
+        assert!(
+            fresh_wv_at > stale_wv_at,
+            "content change must bump updated_at"
+        );
+
+        let frags = vec![FragmentInsert {
+            instance_id: inst,
+            content: "stale-content fragment".into(),
+            embedding: unit_embedding(11),
+        }];
+        let result = repo
+            .persist_round(
+                owner,
+                &serde_json::json!({"arc": "stale"}),
+                &serde_json::json!({}),
+                &frags,
+                &[],
+                Utc::now().date_naive(),
+                30,
+                "stalehash",
+                false,
+                stale_wv_at,
+                token,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a worldview touched mid-round must abort persist_round"
+        );
+
+        let version: i32 =
+            sqlx::query_scalar("SELECT seed_version FROM engine.world_states WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 1, "state update must roll back");
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.world_memories WHERE owner_uid = $1")
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "fragment insert must roll back too");
+
+        // Mirror the real caller (pipeline/world.rs `direct_world`): on a
+        // persist_round error it releases the claim so the owner isn't
+        // stuck behind WORLD_CLAIM_STALE.
+        repo.release_claim(owner, token).await.unwrap();
+
+        // The point of the fix: last_run_at was never advanced, so the
+        // owner is immediately due again under the touch-dueness rule —
+        // no waiting out DAY-length interval.
+        let reclaimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
+        assert_eq!(
+            reclaimed.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![owner],
+            "aborted round must not blunt touch-dueness — owner re-claims next tick"
+        );
     }
 
     #[sqlx::test]
@@ -1316,6 +1468,7 @@ mod tests {
             .await
             .unwrap();
         let (_o, token) = claimed[0];
+        let wv_at = worldview_updated_at(&pool, owner).await;
 
         let at = Utc::now() + chrono::Duration::hours(3);
         let posts = vec![PostInsert {
@@ -1333,6 +1486,7 @@ mod tests {
             30,
             "h",
             false,
+            wv_at,
             token,
         )
         .await
@@ -1413,6 +1567,7 @@ mod tests {
         let a = seed_instance(&pool, owner, "A", "active").await;
         let b = seed_instance(&pool, owner, "B", "active").await;
         let today = Utc::now().date_naive();
+        let wv_at = worldview_updated_at(&pool, owner).await;
         let claimed = repo.claim_due(DAY, STALE, 5).await.unwrap();
         let (_o, token) = claimed[0];
 
@@ -1443,6 +1598,7 @@ mod tests {
             30,
             "h",
             false,
+            wv_at,
             token,
         )
         .await

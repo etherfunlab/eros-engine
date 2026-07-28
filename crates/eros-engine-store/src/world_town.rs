@@ -242,8 +242,14 @@ impl<'a> WorldTownRepo<'a> {
 
     /// Insert one hourly-round persona comment with validation folded into
     /// the INSERT (spec §3.2): post belongs to the owner and is published,
-    /// author is one of the owner's ACTIVE instances, and the round path
-    /// never self-replies. `false` = rejected (caller warns + drops).
+    /// author is one of the owner's ACTIVE instances, the round path never
+    /// self-replies, and (P2 fix) the post's era is revalidated at insert
+    /// time — `p.published_at >= ws.worldview_set_at` — so a worldview reset
+    /// that commits while this round's LLM call was in flight can't land
+    /// fresh AI content on a now-pre-era post; `round_posts` already fed the
+    /// round from the era current at fetch time, but the era can move
+    /// between that fetch and this INSERT. `false` = rejected (caller warns
+    /// + drops).
     pub async fn insert_round_comment(
         &self,
         owner_uid: Uuid,
@@ -258,8 +264,11 @@ impl<'a> WorldTownRepo<'a> {
              FROM engine.world_posts p \
              JOIN engine.persona_instances pi \
                ON pi.id = $3 AND pi.owner_uid = p.owner_uid AND pi.status = 'active' \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
              WHERE p.id = $1 AND p.owner_uid = $2 \
-               AND p.published_at IS NOT NULL AND p.instance_id <> $3",
+               AND p.published_at IS NOT NULL AND p.instance_id <> $3 \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at",
         )
         .bind(post_id)
         .bind(owner_uid)
@@ -359,25 +368,35 @@ impl<'a> WorldTownRepo<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Insert the responder's comment (source = 'reply'). Validation already
-    /// happened in `list_reply_candidates` + the cooldown CAS.
+    /// Insert the responder's comment (source = 'reply'). Most validation
+    /// already happened in `list_reply_candidates` + the cooldown CAS, but
+    /// (P2 fix) the era is revalidated here too — `p.published_at >=
+    /// ws.worldview_set_at` — because the candidate scan and this insert
+    /// bracket an LLM call: a worldview reset can commit while that call is
+    /// in flight, and without this guard the reply would land on a post
+    /// that is now pre-era. `false` = rejected (caller warns + drops).
     pub async fn insert_reply_comment(
         &self,
         post_id: Uuid,
         author_instance_id: Uuid,
         content: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
             "INSERT INTO engine.world_post_comments \
                  (post_id, author_instance_id, source, content) \
-             VALUES ($1, $2, 'reply', $3)",
+             SELECT p.id, $2, 'reply', $3 \
+             FROM engine.world_posts p \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+             WHERE p.id = $1 AND p.published_at IS NOT NULL \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at",
         )
         .bind(post_id)
         .bind(author_instance_id)
         .bind(content)
         .execute(self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// One post with author name, for the reply-responder payload.
@@ -874,7 +893,7 @@ mod tests {
         assert_eq!(cands[0].author_instance_id, inst);
 
         // Persona reply after the user comment clears the candidate.
-        repo.insert_reply_comment(post, inst, "在的").await.unwrap();
+        assert!(repo.insert_reply_comment(post, inst, "在的").await.unwrap());
         assert!(repo
             .list_reply_candidates(window, debounce, cooldown, 10)
             .await
@@ -923,9 +942,10 @@ mod tests {
         // Persona comments (round + reply) must NOT move the stamp.
         repo.insert_round_comment_unchecked_for_test(post, inst, "round", "r")
             .await;
-        repo.insert_reply_comment(post, inst, "reply")
+        assert!(repo
+            .insert_reply_comment(post, inst, "reply")
             .await
-            .unwrap();
+            .unwrap());
         let stamp2: Option<DateTime<Utc>> =
             sqlx::query_scalar("SELECT last_user_comment_at FROM engine.world_posts WHERE id = $1")
                 .bind(post)
@@ -1004,9 +1024,10 @@ mod tests {
         assert_eq!(repo.count_replies_today(owner).await.unwrap(), 0);
         repo.insert_round_comment_unchecked_for_test(post, inst, "round", "round row")
             .await;
-        repo.insert_reply_comment(post, inst, "reply row")
+        assert!(repo
+            .insert_reply_comment(post, inst, "reply row")
             .await
-            .unwrap();
+            .unwrap());
         // User rows never count either.
         repo.insert_user_comment(owner, post, "user row")
             .await
@@ -1221,6 +1242,91 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a round comment after the user comment suppresses the reply"
+        );
+    }
+
+    /// The P2 fix: both town insert paths revalidate the era at write time,
+    /// not just at candidate-scan time. Simulates a worldview reset landing
+    /// mid-flight (between the scan that picked this post and the insert
+    /// that follows an LLM call) by moving `worldview_set_at` forward past
+    /// the post's `published_at` in between two otherwise-identical calls.
+    #[sqlx::test]
+    async fn town_inserts_reject_pre_era_posts(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await; // era started 1 day ago
+                                                          // A second active persona to author the round comment (the round
+                                                          // path rejects self-replies, so it can't reuse `inst`).
+        let genome: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('Rin','p','{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let commenter: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(genome)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let post = seed_post(&pool, owner, inst, "hello", true).await;
+        let repo = WorldTownRepo { pool: &pool };
+
+        // Published "now", era started 1 day ago ⇒ inside the era: both
+        // insert paths succeed.
+        assert!(
+            repo.insert_round_comment(owner, post, commenter, "不错")
+                .await
+                .unwrap(),
+            "post inside the era accepts a round comment"
+        );
+        assert!(
+            repo.insert_reply_comment(post, inst, "谢谢").await.unwrap(),
+            "post inside the era accepts a reply"
+        );
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_post_comments WHERE post_id = $1",
+        )
+        .bind(post)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 2);
+
+        // The era rolls forward past the post's published_at — in
+        // production terms, a worldview reset committed while a
+        // comment/reply LLM call for this post was in flight.
+        sqlx::query("UPDATE engine.world_states SET worldview_set_at = now() WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !repo
+                .insert_round_comment(owner, post, commenter, "迟到的评论")
+                .await
+                .unwrap(),
+            "pre-era post must reject a round comment"
+        );
+        assert!(
+            !repo
+                .insert_reply_comment(post, inst, "迟到的回复")
+                .await
+                .unwrap(),
+            "pre-era post must reject a reply"
+        );
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.world_post_comments WHERE post_id = $1",
+        )
+        .bind(post)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "rejected inserts must not grow the comment count"
         );
     }
 

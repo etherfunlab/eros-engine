@@ -276,7 +276,7 @@ async fn direct_story(
         return Err("story row missing after claim".into());
     };
     let world_repo = eros_engine_store::world::WorldRepo { pool: &state.pool };
-    let Some((worldview, _)) = world_repo
+    let Some((worldview, _, _)) = world_repo
         .worldview_state(owner)
         .await
         .map_err(|e| format!("worldview load failed: {e}"))?

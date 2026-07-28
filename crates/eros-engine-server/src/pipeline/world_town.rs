@@ -156,7 +156,7 @@ async fn run_comment_round(
     }
 
     let world_repo = WorldRepo { pool: &state.pool };
-    let Some((worldview, _)) = world_repo
+    let Some((worldview, _, _)) = world_repo
         .worldview_state(owner)
         .await
         .map_err(|e| format!("worldview load failed: {e}"))?
@@ -269,7 +269,7 @@ async fn run_reply(
         return Ok(()); // silent skip (spec: no failure state on the feed)
     }
     let world_repo = WorldRepo { pool: &state.pool };
-    let Some((worldview, _)) = world_repo
+    let Some((worldview, _, _)) = world_repo
         .worldview_state(cand.owner_uid)
         .await
         .map_err(|e| format!("worldview load failed: {e}"))?
@@ -332,9 +332,15 @@ async fn run_reply(
     if content.is_empty() {
         return Err("world_reply returned empty content".into());
     }
-    repo.insert_reply_comment(cand.post_id, cand.author_instance_id, content)
+    let inserted = repo
+        .insert_reply_comment(cand.post_id, cand.author_instance_id, content)
         .await
-        .map_err(|e| format!("reply insert failed: {e}"))
+        .map_err(|e| format!("reply insert failed: {e}"))?;
+    if !inserted {
+        tracing::warn!(post = %cand.post_id, "world_town: reply dropped — worldview era changed mid-flight");
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Round payload: seed + roster (valid author ids) + posts with threads.

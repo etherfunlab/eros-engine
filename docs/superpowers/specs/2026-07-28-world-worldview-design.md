@@ -183,8 +183,21 @@ phase-2 Stories scan re-derives insights already under the new worldview.
 
 **Concurrency.** The hash stored by `persist_round` is the hash of the
 content actually used to assemble the payload. If downstream updates the
-worldview mid-round, the next tick sees a fresh mismatch and resets again —
-benign, converges. Lost-claim semantics unchanged (`RowNotFound`, no commit).
+worldview mid-round, a naive commit would land output generated from the old
+content while stamping `last_run_at = now()` — which lands *after* the new
+row's `updated_at`, so the touch-dueness condition (`ww.updated_at >
+ws.last_run_at`) would never fire and the change would sit unprocessed for up
+to a full `interval_hours`. `persist_round` closes this instead of tolerating
+it: before doing any purge/insert work, it re-checks — `FOR SHARE`, inside the
+same transaction — that the worldview row's `updated_at` still matches the
+value read at round start. A mismatch (content changed, or the row vanished)
+aborts the round (`RowNotFound`, no commit) without touching `last_run_at`, so
+the owner re-claims on the very next tick and the retried round picks up the
+fresh content. `FOR SHARE` also closes the race window itself: it blocks a
+concurrent downstream `UPDATE` on that row from committing until the round's
+transaction ends, so there is no gap between the check and the commit for a
+change to sneak through. Lost-claim semantics unchanged (`RowNotFound`, no
+commit).
 
 ---
 
@@ -224,7 +237,12 @@ feed GET serves full history unchanged. One asymmetry: posts scheduled by a
 pre-reset director round but **not yet published** carry old-worldview
 content that would otherwise surface *after* the reset, so the reset purge
 deletes unpublished rows while keeping published ones. Published = history;
-unpublished = pipeline, and the pipeline must not leak a stale era.
+unpublished = pipeline, and the pipeline must not leak a stale era. The same
+race exists at smaller scale within a single round: a reset can commit while
+a comment/reply LLM call for an in-era post is still in flight. To close it,
+`insert_round_comment` and `insert_reply_comment` both revalidate the era at
+write time (not just at candidate-scan time), so a reset committing mid-flight
+cannot land AI activity on a post that is now pre-era.
 
 ---
 

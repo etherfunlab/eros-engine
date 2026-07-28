@@ -215,7 +215,7 @@ async fn direct_world(
         roster.truncate(WORLD_ROSTER_CAP);
     }
 
-    let Some((worldview, stored_hash)) = repo
+    let Some((worldview, stored_hash, worldview_updated_at)) = repo
         .worldview_state(owner)
         .await
         .map_err(|e| format!("worldview load failed: {e}"))?
@@ -388,6 +388,7 @@ async fn direct_world(
         resolved.retention_days,
         &worldview_hash,
         reset,
+        worldview_updated_at,
         token,
     )
     .await
