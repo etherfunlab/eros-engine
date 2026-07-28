@@ -502,8 +502,15 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO engine.world_states (owner_uid, seed, digests) \
-             VALUES ($1, '{\"arc\":\"a\"}'::jsonb, '{}'::jsonb)",
+            "INSERT INTO engine.world_states (owner_uid, seed, digests, worldview_set_at) \
+             VALUES ($1, '{\"arc\":\"a\"}'::jsonb, '{}'::jsonb, now() - interval '1 day')",
+        )
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
         )
         .bind(owner)
         .execute(pool)

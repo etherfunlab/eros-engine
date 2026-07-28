@@ -90,6 +90,38 @@ impl<'a> WorldTownRepo<'a> {
         .await
     }
 
+    /// Posts fed to a comment round: same shape as `feed_page` but
+    /// restricted to the current worldview era (posts published at/after
+    /// `world_states.worldview_set_at`). Old-era posts stay user-visible
+    /// history but receive no new AI activity (spec §5). A NULL era (no
+    /// worldview round yet) yields no posts — AI activity waits for the
+    /// first reset round.
+    pub async fn round_posts(
+        &self,
+        owner_uid: Uuid,
+        limit: i64,
+    ) -> Result<Vec<FeedPost>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT p.id AS post_id, p.instance_id, pg.name AS author_name, \
+                    p.content, p.published_at \
+             FROM engine.world_posts p \
+             JOIN engine.world_enrollments we \
+               ON we.owner_uid = p.owner_uid AND we.town_enabled \
+             JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+             JOIN engine.persona_instances pi ON pi.id = p.instance_id \
+             JOIN engine.persona_genomes pg ON pg.id = pi.genome_id \
+             WHERE p.owner_uid = $1 AND p.published_at IS NOT NULL \
+               AND ws.worldview_set_at IS NOT NULL \
+               AND p.published_at >= ws.worldview_set_at \
+             ORDER BY p.published_at DESC, p.id DESC \
+             LIMIT $2",
+        )
+        .bind(owner_uid)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
     /// All comments for a page of posts, thread order (spec §4: threads are
     /// small by construction; no comment pagination in v1).
     pub async fn list_comments_for_posts(
@@ -150,7 +182,9 @@ impl<'a> WorldTownRepo<'a> {
         sqlx::query_scalar(
             "SELECT ws.owner_uid FROM engine.world_states ws \
              JOIN engine.world_enrollments we USING (owner_uid) \
+             JOIN engine.world_worldviews ww USING (owner_uid) \
              WHERE we.town_enabled \
+               AND btrim(ww.content) <> '' \
                AND (ws.last_comment_round_at IS NULL \
                     OR ws.last_comment_round_at < now() - make_interval(secs => $1))",
         )
@@ -267,10 +301,15 @@ impl<'a> WorldTownRepo<'a> {
                    ON we.owner_uid = p.owner_uid AND we.town_enabled \
                  JOIN engine.persona_instances pi \
                    ON pi.id = p.instance_id AND pi.status = 'active' \
+                 JOIN engine.world_states ws ON ws.owner_uid = p.owner_uid \
+                 JOIN engine.world_worldviews ww \
+                   ON ww.owner_uid = p.owner_uid AND btrim(ww.content) <> '' \
                  WHERE p.last_user_comment_at > now() - make_interval(secs => $1) \
                    AND p.last_user_comment_at <= now() - make_interval(secs => $2) \
                    AND (p.last_reply_at IS NULL \
                         OR p.last_reply_at < now() - make_interval(secs => $3)) \
+                   AND ws.worldview_set_at IS NOT NULL \
+                   AND p.published_at >= ws.worldview_set_at \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM engine.world_post_comments a \
                        WHERE a.post_id = p.id AND a.author_instance_id IS NOT NULL \
@@ -361,7 +400,12 @@ impl<'a> WorldTownRepo<'a> {
 mod tests {
     use super::*;
 
-    /// genome + instance + world enrollment (town on) + world_states backfill.
+    const T_WINDOW: Duration = Duration::from_secs(3600);
+    const T_DEBOUNCE: Duration = Duration::from_secs(60);
+    const T_COOLDOWN: Duration = Duration::from_secs(600);
+
+    /// genome + instance + world enrollment (town on) + world_states backfill
+    /// + worldview with an era that started yesterday.
     pub(super) async fn seed_town_owner(pool: &PgPool) -> (Uuid, Uuid) {
         let owner = Uuid::new_v4();
         let genome: Uuid = sqlx::query_scalar(
@@ -388,8 +432,15 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO engine.world_states (owner_uid, seed, digests) \
-             VALUES ($1, '{}'::jsonb, '{}'::jsonb)",
+            "INSERT INTO engine.world_states (owner_uid, seed, digests, worldview_set_at) \
+             VALUES ($1, '{}'::jsonb, '{}'::jsonb, now() - interval '1 day')",
+        )
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.world_worldviews (owner_uid, content) VALUES ($1, '现代都市')",
         )
         .bind(owner)
         .execute(pool)
@@ -419,6 +470,121 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn town_scans_require_worldview(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await;
+        let post = seed_post(&pool, owner, inst, "p", true).await;
+        // Settled user comment: inside the window, past the debounce.
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '2 minutes' \
+             WHERE id = $1",
+        )
+        .bind(post)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = WorldTownRepo { pool: &pool };
+        let round = Duration::from_secs(3600);
+        assert!(repo
+            .list_round_candidates(round)
+            .await
+            .unwrap()
+            .contains(&owner));
+        assert_eq!(
+            repo.list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        sqlx::query("DELETE FROM engine.world_worldviews WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !repo
+                .list_round_candidates(round)
+                .await
+                .unwrap()
+                .contains(&owner),
+            "no worldview ⇒ no comment rounds"
+        );
+        assert!(
+            repo.list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no worldview ⇒ no replies"
+        );
+    }
+
+    #[sqlx::test]
+    async fn reply_candidates_and_round_posts_stay_inside_the_era(pool: PgPool) {
+        let (owner, inst) = seed_town_owner(&pool).await; // era started 1 day ago
+                                                          // Pre-era post: published 3 days ago, and its user comment is OLDER
+                                                          // than the new post's — without the era filter, DISTINCT ON
+                                                          // (oldest-first) would pick THIS one, so the assertion below proves
+                                                          // the filter, not tie-breaking luck.
+        let old = seed_post(&pool, owner, inst, "旧纪元贴文", true).await;
+        sqlx::query(
+            "UPDATE engine.world_posts \
+             SET published_at = now() - interval '3 days', \
+                 last_user_comment_at = now() - interval '3 minutes' \
+             WHERE id = $1",
+        )
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fresh = seed_post(&pool, owner, inst, "新纪元贴文", true).await;
+        sqlx::query(
+            "UPDATE engine.world_posts SET last_user_comment_at = now() - interval '2 minutes' \
+             WHERE id = $1",
+        )
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = WorldTownRepo { pool: &pool };
+        let cands = repo
+            .list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].post_id, fresh, "pre-era post gets no AI reply");
+
+        let round_view: Vec<String> = repo
+            .round_posts(owner, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.content.clone())
+            .collect();
+        assert_eq!(round_view, vec!["新纪元贴文".to_string()]);
+        assert_eq!(
+            repo.feed_page(owner, 10, None).await.unwrap().len(),
+            2,
+            "user-facing feed keeps full history"
+        );
+
+        // NULL era (worldview present but no reset round yet) ⇒ AI activity
+        // waits for the first worldview round.
+        sqlx::query("UPDATE engine.world_states SET worldview_set_at = NULL WHERE owner_uid = $1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(repo.round_posts(owner, 10).await.unwrap().is_empty());
+        assert!(repo
+            .list_reply_candidates(T_WINDOW, T_DEBOUNCE, T_COOLDOWN, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[sqlx::test]
