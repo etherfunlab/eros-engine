@@ -33,7 +33,8 @@ const TOWN_ROUND_COMMENTS_CAP: usize = 12;
 const WORLD_COMMENT_RULES: &str = "规则：\
 1) 只使用给出的 post_id 和 instance_id；发帖者不评论自己的贴子。\
 2) 评论要符合 seed 里的角色关系；贴子下有用户（user）留言时，角色可以自然回应它。\
-3) 输出 0 到 N 条评论；没有值得评论的就输出空数组。每条评论一两句话，口语化。";
+3) 输出 0 到 N 条评论；没有值得评论的就输出空数组。每条评论一两句话，口语化。\
+4) 评论的语气与内容必须符合 worldview 描述的世界观，不得出现与其冲突的时代或科技元素。";
 
 #[derive(Debug, Deserialize)]
 struct CommentRoundOutput {
@@ -155,6 +156,13 @@ async fn run_comment_round(
     }
 
     let world_repo = WorldRepo { pool: &state.pool };
+    let Some((worldview, _)) = world_repo
+        .worldview_state(owner)
+        .await
+        .map_err(|e| format!("worldview load failed: {e}"))?
+    else {
+        return Ok(()); // candidates are worldview-gated; race window only
+    };
     let seed = world_repo
         .load_seed(owner)
         .await
@@ -168,7 +176,7 @@ async fn run_comment_round(
         return Ok(());
     }
     let posts = repo
-        .feed_page(owner, TOWN_ROUND_POSTS_CAP, None)
+        .round_posts(owner, TOWN_ROUND_POSTS_CAP)
         .await
         .map_err(|e| format!("posts load failed: {e}"))?;
     if posts.is_empty() {
@@ -180,7 +188,7 @@ async fn run_comment_round(
         .await
         .map_err(|e| format!("threads load failed: {e}"))?;
 
-    let payload = comment_round_payload(&seed, &roster, &posts, &comments);
+    let payload = comment_round_payload(&seed, &roster, &posts, &comments, &worldview);
     let req = ChatRequest {
         model: resolved.model.clone(),
         fallback_model: resolved.fallback_model.clone(),
@@ -260,6 +268,14 @@ async fn run_reply(
     if spent >= i64::from(resolved.daily_cap) {
         return Ok(()); // silent skip (spec: no failure state on the feed)
     }
+    let world_repo = WorldRepo { pool: &state.pool };
+    let Some((worldview, _)) = world_repo
+        .worldview_state(cand.owner_uid)
+        .await
+        .map_err(|e| format!("worldview load failed: {e}"))?
+    else {
+        return Ok(()); // candidates are worldview-gated; race window only — never burn the cooldown
+    };
     let cooldown = std::time::Duration::from_secs(resolved.thread_cooldown_secs);
     if !repo
         .claim_reply_cooldown(cand.post_id, cooldown)
@@ -269,7 +285,6 @@ async fn run_reply(
         return Ok(()); // cooling down or another instance owns it
     }
 
-    let world_repo = WorldRepo { pool: &state.pool };
     let seed = world_repo
         .load_seed(cand.owner_uid)
         .await
@@ -297,7 +312,7 @@ async fn run_reply(
             },
             ChatMessage {
                 role: "user".into(),
-                content: reply_payload(&seed, &post, &thread),
+                content: reply_payload(&seed, &post, &thread, &worldview),
             },
         ],
         temperature: resolved.temperature as f32,
@@ -328,6 +343,7 @@ fn comment_round_payload(
     roster: &[eros_engine_store::world::RosterEntry],
     posts: &[FeedPost],
     comments: &[FeedComment],
+    worldview: &str,
 ) -> String {
     let personas: Vec<serde_json::Value> = roster
         .iter()
@@ -365,6 +381,7 @@ fn comment_round_payload(
         "seed": seed,
         "personas": personas,
         "posts": posts_json,
+        "worldview": worldview,
     });
     format!(
         "为这个世界的贴文串生成新一轮评论。\n\n{}\n\n{WORLD_COMMENT_RULES}",
@@ -373,7 +390,12 @@ fn comment_round_payload(
 }
 
 /// Reply payload: the responder speaks as the post's author.
-fn reply_payload(seed: &serde_json::Value, post: &FeedPost, thread: &[FeedComment]) -> String {
+fn reply_payload(
+    seed: &serde_json::Value,
+    post: &FeedPost,
+    thread: &[FeedComment],
+    worldview: &str,
+) -> String {
     let thread_json: Vec<serde_json::Value> = thread
         .iter()
         .map(|c| {
@@ -387,10 +409,12 @@ fn reply_payload(seed: &serde_json::Value, post: &FeedPost, thread: &[FeedCommen
         "seed": seed,
         "post": { "author": post.author_name, "content": post.content },
         "thread": thread_json,
+        "worldview": worldview,
     });
     format!(
         "你是贴文作者「{}」。用户（author 为 user 的留言）在你的贴文下留了言，\
-         请以作者身份自然回应最近的用户留言。只输出评论正文，一两句话，口语化。\n\n{}",
+         请以作者身份自然回应最近的用户留言。只输出评论正文，一两句话，口语化，\
+         语气与内容须符合 worldview 描述的世界观。\n\n{}",
         post.author_name,
         serde_json::to_string_pretty(&data).unwrap_or_default()
     )
@@ -535,6 +559,26 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Old-era post: published before the worldview reset below, so
+        // round_posts (era-scoped) must exclude it from the payload.
+        sqlx::query(
+            "INSERT INTO engine.world_posts \
+                 (owner_uid, instance_id, content, scheduled_at, published_at) \
+             VALUES ($1,$2,'月下旧集市',now() - interval '2 days',now() - interval '2 days')",
+        )
+        .bind(owner)
+        .bind(author)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE engine.world_states SET worldview_set_at = now() - interval '1 hour' \
+             WHERE owner_uid = $1",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let reply = serde_json::json!({
             "comments": [
@@ -573,6 +617,15 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the valid comment landed");
         assert_eq!(rows[0].0, Some(commenter));
         assert_eq!(rows[0].1, "恭喜！");
+
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(body.contains("开店了"), "new-era post reaches the payload");
+        assert!(
+            !body.contains("月下旧集市"),
+            "old-era post must not leak into the round payload"
+        );
 
         // Round is stamped: immediately re-running claims nothing and makes
         // no second LLM call (mock .expect(1) enforces it on drop).
@@ -683,5 +736,31 @@ mod tests {
         let fenced = format!("好的：\n```json\n{clean}\n```");
         assert!(parse_comment_output(&fenced).is_some());
         assert!(parse_comment_output("nope").is_none());
+    }
+
+    #[test]
+    fn comment_payload_carries_worldview_and_rule() {
+        let p = comment_round_payload(&serde_json::json!({}), &[], &[], &[], "武侠江湖");
+        assert!(p.contains("\"worldview\""));
+        assert!(p.contains("武侠江湖"));
+        assert!(p.contains("必须符合 worldview"), "worldview rule appended");
+    }
+
+    #[test]
+    fn reply_payload_carries_worldview() {
+        let post = FeedPost {
+            post_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            author_name: "Aria".into(),
+            content: "今日比武".into(),
+            published_at: chrono::Utc::now(),
+        };
+        let p = reply_payload(&serde_json::json!({}), &post, &[], "武侠江湖");
+        assert!(p.contains("\"worldview\""));
+        assert!(p.contains("武侠江湖"));
+        assert!(
+            p.contains("须符合 worldview"),
+            "reply header carries the rule"
+        );
     }
 }
