@@ -291,7 +291,9 @@ mod migration_tests {
                 "last_run_at",
                 "claimed_at",
                 "updated_at",
-                "last_comment_round_at"
+                "last_comment_round_at",
+                "worldview_hash",
+                "worldview_set_at"
             ],
         );
 
