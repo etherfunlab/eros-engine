@@ -332,7 +332,8 @@ while its feature is switched off.
 | Table | Written by | Holds |
 |-------|-----------|-------|
 | `engine.world_enrollments` | downstream | opt-in rows + `town_enabled` + `stories_enabled` flags |
-| `engine.world_states` | engine | seed, digests, director + comment-round scheduling state |
+| `engine.world_worldviews` | downstream | per-owner worldview text (`owner_uid` PK, `content` 1..=10000 chars, `updated_at`) |
+| `engine.world_states` | engine | seed, digests, director + comment-round scheduling state, `worldview_hash` (SHA-256 of the content used last round) + `worldview_set_at` (current era start, gates Town AI activity) |
 | `engine.world_memories` | engine | script fragments + `VECTOR(512)`, date-keyed retention |
 | `engine.world_posts` | engine | scheduled/published posts, reply-cooldown + last-user-comment stamps |
 | `engine.world_post_comments` | engine + user route | threads; `author_instance_id IS NULL` = the user |
@@ -342,7 +343,7 @@ while its feature is switched off.
 
 `stories_enabled` (migration 0038) is downstream-written on the same
 `world_enrollments` row as `town_enabled` — identical opt-in contract. All
-eight tables get the 0013 lockdown treatment (REVOKE from Supabase browser
+nine tables get the 0013 lockdown treatment (REVOKE from Supabase browser
 roles + policy-less RLS). Unenrolling (or flipping a flag off) stops
 simulation and injection immediately but keeps accumulated data —
 re-enrolling resumes the same world/life.
@@ -355,10 +356,13 @@ the shared world sentinel user `11111111-1111-1111-1111-111111111112`;
 `11111111-1111-1111-1111-111111111113` (dreaming = `…111`, world = `…112`,
 stories = `…113` — per-subsystem spend attribution; see
 [LLM / OpenRouter audit](llm-audit.md)). Steady-state cost per enrolled owner
-per day is bounded by: 1 director call + at most `24h/round_secs` comment
-rounds (only those with activity) + at most `daily_cap` replies + up to
-`24h/interval_hours` story calls per **actively-chatted** instance — and a
-world nobody touches still costs exactly one director call.
+**with a worldview** per day is bounded by: 1 director call + at most
+`24h/round_secs` comment rounds (only those with activity) + at most
+`daily_cap` replies + up to `24h/interval_hours` story calls per
+**actively-chatted** instance — and a world nobody touches still costs
+exactly one director call. An enrolled owner **without** a usable worldview
+costs zero LLM calls — excluded entirely from WM director rounds, story
+rounds, and town scans until downstream backfills `engine.world_worldviews`.
 
 ## Current limits
 

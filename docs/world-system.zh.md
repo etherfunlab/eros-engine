@@ -292,7 +292,8 @@ context_days = 7            # 每轮喂给导演的聊天/亲密度证据窗口
 | 表 | 写入方 | 内容 |
 |----|--------|------|
 | `engine.world_enrollments` | 下游 | 注册行 + `town_enabled` + `stories_enabled` 开关 |
-| `engine.world_states` | 引擎 | 种子、摘要、导演 + 评论轮调度状态 |
+| `engine.world_worldviews` | 下游 | per-owner 世界观文本（`owner_uid` 主键，`content` 1..=10000 字符，`updated_at`） |
+| `engine.world_states` | 引擎 | 种子、摘要、导演 + 评论轮调度状态，`worldview_hash`（上一轮所用内容的 SHA-256）+ `worldview_set_at`（当前纪元起点，决定 Town AI 活动的作用范围） |
 | `engine.world_memories` | 引擎 | 剧本片段 + `VECTOR(512)`，按日期保留 |
 | `engine.world_posts` | 引擎 | 定时/已发布贴文、回复冷却戳 + 最新用户留言戳 |
 | `engine.world_post_comments` | 引擎 + 用户路由 | 评论串；`author_instance_id IS NULL` = 用户本人 |
@@ -301,7 +302,7 @@ context_days = 7            # 每轮喂给导演的聊天/亲密度证据窗口
 | `engine.persona_story_memories` | 引擎 | 事件的 1:1 嵌入镜像（`event_id` 外键）+ `VECTOR(512)`，按日期保留 |
 
 `stories_enabled`（migration 0038）与 `town_enabled` 写在同一张
-`world_enrollments` 行上，下游写入，同一套开关约定。八张表都套用 0013 锁定
+`world_enrollments` 行上，下游写入，同一套开关约定。九张表都套用 0013 锁定
 （对 Supabase 浏览器角色 REVOKE + 无策略 RLS）。取消注册（或关掉某个开关）
 立即停止模拟与注入，但保留已积累的数据——重新注册会续上同一个世界/人生。
 
@@ -311,10 +312,13 @@ World Memories / Town 三个任务都以共享的世界哨兵用户
 `11111111-1111-1111-1111-111111111112` 把 token 用量记为 tracing 字段；
 `world_stories_director` 用自己的哨兵 `11111111-1111-1111-1111-111111111113`
 （dreaming = `…111`、world = `…112`、stories = `…113`——按子系统分摊花费；见
-[LLM / OpenRouter 审计](llm-audit.zh.md)）。稳态下每个注册 owner 每天的成本
-上界是：1 次导演调用 + 至多 `24h/round_secs` 次评论轮（且只有有活动的那些）
-+ 至多 `daily_cap` 条回复 + 每个**近期有聊天的**instance 至多
-`24h/interval_hours` 次故事回合——没人碰的世界依然恰好只花一次导演调用。
+[LLM / OpenRouter 审计](llm-audit.zh.md)）。稳态下每个**已配置世界观**的
+注册 owner 每天的成本上界是：1 次导演调用 + 至多 `24h/round_secs` 次评论轮
+（且只有有活动的那些）+ 至多 `daily_cap` 条回复 + 每个**近期有聊天的**
+instance 至多 `24h/interval_hours` 次故事回合——没人碰的世界依然恰好只花
+一次导演调用。没有可用世界观的注册 owner 则零 LLM 成本——被完全排除在
+WM director 回合、故事回合、小镇扫描之外，直到下游回填
+`engine.world_worldviews`。
 
 ## 当前限制
 

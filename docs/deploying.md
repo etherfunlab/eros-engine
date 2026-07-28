@@ -226,9 +226,11 @@ Operational switches, all optional:
 | `WORLD_TICK_SECS` | Director sweeper tick (default 300; `0` disables) |
 | `WORLD_TOWN_DISABLED=true` | Town only: no post generation, no town sweeper; memories keep running |
 
-Cost shape: one director call per enrolled owner per `interval_hours`, plus
-(town only) activity-gated hourly comment rounds and per-owner-capped replies.
-A world nobody interacts with costs exactly the director call. Details,
+Cost shape: one director call per enrolled owner **with a usable worldview**
+per `interval_hours`, plus (town only) activity-gated hourly comment rounds
+and per-owner-capped replies. Owners without a worldview (see above) are
+skipped entirely and cost nothing. A world nobody interacts with costs
+exactly the director call. Details,
 data model, and the boot-validation rules are in [World system](world-system.md).
 
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
