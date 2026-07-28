@@ -191,8 +191,11 @@ benign, converges. Lost-claim semantics unchanged (`RowNotFound`, no commit).
 ## 4. Payload & rules changes (four LLM tasks, chat untouched)
 
 - **WM director** — `director_user_payload` gains a top-level
-  `"worldview": "<content>"` as the **first** field (it frames everything
-  after it). `WORLD_DIRECTOR_RULES` gains one always-on rule:
+  `"worldview": "<content>"` field (serialization order is serde-determined —
+  the workspace's `serde_json` has no `preserve_order` feature, so keys
+  serialize alphabetically here; the framing intent is carried by the
+  always-on worldview rule below, not by field position).
+  `WORLD_DIRECTOR_RULES` gains one always-on rule:
   「一切设定（时代、科技、地点、职业、事件）必须符合 worldview 描述的世界观，
   不得引入与其冲突的元素。」 The conditional rule constants
   (`WORLD_TOWN_POST_RULES`, `WORLD_STORIES_WM_RULES`) are renumbered to
