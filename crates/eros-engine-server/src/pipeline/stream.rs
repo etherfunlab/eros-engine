@@ -2526,6 +2526,113 @@ async fn run_image_prompt_compose(
     None
 }
 
+/// The three per-turn image inputs, resolved from plan → request → config.
+struct ImageTurnInputs {
+    seed_subject: String,
+    style: eros_engine_llm::model_config::StyleKey,
+    aspect_ratio: Option<String>,
+}
+
+/// Pure: resolve the seed subject, style, and aspect ratio for a delegated
+/// image turn. Precedence per field:
+/// - subject: `plan.image_prompt` → `req_image.image_prompt` → `""`
+/// - style:   `req_image.style` → config `default_style` → type default
+/// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → config default
+///
+/// Blank strings count as absent at every level.
+fn resolve_image_turn_inputs(
+    plan: &eros_engine_core::types::ActionPlan,
+    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    resolved_image_gen: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
+) -> ImageTurnInputs {
+    let seed_subject = plan
+        .image_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            req_image
+                .and_then(|i| i.image_prompt.as_deref())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+    let style = req_image
+        .and_then(|i| i.style)
+        .or_else(|| resolved_image_gen.map(|r| r.default_style))
+        .unwrap_or_default();
+    // A per-turn aspect (PDE/plan or per-request) beats the config default.
+    let aspect_ratio = plan
+        .aspect_ratio
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            req_image
+                .and_then(|i| i.aspect_ratio.as_deref())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .map(str::to_string)
+        .or_else(|| resolved_image_gen.map(|r| r.default_aspect_ratio.clone()));
+    ImageTurnInputs {
+        seed_subject,
+        style,
+        aspect_ratio,
+    }
+}
+
+/// Everything the two delegated-image call sites need. `style` is deliberately
+/// absent: it is consumed internally by `compose_image_prompt` and neither
+/// caller uses it afterwards.
+struct DelegatedImagePrompt {
+    /// Seed subject — feeds `build_delegated_image_marker`.
+    seed_subject: String,
+    /// Effective aspect ratio — feeds the marker and the wire frame.
+    aspect_ratio: Option<String>,
+    /// Final wire prompt — feeds the wire frame.
+    composed_prompt: String,
+}
+
+/// Resolve the per-turn image inputs, optionally enrich the subject via the
+/// composer LLM, and wrap the result into the final wire prompt.
+///
+/// The composer is skipped entirely when it is not configured. It is fail-open
+/// throughout: a model error, timeout, or empty reply degrades to the seed
+/// subject and never blocks the image turn.
+async fn build_delegated_image_prompt(
+    state: &AppState,
+    persona: &eros_engine_core::persona::CompanionPersona,
+    plan: &eros_engine_core::types::ActionPlan,
+    req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
+    resolved_image_gen: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
+    pde_transcript: &str,
+) -> DelegatedImagePrompt {
+    let inputs = resolve_image_turn_inputs(plan, req_image, resolved_image_gen);
+    let style_str = serde_json::to_value(inputs.style)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "realistic".to_string());
+    let final_subject = match state.model_config.resolve_image_prompt_compose() {
+        Some(c) => run_image_prompt_compose(
+            state,
+            &c,
+            persona,
+            &inputs.seed_subject,
+            pde_transcript,
+            inputs.aspect_ratio.as_deref(),
+            &style_str,
+        )
+        .await
+        .unwrap_or_else(|| inputs.seed_subject.clone()),
+        None => inputs.seed_subject.clone(),
+    };
+    let composed_prompt =
+        crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
+    DelegatedImagePrompt {
+        seed_subject: inputs.seed_subject,
+        aspect_ratio: inputs.aspect_ratio,
+        composed_prompt,
+    }
+}
+
 /// Try to emit a pseudo-ghost on chain exhaustion.
 ///
 /// Picks a configured fallback phrase from `engine.error_handling_config`,
@@ -3308,56 +3415,18 @@ pub fn run_stream(
                     let msg_ulid = Ulid::new();
                     let msg_uuid: Uuid = msg_ulid.into();
                     let img_mid = ulid_string(msg_ulid);
-                    let subject = plan
-                        .image_prompt
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| {
-                            req_image
-                                .and_then(|i| i.image_prompt.as_deref())
-                                .filter(|s| !s.trim().is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    let style: eros_engine_llm::model_config::StyleKey = req_image
-                        .and_then(|i| i.style)
-                        .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
-                        .unwrap_or_default();
-                    let style_str = serde_json::to_value(style)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .unwrap_or_else(|| "realistic".to_string());
-                    // A per-turn aspect (PDE/plan or per-request) beats the config default.
-                    let aspect: Option<String> = plan
-                        .aspect_ratio
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| {
-                            req_image
-                                .and_then(|i| i.aspect_ratio.as_deref())
-                                .filter(|s| !s.trim().is_empty())
-                        })
-                        .map(str::to_string)
-                        .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_aspect_ratio.clone()));
-                    let final_subject = match state.model_config.resolve_image_prompt_compose() {
-                        Some(c) => run_image_prompt_compose(
-                            &state,
-                            &c,
-                            &input.persona,
-                            &subject,
-                            &pde_transcript,
-                            aspect.as_deref(),
-                            &style_str,
-                        )
-                        .await
-                        .unwrap_or_else(|| subject.clone()),
-                        None => subject.clone(),
-                    };
-                    let composed_prompt = crate::pipeline::handlers::compose_image_prompt(
-                        style,
+                    let img = build_delegated_image_prompt(
+                        &state,
                         &input.persona,
-                        &final_subject,
-                    );
+                        &plan,
+                        req_image,
+                        resolved_image_gen.as_ref(),
+                        &pde_transcript,
+                    )
+                    .await;
+                    let subject = img.seed_subject;
+                    let aspect = img.aspect_ratio;
+                    let composed_prompt = img.composed_prompt;
                     // Persist an empty-content row carrying ONLY the minimal
                     // marker (seed subject + aspect) so the PDE stays image-aware
                     // (§5); the composed prompt and the draw result live with the
@@ -3668,55 +3737,18 @@ pub fn run_stream(
                     if let Some(last) = produced.last() {
                         let msg_uuid = last.message_id;
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
-                        let subject = plan
-                            .image_prompt
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .or_else(|| {
-                                req_image
-                                    .and_then(|i| i.image_prompt.as_deref())
-                                    .filter(|s| !s.trim().is_empty())
-                            })
-                            .unwrap_or("")
-                            .to_string();
-                        let style: eros_engine_llm::model_config::StyleKey = req_image
-                            .and_then(|i| i.style)
-                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_style))
-                            .unwrap_or_default();
-                        let style_str = serde_json::to_value(style)
-                            .ok()
-                            .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| "realistic".to_string());
-                        let aspect: Option<String> = plan
-                            .aspect_ratio
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .or_else(|| {
-                                req_image
-                                    .and_then(|i| i.aspect_ratio.as_deref())
-                                    .filter(|s| !s.trim().is_empty())
-                            })
-                            .map(str::to_string)
-                            .or_else(|| resolved_image_gen.as_ref().map(|r| r.default_aspect_ratio.clone()));
-                        let final_subject = match state.model_config.resolve_image_prompt_compose() {
-                            Some(c) => run_image_prompt_compose(
-                                &state,
-                                &c,
-                                &input.persona,
-                                &subject,
-                                &pde_transcript,
-                                aspect.as_deref(),
-                                &style_str,
-                            )
-                            .await
-                            .unwrap_or_else(|| subject.clone()),
-                            None => subject.clone(),
-                        };
-                        let composed_prompt = crate::pipeline::handlers::compose_image_prompt(
-                            style,
+                        let img = build_delegated_image_prompt(
+                            &state,
                             &input.persona,
-                            &final_subject,
-                        );
+                            &plan,
+                            req_image,
+                            resolved_image_gen.as_ref(),
+                            &pde_transcript,
+                        )
+                        .await;
+                        let subject = img.seed_subject;
+                        let aspect = img.aspect_ratio;
+                        let composed_prompt = img.composed_prompt;
                         // Merge ONLY the minimal marker (seed subject + aspect)
                         // onto the already-persisted text row so the PDE stays
                         // image-aware (§5). The text already reached the client;
@@ -4078,6 +4110,110 @@ mod tests {
         assert!(p.contains("on a rooftop"));
         assert!(p.contains("realistic"));
         assert!(p.contains("9:16"));
+    }
+
+    // ─── resolve_image_turn_inputs ───────────────────────────────────────
+
+    fn img_plan(
+        image_prompt: Option<&str>,
+        aspect: Option<&str>,
+    ) -> eros_engine_core::types::ActionPlan {
+        eros_engine_core::types::ActionPlan {
+            action_type: ActionType::ReplyImage,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec![],
+            reply_tone: None,
+            image_prompt: image_prompt.map(str::to_string),
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: aspect.map(str::to_string),
+        }
+    }
+
+    fn img_params(
+        image_prompt: Option<&str>,
+        style: Option<eros_engine_llm::model_config::StyleKey>,
+        aspect: Option<&str>,
+    ) -> crate::routes::companion_stream::ImageReplyParams {
+        crate::routes::companion_stream::ImageReplyParams {
+            image_prompt: image_prompt.map(str::to_string),
+            style,
+            aspect_ratio: aspect.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn img_gen(
+        style: eros_engine_llm::model_config::StyleKey,
+        aspect: &str,
+    ) -> eros_engine_llm::model_config::ResolvedImageGen {
+        eros_engine_llm::model_config::ResolvedImageGen {
+            model: None,
+            fallback_model: vec![],
+            default_style: style,
+            default_aspect_ratio: aspect.to_string(),
+            default_resolution: None,
+            max_tokens: 4096,
+        }
+    }
+
+    #[test]
+    fn image_turn_subject_prefers_plan_then_request_then_empty() {
+        use eros_engine_llm::model_config::StyleKey;
+        let params = img_params(Some("from request"), None, None);
+
+        // plan wins
+        let r = resolve_image_turn_inputs(&img_plan(Some("from plan"), None), Some(&params), None);
+        assert_eq!(r.seed_subject, "from plan");
+
+        // blank plan subject falls through to the request
+        let r = resolve_image_turn_inputs(&img_plan(Some("   "), None), Some(&params), None);
+        assert_eq!(r.seed_subject, "from request");
+
+        // neither ⇒ empty string
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
+        assert_eq!(r.seed_subject, "");
+        let _ = StyleKey::Realistic;
+    }
+
+    #[test]
+    fn image_turn_style_prefers_request_then_config_then_default() {
+        use eros_engine_llm::model_config::StyleKey;
+        let gen = img_gen(StyleKey::Anime, "1:1");
+
+        let params = img_params(None, Some(StyleKey::SemiRealistic), None);
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&params), Some(&gen));
+        assert_eq!(r.style, StyleKey::SemiRealistic, "request wins");
+
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None, Some(&gen));
+        assert_eq!(r.style, StyleKey::Anime, "config default");
+
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
+        assert_eq!(r.style, StyleKey::default(), "no config ⇒ type default");
+    }
+
+    #[test]
+    fn image_turn_aspect_prefers_plan_then_request_then_config() {
+        use eros_engine_llm::model_config::StyleKey;
+        let gen = img_gen(StyleKey::Realistic, "1:1");
+        let params = img_params(None, None, Some("16:9"));
+
+        let r = resolve_image_turn_inputs(&img_plan(None, Some("3:4")), Some(&params), Some(&gen));
+        assert_eq!(r.aspect_ratio.as_deref(), Some("3:4"), "plan wins");
+
+        let r = resolve_image_turn_inputs(&img_plan(None, Some("  ")), Some(&params), Some(&gen));
+        assert_eq!(
+            r.aspect_ratio.as_deref(),
+            Some("16:9"),
+            "blank plan ⇒ request"
+        );
+
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None, Some(&gen));
+        assert_eq!(r.aspect_ratio.as_deref(), Some("1:1"), "config default");
+
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
+        assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
     }
 
     #[test]
