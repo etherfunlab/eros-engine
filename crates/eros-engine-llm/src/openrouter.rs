@@ -1379,9 +1379,6 @@ impl OpenRouterClient {
         use eventsource_stream::Eventsource;
         use futures_util::StreamExt;
 
-        if self.api_key.is_empty() {
-            return Err(LlmError::Config("openrouter: api key not set".into()));
-        }
         if model.is_empty() {
             return Err(LlmError::Config(
                 "openrouter: execute_stream requires a non-empty model".into(),
@@ -1392,8 +1389,9 @@ impl OpenRouterClient {
         // serialised unset audit fields as `user: null`, which OpenRouter
         // rejects (400 "expected string, received null"). Sharing WireRequest
         // keeps the skip-None behaviour and stops the two paths from drifting.
+        let (bare_model, ep) = self.resolve_endpoint(model)?;
         let wire = WireRequest {
-            model,
+            model: &bare_model,
             messages: &req.messages,
             temperature: req.temperature,
             top_p: req.top_p,
@@ -1407,13 +1405,14 @@ impl OpenRouterClient {
             reasoning: req.reasoning.as_ref(),
             provider: self.provider_prefs(),
             response_format: None,
-        };
+        }
+        .for_endpoint(&ep);
 
         let started = std::time::Instant::now();
-        let resp = self
+        let resp = ep
             .http
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
+            .post(ep.url)
+            .bearer_auth(ep.api_key)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&wire)
             .send()
@@ -2782,6 +2781,71 @@ data: [DONE]\n\n";
             .expect("stream opens");
         // Drain (single [DONE]).
         while stream.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn stream_custom_provider_gets_bare_model_and_subset() {
+        let server_b = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution {
+                referer: Some("https://eros.example".into()),
+                title: Some("Eros".into()),
+                categories: None,
+            },
+            "https://unused.test/v1".into(),
+        )
+        .with_ignore_providers(vec!["bad".into()])
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let req = ChatRequest {
+            model: String::new(), // placeholder; execute_stream_as takes the model separately
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            session_id: Some("sess".into()),
+            ..Default::default()
+        };
+        let mut s = client
+            .execute_stream_as(&req, "venice-model@venice")
+            .await
+            .expect("stream opens");
+        use futures_util::StreamExt as _;
+        while s.next().await.is_some() {}
+
+        let r = &server_b.received_requests().await.unwrap()[0];
+        assert_eq!(
+            r.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer v-key"
+        );
+        assert!(r.headers.get("HTTP-Referer").is_none());
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["model"], "venice-model");
+        assert_eq!(body["stream"], true);
+        for k in ["session_id", "metadata", "reasoning", "provider"] {
+            assert!(
+                body.get(k).is_none(),
+                "body field {k} leaked into the stream wire"
+            );
+        }
     }
 
     // ─── B1: X-Generation-Id header capture ─────────────────────────────────
