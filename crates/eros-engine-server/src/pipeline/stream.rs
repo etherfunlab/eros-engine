@@ -5956,6 +5956,21 @@ data: [DONE]\n\n";
     /// Shared setup for the two `prompt_variant` tests: a keyed composer
     /// config, a mock that records every outbound call, and a forced
     /// image-only turn. Returns the recorded requests and the emitted frames.
+    ///
+    /// The turn's user content is deliberately kept below
+    /// `post_process::AFFINITY_EVAL_MIN_CHARS` (4 chars). A successful forced
+    /// `ReplyImage` turn `tokio::spawn`s `post_process::run` in the background
+    /// and returns before that task finishes; `post_process::run` unconditionally
+    /// attempts an `affinity_evaluation` LLM call (against this same mock)
+    /// whenever `eval_skip_reason` lets it through — and `resolve()` never
+    /// returns `None` for an unconfigured task, so there is no config-side gate
+    /// to lean on here. A longer message (e.g. "draw me", 7 chars) clears the
+    /// length gate, and because `ReplyImage` proxies the assistant text with
+    /// `plan.image_prompt` (non-blank here), it would also clear the
+    /// empty-assistant gate — so the eval call fires, racing the test's
+    /// `mock.received_requests()` against a `tokio::spawn`ed task. Keeping the
+    /// content short makes "the composer is the only possible call" true by
+    /// construction, not by scheduling luck.
     async fn run_variant_turn(
         pool: &PgPool,
         prompt_variant: Option<&str>,
@@ -5997,7 +6012,7 @@ data: [DONE]\n\n";
         let user_message_id = match chat_repo
             .upsert_user_message_idempotent(
                 session_id,
-                "draw me",
+                "hi",
                 "01J9000000000000000000000A",
                 "user",
                 None,
@@ -6016,7 +6031,7 @@ data: [DONE]\n\n";
                 session_id,
                 user_id,
                 instance_id,
-                content: "draw me".into(),
+                content: "hi".into(),
                 prompt_traits: vec![],
                 audit: None,
                 tier: None,
