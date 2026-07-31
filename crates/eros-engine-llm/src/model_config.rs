@@ -197,6 +197,51 @@ fn plain_or_empty(spec: Option<&PromptSpec>) -> String {
         .to_string()
 }
 
+/// Structural rules for a variant-shaped `filter_prompt`. `Plain` always
+/// passes — its blank-string leniency ("commented out" ⇒ built-in default) is
+/// deliberate and unchanged. A variant container is a deliberate list, so a
+/// blank inside it is a typo, and silently substituting the generic built-in
+/// prompt would be the hardest class of misconfiguration to notice.
+fn check_variant_shape(task: &str, spec: &PromptSpec) -> Result<(), String> {
+    let refuse = |why: String| {
+        Err(format!(
+            "[tasks.{task}].filter_prompt {why} — eros-engine refuses to boot."
+        ))
+    };
+    match spec {
+        PromptSpec::Plain(_) => Ok(()),
+        PromptSpec::Indexed(v) => {
+            if v.is_empty() {
+                return refuse("is an empty array".to_string());
+            }
+            match v.iter().position(|s| s.trim().is_empty()) {
+                Some(i) => refuse(format!("has a blank entry at index {i}")),
+                None => Ok(()),
+            }
+        }
+        PromptSpec::Keyed(m) => {
+            if m.is_empty() {
+                return refuse("is an empty table".to_string());
+            }
+            for (k, v) in m {
+                if k.trim().is_empty() {
+                    return refuse("has a blank key".to_string());
+                }
+                if k.trim().eq_ignore_ascii_case("raw") {
+                    return refuse(format!(
+                        "uses the reserved key \"{k}\": \"raw\" is the wire value that skips the \
+                         composer entirely, so a prompt stored under it could never be selected"
+                    ));
+                }
+                if v.trim().is_empty() {
+                    return refuse(format!("has a blank value for key \"{k}\""));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Client-facing model-name display override (chat `meta.model`). Four TOML
 /// shapes, unambiguous to serde: `false`/`true` (bool), `"name"` (string),
 /// `["a","b"]` (array → random per emit), or `{ "id" = "name", default =
@@ -1873,6 +1918,53 @@ impl ModelConfig {
                      refuses to boot. Set a filter_prompt, or remove the [tasks.{name}] \
                      section to disable {name}."
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Boot gate for `filter_prompt` variant shapes. Variants are read by
+    /// `chat_image_prompt_compose` alone, and never from a tier block (the
+    /// composer resolves with `tier = None`), so a variant anywhere else is
+    /// dead config — refuse to boot rather than let it silently no-op.
+    ///
+    /// Also enforces the structural rules for a variant container: non-empty,
+    /// no blank keys or values, and no reserved `raw` key (`raw` is the wire
+    /// escape that skips the composer, so a config key by that name could
+    /// never be selected).
+    ///
+    /// Task names are visited in sorted order so the reported failure is
+    /// deterministic across restarts (`self.tasks` is a `HashMap`).
+    pub fn validate_prompt_variants(&self) -> Result<(), String> {
+        const COMPOSE_TASK: &str = "chat_image_prompt_compose";
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            let task = &self.tasks[name];
+            if let Some(spec) = &task.filter_prompt {
+                if !matches!(spec, PromptSpec::Plain(_)) && name != COMPOSE_TASK {
+                    return Err(format!(
+                        "[tasks.{name}].filter_prompt uses a variant shape (array/table), but \
+                         only [tasks.{COMPOSE_TASK}] reads variants — eros-engine refuses to \
+                         boot. Use a plain string here."
+                    ));
+                }
+                check_variant_shape(name, spec)?;
+            }
+            let mut tier_names: Vec<&String> = task.tiers.keys().collect();
+            tier_names.sort();
+            for tier_name in tier_names {
+                let tier = &task.tiers[tier_name];
+                if let Some(spec) = &tier.filter_prompt {
+                    if !matches!(spec, PromptSpec::Plain(_)) {
+                        return Err(format!(
+                            "[tasks.{name}.tiers.{tier_name}].filter_prompt uses a variant shape \
+                             (array/table), but tier blocks never carry variants — the composer \
+                             resolves with no tier, so it could never be selected. eros-engine \
+                             refuses to boot. Use a plain string here."
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -4912,5 +5004,108 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert_eq!(s.select(None), None, "no variant selects nothing");
         assert_eq!(s.select(Some("z")), None, "unknown key");
         assert_eq!(s.select(Some("A")), None, "key match is case-sensitive");
+    }
+
+    // ─── validate_prompt_variants ────────────────────────────────────────
+
+    fn cfg(src: &str) -> ModelConfig {
+        ModelConfig::from_toml_str(src).expect("parse ModelConfig")
+    }
+
+    #[test]
+    fn variants_allowed_on_the_composer_task_only() {
+        // Composer: array and table both accepted.
+        assert!(cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"bbb\"]\n")
+        .validate_prompt_variants()
+        .is_ok());
+        assert!(cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"aaa\", b = \"bbb\" }\n")
+        .validate_prompt_variants()
+        .is_ok());
+        // Any other task: rejected.
+        let e = cfg("[tasks.chat_output_filter]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"bbb\"]\n")
+        .validate_prompt_variants()
+        .expect_err("non-composer variant must refuse to boot");
+        assert!(e.contains("chat_output_filter"), "{e}");
+        assert!(e.contains("refuses to boot"), "{e}");
+    }
+
+    #[test]
+    fn plain_filter_prompts_always_validate() {
+        assert!(cfg(
+            "[tasks.chat_output_filter]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                     [tasks.chat_output_filter.tiers.gold]\nfilter_prompt = \"tier p\"\n\
+                     [tasks.world_reply]\nmodel = \"m\"\nfilter_prompt = \"   \"\n"
+        )
+        .validate_prompt_variants()
+        .is_ok());
+        // No filter_prompt anywhere is also fine.
+        assert!(cfg("[tasks.chat_companion]\nmodel = \"m\"\n")
+            .validate_prompt_variants()
+            .is_ok());
+    }
+
+    #[test]
+    fn tier_blocks_never_carry_variants() {
+        // Rejected even under the composer task, because the composer resolves
+        // with `tier = None` and could never select it.
+        let e = cfg(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                     [tasks.chat_image_prompt_compose.tiers.gold]\n\
+                     filter_prompt = [\"aaa\"]\n",
+        )
+        .validate_prompt_variants()
+        .expect_err("tier variant must refuse to boot");
+        assert!(e.contains("tiers.gold"), "{e}");
+    }
+
+    #[test]
+    fn empty_variant_containers_refuse_to_boot() {
+        for src in [
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = []\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = {}\n",
+        ] {
+            let e = cfg(src)
+                .validate_prompt_variants()
+                .expect_err("empty variant container must refuse to boot");
+            assert!(e.contains("empty"), "{e}");
+        }
+    }
+
+    #[test]
+    fn blank_variant_entries_refuse_to_boot() {
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"aaa\", \"   \"]\n")
+        .validate_prompt_variants()
+        .expect_err("blank array entry must refuse to boot");
+        assert!(e.contains("index 1"), "{e}");
+
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"aaa\", b = \"  \" }\n")
+        .validate_prompt_variants()
+        .expect_err("blank table value must refuse to boot");
+        assert!(e.contains("blank value for key \"b\""), "{e}");
+
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { \"  \" = \"aaa\" }\n")
+        .validate_prompt_variants()
+        .expect_err("blank table key must refuse to boot");
+        assert!(e.contains("blank key"), "{e}");
+    }
+
+    #[test]
+    fn raw_is_a_reserved_key_case_insensitively() {
+        for key in ["raw", "Raw", "RAW"] {
+            let src = format!(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                 filter_prompt = {{ {key} = \"aaa\", b = \"bbb\" }}\n"
+            );
+            let e = cfg(&src)
+                .validate_prompt_variants()
+                .expect_err("reserved key must refuse to boot");
+            assert!(e.contains("reserved"), "{e}");
+        }
     }
 }

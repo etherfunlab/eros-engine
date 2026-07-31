@@ -308,6 +308,10 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    if let Err(msg) = model_config.validate_prompt_variants() {
+        anyhow::bail!(msg);
+    }
+
     // Skip when the master switch is off — WORLD_DISABLED must be able to
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
