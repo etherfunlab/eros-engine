@@ -246,10 +246,13 @@ bare id before passing `model_id`): the three `d.display(…)` calls
 `should_filter(…)` call (1210), and the streaming scrubber constructor
 `StreamScrubber::new(&state.output_regex, model_id)` (527) — the scrubber
 selects `output_regex` rules by model id, so it is the same model-keyed
-semantics as `apply_output_regex`. Since several of these cluster per attempt,
-the implementation should compute the bare id once per candidate iteration,
-not per call. (`voice.rs` and the product-QA loop consume none of these
-tables — audit only, which stays on the full slug.)
+semantics as `apply_output_regex`. One more sits on the replay path: the
+idempotent-retry Meta frame feeds the **persisted** `row.model` — which §6
+stores as the full slug — into `d.display(…)` (stream.rs:3926), so it strips
+the same way. Since several of these cluster per attempt, the implementation
+should compute the bare id once per candidate iteration, not per call.
+(`voice.rs` and the product-QA loop consume none of these tables — audit
+only, which stays on the full slug.)
 
 ---
 
