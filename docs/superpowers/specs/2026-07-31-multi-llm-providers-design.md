@@ -60,6 +60,11 @@ someprovider = "https://someprovider/api/v1/chat/completions"
 Parsed into `ModelConfig` as `#[serde(default)] pub providers: HashMap<String, String>`,
 sibling to `defaults` and `tasks`.
 
+Under `MODEL_CONFIG_DIR` (multi-file merge, `from_toml_dir`) the block needs no
+new merge code — but like `[defaults]` and unlike `[tasks]`, it merges as **one
+whole top-level key**: two files each declaring `[providers]` refuse to boot
+with the existing duplicate-definition error. All providers live in one file.
+
 **Name (the table key)**
 
 - Must match `^[a-z0-9_]+$`. Rejected at boot otherwise, with a message telling
@@ -159,17 +164,19 @@ the boot validation in §7 entirely. Left as-is, that input lands at OpenRouter
 as a nonsense model id and returns 400 — the same failure any other junk
 `req_model` already produces.
 
-**Why these four points.** Fallback chains are walked in two different places:
+**Why these three points.** Fallback chains are walked in two different places:
 `execute` / `execute_vision` iterate candidates internally, while the streaming
 path iterates in the **server** (`pipeline/stream.rs:549`, `voice.rs:179`),
-handing `execute_stream_as` one model id per attempt. These four `.post()` sites
-are the only place both shapes meet — the point where a model *string* becomes a
+handing `execute_stream_as` one model id per attempt. These `.post()` sites are
+the only place both shapes meet — the point where a model *string* becomes a
 *request*. Resolving there means mixed chains
 (`model = "a@venice"`, `fallback = ["b"]`) work with no coordination code, and
 `pipeline/stream.rs` needs no change to its call form.
 
-The `if self.api_key.is_empty()` guard currently at the head of each of the four
-methods moves into `resolve_endpoint`, where it checks *that endpoint's* key.
+The `if self.api_key.is_empty()` guard currently at the head of the three
+switching methods moves into `resolve_endpoint`, where it checks *that
+endpoint's* key. `execute_image_inner` keeps its existing guard on
+`self.api_key`, consistent with staying pinned to the built-in endpoint.
 
 ---
 
@@ -196,7 +203,10 @@ Three body builders, so three edit sites:
   the wire — no separate serialization path.
 - `execute_vision` builds a `serde_json::Value` and then injects
   `body["provider"]` (912-917). That injection becomes conditional.
-- `execute_image_inner` is untouched; §7 guarantees it never sees a suffix.
+- `execute_image_inner` is untouched. §7 keeps *config-supplied* draw slugs
+  suffix-free; a client-supplied `req_model` may still carry an `@`, which
+  passes through verbatim as a (nonsense) model id per §3 — never interpreted
+  as routing.
 
 **Known weakness, closed by test rather than by types.** Nothing in this design
 *forces* a future OpenRouter-specific field to be added to the drop list. The
@@ -230,8 +240,12 @@ All three receive the **unescaped, suffix-stripped** model id. Operators write
 so an unstripped slug would leak the deployment's provider topology to end
 users.
 
-Change site: the three `d.display(model_id)` calls in `stream.rs` each resolve
-the bare id first.
+Change sites — all in `stream.rs`, all the same one-line shape (resolve the
+bare id before passing `model_id`): the three `d.display(…)` calls
+(535/1071/1148), the two `apply_output_regex(…)` calls (712/1162), and the
+`should_filter(…)` call (1210). Since several of these cluster per attempt, the
+implementation should compute the bare id once per candidate iteration, not
+per call.
 
 ---
 
