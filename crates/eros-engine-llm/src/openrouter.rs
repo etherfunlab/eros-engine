@@ -1040,6 +1040,14 @@ impl OpenRouterClient {
                         body["provider"] = v;
                     }
                 }
+            } else {
+                // Custom `[providers]` endpoints get a strict OpenAI subset
+                // (spec §4) — `reasoning` is an OpenRouter-specific extension
+                // that `build_vision_body` bakes in unconditionally, so strip
+                // it back out here, mirroring `WireRequest::for_endpoint`.
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("reasoning");
+                }
             }
             let resp = match ep
                 .http
@@ -3560,7 +3568,10 @@ data: [DONE]\n\n";
                 caption: None,
                 temperature: 0.0,
                 max_tokens: 64,
-                reasoning: None,
+                reasoning: Some(ReasoningConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
             })
             .await
             .expect("vision call succeeds");
@@ -3576,6 +3587,10 @@ data: [DONE]\n\n";
         assert!(
             body.get("provider").is_none(),
             "provider prefs leaked to custom vision"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "OpenRouter-only reasoning object leaked to custom vision"
         );
     }
 
