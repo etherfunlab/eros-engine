@@ -292,6 +292,7 @@ draws on the chat stream).
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | task `default_style` | One of the three engine-owned style presets. |
 | `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
 | `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
+| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely and draws the seed subject as-is. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
 (`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`

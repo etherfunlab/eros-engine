@@ -2610,7 +2610,8 @@ async fn build_delegated_image_prompt(
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "realistic".to_string());
-    let final_subject = match state.model_config.resolve_image_prompt_compose(None) {
+    let variant = req_image.and_then(|i| i.prompt_variant.as_deref());
+    let final_subject = match state.model_config.resolve_image_prompt_compose(variant) {
         Some(c) => run_image_prompt_compose(
             state,
             &c,
@@ -5949,6 +5950,151 @@ data: [DONE]\n\n";
             img["prompt"],
             serde_json::json!(composed),
             "the composed wire prompt must not be persisted (only the seed subject)"
+        );
+    }
+
+    /// Shared setup for the two `prompt_variant` tests: a keyed composer
+    /// config, a mock that records every outbound call, and a forced
+    /// image-only turn. Returns the recorded requests and the emitted frames.
+    async fn run_variant_turn(
+        pool: &PgPool,
+        prompt_variant: Option<&str>,
+    ) -> (Vec<wiremock::Request>, Vec<ProtocolFrame>) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 500 on every call: the composer fails open to the seed subject. These
+        // tests assert on what was SENT, so the response body is irrelevant.
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n\
+                 filter_prompt = { a = \"PROMPT_A\", b = \"PROMPT_B\" }\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                eros_engine_llm::openrouter::AppAttribution::default(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "draw me",
+                "01J9000000000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "draw me".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    image_prompt: Some("a beach at sunset".into()),
+                    prompt_variant: prompt_variant.map(str::to_string),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        (reqs, frames)
+    }
+
+    /// `image.prompt_variant = "b"` must send variant b's text as the
+    /// composer's system message — proof the wire value reaches
+    /// `PromptSpec::select`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn prompt_variant_selects_the_configured_composer_prompt(pool: PgPool) {
+        let (reqs, _frames) = run_variant_turn(&pool, Some("b")).await;
+        assert_eq!(
+            reqs.len(),
+            1,
+            "an image-only turn makes exactly one provider call (the composer)"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(
+            body["messages"][0]["content"], "PROMPT_B",
+            "composer must use variant b, got {}",
+            body["messages"][0]["content"]
+        );
+    }
+
+    /// `prompt_variant = "raw"` must make ZERO provider calls and pass the seed
+    /// subject through to the wire prompt verbatim.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn prompt_variant_raw_skips_the_composer(pool: PgPool) {
+        let (reqs, frames) = run_variant_turn(&pool, Some("raw")).await;
+        assert!(
+            reqs.is_empty(),
+            "raw must make no composer call, got {} request(s)",
+            reqs.len()
+        );
+
+        let composed_b64 = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt, ..
+                } => Some(composed_prompt.clone()),
+                _ => None,
+            })
+            .expect("image_request present");
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("a beach at sunset"),
+            "raw must pass the seed subject through: {composed}"
         );
     }
 

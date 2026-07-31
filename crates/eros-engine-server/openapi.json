@@ -1750,6 +1750,13 @@
           "mode": {
             "$ref": "#/components/schemas/ImageMode"
           },
+          "prompt_variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use\nfor this turn: an index (`\"0\"`, `\"1\"`) for the array shape, or a key\n(`\"a\"`, `\"b\"`) for the table shape. Ignored when that task configures a\nsingle plain prompt.\n\n`\"raw\"` (case-insensitive) is reserved: it skips the composer LLM\nentirely and draws the seed subject as-is, saving one LLM call.\n\nAn unknown index/key falls back to the engine's built-in composer\nprompt — it is never an error."
+          },
           "style": {
             "type": [
               "string",
