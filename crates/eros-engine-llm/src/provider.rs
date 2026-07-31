@@ -41,7 +41,10 @@ impl fmt::Display for SlugError {
                 write!(f, "model slug `{slug}` has an empty model id before `@`")
             }
             SlugError::EmptyProvider { slug } => {
-                write!(f, "model slug `{slug}` has an empty provider name after `@`")
+                write!(
+                    f,
+                    "model slug `{slug}` has an empty provider name after `@`"
+                )
             }
         }
     }
@@ -70,14 +73,20 @@ pub fn split_model_slug(slug: &str) -> Result<(String, Option<&str>), SlugError>
             let (id_raw, rest) = slug.split_at(*i);
             let provider = &rest[1..];
             if id_raw.is_empty() {
-                return Err(SlugError::EmptyModelId { slug: slug.to_string() });
+                return Err(SlugError::EmptyModelId {
+                    slug: slug.to_string(),
+                });
             }
             if provider.is_empty() {
-                return Err(SlugError::EmptyProvider { slug: slug.to_string() });
+                return Err(SlugError::EmptyProvider {
+                    slug: slug.to_string(),
+                });
             }
             Ok((unescape(id_raw), Some(provider)))
         }
-        _ => Err(SlugError::MultipleAt { slug: slug.to_string() }),
+        _ => Err(SlugError::MultipleAt {
+            slug: slug.to_string(),
+        }),
     }
 }
 
@@ -148,7 +157,10 @@ mod tests {
 
     #[test]
     fn empty_provider_errors() {
-        assert!(matches!(split_model_slug("x@"), Err(SlugError::EmptyProvider { .. })));
+        assert!(matches!(
+            split_model_slug("x@"),
+            Err(SlugError::EmptyProvider { .. })
+        ));
     }
 
     #[test]
@@ -186,6 +198,9 @@ mod tests {
     fn error_messages_name_the_slug_and_the_escape() {
         let msg = split_model_slug("a@b@venice").unwrap_err().to_string();
         assert!(msg.contains("a@b@venice"));
-        assert!(msg.contains("\\@"), "message should teach the escape: {msg}");
+        assert!(
+            msg.contains("\\@"),
+            "message should teach the escape: {msg}"
+        );
     }
 }
