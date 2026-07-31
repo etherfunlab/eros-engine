@@ -110,6 +110,13 @@ pub fn split_model_slug(slug: &str) -> Result<(String, Option<&str>), SlugError>
     }
 }
 
+/// Escape literal `@` bytes in a model id so the result round-trips through
+/// [`split_model_slug`] when a `@provider` suffix is appended. Inverse of the
+/// unescape performed by `split_model_slug`; identity for ids without `@`.
+pub fn escape_model_id(id: &str) -> String {
+    id.replace('@', "\\@")
+}
+
 /// The suffix-stripped, unescaped model id — what model-keyed config tables
 /// (`display` / `output_regex` / `output_filter.trigger`) and the wire `model`
 /// field use. Falls back to the raw string on invalid grammar: post-boot,
@@ -218,6 +225,26 @@ mod tests {
         assert_eq!(bare_model_id("some-slug@venice"), "some-slug");
         assert_eq!(bare_model_id("weird\\@vendor/m"), "weird@vendor/m");
         assert_eq!(bare_model_id("plain/model"), "plain/model");
+    }
+
+    #[test]
+    fn escape_model_id_escapes_literal_at() {
+        assert_eq!(escape_model_id("weird@vendor/m"), "weird\\@vendor/m");
+    }
+
+    #[test]
+    fn escape_model_id_is_identity_without_at() {
+        assert_eq!(escape_model_id("plain/model"), "plain/model");
+    }
+
+    #[test]
+    fn escape_model_id_round_trips_through_split_model_slug() {
+        let escaped = escape_model_id("weird@vendor/m");
+        let slug = format!("{escaped}@venice");
+        assert_eq!(
+            split_model_slug(&slug).unwrap(),
+            ("weird@vendor/m".to_string(), Some("venice"))
+        );
     }
 
     #[test]

@@ -1123,12 +1123,14 @@ impl OpenRouterClient {
             }
             // §6: a custom row self-identifies as <echo>@<provider> so a failed
             // eros-audit join on generation_id explains itself from the model
-            // column. OpenRouter rows are byte-identical to before.
+            // column. OpenRouter rows are byte-identical to before. The echo /
+            // bare id is escaped so a literal `@` in it doesn't produce a
+            // second unescaped `@`, which `split_model_slug` would reject.
             let model_out = match ep.name {
                 None => parsed.model,
                 Some(p) => Some(match parsed.model {
-                    Some(echo) => format!("{echo}@{p}"),
-                    None => format!("{bare_model}@{p}"),
+                    Some(echo) => format!("{}@{p}", crate::provider::escape_model_id(&echo)),
+                    None => format!("{}@{p}", crate::provider::escape_model_id(&bare_model)),
                 }),
             };
             return Ok(ChatResponse {
@@ -1374,12 +1376,14 @@ impl OpenRouterClient {
         }
         // §6: a custom row self-identifies as <echo>@<provider> so a failed
         // eros-audit join on generation_id explains itself from the model
-        // column. OpenRouter rows are byte-identical to before.
+        // column. OpenRouter rows are byte-identical to before. The echo /
+        // bare id is escaped so a literal `@` in it doesn't produce a
+        // second unescaped `@`, which `split_model_slug` would reject.
         let model_out = match ep.name {
             None => parsed.model,
             Some(p) => Some(match parsed.model {
-                Some(echo) => format!("{echo}@{p}"),
-                None => format!("{bare_model}@{p}"),
+                Some(echo) => format!("{}@{p}", crate::provider::escape_model_id(&echo)),
+                None => format!("{}@{p}", crate::provider::escape_model_id(&bare_model)),
             }),
         };
         Ok(ChatResponse {
@@ -4149,6 +4153,53 @@ data: [DONE]\n\n";
         for k in ["session_id", "metadata", "reasoning", "provider"] {
             assert!(body.get(k).is_none(), "body field {k} leaked");
         }
+    }
+
+    #[tokio::test]
+    async fn custom_echo_with_literal_at_is_escaped_in_audit_slug() {
+        let server_b = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "v-gen-3",
+                "model": "weird@vendor/m",
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            "https://unused.test/v1".into(),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let resp = client
+            .execute(ChatRequest {
+                model: "weird\\@vendor/m@venice".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("custom call succeeds");
+        // The echoed id contains a literal `@`; it must be escaped before the
+        // `@venice` suffix so the persisted slug has exactly one unescaped
+        // `@` and is parseable again.
+        assert_eq!(resp.model.as_deref(), Some("weird\\@vendor/m@venice"));
+        assert_eq!(
+            crate::provider::bare_model_id(resp.model.as_deref().unwrap()),
+            "weird@vendor/m"
+        );
     }
 
     #[tokio::test]
