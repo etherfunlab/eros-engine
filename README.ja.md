@@ -99,7 +99,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 - [Ghost mechanics](docs/ghost-mechanics.md) — スコア式、保護ルール、例。
 - [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、Voyage、pgvector による検索。
 - [World system](docs/world-system.md) — 実験的なオーナー単位のペルソナワールド：World Memories のシミュレーションとリコール注入、World Town のソーシャルフィード。
-- [Model config](docs/model-config.md) — `model_config.toml` schema、すべてのタスク（chat、vision、image generation、PDE、filters、extraction）、モデル選択、0.x の安定性に関する方針。
+- [Model config](docs/model-config.md) — `model_config.toml` schema、すべてのタスク（chat、vision、image generation、PDE、filters、extraction）、モデル選択、マルチプロバイダールーティング（`[providers]`）、0.x の安定性に関する方針。
 - [Prompt traits](docs/prompt-traits.md) — リクエスト単位の system prompt 注入と tier の許可リスト。
 - [LLM / OpenRouter audit](docs/llm-audit.md) — ユーザー単位 / セッション単位の attribution の受け渡し。
 - [Deploying](docs/deploying.md) — Docker、独自の Postgres / IdP、運用向け環境変数。

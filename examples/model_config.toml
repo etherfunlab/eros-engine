@@ -22,6 +22,37 @@
 #ignore_providers = ["some-bad-provider-slug"]
 #provider_sort = "latency"
 #
+# ── Custom providers (optional) ──────────────────────────────────────────────
+# Route individual model slugs to your own OpenAI-compatible endpoints.
+# Declare an endpoint here, then suffix a model id with "@<name>":
+#
+#   model = "venice-uncensored@venice"     # served by [providers].venice
+#   fallback = ["x-ai/grok-4.20"]          # no suffix → built-in OpenRouter
+#
+# Rules:
+# - Names match [a-z0-9_]+. "openrouter" is reserved — override the built-in
+#   endpoint with the OPENROUTER_BASE_URL env var instead.
+# - The value is the COMPLETE chat-completions URL, posted verbatim.
+# - The API key comes from env: [providers].venice → $VENICE_API_KEY.
+#   Required only when some model slug actually references the provider —
+#   this sample entry does not break boot.
+# - Model ids before "@" are the PROVIDER'S OWN slugs, sent verbatim; the
+#   engine never translates model names between providers.
+# - A literal "@" inside a model id is escaped "\@" — in a TOML double-quoted
+#   string write "weird\\@vendor/m".
+# - Model-keyed tables (`display`, `output_regex` models, `output_filter`
+#   trigger models) always use the BARE id, never "id@provider".
+# - Custom providers receive a strict OpenAI-compatible request:
+#   [defaults].ignore_providers / provider_sort and per-task `reasoning` are
+#   inert for them, and no attribution headers are sent.
+# - [tasks.chat_image_generation] does not accept "@provider" (the draw
+#   endpoint speaks OpenRouter's modalities extension).
+# - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key (like
+#   [defaults]): all providers live in one file.
+#
+#[providers]
+#venice = "https://api.venice.ai/api/v1/chat/completions"
+#
 # One-off repair of rows already persisted with byte-BPE garble (run manually,
 # NOT a migration — the engine refuses to own downstream prod data). Repairs the
 # two unambiguous whitespace glyphs only (Ġ→space, Ċ→newline), idempotent,

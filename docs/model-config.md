@@ -82,6 +82,56 @@ Field details:
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 | `tasks.<name>.dimensions` | `u32` | no | Embedding-only. Ignored by chat / insight tasks. |
 
+### `[providers]` — custom OpenAI-compatible endpoints (opt-in)
+
+```toml
+[providers]
+venice = "https://api.venice.ai/api/v1/chat/completions"
+```
+
+Declares additional chat-completions endpoints alongside the built-in
+OpenRouter client. Reference one by suffixing a model slug anywhere a
+`model` / `fallback` accepts one (any shape — fixed, round-robin, weighted):
+
+```toml
+[tasks.chat_companion]
+model = "venice-uncensored@venice"   # served by [providers].venice
+fallback = ["x-ai/grok-4.20"]        # no suffix → built-in OpenRouter
+```
+
+Rules, all enforced at boot (the engine refuses to boot on any violation):
+
+- **Names** match `[a-z0-9_]+`; `openrouter` is reserved (override the
+  built-in endpoint with the `OPENROUTER_BASE_URL` env var instead).
+- **URL** is the complete chat-completions URL, posted verbatim — no path
+  joining.
+- **API key** comes from the environment as `<NAME_UPPERCASED>_API_KEY`
+  (`venice` → `$VENICE_API_KEY`), required only for providers actually
+  referenced by some model slug. Declared-but-unreferenced entries need no
+  key.
+- **Model ids are the provider's own slugs**, sent verbatim — the engine
+  never translates model names between providers.
+- A literal `@` inside a model id is escaped `\@`. In a TOML double-quoted
+  string that is written `"weird\\@vendor/m"`; at most one unescaped `@` per
+  slug.
+- **Model-keyed tables use bare ids**: `model_name_display_override`,
+  `output_regex` `models`, and `output_filter` trigger `models` match on the
+  id *without* `@provider`.
+- **Wire shape**: custom providers receive a strict OpenAI chat-completions
+  subset. `[defaults].ignore_providers`, `[defaults].provider_sort`, and
+  per-task `reasoning` are **inert** on custom providers, and the OpenRouter
+  attribution headers are not sent to them.
+- **Audit**: rows served by a custom provider record
+  `model = "<upstream echo>@<name>"` and the provider's own `generation_id`
+  verbatim — a `generation_id` join against OpenRouter's logs misses for
+  those rows, and the `model` column says why.
+- `[tasks.chat_image_generation]` does not accept `@provider` — the draw
+  endpoint speaks OpenRouter's `modalities` extension. The composer task
+  (`chat_image_prompt_compose`) is an ordinary chat task and routes like any
+  other.
+- Under `MODEL_CONFIG_DIR`, `[providers]` merges as one whole top-level key
+  (like `[defaults]`, unlike `[tasks]`): all providers live in one file.
+
 ### `model_name_display_override` (chat task only)
 
 Controls the `model` value sent to clients in chat SSE `meta` frames. Affects

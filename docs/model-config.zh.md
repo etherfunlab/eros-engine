@@ -82,6 +82,51 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 | `tasks.<name>.dimensions` | `u32` | 否 | 仅用于 embedding。chat / insight 任务会忽略。 |
 
+### `[providers]` — 自定义 OpenAI 兼容端点（opt-in）
+
+```toml
+[providers]
+venice = "https://api.venice.ai/api/v1/chat/completions"
+```
+
+在内置 OpenRouter client 之外声明额外的 chat-completions 端点。在任何接受
+`model` / `fallback` 的位置（三种形态：固定、轮询、加权）给模型 slug 加
+`@<name>` 后缀即可引用：
+
+```toml
+[tasks.chat_companion]
+model = "venice-uncensored@venice"   # 由 [providers].venice 提供服务
+fallback = ["x-ai/grok-4.20"]        # 无后缀 → 内置 OpenRouter
+```
+
+以下规则全部在启动时强制校验（任一违反即拒绝启动）：
+
+- **名称**匹配 `[a-z0-9_]+`；`openrouter` 为保留字（覆盖内置端点请用
+  `OPENROUTER_BASE_URL` 环境变量）。
+- **URL** 为完整的 chat-completions 地址，原样 POST，引擎不做任何路径拼接。
+- **API key** 来自环境变量 `<大写名称>_API_KEY`（`venice` →
+  `$VENICE_API_KEY`），仅对被模型 slug 实际引用的 provider 强制要求；
+  已声明但未引用的条目无需 key。
+- **模型 id 用该 provider 自己的 slug**，原样上线——引擎从不在 provider
+  之间转译模型名。
+- 模型 id 中的字面 `@` 用 `\@` 转义。TOML 双引号字符串写作
+  `"weird\\@vendor/m"`；每个 slug 至多一个未转义的 `@`。
+- **按模型匹配的表用裸 id**：`model_name_display_override`、`output_regex`
+  的 `models`、`output_filter` trigger 的 `models`，匹配时都不带
+  `@provider`。
+- **wire 形态**：自定义 provider 收到严格的 OpenAI chat-completions 子集。
+  `[defaults].ignore_providers`、`[defaults].provider_sort` 和任务级
+  `reasoning` 对自定义 provider **不生效**，OpenRouter 归因标头也不会发送。
+- **审计**：自定义 provider 服务的行记录
+  `model = "<上游回显>@<name>"`，`generation_id` 原样存 provider 返回的
+  id——用 `generation_id` 去 join OpenRouter 日志时这些行会 miss，
+  `model` 列会说明原因。
+- `[tasks.chat_image_generation]` 不接受 `@provider`——绘图端点使用
+  OpenRouter 的 `modalities` 扩展。改写器任务（`chat_image_prompt_compose`）
+  是普通 chat 任务，路由规则与其他任务相同。
+- 使用 `MODEL_CONFIG_DIR` 时，`[providers]` 作为单个顶层 key 整体合并
+  （同 `[defaults]`，不同于 `[tasks]`）：所有 provider 必须写在同一个文件里。
+
 ### `model_name_display_override`（仅限 chat 任务）
 
 控制 chat SSE `meta` frame 中发送给客户端的 `model` 值。它**只**影响客户端显示——绝不影响 OpenRouter 请求、持久化的 assistant 记录或用量日志。该字段位于 `[tasks.chat_companion]` 的任务级配置中；所有 tier 都会继承。为其他任务设置该字段可以通过解析，但不会产生效果。
