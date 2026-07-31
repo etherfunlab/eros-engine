@@ -291,11 +291,14 @@ max_tokens = 4096
 #   filter_prompt = ["…", "…"]                # pick by index: prompt_variant = "0" / "1"
 #   filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
 #
-# Anything not selected — no prompt_variant, an out-of-range index, an unknown
-# key — falls back to the BUILT-IN prompt above (logged at warn). There is no
-# "first entry wins" and no reserved `default` key: writing `default = "…"`
-# defines an ordinary variant that is selected only by a literal
-# prompt_variant = "default".
+# Anything not selected falls back to the BUILT-IN prompt above. That covers
+# both an absent prompt_variant (silent — this is the common case, no LLM was
+# asked to pick anything) and an explicitly-supplied variant that fails to
+# match — an out-of-range index or an unknown key — which additionally logs a
+# warn (a supplied variant that goes unused is worth a human's attention).
+# There is no "first entry wins" and no reserved `default` key: writing
+# `default = "…"` defines an ordinary variant that is selected only by a
+# literal prompt_variant = "default".
 #
 # `prompt_variant = "raw"` (case-insensitive) skips the composer LLM entirely
 # and draws the seed subject as-is — one fewer LLM call for that turn. `raw` is

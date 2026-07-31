@@ -1698,13 +1698,20 @@ impl ModelConfig {
             .filter_prompt
             .as_ref()
             .and_then(|s| s.select(variant));
-        if selected.is_none() && variant.is_some() && task_cfg.filter_prompt.is_some() {
-            tracing::warn!(
+        // The warn/debug decision is a pure function of (selected, variant,
+        // has a filter_prompt at all) — pulled out of the tracing call so it
+        // can be unit-tested directly, without a tracing subscriber, and so a
+        // refactor that accidentally drops a guard shows up as a plain
+        // assertion failure instead of only a missing log line.
+        match compose_variant_log_event(selected, variant, task_cfg.filter_prompt.is_some()) {
+            Some(ComposeVariantLogEvent::Mismatch) => tracing::warn!(
                 variant = %variant.unwrap_or_default(),
                 "image-compose: variant not found; using the built-in prompt"
-            );
-        } else if selected.is_some() && variant.is_some() {
-            tracing::debug!(variant = %variant.unwrap_or_default(), "image-compose: variant selected");
+            ),
+            Some(ComposeVariantLogEvent::Selected) => {
+                tracing::debug!(variant = %variant.unwrap_or_default(), "image-compose: variant selected")
+            }
+            None => {}
         }
         // `trim`/`is_empty` is what makes a blank PLAIN filter_prompt fall
         // through to the built-in prompt. Redundant for the variant shapes
@@ -1735,6 +1742,40 @@ impl ModelConfig {
 fn dedup_keep_first(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// What (if anything) `resolve_image_prompt_compose` should log about a
+/// variant lookup. A `warn` on every miss would fire on the common
+/// no-`prompt_variant`-supplied turn, which is silent by design — only an
+/// explicitly-supplied variant that failed to match is worth surfacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeVariantLogEvent {
+    /// The caller supplied a variant, a `filter_prompt` container exists, and
+    /// nothing matched — falling back to the built-in prompt is surprising
+    /// enough to warn about.
+    Mismatch,
+    /// The caller supplied a variant and something was selected for it
+    /// (worth a breadcrumb at `debug`, not louder).
+    Selected,
+}
+
+/// Pure decision behind the warn/debug logging in
+/// `resolve_image_prompt_compose`, split out so the guard conditions are
+/// unit-testable without a `tracing` subscriber: a refactor that drops the
+/// `variant.is_some()` or `has_filter_prompt` guard changes this function's
+/// return value directly, instead of only silently changing log output.
+fn compose_variant_log_event(
+    selected: Option<&str>,
+    variant: Option<&str>,
+    has_filter_prompt: bool,
+) -> Option<ComposeVariantLogEvent> {
+    if selected.is_none() && variant.is_some() && has_filter_prompt {
+        Some(ComposeVariantLogEvent::Mismatch)
+    } else if selected.is_some() && variant.is_some() {
+        Some(ComposeVariantLogEvent::Selected)
+    } else {
+        None
+    }
 }
 
 /// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
@@ -5235,7 +5276,13 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn raw_on_an_absent_compose_task_is_still_none() {
+    fn raw_returns_none_whether_or_not_the_composer_is_configured() {
+        // NOTE: this does NOT pin the "raw check precedes the task lookup"
+        // ordering — `self.tasks.get(COMPOSE_TASK)?` early-returns `None` for
+        // an absent task regardless of which check runs first, so this test
+        // passes under both orderings. It only pins that `raw` still yields
+        // `None` (composer does not run) when the task block is absent, same
+        // as when it's present — a real behavior, just not evidence of order.
         let c = cfg("[tasks.chat_companion]\nmodel = \"m\"\n");
         assert!(c.resolve_image_prompt_compose(Some("raw")).is_none());
         assert!(c.resolve_image_prompt_compose(None).is_none());
@@ -5251,5 +5298,50 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
                 .compose_prompt,
             DEFAULT_COMPOSE_PROMPT
         );
+    }
+
+    #[test]
+    fn raw_variant_is_trimmed_before_the_raw_comparison() {
+        // Pins that the incoming variant is trimmed BEFORE the "raw" match,
+        // not after: `filter_prompt` is a non-blank Plain string here, so if
+        // trimming happened later (or not at all), " raw \n" would fail the
+        // exact `eq_ignore_ascii_case("raw")` comparison, fall through to
+        // normal selection, and this would resolve to `Some(..)` with
+        // compose_prompt = "custom" instead of `None`.
+        let c =
+            cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n");
+        assert!(c.resolve_image_prompt_compose(Some(" raw \n")).is_none());
+    }
+
+    // ─── compose_variant_log_event: the warn/debug guards, pinned directly ──
+    // (no tracing subscriber needed — the decision is a pure function)
+
+    #[test]
+    fn compose_variant_log_event_warns_only_on_an_explicit_unmatched_variant() {
+        // The common case: no prompt_variant was supplied at all. Falling
+        // back to the built-in prompt is silent — nothing was asked for, so
+        // nothing failed to be found.
+        assert_eq!(compose_variant_log_event(None, None, true), None);
+        // A container exists but no filter_prompt at all was configured —
+        // can't happen via the public resolver (selected implies a
+        // filter_prompt), but the guard must not fire even so.
+        assert_eq!(compose_variant_log_event(None, Some("z"), false), None);
+        // The one case that DOES warn: a variant was supplied, a
+        // filter_prompt container exists, and nothing matched.
+        assert_eq!(
+            compose_variant_log_event(None, Some("z"), true),
+            Some(ComposeVariantLogEvent::Mismatch)
+        );
+    }
+
+    #[test]
+    fn compose_variant_log_event_debug_only_when_a_variant_was_supplied_and_matched() {
+        assert_eq!(
+            compose_variant_log_event(Some("AAA"), Some("0"), true),
+            Some(ComposeVariantLogEvent::Selected)
+        );
+        // No variant supplied ⇒ nothing to report, even though `selected` is
+        // `Some` (e.g. a Plain filter_prompt, which always resolves).
+        assert_eq!(compose_variant_log_event(Some("AAA"), None, true), None);
     }
 }

@@ -489,11 +489,15 @@ filter_prompt = ["…", "…"]                # pick by index: prompt_variant = 
 filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
 ```
 
-Anything not selected — no `prompt_variant`, an out-of-range index, an unknown
-key — falls back to the **built-in** prompt above (logged at `warn`), never to
-"first entry wins". There is no reserved `default` key: writing `default = "…"`
-defines an ordinary variant, selected only by a literal `prompt_variant =
-"default"`.
+Anything not selected falls back to the **built-in** prompt above, never to
+"first entry wins" — but the two ways of "not selected" are logged
+differently. An **absent** `prompt_variant` falls back silently (the common
+case: no variant was requested, so there is nothing to warn about). An
+**explicitly-supplied** variant that fails to match — an out-of-range index, an
+unknown key — also falls back, but additionally logs at `warn`, since a
+variant the caller asked for and didn't get is worth surfacing. There is no
+reserved `default` key: writing `default = "…"` defines an ordinary variant,
+selected only by a literal `prompt_variant = "default"`.
 
 `prompt_variant = "raw"` (case-insensitive) skips the composer LLM entirely and
 draws the seed subject as-is — one fewer LLM call for that turn. `raw` is
