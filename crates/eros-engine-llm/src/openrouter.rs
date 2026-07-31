@@ -4216,4 +4216,66 @@ data: [DONE]\n\n";
             .expect("chain advances past the unresolvable candidate");
         assert_eq!(resp.reply, "ok");
     }
+
+    #[tokio::test]
+    async fn draw_endpoint_never_routes_a_provider_suffix() {
+        let server_a = MockServer::start().await; // built-in endpoint
+        let server_b = MockServer::start().await; // configured provider — must stay silent
+        Mock::given(path("/or/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-img",
+                "model": "x@venice",
+                "choices": [{ "message": { "content": "", "images": [
+                    { "image_url": { "url": "data:image/png;base64,AAAA" } }
+                ] } }]
+            })))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            format!("{}/or/chat/completions", server_a.uri()),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        // "x@venice" simulates a hostile/typo client req_model reaching the
+        // draw chain. It must go to the BUILT-IN endpoint as a verbatim —
+        // nonsense — model id, never to the configured provider.
+        let resp = client
+            .execute_image(ImageGenRequest {
+                model: "x@venice".into(),
+                fallback_model: vec![],
+                prompt: "a cat".into(),
+                face_ref_url: None,
+                aspect_ratio: None,
+                resolution: None,
+                max_tokens: 1024,
+                prompt_original: None,
+            })
+            .await
+            .expect("image call succeeds against the built-in endpoint");
+        assert_eq!(resp.images.len(), 1);
+        let req_a = &server_a.received_requests().await.unwrap()[0];
+        assert_eq!(
+            req_a
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer or-key"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&req_a.body).unwrap();
+        assert_eq!(body["model"], "x@venice", "slug must pass through verbatim");
+        assert!(
+            server_b.received_requests().await.unwrap().is_empty(),
+            "draw endpoint must NEVER post to a [providers] host"
+        );
+    }
 }
