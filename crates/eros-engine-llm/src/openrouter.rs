@@ -520,6 +520,24 @@ struct WireRequest<'a> {
     response_format: Option<&'a serde_json::Value>,
 }
 
+impl<'a> WireRequest<'a> {
+    /// Strip the OpenRouter-specific fields for a custom endpoint (spec §4):
+    /// custom providers receive a strict OpenAI chat-completions subset. All
+    /// four fields carry `skip_serializing_if`, so `None` removes them from
+    /// the wire entirely — one serialization path, no drift. NOTE: when
+    /// adding a field to WireRequest, decide its fate here; the
+    /// `custom_endpoint_wire_is_strict_openai_subset` test enforces it.
+    fn for_endpoint(mut self, ep: &Endpoint<'_>) -> Self {
+        if ep.name.is_some() {
+            self.session_id = None;
+            self.metadata = None;
+            self.reasoning = None;
+            self.provider = None;
+        }
+        self
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WireImageUrl {
     url: String,
@@ -683,7 +701,6 @@ pub struct OpenRouterClient {
     /// for every custom-provider post. The three attribution headers are
     /// baked into `http` at construction and cannot be withdrawn per-request
     /// (spec §3); same connect/pool bounds as `http`.
-    #[allow(dead_code)] // consumed by Task 4-6
     plain_http: reqwest::Client,
 }
 
@@ -807,7 +824,6 @@ impl OpenRouterClient {
 /// `name: None` ⇒ the built-in OpenRouter endpoint (attribution headers,
 /// full wire); `Some(name)` ⇒ a `[providers]` entry (plain client, strict
 /// OpenAI wire subset, audit model suffixed `@name`).
-#[allow(dead_code)] // consumed by Task 4-6
 struct Endpoint<'a> {
     url: &'a str,
     api_key: &'a str,
@@ -823,7 +839,6 @@ impl OpenRouterClient {
     /// `LlmError::Config`, which advances the caller's candidate chain
     /// instead of panicking (unreachable for config slugs post-boot, but
     /// `execute_stream_as` receives arbitrary server strings).
-    #[allow(dead_code)] // consumed by Task 4-6
     fn resolve_endpoint<'s>(&'s self, slug: &str) -> Result<(String, Endpoint<'s>), LlmError> {
         let (bare, provider) = crate::provider::split_model_slug(slug)
             .map_err(|e| LlmError::Config(format!("openrouter: {e}")))?;
@@ -1254,12 +1269,9 @@ impl OpenRouterClient {
         req_reasoning: Option<&ReasoningConfig>,
         req_response_format: Option<&serde_json::Value>,
     ) -> Result<ChatResponse, LlmError> {
-        if self.api_key.is_empty() {
-            return Err(LlmError::Config("openrouter: api key not set".into()));
-        }
-
+        let (bare_model, ep) = self.resolve_endpoint(model)?;
         let wire = WireRequest {
-            model,
+            model: &bare_model,
             messages,
             temperature,
             top_p,
@@ -1273,12 +1285,13 @@ impl OpenRouterClient {
             reasoning: req_reasoning,
             provider: self.provider_prefs(),
             response_format: req_response_format,
-        };
+        }
+        .for_endpoint(&ep);
 
-        let resp = self
+        let resp = ep
             .http
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
+            .post(ep.url)
+            .bearer_auth(ep.api_key)
             .json(&wire)
             .send()
             .await?;
@@ -1324,10 +1337,20 @@ impl OpenRouterClient {
                 finish_reason,
             });
         }
+        // §6: a custom row self-identifies as <echo>@<provider> so a failed
+        // eros-audit join on generation_id explains itself from the model
+        // column. OpenRouter rows are byte-identical to before.
+        let model_out = match ep.name {
+            None => parsed.model,
+            Some(p) => Some(match parsed.model {
+                Some(echo) => format!("{echo}@{p}"),
+                None => format!("{bare_model}@{p}"),
+            }),
+        };
         Ok(ChatResponse {
             reply: clean_response(raw.trim()),
             generation_id: parsed.id,
-            model: parsed.model,
+            model: model_out,
             usage: parsed.usage,
             finish_reason,
         })
@@ -3718,5 +3741,331 @@ data: [DONE]\n\n";
             message.contains("sexual"),
             "moderation reasons stay visible for triage: {message}"
         );
+    }
+
+    // ---- multi-provider routing: non-stream wire (spec §4/§6) ----
+
+    /// A WireRequest with EVERY optional field set — the worst case for leaks.
+    /// Returns owned parts; tests borrow from them.
+    fn full_wire_parts() -> (
+        Vec<ChatMessage>,
+        serde_json::Map<String, serde_json::Value>,
+        ReasoningConfig,
+        serde_json::Value,
+        Vec<String>,
+    ) {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let mut meta = serde_json::Map::new();
+        meta.insert("k".into(), serde_json::json!("v"));
+        let reasoning = ReasoningConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let response_format = serde_json::json!({ "type": "json_object" });
+        let ignore = vec!["bad-provider".to_string()];
+        (messages, meta, reasoning, response_format, ignore)
+    }
+
+    #[test]
+    fn custom_endpoint_wire_is_strict_openai_subset() {
+        // THE allow-list lock (spec §4): a custom-endpoint body's keys must be
+        // a SUBSET of the OpenAI chat-completions surface. Subset, not
+        // equality — several fields are legitimately skipped when None/false.
+        // If this test fails on a field you just added to WireRequest, add it
+        // to WireRequest::for_endpoint's drop list (or the allow list, if it
+        // is standard OpenAI).
+        let (messages, meta, reasoning, response_format, ignore) = full_wire_parts();
+        let http = reqwest::Client::new();
+        let ep = Endpoint {
+            url: "https://x",
+            api_key: "k",
+            http: &http,
+            name: Some("venice"),
+        };
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.5,
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(0.1),
+            max_tokens: 10,
+            stream: true,
+            user: Some("u"),
+            session_id: Some("s"),
+            metadata: Some(&meta),
+            reasoning: Some(&reasoning),
+            provider: Some(ProviderPrefs {
+                ignore: &ignore,
+                sort: Some("latency"),
+            }),
+            response_format: Some(&response_format),
+        }
+        .for_endpoint(&ep);
+        let v = serde_json::to_value(&wire).unwrap();
+        const ALLOW: [&str; 10] = [
+            "model",
+            "messages",
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "max_tokens",
+            "stream",
+            "user",
+            "response_format",
+        ];
+        for k in v.as_object().unwrap().keys() {
+            assert!(
+                ALLOW.contains(&k.as_str()),
+                "OpenRouter-specific field `{k}` leaked to a custom provider"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_endpoint_wire_keeps_all_fields() {
+        // Regression lock: for_endpoint on the built-in endpoint drops NOTHING.
+        let (messages, meta, reasoning, response_format, ignore) = full_wire_parts();
+        let http = reqwest::Client::new();
+        let ep = Endpoint {
+            url: "https://x",
+            api_key: "k",
+            http: &http,
+            name: None,
+        };
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.5,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            max_tokens: 10,
+            stream: false,
+            user: None,
+            session_id: Some("s"),
+            metadata: Some(&meta),
+            reasoning: Some(&reasoning),
+            provider: Some(ProviderPrefs {
+                ignore: &ignore,
+                sort: None,
+            }),
+            response_format: Some(&response_format),
+        }
+        .for_endpoint(&ep);
+        let v = serde_json::to_value(&wire).unwrap();
+        let obj = v.as_object().unwrap();
+        for k in ["session_id", "metadata", "reasoning", "provider"] {
+            assert!(
+                obj.contains_key(k),
+                "`{k}` must survive on the OpenRouter path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_provider_gets_bare_model_own_key_no_attribution() {
+        let server_b = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "v-gen-1",
+                "model": "venice-echo",
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        // Attribution + prefs configured — none of it may reach the custom host.
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution {
+                referer: Some("https://eros.example".into()),
+                title: Some("Eros".into()),
+                categories: Some("roleplay".into()),
+            },
+            "https://unused-openrouter.test/v1".into(),
+        )
+        .with_ignore_providers(vec!["bad".into()])
+        .with_provider_sort(Some("latency".into()))
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let mut meta = serde_json::Map::new();
+        meta.insert("k".into(), serde_json::json!("v"));
+        let resp = client
+            .execute(ChatRequest {
+                model: "venice-model@venice".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.5,
+                max_tokens: 16,
+                session_id: Some("sess".into()),
+                metadata: Some(meta),
+                reasoning: Some(ReasoningConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("custom call succeeds");
+
+        // §6: audit model = upstream echo + @provider; generation_id verbatim.
+        assert_eq!(resp.model.as_deref(), Some("venice-echo@venice"));
+        assert_eq!(resp.generation_id.as_deref(), Some("v-gen-1"));
+
+        let req = &server_b.received_requests().await.unwrap()[0];
+        // Bearer is the provider's own key.
+        assert_eq!(
+            req.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer v-key"
+        );
+        // No attribution headers on a custom host (spec §4).
+        for h in [
+            "HTTP-Referer",
+            "X-OpenRouter-Title",
+            "X-OpenRouter-Categories",
+        ] {
+            assert!(req.headers.get(h).is_none(), "header {h} leaked");
+        }
+        // Bare model id + none of the four OpenRouter-only body fields.
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["model"], "venice-model");
+        for k in ["session_id", "metadata", "reasoning", "provider"] {
+            assert!(body.get(k).is_none(), "body field {k} leaked");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_echo_missing_falls_back_to_bare_at_name() {
+        let server_b = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            "https://unused.test/v1".into(),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let resp = client
+            .execute(ChatRequest {
+                model: "vm@venice".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // ok_response() has no "model" field → bare@name.
+        assert_eq!(resp.model.as_deref(), Some("vm@venice"));
+    }
+
+    #[tokio::test]
+    async fn mixed_chain_falls_back_from_custom_to_openrouter() {
+        let server_a = MockServer::start().await; // built-in
+        let server_b = MockServer::start().await; // venice — down
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        Mock::given(path("/or/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            format!("{}/or/chat/completions", server_a.uri()),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let resp = client
+            .execute(ChatRequest {
+                model: "m@venice".into(),
+                fallback_model: vec!["or/fallback".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("fallback serves");
+        assert_eq!(resp.reply, "ok");
+        // The OpenRouter attempt used its own key and the fallback's bare id.
+        let req_a = &server_a.received_requests().await.unwrap()[0];
+        assert_eq!(
+            req_a
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer or-key"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&req_a.body).unwrap();
+        assert_eq!(body["model"], "or/fallback");
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_advances_the_chain() {
+        let server_a = MockServer::start().await;
+        Mock::given(path("/or/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            format!("{}/or/chat/completions", server_a.uri()),
+        );
+        let resp = client
+            .execute(ChatRequest {
+                model: "m@nope".into(),
+                fallback_model: vec!["good/m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("chain advances past the unresolvable candidate");
+        assert_eq!(resp.reply, "ok");
     }
 }

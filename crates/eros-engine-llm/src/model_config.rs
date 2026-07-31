@@ -315,7 +315,7 @@ impl DisplayOverride {
 /// omitted from the wire. Common uses: `{ enabled = false }` to disable
 /// reasoning entirely, or `{ exclude = true }` to keep reasoning but drop it
 /// from the response. (Extend with `effort`/`max_tokens` here if ever needed.)
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReasoningConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
