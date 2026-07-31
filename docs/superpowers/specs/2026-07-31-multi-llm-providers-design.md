@@ -242,10 +242,14 @@ users.
 
 Change sites — all in `stream.rs`, all the same one-line shape (resolve the
 bare id before passing `model_id`): the three `d.display(…)` calls
-(535/1071/1148), the two `apply_output_regex(…)` calls (712/1162), and the
-`should_filter(…)` call (1210). Since several of these cluster per attempt, the
-implementation should compute the bare id once per candidate iteration, not
-per call.
+(535/1071/1148), the two `apply_output_regex(…)` calls (712/1162), the
+`should_filter(…)` call (1210), and the streaming scrubber constructor
+`StreamScrubber::new(&state.output_regex, model_id)` (527) — the scrubber
+selects `output_regex` rules by model id, so it is the same model-keyed
+semantics as `apply_output_regex`. Since several of these cluster per attempt,
+the implementation should compute the bare id once per candidate iteration,
+not per call. (`voice.rs` and the product-QA loop consume none of these
+tables — audit only, which stays on the full slug.)
 
 ---
 
