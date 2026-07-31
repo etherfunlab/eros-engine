@@ -187,6 +187,16 @@ impl PromptSpec {
     }
 }
 
+/// A task/tier `filter_prompt` as a plain string, or `""`. This is the shape
+/// every non-composer `resolve_*` expects. A variant shape reads as `""`
+/// (i.e. "unset"), so those tasks degrade to "feature off" rather than
+/// misbehaving — a branch `validate_prompt_variants` makes unreachable at boot.
+fn plain_or_empty(spec: Option<&PromptSpec>) -> String {
+    spec.and_then(PromptSpec::as_plain)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Client-facing model-name display override (chat `meta.model`). Four TOML
 /// shapes, unambiguous to serde: `false`/`true` (bool), `"name"` (string),
 /// `["a","b"]` (array → random per emit), or `{ "id" = "name", default =
@@ -401,7 +411,7 @@ pub struct TierConfig {
     #[serde(default)]
     pub output_filter: Option<bool>,
     #[serde(default)]
-    pub filter_prompt: Option<String>,
+    pub filter_prompt: Option<PromptSpec>,
     #[serde(default)]
     pub trigger: Option<OutputFilterTrigger>,
     #[serde(default)]
@@ -572,7 +582,7 @@ pub struct TaskConfig {
     /// rewrite is passed as a SEPARATE user message — this is NOT a template
     /// with placeholder substitution.
     #[serde(default)]
-    pub filter_prompt: Option<String>,
+    pub filter_prompt: Option<PromptSpec>,
     #[serde(default)]
     pub trigger: Option<OutputFilterTrigger>,
     #[serde(default)]
@@ -1307,9 +1317,16 @@ impl ModelConfig {
 
         // filter_prompt / trigger / timing: tier → default block.
         let filter_prompt = tier_cfg
-            .and_then(|t| t.filter_prompt.clone())
-            .or_else(|| task_cfg.filter_prompt.clone())
-            .unwrap_or_default();
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
+            .or_else(|| {
+                task_cfg
+                    .filter_prompt
+                    .as_ref()
+                    .and_then(PromptSpec::as_plain)
+            })
+            .unwrap_or_default()
+            .to_string();
         if filter_prompt.trim().is_empty() {
             return None; // no usable instruction ⇒ inert
         }
@@ -1381,7 +1398,7 @@ impl ModelConfig {
             return None;
         }
         let task_cfg = self.tasks.get(FILTER_TASK)?;
-        let filter_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let filter_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if filter_prompt.trim().is_empty() {
             return None;
         }
@@ -1409,7 +1426,7 @@ impl ModelConfig {
     pub fn resolve_vision(&self) -> Option<ResolvedVision> {
         const VISION_TASK: &str = "chat_vision";
         let task_cfg = self.tasks.get(VISION_TASK)?;
-        let describe_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let describe_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if describe_prompt.trim().is_empty() {
             return None;
         }
@@ -1444,7 +1461,9 @@ impl ModelConfig {
         let audio_tags = task_cfg.tts_audio_tags.unwrap_or(false);
         let custom = task_cfg
             .filter_prompt
-            .clone()
+            .as_ref()
+            .and_then(PromptSpec::as_plain)
+            .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
         let directive = match (custom, audio_tags) {
             (Some(c), true) => format!("{c}\n\n{AUDIO_TAGS_ADDENDUM}"),
@@ -1489,7 +1508,7 @@ impl ModelConfig {
     pub fn resolve_pde(&self) -> Option<ResolvedPde> {
         const PDE_TASK: &str = "pde_decision";
         let task_cfg = self.tasks.get(PDE_TASK)?;
-        let decision_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let decision_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if decision_prompt.trim().is_empty() {
             return None;
         }
@@ -1517,7 +1536,7 @@ impl ModelConfig {
     pub fn resolve_product_qa(&self) -> Option<ResolvedProductQa> {
         const PRODUCT_QA_TASK: &str = "chat_product_qa";
         let task_cfg = self.tasks.get(PRODUCT_QA_TASK)?;
-        let answer_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let answer_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if answer_prompt.trim().is_empty() {
             return None;
         }
@@ -1545,7 +1564,8 @@ impl ModelConfig {
     pub fn product_qa_enabled(&self) -> bool {
         self.tasks
             .get("chat_product_qa")
-            .and_then(|t| t.filter_prompt.as_deref())
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
             .is_some_and(|p| !p.trim().is_empty())
     }
 
@@ -1556,7 +1576,8 @@ impl ModelConfig {
     pub fn pde_enabled(&self) -> bool {
         self.tasks
             .get("pde_decision")
-            .and_then(|t| t.filter_prompt.as_deref())
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
             .is_some_and(|p| !p.trim().is_empty())
     }
 
@@ -1614,7 +1635,8 @@ impl ModelConfig {
         let task_cfg = self.tasks.get(COMPOSE_TASK)?;
         let compose_prompt = task_cfg
             .filter_prompt
-            .as_deref()
+            .as_ref()
+            .and_then(PromptSpec::as_plain)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -1697,7 +1719,7 @@ impl ModelConfig {
     /// straight from `resolve()` so the call site keeps today's selection semantics.
     fn resolve_extract(&self, task: &str) -> Option<ResolvedExtract> {
         let task_cfg = self.tasks.get(task)?;
-        let extract_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let extract_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if extract_prompt.trim().is_empty() {
             return None;
         }
@@ -1717,7 +1739,7 @@ impl ModelConfig {
     /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
     pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
         let task_cfg = self.tasks.get("world_director")?;
-        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let director_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if director_prompt.trim().is_empty() {
             return None;
         }
@@ -1744,7 +1766,7 @@ impl ModelConfig {
     /// the comment-round path goes inert.
     pub fn resolve_world_comment(&self) -> Option<ResolvedWorldComment> {
         let task_cfg = self.tasks.get("world_comment")?;
-        let comment_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let comment_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if comment_prompt.trim().is_empty() {
             return None;
         }
@@ -1774,7 +1796,7 @@ impl ModelConfig {
         const MIN_BAND_SECS: u64 = 30;
 
         let task_cfg = self.tasks.get("world_reply")?;
-        let reply_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let reply_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if reply_prompt.trim().is_empty() {
             return None;
         }
@@ -1813,7 +1835,7 @@ impl ModelConfig {
     /// blank — the story claim path goes inert.
     pub fn resolve_world_stories_director(&self) -> Option<ResolvedWorldStories> {
         let task_cfg = self.tasks.get("world_stories_director")?;
-        let director_prompt = task_cfg.filter_prompt.clone().unwrap_or_default();
+        let director_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
         if director_prompt.trim().is_empty() {
             return None;
         }
@@ -2322,7 +2344,7 @@ filter_prompt = "Answer product questions from the docs."
         assert!(pde.fallback.is_none());
         assert_eq!(pde.temperature, Some(0.5));
         assert_eq!(
-            pde.filter_prompt.as_deref(),
+            pde.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
             Some("Decide the action and inner_state.")
         );
         assert_eq!(pde.ghosting, Some(false));
@@ -2334,7 +2356,7 @@ filter_prompt = "Answer product questions from the docs."
         assert_eq!(pq.model.as_fixed(), Some("x-ai/grok-4-mini"));
         assert_eq!(pq.retry_depth, Some(1));
         assert_eq!(
-            pq.filter_prompt.as_deref(),
+            pq.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
             Some("Answer product questions from the docs.")
         );
         let rpq = cfg
@@ -2875,7 +2897,10 @@ trigger = { random = 1.0 }
         assert_eq!(cc.tiers["gold"].output_filter, Some(true));
 
         let f = &cfg.tasks["chat_output_filter"];
-        assert_eq!(f.filter_prompt.as_deref(), Some("Rewrite: {x}"));
+        assert_eq!(
+            f.filter_prompt.as_ref().and_then(PromptSpec::as_plain),
+            Some("Rewrite: {x}")
+        );
         assert_eq!(f.retry_depth, Some(2));
         assert_eq!(f.timing, Some(FilterTiming::AfterExtract));
         let trig = f.trigger.clone().unwrap();
@@ -2887,7 +2912,10 @@ trigger = { random = 1.0 }
         // per-tier override parses; tier trigger replaces default wholesale
         assert_eq!(f.tiers["gold"].trigger.clone().unwrap().random, Some(1.0));
         assert_eq!(
-            f.tiers["gold"].filter_prompt.as_deref(),
+            f.tiers["gold"]
+                .filter_prompt
+                .as_ref()
+                .and_then(PromptSpec::as_plain),
             Some("tier prompt")
         );
     }
