@@ -320,6 +320,13 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Multi-provider routing (spec 2026-07-31): [providers] table shape plus a
+    // literal full scan of every candidate slug — grammar, declaredness, and
+    // per-provider <NAME>_API_KEY presence. Refuses to boot on any miss.
+    if let Err(msg) = model_config.validate_providers() {
+        anyhow::bail!(msg);
+    }
+
     // Skip when the master switch is off — WORLD_DISABLED must be able to
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
@@ -352,10 +359,18 @@ async fn run_server() -> Result<()> {
     };
 
     // OpenRouter client is constructed after model_config so we can wire in the
-    // global provider routing prefs from [defaults]: the exclusion list and the
-    // optional sort preference (both off by default).
+    // global provider routing prefs from [defaults] (exclusion list + optional
+    // sort) and the [providers] endpoint map. OPENROUTER_BASE_URL (optional)
+    // overrides the built-in endpoint; empty counts as unset, matching the
+    // OPENROUTER_APP_* convention above.
     let openrouter = Arc::new(
         eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key, attribution)
+            .with_openrouter_base_url(
+                std::env::var("OPENROUTER_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            )
+            .with_providers(model_config.build_providers())
             .with_ignore_providers(model_config.defaults.ignore_providers.clone())
             .with_provider_sort(model_config.defaults.provider_sort.clone()),
     );
