@@ -514,6 +514,10 @@ fn drive_chat_burst(
             // fallback failed differently (mirrors OpenRouterClient::execute).
             let mut last_complete_garble: Option<String> = None;
             for (idx, model_id) in chain.iter().enumerate() {
+                // Model-keyed config tables (display / output_regex / trigger)
+                // are written with bare ids; model_id here is the full config
+                // slug (may carry @provider — which audit KEEPS, spec §6).
+                let bare_model_id = eros_engine_llm::provider::bare_model_id(model_id);
                 let msg_ulid = Ulid::new();
                 let msg_uuid: Uuid = msg_ulid.into();
                 let mut acc = String::new();
@@ -526,13 +530,13 @@ fn drive_chat_burst(
                 // apply below. Empty rule set ⇒ pure passthrough.
                 let mut scrubber = eros_engine_llm::stream_scrub::StreamScrubber::new(
                     &state.output_regex,
-                    model_id,
+                    &bare_model_id,
                 );
 
                 yield ProtocolFrame::Meta {
                     message_id: ulid_string(msg_ulid),
                     action_type: frame_action,
-                    model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                    model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
                     continues_from: continues_from.map(ulid_string),
                 };
 
@@ -711,7 +715,7 @@ fn drive_chat_burst(
                 } else {
                     let strip = eros_engine_llm::model_config::apply_output_regex(
                         &state.output_regex,
-                        model_id,
+                        &bare_model_id,
                         &acc,
                     );
                     let audit = if strip.matched_rules.is_empty() {
@@ -908,6 +912,10 @@ fn drive_chat_burst(
         // `filter` is None when the turn buffers solely because of output_regex.
         let f_opt = filter.as_ref();
         for (idx, model_id) in chain.iter().enumerate() {
+            // Model-keyed config tables (display / output_regex / trigger)
+            // are written with bare ids; model_id here is the full config
+            // slug (may carry @provider — which audit KEEPS, spec §6).
+            let bare_model_id = eros_engine_llm::provider::bare_model_id(model_id);
             let msg_ulid = Ulid::new();
             let msg_uuid: Uuid = msg_ulid.into();
             let mut acc = String::new();
@@ -1068,7 +1076,7 @@ fn drive_chat_burst(
                     yield ProtocolFrame::Meta {
                         message_id: ulid_string(msg_ulid),
                         action_type: frame_action,
-                        model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                        model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
                         continues_from: None,
                     };
                     // Forward the served usage (a provider can emit a usage block
@@ -1145,7 +1153,7 @@ fn drive_chat_burst(
             yield ProtocolFrame::Meta {
                 message_id: ulid_string(msg_ulid),
                 action_type: frame_action,
-                model: display_override.as_ref().and_then(|d| d.display(model_id)),
+                model: display_override.as_ref().and_then(|d| d.display(&bare_model_id)),
                 continues_from: None,
             };
 
@@ -1161,7 +1169,7 @@ fn drive_chat_burst(
             // frame falsely reports `filtered = true`.
             let strip = eros_engine_llm::model_config::apply_output_regex(
                 &state.output_regex,
-                model_id,
+                &bare_model_id,
                 &acc,
             );
             let cleaned = strip.cleaned;
@@ -1207,7 +1215,7 @@ fn drive_chat_burst(
             } else {
                 match f_opt {
                     Some(f) => {
-                    let hits = f.trigger.should_filter(model_id, &tag_refs, random_draw);
+                    let hits = f.trigger.should_filter(&bare_model_id, &tag_refs, random_draw);
                     match hits {
                         Some(h) => match run_output_filter(&state, f, &cleaned).await {
                             Ok(out) => {
@@ -3923,7 +3931,9 @@ pub fn replay_stream(
                     // retries are wire-identical regardless of any
                     // display_override config.
                     model: row.model.as_deref().and_then(|m| {
-                        display_override.as_ref().and_then(|d| d.display(m))
+                        display_override
+                            .as_ref()
+                            .and_then(|d| d.display(&eros_engine_llm::provider::bare_model_id(m)))
                     }),
                     continues_from: prev_ulid.map(ulid_string),
                 };
