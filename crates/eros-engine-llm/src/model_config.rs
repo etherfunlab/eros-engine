@@ -227,6 +227,13 @@ fn check_variant_shape(task: &str, spec: &PromptSpec) -> Result<(), String> {
                 if k.trim().is_empty() {
                     return refuse("has a blank key".to_string());
                 }
+                if k.trim() != k.as_str() {
+                    return refuse(format!(
+                        "has whitespace-padded key \"{k}\": its trimmed form differs from the raw \
+                         key, but `select` matches a client's `image.prompt_variant` exactly — so \
+                         neither \"{k}\" nor its trimmed form could ever select it"
+                    ));
+                }
                 if k.trim().eq_ignore_ascii_case("raw") {
                     return refuse(format!(
                         "uses the reserved key \"{k}\": \"raw\" is the wire value that skips the \
@@ -1703,13 +1710,23 @@ impl ModelConfig {
         // can be unit-tested directly, without a tracing subscriber, and so a
         // refactor that accidentally drops a guard shows up as a plain
         // assertion failure instead of only a missing log line.
+        // `?` (Debug), not `%` (Display): `variant` is a client-supplied wire
+        // value (`image.prompt_variant`) that nothing on the validation path
+        // bounds — unlike `tier`, which is pattern-and-length checked in
+        // `validate_payload`. Debug escapes/quotes so embedded newlines or
+        // control characters can't smuggle fake log lines, and
+        // `cap_for_log` bounds its length so a pathological value can't blow
+        // up log volume.
         match compose_variant_log_event(selected, variant, task_cfg.filter_prompt.is_some()) {
             Some(ComposeVariantLogEvent::Mismatch) => tracing::warn!(
-                variant = %variant.unwrap_or_default(),
+                variant = ?cap_for_log(variant.unwrap_or_default(), 64),
                 "image-compose: variant not found; using the built-in prompt"
             ),
             Some(ComposeVariantLogEvent::Selected) => {
-                tracing::debug!(variant = %variant.unwrap_or_default(), "image-compose: variant selected")
+                tracing::debug!(
+                    variant = ?cap_for_log(variant.unwrap_or_default(), 64),
+                    "image-compose: variant selected"
+                )
             }
             None => {}
         }
@@ -1742,6 +1759,19 @@ impl ModelConfig {
 fn dedup_keep_first(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Cap a string to at most `max_chars` characters before it reaches a log
+/// line, appending `…` when truncated. Counts/truncates by `char`, never mid
+/// UTF-8 codepoint. Used to bound client-supplied values (e.g. the image
+/// compose `variant`) that no request-validation step already length-limits.
+fn cap_for_log(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 /// What (if anything) `resolve_image_prompt_compose` should log about a
@@ -1999,9 +2029,11 @@ impl ModelConfig {
     /// dead config — refuse to boot rather than let it silently no-op.
     ///
     /// Also enforces the structural rules for a variant container: non-empty,
-    /// no blank keys or values, and no reserved `raw` key (`raw` is the wire
-    /// escape that skips the composer, so a config key by that name could
-    /// never be selected).
+    /// no blank or whitespace-padded keys, no blank values, and no reserved
+    /// `raw` key (`raw` is the wire escape that skips the composer, so a
+    /// config key by that name could never be selected — and a padded key
+    /// like `" a "` could never be selected either, since `select` matches a
+    /// client's variant exactly).
     ///
     /// Task names are visited in sorted order so the reported failure is
     /// deterministic across restarts (`self.tasks` is a `HashMap`).
@@ -5183,6 +5215,24 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         }
     }
 
+    #[test]
+    fn whitespace_padded_keyed_key_refuses_to_boot() {
+        // A key like " a " parses and boots fine as TOML, but `select` matches
+        // a client's (already-trimmed) `image.prompt_variant` exactly — so
+        // neither "a" nor " a " could ever select it. Distinct from the
+        // all-whitespace ("blank key") case above: this key is non-blank,
+        // just padded, and the blank-key check must not misfire on it.
+        let e = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { \" a \" = \"aaa\", b = \"bbb\" }\n")
+        .validate_prompt_variants()
+        .expect_err("whitespace-padded key must refuse to boot");
+        assert!(e.contains("whitespace-padded"), "{e}");
+        assert!(
+            !e.contains("blank key"),
+            "must not be reported as the blank-key case: {e}"
+        );
+    }
+
     // ─── resolve_image_prompt_compose: variants + raw ────────────────────
 
     #[test]
@@ -5343,5 +5393,24 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // No variant supplied ⇒ nothing to report, even though `selected` is
         // `Some` (e.g. a Plain filter_prompt, which always resolves).
         assert_eq!(compose_variant_log_event(Some("AAA"), None, true), None);
+    }
+
+    // ─── cap_for_log ──────────────────────────────────────────────────────
+
+    #[test]
+    fn cap_for_log_passes_short_strings_through_unchanged() {
+        assert_eq!(cap_for_log("abc", 64), "abc");
+        assert_eq!(cap_for_log("", 64), "");
+        // Exactly at the cap: no truncation marker.
+        assert_eq!(cap_for_log("aaaa", 4), "aaaa");
+    }
+
+    #[test]
+    fn cap_for_log_truncates_on_a_char_boundary_and_marks_it() {
+        assert_eq!(cap_for_log("aaaaa", 4), "aaaa…");
+        // Multi-byte chars: counted/truncated by char, never mid-codepoint
+        // (which would panic on a byte-index slice).
+        let s = "你好世界和平"; // 6 chars
+        assert_eq!(cap_for_log(s, 3), "你好世…");
     }
 }

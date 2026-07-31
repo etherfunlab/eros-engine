@@ -489,6 +489,20 @@ filter_prompt = ["…", "…"]                # pick by index: prompt_variant = 
 filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
 ```
 
+Composer prompts tend to be long, multi-paragraph strings, and TOML 1.0.0
+discourages breaking an inline table across lines — so the keyed form also
+works as a standard (non-inline) table, one key per section:
+
+```toml
+[tasks.chat_image_prompt_compose.filter_prompt]
+a = """
+…long prompt…
+"""
+b = """
+…another long prompt…
+"""
+```
+
 Anything not selected falls back to the **built-in** prompt above, never to
 "first entry wins" — but the two ways of "not selected" are logged
 differently. An **absent** `prompt_variant` falls back silently (the common

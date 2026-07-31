@@ -290,6 +290,18 @@ async fn run_server() -> Result<()> {
         }
     });
 
+    // Prompt-variant shape gate runs FIRST, before the resolver-based checks
+    // below (extraction / product_qa). Those detect "unset" via
+    // `PromptSpec::as_plain()`, under which a variant shape (array/table)
+    // reads as `None` — so a variant-shaped filter_prompt misplaced under, say,
+    // [tasks.insight_extraction] would otherwise surface as "filter_prompt is
+    // unset" (telling an operator who just set it to set it) instead of the
+    // accurate "uses a variant shape, but only [tasks.chat_image_prompt_compose]
+    // reads variants" from `validate_prompt_variants`.
+    if let Err(msg) = model_config.validate_prompt_variants() {
+        anyhow::bail!(msg);
+    }
+
     // Extraction prompts are required ONLY when the task section exists. A
     // missing [tasks.*_extraction] section means that extraction is off — the
     // engine boots and runs without it. A present section with a blank/absent
@@ -305,10 +317,6 @@ async fn run_server() -> Result<()> {
     }
 
     if let Err(msg) = model_config.validate_product_qa_prompt() {
-        anyhow::bail!(msg);
-    }
-
-    if let Err(msg) = model_config.validate_prompt_variants() {
         anyhow::bail!(msg);
     }
 
@@ -459,6 +467,54 @@ mod tests {
             .expect("shipped example parses");
         cfg.validate_product_qa_prompt()
             .expect("shipped example must pass the product_qa boot gate");
+    }
+
+    /// The shipped example's [tasks.chat_image_prompt_compose] override is
+    /// commented out, and every other task in it uses a plain filter_prompt —
+    /// it MUST pass the variant-shape boot gate, or `main` bails.
+    #[test]
+    fn shipped_model_config_satisfies_prompt_variant_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        assert!(
+            cfg.validate_prompt_variants().is_ok(),
+            "shipped config must pass the prompt-variant boot gate: {:?}",
+            cfg.validate_prompt_variants()
+        );
+    }
+
+    /// Regression for the boot-check ordering bug: `validate_extraction_prompts`
+    /// detects "unset" via `PromptSpec::as_plain()`, under which a variant shape
+    /// reads as `None` — so, checked in isolation, it produces a misleading
+    /// "filter_prompt is unset" message for a variant-shaped
+    /// [tasks.insight_extraction], instead of the accurate "uses a variant
+    /// shape" one from `validate_prompt_variants`. `main` must run
+    /// `validate_prompt_variants()` BEFORE `validate_extraction_prompts()` so
+    /// the accurate message is the one an operator actually sees.
+    #[test]
+    fn variant_shaped_extraction_prompt_reports_the_accurate_error() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = [\"a\", \"b\"]\n",
+        )
+        .expect("parses");
+
+        let variant_err = cfg
+            .validate_prompt_variants()
+            .expect_err("variant shape under insight_extraction must refuse to boot");
+        assert!(variant_err.contains("variant shape"), "{variant_err}");
+        assert!(variant_err.contains("insight_extraction"), "{variant_err}");
+        assert!(
+            !variant_err.contains("unset"),
+            "the accurate message must not also claim the prompt is unset: {variant_err}"
+        );
+
+        // Sanity: pins the exact masking bug this ordering fix prevents —
+        // checked on its own (the pre-fix order), the extraction gate sees the
+        // variant shape as "unset" and reports the wrong, misleading reason.
+        let unset_err = cfg
+            .validate_extraction_prompts()
+            .expect_err("extraction gate also errors on this config, but for the wrong reason");
+        assert!(unset_err.contains("unset"), "{unset_err}");
     }
 
     #[test]

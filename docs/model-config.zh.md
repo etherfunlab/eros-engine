@@ -409,6 +409,19 @@ filter_prompt = ["…", "…"]                # 按下标选：prompt_variant = 
 filter_prompt = { a = "…", b = "…" }      # 按 key 选：  prompt_variant = "a" / "b"
 ```
 
+改写器提示词通常又长又多段，而 TOML 1.0.0 本就不建议把 inline table 拆成多行——所以按
+key 选的形态也可以写成标准（非 inline）表，一个 key 一个 section：
+
+```toml
+[tasks.chat_image_prompt_compose.filter_prompt]
+a = """
+…较长的提示词…
+"""
+b = """
+…另一个较长的提示词…
+"""
+```
+
 没有命中都会回退到上面的**内置**提示词，不存在"取第一项"这种行为——但两种"没命中"的记录方式不同。**没传** `prompt_variant` 属于静默回退（最常见的情况：既然没人要求选变体，也就没什么好警告的）。**明确传了但没命中**的变体——下标越界、key 不存在——同样回退，但会额外记一条 `warn` 日志，因为调用方指定了变体却没用上，值得被看到。也没有保留的 `default` key：写 `default = "…"` 只是定义了一个普通变体，只有字面量 `prompt_variant = "default"` 才会命中它。
 
 `prompt_variant = "raw"`（大小写不敏感）会完全跳过改写器 LLM，直接用种子主题原样出图——这一轮少一次 LLM 调用。`raw` 是保留字：表里若出现字面量为 `raw` 的 key（任意大小写）会拒绝启动。

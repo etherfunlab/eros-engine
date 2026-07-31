@@ -2539,7 +2539,9 @@ struct ImageTurnInputs {
 /// - style:   `req_image.style` → config `default_style` → type default
 /// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → config default
 ///
-/// Blank strings count as absent at every level.
+/// Blank strings count as absent at the plan and request levels. The config
+/// default (`default_aspect_ratio`) is taken as-is, unfiltered — pre-existing
+/// behavior, unchanged.
 fn resolve_image_turn_inputs(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
@@ -4161,7 +4163,6 @@ mod tests {
 
     #[test]
     fn image_turn_subject_prefers_plan_then_request_then_empty() {
-        use eros_engine_llm::model_config::StyleKey;
         let params = img_params(Some("from request"), None, None);
 
         // plan wins
@@ -4175,7 +4176,13 @@ mod tests {
         // neither ⇒ empty string
         let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
         assert_eq!(r.seed_subject, "");
-        let _ = StyleKey::Realistic;
+
+        // blank request value, plan absent ⇒ falls through to empty string
+        // too, not the blank string itself (the request-level blank filter
+        // must still fire).
+        let blank_params = img_params(Some("   "), None, None);
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params), None);
+        assert_eq!(r.seed_subject, "");
     }
 
     #[test]
@@ -4215,6 +4222,16 @@ mod tests {
 
         let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
         assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
+
+        // blank request value, plan absent ⇒ falls through to the config
+        // default (the request-level blank filter must still fire).
+        let blank_params = img_params(None, None, Some("  "));
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params), Some(&gen));
+        assert_eq!(
+            r.aspect_ratio.as_deref(),
+            Some("1:1"),
+            "blank request ⇒ config default"
+        );
     }
 
     #[test]
