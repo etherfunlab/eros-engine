@@ -4,6 +4,9 @@
 //!
 //! Returns plain-text reply only; no JSON evaluation.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
@@ -672,6 +675,16 @@ pub struct OpenRouterClient {
     /// [`OpenRouterClient::with_provider_sort`]. When `None` the field is
     /// omitted, preserving OpenRouter's default price-based load balancing.
     provider_sort: Option<String>,
+    /// Custom `[providers]` endpoints, name → endpoint. Empty by default;
+    /// installed at boot via [`OpenRouterClient::with_providers`]. Arc so the
+    /// client's Clone stays cheap.
+    providers: Arc<HashMap<String, crate::provider::ProviderEndpoint>>,
+    /// HTTP client WITHOUT the OpenRouter attribution default-headers, used
+    /// for every custom-provider post. The three attribution headers are
+    /// baked into `http` at construction and cannot be withdrawn per-request
+    /// (spec §3); same connect/pool bounds as `http`.
+    #[allow(dead_code)] // consumed by Task 4-6
+    plain_http: reqwest::Client,
 }
 
 impl OpenRouterClient {
@@ -734,10 +747,17 @@ impl OpenRouterClient {
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("reqwest client build never fails with empty config");
+        let plain_http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build()
+            .expect("reqwest client build never fails with empty config");
         Self {
             http,
+            plain_http,
             api_key,
             base_url,
+            providers: Arc::new(HashMap::new()),
             ignore_providers: Vec::new(),
             provider_sort: None,
         }
@@ -759,6 +779,91 @@ impl OpenRouterClient {
     pub fn with_provider_sort(mut self, sort: Option<String>) -> Self {
         self.provider_sort = sort.filter(|s| !s.is_empty());
         self
+    }
+
+    /// Install the `[providers]` endpoint map (multi-provider spec §3).
+    /// Consuming builder, boot-chained like `with_ignore_providers`.
+    pub fn with_providers(
+        mut self,
+        providers: HashMap<String, crate::provider::ProviderEndpoint>,
+    ) -> Self {
+        self.providers = Arc::new(providers);
+        self
+    }
+
+    /// Override the built-in OpenRouter endpoint (the OPENROUTER_BASE_URL env
+    /// var). `None` keeps the pinned default. NOTE: distinct from the
+    /// `with_base_url` CONSTRUCTOR above, which tests use — this is a
+    /// consuming builder for boot.
+    pub fn with_openrouter_base_url(mut self, url: Option<String>) -> Self {
+        if let Some(u) = url {
+            self.base_url = u;
+        }
+        self
+    }
+}
+
+/// A resolved posting target: where one candidate's request goes.
+/// `name: None` ⇒ the built-in OpenRouter endpoint (attribution headers,
+/// full wire); `Some(name)` ⇒ a `[providers]` entry (plain client, strict
+/// OpenAI wire subset, audit model suffixed `@name`).
+#[allow(dead_code)] // consumed by Task 4-6
+struct Endpoint<'a> {
+    url: &'a str,
+    api_key: &'a str,
+    http: &'a reqwest::Client,
+    name: Option<&'a str>,
+}
+
+impl OpenRouterClient {
+    /// Split a candidate slug and resolve where it posts (spec §3). The
+    /// api-key emptiness guard lives HERE, per endpoint, rather than at the
+    /// head of each execute method — a mixed chain must check the key of the
+    /// endpoint each candidate actually uses. Unknown provider ⇒
+    /// `LlmError::Config`, which advances the caller's candidate chain
+    /// instead of panicking (unreachable for config slugs post-boot, but
+    /// `execute_stream_as` receives arbitrary server strings).
+    #[allow(dead_code)] // consumed by Task 4-6
+    fn resolve_endpoint<'s>(&'s self, slug: &str) -> Result<(String, Endpoint<'s>), LlmError> {
+        let (bare, provider) = crate::provider::split_model_slug(slug)
+            .map_err(|e| LlmError::Config(format!("openrouter: {e}")))?;
+        match provider {
+            None => {
+                if self.api_key.is_empty() {
+                    return Err(LlmError::Config("openrouter: api key not set".into()));
+                }
+                Ok((
+                    bare,
+                    Endpoint {
+                        url: &self.base_url,
+                        api_key: &self.api_key,
+                        http: &self.http,
+                        name: None,
+                    },
+                ))
+            }
+            Some(p) => {
+                let (name, ep) = self.providers.get_key_value(p).ok_or_else(|| {
+                    LlmError::Config(format!(
+                        "openrouter: model slug `{slug}` names undeclared provider `{p}`"
+                    ))
+                })?;
+                if ep.api_key.is_empty() {
+                    return Err(LlmError::Config(format!(
+                        "openrouter: provider `{p}`: api key not set"
+                    )));
+                }
+                Ok((
+                    bare,
+                    Endpoint {
+                        url: &ep.base_url,
+                        api_key: &ep.api_key,
+                        http: &self.plain_http,
+                        name: Some(name.as_str()),
+                    },
+                ))
+            }
+        }
     }
 
     /// Build the `ProviderPrefs` for a wire body, or `None` when neither the
@@ -2927,6 +3032,105 @@ data: [DONE]\n\n";
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
         assert_eq!(prefs.sort, Some("latency"));
+    }
+
+    // ---- multi-provider routing: resolve_endpoint (spec §3) ----
+
+    fn client_with_venice() -> OpenRouterClient {
+        OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            "https://openrouter.test/v1".into(),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: "https://venice.test/v1/chat/completions".into(),
+                api_key: "v-key".into(),
+            },
+        )]))
+    }
+
+    #[test]
+    fn resolve_no_suffix_is_openrouter() {
+        let c = client_with_venice();
+        let (bare, ep) = c.resolve_endpoint("x-ai/grok-4.20").unwrap();
+        assert_eq!(bare, "x-ai/grok-4.20");
+        assert_eq!(ep.url, "https://openrouter.test/v1");
+        assert_eq!(ep.api_key, "or-key");
+        assert!(ep.name.is_none());
+    }
+
+    #[test]
+    fn resolve_suffix_hits_custom_endpoint() {
+        let c = client_with_venice();
+        let (bare, ep) = c.resolve_endpoint("some-slug@venice").unwrap();
+        assert_eq!(bare, "some-slug");
+        assert_eq!(ep.url, "https://venice.test/v1/chat/completions");
+        assert_eq!(ep.api_key, "v-key");
+        assert_eq!(ep.name, Some("venice"));
+    }
+
+    #[test]
+    fn resolve_escaped_at_stays_openrouter() {
+        let c = client_with_venice();
+        let (bare, ep) = c.resolve_endpoint("weird\\@vendor/m").unwrap();
+        assert_eq!(bare, "weird@vendor/m");
+        assert!(ep.name.is_none());
+    }
+
+    #[test]
+    fn resolve_unknown_provider_is_config_error() {
+        let c = client_with_venice();
+        assert!(matches!(
+            c.resolve_endpoint("m@nope"),
+            Err(LlmError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_empty_openrouter_key_still_guards() {
+        // The old head-of-method guard moved here; same error, same wording.
+        let c = OpenRouterClient::with_base_url(
+            String::new(),
+            AppAttribution::default(),
+            "https://openrouter.test/v1".into(),
+        );
+        assert!(matches!(c.resolve_endpoint("m"), Err(LlmError::Config(_))));
+    }
+
+    #[test]
+    fn resolve_empty_custom_key_guards() {
+        let c = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            "https://openrouter.test/v1".into(),
+        )
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: "https://venice.test/v1".into(),
+                api_key: String::new(),
+            },
+        )]));
+        assert!(matches!(
+            c.resolve_endpoint("m@venice"),
+            Err(LlmError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn with_openrouter_base_url_overrides_and_none_keeps() {
+        let c = client_with_venice().with_openrouter_base_url(Some("https://proxy.test/v1".into()));
+        assert_eq!(
+            c.resolve_endpoint("m").unwrap().1.url,
+            "https://proxy.test/v1"
+        );
+        let c2 = client_with_venice().with_openrouter_base_url(None);
+        assert_eq!(
+            c2.resolve_endpoint("m").unwrap().1.url,
+            "https://openrouter.test/v1"
+        );
     }
 
     /// Garbled string used in garble-guard tests. `Ġ`/`Ċ` density is 2/12 ≈ 16.7 % >> 3 % threshold.
