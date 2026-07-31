@@ -191,7 +191,7 @@ endpoint's* key. `execute_image_inner` keeps its existing guard on
 | `metadata` | sent | **dropped** |
 | `reasoning` | sent | **dropped** |
 | `provider` (ignore / sort) | sent | **dropped** |
-| `HTTP-Referer`, `X-Title`, `X-OpenRouter-Categories` | sent | **not sent** |
+| `HTTP-Referer`, `X-OpenRouter-Title`, `X-OpenRouter-Categories` | sent | **not sent** |
 
 Three body builders, so three edit sites:
 

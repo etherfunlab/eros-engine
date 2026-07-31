@@ -10,10 +10,22 @@ use std::fmt;
 /// One custom OpenAI-compatible endpoint from the `[providers]` block.
 /// `base_url` is the complete chat-completions URL, posted verbatim;
 /// `api_key` comes from the `<NAME>_API_KEY` env var at boot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderEndpoint {
     pub base_url: String,
     pub api_key: String,
+}
+
+impl fmt::Debug for ProviderEndpoint {
+    /// Manual impl (not `derive`): `api_key` must never land in a log line or
+    /// a panic message via `{:?}`, so it's redacted here rather than relying
+    /// on every caller to remember not to print the field directly.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderEndpoint")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Why a model slug failed to parse. Carries the offending slug so boot
@@ -38,12 +50,20 @@ impl fmt::Display for SlugError {
                  string, write `\"\\\\@\"`)"
             ),
             SlugError::EmptyModelId { slug } => {
-                write!(f, "model slug `{slug}` has an empty model id before `@`")
+                write!(
+                    f,
+                    "model slug `{slug}` has an empty model id before `@` — if the model id \
+                     itself is meant to start with a literal `@` (e.g. an OpenRouter preset \
+                     like `@preset/roleplay`), escape it as `\\@` (in a TOML double-quoted \
+                     string, write `\"\\\\@\"`)"
+                )
             }
             SlugError::EmptyProvider { slug } => {
                 write!(
                     f,
-                    "model slug `{slug}` has an empty provider name after `@`"
+                    "model slug `{slug}` has an empty provider name after `@` — if the trailing \
+                     `@` is meant to be a literal character in the model id, escape it as `\\@` \
+                     (in a TOML double-quoted string, write `\"\\\\@\"`)"
                 )
             }
         }
@@ -105,6 +125,19 @@ pub fn bare_model_id(slug: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_endpoint_debug_redacts_api_key() {
+        let ep = ProviderEndpoint {
+            base_url: "https://api.venice.ai/chat/completions".to_string(),
+            api_key: "sk-live-SUPER-SECRET-KEY".to_string(),
+        };
+        let dbg = format!("{ep:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-KEY"),
+            "Debug output must not leak api_key: {dbg}"
+        );
+    }
 
     #[test]
     fn no_at_is_openrouter_verbatim() {
@@ -198,6 +231,30 @@ mod tests {
     fn error_messages_name_the_slug_and_the_escape() {
         let msg = split_model_slug("a@b@venice").unwrap_err().to_string();
         assert!(msg.contains("a@b@venice"));
+        assert!(
+            msg.contains("\\@"),
+            "message should teach the escape: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_model_id_message_teaches_the_escape() {
+        // Finding 2: a preset-style slug like `@preset/roleplay` should point
+        // the operator at the `\@` escape, not just say "empty".
+        let msg = split_model_slug("@preset/roleplay")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("@preset/roleplay"));
+        assert!(
+            msg.contains("\\@"),
+            "message should teach the escape: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_provider_message_teaches_the_escape() {
+        let msg = split_model_slug("x@").unwrap_err().to_string();
+        assert!(msg.contains("x@"));
         assert!(
             msg.contains("\\@"),
             "message should teach the escape: {msg}"

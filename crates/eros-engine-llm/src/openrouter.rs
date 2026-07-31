@@ -149,6 +149,19 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
     body
 }
 
+/// Strip the OpenRouter-specific fields `build_vision_body` bakes in
+/// unconditionally, for a custom `[providers]` endpoint (spec §4). Mirrors
+/// `WireRequest::for_endpoint`'s drop list, but operates on the raw
+/// `serde_json::Value` since the vision body isn't a typed wire struct. A
+/// named helper (rather than inlining the strip at each call site) so the
+/// `execute_vision` production path and its subset-lock test can never drift
+/// apart.
+fn strip_openrouter_vision_fields(body: &mut serde_json::Value) {
+    if let Some(o) = body.as_object_mut() {
+        o.remove("reasoning");
+    }
+}
+
 /// Which prompt variant an image attempt used. `Single` = no compose retry
 /// (compose off, or it left the subject unchanged); `Composed`/`Original` =
 /// the two variants tried per model when compose rewrote the subject.
@@ -1045,9 +1058,7 @@ impl OpenRouterClient {
                 // (spec §4) — `reasoning` is an OpenRouter-specific extension
                 // that `build_vision_body` bakes in unconditionally, so strip
                 // it back out here, mirroring `WireRequest::for_endpoint`.
-                if let Some(o) = body.as_object_mut() {
-                    o.remove("reasoning");
-                }
+                strip_openrouter_vision_fields(&mut body);
             }
             let resp = match ep
                 .http
@@ -3970,6 +3981,52 @@ data: [DONE]\n\n";
             assert!(
                 ALLOW.contains(&k.as_str()),
                 "OpenRouter-specific field `{k}` leaked to a custom provider"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_endpoint_vision_body_is_strict_openai_subset() {
+        // Finding 1 (final review): the WireRequest lock above only covers
+        // the typed chat/stream path (`call_once` / `execute_stream_as`).
+        // `execute_vision` instead builds a raw `serde_json::Value` via
+        // `build_vision_body` and strips OpenRouter-only fields with
+        // `strip_openrouter_vision_fields` — the exact helper `execute_vision`
+        // calls for a custom endpoint — so it needs its own lock, driving both
+        // together the same way production does. This can't drift from
+        // `execute_vision`'s custom-endpoint path because both call the same
+        // helper.
+        let req = VisionRequest {
+            model: "ignored".into(),
+            fallback_model: vec!["ignored-2".into()],
+            system_prompt: "sys".into(),
+            image_url: "https://x/y.png".into(),
+            caption: Some("a caption".into()),
+            temperature: 0.5,
+            max_tokens: 10,
+            reasoning: Some(ReasoningConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+        };
+        let mut body = build_vision_body(&req, "m");
+        strip_openrouter_vision_fields(&mut body);
+        const ALLOW: [&str; 10] = [
+            "model",
+            "messages",
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "max_tokens",
+            "stream",
+            "user",
+            "response_format",
+        ];
+        for k in body.as_object().unwrap().keys() {
+            assert!(
+                ALLOW.contains(&k.as_str()),
+                "OpenRouter-specific field `{k}` leaked to a custom provider via the vision body"
             );
         }
     }
