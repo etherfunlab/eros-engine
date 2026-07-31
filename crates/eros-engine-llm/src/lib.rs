@@ -5,6 +5,7 @@ pub mod byte_bpe;
 pub mod error;
 pub mod model_config;
 pub mod openrouter;
+pub mod provider;
 pub mod stream_scrub;
 pub mod voyage;
 
