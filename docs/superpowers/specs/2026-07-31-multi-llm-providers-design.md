@@ -42,8 +42,10 @@ already sends.
   is separable from this feature.
 - **Model-keyed config tables use bare ids** (§5). `@provider` appears only in
   `model` and `fallback`.
-- **Image generation is out of scope and rejected at boot** (§7), pending its
-  removal in a follow-up (§11).
+- **The draw endpoint is out of scope and rejected at boot** (§7), pending its
+  removal in a follow-up (§11). This is scoped to
+  `[tasks.chat_image_generation]` only — `chat_image_prompt_compose` is a
+  normal chat-shaped task and supports `@provider`.
 
 ---
 
@@ -268,19 +270,26 @@ unlucky draw at 3am.
 **Provider table checks.** Names match `^[a-z0-9_]+$`; `openrouter` is not
 declared; every URL is non-empty.
 
-**Image generation.** Any `@` in `[tasks.chat_image_gen]`'s own `model` or
-`fallback` refuses to boot, with a message explaining that image generation uses
-OpenRouter's `modalities` extension (`build_image_body`, `openrouter.rs:395`,
-sends `modalities: ["image"]` plus top-level `width`/`height` and reads back
-`choices[].message.images[].image_url.url` — not OpenAI-compatible in either
-direction).
+**The draw endpoint.** Any `@` in `[tasks.chat_image_generation]`'s own `model`
+or `fallback` refuses to boot, with a message explaining that the draw endpoint
+uses OpenRouter's `modalities` extension (`build_image_body`,
+`openrouter.rs:395`, sends `modalities: ["image"]` plus top-level
+`width`/`height` and reads back `choices[].message.images[].image_url.url` — not
+OpenAI-compatible in either direction).
+
+This restriction is scoped to the **draw endpoint**
+(`POST /comp/chat/{session_id}/image/stream`), which is the only consumer of
+that block. It does not touch the rest of the image path: the chat stream never
+draws, it emits an `image_request` frame, and
+`[tasks.chat_image_prompt_compose]` is an ordinary chat-shaped task that
+supports `@provider` like any other.
 
 This is a *literal* check only. `[defaults].fallback_model` can still carry a
-suffix into an image-gen chain by inheritance; that hole is deliberately left
-open (§11) because the conditional rule needed to close it is a three-way
-conjunction that would become dead code the moment image generation is removed.
-The residual failure is an OpenRouter 400 model-not-found — loud and easy to
-diagnose, and bounded to one release cycle.
+suffix into the draw chain by inheritance; that hole is deliberately left open
+(§11) because the conditional rule needed to close it is a three-way
+conjunction that would become dead code the moment the draw endpoint is
+removed. The residual failure is an OpenRouter 400 model-not-found — loud and
+easy to diagnose, and bounded to one release cycle.
 
 **Runtime.** After a full boot scan an unknown provider is unreachable in
 theory, but `execute_stream_as` receives a `&str` from the server, so
@@ -337,7 +346,10 @@ Two naming notes:
   suffix together; two unescaped `@`; empty model id (`@venice`); empty provider
   (`x@`); trailing lone backslash.
 - Boot validation: a red and a green case per rule in §7, including the
-  image-gen literal check and the weighted-table full scan.
+  `chat_image_generation` literal check and the weighted-table full scan. Also
+  a green case asserting `chat_image_prompt_compose` **accepts** `@provider`,
+  so the draw-endpoint restriction can never widen to the compose task by
+  accident.
 - **Wire allow-list lock** (§4): custom-endpoint body key set ⊆ allow-list.
 - wiremock integration: two mock servers; assert the custom request reaches the
   right URL with the right bearer token, carries **none** of the three
@@ -362,21 +374,34 @@ Two naming notes:
 
 ## 11. Out of scope / follow-up
 
-**Removing the image-generation endpoint** — a separate PR after this one lands.
+**Removing the draw endpoint** — a separate PR after this one lands. After it,
+the engine *composes image prompts but never calls a generation API*: the chat
+stream emits an `image_request` frame carrying the composed prompt, and the
+consumer calls whichever image vendor it likes.
+
 Rationale, as stated by the maintainer:
 
-1. Image generation was never a primary capability of the engine, and carrying
-   it costs more maintenance than it returns.
+1. Driving image generation was never a primary capability of the engine, and
+   carrying it costs more maintenance than it returns.
 2. Image API shapes differ per vendor and are actively churning — OpenRouter
    itself has since shipped a new image API — so this is not a surface worth
    generalizing behind the `[providers]` abstraction.
 
-Blast radius noted for that PR: `image_gen` / `ImageGen` / `reply_image` /
-`image_prompt_compose` appear across 8 files. `core/types.rs` and `core/pde.rs`
-carry the `reply_image` and `reply_text_image` PDE actions, and
-`chat_image_prompt_compose` — whose `filter_prompt` variants shipped in PR #201
-— loses its only consumer. Closing the `[defaults].fallback_model` inheritance
-hole (§7) becomes moot once this lands.
+Scope of that PR:
+
+| Removed | Kept |
+|---|---|
+| `[tasks.chat_image_generation]` | `[tasks.chat_image_prompt_compose]` — becomes the engine's only image output |
+| `POST /comp/chat/{session_id}/image/stream` | PDE actions `reply_image` / `reply_text_image` |
+| `execute_image`, `execute_image_inner`, `build_image_body`, `plan_attempts` | the `image_request` frame |
+| `ImageGenRequest` / `ImageGenResponse` / `ImageGenError`, `ResolvedImageGen`, `effective_image_chain` | `ImageReplyParams`, `image.prompt_variant` (PR #201) |
+| the draw-only `default_style` / `aspect_ratio` / `resolution` fields | |
+
+The chat stream already never draws — availability of the image PDE actions
+stopped depending on `[tasks.chat_image_generation]` some time ago
+(`docs/model-config.md:352`), so removing the block does not touch the PDE
+actions or the compose task. Closing the `[defaults].fallback_model`
+inheritance hole (§7) becomes moot once this lands.
 
 **Not addressed here:** per-provider timeouts or retry policy; non-chat
 endpoints (embeddings stay on Voyage); any provider-specific extension
