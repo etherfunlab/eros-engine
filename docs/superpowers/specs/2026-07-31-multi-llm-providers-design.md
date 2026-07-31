@@ -145,9 +145,19 @@ struct Endpoint<'a> { url: &'a str, api_key: &'a str, http: &'a reqwest::Client,
 fn resolve_endpoint(&self, slug: &str) -> Result<(String, Endpoint<'_>), LlmError>;
 ```
 
-Four call sites switch from `self.base_url` / `self.api_key` / `self.http` to
-the resolved endpoint: `execute_vision` (920), `execute_image_inner` (1062),
-`call_once` (1175), `execute_stream_as` (1287).
+**Three** call sites switch from `self.base_url` / `self.api_key` / `self.http`
+to the resolved endpoint: `execute_vision` (920), `call_once` (1175),
+`execute_stream_as` (1287).
+
+`execute_image_inner` (1062) deliberately does **not**. It keeps posting to
+`self.base_url` with `self.api_key` and passes the whole slug through as the
+model id. The reason is `effective_image_chain` (`model_config.rs:1819`), whose
+first candidate is `req_model` — a **client-supplied, per-turn** string. Routing
+the draw endpoint through `resolve_endpoint` would let any client send
+`req_model = "x@venice"` and reach an arbitrary configured provider, bypassing
+the boot validation in §7 entirely. Left as-is, that input lands at OpenRouter
+as a nonsense model id and returns 400 — the same failure any other junk
+`req_model` already produces.
 
 **Why these four points.** Fallback chains are walked in two different places:
 `execute` / `execute_vision` iterate candidates internally, while the streaming
@@ -284,12 +294,18 @@ draws, it emits an `image_request` frame, and
 `[tasks.chat_image_prompt_compose]` is an ordinary chat-shaped task that
 supports `@provider` like any other.
 
-This is a *literal* check only. `[defaults].fallback_model` can still carry a
-suffix into the draw chain by inheritance; that hole is deliberately left open
-(§11) because the conditional rule needed to close it is a three-way
-conjunction that would become dead code the moment the draw endpoint is
-removed. The residual failure is an OpenRouter 400 model-not-found — loud and
-easy to diagnose, and bounded to one release cycle.
+**A literal check is complete here — no inheritance to chase.**
+`[defaults].fallback_model` is consumed only by `resolve()`
+(`model_config.rs:1277`, `1285`), the text-task resolver. The draw path never
+touches it: `resolve_image_gen` (1657) reads only `task_cfg.fallback`, and
+`effective_image_chain` (1819) composes only `req_model` + `r.model` +
+`r.fallback_model`. A global text fallback therefore cannot leak into a draw
+chain, so scanning `[tasks.chat_image_generation]`'s own two fields is
+exhaustive for config-supplied slugs.
+
+The one slug this check cannot cover is `req_model`, which arrives per-turn
+from the client rather than from config. That is handled structurally instead,
+by keeping the draw endpoint off `resolve_endpoint` entirely (§3).
 
 **Runtime.** After a full boot scan an unknown provider is unreachable in
 theory, but `execute_stream_as` receives a `&str` from the server, so
@@ -351,6 +367,10 @@ Two naming notes:
   so the draw-endpoint restriction can never widen to the compose task by
   accident.
 - **Wire allow-list lock** (§4): custom-endpoint body key set ⊆ allow-list.
+- **Draw endpoint stays on OpenRouter** (§3): a client-supplied
+  `req_model = "x@venice"` posts to the OpenRouter base URL with `x@venice` as
+  the model id — never to Venice. Locks the one path boot validation cannot
+  reach.
 - wiremock integration: two mock servers; assert the custom request reaches the
   right URL with the right bearer token, carries **none** of the three
   attribution headers, and omits **all four** OpenRouter-only body fields.
@@ -400,8 +420,7 @@ Scope of that PR:
 The chat stream already never draws — availability of the image PDE actions
 stopped depending on `[tasks.chat_image_generation]` some time ago
 (`docs/model-config.md:352`), so removing the block does not touch the PDE
-actions or the compose task. Closing the `[defaults].fallback_model`
-inheritance hole (§7) becomes moot once this lands.
+actions or the compose task.
 
 **Not addressed here:** per-provider timeouts or retry policy; non-chat
 endpoints (embeddings stay on Voyage); any provider-specific extension
