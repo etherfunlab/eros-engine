@@ -31,6 +31,19 @@ impl FallbackSpec {
             FallbackSpec::Multiple(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
         }
     }
+
+    /// Every literal candidate id, non-empty only (see `ModelSpec::candidate_ids`).
+    fn candidate_ids(&self) -> Vec<&str> {
+        match self {
+            FallbackSpec::Single(s) if s.is_empty() => Vec::new(),
+            FallbackSpec::Single(s) => vec![s.as_str()],
+            FallbackSpec::Multiple(v) => v
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(String::as_str)
+                .collect(),
+        }
+    }
 }
 
 /// A task/tier's primary `model`. Accepts three TOML shapes:
@@ -102,6 +115,19 @@ impl ModelSpec {
                 Some(pick_weighted(entries, position).to_string())
             }
             _ => None,
+        }
+    }
+
+    /// Every literal candidate id in this spec, non-empty entries only. Boot
+    /// validation must see ALL candidates: a weighted table picks at random
+    /// per call, so validating only `select()`'s output would let a
+    /// misconfigured entry lie dormant until an unlucky draw.
+    fn candidate_ids(&self) -> Vec<&str> {
+        match self {
+            ModelSpec::Fixed(s) if s.is_empty() => Vec::new(),
+            ModelSpec::Fixed(s) => vec![s.as_str()],
+            ModelSpec::RoundRobin { models, .. } => models.iter().map(String::as_str).collect(),
+            ModelSpec::Weighted(entries) => entries.iter().map(|(m, _)| m.as_str()).collect(),
         }
     }
 }
@@ -718,6 +744,14 @@ pub struct TaskConfig {
 pub struct ModelConfig {
     #[serde(default)]
     pub defaults: DefaultConfig,
+    /// The `[providers]` block — custom OpenAI-compatible endpoints keyed by
+    /// name (spec 2026-07-31-multi-llm-providers). Value is the COMPLETE
+    /// chat-completions URL, posted verbatim (no path joining). The API key
+    /// comes from env as `<NAME_UPPERCASED>_API_KEY`. Under MODEL_CONFIG_DIR
+    /// this merges as one whole top-level key (like `[defaults]`, unlike
+    /// `[tasks]`): all providers live in one file.
+    #[serde(default)]
+    pub providers: HashMap<String, String>,
     #[serde(default)]
     pub tasks: HashMap<String, TaskConfig>,
 }
@@ -2070,6 +2104,154 @@ impl ModelConfig {
             }
         }
         Ok(())
+    }
+
+    /// Boot gate for the `[providers]` block and every `@provider` model slug
+    /// (multi-provider spec §7). Checks, in order: provider-table shape
+    /// (charset, reserved name, non-empty URL), then a LITERAL full scan of
+    /// every candidate slug — `[defaults].fallback_model`, every task's and
+    /// tier's `model`/`fallback`, including every round-robin element and
+    /// weighted-table key. Referenced providers must have a non-empty
+    /// `<NAME>_API_KEY` in the environment (loud-fail, like VOYAGE_API_KEY).
+    pub fn validate_providers(&self) -> Result<(), String> {
+        self.validate_providers_with(|k| std::env::var(k).ok())
+    }
+
+    /// Testable core: `env` abstracts `std::env::var` so tests inject keys
+    /// without process-global mutation.
+    fn validate_providers_with(&self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+        const IMG_TASK: &str = "chat_image_generation";
+
+        // 1. Provider table shape. Sorted for deterministic messages.
+        let mut names: Vec<&String> = self.providers.keys().collect();
+        names.sort();
+        for name in names {
+            if name == "openrouter" {
+                return Err(
+                    "[providers]: `openrouter` is reserved — override the built-in \
+                     endpoint with the OPENROUTER_BASE_URL env var, not a [providers] \
+                     entry"
+                        .to_string(),
+                );
+            }
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Err(format!(
+                    "[providers].{name}: provider names must match [a-z0-9_]+ — the name \
+                     is uppercased into the `<NAME>_API_KEY` env var, so use underscores"
+                ));
+            }
+            if self.providers[name].is_empty() {
+                return Err(format!("[providers].{name}: base URL is empty"));
+            }
+        }
+
+        // 2. Literal full scan of every candidate slug.
+        let mut slugs: Vec<(String, &str, bool)> = Vec::new();
+        if let Some(fb) = self.defaults.fallback_model.as_deref() {
+            if !fb.is_empty() {
+                slugs.push(("[defaults].fallback_model".to_string(), fb, false));
+            }
+        }
+        let mut task_names: Vec<&String> = self.tasks.keys().collect();
+        task_names.sort();
+        for name in task_names {
+            let task = &self.tasks[name];
+            let draw = name == IMG_TASK;
+            for id in task.model.candidate_ids() {
+                slugs.push((format!("[tasks.{name}].model"), id, draw));
+            }
+            if let Some(fb) = &task.fallback {
+                for id in fb.candidate_ids() {
+                    slugs.push((format!("[tasks.{name}].fallback"), id, draw));
+                }
+            }
+            let mut tier_names: Vec<&String> = task.tiers.keys().collect();
+            tier_names.sort();
+            for tier in tier_names {
+                let t = &task.tiers[tier];
+                if let Some(m) = &t.model {
+                    for id in m.candidate_ids() {
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].model"), id, draw));
+                    }
+                }
+                if let Some(fb) = &t.fallback {
+                    for id in fb.candidate_ids() {
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].fallback"), id, draw));
+                    }
+                }
+            }
+        }
+
+        for (at, slug, draw) in slugs {
+            if draw {
+                // The draw endpoint speaks OpenRouter's modalities extension —
+                // not OpenAI-compatible in either direction, so no routing (and
+                // therefore no escape) is meaningful here at all.
+                if slug.contains('@') {
+                    return Err(format!(
+                        "{at}: `{slug}` — image generation sends OpenRouter's `modalities` \
+                         extension, which OpenAI-compatible providers do not accept; \
+                         `@provider` routing is not supported on [tasks.{IMG_TASK}]"
+                    ));
+                }
+                continue;
+            }
+            let (_, provider) =
+                crate::provider::split_model_slug(slug).map_err(|e| format!("{at}: {e}"))?;
+            if let Some(p) = provider {
+                if !self.providers.contains_key(p) {
+                    let mut declared: Vec<&str> =
+                        self.providers.keys().map(String::as_str).collect();
+                    declared.sort();
+                    return Err(format!(
+                        "{at}: `{slug}` names provider `{p}`, which is not declared in \
+                         [providers] (declared: {declared:?}). If the `@` is part of the \
+                         model id, escape it as `\\@` (in TOML double quotes: `\"\\\\@\"`)."
+                    ));
+                }
+                let var = format!("{}_API_KEY", p.to_uppercase());
+                if env(&var).is_none_or(|v| v.is_empty()) {
+                    return Err(format!(
+                        "{at}: `{slug}` routes to provider `{p}` but ${var} is unset or \
+                         empty — eros-engine refuses to boot rather than fail at request \
+                         time"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the name → endpoint map handed to `OpenRouterClient` at boot.
+    /// NO checks here — runs only after `validate_providers` passed. Every
+    /// declared entry is included; an unreferenced entry without a key gets an
+    /// empty api_key (unreachable at runtime, and `resolve_endpoint` guards
+    /// it anyway).
+    pub fn build_providers(&self) -> HashMap<String, crate::provider::ProviderEndpoint> {
+        self.build_providers_with(|k| std::env::var(k).ok())
+    }
+
+    fn build_providers_with(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> HashMap<String, crate::provider::ProviderEndpoint> {
+        self.providers
+            .iter()
+            .map(|(name, url)| {
+                let key = env(&format!("{}_API_KEY", name.to_uppercase())).unwrap_or_default();
+                (
+                    name.clone(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: url.clone(),
+                        api_key: key,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Boot gate, mirroring `validate_extraction_prompts`: any present world
@@ -5412,5 +5594,206 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // (which would panic on a byte-index slice).
         let s = "你好世界和平"; // 6 chars
         assert_eq!(cap_for_log(s, 3), "你好世…");
+    }
+
+    // ---- [providers] block + validate_providers (multi-provider spec §1/§7) ----
+
+    /// env closure: no provider key exists.
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn providers_block_parses() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://api.venice.ai/api/v1/chat/completions\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.providers.get("venice").map(String::as_str),
+            Some("https://api.venice.ai/api/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn providers_absent_is_empty_and_valid() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\n").unwrap();
+        assert!(cfg.providers.is_empty());
+        assert!(cfg.validate_providers_with(no_env).is_ok());
+    }
+
+    #[test]
+    fn provider_name_openrouter_is_reserved() {
+        let cfg =
+            ModelConfig::from_toml_str("[providers]\nopenrouter = \"https://x/v1\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("reserved"));
+        assert!(msg.contains("OPENROUTER_BASE_URL"));
+    }
+
+    #[test]
+    fn provider_name_charset_is_constrained() {
+        // Dash is rejected: the name uppercases into an env var, no mangling.
+        let cfg =
+            ModelConfig::from_toml_str("[providers]\n\"venice-ai\" = \"https://x/v1\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("a-z0-9_"), "should state the charset: {msg}");
+    }
+
+    #[test]
+    fn provider_empty_url_refuses_boot() {
+        let cfg = ModelConfig::from_toml_str("[providers]\nvenice = \"\"\n").unwrap();
+        assert!(cfg
+            .validate_providers_with(no_env)
+            .unwrap_err()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn unreferenced_provider_needs_no_key() {
+        // The examples/ config ships a sample [providers] entry; deployments
+        // that copy it without using it must still boot.
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"plain/m\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(no_env).is_ok());
+    }
+
+    #[test]
+    fn referenced_provider_missing_key_refuses_boot() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
+        )
+        .unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(
+            msg.contains("VENICE_API_KEY"),
+            "must name the env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn referenced_provider_empty_key_refuses_boot() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "VENICE_API_KEY").then(String::new);
+        assert!(cfg.validate_providers_with(env).is_err());
+    }
+
+    #[test]
+    fn referenced_provider_with_key_is_green() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\nfallback=[\"other/m\"]\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        assert!(cfg.validate_providers_with(env).is_ok());
+    }
+
+    #[test]
+    fn undeclared_provider_in_slug_refuses_boot() {
+        // Also the escape-typo case: "aaa@bb" points at the \@ escape.
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"aaa@bb\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("`bb`"));
+        assert!(msg.contains("\\@"), "should teach the escape: {msg}");
+    }
+
+    #[test]
+    fn slug_grammar_error_propagates_with_location() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"a@b@venice\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(
+            msg.contains("[tasks.chat_companion].model"),
+            "location: {msg}"
+        );
+    }
+
+    #[test]
+    fn weighted_table_keys_are_all_scanned() {
+        // resolve() picks at random — validation must see every key.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = { \"good/m\" = 0.9, \"bad@nope\" = 0.1 }\n",
+        )
+        .unwrap();
+        assert!(cfg
+            .validate_providers_with(no_env)
+            .unwrap_err()
+            .contains("nope"));
+    }
+
+    #[test]
+    fn tier_fallback_is_scanned() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel=\"m\"\n[tasks.chat_companion.tiers.premium]\nfallback=[\"x@nope\"]\n",
+        )
+        .unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("[tasks.chat_companion.tiers.premium].fallback"));
+    }
+
+    #[test]
+    fn defaults_fallback_model_is_scanned() {
+        let cfg = ModelConfig::from_toml_str("[defaults]\nfallback_model=\"x@nope\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("[defaults].fallback_model"));
+    }
+
+    #[test]
+    fn image_generation_rejects_any_at() {
+        // Draw endpoint speaks OpenRouter's modalities extension (spec §7).
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_image_generation]\nmodel=\"img@venice\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        let msg = cfg.validate_providers_with(env).unwrap_err();
+        assert!(msg.contains("modalities"), "should explain why: {msg}");
+
+        // Even an ESCAPED @ is rejected there — no routing, no escape need.
+        let cfg2 =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img\\\\@x\"\n")
+                .unwrap();
+        assert!(cfg2.validate_providers_with(no_env).is_err());
+    }
+
+    #[test]
+    fn image_generation_fallback_is_also_literal_checked() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_generation]\nmodel=\"img/m\"\nfallback=[\"img@venice\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(no_env).is_err());
+    }
+
+    #[test]
+    fn compose_task_accepts_provider_suffix() {
+        // Pins spec §9: the draw-endpoint restriction must never widen to the
+        // compose task — it is an ordinary chat-shaped task.
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_image_prompt_compose]\nmodel=\"m@venice\"\nfilter_prompt=\"compose it\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        assert!(cfg.validate_providers_with(env).is_ok());
+    }
+
+    #[test]
+    fn build_providers_maps_declared_entries() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://x/v1\"\nother = \"https://y/v1\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        let map = cfg.build_providers_with(env);
+        assert_eq!(map["venice"].base_url, "https://x/v1");
+        assert_eq!(map["venice"].api_key, "sk-v");
+        // Unreferenced/keyless entry still present, with an empty key —
+        // resolve_endpoint's runtime guard covers the (unreachable) miss.
+        assert_eq!(map["other"].api_key, "");
     }
 }
