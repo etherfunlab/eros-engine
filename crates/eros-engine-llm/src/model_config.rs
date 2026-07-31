@@ -3,7 +3,7 @@
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -129,6 +129,60 @@ impl ModelSpec {
         match self {
             ModelSpec::Fixed(s) => Some(s.as_str()),
             _ => None,
+        }
+    }
+}
+
+/// A task's `filter_prompt`. Accepts three TOML shapes, mirroring `ModelSpec`:
+/// `"xxx"` (plain), `["aaa","bbb"]` (index-keyed variants), or
+/// `{ a = "aaa", b = "bbb" }` (string-keyed variants).
+///
+/// Only `[tasks.chat_image_prompt_compose]` reads variants; every other task —
+/// and every tier block, including the composer's own — must use the plain
+/// shape. Enforced at boot by `ModelConfig::validate_prompt_variants`, because
+/// `TaskConfig` is shared by every `[tasks.*]` section and the type alone
+/// cannot express the restriction.
+///
+/// `BTreeMap` (not `HashMap`) so key ordering in boot-failure messages is
+/// deterministic across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PromptSpec {
+    Plain(String),
+    Indexed(Vec<String>),
+    Keyed(BTreeMap<String, String>),
+}
+
+impl PromptSpec {
+    /// The prompt as a plain string. `None` for the variant shapes — which,
+    /// after `validate_prompt_variants`, only the composer task can hold.
+    /// Callers treat `None` exactly like an absent `filter_prompt`.
+    pub fn as_plain(&self) -> Option<&str> {
+        match self {
+            PromptSpec::Plain(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Pick the variant named by `variant`. `None` ⇒ nothing was selected and
+    /// the caller falls back to its built-in default.
+    ///
+    /// `Plain` ignores `variant` entirely — the string IS the prompt.
+    /// `Indexed` parses `variant` as a `usize` index. `Keyed` looks it up as an
+    /// exact, case-sensitive key (`default` carries no special meaning). Every
+    /// miss in a variant shape — absent, unparseable, out of range, unknown
+    /// key — is `None`.
+    ///
+    /// `raw` is handled by the caller BEFORE this is reached; it never appears
+    /// here.
+    pub fn select(&self, variant: Option<&str>) -> Option<&str> {
+        match self {
+            PromptSpec::Plain(s) => Some(s.as_str()),
+            PromptSpec::Indexed(v) => {
+                let idx: usize = variant?.parse().ok()?;
+                v.get(idx).map(String::as_str)
+            }
+            PromptSpec::Keyed(m) => m.get(variant?).map(String::as_str),
         }
     }
 }
@@ -4762,5 +4816,73 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // No stories section at all ⇒ fine either way.
         let cfg = ModelConfig::from_toml_str("").unwrap();
         assert!(cfg.validate_world_prompts(true, true).is_ok());
+    }
+
+    // ─── PromptSpec ──────────────────────────────────────────────────────
+
+    #[derive(Deserialize)]
+    struct SpecWrap {
+        p: PromptSpec,
+    }
+
+    fn spec(src: &str) -> PromptSpec {
+        toml::from_str::<SpecWrap>(src).expect("parse PromptSpec").p
+    }
+
+    #[test]
+    fn prompt_spec_parses_three_shapes() {
+        assert_eq!(spec(r#"p = "xxx""#), PromptSpec::Plain("xxx".into()));
+        assert_eq!(
+            spec(r#"p = ["aaa", "bbb"]"#),
+            PromptSpec::Indexed(vec!["aaa".into(), "bbb".into()])
+        );
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("a".to_string(), "aaa".to_string());
+        m.insert("b".to_string(), "bbb".to_string());
+        assert_eq!(
+            spec(r#"p = { a = "aaa", b = "bbb" }"#),
+            PromptSpec::Keyed(m)
+        );
+    }
+
+    #[test]
+    fn prompt_spec_as_plain_only_for_plain() {
+        assert_eq!(spec(r#"p = "xxx""#).as_plain(), Some("xxx"));
+        assert_eq!(spec(r#"p = ["aaa"]"#).as_plain(), None);
+        assert_eq!(spec(r#"p = { a = "aaa" }"#).as_plain(), None);
+    }
+
+    #[test]
+    fn prompt_spec_plain_ignores_variant() {
+        let s = spec(r#"p = "xxx""#);
+        assert_eq!(s.select(None), Some("xxx"));
+        assert_eq!(s.select(Some("b")), Some("xxx"));
+        assert_eq!(s.select(Some("7")), Some("xxx"));
+    }
+
+    #[test]
+    fn prompt_spec_indexed_selection() {
+        let s = spec(r#"p = ["aaa", "bbb"]"#);
+        assert_eq!(s.select(Some("0")), Some("aaa"));
+        assert_eq!(s.select(Some("1")), Some("bbb"));
+        // "01" parses as 1 — ordinary usize::from_str behavior, not special-cased.
+        assert_eq!(s.select(Some("01")), Some("bbb"));
+        // Every miss is None; the caller substitutes its built-in default.
+        assert_eq!(s.select(None), None, "no variant selects nothing");
+        assert_eq!(s.select(Some("5")), None, "out of range");
+        assert_eq!(s.select(Some("a")), None, "non-numeric");
+        assert_eq!(s.select(Some("-1")), None, "unparseable as usize");
+    }
+
+    #[test]
+    fn prompt_spec_keyed_selection() {
+        let s = spec(r#"p = { a = "aaa", b = "bbb", default = "ccc" }"#);
+        assert_eq!(s.select(Some("a")), Some("aaa"));
+        assert_eq!(s.select(Some("b")), Some("bbb"));
+        // `default` is an ORDINARY key: it wins only on a literal "default".
+        assert_eq!(s.select(Some("default")), Some("ccc"));
+        assert_eq!(s.select(None), None, "no variant selects nothing");
+        assert_eq!(s.select(Some("z")), None, "unknown key");
+        assert_eq!(s.select(Some("A")), None, "key match is case-sensitive");
     }
 }
