@@ -1019,26 +1019,32 @@ impl OpenRouterClient {
                 "openrouter: vision has no models configured".into(),
             ));
         }
-        if self.api_key.is_empty() {
-            return Err(LlmError::Config("openrouter: api key not set".into()));
-        }
-
         let mut last_err: Option<LlmError> = None;
         // Latest recoverable garble, kept separate so a later non-garble failure
         // can't discard a repairable earlier garble (mirrors `execute`). Tuple:
         // (model, raw, finish_reason).
         let mut last_garbled: Option<(String, String, Option<String>)> = None;
         for model in &candidates {
-            let mut body = build_vision_body(&req, model);
-            if let Some(prefs) = self.provider_prefs() {
-                if let Ok(v) = serde_json::to_value(&prefs) {
-                    body["provider"] = v;
+            let (bare_model, ep) = match self.resolve_endpoint(model) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (endpoint); next");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let mut body = build_vision_body(&req, &bare_model);
+            if ep.name.is_none() {
+                if let Some(prefs) = self.provider_prefs() {
+                    if let Ok(v) = serde_json::to_value(&prefs) {
+                        body["provider"] = v;
+                    }
                 }
             }
-            let resp = match self
+            let resp = match ep
                 .http
-                .post(&self.base_url)
-                .bearer_auth(&self.api_key)
+                .post(ep.url)
+                .bearer_auth(ep.api_key)
                 .json(&body)
                 .send()
                 .await
@@ -1096,10 +1102,20 @@ impl OpenRouterClient {
                 }
                 continue;
             }
+            // §6: a custom row self-identifies as <echo>@<provider> so a failed
+            // eros-audit join on generation_id explains itself from the model
+            // column. OpenRouter rows are byte-identical to before.
+            let model_out = match ep.name {
+                None => parsed.model,
+                Some(p) => Some(match parsed.model {
+                    Some(echo) => format!("{echo}@{p}"),
+                    None => format!("{bare_model}@{p}"),
+                }),
+            };
             return Ok(ChatResponse {
                 reply: clean_response(raw.trim()),
                 generation_id: parsed.id,
-                model: parsed.model,
+                model: model_out,
                 usage: parsed.usage,
                 finish_reason,
             });
@@ -3508,6 +3524,59 @@ data: [DONE]\n\n";
             "no generation_id when repaired"
         );
         assert_eq!(resp.model.as_deref(), Some("vp"));
+    }
+
+    #[tokio::test]
+    async fn vision_custom_provider_bare_model_no_prefs_suffixed_audit() {
+        let server_b = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "v-gen-2",
+                "model": "venice-vision-echo",
+                "choices": [{ "message": { "content": "{\"desc\":\"a cat\"}" } }]
+            })))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "or-key".into(),
+            AppAttribution::default(),
+            "https://unused.test/v1".into(),
+        )
+        .with_ignore_providers(vec!["bad".into()]) // would inject body["provider"] on OpenRouter
+        .with_providers(std::collections::HashMap::from([(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                api_key: "v-key".into(),
+            },
+        )]));
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vis@venice".into(),
+                fallback_model: vec![],
+                system_prompt: "describe".into(),
+                image_url: "data:image/png;base64,AAAA".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+            })
+            .await
+            .expect("vision call succeeds");
+        assert_eq!(resp.model.as_deref(), Some("venice-vision-echo@venice"));
+
+        let r = &server_b.received_requests().await.unwrap()[0];
+        assert_eq!(
+            r.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer v-key"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["model"], "vis");
+        assert!(
+            body.get("provider").is_none(),
+            "provider prefs leaked to custom vision"
+        );
     }
 
     #[test]
