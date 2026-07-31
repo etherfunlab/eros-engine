@@ -1670,18 +1670,47 @@ impl ModelConfig {
         })
     }
 
-    /// Resolve the image-prompt composer task. `None` (feature off) only when
-    /// `[tasks.chat_image_prompt_compose]` is absent. When the task is present, a
-    /// non-blank `filter_prompt` overrides the built-in `DEFAULT_COMPOSE_PROMPT`;
-    /// a blank/absent one falls back to it. No probability/trigger gate; the
-    /// caller invokes it only after an image action is decided.
-    pub fn resolve_image_prompt_compose(&self) -> Option<ResolvedImagePromptCompose> {
+    /// Resolve the image-prompt composer task. `None` (composer does not run)
+    /// when `[tasks.chat_image_prompt_compose]` is absent, **or** when the
+    /// caller passed the reserved `raw` variant — the two are indistinguishable
+    /// by design, since both mean "use the seed subject verbatim"; `tracing`
+    /// tells them apart.
+    ///
+    /// `variant` is the client's per-turn `image.prompt_variant`, already
+    /// trimmed by the caller. Selection is delegated to `PromptSpec::select`:
+    /// a plain `filter_prompt` ignores it, and any miss in a variant shape
+    /// falls back to the built-in `DEFAULT_COMPOSE_PROMPT`.
+    ///
+    /// No probability/trigger gate; the caller invokes it only after an image
+    /// action is decided.
+    pub fn resolve_image_prompt_compose(
+        &self,
+        variant: Option<&str>,
+    ) -> Option<ResolvedImagePromptCompose> {
         const COMPOSE_TASK: &str = "chat_image_prompt_compose";
+        let variant = variant.map(str::trim).filter(|v| !v.is_empty());
+        if variant.is_some_and(|v| v.eq_ignore_ascii_case("raw")) {
+            tracing::debug!("image-compose: variant \"raw\" — skipping composer");
+            return None;
+        }
         let task_cfg = self.tasks.get(COMPOSE_TASK)?;
-        let compose_prompt = task_cfg
+        let selected = task_cfg
             .filter_prompt
             .as_ref()
-            .and_then(PromptSpec::as_plain)
+            .and_then(|s| s.select(variant));
+        if selected.is_none() && variant.is_some() && task_cfg.filter_prompt.is_some() {
+            tracing::warn!(
+                variant = %variant.unwrap_or_default(),
+                "image-compose: variant not found; using the built-in prompt"
+            );
+        } else if selected.is_some() && variant.is_some() {
+            tracing::debug!(variant = %variant.unwrap_or_default(), "image-compose: variant selected");
+        }
+        // `trim`/`is_empty` is what makes a blank PLAIN filter_prompt fall
+        // through to the built-in prompt. Redundant for the variant shapes
+        // (`validate_prompt_variants` rejects blanks there at boot), but
+        // removing it would regress the plain shape.
+        let compose_prompt = selected
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -4437,7 +4466,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn resolve_image_prompt_compose_none_when_task_absent() {
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
-        assert!(cfg.resolve_image_prompt_compose().is_none());
+        assert!(cfg.resolve_image_prompt_compose(None).is_none());
     }
 
     #[test]
@@ -4448,14 +4477,16 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
         )
         .unwrap();
-        let r = cfg.resolve_image_prompt_compose().unwrap();
+        let r = cfg.resolve_image_prompt_compose(None).unwrap();
         assert_eq!(r.compose_prompt, DEFAULT_COMPOSE_PROMPT);
 
         // also true when filter_prompt is omitted entirely
         let cfg2 = ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
             .unwrap();
         assert_eq!(
-            cfg2.resolve_image_prompt_compose().unwrap().compose_prompt,
+            cfg2.resolve_image_prompt_compose(None)
+                .unwrap()
+                .compose_prompt,
             DEFAULT_COMPOSE_PROMPT
         );
     }
@@ -4467,7 +4498,9 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap();
         assert_eq!(
-            cfg.resolve_image_prompt_compose().unwrap().compose_prompt,
+            cfg.resolve_image_prompt_compose(None)
+                .unwrap()
+                .compose_prompt,
             "custom composer"
         );
     }
@@ -4478,7 +4511,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"compose it\"\nfallback = [\"a\", \"b\", \"c\"]\nretry_depth = 1\n",
         )
         .unwrap();
-        let r = cfg.resolve_image_prompt_compose().unwrap();
+        let r = cfg.resolve_image_prompt_compose(None).unwrap();
         assert_eq!(r.compose_prompt, "compose it");
         assert_eq!(r.retry_depth, 1);
         assert_eq!(r.fallback_model.len(), 1);
@@ -5107,5 +5140,116 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
                 .expect_err("reserved key must refuse to boot");
             assert!(e.contains("reserved"), "{e}");
         }
+    }
+
+    // ─── resolve_image_prompt_compose: variants + raw ────────────────────
+
+    #[test]
+    fn compose_indexed_variant_selection() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"AAA\", \"BBB\"]\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("1"))
+                .unwrap()
+                .compose_prompt,
+            "BBB"
+        );
+        // No variant, and every miss, fall through to the built-in prompt.
+        for v in [None, Some("5"), Some("a"), Some("-1")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                DEFAULT_COMPOSE_PROMPT,
+                "variant {v:?} should fall back to the built-in prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_keyed_variant_selection() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = { a = \"AAA\", default = \"CCC\" }\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("a"))
+                .unwrap()
+                .compose_prompt,
+            "AAA"
+        );
+        // `default` is an ordinary key — it needs a literal "default" to win.
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("default"))
+                .unwrap()
+                .compose_prompt,
+            "CCC"
+        );
+        for v in [None, Some("z")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                DEFAULT_COMPOSE_PROMPT
+            );
+        }
+    }
+
+    #[test]
+    fn compose_plain_prompt_ignores_the_variant() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = \"custom composer\"\n");
+        for v in [None, Some("a"), Some("3")] {
+            assert_eq!(
+                c.resolve_image_prompt_compose(v).unwrap().compose_prompt,
+                "custom composer"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_blank_plain_prompt_still_falls_back() {
+        // Pre-existing behavior, unchanged: a blank plain string is "commented
+        // out", not a boot failure.
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"   \"\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(None).unwrap().compose_prompt,
+            DEFAULT_COMPOSE_PROMPT
+        );
+    }
+
+    #[test]
+    fn raw_skips_the_composer_in_every_shape() {
+        let sources = [
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = [\"AAA\"]\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"AAA\" }\n",
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n",
+            // No filter_prompt at all (built-in prompt) — raw still wins.
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n",
+        ];
+        for src in sources {
+            let c = cfg(src);
+            for v in ["raw", "Raw", "RAW"] {
+                assert!(
+                    c.resolve_image_prompt_compose(Some(v)).is_none(),
+                    "{v} must skip the composer for: {src}"
+                );
+            }
+            // Sanity: without `raw` the composer is still resolved.
+            assert!(c.resolve_image_prompt_compose(None).is_some(), "{src}");
+        }
+    }
+
+    #[test]
+    fn raw_on_an_absent_compose_task_is_still_none() {
+        let c = cfg("[tasks.chat_companion]\nmodel = \"m\"\n");
+        assert!(c.resolve_image_prompt_compose(Some("raw")).is_none());
+        assert!(c.resolve_image_prompt_compose(None).is_none());
+    }
+
+    #[test]
+    fn blank_variant_string_is_treated_as_absent() {
+        let c = cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+                     filter_prompt = [\"AAA\", \"BBB\"]\n");
+        assert_eq!(
+            c.resolve_image_prompt_compose(Some("   "))
+                .unwrap()
+                .compose_prompt,
+            DEFAULT_COMPOSE_PROMPT
+        );
     }
 }

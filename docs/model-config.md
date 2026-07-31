@@ -469,7 +469,7 @@ max_tokens   = 700
 | `temperature` | `f64` | task default | Sampling temperature for the composer call. |
 | `max_tokens` | `u32` | task default | Token cap for the composer call. |
 | `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
-| `filter_prompt` | `String` | **built-in default** | **Optional** (unlike other tasks). Blank/absent ⇒ the engine's built-in `DEFAULT_COMPOSE_PROMPT`; non-blank ⇒ override. |
+| `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **built-in default** | **Optional** (unlike other tasks). Blank/absent ⇒ the engine's built-in `DEFAULT_COMPOSE_PROMPT`. See **variants** below for the array/table shapes. |
 
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
 config), the composer ships a generic, **product-identity-free** built-in
@@ -478,6 +478,31 @@ appearance into a detailed prompt and does **not** soften, downgrade, censor, or
 refuse, and adds no content-moderation layer of its own — moderation is delegated
 to the image-model provider and the downstream deployment, not this step. A
 non-blank `filter_prompt` overrides it; a blank/absent one falls back to it.
+
+**Variants.** This is the **only** task whose `filter_prompt` accepts more than a
+plain string. The consumer picks one per chat turn via `image.prompt_variant` on
+the send-message body. Three shapes:
+
+```toml
+filter_prompt = "…"                       # one prompt; prompt_variant is ignored
+filter_prompt = ["…", "…"]                # pick by index: prompt_variant = "0" / "1"
+filter_prompt = { a = "…", b = "…" }      # pick by key:   prompt_variant = "a" / "b"
+```
+
+Anything not selected — no `prompt_variant`, an out-of-range index, an unknown
+key — falls back to the **built-in** prompt above (logged at `warn`), never to
+"first entry wins". There is no reserved `default` key: writing `default = "…"`
+defines an ordinary variant, selected only by a literal `prompt_variant =
+"default"`.
+
+`prompt_variant = "raw"` (case-insensitive) skips the composer LLM entirely and
+draws the seed subject as-is — one fewer LLM call for that turn. `raw` is
+reserved: a table key literally named `raw` (any casing) refuses to boot.
+
+Variants are honored on this task only. An array/table `filter_prompt` on any
+other task, or inside **any** `[tasks.*.tiers.*]` block (this task's own tiers
+included — the composer always resolves with no tier), refuses to boot rather
+than sit there unreachable.
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_prompt_compose()` in `model_config.rs`.

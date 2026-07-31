@@ -2610,7 +2610,7 @@ async fn build_delegated_image_prompt(
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "realistic".to_string());
-    let final_subject = match state.model_config.resolve_image_prompt_compose() {
+    let final_subject = match state.model_config.resolve_image_prompt_compose(None) {
         Some(c) => run_image_prompt_compose(
             state,
             &c,

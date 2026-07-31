@@ -397,9 +397,23 @@ max_tokens   = 700
 | `temperature` | `f64` | 任务默认 | 改写器调用的采样温度。 |
 | `max_tokens` | `u32` | 任务默认 | 改写器调用的 token 上限。 |
 | `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
-| `filter_prompt` | `String` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`；非空 ⇒ 覆盖。 |
+| `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
 **内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），改写器自带一个通用、**不含产品身份**的内置默认。它的立场是**只扩写**：忠实地把种子主题和外观扩成详细提示词，**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它；空白/缺失则回退到它。
+
+**变体（variants）。** 这是**唯一**一个 `filter_prompt` 接受纯字符串以外形态的任务。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
+
+```toml
+filter_prompt = "…"                       # 单一提示词；prompt_variant 被忽略
+filter_prompt = ["…", "…"]                # 按下标选：prompt_variant = "0" / "1"
+filter_prompt = { a = "…", b = "…" }      # 按 key 选：  prompt_variant = "a" / "b"
+```
+
+没有命中的情况——没传 `prompt_variant`、下标越界、key 不存在——一律回退到上面的**内置**提示词（记 `warn` 日志），不存在"取第一项"这种行为。也没有保留的 `default` key：写 `default = "…"` 只是定义了一个普通变体，只有字面量 `prompt_variant = "default"` 才会命中它。
+
+`prompt_variant = "raw"`（大小写不敏感）会完全跳过改写器 LLM，直接用种子主题原样出图——这一轮少一次 LLM 调用。`raw` 是保留字：表里若出现字面量为 `raw` 的 key（任意大小写）会拒绝启动。
+
+变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt`，或**任何** `[tasks.*.tiers.*]` 块（包括本任务自己的 tiers——改写器解析时永远不走 tier）里的数组/表形态，都会拒绝启动，而不是留在那里永远选不到。
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_prompt_compose()`。
 
