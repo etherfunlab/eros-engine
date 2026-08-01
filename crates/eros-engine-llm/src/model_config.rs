@@ -682,15 +682,6 @@ pub struct TaskConfig {
     /// Per-tier overrides keyed by tier name. Empty for tasks that don't tier.
     #[serde(default)]
     pub tiers: HashMap<String, TierConfig>,
-    /// chat_image_generation-only: default style when the frontend omits one.
-    #[serde(default)]
-    pub default_style: Option<StyleKey>,
-    /// chat_image_generation-only: default aspect ratio (e.g. "3:4").
-    #[serde(default)]
-    pub default_aspect_ratio: Option<String>,
-    /// chat_image_generation-only: default resolution (e.g. "1024x1365").
-    #[serde(default)]
-    pub default_resolution: Option<String>,
     /// chat_voice-only: opt into inline TTS audio tags (Gemini transcript tags
     /// like `[laughs]`, `[whispers]`). Absent/`false` ⇒ the built-in voice
     /// directive keeps forbidding brackets (unchanged behaviour). `true` ⇒ the
@@ -1069,30 +1060,6 @@ pub struct ResolvedWorldStories {
     pub retention_days: u32,
     pub active_window_hours: u32,
     pub context_days: u32,
-}
-
-/// Resolved image-generation task (`chat_image_generation`). `model` is optional:
-/// `None` means defer entirely to the per-turn frontend model. The per-turn
-/// chain is built by `effective_image_chain`.
-#[derive(Debug, Clone)]
-pub struct ResolvedImageGen {
-    pub model: Option<ModelSpec>,
-    pub fallback_model: Vec<String>,
-    pub default_style: StyleKey,
-    pub default_aspect_ratio: String,
-    pub default_resolution: Option<String>,
-    pub max_tokens: u32,
-}
-
-impl TaskConfig {
-    /// Image-gen view of `model`: an empty Fixed string ⇒ None (model deferred
-    /// to the per-turn frontend).
-    pub(crate) fn model_image_opt(&self) -> Option<ModelSpec> {
-        match &self.model {
-            ModelSpec::Fixed(s) if s.is_empty() => None,
-            other => Some(other.clone()),
-        }
-    }
 }
 
 /// Where the model config comes from, resolved from the two env vars.
@@ -1685,32 +1652,6 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Resolve the image-generation task. `None` (feature off) when
-    /// `[tasks.chat_image_generation]` is absent. `Some(_)` means ENABLED — a
-    /// usable model is resolved per-turn by `effective_image_chain`.
-    pub fn resolve_image_gen(&self) -> Option<ResolvedImageGen> {
-        const IMG_TASK: &str = "chat_image_generation";
-        let task_cfg = self.tasks.get(IMG_TASK)?;
-        let retry_depth = task_cfg.retry_depth.unwrap_or(2);
-        let mut fallback_model = task_cfg
-            .fallback
-            .clone()
-            .map(FallbackSpec::into_vec)
-            .unwrap_or_default();
-        fallback_model.truncate(retry_depth as usize);
-        Some(ResolvedImageGen {
-            model: task_cfg.model_image_opt(),
-            fallback_model,
-            default_style: task_cfg.default_style.unwrap_or_default(),
-            default_aspect_ratio: task_cfg
-                .default_aspect_ratio
-                .clone()
-                .unwrap_or_else(|| "1:1".to_string()),
-            default_resolution: task_cfg.default_resolution.clone(),
-            max_tokens: task_cfg.max_tokens.unwrap_or(4096),
-        })
-    }
-
     /// Resolve the image-prompt composer task. `None` (composer does not run)
     /// when `[tasks.chat_image_prompt_compose]` is absent, **or** when the
     /// caller passed the reserved `raw` variant — the two are indistinguishable
@@ -1789,12 +1730,6 @@ impl ModelConfig {
     }
 }
 
-/// Drop later duplicates, preserving first-seen order.
-fn dedup_keep_first(v: &mut Vec<String>) {
-    let mut seen = std::collections::HashSet::new();
-    v.retain(|s| seen.insert(s.clone()));
-}
-
 /// Cap a string to at most `max_chars` characters before it reaches a log
 /// line, appending `…` when truncated. Counts/truncates by `char`, never mid
 /// UTF-8 codepoint. Used to bound client-supplied values (e.g. the image
@@ -1840,34 +1775,6 @@ fn compose_variant_log_event(
     } else {
         None
     }
-}
-
-/// Build the per-turn image model chain. Returns `None` ⇒ no model anywhere ⇒
-/// the turn cannot generate (caller degrades to text). `Some((primary, chain))`
-/// otherwise. Order: per-turn override → config `ModelSpec` → config fallback.
-///
-/// The `[tasks.chat_image_generation]` task block is the feature switch: when
-/// `resolved` is `None` (no task block) the feature is OFF, so a per-turn
-/// `req_model` override is IGNORED and this returns `None`. Otherwise the
-/// per-turn override takes precedence over the config model/fallback.
-pub fn effective_image_chain(
-    req_model: Option<&str>,
-    resolved: Option<&ResolvedImageGen>,
-) -> Option<(String, Vec<String>)> {
-    // Gate on the task block first: no `[tasks.chat_image_generation]` ⇒
-    // image-gen is opt-OUT, so a client-supplied `req_model` must not enable it.
-    let r = resolved?;
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(m) = req_model.map(str::trim).filter(|s| !s.is_empty()) {
-        candidates.push(m.to_owned());
-    }
-    if let Some(m) = r.model.as_ref().and_then(ModelSpec::select) {
-        candidates.push(m);
-    }
-    candidates.extend(r.fallback_model.iter().cloned());
-    dedup_keep_first(&mut candidates);
-    let mut it = candidates.into_iter();
-    it.next().map(|primary| (primary, it.collect()))
 }
 
 impl ModelConfig {
@@ -2120,8 +2027,6 @@ impl ModelConfig {
     /// Testable core: `env` abstracts `std::env::var` so tests inject keys
     /// without process-global mutation.
     fn validate_providers_with(&self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
-        const IMG_TASK: &str = "chat_image_generation";
-
         // 1. Provider table shape. Sorted for deterministic messages.
         let mut names: Vec<&String> = self.providers.keys().collect();
         names.sort();
@@ -2150,23 +2055,22 @@ impl ModelConfig {
         }
 
         // 2. Literal full scan of every candidate slug.
-        let mut slugs: Vec<(String, &str, bool)> = Vec::new();
+        let mut slugs: Vec<(String, &str)> = Vec::new();
         if let Some(fb) = self.defaults.fallback_model.as_deref() {
             if !fb.is_empty() {
-                slugs.push(("[defaults].fallback_model".to_string(), fb, false));
+                slugs.push(("[defaults].fallback_model".to_string(), fb));
             }
         }
         let mut task_names: Vec<&String> = self.tasks.keys().collect();
         task_names.sort();
         for name in task_names {
             let task = &self.tasks[name];
-            let draw = name == IMG_TASK;
             for id in task.model.candidate_ids() {
-                slugs.push((format!("[tasks.{name}].model"), id, draw));
+                slugs.push((format!("[tasks.{name}].model"), id));
             }
             if let Some(fb) = &task.fallback {
                 for id in fb.candidate_ids() {
-                    slugs.push((format!("[tasks.{name}].fallback"), id, draw));
+                    slugs.push((format!("[tasks.{name}].fallback"), id));
                 }
             }
             let mut tier_names: Vec<&String> = task.tiers.keys().collect();
@@ -2175,31 +2079,18 @@ impl ModelConfig {
                 let t = &task.tiers[tier];
                 if let Some(m) = &t.model {
                     for id in m.candidate_ids() {
-                        slugs.push((format!("[tasks.{name}.tiers.{tier}].model"), id, draw));
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].model"), id));
                     }
                 }
                 if let Some(fb) = &t.fallback {
                     for id in fb.candidate_ids() {
-                        slugs.push((format!("[tasks.{name}.tiers.{tier}].fallback"), id, draw));
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].fallback"), id));
                     }
                 }
             }
         }
 
-        for (at, slug, draw) in slugs {
-            if draw {
-                // The draw endpoint speaks OpenRouter's modalities extension —
-                // not OpenAI-compatible in either direction, so no routing (and
-                // therefore no escape) is meaningful here at all.
-                if slug.contains('@') {
-                    return Err(format!(
-                        "{at}: `{slug}` — image generation sends OpenRouter's `modalities` \
-                         extension, which OpenAI-compatible providers do not accept; \
-                         `@provider` routing is not supported on [tasks.{IMG_TASK}]"
-                    ));
-                }
-                continue;
-            }
+        for (at, slug) in slugs {
             let (_, provider) =
                 crate::provider::split_model_slug(slug).map_err(|e| format!("{at}: {e}"))?;
             if let Some(p) = provider {
@@ -4444,35 +4335,7 @@ temperature = 0.8
         );
     }
 
-    // ─── Task 2: StyleKey presets + ResolvedImageGen + resolve_image_gen ──────
-
-    #[test]
-    fn resolve_image_gen_none_when_task_absent() {
-        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\n").unwrap();
-        assert!(cfg.resolve_image_gen().is_none());
-    }
-
-    #[test]
-    fn resolve_image_gen_some_with_optional_model() {
-        // Block present, NO model key → Some, with model: None.
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nfallback=[\"fb-img\"]\ndefault_style=\"anime\"\n",
-        )
-        .unwrap();
-        let r = cfg.resolve_image_gen().expect("block present ⇒ Some");
-        assert!(r.model.is_none());
-        assert_eq!(r.fallback_model, vec!["fb-img".to_string()]);
-        assert_eq!(r.default_style, StyleKey::Anime);
-    }
-
-    #[test]
-    fn resolve_image_gen_carries_model_spec() {
-        let cfg =
-            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img-a\"\n").unwrap();
-        let r = cfg.resolve_image_gen().unwrap();
-        assert!(matches!(r.model, Some(ModelSpec::Fixed(ref s)) if s == "img-a"));
-        assert_eq!(r.default_style, StyleKey::Realistic); // serde default
-    }
+    // ─── StyleKey presets ───────────────────────────────────────────────────
 
     #[test]
     fn style_preset_maps_keys() {
@@ -4489,65 +4352,6 @@ temperature = 0.8
         assert!(matches!(&task.model, ModelSpec::Fixed(s) if s == "x"));
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.model, "x");
-    }
-
-    // ─── Task 3: effective_image_chain + dedup_keep_first ─────────────────────
-
-    #[test]
-    fn effective_chain_per_turn_wins_and_dedups() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"X\",\"Y\"]\n",
-        )
-        .unwrap();
-        let r = cfg.resolve_image_gen();
-        // per-turn "X" + config "cfg" + fallback ["X","Y"] → [X, cfg, Y] (dedup X)
-        assert_eq!(
-            effective_image_chain(Some("X"), r.as_ref()),
-            Some(("X".to_string(), vec!["cfg".to_string(), "Y".to_string()]))
-        );
-    }
-
-    #[test]
-    fn effective_chain_fallback_only_is_primary() {
-        let cfg =
-            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nfallback=[\"Z\",\"W\"]\n")
-                .unwrap();
-        let r = cfg.resolve_image_gen();
-        assert_eq!(
-            effective_image_chain(None, r.as_ref()),
-            Some(("Z".to_string(), vec!["W".to_string()]))
-        );
-    }
-
-    #[test]
-    fn effective_chain_empty_is_none() {
-        let cfg = ModelConfig::from_toml_str("[tasks.chat_image_generation]\n").unwrap();
-        assert_eq!(
-            effective_image_chain(None, cfg.resolve_image_gen().as_ref()),
-            None
-        );
-        assert_eq!(effective_image_chain(None, None), None);
-    }
-
-    #[test]
-    fn effective_chain_config_model_when_no_per_turn() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"cfg\"\nfallback=[\"F\"]\n",
-        )
-        .unwrap();
-        let r = cfg.resolve_image_gen();
-        assert_eq!(
-            effective_image_chain(None, r.as_ref()),
-            Some(("cfg".to_string(), vec!["F".to_string()]))
-        );
-    }
-
-    #[test]
-    fn effective_chain_no_task_block_ignores_per_turn_model() {
-        // The [tasks.chat_image_generation] block is the feature switch. With it
-        // absent (`resolved = None`), a client-supplied per-turn `model` must NOT
-        // enable billable image generation — opt-in only.
-        assert_eq!(effective_image_chain(Some("X"), None), None);
     }
 
     #[test]
@@ -5741,33 +5545,6 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let cfg = ModelConfig::from_toml_str("[defaults]\nfallback_model=\"x@nope\"\n").unwrap();
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
         assert!(msg.contains("[defaults].fallback_model"));
-    }
-
-    #[test]
-    fn image_generation_rejects_any_at() {
-        // Draw endpoint speaks OpenRouter's modalities extension (spec §7).
-        let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_image_generation]\nmodel=\"img@venice\"\n",
-        )
-        .unwrap();
-        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
-        let msg = cfg.validate_providers_with(env).unwrap_err();
-        assert!(msg.contains("modalities"), "should explain why: {msg}");
-
-        // Even an ESCAPED @ is rejected there — no routing, no escape need.
-        let cfg2 =
-            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img\\\\@x\"\n")
-                .unwrap();
-        assert!(cfg2.validate_providers_with(no_env).is_err());
-    }
-
-    #[test]
-    fn image_generation_fallback_is_also_literal_checked() {
-        let cfg = ModelConfig::from_toml_str(
-            "[tasks.chat_image_generation]\nmodel=\"img/m\"\nfallback=[\"img@venice\"]\n",
-        )
-        .unwrap();
-        assert!(cfg.validate_providers_with(no_env).is_err());
     }
 
     #[test]
