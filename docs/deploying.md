@@ -262,7 +262,7 @@ and cost nothing. A world nobody interacts with costs exactly the director
 call. Details, data model, and the boot-validation rules are in
 [World system](world-system.md).
 
-- **Env vars:** the full annotated list lives in [`.env.example`](../.env.example) — OpenRouter attribution headers, usage-key filtering, EMA inertia dials, sweeper switches (dreaming / snapshot / world), debug toggles.
+- **Env vars:** the complete variable list lives in [`.env.example`](../.env.example); it is deliberately terse — details live in this guide and in [model-config.md](model-config.md).
 - **Background sweepers:** `serve` also runs the dreaming-lite (session-end memory classifier) and insight-snapshot sweepers. Both are optional: `DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` turn them off without affecting the chat path.
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The raw OpenAPI JSON is not served over HTTP — dump it with the `print-openapi` subcommand.
@@ -274,4 +274,4 @@ call. Details, data model, and the boot-validation rules are in
 
 - `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
 - `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the five modes above)
-- [`.env.example`](../.env.example) — annotated operational env-var list
+- [`.env.example`](../.env.example) — operational env-var list (details in this guide)
