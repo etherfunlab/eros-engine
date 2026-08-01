@@ -2,6 +2,7 @@
 //! HTTP clients for external LLM + embedding providers, and the TOML task→model config.
 
 pub mod byte_bpe;
+pub mod embedding;
 pub mod error;
 pub mod model_config;
 pub mod openrouter;
