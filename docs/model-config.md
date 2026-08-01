@@ -102,7 +102,9 @@ fallback = ["x-ai/grok-4.20"]        # no suffix → built-in OpenRouter
 Rules, all enforced at boot (the engine refuses to boot on any violation):
 
 - **Names** match `[a-z0-9_]+`; `openrouter` is reserved (override the
-  built-in endpoint with the `OPENROUTER_BASE_URL` env var instead).
+  built-in endpoint with the `OPENROUTER_BASE_URL` env var instead), and so
+  is `voyage` (`$VOYAGE_API_KEY` already belongs to the built-in embeddings
+  client).
 - **URL** is the complete chat-completions URL, posted verbatim — no path
   joining.
 - **API key** comes from the environment as `<NAME_UPPERCASED>_API_KEY`

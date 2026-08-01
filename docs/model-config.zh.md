@@ -102,7 +102,8 @@ fallback = ["x-ai/grok-4.20"]        # 无后缀 → 内置 OpenRouter
 以下规则全部在启动时强制校验（任一违反即拒绝启动）：
 
 - **名称**匹配 `[a-z0-9_]+`；`openrouter` 为保留字（覆盖内置端点请用
-  `OPENROUTER_BASE_URL` 环境变量）。
+  `OPENROUTER_BASE_URL` 环境变量），`voyage` 同为保留字（`$VOYAGE_API_KEY`
+  已属于内置 embeddings 客户端）。
 - **URL** 为完整的 chat-completions 地址，原样 POST，引擎不做任何路径拼接。
 - **API key** 来自环境变量 `<大写名称>_API_KEY`（`venice` →
   `$VENICE_API_KEY`），仅对被模型 slug 实际引用的 provider 强制要求；

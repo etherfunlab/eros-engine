@@ -2039,6 +2039,15 @@ impl ModelConfig {
                         .to_string(),
                 );
             }
+            if name == "voyage" {
+                return Err(
+                    "[providers]: `voyage` is reserved — $VOYAGE_API_KEY already \
+                     belongs to the built-in Voyage embeddings client, so a \
+                     [providers] entry named `voyage` would read the same key. \
+                     Pick another name."
+                        .to_string(),
+                );
+            }
             if name.is_empty()
                 || !name
                     .chars()
@@ -5449,6 +5458,14 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
         assert!(msg.contains("reserved"));
         assert!(msg.contains("OPENROUTER_BASE_URL"));
+    }
+
+    #[test]
+    fn provider_name_voyage_is_reserved() {
+        let cfg = ModelConfig::from_toml_str("[providers]\nvoyage = \"https://x/v1\"\n").unwrap();
+        let msg = cfg.validate_providers_with(no_env).unwrap_err();
+        assert!(msg.contains("reserved"));
+        assert!(msg.contains("VOYAGE_API_KEY"));
     }
 
     #[test]
