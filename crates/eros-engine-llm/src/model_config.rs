@@ -2148,6 +2148,25 @@ impl ModelConfig {
             self.providers[name].validate_headers(name)?;
         }
 
+        // 1.5. [defaults].ignore_providers must carry @openrouter (spec §4): the
+        // knob acts on OpenRouter routing only, and the mandatory suffix makes
+        // that scope part of the syntax.
+        for entry in &self.defaults.ignore_providers {
+            let (bare, provider) = crate::provider::split_model_slug(entry)
+                .map_err(|e| format!("[defaults].ignore_providers: {e}"))?;
+            match provider {
+                Some("openrouter") if !bare.is_empty() => {}
+                _ => {
+                    return Err(format!(
+                        "[defaults].ignore_providers: `{entry}` must be written \
+                         `<upstream-slug>@openrouter` — the exclusion list acts on \
+                         OpenRouter routing only (custom providers and Voyage never \
+                         receive provider.ignore)"
+                    ));
+                }
+            }
+        }
+
         // 2. Literal full scan of every candidate slug.
         let mut slugs: Vec<(String, &str)> = Vec::new();
         if let Some(fb) = self.defaults.fallback_model.as_deref() {
@@ -2242,6 +2261,22 @@ impl ModelConfig {
             .collect()
     }
 
+    /// `[defaults].ignore_providers` with the mandatory `@openrouter` suffix
+    /// stripped — what `provider.ignore` carries on the wire. Call only after
+    /// `validate_providers` passed; entries that fail the grammar are skipped
+    /// (unreachable post-boot).
+    pub fn ignore_provider_wire_slugs(&self) -> Vec<String> {
+        self.defaults
+            .ignore_providers
+            .iter()
+            .filter_map(|e| {
+                crate::provider::split_model_slug(e)
+                    .ok()
+                    .map(|(bare, _)| bare)
+            })
+            .collect()
+    }
+
     /// Reject config blocks for features that were removed, so an operator
     /// upgrading across the removal cannot silently keep a block that no
     /// longer does anything. Loud-fail, same shape as the other boot gates.
@@ -2320,6 +2355,24 @@ impl ModelConfig {
         }
         Ok(out)
     }
+}
+
+/// Parse the generation number out of a bare voyage model id: the numeric
+/// segment (digits and dots) immediately after `voyage-`, ending at the next
+/// `-` or end of string. `None` ⇒ no leading numeric segment (domain-named
+/// models like `voyage-code-3`) or not a single number. Used by the
+/// model_read/model_write boot gate: only the voyage-4 series and above
+/// guarantee one shared vector space across model sizes.
+fn voyage_model_generation(bare_id: &str) -> Option<f64> {
+    let rest = bare_id.strip_prefix("voyage-")?;
+    let segment: &str = rest
+        .split('-')
+        .next()
+        .expect("split always yields at least one element");
+    if segment.is_empty() {
+        return None;
+    }
+    segment.parse::<f64>().ok()
 }
 
 #[cfg(test)]
@@ -4349,14 +4402,14 @@ filter_prompt = "只根据产品资料作答。"
     fn defaults_ignore_providers_parses() {
         let toml = r#"
             [defaults]
-            ignore_providers = ["BadHost", "AnotherHost"]
+            ignore_providers = ["BadHost@openrouter", "AnotherHost@openrouter"]
             [tasks.chat_companion]
             model = "x/y"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert_eq!(
             cfg.defaults.ignore_providers,
-            vec!["BadHost", "AnotherHost"]
+            vec!["BadHost@openrouter", "AnotherHost@openrouter"]
         );
     }
 
@@ -4368,6 +4421,54 @@ filter_prompt = "只根据产品资料作答。"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert!(cfg.defaults.ignore_providers.is_empty());
+    }
+
+    #[test]
+    fn voyage_generation_parses_main_line() {
+        assert_eq!(voyage_model_generation("voyage-4"), Some(4.0));
+        assert_eq!(voyage_model_generation("voyage-4-lite"), Some(4.0));
+        assert_eq!(voyage_model_generation("voyage-4.5-large"), Some(4.5));
+        assert_eq!(voyage_model_generation("voyage-10"), Some(10.0));
+        assert_eq!(voyage_model_generation("voyage-3.5-lite"), Some(3.5));
+    }
+
+    #[test]
+    fn voyage_generation_rejects_unparseable() {
+        assert_eq!(voyage_model_generation("voyage-code-3"), None);
+        assert_eq!(voyage_model_generation("voyage-"), None);
+        assert_eq!(voyage_model_generation("bge-m3"), None);
+        assert_eq!(voyage_model_generation("voyage-4.5.1"), None); // not a single f64
+    }
+
+    #[test]
+    fn ignore_providers_require_openrouter_suffix() {
+        let cfg =
+            ModelConfig::from_toml_str("[defaults]\nignore_providers = [\"bad-slug\"]\n").unwrap();
+        let msg = cfg.validate_providers_with(|_| None).unwrap_err();
+        assert!(
+            msg.contains("@openrouter"),
+            "must teach the new form: {msg}"
+        );
+    }
+
+    #[test]
+    fn ignore_providers_reject_other_provider_suffix() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = { chat = \"https://x/c\" }\n\
+             [defaults]\nignore_providers = [\"bad-slug@venice\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(|_| None).is_err());
+    }
+
+    #[test]
+    fn ignore_providers_wire_slugs_are_stripped() {
+        let cfg = ModelConfig::from_toml_str(
+            "[defaults]\nignore_providers = [\"bad-a@openrouter\", \"bad-b@openrouter\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(|_| None).is_ok());
+        assert_eq!(cfg.ignore_provider_wire_slugs(), vec!["bad-a", "bad-b"]);
     }
 
     #[test]
