@@ -463,7 +463,7 @@ input filter has no triggers, timing, or tiers).
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
-| `embedding` | `EmbeddingRouter::from_config()` at boot (`main.rs`), via `ModelConfig::resolve_embedding()` — routes `embed_query`/`embed_document`/`embed_documents` to native Voyage, the built-in OpenRouter embeddings endpoint, or a custom `[providers]` entry; absent block = native Voyage `voyage-3-lite` (unchanged pre-config behaviour) | live |
+| `embedding` | `EmbeddingRouter::from_config()` at boot (`main.rs`), via `ModelConfig::resolve_embedding()` — routes `embed_query`/`embed_document`/`embed_documents` to native Voyage, the built-in OpenRouter embeddings endpoint, or a custom `[providers]` entry; absent block = native Voyage `voyage-4-lite` | live |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
@@ -693,7 +693,8 @@ config-driven.
 ```toml
 # Single model — read and write use the same backend.
 [tasks.embedding]
-model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
+model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
+# model = "voyage-3-lite"                     # legacy pin (no longer recommended by Voyage)
 # model = "openai/text-embedding-3-small@openrouter"
 # model = "bge-m3@local"                      # third-party, OpenRouter-compatible wire
 
@@ -727,8 +728,12 @@ Routing per suffix, resolved by `ModelConfig::resolve_embedding()`:
   (redundant but harmless — equivalent to `model`). `@openrouter` and
   `@<custom>` refuse to boot on `model_read`/`model_write` (only Voyage
   guarantees a shared vector space across model sizes).
-- `[tasks.embedding]` **absent** ⇒ exactly the pre-config behaviour: native
-  Voyage, `voyage-3-lite`, no dimension parameter on the wire.
+- `[tasks.embedding]` **absent** ⇒ native Voyage with `voyage-4-lite`
+  (`output_dimension: 512` on the wire). Voyage no longer recommends
+  `voyage-3-lite`; a deployment that still needs it must pin it explicitly.
+  Switching models over existing data changes the vector space — old rows
+  are not comparable to new queries — so either pin the old model or
+  re-embed.
 - `model` must be a single fixed string; round-robin, weighted, `fallback`,
   and `tiers` all refuse to boot (mixed/incompatible vector spaces would be
   the result — the `chat_voice` fixed-only precedent).

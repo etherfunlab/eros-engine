@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::LlmError;
 
 const BASE_URL: &str = "https://api.voyageai.com/v1/embeddings";
-const DEFAULT_MODEL: &str = "voyage-3-lite";
+const DEFAULT_MODEL: &str = "voyage-4-lite";
 pub const EMBEDDING_DIM: usize = 512;
 
 /// Voyage models with a FIXED output dimension, where the API's
-/// `output_dimension` parameter must not be sent. voyage-3-lite is the
-/// pre-config-era default (512-dim); keeping the param off its wire keeps
-/// previously shipped configs byte-identical on the wire.
+/// `output_dimension` parameter must not be sent. voyage-3-lite (the
+/// pre-voyage-4-era default, 512-dim, no longer recommended by Voyage) stays
+/// listed so a deployment that pins it keeps its pre-config wire unchanged.
 const FIXED_DIM_MODELS: &[&str] = &["voyage-3-lite"];
 
 #[derive(Clone)]
@@ -302,7 +302,8 @@ mod tests {
             .mount(&server)
             .await;
         let client =
-            VoyageClient::with_base_url("k".into(), format!("{}/v1/embeddings", server.uri()));
+            VoyageClient::with_base_url("k".into(), format!("{}/v1/embeddings", server.uri()))
+                .with_model("voyage-3-lite".into());
         let _ = client
             .embed_document("hello")
             .await

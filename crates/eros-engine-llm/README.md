@@ -9,7 +9,7 @@ External LLM + embedding HTTP clients for the [`eros-engine`](https://github.com
 ## What's in here
 
 - `openrouter` — chat-completion client for [OpenRouter](https://openrouter.ai).
-- `voyage` — embedding client for [Voyage AI](https://voyageai.com) (`voyage-3-lite`, 512-d).
+- `voyage` — embedding client for [Voyage AI](https://voyageai.com) (`voyage-4-lite` default, 512-d).
 - `model_config` — TOML schema mapping logical tasks (chat, summarize, classify, ...) to concrete model slugs. The on-disk schema is frozen for the OSS 0.x line.
 - `error` — `LlmError` for HTTP and parse failures.
 

@@ -599,18 +599,24 @@ filter_prompt = """
 
 # ── Embeddings ───────────────────────────────────────────────────────────────
 # Dimensions are FIXED at 512 (the pgvector schema is VECTOR(512)); there is
-# no dimensions knob. Absent block = built-in Voyage with voyage-3-lite.
+# no dimensions knob. Absent block = built-in Voyage with voyage-4-lite.
 #
 # `model` is a SINGLE fixed id (no round-robin/weighted, no fallback, no
 # tiers — mixed vector spaces are incomparable). A bare id means the native
-# Voyage client ("voyage-3-lite" ≡ "voyage-3-lite@voyage"). Route elsewhere
+# Voyage client ("voyage-4-lite" ≡ "voyage-4-lite@voyage"). Route elsewhere
 # with "@openrouter" (built-in OpenRouter embeddings endpoint) or a custom
 # "[providers]" entry that declares an `embeddings` URL — both speak the
 # OpenRouter-compatible embeddings wire. NOTE: only the native Voyage client
 # distinguishes query vs document embeddings (input_type); routing off
 # Voyage forfeits that optimisation.
+#
+# The legacy voyage-3-lite (no longer recommended by Voyage) is still usable
+# by pinning it here explicitly: model = "voyage-3-lite". Careful when
+# switching models on an existing deployment: rows embedded by the old model
+# are NOT comparable to queries embedded by the new one — pin the old model
+# or re-embed.
 [tasks.embedding]
-model = "voyage-3-lite"
+model = "voyage-4-lite"
 
 # OR split read/write across two models in ONE shared vector space —
 # voyage-4 series and above ONLY (lower series refuse to boot: mixing their

@@ -43,7 +43,7 @@ CREATE INDEX idx_memories_session
 
 ## Embedding
 
-`voyage-3-lite` via Voyage's API. 512 dimensions, multilingual, ~$0.02 per 1M input tokens.
+`voyage-4-lite` via Voyage's API by default (configurable in `[tasks.embedding]`). 512 dimensions, multilingual.
 
 ```rust
 // crates/eros-engine-llm/src/voyage.rs

@@ -405,7 +405,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
-| `embedding` | 启动时的 `EmbeddingRouter::from_config()`（`main.rs`），经由 `ModelConfig::resolve_embedding()`——把 `embed_query`/`embed_document`/`embed_documents` 路由到原生 Voyage、内置 OpenRouter embeddings 端点、或某个 `[providers]` 条目；块缺失 = 原生 Voyage `voyage-3-lite`（与引入配置前的行为一致） | live |
+| `embedding` | 启动时的 `EmbeddingRouter::from_config()`（`main.rs`），经由 `ModelConfig::resolve_embedding()`——把 `embed_query`/`embed_document`/`embed_documents` 路由到原生 Voyage、内置 OpenRouter embeddings 端点、或某个 `[providers]` 条目；块缺失 = 原生 Voyage `voyage-4-lite` | live |
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
@@ -581,7 +581,8 @@ filter_prompt = """
 ```toml
 # 单模型——read 和 write 用同一个后端。
 [tasks.embedding]
-model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
+model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
+# model = "voyage-3-lite"                     # 遗留写法显式钉住（Voyage 官方已不再推荐）
 # model = "openai/text-embedding-3-small@openrouter"
 # model = "bge-m3@local"                      # 第三方，OpenRouter 兼容 wire
 
@@ -614,8 +615,10 @@ model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
   等价于 `model`）。`@openrouter` 和 `@<custom>` 在 `model_read`/
   `model_write` 上会拒绝启动（只有 Voyage 能保证跨模型体量共享一个向量
   空间）。
-- `[tasks.embedding]` **缺失** ⇒ 与引入配置前完全一致的行为：原生
-  Voyage、`voyage-3-lite`、wire 上不带 dimension 参数。
+- `[tasks.embedding]` **缺失** ⇒ 原生 Voyage + `voyage-4-lite`（wire 上带
+  `output_dimension: 512`）。Voyage 官方已不再推荐 `voyage-3-lite`，仍要
+  用它的部署必须在配置里显式钉住。在已有数据上换模型会切换向量空间——
+  旧行与新查询不可比——所以要么钉住旧模型，要么整体重嵌入。
 - `model` 必须是单个固定字符串；round-robin、weighted、`fallback`、
   `tiers` 全部拒绝启动（否则会产生混合/不兼容的向量空间——沿用
   `chat_voice` 仅固定字符串的先例）。

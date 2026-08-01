@@ -43,7 +43,7 @@ CREATE INDEX idx_memories_session
 
 ## Embedding
 
-`voyage-3-lite` 走 Voyage API。512 維、多語言、約每百萬輸入 token $0.02 美元。
+默认 `voyage-4-lite` 走 Voyage API（可在 `[tasks.embedding]` 配置）。512 维、多语言。
 
 ```rust
 // crates/eros-engine-llm/src/voyage.rs

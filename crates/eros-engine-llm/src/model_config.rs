@@ -958,7 +958,7 @@ pub struct ResolvedEmbedding {
     pub write: EmbedTarget,
 }
 
-const DEFAULT_EMBED_MODEL: &str = "voyage-3-lite";
+const DEFAULT_EMBED_MODEL: &str = "voyage-4-lite";
 
 /// Resolved model parameters for an LLM call.
 ///
@@ -2003,7 +2003,10 @@ impl ModelConfig {
 
     /// Pure resolution of `[tasks.embedding]` — call after `validate_providers`
     /// passed. Absent block, or a block with no model fields, resolves to the
-    /// legacy default (native Voyage, voyage-3-lite) on both sides.
+    /// default (native Voyage, voyage-4-lite) on both sides. Deployments that
+    /// need the no-longer-recommended voyage-3-lite must pin it explicitly —
+    /// note the vector-space consequence: rows embedded by one model are not
+    /// comparable to queries embedded by another.
     pub fn resolve_embedding(&self) -> ResolvedEmbedding {
         let task = self.tasks.get("embedding");
         let target = |slug: &str| -> EmbedTarget {
@@ -6459,12 +6462,12 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn resolve_embedding_defaults_to_voyage_3_lite() {
+    fn resolve_embedding_defaults_to_voyage_4_lite() {
         for toml in ["", "[tasks.embedding]\n"] {
             let cfg = ModelConfig::from_toml_str(toml).unwrap();
             let r = cfg.resolve_embedding();
-            assert_eq!(r.read.model, "voyage-3-lite");
-            assert_eq!(r.write.model, "voyage-3-lite");
+            assert_eq!(r.read.model, "voyage-4-lite");
+            assert_eq!(r.write.model, "voyage-4-lite");
             assert!(matches!(r.read.route, EmbedRoute::Voyage));
             assert!(matches!(r.write.route, EmbedRoute::Voyage));
         }

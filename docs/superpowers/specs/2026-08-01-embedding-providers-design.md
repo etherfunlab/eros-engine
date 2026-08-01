@@ -67,9 +67,13 @@ model-keyed tables — carries over unchanged.
   chat endpoint, exactly as in 0.9.3. `@openrouter` becomes a globally valid
   explicit spelling of the same thing.
 - **Bare embedding slugs mean Voyage.** In `[tasks.embedding]`,
-  `"voyage-3-lite"` ≡ `"voyage-3-lite@voyage"`. The default provider flips
+  `"voyage-4-lite"` ≡ `"voyage-4-lite@voyage"`. The default provider flips
   per task family because the incumbent embedding backend is Voyage, not
   OpenRouter.
+- **The default model is `voyage-4-lite`** (post-review amendment,
+  2026-08-01: Voyage no longer recommends `voyage-3-lite`). A deployment
+  that still wants `voyage-3-lite` must pin it explicitly — and switching
+  models over existing data changes the vector space, so pin or re-embed.
 - **`@voyage` is embeddings-only.** A `@voyage` suffix on any non-embedding
   task slug refuses to boot. `voyage` stays undeclarable in `[providers]`
   (its native API is not the OpenRouter-compatible format this mechanism
@@ -138,7 +142,8 @@ headers = { "X-Team" = "companion", "X-Env" = "prod" }
 ```toml
 # Single model — read and write use the same backend.
 [tasks.embedding]
-model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
+model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
+# model = "voyage-3-lite"                     # legacy pin (no longer recommended by Voyage)
 # model = "openai/text-embedding-3-small@openrouter"
 # model = "bge-m3@local"                      # third-party, OpenRouter-compatible wire
 
@@ -165,9 +170,8 @@ Field semantics:
   queries are embedded every turn: a deployment can write with a large
   voyage-4 model and read with a cheap one (or vice versa) inside the one
   shared voyage-4 vector space.
-- `[tasks.embedding]` **absent** ⇒ exactly today's behaviour: native Voyage,
-  `voyage-3-lite`, no dimension parameter on the wire, `$VOYAGE_API_KEY`
-  required.
+- `[tasks.embedding]` **absent** ⇒ native Voyage, `voyage-4-lite`
+  (`output_dimension: 512` on the wire), `$VOYAGE_API_KEY` required.
 - On other `[tasks.embedding]` fields: `temperature`, `max_tokens`, etc.
   remain ignored as today; `fallback` and `tiers` refuse to boot (§6).
 
@@ -275,15 +279,15 @@ enum EmbedBackend {
 
 ### 5.2 `VoyageClient` — consumes the config (tech-debt cleanup)
 
-- Model comes from `[tasks.embedding]` instead of the hard-coded
-  `voyage-3-lite`; the hard-coded default remains only for the
-  block-absent path.
+- Model comes from `[tasks.embedding]` instead of the old hard-coded
+  `voyage-3-lite`; the hard-coded default (`voyage-4-lite` after the §0
+  amendment) remains only for the block-absent path.
 - Sends `output_dimension: 512` on the wire **except** for `voyage-3-lite`,
   which is a fixed-512-dim legacy model (the parameter is unnecessary
-  there, and the exception keeps the previously shipped example config
-  byte-identical on the wire). The exception is a named constant with a
-  comment; implementation verifies the exact parameter-support boundary
-  against the Voyage API docs.
+  there, and the exception keeps a pinned legacy config byte-identical to
+  its pre-config wire). The exception is a named constant with a comment;
+  implementation verifies the exact parameter-support boundary against the
+  Voyage API docs.
 - `input_type` (`"query"` / `"document"`) behaviour is unchanged.
 - Response embeddings are length-checked to 512 before returning
   (a clear `LlmError` instead of a downstream SQL error).
