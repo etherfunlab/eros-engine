@@ -12,7 +12,7 @@ pub struct AppState {
     pub auth: Arc<dyn crate::auth::AuthValidator>,
     pub config: ServerConfig,
     pub openrouter: Arc<eros_engine_llm::openrouter::OpenRouterClient>,
-    pub voyage: Arc<eros_engine_llm::voyage::VoyageClient>,
+    pub embed: Arc<eros_engine_llm::embedding::EmbeddingRouter>,
     pub model_config: Arc<eros_engine_llm::model_config::ModelConfig>,
     /// Compiled `[tasks.chat_companion].output_regex` rules, built once at boot
     /// (fail-fast). Empty when none configured. Read by `drive_chat_burst`.
@@ -196,7 +196,7 @@ pub struct ServerConfig {
     /// How long a `classification_claimed_at` claim is considered fresh.
     /// Older than this and the picker treats it as a crashed worker and
     /// re-claims the row. Should comfortably exceed the worst-case
-    /// processing time (one LLM call + N voyage embeddings).
+    /// processing time (one LLM call + N calls to the embedding router).
     pub dreaming_claim_stale_threshold: Duration,
     /// Top-level keys removed from the `usage` object before it leaves the
     /// engine — both `CompanionReplyResponse.usage` (sync) and the SSE

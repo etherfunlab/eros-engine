@@ -19,7 +19,7 @@
 //!    `companion_insights` pipeline. The schema description constant
 //!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
 //!
-//! Memory-layer "prompts" are not LLM-driven (Voyage embedding only) and
+//! Memory-layer "prompts" are not LLM-driven (the embedding router only) and
 //! so don't live here. Future port targets (dream / proactive) should be
 //! added as new families in this file.
 

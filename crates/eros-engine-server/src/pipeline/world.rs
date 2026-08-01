@@ -351,10 +351,10 @@ async fn direct_world(
     // Batch-embed all fragments in one Voyage call (order-preserving).
     let texts: Vec<&str> = fragments.iter().map(|(_, f)| f.as_str()).collect();
     let embeddings = state
-        .voyage
+        .embed
         .embed_documents(&texts)
         .await
-        .map_err(|e| format!("voyage embed_documents failed: {e}"))?;
+        .map_err(|e| format!("embed_documents failed: {e}"))?;
     let inserts: Vec<FragmentInsert> = fragments
         .into_iter()
         .zip(embeddings)

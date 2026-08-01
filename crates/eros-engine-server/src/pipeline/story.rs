@@ -343,10 +343,10 @@ async fn direct_story(
         Vec::new()
     } else {
         state
-            .voyage
+            .embed
             .embed_documents(&texts)
             .await
-            .map_err(|e| format!("voyage embed_documents failed: {e}"))?
+            .map_err(|e| format!("embed_documents failed: {e}"))?
     };
     let inserts: Vec<StoryEventInsert> = events
         .into_iter()
@@ -510,12 +510,13 @@ mod tests {
 
     // NOTE: both integration tests below mock `world_stories_director` with an
     // EMPTY `events: []` array. The runner's `texts.is_empty()` guard in
-    // `direct_story` then skips the Voyage call entirely (mirrors world.rs's
+    // `direct_story` then skips the embedding call entirely (mirrors world.rs's
     // `direct_world_persists_seed_and_digests_without_fragments`, which dodges
-    // Voyage the same way via empty script_fragments). `test_state`'s default
-    // `VoyageClient::new("stub")` is kept and never invoked — `VoyageClient`
-    // has no `with_base_url` constructor to mock against (only `new`), unlike
-    // `OpenRouterClient`, which does and is wiremocked normally below.
+    // the embedding router the same way via empty script_fragments). `test_state`'s
+    // default embedding router resolves to the built-in Voyage backend and is
+    // kept but never invoked — `VoyageClient` has no `with_base_url` constructor
+    // to mock against (only `new`), unlike `OpenRouterClient`, which does and is
+    // wiremocked normally below.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn direct_story_persists_full_round(pool: sqlx::PgPool) {
         use wiremock::matchers::{method, path as wm_path};

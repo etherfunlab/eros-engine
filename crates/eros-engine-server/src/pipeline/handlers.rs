@@ -313,10 +313,10 @@ async fn recall_memory(
     if (!x_on && !y_on) || query_text.trim().is_empty() {
         return (vec![], vec![], None);
     }
-    let embedding = match state.voyage.embed_query(query_text).await {
+    let embedding = match state.embed.embed_query(query_text).await {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!("voyage embed_query failed: {e}");
+            tracing::warn!("embed_query failed: {e}");
             return (vec![], vec![], None);
         }
     };

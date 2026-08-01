@@ -17,9 +17,9 @@
 use uuid::Uuid;
 
 use eros_engine_core::types::{ActionPlan, ActionType, Event};
+use eros_engine_llm::embedding::EmbeddingRouter;
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
-use eros_engine_llm::voyage::VoyageClient;
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::HumanInsightRepo;
@@ -318,7 +318,7 @@ async fn write_turn(
     let rel_content = relationship_memory_content(user_msg);
     if let Err(e) = embed_and_upsert(
         &repo,
-        &state.voyage,
+        &state.embed,
         MemoryLayer::Relationship,
         session_id,
         user_id,
@@ -334,7 +334,7 @@ async fn write_turn(
     if !user_msg.trim().is_empty() {
         if let Err(e) = embed_and_upsert(
             &repo,
-            &state.voyage,
+            &state.embed,
             MemoryLayer::Profile,
             session_id,
             user_id,
@@ -350,7 +350,7 @@ async fn write_turn(
 
 async fn embed_and_upsert(
     repo: &MemoryRepo<'_>,
-    voyage: &VoyageClient,
+    embed: &EmbeddingRouter,
     layer: MemoryLayer,
     session_id: Uuid,
     user_id: Uuid,
@@ -360,10 +360,10 @@ async fn embed_and_upsert(
     if content.trim().is_empty() {
         return Ok(());
     }
-    let embedding = voyage
+    let embedding = embed
         .embed_document(content)
         .await
-        .map_err(|e| format!("voyage embed failed: {e}"))?;
+        .map_err(|e| format!("embed failed: {e}"))?;
     // category=None: this writer dumps raw turns. The classifier extraction
     // step (future) will write its own rows with category populated.
     repo.upsert(

@@ -239,7 +239,7 @@ async fn classify_session(
         }
         let category = normalise_category(&cand.category);
         let metadata = candidate_metadata(cand);
-        match state.voyage.embed_document(trimmed).await {
+        match state.embed.embed_document(trimmed).await {
             Ok(embedding) => {
                 if let Err(e) = repo
                     .upsert(
@@ -260,7 +260,7 @@ async fn classify_session(
                 }
             }
             Err(e) => {
-                tracing::warn!(%session_id, "dreaming: voyage embed failed: {e}");
+                tracing::warn!(%session_id, "dreaming: embed failed: {e}");
             }
         }
     }

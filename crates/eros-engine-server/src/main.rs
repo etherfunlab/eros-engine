@@ -213,16 +213,6 @@ async fn run_server() -> Result<()> {
 
     let openrouter_key =
         std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
-    let voyage_key = std::env::var("VOYAGE_API_KEY").context("VOYAGE_API_KEY is required")?;
-    if voyage_key.trim().is_empty() {
-        // Loud-fail vs gateway's silent-skip. The gateway has a known
-        // regression where an empty VOYAGE_API_KEY silently disables
-        // embeddings; we refuse to boot rather than carry that footgun.
-        anyhow::bail!(
-            "VOYAGE_API_KEY is empty — eros-engine refuses to boot rather than silently disable embeddings"
-        );
-    }
-    let voyage = Arc::new(eros_engine_llm::voyage::VoyageClient::new(voyage_key));
 
     // Auth: prefer JWKS (asymmetric, the post-2025 Supabase default) and
     // fall back to a legacy HS256 shared secret if one is configured. At
@@ -316,6 +306,14 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Embedding routing (spec 2026-08-01): read/write backends resolved from
+    // [tasks.embedding] + [providers]. validate_providers has already gated
+    // every failure mode; from_config re-checks keys defensively.
+    let embed = Arc::new(
+        eros_engine_llm::embedding::EmbeddingRouter::from_config(&model_config)
+            .map_err(|e| anyhow::anyhow!("embedding router construction failed: {e}"))?,
+    );
+
     if let Err(msg) = model_config.validate_removed_tasks() {
         anyhow::bail!(msg);
     }
@@ -376,7 +374,7 @@ async fn run_server() -> Result<()> {
         auth,
         config: cfg.clone(),
         openrouter,
-        voyage,
+        embed,
         model_config,
         output_regex,
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
