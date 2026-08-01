@@ -585,11 +585,18 @@ impl OpenRouterClient {
     /// `LlmError::Config`, which advances the caller's candidate chain
     /// instead of panicking (unreachable for config slugs post-boot, but
     /// `execute_stream_as` receives arbitrary server strings).
+    ///
+    /// `openrouter` is a reserved alias for "no suffix" (spec §3/§4): a slug
+    /// suffixed `@openrouter` must be byte-for-byte equivalent to the same
+    /// slug with no suffix at all — built-in endpoint, attributed `http`
+    /// client, full OpenRouter wire, no `[providers]` lookup. It is handled
+    /// in THIS arm, not `Some(p)`, precisely so it never falls into the
+    /// custom-provider path (plain client, stripped wire, audit suffix).
     fn resolve_endpoint<'s>(&'s self, slug: &str) -> Result<(String, Endpoint<'s>), LlmError> {
         let (bare, provider) = crate::provider::split_model_slug(slug)
             .map_err(|e| LlmError::Config(format!("openrouter: {e}")))?;
         match provider {
-            None => {
+            None | Some("openrouter") => {
                 if self.api_key.is_empty() {
                     return Err(LlmError::Config("openrouter: api key not set".into()));
                 }
@@ -2752,6 +2759,114 @@ data: [DONE]\n\n";
         let (bare, ep) = c.resolve_endpoint("weird\\@vendor/m").unwrap();
         assert_eq!(bare, "weird@vendor/m");
         assert!(ep.name.is_none());
+    }
+
+    #[test]
+    fn resolve_at_openrouter_suffix_matches_no_suffix() {
+        // Critical-finding regression (spec §3/§4): `@openrouter` must be
+        // byte-for-byte equivalent to no suffix at all — built-in endpoint,
+        // no `[providers]` lookup. `client_with_venice` declares ONLY
+        // `venice`, no `openrouter` entry, so a resolution that (bugly)
+        // fell through to the `Some(p)` custom-provider arm would fail here
+        // with "names undeclared provider `openrouter`" — this test proves
+        // it does not.
+        let c = client_with_venice();
+        let (bare_plain, ep_plain) = c.resolve_endpoint("x-ai/grok-4.20").unwrap();
+        let (bare_alias, ep_alias) = c.resolve_endpoint("x-ai/grok-4.20@openrouter").unwrap();
+        assert_eq!(bare_alias, bare_plain);
+        assert_eq!(ep_alias.url, ep_plain.url);
+        assert_eq!(ep_alias.api_key, ep_plain.api_key);
+        assert!(ep_alias.name.is_none());
+        assert!(ep_alias.headers.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_at_openrouter_suffix_hits_built_in_endpoint_full_wire() {
+        // Critical-finding regression test: `@openrouter` on a chat slug must
+        // resolve through the SAME path as no suffix (spec §3/§4) — built-in
+        // endpoint, full OpenRouter wire (provider.ignore included), bare
+        // model on the wire — never the custom-provider subset. No
+        // `[providers]` map is installed at all, proving the alias needs no
+        // `[providers].openrouter` entry to work.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        )
+        .with_ignore_providers(vec!["bad".into()]);
+        let _ = client
+            .execute(ChatRequest {
+                model: "test/model@openrouter".into(),
+                fallback_model: Vec::new(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                temperature: 0.0,
+                max_tokens: 16,
+                ..Default::default()
+            })
+            .await
+            .expect("call succeeds");
+
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["model"], "test/model",
+            "wire model must be the bare id — the @openrouter suffix must not reach the wire"
+        );
+        assert_eq!(
+            body["provider"]["ignore"][0], "bad",
+            "provider.ignore must be present — proves the full wire, not the custom subset"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_as_openrouter_suffix_hits_built_in_endpoint() {
+        // Cheap parallel to the execute() alias-equivalence test above, on
+        // the streaming path — same resolve_endpoint fix, same assertions.
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        )
+        .with_ignore_providers(vec!["bad".into()]);
+        let req = ChatRequest {
+            model: String::new(), // placeholder; execute_stream_as takes the model separately
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let mut s = client
+            .execute_stream_as(&req, "test/model@openrouter")
+            .await
+            .expect("stream opens");
+        use futures_util::StreamExt as _;
+        while s.next().await.is_some() {}
+
+        let r = &server.received_requests().await.unwrap()[0];
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["model"], "test/model");
+        assert_eq!(body["provider"]["ignore"][0], "bad");
     }
 
     #[test]
