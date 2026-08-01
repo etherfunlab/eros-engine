@@ -4852,7 +4852,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -4951,7 +4950,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5063,7 +5061,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5213,7 +5210,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5347,7 +5343,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5451,7 +5446,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5561,7 +5555,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5743,7 +5736,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -5892,7 +5884,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6046,7 +6037,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6365,7 +6355,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6491,7 +6480,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6630,7 +6618,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6784,7 +6771,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6900,7 +6886,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -6997,7 +6982,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7106,7 +7090,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7217,7 +7200,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7347,7 +7329,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7550,7 +7531,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7696,7 +7676,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7804,7 +7783,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -7983,7 +7961,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -8146,7 +8123,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -8290,7 +8266,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -8436,7 +8411,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -8684,7 +8658,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -8875,7 +8848,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9001,7 +8973,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9137,7 +9108,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9291,7 +9261,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9418,7 +9387,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9528,7 +9496,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9682,7 +9649,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9797,7 +9763,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -9925,7 +9890,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -10234,7 +10198,6 @@ data: [DONE]\n\n";
 
         let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
             "k".into(),
-            eros_engine_llm::openrouter::AppAttribution::default(),
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
@@ -10259,7 +10222,6 @@ data: [DONE]\n\n";
 
         let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
             "k".into(),
-            eros_engine_llm::openrouter::AppAttribution::default(),
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
@@ -10348,7 +10310,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -10512,7 +10473,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -10703,7 +10663,6 @@ data: [DONE]\n\n"
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -10905,7 +10864,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -11091,7 +11049,6 @@ data: [DONE]\n\n";
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -11291,7 +11248,6 @@ data: [DONE]\n\n"
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -11537,7 +11493,6 @@ data: [DONE]\n\n"
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );

@@ -213,17 +213,6 @@ async fn run_server() -> Result<()> {
 
     let openrouter_key =
         std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is required")?;
-    let attribution = eros_engine_llm::openrouter::AppAttribution {
-        referer: std::env::var("OPENROUTER_APP_REFERER")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        title: std::env::var("OPENROUTER_APP_TITLE")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        categories: std::env::var("OPENROUTER_APP_CATEGORIES")
-            .ok()
-            .filter(|s| !s.is_empty()),
-    };
     let voyage_key = std::env::var("VOYAGE_API_KEY").context("VOYAGE_API_KEY is required")?;
     if voyage_key.trim().is_empty() {
         // Loud-fail vs gateway's silent-skip. The gateway has a known
@@ -364,18 +353,15 @@ async fn run_server() -> Result<()> {
 
     // OpenRouter client is constructed after model_config so we can wire in the
     // global provider routing prefs from [defaults] (exclusion list + optional
-    // sort) and the [providers] endpoint map. OPENROUTER_BASE_URL (optional)
-    // overrides the built-in endpoint; empty counts as unset, matching the
-    // OPENROUTER_APP_* convention above.
+    // sort), the [providers] endpoint map, and the [providers].openrouter
+    // entry (chat URL override + default headers, replacing the old
+    // OPENROUTER_BASE_URL / OPENROUTER_APP_* env vars).
     let openrouter = Arc::new(
-        eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key, attribution)
-            .with_openrouter_base_url(
-                std::env::var("OPENROUTER_BASE_URL")
-                    .ok()
-                    .filter(|s| !s.is_empty()),
-            )
+        eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key)
+            .with_openrouter_chat_url(model_config.openrouter_chat_url())
+            .with_openrouter_headers(model_config.openrouter_header_map())
             .with_providers(model_config.build_providers())
-            .with_ignore_providers(model_config.defaults.ignore_providers.clone())
+            .with_ignore_providers(model_config.ignore_provider_wire_slugs())
             .with_provider_sort(model_config.defaults.provider_sort.clone()),
     );
 

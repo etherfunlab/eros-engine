@@ -435,7 +435,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -546,7 +545,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -676,7 +674,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -808,7 +805,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -930,7 +926,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -1047,7 +1042,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -1167,7 +1161,6 @@ data: [DONE]\n\n";
         state.openrouter = Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );

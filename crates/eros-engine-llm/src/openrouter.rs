@@ -55,15 +55,6 @@ where
     })
 }
 
-/// OpenRouter app-attribution header names. Pinned to the current
-/// `https://openrouter.ai/docs/app-attribution` spec. If OpenRouter
-/// renames either header in the future, update the value here; today's
-/// names become legacy and (if a transition window applies) get added as
-/// a parallel alias below.
-const HEADER_REFERER: &str = "HTTP-Referer";
-const HEADER_TITLE: &str = "X-OpenRouter-Title";
-const HEADER_CATEGORIES: &str = "X-OpenRouter-Categories";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -450,25 +441,6 @@ struct WireStreamFrame {
     error: Option<WireStreamError>,
 }
 
-/// App-Attribution headers sent on every outbound OpenRouter call.
-/// Skipping `None` fields avoids emitting blank-but-set headers, which
-/// OpenRouter would record as a real attribution. Both `None` reverts
-/// to today's no-header behaviour.
-#[derive(Debug, Clone, Default)]
-pub struct AppAttribution {
-    /// Sent as `HTTP-Referer`. Identifies the deploying app to OpenRouter.
-    pub referer: Option<String>,
-    /// Sent as `X-OpenRouter-Title`. Display name in OpenRouter's app
-    /// analytics. (OpenRouter also accepts the legacy `X-Title` alias; we
-    /// send the current canonical name.)
-    pub title: Option<String>,
-    /// Sent as `X-OpenRouter-Categories`. Comma-separated marketplace
-    /// categories for OpenRouter's app directory. Passed through verbatim;
-    /// OpenRouter silently ignores unrecognised values, so the engine does
-    /// no validation. Only takes effect when paired with `referer`.
-    pub categories: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct OpenRouterClient {
     http: reqwest::Client,
@@ -486,18 +458,19 @@ pub struct OpenRouterClient {
     /// installed at boot via [`OpenRouterClient::with_providers`]. Arc so the
     /// client's Clone stays cheap.
     providers: Arc<HashMap<String, crate::provider::ProviderEndpoint>>,
-    /// HTTP client WITHOUT the OpenRouter attribution default-headers, used
-    /// for every custom-provider post. The three attribution headers are
-    /// baked into `http` at construction and cannot be withdrawn per-request
-    /// (spec §3); same connect/pool bounds as `http`.
+    /// HTTP client WITHOUT the `[providers].openrouter.headers` default
+    /// headers, used for every custom-provider post. Those default headers
+    /// are baked into `http` at boot via [`OpenRouterClient::with_openrouter_headers`]
+    /// and cannot be withdrawn per-request; custom `[providers]` endpoints
+    /// instead carry their own declared headers per-request (spec §3). Same
+    /// connect/pool bounds as `http`.
     plain_http: reqwest::Client,
 }
 
 impl OpenRouterClient {
-    /// Production constructor. Pins to OpenRouter's canonical URL and
-    /// bakes attribution headers into the shared reqwest client at boot.
-    pub fn new(api_key: String, attribution: AppAttribution) -> Self {
-        Self::with_base_url(api_key, attribution, BASE_URL.to_string())
+    /// Production constructor. Pins to OpenRouter's canonical URL.
+    pub fn new(api_key: String) -> Self {
+        Self::with_base_url(api_key, BASE_URL.to_string())
     }
 
     /// Low-level constructor that lets callers override the OpenRouter
@@ -505,50 +478,15 @@ impl OpenRouterClient {
     /// downstream) that wire a wiremock or fake server in front of the
     /// client. Production code should use `new`, which pins to OpenRouter's
     /// canonical URL.
-    pub fn with_base_url(api_key: String, attribution: AppAttribution, base_url: String) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(ref referer) = attribution.referer {
-            match reqwest::header::HeaderValue::from_str(referer) {
-                Ok(v) => {
-                    headers.insert(HEADER_REFERER, v);
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    header = HEADER_REFERER,
-                    "openrouter: dropping invalid attribution value"
-                ),
-            }
-        }
-        if let Some(ref title) = attribution.title {
-            match reqwest::header::HeaderValue::from_str(title) {
-                Ok(v) => {
-                    headers.insert(HEADER_TITLE, v);
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    header = HEADER_TITLE,
-                    "openrouter: dropping invalid attribution value"
-                ),
-            }
-        }
-        if let Some(ref categories) = attribution.categories {
-            match reqwest::header::HeaderValue::from_str(categories) {
-                Ok(v) => {
-                    headers.insert(HEADER_CATEGORIES, v);
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    header = HEADER_CATEGORIES,
-                    "openrouter: dropping invalid attribution value"
-                ),
-            }
-        }
+    pub fn with_base_url(api_key: String, base_url: String) -> Self {
+        // http and plain_http start identical; with_openrouter_headers
+        // rebuilds `http` with default headers when the config declares any.
+        //
         // connect/pool bounds only — deliberately NO global `.timeout()` or
         // client-level read timeout: both would also bound non-streaming calls
         // (image generation legitimately spends its whole wall-time before the
         // first body byte). Stream liveness is `idle_bounded`'s job.
         let http = reqwest::Client::builder()
-            .default_headers(headers)
             .connect_timeout(CONNECT_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
@@ -569,8 +507,33 @@ impl OpenRouterClient {
         }
     }
 
+    /// Install `[providers].openrouter.headers` as default headers on the
+    /// built-in-endpoint client. Consuming builder, boot-chained. `plain_http`
+    /// (custom providers) is untouched — their headers ride per-request.
+    pub fn with_openrouter_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
+        if !headers.is_empty() {
+            self.http = reqwest::Client::builder()
+                .default_headers(headers)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .build()
+                .expect("reqwest client build never fails with static config");
+        }
+        self
+    }
+
+    /// Override the built-in chat URL from `[providers].openrouter.chat`.
+    /// `None` keeps the pinned default. Replaces the removed
+    /// OPENROUTER_BASE_URL env var.
+    pub fn with_openrouter_chat_url(mut self, url: Option<String>) -> Self {
+        if let Some(u) = url {
+            self.base_url = u;
+        }
+        self
+    }
+
     /// Set the global provider-exclusion list (issue #84). Consuming builder so
-    /// boot can chain it: `OpenRouterClient::new(key, attr).with_ignore_providers(list)`.
+    /// boot can chain it: `OpenRouterClient::new(key).with_ignore_providers(list)`.
     /// Sent as `provider.ignore` on every outbound call.
     pub fn with_ignore_providers(mut self, providers: Vec<String>) -> Self {
         self.ignore_providers = providers;
@@ -596,28 +559,22 @@ impl OpenRouterClient {
         self.providers = Arc::new(providers);
         self
     }
-
-    /// Override the built-in OpenRouter endpoint (the OPENROUTER_BASE_URL env
-    /// var). `None` keeps the pinned default. NOTE: distinct from the
-    /// `with_base_url` CONSTRUCTOR above, which tests use — this is a
-    /// consuming builder for boot.
-    pub fn with_openrouter_base_url(mut self, url: Option<String>) -> Self {
-        if let Some(u) = url {
-            self.base_url = u;
-        }
-        self
-    }
 }
 
 /// A resolved posting target: where one candidate's request goes.
-/// `name: None` ⇒ the built-in OpenRouter endpoint (attribution headers,
-/// full wire); `Some(name)` ⇒ a `[providers]` entry (plain client, strict
+/// `name: None` ⇒ the built-in OpenRouter endpoint (config-driven default
+/// headers ride on `http`, full wire); `Some(name)` ⇒ a `[providers]` entry
+/// (plain client, its own declared headers threaded per-request, strict
 /// OpenAI wire subset, audit model suffixed `@name`).
 struct Endpoint<'a> {
     url: &'a str,
     api_key: &'a str,
     http: &'a reqwest::Client,
     name: Option<&'a str>,
+    /// `None` for the built-in endpoint (default headers already ride on
+    /// `http`); `Some(&ep.headers)` for a custom `[providers]` endpoint,
+    /// applied per-request since `plain_http` carries no default headers.
+    headers: Option<&'a reqwest::header::HeaderMap>,
 }
 
 impl OpenRouterClient {
@@ -643,6 +600,7 @@ impl OpenRouterClient {
                         api_key: &self.api_key,
                         http: &self.http,
                         name: None,
+                        headers: None,
                     },
                 ))
             }
@@ -664,6 +622,7 @@ impl OpenRouterClient {
                         api_key: &ep.api_key,
                         http: &self.plain_http,
                         name: Some(name.as_str()),
+                        headers: Some(&ep.headers),
                     },
                 ))
             }
@@ -836,14 +795,11 @@ impl OpenRouterClient {
                 // it back out here, mirroring `WireRequest::for_endpoint`.
                 strip_openrouter_vision_fields(&mut body);
             }
-            let resp = match ep
-                .http
-                .post(ep.url)
-                .bearer_auth(ep.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
+            let mut builder = ep.http.post(ep.url).bearer_auth(ep.api_key);
+            if let Some(h) = ep.headers {
+                builder = builder.headers(h.clone());
+            }
+            let resp = match builder.json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
@@ -974,13 +930,11 @@ impl OpenRouterClient {
         }
         .for_endpoint(&ep);
 
-        let resp = ep
-            .http
-            .post(ep.url)
-            .bearer_auth(ep.api_key)
-            .json(&wire)
-            .send()
-            .await?;
+        let mut builder = ep.http.post(ep.url).bearer_auth(ep.api_key);
+        if let Some(h) = ep.headers {
+            builder = builder.headers(h.clone());
+        }
+        let resp = builder.json(&wire).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1097,14 +1051,15 @@ impl OpenRouterClient {
         .for_endpoint(&ep);
 
         let started = std::time::Instant::now();
-        let resp = ep
+        let mut builder = ep
             .http
             .post(ep.url)
             .bearer_auth(ep.api_key)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&wire)
-            .send()
-            .await?;
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Some(h) = ep.headers {
+            builder = builder.headers(h.clone());
+        }
+        let resp = builder.json(&wire).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1232,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_sends_app_attribution_headers_when_set() {
+    async fn client_sends_configured_openrouter_headers() {
         let server = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .and(header("HTTP-Referer", "https://eros.example"))
@@ -1241,16 +1196,18 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("HTTP-Referer", "https://eros.example".parse().unwrap());
+        headers.insert("X-OpenRouter-Title", "Eros".parse().unwrap());
+        headers.insert(
+            "X-OpenRouter-Categories",
+            "roleplay,general-chat".parse().unwrap(),
+        );
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution {
-                referer: Some("https://eros.example".into()),
-                title: Some("Eros".into()),
-                categories: Some("roleplay,general-chat".into()),
-            },
             format!("{}/api/v1/chat/completions", server.uri()),
-        );
+        )
+        .with_openrouter_headers(headers);
         let _ = client
             .execute(ChatRequest {
                 model: "test/model".into(),
@@ -1265,7 +1222,6 @@ mod tests {
             })
             .await
             .expect("call succeeds");
-
         // Categories is checked on the raw received value rather than via
         // wiremock's `header` matcher: that matcher splits the received value
         // on commas, so a comma-joined string would never compare equal. We
@@ -1275,14 +1231,11 @@ mod tests {
             .iter()
             .find_map(|r| r.headers.get("x-openrouter-categories"))
             .expect("X-OpenRouter-Categories header present");
-        assert_eq!(
-            categories.to_str().expect("header is valid utf-8"),
-            "roleplay,general-chat"
-        );
+        assert_eq!(categories.to_str().unwrap(), "roleplay,general-chat");
     }
 
     #[tokio::test]
-    async fn client_omits_app_attribution_headers_when_default() {
+    async fn client_omits_headers_when_none_configured() {
         let server = MockServer::start().await;
         Mock::given(path("/api/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
@@ -1292,7 +1245,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let _ = client
@@ -1327,26 +1279,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_drops_invalid_attribution_value() {
+    async fn custom_provider_receives_declared_headers_only() {
         let server = MockServer::start().await;
-        Mock::given(path("/api/v1/chat/completions"))
+        Mock::given(path("/v1/chat/completions"))
+            .and(header("X-Team", "companion"))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
             .expect(1)
             .mount(&server)
             .await;
-
-        let client = OpenRouterClient::with_base_url(
-            "test-key".into(),
-            AppAttribution {
-                referer: Some("bad\nvalue".into()),
-                title: Some("also\rbad".into()),
-                categories: Some("still\nbad".into()),
+        let mut ep_headers = reqwest::header::HeaderMap::new();
+        ep_headers.insert("X-Team", "companion".parse().unwrap());
+        let mut providers = HashMap::new();
+        providers.insert(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/v1/chat/completions", server.uri()),
+                api_key: "vk".into(),
+                headers: ep_headers,
             },
-            format!("{}/api/v1/chat/completions", server.uri()),
         );
+        let client = OpenRouterClient::with_base_url("test-key".into(), "http://unused/".into())
+            .with_providers(providers);
         let _ = client
             .execute(ChatRequest {
-                model: "test/model".into(),
+                model: "some-model@venice".into(),
                 fallback_model: Vec::new(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
@@ -1357,22 +1313,7 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("call succeeds despite dropped header");
-
-        for req in server.received_requests().await.unwrap_or_default() {
-            assert!(
-                req.headers.get("http-referer").is_none(),
-                "HTTP-Referer must be dropped"
-            );
-            assert!(
-                req.headers.get("x-openrouter-title").is_none(),
-                "X-OpenRouter-Title must be dropped"
-            );
-            assert!(
-                req.headers.get("x-openrouter-categories").is_none(),
-                "X-OpenRouter-Categories must be dropped"
-            );
-        }
+            .expect("call succeeds");
     }
 
     #[test]
@@ -1497,7 +1438,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -1537,7 +1477,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -1583,7 +1522,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -1633,7 +1571,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -1664,7 +1601,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -1811,7 +1747,6 @@ mod tests {
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -1860,7 +1795,6 @@ mod tests {
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -1896,7 +1830,6 @@ mod tests {
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -1925,7 +1858,6 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -1972,7 +1904,6 @@ mod tests {
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -2023,7 +1954,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
 
@@ -2092,7 +2022,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
 
@@ -2141,7 +2070,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -2275,7 +2203,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let mut stream = client
@@ -2352,7 +2279,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let mut stream = client
@@ -2406,7 +2332,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let mut stream = client
@@ -2449,7 +2374,6 @@ data: [DONE]\n\n";
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let req = ChatRequest {
@@ -2484,24 +2408,17 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        let client = OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution {
-                referer: Some("https://eros.example".into()),
-                title: Some("Eros".into()),
-                categories: None,
-            },
-            "https://unused.test/v1".into(),
-        )
-        .with_ignore_providers(vec!["bad".into()])
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: format!("{}/v1/chat/completions", server_b.uri()),
-                api_key: "v-key".into(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]));
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_ignore_providers(vec!["bad".into()])
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                    },
+                )]));
         let req = ChatRequest {
             model: String::new(), // placeholder; execute_stream_as takes the model separately
             messages: vec![ChatMessage {
@@ -2558,7 +2475,6 @@ data: [DONE]\n\n";
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let mut stream = client
@@ -2603,7 +2519,6 @@ data: [DONE]\n\n";
             .await;
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let mut stream = client
@@ -2764,12 +2679,8 @@ data: [DONE]\n\n";
 
     #[test]
     fn with_ignore_providers_sets_prefs() {
-        let c = OpenRouterClient::with_base_url(
-            "k".into(),
-            AppAttribution::default(),
-            "http://localhost".into(),
-        )
-        .with_ignore_providers(vec!["BadHost".into()]);
+        let c = OpenRouterClient::with_base_url("k".into(), "http://localhost".into())
+            .with_ignore_providers(vec!["BadHost".into()]);
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
         assert!(prefs.sort.is_none());
@@ -2778,33 +2689,21 @@ data: [DONE]\n\n";
     #[test]
     fn with_provider_sort_sets_prefs_and_composes_with_ignore() {
         // sort alone → prefs present.
-        let c = OpenRouterClient::with_base_url(
-            "k".into(),
-            AppAttribution::default(),
-            "http://localhost".into(),
-        )
-        .with_provider_sort(Some("throughput".into()));
+        let c = OpenRouterClient::with_base_url("k".into(), "http://localhost".into())
+            .with_provider_sort(Some("throughput".into()));
         let prefs = c.provider_prefs().expect("prefs present for sort-only");
         assert_eq!(prefs.sort, Some("throughput"));
         assert!(prefs.ignore.is_empty());
 
         // empty string sort → treated as unset (no prefs when nothing else set).
-        let c = OpenRouterClient::with_base_url(
-            "k".into(),
-            AppAttribution::default(),
-            "http://localhost".into(),
-        )
-        .with_provider_sort(Some(String::new()));
+        let c = OpenRouterClient::with_base_url("k".into(), "http://localhost".into())
+            .with_provider_sort(Some(String::new()));
         assert!(c.provider_prefs().is_none(), "empty sort is unset");
 
         // ignore + sort compose into one prefs object.
-        let c = OpenRouterClient::with_base_url(
-            "k".into(),
-            AppAttribution::default(),
-            "http://localhost".into(),
-        )
-        .with_ignore_providers(vec!["BadHost".into()])
-        .with_provider_sort(Some("latency".into()));
+        let c = OpenRouterClient::with_base_url("k".into(), "http://localhost".into())
+            .with_ignore_providers(vec!["BadHost".into()])
+            .with_provider_sort(Some("latency".into()));
         let prefs = c.provider_prefs().expect("prefs present");
         assert_eq!(prefs.ignore, ["BadHost"]);
         assert_eq!(prefs.sort, Some("latency"));
@@ -2813,19 +2712,15 @@ data: [DONE]\n\n";
     // ---- multi-provider routing: resolve_endpoint (spec §3) ----
 
     fn client_with_venice() -> OpenRouterClient {
-        OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution::default(),
-            "https://openrouter.test/v1".into(),
-        )
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: "https://venice.test/v1/chat/completions".into(),
-                api_key: "v-key".into(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]))
+        OpenRouterClient::with_base_url("or-key".into(), "https://openrouter.test/v1".into())
+            .with_providers(std::collections::HashMap::from([(
+                "venice".to_string(),
+                crate::provider::ProviderEndpoint {
+                    base_url: "https://venice.test/v1/chat/completions".into(),
+                    api_key: "v-key".into(),
+                    headers: reqwest::header::HeaderMap::new(),
+                },
+            )]))
     }
 
     #[test]
@@ -2868,29 +2763,22 @@ data: [DONE]\n\n";
     #[test]
     fn resolve_empty_openrouter_key_still_guards() {
         // The old head-of-method guard moved here; same error, same wording.
-        let c = OpenRouterClient::with_base_url(
-            String::new(),
-            AppAttribution::default(),
-            "https://openrouter.test/v1".into(),
-        );
+        let c = OpenRouterClient::with_base_url(String::new(), "https://openrouter.test/v1".into());
         assert!(matches!(c.resolve_endpoint("m"), Err(LlmError::Config(_))));
     }
 
     #[test]
     fn resolve_empty_custom_key_guards() {
-        let c = OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution::default(),
-            "https://openrouter.test/v1".into(),
-        )
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: "https://venice.test/v1".into(),
-                api_key: String::new(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]));
+        let c =
+            OpenRouterClient::with_base_url("or-key".into(), "https://openrouter.test/v1".into())
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: "https://venice.test/v1".into(),
+                        api_key: String::new(),
+                        headers: reqwest::header::HeaderMap::new(),
+                    },
+                )]));
         assert!(matches!(
             c.resolve_endpoint("m@venice"),
             Err(LlmError::Config(_))
@@ -2898,13 +2786,13 @@ data: [DONE]\n\n";
     }
 
     #[test]
-    fn with_openrouter_base_url_overrides_and_none_keeps() {
-        let c = client_with_venice().with_openrouter_base_url(Some("https://proxy.test/v1".into()));
+    fn with_openrouter_chat_url_overrides_and_none_keeps() {
+        let c = client_with_venice().with_openrouter_chat_url(Some("https://proxy.test/v1".into()));
         assert_eq!(
             c.resolve_endpoint("m").unwrap().1.url,
             "https://proxy.test/v1"
         );
-        let c2 = client_with_venice().with_openrouter_base_url(None);
+        let c2 = client_with_venice().with_openrouter_chat_url(None);
         assert_eq!(
             c2.resolve_endpoint("m").unwrap().1.url,
             "https://openrouter.test/v1"
@@ -2944,7 +2832,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -2989,7 +2876,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -3043,7 +2929,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -3084,7 +2969,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -3128,7 +3012,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let err = client
@@ -3173,7 +3056,6 @@ data: [DONE]\n\n";
 
         let client = OpenRouterClient::with_base_url(
             "test-key".into(),
-            AppAttribution::default(),
             format!("{}/api/v1/chat/completions", server.uri()),
         );
         let resp = client
@@ -3213,20 +3095,17 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        let client = OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution::default(),
-            "https://unused.test/v1".into(),
-        )
-        .with_ignore_providers(vec!["bad".into()]) // would inject body["provider"] on OpenRouter
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: format!("{}/v1/chat/completions", server_b.uri()),
-                api_key: "v-key".into(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]));
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_ignore_providers(vec!["bad".into()]) // would inject body["provider"] on OpenRouter
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                    },
+                )]));
         let resp = client
             .execute_vision(VisionRequest {
                 model: "vis@venice".into(),
@@ -3365,6 +3244,7 @@ data: [DONE]\n\n";
             api_key: "k",
             http: &http,
             name: Some("venice"),
+            headers: None,
         };
         let wire = WireRequest {
             model: "m",
@@ -3463,6 +3343,7 @@ data: [DONE]\n\n";
             api_key: "k",
             http: &http,
             name: None,
+            headers: None,
         };
         let wire = WireRequest {
             model: "m",
@@ -3506,14 +3387,9 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        // Attribution + prefs configured — none of it may reach the custom host.
+        // Prefs configured — none of it may reach the custom host.
         let client = OpenRouterClient::with_base_url(
             "or-key".into(),
-            AppAttribution {
-                referer: Some("https://eros.example".into()),
-                title: Some("Eros".into()),
-                categories: Some("roleplay".into()),
-            },
             "https://unused-openrouter.test/v1".into(),
         )
         .with_ignore_providers(vec!["bad".into()])
@@ -3586,19 +3462,16 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        let client = OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution::default(),
-            "https://unused.test/v1".into(),
-        )
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: format!("{}/v1/chat/completions", server_b.uri()),
-                api_key: "v-key".into(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]));
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                    },
+                )]));
         let resp = client
             .execute(ChatRequest {
                 model: "weird\\@vendor/m@venice".into(),
@@ -3630,19 +3503,16 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        let client = OpenRouterClient::with_base_url(
-            "or-key".into(),
-            AppAttribution::default(),
-            "https://unused.test/v1".into(),
-        )
-        .with_providers(std::collections::HashMap::from([(
-            "venice".to_string(),
-            crate::provider::ProviderEndpoint {
-                base_url: format!("{}/v1/chat/completions", server_b.uri()),
-                api_key: "v-key".into(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
-        )]));
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", server_b.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                    },
+                )]));
         let resp = client
             .execute(ChatRequest {
                 model: "vm@venice".into(),
@@ -3676,7 +3546,6 @@ data: [DONE]\n\n";
             .await;
         let client = OpenRouterClient::with_base_url(
             "or-key".into(),
-            AppAttribution::default(),
             format!("{}/or/chat/completions", server_a.uri()),
         )
         .with_providers(std::collections::HashMap::from([(
@@ -3727,7 +3596,6 @@ data: [DONE]\n\n";
             .await;
         let client = OpenRouterClient::with_base_url(
             "or-key".into(),
-            AppAttribution::default(),
             format!("{}/or/chat/completions", server_a.uri()),
         );
         let resp = client

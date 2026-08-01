@@ -448,7 +448,6 @@ mod tests {
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
@@ -527,7 +526,6 @@ mod tests {
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "test-key".into(),
-                eros_engine_llm::openrouter::AppAttribution::default(),
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );

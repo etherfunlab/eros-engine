@@ -2494,6 +2494,23 @@ impl ModelConfig {
             .collect()
     }
 
+    /// `[providers].openrouter.chat`, if declared — the built-in chat URL
+    /// override (spec §4).
+    pub fn openrouter_chat_url(&self) -> Option<String> {
+        self.providers
+            .get("openrouter")
+            .and_then(|e| e.chat.clone())
+    }
+
+    /// `[providers].openrouter.headers` as a HeaderMap (empty when absent).
+    /// The one home for OpenRouter attribution headers.
+    pub fn openrouter_header_map(&self) -> reqwest::header::HeaderMap {
+        self.providers
+            .get("openrouter")
+            .map(|e| e.header_map())
+            .unwrap_or_default()
+    }
+
     /// Reject config blocks for features that were removed, so an operator
     /// upgrading across the removal cannot silently keep a block that no
     /// longer does anything. Loud-fail, same shape as the other boot gates.

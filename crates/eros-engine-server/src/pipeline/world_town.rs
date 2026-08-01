@@ -483,7 +483,6 @@ mod tests {
         state.openrouter = std::sync::Arc::new(
             eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
                 "k".into(),
-                Default::default(),
                 format!("{mock_uri}/api/v1/chat/completions"),
             ),
         );
