@@ -515,8 +515,9 @@ pub struct DefaultConfig {
     #[serde(default)]
     pub fallback_max_tokens: Option<u32>,
     /// OpenRouter provider slugs to exclude from routing on EVERY task
-    /// (issue #84). Sent as `provider.ignore` on every outbound call; the
-    /// client reads this once at boot. Empty = no exclusion.
+    /// (issue #84). Each slug MUST carry the @openrouter suffix (the exclusion
+    /// list acts on OpenRouter routing only). Sent as `provider.ignore` on every
+    /// outbound call; the client reads this once at boot. Empty = no exclusion.
     #[serde(default)]
     pub ignore_providers: Vec<String>,
     /// OpenRouter `provider.sort` routing preference applied on EVERY task:
@@ -820,13 +821,15 @@ pub struct TaskConfig {
 pub struct ModelConfig {
     #[serde(default)]
     pub defaults: DefaultConfig,
-    /// The `[providers]` block — custom OpenAI-compatible endpoints keyed by
-    /// name (spec 2026-08-01-embedding-providers §1). Each entry is a table
-    /// with `chat` and/or `embeddings` URLs (COMPLETE, posted verbatim — no
-    /// path joining) plus an optional `headers` table. The API key comes
-    /// from env as `<NAME_UPPERCASED>_API_KEY`. Under MODEL_CONFIG_DIR this
-    /// merges as one whole top-level key (like `[defaults]`, unlike
-    /// `[tasks]`): all providers live in one file.
+    /// The `[providers]` block — custom endpoints keyed by name. Each entry is
+    /// a table with optional `chat` (OpenAI-compatible) and `embeddings`
+    /// (OpenRouter-compatible) URLs, plus an optional `headers` table sent
+    /// verbatim on every request. URLs are COMPLETE, posted verbatim — no
+    /// path joining. The API key comes from env as `<NAME_UPPERCASED>_API_KEY`.
+    /// "openrouter" is special: it overrides BUILT-IN OpenRouter endpoints per
+    /// key and homes the attribution headers (HTTP-Referer, X-OpenRouter-Title,
+    /// X-OpenRouter-Categories). Under MODEL_CONFIG_DIR this merges as one
+    /// whole top-level key (like `[defaults]`, unlike `[tasks]`).
     #[serde(default)]
     pub providers: HashMap<String, ProviderEntry>,
     #[serde(default)]

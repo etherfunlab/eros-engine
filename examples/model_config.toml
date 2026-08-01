@@ -19,38 +19,52 @@
 # "latency" favours TTFT for chat; note it disables price load-balancing, so
 # watch cost and success rate separately.
 #[defaults]
-#ignore_providers = ["some-bad-provider-slug"]
+#ignore_providers = ["some-bad-provider-slug@openrouter"]
+# Entries MUST carry the @openrouter suffix — the exclusion list acts on OpenRouter routing only.
 #provider_sort = "latency"
 #
 # ── Custom providers (optional) ──────────────────────────────────────────────
-# Route individual model slugs to your own OpenAI-compatible endpoints.
-# Declare an endpoint here, then suffix a model id with "@<name>":
+# Route model slugs to your own endpoints. Each entry is a table with up to
+# three keys — `chat` (an OpenAI-compatible chat-completions URL), `embeddings`
+# (an OpenRouter-compatible embeddings URL), and `headers` (sent verbatim on
+# every request to this entry's endpoints):
 #
-#   model = "venice-uncensored@venice"     # served by [providers].venice
-#   fallback = ["x-ai/grok-4.20"]          # no suffix → built-in OpenRouter
+#   [providers.venice]
+#   chat    = "https://api.venice.ai/api/v1/chat/completions"
+#   headers = { "X-Team" = "companion" }
+#
+#   [providers.local]
+#   embeddings = "http://127.0.0.1:8080/v1/embeddings"
 #
 # Rules:
-# - Names match [a-z0-9_]+. "openrouter" is reserved — override the built-in
-#   endpoint with the OPENROUTER_BASE_URL env var instead. "voyage" is
-#   reserved too ($VOYAGE_API_KEY belongs to the built-in embeddings client).
-# - The value is the COMPLETE chat-completions URL, posted verbatim.
-# - The API key comes from env: [providers].venice → $VENICE_API_KEY.
-#   Required only when some model slug actually references the provider —
-#   this sample entry does not break boot.
-# - Model ids before "@" are the PROVIDER'S OWN slugs, sent verbatim; the
-#   engine never translates model names between providers.
-# - A literal "@" inside a model id is escaped "\@" — in a TOML double-quoted
-#   string write "weird\\@vendor/m".
+# - Names match [a-z0-9_]+. "voyage" is reserved ($VOYAGE_API_KEY belongs to
+#   the built-in native Voyage embeddings client).
+# - "openrouter" is special: declaring it overrides the BUILT-IN endpoints
+#   per key (an absent key keeps the official URL), and its `headers` table
+#   is the one home for the attribution headers (HTTP-Referer,
+#   X-OpenRouter-Title, X-OpenRouter-Categories). The old OPENROUTER_APP_*
+#   env vars are ignored; OPENROUTER_BASE_URL is gone.
+#
+#   [providers.openrouter]
+#   headers = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
+#
+# - URLs are COMPLETE and posted verbatim — no path joining.
+# - The API key comes from env: [providers].venice → $VENICE_API_KEY
+#   (one key per entry, shared by both endpoints). Required only when some
+#   slug actually references the entry. `openrouter` uses the existing
+#   $OPENROUTER_API_KEY.
+# - `headers` cannot declare Authorization or Content-Type (engine-owned).
+# - Suffix a model slug with "@<name>" to route it. "@openrouter" is always
+#   valid and means the built-in endpoint — on chat tasks it is equivalent
+#   to writing no suffix at all.
+# - Model ids before "@" are the PROVIDER'S OWN slugs, sent verbatim; a
+#   literal "@" inside a model id is escaped "\@" (in TOML: "weird\\@vendor/m").
 # - Model-keyed tables (`display`, `output_regex` models, `output_filter`
 #   trigger models) always use the BARE id, never "id@provider".
 # - Custom providers receive a strict OpenAI-compatible request:
 #   [defaults].ignore_providers / provider_sort and per-task `reasoning` are
-#   inert for them, and no attribution headers are sent.
-# - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key (like
-#   [defaults]): all providers live in one file.
-#
-#[providers]
-#venice = "https://api.venice.ai/api/v1/chat/completions"
+#   inert for them; they receive exactly the headers you declare.
+# - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
 #
 # One-off repair of rows already persisted with byte-BPE garble (run manually,
 # NOT a migration — the engine refuses to own downstream prod data). Repairs the
@@ -583,13 +597,28 @@ filter_prompt = """
 保持角色口吻，简短口语化，只输出评论正文。
 """
 
-# Reserved — not consumed by current code. `VoyageClient` reads
-# `VOYAGE_API_KEY` directly and hard-codes `voyage-3-lite` (512 dims).
-# This entry exists for future generalisation if we ever support a
-# pluggable embedding provider.
+# ── Embeddings ───────────────────────────────────────────────────────────────
+# Dimensions are FIXED at 512 (the pgvector schema is VECTOR(512)); there is
+# no dimensions knob. Absent block = built-in Voyage with voyage-3-lite.
+#
+# `model` is a SINGLE fixed id (no round-robin/weighted, no fallback, no
+# tiers — mixed vector spaces are incomparable). A bare id means the native
+# Voyage client ("voyage-3-lite" ≡ "voyage-3-lite@voyage"). Route elsewhere
+# with "@openrouter" (built-in OpenRouter embeddings endpoint) or a custom
+# "[providers]" entry that declares an `embeddings` URL — both speak the
+# OpenRouter-compatible embeddings wire. NOTE: only the native Voyage client
+# distinguishes query vs document embeddings (input_type); routing off
+# Voyage forfeits that optimisation.
 [tasks.embedding]
 model = "voyage-3-lite"
-dimensions = 512
+
+# OR split read/write across two models in ONE shared vector space —
+# voyage-4 series and above ONLY (lower series refuse to boot: mixing their
+# spaces corrupts recall silently). `model_read` serves the per-turn recall
+# query; `model_write` embeds documents at storage time. Mutually exclusive
+# with `model`; both halves required.
+#model_read  = "voyage-4-lite"
+#model_write = "voyage-4"
 
 # ── Voice channel (chat_voice) ───────────────────────────────────────────────
 # OPT-IN. Feature is OFF unless this block exists. Powers the lean voice-call
