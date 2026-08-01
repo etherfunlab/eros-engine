@@ -2408,8 +2408,11 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
+        let mut openrouter_headers = reqwest::header::HeaderMap::new();
+        openrouter_headers.insert("HTTP-Referer", "https://eros.example".parse().unwrap());
         let client =
             OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_openrouter_headers(openrouter_headers)
                 .with_ignore_providers(vec!["bad".into()])
                 .with_providers(std::collections::HashMap::from([(
                     "venice".to_string(),
@@ -3387,11 +3390,19 @@ data: [DONE]\n\n";
             .expect(1)
             .mount(&server_b)
             .await;
-        // Prefs configured — none of it may reach the custom host.
+        // Headers + prefs configured — none of it may reach the custom host.
+        let mut openrouter_headers = reqwest::header::HeaderMap::new();
+        openrouter_headers.insert("HTTP-Referer", "https://eros.example".parse().unwrap());
+        openrouter_headers.insert("X-OpenRouter-Title", "Eros".parse().unwrap());
+        openrouter_headers.insert(
+            "X-OpenRouter-Categories",
+            "roleplay,general-chat".parse().unwrap(),
+        );
         let client = OpenRouterClient::with_base_url(
             "or-key".into(),
             "https://unused-openrouter.test/v1".into(),
         )
+        .with_openrouter_headers(openrouter_headers)
         .with_ignore_providers(vec!["bad".into()])
         .with_provider_sort(Some("latency".into()))
         .with_providers(std::collections::HashMap::from([(
