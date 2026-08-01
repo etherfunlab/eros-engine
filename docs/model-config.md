@@ -413,9 +413,10 @@ The PDE writes a terse seed `image_prompt` while also choosing the action and
 engine runs a dedicated composer **after** an image action is decided and
 **before** generation: it sends the model the persona appearance, the recent
 scene, the PDE seed subject, the chosen style, and the target aspect ratio, and
-uses the expanded result as the image subject (sent to the image model,
-persisted to `metadata.image.prompt`, and emitted in the `image` SSE frame). The
-PDE's original seed is preserved separately in the decision audit.
+uses the expanded result as the image subject (carried in the `image_request`
+frame's `composed_prompt`; the persisted `metadata.image.prompt` marker keeps
+the PDE seed subject). The PDE's original seed is preserved separately in the
+decision audit.
 
 The feature is **off by default** and activates only when this block exists.
 It is **fail-open**: on composer failure / timeout / empty output the engine

@@ -255,7 +255,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 `ImageReplyParams` — to request or force a companion-generated image this turn.
 The `image` block is also the per-turn opt-in: **omit it to suppress image
 generation for the turn** (the PDE may then only `reply_text` / `ghost`), or
-send `image: {}` to enable it with the task defaults. This lets a caller's own
+send `image: {}` to enable it with the engine's built-in defaults. This lets a caller's own
 per-turn policy gate images independently of the PDE's content decision.
 
 ```bash
@@ -285,9 +285,9 @@ draws on the chat stream).
 |---|---|---|---|
 | `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
-| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | task `default_style` | One of the three engine-owned style presets. |
+| `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
-| `aspect_ratio` | `String` | task `default_aspect_ratio` | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. Returns `422` if invalid. |
+| `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
 | `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely and draws the seed subject as-is. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
@@ -302,10 +302,9 @@ Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
 unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
 
 **`image_request` SSE frame** — emitted once per image turn in place of any
-in-engine draw. The engine composes the prompt; the consumer draws it (there
-is no engine draw endpoint). The chat stream itself draws nothing, streams
-no image bytes, and persists no draw result. The engine does not draw; the
-consumer calls its own image vendor.
+in-engine draw. The engine composes the prompt; the consumer draws it via its
+own image vendor (there is no engine draw endpoint). The chat stream itself
+draws nothing, streams no image bytes, and persists no draw result.
 
 ```
 data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}

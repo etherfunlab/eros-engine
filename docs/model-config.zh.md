@@ -359,7 +359,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 ### `[tasks.chat_image_prompt_compose]` — 图片提示词改写器（opt-in）
 
-PDE 在选动作、定 `inner_state` 的同时，还要在很紧的 token 预算里写一个简短的种子 `image_prompt`。配置此任务块后，引擎会在**决定出图之后、生成之前**单独跑一次改写器：把人格外观、最近场景、PDE 种子主题、所选 style 和目标宽高比交给该模型，用扩写后的结果作为图片主体（送给图片模型、写入 `metadata.image.prompt`、并在 `image` SSE frame 中发出）。PDE 的原始种子单独保留在决策审计里。
+PDE 在选动作、定 `inner_state` 的同时，还要在很紧的 token 预算里写一个简短的种子 `image_prompt`。配置此任务块后，引擎会在**决定出图之后、生成之前**单独跑一次改写器：把人格外观、最近场景、PDE 种子主题、所选 style 和目标宽高比交给该模型，用扩写后的结果作为图片主体（随 `image_request` 帧的 `composed_prompt` 下发；持久化的 `metadata.image.prompt` 标记保留 PDE 种子提示词）。PDE 的原始种子单独保留在决策审计里。
 
 该功能**默认关闭**，仅当此块存在时激活。它是 **fail-open** 的：改写器失败 / 超时 / 输出为空时，引擎回退到 PDE 种子原值，绝不阻塞或失败图片轮次。该任务**仅在图片轮次按需解析**，因此不会在文本/ghost 轮次推进 `model` 的 round-robin 游标。
 
