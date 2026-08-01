@@ -2364,16 +2364,15 @@ struct ImageTurnInputs {
 /// Pure: resolve the seed subject, style, and aspect ratio for a delegated
 /// image turn. Precedence per field:
 /// - subject: `plan.image_prompt` → `req_image.image_prompt` → `""`
-/// - style:   `req_image.style` → config `default_style` → type default
-/// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → config default
+/// - style:   `req_image.style` → type default (`Realistic`)
+/// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
 ///
-/// Blank strings count as absent at the plan and request levels. The config
-/// default (`default_aspect_ratio`) is taken as-is, unfiltered — pre-existing
-/// behavior, unchanged.
+/// Blank strings count as absent at the plan and request levels. There are no
+/// config-level defaults: the engine carries no image configuration, so style
+/// and aspect are per-turn inputs only.
 fn resolve_image_turn_inputs(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
-    resolved_image_gen: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
 ) -> ImageTurnInputs {
     let seed_subject = plan
         .image_prompt
@@ -2386,11 +2385,7 @@ fn resolve_image_turn_inputs(
         })
         .unwrap_or("")
         .to_string();
-    let style = req_image
-        .and_then(|i| i.style)
-        .or_else(|| resolved_image_gen.map(|r| r.default_style))
-        .unwrap_or_default();
-    // A per-turn aspect (PDE/plan or per-request) beats the config default.
+    let style = req_image.and_then(|i| i.style).unwrap_or_default();
     let aspect_ratio = plan
         .aspect_ratio
         .as_deref()
@@ -2400,8 +2395,7 @@ fn resolve_image_turn_inputs(
                 .and_then(|i| i.aspect_ratio.as_deref())
                 .filter(|s| !s.trim().is_empty())
         })
-        .map(str::to_string)
-        .or_else(|| resolved_image_gen.map(|r| r.default_aspect_ratio.clone()));
+        .map(str::to_string);
     ImageTurnInputs {
         seed_subject,
         style,
@@ -2432,10 +2426,9 @@ async fn build_delegated_image_prompt(
     persona: &eros_engine_core::persona::CompanionPersona,
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
-    resolved_image_gen: Option<&eros_engine_llm::model_config::ResolvedImageGen>,
     pde_transcript: &str,
 ) -> DelegatedImagePrompt {
-    let inputs = resolve_image_turn_inputs(plan, req_image, resolved_image_gen);
+    let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
@@ -2799,12 +2792,8 @@ pub fn run_stream(
         let is_tip = user_msg.tips_amount_usd.is_some();
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
-        // consumer signalling "I handle images this turn"), independent of
-        // `[tasks.chat_image_generation]`. `resolve_image_gen()` is still read
-        // for the composer's default_style / default_aspect_ratio (it does not
-        // advance the image round-robin cursor); the cursor is advanced only by
-        // the draw endpoint's `effective_image_chain` call.
-        let resolved_image_gen = state.model_config.resolve_image_gen();
+        // consumer signalling "I handle images this turn"). The engine holds
+        // no image configuration at all.
         let req_image = user_msg.image.as_ref();
         let image_executor_available = req_image.is_some();
         let force_image = req_image.is_some_and(|i| i.force) && !is_tip;
@@ -3251,7 +3240,6 @@ pub fn run_stream(
                         &input.persona,
                         &plan,
                         req_image,
-                        resolved_image_gen.as_ref(),
                         &pde_transcript,
                     )
                     .await;
@@ -3573,7 +3561,6 @@ pub fn run_stream(
                             &input.persona,
                             &plan,
                             req_image,
-                            resolved_image_gen.as_ref(),
                             &pde_transcript,
                         )
                         .await;
@@ -3948,91 +3935,63 @@ mod tests {
         }
     }
 
-    fn img_gen(
-        style: eros_engine_llm::model_config::StyleKey,
-        aspect: &str,
-    ) -> eros_engine_llm::model_config::ResolvedImageGen {
-        eros_engine_llm::model_config::ResolvedImageGen {
-            model: None,
-            fallback_model: vec![],
-            default_style: style,
-            default_aspect_ratio: aspect.to_string(),
-            default_resolution: None,
-            max_tokens: 4096,
-        }
-    }
-
     #[test]
     fn image_turn_subject_prefers_plan_then_request_then_empty() {
         let params = img_params(Some("from request"), None, None);
 
         // plan wins
-        let r = resolve_image_turn_inputs(&img_plan(Some("from plan"), None), Some(&params), None);
+        let r = resolve_image_turn_inputs(&img_plan(Some("from plan"), None), Some(&params));
         assert_eq!(r.seed_subject, "from plan");
 
         // blank plan subject falls through to the request
-        let r = resolve_image_turn_inputs(&img_plan(Some("   "), None), Some(&params), None);
+        let r = resolve_image_turn_inputs(&img_plan(Some("   "), None), Some(&params));
         assert_eq!(r.seed_subject, "from request");
 
         // neither ⇒ empty string
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
         assert_eq!(r.seed_subject, "");
 
         // blank request value, plan absent ⇒ falls through to empty string
         // too, not the blank string itself (the request-level blank filter
         // must still fire).
         let blank_params = img_params(Some("   "), None, None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params), None);
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
         assert_eq!(r.seed_subject, "");
     }
 
     #[test]
-    fn image_turn_style_prefers_request_then_config_then_default() {
+    fn image_turn_style_prefers_request_then_default() {
         use eros_engine_llm::model_config::StyleKey;
-        let gen = img_gen(StyleKey::Anime, "1:1");
 
         let params = img_params(None, Some(StyleKey::SemiRealistic), None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&params), Some(&gen));
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&params));
         assert_eq!(r.style, StyleKey::SemiRealistic, "request wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None, Some(&gen));
-        assert_eq!(r.style, StyleKey::Anime, "config default");
-
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
-        assert_eq!(r.style, StyleKey::default(), "no config ⇒ type default");
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        assert_eq!(r.style, StyleKey::default(), "no request ⇒ type default");
     }
 
     #[test]
-    fn image_turn_aspect_prefers_plan_then_request_then_config() {
-        use eros_engine_llm::model_config::StyleKey;
-        let gen = img_gen(StyleKey::Realistic, "1:1");
+    fn image_turn_aspect_prefers_plan_then_request_then_none() {
         let params = img_params(None, None, Some("16:9"));
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("3:4")), Some(&params), Some(&gen));
+        let r = resolve_image_turn_inputs(&img_plan(None, Some("3:4")), Some(&params));
         assert_eq!(r.aspect_ratio.as_deref(), Some("3:4"), "plan wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("  ")), Some(&params), Some(&gen));
+        let r = resolve_image_turn_inputs(&img_plan(None, Some("  ")), Some(&params));
         assert_eq!(
             r.aspect_ratio.as_deref(),
             Some("16:9"),
             "blank plan ⇒ request"
         );
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None, Some(&gen));
-        assert_eq!(r.aspect_ratio.as_deref(), Some("1:1"), "config default");
-
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None, None);
+        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
         assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
 
-        // blank request value, plan absent ⇒ falls through to the config
-        // default (the request-level blank filter must still fire).
+        // Blank request value ⇒ the request-level blank filter still fires.
         let blank_params = img_params(None, None, Some("  "));
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params), Some(&gen));
-        assert_eq!(
-            r.aspect_ratio.as_deref(),
-            Some("1:1"),
-            "blank request ⇒ config default"
-        );
+        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
+        assert_eq!(r.aspect_ratio, None, "blank request ⇒ None");
     }
 
     #[test]
