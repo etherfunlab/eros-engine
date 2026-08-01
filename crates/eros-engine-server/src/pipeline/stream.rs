@@ -5538,9 +5538,10 @@ data: [DONE]\n\n";
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // Any OpenRouter call 500s — so an ERRONEOUS draw would surface as an
-        // `image_failed` frame (asserted absent). The correct delegated
-        // image-only path makes no provider call at all.
+        // Any OpenRouter call 500s — so an ERRONEOUS draw attempt would
+        // surface as an extra frame in the sequence (the exact 4-frame
+        // sequence is asserted below, leaving no room for one). The correct
+        // delegated image-only path makes no provider call at all.
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(500))
@@ -5861,8 +5862,9 @@ data: [DONE]\n\n";
 
         // The text reply streams from this mock (≥ MIN_FILTERED_OUTPUT_CHARS so it
         // is not degraded as too-short). The delegated image path makes NO extra
-        // (draw) call; a draw would reuse this endpoint but we assert no
-        // image_failed / image frame appears.
+        // (draw) call; a draw would reuse this endpoint, but the frame-sequence
+        // assertions below leave no room for an extra frame between
+        // `image_request` and `final`.
         let mock = MockServer::start().await;
         let body = "\
 data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\

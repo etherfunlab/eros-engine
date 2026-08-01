@@ -294,16 +294,16 @@ draws on the chat stream).
 (`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
 frame (below) — the chat stream never resolves it to a URL itself. The
 `previous`-with-no-image → `face` fallback, and the `face_ref_url` /
-`prev_image_url` reference URLs, belong to the draw endpoint (see its request
-body below). The persisted `metadata.image` marker records only the seed
-subject and aspect ratio, not the reference kind.
+`prev_image_url` reference URLs, belong to the consumer's own image-vendor
+call (the engine has no draw endpoint). The persisted `metadata.image` marker
+records only the seed subject and aspect ratio, not the reference kind.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
 unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
 
 **`image_request` SSE frame** — emitted once per image turn in place of any
-in-engine draw. The engine composes the prompt; the consumer draws it (directly
-or via the draw endpoint below). The chat stream itself draws nothing, streams
+in-engine draw. The engine composes the prompt; the consumer draws it (there
+is no engine draw endpoint). The chat stream itself draws nothing, streams
 no image bytes, and persists no draw result. The engine does not draw; the
 consumer calls its own image vendor.
 
