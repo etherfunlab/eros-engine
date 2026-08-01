@@ -533,15 +533,112 @@ pub struct DefaultConfig {
 /// on every request to this entry's endpoints (both `chat` and `embeddings`);
 /// `Authorization`/`Content-Type` are engine-owned and rejected at boot.
 /// `BTreeMap` so validation-error ordering is deterministic across restarts.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// `Deserialize` is hand-written (below) rather than derived: the 0.9.3
+/// shape was a plain string, and a config still written that way must not
+/// see a generic serde "invalid type: string ..., expected struct
+/// ProviderEntry" — it should see the table form it needs to switch to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderEntry {
-    #[serde(default)]
     pub chat: Option<String>,
-    #[serde(default)]
     pub embeddings: Option<String>,
-    #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
+}
+
+/// Error taught to an operator whose `[providers]` entry is still the 0.9.3
+/// plain-string shape (dropped with no compatibility layer — spec §0/§1).
+const PROVIDER_ENTRY_TABLE_FORM_ERROR: &str = "[providers] values must be tables — write \
+     venice = { chat = \"https://…\" } (and/or embeddings = \"…\", headers = { … }); the \
+     0.9.3 string form was removed";
+
+impl<'de> Deserialize<'de> for ProviderEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Table-only inner shape, `deny_unknown_fields` preserved exactly as
+        // before. Kept private and reached only via `visit_map` below, so a
+        // non-table value never reaches it and never gets its generic
+        // "expected struct" message.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            #[serde(default)]
+            chat: Option<String>,
+            #[serde(default)]
+            embeddings: Option<String>,
+            #[serde(default)]
+            headers: Option<BTreeMap<String, String>>,
+        }
+
+        struct ProviderEntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProviderEntryVisitor {
+            type Value = ProviderEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a [providers] entry table (chat = \"…\", embeddings = \"…\", headers = { … })",
+                )
+            }
+
+            // Every scalar shape a 0.9.3-era config could still send —
+            // string is the one that actually shipped, the rest are
+            // defensive (an int/bool/etc is just as clearly not a table).
+            fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(PROVIDER_ENTRY_TABLE_FORM_ERROR))
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(PROVIDER_ENTRY_TABLE_FORM_ERROR))
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(PROVIDER_ENTRY_TABLE_FORM_ERROR))
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(PROVIDER_ENTRY_TABLE_FORM_ERROR))
+            }
+
+            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                use serde::de::Error as _;
+                Err(A::Error::custom(PROVIDER_ENTRY_TABLE_FORM_ERROR))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // Unknown-key / wrong-type errors from `Table`'s own
+                // `deny_unknown_fields` derive propagate unchanged — this
+                // adapter only changes how a NON-table value is reported.
+                let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ProviderEntry {
+                    chat: table.chat,
+                    embeddings: table.embeddings,
+                    headers: table.headers,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ProviderEntryVisitor)
+    }
 }
 
 impl ProviderEntry {
@@ -711,9 +808,6 @@ pub struct TaskConfig {
     /// explicit opt-out and suppresses `defaults.fallback_model`.
     #[serde(default)]
     pub fallback: Option<FallbackSpec>,
-    /// Embedding-only: vector dimensions.
-    #[serde(default)]
-    pub dimensions: Option<u32>,
     /// Task-level (default-block) prompt-trait allow-list. Same three-state
     /// semantics as `TierConfig::allow_traits`.
     #[serde(default)]
@@ -757,7 +851,7 @@ pub struct TaskConfig {
     pub retry_depth: Option<u32>,
     /// PDE-only: ghost kill-switch. `false` disables ghosting across the whole
     /// PDE path; absent/`true` keeps it on. Read only on `[tasks.pde_decision]`
-    /// (other tasks ignore it), like `input_filter`/`dimensions`.
+    /// (other tasks ignore it), like `input_filter`.
     #[serde(default)]
     pub ghosting: Option<bool>,
     /// PDE-only: send `response_format = json_schema` on the judge request to
@@ -2606,10 +2700,15 @@ fn voyage_model_generation(bare_id: &str) -> Option<f64> {
         .split('-')
         .next()
         .expect("split always yields at least one element");
-    if segment.is_empty() {
+    // Reject anything but ASCII digits and dots BEFORE parsing. `f64::from_str`
+    // is far more permissive than a version number — it accepts `inf`, `nan`,
+    // and scientific notation like `4e2` (== 400.0), any of which would let a
+    // non-numeric or absurd segment sail through the `>= 4.0` gate below.
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
         return None;
     }
-    segment.parse::<f64>().ok()
+    let n = segment.parse::<f64>().ok()?;
+    n.is_finite().then_some(n)
 }
 
 #[cfg(test)]
@@ -2920,7 +3019,7 @@ structured_output = true
 [tasks.embedding]
 model        = "voyage-3-lite"
 dimensions   = 512
-description  = "reserved — Voyage hard-codes its own model"
+description  = "active — routes embed_query/embed_document via EmbeddingRouter"
 
 [tasks.chat_input_filter]
 model        = "openai/gpt-5.4-nano"
@@ -3034,10 +3133,13 @@ filter_prompt = "Answer product questions from the docs."
             .expect("fixture product_qa resolves");
         assert_eq!(rpq.answer_prompt, "Answer product questions from the docs.");
 
-        // embedding — reserved, with `dimensions` set.
+        // embedding — active. `dimensions` was removed from `TaskConfig`
+        // (spec 2026-08-01-embedding-providers §0: dims are fixed at 512);
+        // the fixture keeps the `dimensions = 512` TOML line above to lock
+        // the compat contract that a leftover key from an old config still
+        // parses — it's just an ignored unknown key now, not a field.
         let emb = cfg.tasks.get("embedding").unwrap();
         assert_eq!(emb.model.as_fixed(), Some("voyage-3-lite"));
-        assert_eq!(emb.dimensions, Some(512));
 
         // Resolution behaviour on the live tasks.
         let r = cfg.resolve("chat_companion", None);
@@ -4678,6 +4780,18 @@ filter_prompt = "只根据产品资料作答。"
     }
 
     #[test]
+    fn voyage_generation_rejects_f64_leniency() {
+        // `f64::from_str` accepts far more than a version number does —
+        // segments must be ASCII digits/dots only, checked BEFORE parsing,
+        // so none of these ever reach `str::parse::<f64>`.
+        assert_eq!(voyage_model_generation("voyage-inf"), None);
+        assert_eq!(voyage_model_generation("voyage-nan"), None);
+        // "4e2" parses as 400.0 (scientific notation) — well past the N >= 4
+        // gate, but "e" isn't a version-number character.
+        assert_eq!(voyage_model_generation("voyage-4e2"), None);
+    }
+
+    #[test]
     fn ignore_providers_require_openrouter_suffix() {
         let cfg =
             ModelConfig::from_toml_str("[defaults]\nignore_providers = [\"bad-slug\"]\n").unwrap();
@@ -5891,14 +6005,28 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn providers_string_value_is_rejected() {
         // 0.9.3's plain-string shape is dropped with no compat layer (spec §0).
+        // The error must teach the table form, not surface a generic serde
+        // "expected struct ProviderEntry" message.
         let err = ModelConfig::from_toml_str(
             "[providers]\nvenice = \"https://api.venice.ai/api/v1/chat/completions\"\n",
         )
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("venice"),
-            "error should locate the entry: {msg}"
+            msg.contains("[providers] values must be tables"),
+            "error should teach the table form: {msg}"
+        );
+        assert!(
+            msg.contains("chat = ") && msg.contains("embeddings = ") && msg.contains("headers ="),
+            "error should show the table shape (chat/embeddings/headers): {msg}"
+        );
+        assert!(
+            msg.contains("0.9.3 string form was removed"),
+            "error should explain why the old shape no longer works: {msg}"
+        );
+        assert!(
+            !msg.contains("expected struct ProviderEntry"),
+            "error should not leak the generic serde message: {msg}"
         );
     }
 
@@ -6253,7 +6381,13 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
 
     #[test]
     fn embedding_pair_below_voyage_4_is_rejected() {
-        for bad in ["voyage-3.5-lite", "voyage-code-3", "bge-m3"] {
+        for bad in [
+            "voyage-3.5-lite",
+            "voyage-code-3",
+            "bge-m3",
+            "voyage-inf",
+            "voyage-4e2",
+        ] {
             let cfg = ModelConfig::from_toml_str(&format!(
                 "[tasks.embedding]\nmodel_read = \"{bad}\"\nmodel_write = \"voyage-4\"\n"
             ))
@@ -6305,6 +6439,23 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
                 "must refuse: {toml}"
             );
         }
+    }
+
+    #[test]
+    fn stale_dimensions_key_is_an_ignored_unknown_field() {
+        // `dimensions` was removed from `TaskConfig` (spec
+        // 2026-08-01-embedding-providers §0: dims are hard-coded 512, no
+        // config knob). `TaskConfig` doesn't `deny_unknown_fields`, so a
+        // leftover `dimensions = 512` line from a pre-removal config must
+        // still parse — same compat contract as any other stale key.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel = \"voyage-3-lite\"\ndimensions = 512\n",
+        )
+        .expect("stale `dimensions` key must not break parsing");
+        assert_eq!(
+            cfg.tasks["embedding"].model.as_fixed(),
+            Some("voyage-3-lite")
+        );
     }
 
     #[test]
