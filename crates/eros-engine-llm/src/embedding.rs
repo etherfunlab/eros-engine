@@ -130,6 +130,149 @@ fn parse_response(body: &str, expected: usize, model: &str) -> Result<Vec<Vec<f3
     Ok(out)
 }
 
+/// One embedding backend: native Voyage (keeps `input_type`) or the
+/// OpenRouter-compatible wire (no query/document distinction).
+pub(crate) enum EmbedBackend {
+    Voyage(crate::voyage::VoyageClient),
+    OpenAiCompat(EmbedHttpClient),
+}
+
+impl EmbedBackend {
+    async fn embed(&self, text: &str, input_type_query: bool) -> Result<Vec<f32>, LlmError> {
+        match self {
+            EmbedBackend::Voyage(v) if input_type_query => v.embed_query(text).await,
+            EmbedBackend::Voyage(v) => v.embed_document(text).await,
+            EmbedBackend::OpenAiCompat(c) => c.embed_one(text).await,
+        }
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
+        match self {
+            EmbedBackend::Voyage(v) => v.embed_documents(texts).await,
+            EmbedBackend::OpenAiCompat(c) => c.embed_batch(texts).await,
+        }
+    }
+}
+
+/// Read/write embedding facade (spec §5.1). `read` serves `embed_query`
+/// (the per-turn recall path); `write` serves `embed_document(s)` (the
+/// storage paths). Both point at the same backend unless
+/// `model_read`/`model_write` split them.
+pub struct EmbeddingRouter {
+    pub(crate) read: EmbedBackend,
+    pub(crate) write: EmbedBackend,
+}
+
+impl EmbeddingRouter {
+    /// Production constructor: real env. Call after
+    /// `ModelConfig::validate_providers` passed.
+    pub fn from_config(cfg: &crate::model_config::ModelConfig) -> Result<Self, LlmError> {
+        Self::from_config_with(cfg, |k| std::env::var(k).ok())
+    }
+
+    /// Testable core: `env` abstracts `std::env::var`.
+    pub fn from_config_with(
+        cfg: &crate::model_config::ModelConfig,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, LlmError> {
+        use crate::model_config::EmbedRoute;
+        let resolved = cfg.resolve_embedding();
+        let build = |target: &crate::model_config::EmbedTarget| -> Result<EmbedBackend, LlmError> {
+            match &target.route {
+                EmbedRoute::Voyage => {
+                    let key = env("VOYAGE_API_KEY").unwrap_or_default();
+                    if key.trim().is_empty() {
+                        return Err(LlmError::Config(
+                            "VOYAGE_API_KEY is unset or empty but the embedding config \
+                             resolves to the built-in Voyage client"
+                                .into(),
+                        ));
+                    }
+                    Ok(EmbedBackend::Voyage(
+                        crate::voyage::VoyageClient::new(key).with_model(target.model.clone()),
+                    ))
+                }
+                EmbedRoute::OpenRouter => {
+                    let key = env("OPENROUTER_API_KEY").unwrap_or_default();
+                    if key.is_empty() {
+                        return Err(LlmError::Config(
+                            "OPENROUTER_API_KEY is unset but [tasks.embedding] routes to \
+                             @openrouter"
+                                .into(),
+                        ));
+                    }
+                    let entry = cfg.providers.get("openrouter");
+                    let url = entry
+                        .and_then(|e| e.embeddings.clone())
+                        .unwrap_or_else(|| OPENROUTER_EMBEDDINGS_URL.to_string());
+                    let headers = entry.map(|e| e.header_map()).unwrap_or_default();
+                    Ok(EmbedBackend::OpenAiCompat(EmbedHttpClient::new(
+                        url,
+                        key,
+                        headers,
+                        target.model.clone(),
+                    )))
+                }
+                EmbedRoute::Custom(name) => {
+                    let entry = cfg.providers.get(name).ok_or_else(|| {
+                        LlmError::Config(format!("embedding provider `{name}` is not declared"))
+                    })?;
+                    let url = entry.embeddings.clone().ok_or_else(|| {
+                        LlmError::Config(format!("[providers].{name} declares no `embeddings` URL"))
+                    })?;
+                    let var = format!("{}_API_KEY", name.to_uppercase());
+                    let key = env(&var).unwrap_or_default();
+                    if key.is_empty() {
+                        return Err(LlmError::Config(format!("${var} is unset or empty")));
+                    }
+                    Ok(EmbedBackend::OpenAiCompat(EmbedHttpClient::new(
+                        url,
+                        key,
+                        entry.header_map(),
+                        target.model.clone(),
+                    )))
+                }
+            }
+        };
+        Ok(Self {
+            read: build(&resolved.read)?,
+            write: build(&resolved.write)?,
+        })
+    }
+
+    /// Embed a recall query (read backend; Voyage `input_type: "query"`).
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        self.read.embed(text, true).await
+    }
+
+    /// Embed one document for storage (write backend).
+    pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        self.write.embed(text, false).await
+    }
+
+    /// Embed a batch of documents for storage (write backend,
+    /// order-preserving; empty input short-circuits).
+    pub async fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
+        self.write.embed_batch(texts).await
+    }
+}
+
+#[cfg(test)]
+impl EmbeddingRouter {
+    pub(crate) fn read_is_voyage(&self) -> bool {
+        matches!(self.read, EmbedBackend::Voyage(_))
+    }
+    pub(crate) fn write_is_voyage(&self) -> bool {
+        matches!(self.write, EmbedBackend::Voyage(_))
+    }
+    pub(crate) fn read_url(&self) -> Option<&str> {
+        match &self.read {
+            EmbedBackend::OpenAiCompat(c) => Some(c.base_url.as_str()),
+            EmbedBackend::Voyage(_) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use wiremock::matchers::{body_partial_json, header, path};
@@ -270,5 +413,100 @@ mod tests {
             client.embed_batch(&[]).await.expect("ok"),
             Vec::<Vec<f32>>::new()
         );
+    }
+
+    fn env_with<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn from_config_defaults_to_voyage() {
+        let cfg = crate::model_config::ModelConfig::from_toml_str("").unwrap();
+        let router =
+            EmbeddingRouter::from_config_with(&cfg, env_with(&[("VOYAGE_API_KEY", "k")])).unwrap();
+        // Shape assertion via Debug-free matches: expose #[cfg(test)] accessors.
+        assert!(router.read_is_voyage() && router.write_is_voyage());
+    }
+
+    #[test]
+    fn from_config_missing_voyage_key_errors() {
+        let cfg = crate::model_config::ModelConfig::from_toml_str("").unwrap();
+        assert!(EmbeddingRouter::from_config_with(&cfg, |_| None).is_err());
+    }
+
+    #[test]
+    fn from_config_openrouter_route_uses_override_url_and_headers() {
+        let cfg = crate::model_config::ModelConfig::from_toml_str(
+            "[providers.openrouter]\n\
+             embeddings = \"http://proxy/v1/embeddings\"\n\
+             headers = { \"HTTP-Referer\" = \"https://eros.example\" }\n\
+             [tasks.embedding]\nmodel = \"openai/text-embedding-3-small@openrouter\"\n",
+        )
+        .unwrap();
+        let router =
+            EmbeddingRouter::from_config_with(&cfg, env_with(&[("OPENROUTER_API_KEY", "ok")]))
+                .unwrap();
+        assert_eq!(router.read_url(), Some("http://proxy/v1/embeddings"));
+    }
+
+    #[test]
+    fn from_config_custom_route_reads_name_key() {
+        let cfg = crate::model_config::ModelConfig::from_toml_str(
+            "[providers]\nlocal = { embeddings = \"http://e/v1/embeddings\" }\n\
+             [tasks.embedding]\nmodel = \"bge-m3@local\"\n",
+        )
+        .unwrap();
+        assert!(
+            EmbeddingRouter::from_config_with(&cfg, |_| None).is_err(),
+            "missing LOCAL_API_KEY must error"
+        );
+        assert!(
+            EmbeddingRouter::from_config_with(&cfg, env_with(&[("LOCAL_API_KEY", "k")])).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_write_dispatch_hits_the_right_backend() {
+        // read → voyage-4-lite (query), write → voyage-4 (document), one mock
+        // server standing in for Voyage.
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "voyage-4-lite", "input_type": "query" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": vec![0.0f32; 512] } ] }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "voyage-4", "input_type": "document" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": vec![0.0f32; 512] } ] }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/embeddings", server.uri());
+        let router = EmbeddingRouter {
+            read: EmbedBackend::Voyage(
+                crate::voyage::VoyageClient::with_base_url("k".into(), url.clone())
+                    .with_model("voyage-4-lite".into()),
+            ),
+            write: EmbedBackend::Voyage(
+                crate::voyage::VoyageClient::with_base_url("k".into(), url)
+                    .with_model("voyage-4".into()),
+            ),
+        };
+        router.embed_query("q").await.expect("read ok");
+        router.embed_document("d").await.expect("write ok");
     }
 }
