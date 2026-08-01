@@ -527,6 +527,83 @@ pub struct DefaultConfig {
     pub provider_sort: Option<String>,
 }
 
+/// One `[providers]` entry (spec 2026-08-01-embedding-providers §1). URLs are
+/// complete and posted verbatim — no path joining. `headers` are sent verbatim
+/// on every request to this entry's endpoints (both `chat` and `embeddings`);
+/// `Authorization`/`Content-Type` are engine-owned and rejected at boot.
+/// `BTreeMap` so validation-error ordering is deterministic across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEntry {
+    #[serde(default)]
+    pub chat: Option<String>,
+    #[serde(default)]
+    pub embeddings: Option<String>,
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
+}
+
+impl ProviderEntry {
+    /// True when nothing at all is declared (all-`None`).
+    pub fn is_empty(&self) -> bool {
+        self.chat.is_none() && self.embeddings.is_none() && self.headers.is_none()
+    }
+
+    /// Boot gate for the `headers` table: engine-owned names are rejected
+    /// (a silently overridden `Authorization` is the worst kind of footgun),
+    /// and every pair must be valid HTTP header material — loud-fail, not
+    /// the env era's warn-and-drop.
+    fn validate_headers(&self, entry: &str) -> Result<(), String> {
+        let Some(headers) = &self.headers else {
+            return Ok(());
+        };
+        if headers.is_empty() {
+            return Err(format!("[providers].{entry}.headers: table is empty"));
+        }
+        for (name, value) in headers {
+            let lower = name.to_ascii_lowercase();
+            if lower == "authorization" || lower == "content-type" {
+                return Err(format!(
+                    "[providers].{entry}.headers: `{name}` is engine-owned — the \
+                     engine sets Authorization from the provider's API key and \
+                     Content-Type from the request body; it cannot be overridden"
+                ));
+            }
+            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(format!(
+                    "[providers].{entry}.headers: `{name}` is not a valid HTTP header name"
+                ));
+            }
+            if reqwest::header::HeaderValue::from_str(value).is_err() {
+                return Err(format!(
+                    "[providers].{entry}.headers: value for `{name}` is not a valid \
+                     HTTP header value"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The validated `headers` table as a reqwest `HeaderMap`. Invalid pairs
+    /// are skipped with a warning — unreachable after `validate_headers`, but
+    /// this method must not panic for library callers that skip validation.
+    pub fn header_map(&self) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in self.headers.iter().flatten() {
+            match (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                (Ok(n), Ok(v)) => {
+                    map.insert(n, v);
+                }
+                _ => tracing::warn!(header = %name, "providers: skipping invalid header"),
+            }
+        }
+        map
+    }
+}
+
 fn default_model_spec() -> ModelSpec {
     ModelSpec::Fixed(String::new())
 }
@@ -736,13 +813,14 @@ pub struct ModelConfig {
     #[serde(default)]
     pub defaults: DefaultConfig,
     /// The `[providers]` block — custom OpenAI-compatible endpoints keyed by
-    /// name (spec 2026-07-31-multi-llm-providers). Value is the COMPLETE
-    /// chat-completions URL, posted verbatim (no path joining). The API key
-    /// comes from env as `<NAME_UPPERCASED>_API_KEY`. Under MODEL_CONFIG_DIR
-    /// this merges as one whole top-level key (like `[defaults]`, unlike
+    /// name (spec 2026-08-01-embedding-providers §1). Each entry is a table
+    /// with `chat` and/or `embeddings` URLs (COMPLETE, posted verbatim — no
+    /// path joining) plus an optional `headers` table. The API key comes
+    /// from env as `<NAME_UPPERCASED>_API_KEY`. Under MODEL_CONFIG_DIR this
+    /// merges as one whole top-level key (like `[defaults]`, unlike
     /// `[tasks]`): all providers live in one file.
     #[serde(default)]
-    pub providers: HashMap<String, String>,
+    pub providers: HashMap<String, ProviderEntry>,
     #[serde(default)]
     pub tasks: HashMap<String, TaskConfig>,
 }
@@ -2031,14 +2109,6 @@ impl ModelConfig {
         let mut names: Vec<&String> = self.providers.keys().collect();
         names.sort();
         for name in names {
-            if name == "openrouter" {
-                return Err(
-                    "[providers]: `openrouter` is reserved — override the built-in \
-                     endpoint with the OPENROUTER_BASE_URL env var, not a [providers] \
-                     entry"
-                        .to_string(),
-                );
-            }
             if name == "voyage" {
                 return Err(
                     "[providers]: `voyage` is reserved — $VOYAGE_API_KEY already \
@@ -2059,8 +2129,23 @@ impl ModelConfig {
                 ));
             }
             if self.providers[name].is_empty() {
-                return Err(format!("[providers].{name}: base URL is empty"));
+                return Err(format!(
+                    "[providers].{name}: entry is empty — declare at least one of \
+                     `chat = \"<url>\"` or `embeddings = \"<url>\"` (or `headers` on \
+                     the `openrouter` entry)"
+                ));
             }
+            if let Some(url) = self.providers[name].chat.as_deref() {
+                if url.is_empty() {
+                    return Err(format!("[providers].{name}.chat: URL is empty"));
+                }
+            }
+            if let Some(url) = self.providers[name].embeddings.as_deref() {
+                if url.is_empty() {
+                    return Err(format!("[providers].{name}.embeddings: URL is empty"));
+                }
+            }
+            self.providers[name].validate_headers(name)?;
         }
 
         // 2. Literal full scan of every candidate slug.
@@ -2127,8 +2212,9 @@ impl ModelConfig {
     }
 
     /// Build the name → endpoint map handed to `OpenRouterClient` at boot.
-    /// NO checks here — runs only after `validate_providers` passed. Every
-    /// declared entry is included; an unreferenced entry without a key gets an
+    /// NO checks here — runs only after `validate_providers` passed. Only
+    /// entries with a `chat` URL are included (chat routing is the only
+    /// consumer of this map); an unreferenced entry without a key gets an
     /// empty api_key (unreachable at runtime, and `resolve_endpoint` guards
     /// it anyway).
     pub fn build_providers(&self) -> HashMap<String, crate::provider::ProviderEndpoint> {
@@ -2141,15 +2227,17 @@ impl ModelConfig {
     ) -> HashMap<String, crate::provider::ProviderEndpoint> {
         self.providers
             .iter()
-            .map(|(name, url)| {
+            .filter_map(|(name, entry)| {
+                let chat = entry.chat.clone()?;
                 let key = env(&format!("{}_API_KEY", name.to_uppercase())).unwrap_or_default();
-                (
+                Some((
                     name.clone(),
                     crate::provider::ProviderEndpoint {
-                        base_url: url.clone(),
+                        base_url: chat,
                         api_key: key,
+                        headers: entry.header_map(),
                     },
-                )
+                ))
             })
             .collect()
     }
@@ -5433,15 +5521,51 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn providers_block_parses() {
+    fn providers_table_value_parses() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://api.venice.ai/api/v1/chat/completions\"\n",
+            "[providers]\n\
+             venice = { chat = \"https://api.venice.ai/api/v1/chat/completions\" }\n\
+             local  = { embeddings = \"http://127.0.0.1:8080/v1/embeddings\" }\n\
+             [providers.proxy]\n\
+             chat    = \"https://proxy.internal/v1/chat/completions\"\n\
+             headers = { \"X-Team\" = \"companion\" }\n",
         )
         .unwrap();
         assert_eq!(
-            cfg.providers.get("venice").map(String::as_str),
+            cfg.providers["venice"].chat.as_deref(),
             Some("https://api.venice.ai/api/v1/chat/completions")
         );
+        assert!(cfg.providers["venice"].embeddings.is_none());
+        assert_eq!(
+            cfg.providers["local"].embeddings.as_deref(),
+            Some("http://127.0.0.1:8080/v1/embeddings")
+        );
+        assert_eq!(
+            cfg.providers["proxy"].headers.as_ref().unwrap()["X-Team"],
+            "companion"
+        );
+    }
+
+    #[test]
+    fn providers_string_value_is_rejected() {
+        // 0.9.3's plain-string shape is dropped with no compat layer (spec §0).
+        let err = ModelConfig::from_toml_str(
+            "[providers]\nvenice = \"https://api.venice.ai/api/v1/chat/completions\"\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("venice"),
+            "error should locate the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn providers_unknown_key_is_rejected() {
+        assert!(ModelConfig::from_toml_str(
+            "[providers]\nvenice = { chat = \"https://x/v1/chat/completions\", api_key = \"nope\" }\n",
+        )
+        .is_err());
     }
 
     #[test]
@@ -5452,17 +5576,18 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn provider_name_openrouter_is_reserved() {
-        let cfg =
-            ModelConfig::from_toml_str("[providers]\nopenrouter = \"https://x/v1\"\n").unwrap();
-        let msg = cfg.validate_providers_with(no_env).unwrap_err();
-        assert!(msg.contains("reserved"));
-        assert!(msg.contains("OPENROUTER_BASE_URL"));
+    fn providers_openrouter_entry_is_now_legal() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nopenrouter = { embeddings = \"http://proxy/v1/embeddings\" }\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(|_| None).is_ok());
     }
 
     #[test]
     fn provider_name_voyage_is_reserved() {
-        let cfg = ModelConfig::from_toml_str("[providers]\nvoyage = \"https://x/v1\"\n").unwrap();
+        let cfg = ModelConfig::from_toml_str("[providers]\nvoyage = { chat = \"https://x/v1\" }\n")
+            .unwrap();
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
         assert!(msg.contains("reserved"));
         assert!(msg.contains("VOYAGE_API_KEY"));
@@ -5471,15 +5596,17 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn provider_name_charset_is_constrained() {
         // Dash is rejected: the name uppercases into an env var, no mangling.
-        let cfg =
-            ModelConfig::from_toml_str("[providers]\n\"venice-ai\" = \"https://x/v1\"\n").unwrap();
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\n\"venice-ai\" = { chat = \"https://x/v1\" }\n",
+        )
+        .unwrap();
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
         assert!(msg.contains("a-z0-9_"), "should state the charset: {msg}");
     }
 
     #[test]
     fn provider_empty_url_refuses_boot() {
-        let cfg = ModelConfig::from_toml_str("[providers]\nvenice = \"\"\n").unwrap();
+        let cfg = ModelConfig::from_toml_str("[providers]\nvenice = { chat = \"\" }\n").unwrap();
         assert!(cfg
             .validate_providers_with(no_env)
             .unwrap_err()
@@ -5491,7 +5618,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // The examples/ config ships a sample [providers] entry; deployments
         // that copy it without using it must still boot.
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"plain/m\"\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"plain/m\"\n",
         )
         .unwrap();
         assert!(cfg.validate_providers_with(no_env).is_ok());
@@ -5500,7 +5627,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn referenced_provider_missing_key_refuses_boot() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
         )
         .unwrap();
         let msg = cfg.validate_providers_with(no_env).unwrap_err();
@@ -5513,7 +5640,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn referenced_provider_empty_key_refuses_boot() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"m@venice\"\n",
         )
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(String::new);
@@ -5523,7 +5650,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn referenced_provider_with_key_is_green() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_companion]\nmodel=\"m@venice\"\nfallback=[\"other/m\"]\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"m@venice\"\nfallback=[\"other/m\"]\n",
         )
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
@@ -5585,7 +5712,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // Regression lock: the compose task must keep accepting `@provider` —
         // it is an ordinary chat-shaped task, not an OpenRouter-only executor.
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_image_prompt_compose]\nmodel=\"m@venice\"\nfilter_prompt=\"compose it\"\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_image_prompt_compose]\nmodel=\"m@venice\"\nfilter_prompt=\"compose it\"\n",
         )
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
@@ -5616,7 +5743,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn build_providers_maps_declared_entries() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = \"https://x/v1\"\nother = \"https://y/v1\"\n",
+            "[providers]\nvenice = { chat = \"https://x/v1\" }\nother = { chat = \"https://y/v1\" }\n",
         )
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
@@ -5626,5 +5753,47 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // Unreferenced/keyless entry still present, with an empty key —
         // resolve_endpoint's runtime guard covers the (unreachable) miss.
         assert_eq!(map["other"].api_key, "");
+    }
+
+    #[test]
+    fn providers_empty_entry_is_rejected() {
+        let cfg = ModelConfig::from_toml_str("[providers]\nvenice = {}\n").unwrap();
+        let msg = cfg.validate_providers_with(|_| None).unwrap_err();
+        assert!(msg.contains("[providers].venice"), "{msg}");
+    }
+
+    #[test]
+    fn providers_reserved_header_names_are_rejected() {
+        for header in ["Authorization", "authorization", "Content-Type"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[providers]\nvenice = {{ chat = \"https://x/c\", headers = {{ \"{header}\" = \"boom\" }} }}\n",
+            ))
+            .unwrap();
+            let msg = cfg.validate_providers_with(|_| None).unwrap_err();
+            assert!(msg.contains("engine-owned"), "{header}: {msg}");
+        }
+    }
+
+    #[test]
+    fn providers_invalid_header_value_is_rejected() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = { chat = \"https://x/c\", headers = { \"X-Bad\" = \"line\\nbreak\" } }\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(|_| None).is_err());
+    }
+
+    #[test]
+    fn build_providers_skips_embedding_only_entries_and_carries_headers() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\n\
+             venice = { chat = \"https://x/c\", headers = { \"X-Team\" = \"companion\" } }\n\
+             local  = { embeddings = \"http://e/v1/embeddings\" }\n",
+        )
+        .unwrap();
+        let map = cfg.build_providers_with(|_| Some("k".to_string()));
+        assert!(map.contains_key("venice"));
+        assert!(!map.contains_key("local"));
+        assert_eq!(map["venice"].headers.get("X-Team").unwrap(), "companion");
     }
 }

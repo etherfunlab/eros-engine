@@ -2499,6 +2499,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let req = ChatRequest {
@@ -2822,6 +2823,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: "https://venice.test/v1/chat/completions".into(),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]))
     }
@@ -2886,6 +2888,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: "https://venice.test/v1".into(),
                 api_key: String::new(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         assert!(matches!(
@@ -3221,6 +3224,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let resp = client
@@ -3519,6 +3523,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let mut meta = serde_json::Map::new();
@@ -3591,6 +3596,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let resp = client
@@ -3634,6 +3640,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let resp = client
@@ -3677,6 +3684,7 @@ data: [DONE]\n\n";
             crate::provider::ProviderEndpoint {
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
+                headers: reqwest::header::HeaderMap::new(),
             },
         )]));
         let resp = client

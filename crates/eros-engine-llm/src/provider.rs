@@ -9,21 +9,30 @@ use std::fmt;
 
 /// One custom OpenAI-compatible endpoint from the `[providers]` block.
 /// `base_url` is the complete chat-completions URL, posted verbatim;
-/// `api_key` comes from the `<NAME>_API_KEY` env var at boot.
-#[derive(Clone, PartialEq, Eq)]
+/// `api_key` comes from the `<NAME>_API_KEY` env var at boot. `headers` is
+/// the entry's config-declared `headers` table, applied per-request.
+///
+/// `Eq` is dropped (not derived) because `HeaderMap` doesn't implement it —
+/// `PartialEq` is enough for the existing equality-based tests.
+#[derive(Clone, PartialEq)]
 pub struct ProviderEndpoint {
     pub base_url: String,
     pub api_key: String,
+    /// Config-declared custom headers, applied per-request. Empty by default.
+    pub headers: reqwest::header::HeaderMap,
 }
 
 impl fmt::Debug for ProviderEndpoint {
     /// Manual impl (not `derive`): `api_key` must never land in a log line or
     /// a panic message via `{:?}`, so it's redacted here rather than relying
-    /// on every caller to remember not to print the field directly.
+    /// on every caller to remember not to print the field directly. Header
+    /// VALUES may be sensitive too (e.g. a proxy auth token), so the whole
+    /// `headers` map is redacted rather than printed key-by-key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderEndpoint")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
+            .field("headers", &"<redacted>")
             .finish()
     }
 }
@@ -138,11 +147,31 @@ mod tests {
         let ep = ProviderEndpoint {
             base_url: "https://api.venice.ai/chat/completions".to_string(),
             api_key: "sk-live-SUPER-SECRET-KEY".to_string(),
+            headers: reqwest::header::HeaderMap::new(),
         };
         let dbg = format!("{ep:?}");
         assert!(
             !dbg.contains("SUPER-SECRET-KEY"),
             "Debug output must not leak api_key: {dbg}"
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_debug_redacts_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-proxy-secret",
+            reqwest::header::HeaderValue::from_static("SUPER-SECRET-HEADER-VALUE"),
+        );
+        let ep = ProviderEndpoint {
+            base_url: "https://api.venice.ai/chat/completions".to_string(),
+            api_key: "sk-live-key".to_string(),
+            headers,
+        };
+        let dbg = format!("{ep:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-HEADER-VALUE"),
+            "Debug output must not leak header values: {dbg}"
         );
     }
 
