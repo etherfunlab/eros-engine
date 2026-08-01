@@ -31,7 +31,8 @@
 #
 # Rules:
 # - Names match [a-z0-9_]+. "openrouter" is reserved — override the built-in
-#   endpoint with the OPENROUTER_BASE_URL env var instead.
+#   endpoint with the OPENROUTER_BASE_URL env var instead. "voyage" is
+#   reserved too ($VOYAGE_API_KEY belongs to the built-in embeddings client).
 # - The value is the COMPLETE chat-completions URL, posted verbatim.
 # - The API key comes from env: [providers].venice → $VENICE_API_KEY.
 #   Required only when some model slug actually references the provider —
