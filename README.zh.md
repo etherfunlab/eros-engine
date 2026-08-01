@@ -130,7 +130,7 @@ cargo run -p eros-engine-server -- serve
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile`——历史、会话列表、结构化画像。
 - `GET /comp/affinity/{session_id}`——仅调试用的实时亲密度向量（`EXPOSE_AFFINITY_DEBUG=true`）。
 
-有关完整的请求 schema、SSE 帧布局（包括聊天流上的 `delta`、`image_request`、ghost 和 error 帧，以及绘图端点的 `image` 帧）以及各字段语义，请参阅 [API 参考](docs/api-reference.zh.md)。
+有关完整的请求 schema、SSE 帧布局（包括聊天流上的 `delta`、`image_request`、ghost 和 error 帧）以及各字段语义，请参阅 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 
