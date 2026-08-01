@@ -127,7 +127,6 @@ cargo run -p eros-engine-server -- serve
 
 - `POST /comp/chat/start` — ペルソナとのチャットセッションを開始します。
 - `POST /comp/chat/{session_id}/message/stream` — **中心となる**チャットターンの endpoint です。トークン単位の Server-Sent Events を返します。ターンごとの任意フィールドには、`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（コンパニオンへの tip）、`image_url`（コンパニオンへ写真を送信）、`image`（コンパニオンによる画像生成を要求。style / aspect ratio を指定）があります。画像ターンではエンジンがプロンプトを組み立てて `image_request` frame を送出し、チャットストリーム自体は描画しません。
-- `POST /comp/chat/{session_id}/image/stream` — opt-in：`image_request` を受け取ったら、エンジンに組み立て済みのプロンプトを描画させ、画像をストリームで返します（`image_pending` → `image_attempt*` → `image` / `image_failed`）。`[tasks.chat_image_generation]` が必要で、無ければ `501` を返し、呼び出し側が自分で描画します。
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — 履歴、セッション一覧、構造化されたインサイトプロフィールを取得します。
 - `GET /comp/affinity/{session_id}` — debug 専用のリアルタイム親密度ベクトル（`EXPOSE_AFFINITY_DEBUG=true`）。
 

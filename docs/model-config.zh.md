@@ -121,9 +121,6 @@ fallback = ["x-ai/grok-4.20"]        # 无后缀 → 内置 OpenRouter
   `model = "<上游回显>@<name>"`，`generation_id` 原样存 provider 返回的
   id——用 `generation_id` 去 join OpenRouter 日志时这些行会 miss，
   `model` 列会说明原因。
-- `[tasks.chat_image_generation]` 不接受 `@provider`——绘图端点使用
-  OpenRouter 的 `modalities` 扩展。改写器任务（`chat_image_prompt_compose`）
-  是普通 chat 任务，路由规则与其他任务相同。
 - 使用 `MODEL_CONFIG_DIR` 时，`[providers]` 作为单个顶层 key 整体合并
   （同 `[defaults]`，不同于 `[tasks]`）：所有 provider 必须写在同一个文件里。
 
@@ -327,7 +324,6 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights`（事实挖掘 + JSONB 合并） | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
-| `chat_image_generation` | `pipeline::stream`（opt-in 引擎侧绘图执行器——绘图端点；存在此任务块时激活） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`（opt-in 图片提示词改写器；在图片生成前扩写 PDE 的种子主题；存在此任务块时激活） | live（opt-in） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
@@ -340,7 +336,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_generation`，通过 `resolve_image_gen()`（图片执行器，opt-in）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（图片提示词改写器，opt-in，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（图片提示词改写器，opt-in，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 
 `embedding` 已无实际作用——Voyage 不经过此路径。
 
@@ -349,7 +345,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：
 
 - LLM 接收最近的对话、关系状态和对话信号，并返回 JSON verdict，其中包含：
-  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（请求包含 `image` 块时图片变体才可用——调用方以此声明本轮由自己处理图片；否则降级为 `reply_text`。可用性不再依赖 `[tasks.chat_image_generation]`：聊天流从不绘图，只发出 `image_request` 帧；`[tasks.chat_image_generation]` 仅用于门控独立的绘图端点 `POST /comp/chat/{session_id}/image/stream`。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
+  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（请求包含 `image` 块时图片变体才可用——调用方以此声明本轮由自己处理图片；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `tone`（选填）：这一轮回复该用的语气/口吻，一句话——在文本类动作上注入 reply prompt 的 `[reply_tone]` 区块；缺省则不注入
   - `image_prompt`、`reason`：可选
@@ -360,61 +356,6 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
-
-### `[tasks.chat_image_generation]` — 引擎侧绘图（opt-in）
-
-此块配置引擎的图片执行器——绘图端点（`POST /comp/chat/{session_id}/image/stream`）用来绘制已组合提示词的模型链、风格和尺寸默认值。它**默认关闭**且**可选**。
-
-它**不**门控聊天流。只要当前轮次的请求带有 `image` 块，本轮的 `reply_image` / `reply_text_image` 动作就可用（省略 `image` 会把这些动作降级为 `reply_text`，类似 `chat_vision` 仅在带 `image_url` 时运行）；此时聊天流始终发出 `image_request` 帧、从不绘图。此块只决定当调用方调用绘图端点时引擎是否*绘制*：存在 ⇒ 端点按下方模型链绘图；缺失（或无法解析出模型）⇒ 端点返回 `501`，由调用方自行绘制已组合提示词。
-
-这里可以用任意 OpenRouter 图片模型，包括**只输出图片**的模型（如 `bytedance-seed/seedream-4.5`）：引擎只请求 `modalities: ["image"]`，从不向图片模型要文本。`reply_text_image` 轮次的文字始终来自 `chat_companion`，而非图片模型。
-
-```toml
-[tasks.chat_image_generation]
-# `model` is OPTIONAL. Omit to defer model selection to the per-turn frontend
-# param (req.image.model). When set, reuses ModelSpec: "" fixed / [] round-robin
-# / {} weighted (the same three shapes as chat_companion.model).
-model = "google/gemini-2.5-flash-image"   # OPTIONAL
-# `fallback` is a FallbackSpec: a single id string OR an ordered array tried
-# SEQUENTIALLY (first success wins — NOT round-robin). Note: under `model`,
-# [...] = round-robin; under `fallback`, [...] = ordered retry chain.
-fallback = ["google/gemini-2.5-flash-image"]
-default_style = "realistic"          # realistic | semi_realistic | anime
-default_aspect_ratio = "3:4"
-default_resolution = "1024x1365"
-max_tokens = 4096
-```
-
-**每轮模型解析**——使用一个统一的候选列表，头部 = primary，尾部 = 重试链：
-
-1. `req.image.model`——前端提供的每轮单 id 覆盖
-2. 配置中的 `model`——为本次调用将 `ModelSpec` 解析为一个 id
-3. 配置中的 `fallback`——有序重试链条目
-
-后续重复项会被删除（保留最先出现的项）。列表为空表示无法解析出模型，当前轮次会降级为 `reply_text`。
-
-**只配置 `fallback` 也足够：**未设置 `model` 且没有每轮覆盖时，`fallback` 的头部会成为 primary。仅配置 `model`（无 `fallback`）时，失败后没有安全保障。
-
-| 字段 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `model` | `ModelSpec`（字符串 \| 数组 \| 表） | 缺失 | **可选。** 缺失 ⇒ 执行器已启用，但前端必须为每轮提供模型。 |
-| `fallback` | `String` \| `Array<String>` | `[]` | 顺序重试链（FallbackSpec）。 |
-| `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 每轮 style key（可通过 `req.image.style` 覆盖）。 |
-| `default_aspect_ratio` | `String` | `"3:4"` | 每轮宽高比（可通过 `req.image.aspect_ratio` 覆盖）。允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。 |
-| `default_resolution` | `String` | 缺失 | 取决于模型的分辨率提示（例如 `"1024x1365"`）。**绘图端点不会应用它**——端点根据 `image_request` 帧中携带的每轮宽高比推导图片尺寸，仅在绘图请求显式传入 `resolution`（`DrawImageRequest.resolution`）时才使用它。 |
-| `max_tokens` | `u32` | 编译时内置默认值 | 图片生成调用的 token 上限。 |
-
-**Style preset** 是引擎所有的常量，会注入生成 prompt：
-
-| Key | 描述 |
-|---|---|
-| `realistic` | 照片级写实的生活抓拍，自然的皮肤纹理、可信的解剖结构、柔和自然光线和真实的智能手机照片美学。 |
-| `semi_realistic` | 半写实数字角色插画，可信的解剖结构、柔和绘制的皮肤、略微风格化的面部特征和细致的电影感光线。 |
-| `anime` | 高质量日式 anime 插画，干净且富有表现力的线稿、细致的眼睛、精致的赛璐璐上色、协调的解剖结构和细致的背景。 |
-
-**Persona 外观**——如果 persona 的 `art_metadata` 含有 `appearance` key，它会注入生成 prompt，位于 style preset 和主体之间。`appearance` 字段是可选且附加的——没有该字段的现有 persona 不受影响。
-
-调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_gen()`。
 
 ### `[tasks.chat_image_prompt_compose]` — 图片提示词改写器（opt-in）
 

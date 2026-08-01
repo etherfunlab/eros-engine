@@ -2354,7 +2354,7 @@ async fn run_image_prompt_compose(
     None
 }
 
-/// The three per-turn image inputs, resolved from plan → request → config.
+/// The three per-turn image inputs, resolved from plan → request.
 struct ImageTurnInputs {
     seed_subject: String,
     style: eros_engine_llm::model_config::StyleKey,
@@ -5525,9 +5525,9 @@ data: [DONE]\n\n";
     // These drive `run_stream` with a `force`d image action (mode selects the
     // arm), asserting the delegated frame sequence, that NO in-engine draw
     // happens, and that only the minimal `metadata.image` marker is persisted.
-    // The model config OMITS `[tasks.chat_image_generation]` — proving the gate
-    // flip: the chat stream still emits `image_request` (and the marker) with no
-    // image-gen task configured. It also omits the judge (`pde_decision`) and the
+    // The model config carries no image task — the chat stream always
+    // delegates: it still emits `image_request` (and the marker) with nothing
+    // image-related configured. It also omits the judge (`pde_decision`) and the
     // composer (`chat_image_prompt_compose`), so the image-only turn makes zero
     // LLM calls and the outcome is deterministic.
 

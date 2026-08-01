@@ -127,7 +127,6 @@ cargo run -p eros-engine-server -- serve
 
 - `POST /comp/chat/start`——与指定人设开启聊天会话。
 - `POST /comp/chat/{session_id}/message/stream`——**核心**对话端点：逐 token 的 Server-Sent Events。每轮可选字段：`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（给角色打赏）、`image_url`（给角色发一张照片）、`image`（请求角色生成一张图片——风格 / 画幅）。图片轮次由引擎组合提示词并发出 `image_request` 帧，聊天流本身不绘图。
-- `POST /comp/chat/{session_id}/image/stream`——可选：收到 `image_request` 后，让引擎绘制已组合的提示词并把图片流式返回（`image_pending` → `image_attempt*` → `image` / `image_failed`）。需要 `[tasks.chat_image_generation]`；缺失时返回 `501`，由调用方自行绘制。
 - `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile`——历史、会话列表、结构化画像。
 - `GET /comp/affinity/{session_id}`——仅调试用的实时亲密度向量（`EXPOSE_AFFINITY_DEBUG=true`）。
 

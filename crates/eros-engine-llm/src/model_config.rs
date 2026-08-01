@@ -5565,8 +5565,8 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
 
     #[test]
     fn compose_task_accepts_provider_suffix() {
-        // Pins spec §9: the draw-endpoint restriction must never widen to the
-        // compose task — it is an ordinary chat-shaped task.
+        // Regression lock: the compose task must keep accepting `@provider` —
+        // it is an ordinary chat-shaped task, not an OpenRouter-only executor.
         let cfg = ModelConfig::from_toml_str(
             "[providers]\nvenice = \"https://x/v1\"\n[tasks.chat_image_prompt_compose]\nmodel=\"m@venice\"\nfilter_prompt=\"compose it\"\n",
         )

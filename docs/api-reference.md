@@ -257,10 +257,6 @@ The `image` block is also the per-turn opt-in: **omit it to suppress image
 generation for the turn** (the PDE may then only `reply_text` / `ghost`), or
 send `image: {}` to enable it with the task defaults. This lets a caller's own
 per-turn policy gate images independently of the PDE's content decision.
-`[tasks.chat_image_generation]` (see [model-config.md](model-config.md)) is
-**optional** here — it now gates only the draw endpoint below (`POST
-/comp/chat/{session_id}/image/stream`); the chat stream's `image_request`
-emission does not depend on it.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -308,7 +304,8 @@ unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
 **`image_request` SSE frame** — emitted once per image turn in place of any
 in-engine draw. The engine composes the prompt; the consumer draws it (directly
 or via the draw endpoint below). The chat stream itself draws nothing, streams
-no image bytes, and persists no draw result.
+no image bytes, and persists no draw result. The engine does not draw; the
+consumer calls its own image vendor.
 
 ```
 data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e...","image_ref":"face","aspect_ratio":"3:4"}
@@ -329,41 +326,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no LLM was called.
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
 
-The chat stream emits none of `image_pending`/`image_attempt`/`image`/`image_failed`
-and persists no draw result — total-failure handling is the consumer's (see the
-draw endpoint below, which does emit that sequence).
-
-### `POST /comp/chat/{session_id}/image/stream`
-
-Opt-in SSE endpoint: on receiving an `image_request` frame, the consumer may
-call this to have the engine draw the composed prompt (instead of drawing it
-itself). The engine draws the prompt **verbatim** — no re-compose, no persona —
-and persists nothing (the consumer owns image storage). Requires
-`[tasks.chat_image_generation]` in the model config; when that block is absent
-the endpoint returns `501` and the consumer must self-draw. Auth + session
-ownership match `message/stream`.
-
-**Request body**
-
-| Field | Type | Notes |
-|---|---|---|
-| `message_id` | `String` | The assistant message id `X` from the `image_request` frame; echoed on every draw frame. |
-| `composed_prompt` | `String` | base64(STANDARD) of the final wire prompt, copied from the frame. Drawn verbatim. |
-| `image_ref` | `"face"` \| `"previous"` | From the frame; selects the reference image. |
-| `face_ref_url` | `String?` | Absolute http(s) URL of the face/style reference. |
-| `prev_image_url` | `String?` | Absolute http(s) URL of the previous image (for `image_ref: "previous"`; falls back to `face_ref_url` when absent). |
-| `model` | `String?` | Per-draw model override. |
-| `aspect_ratio` | `String?` | One of `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
-| `resolution` | `String?` | Explicit `WxH` (overrides `aspect_ratio`). |
-
-**Output frames** — `image_pending → image_attempt* → (image | image_failed)`.
-`image` carries the generated image as a base64 data URL (the engine has no blob
-store); every frame echoes `message_id`.
-
-**Errors** — `400` malformed `composed_prompt` (bad base64); `403`/`404` session
-ownership; `422` bad URL / aspect / resolution; `429` per-user concurrent-stream
-cap reached (shared with the chat stream); `501` (`image_generation_disabled`)
-when the engine has no image-generation config — the consumer should self-draw.
+The engine never draws and no draw-lifecycle frames exist: the consumer
+receives `image_request` and calls its own image vendor.
 
 ### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
 

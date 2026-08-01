@@ -125,10 +125,6 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
   `model = "<upstream echo>@<name>"` and the provider's own `generation_id`
   verbatim — a `generation_id` join against OpenRouter's logs misses for
   those rows, and the `model` column says why.
-- `[tasks.chat_image_generation]` does not accept `@provider` — the draw
-  endpoint speaks OpenRouter's `modalities` extension. The composer task
-  (`chat_image_prompt_compose`) is an ordinary chat task and routes like any
-  other.
 - Under `MODEL_CONFIG_DIR`, `[providers]` merges as one whole top-level key
   (like `[defaults]`, unlike `[tasks]`): all providers live in one file.
 
@@ -377,7 +373,6 @@ input filter has no triggers, timing, or tiers).
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
-| `chat_image_generation` | `pipeline::stream` (opt-in engine-side image draw executor — the draw endpoint; activated when this task block is present) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (opt-in image-prompt composer; expands the PDE seed subject before image generation; activated when this task block is present) | live (opt-in) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
@@ -390,7 +385,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_generation` via `resolve_image_gen()` (image executor, opt-in); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` is vestigial — Voyage doesn't go through this path.
 
@@ -399,7 +394,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. Availability no longer depends on `[tasks.chat_image_generation]`: the chat stream never draws, it emits an `image_request` frame. `[tasks.chat_image_generation]` gates only the separate draw endpoint, `POST /comp/chat/{session_id}/image/stream`. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. The chat stream never draws — it emits an `image_request` frame and the consumer calls its own image vendor. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `tone` (optional): a short delivery directive for this turn's reply — injected into the reply prompt as a `[reply_tone]` section on text-bearing actions; omitted when absent
   - `image_prompt`, `reason`: optional
@@ -410,77 +405,6 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 **Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image action is available this turn (the request carries an `image` block), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
-
-### `[tasks.chat_image_generation]` — engine-side image drawing (opt-in)
-
-This block configures the engine's image executor — the model chain, styles, and
-size defaults the draw endpoint (`POST /comp/chat/{session_id}/image/stream`) uses
-to draw a composed prompt. It is **off by default** and **optional**.
-
-It does **not** gate the chat stream. A turn's `reply_image` / `reply_text_image`
-action is available whenever the per-turn request carries an `image` block
-(omitting `image` degrades those actions to `reply_text`, mirroring how
-`chat_vision` runs only when `image_url` is present); the chat stream then always
-emits an `image_request` frame and never draws. This block controls only whether
-the engine will *draw* when the consumer calls the draw endpoint: present ⇒ the
-endpoint draws, walking the model chain below; absent (or no model resolvable) ⇒
-the endpoint returns `501` and the consumer draws the composed prompt itself.
-
-Any OpenRouter image model works here, including **image-only** models (e.g. `bytedance-seed/seedream-4.5`): the engine requests `modalities: ["image"]` and never asks the image model for text. The caption on a `reply_text_image` turn always comes from `chat_companion`, never the image model.
-
-```toml
-[tasks.chat_image_generation]
-# `model` is OPTIONAL. Omit to defer model selection to the per-turn frontend
-# param (req.image.model). When set, reuses ModelSpec: "" fixed / [] round-robin
-# / {} weighted (the same three shapes as chat_companion.model).
-model = "google/gemini-2.5-flash-image"   # OPTIONAL
-# `fallback` is a FallbackSpec: a single id string OR an ordered array tried
-# SEQUENTIALLY (first success wins — NOT round-robin). Note: under `model`,
-# [...] = round-robin; under `fallback`, [...] = ordered retry chain.
-fallback = ["google/gemini-2.5-flash-image"]
-default_style = "realistic"          # realistic | semi_realistic | anime
-default_aspect_ratio = "3:4"
-default_resolution = "1024x1365"
-max_tokens = 4096
-```
-
-**Per-turn model resolution** — one unified candidate list, head = primary, tail = retry chain:
-
-1. `req.image.model` — per-turn single-id override from the frontend
-2. Config `model` — the `ModelSpec` resolved to one id for this call
-3. Config `fallback` — ordered retry chain entries
-
-Later duplicates are removed (keep-first). An empty list means no model is
-resolvable and the turn degrades to `reply_text`.
-
-**`fallback` alone is sufficient:** with no `model` set and no per-turn override,
-the head of `fallback` becomes the primary. A `model`-only config (no `fallback`)
-leaves no safety net on failure.
-
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `model` | `ModelSpec` (string \| array \| table) | absent | **Optional.** Absent ⇒ executor enabled but frontend must supply a model per turn. |
-| `fallback` | `String` \| `Array<String>` | `[]` | Sequential retry chain (FallbackSpec). |
-| `default_style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | Per-turn style key (overridable via `req.image.style`). |
-| `default_aspect_ratio` | `String` | `"3:4"` | Per-turn aspect ratio (overridable via `req.image.aspect_ratio`). Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`. |
-| `default_resolution` | `String` | absent | Model-specific resolution hint (e.g. `"1024x1365"`). **Not applied by the draw endpoint** — the endpoint derives image size from the per-scene aspect carried in the `image_request` frame, and honors only an explicit `resolution` on the draw request (`DrawImageRequest.resolution`). |
-| `max_tokens` | `u32` | compiled-in default | Token cap for the image-gen call. |
-
-**Style presets** are engine-owned constants injected into the generation prompt:
-
-| Key | Description |
-|---|---|
-| `realistic` | Photorealistic candid lifestyle photography, natural skin texture, believable anatomy, soft natural lighting, authentic smartphone photo aesthetic. |
-| `semi_realistic` | Semi-realistic digital character illustration, believable anatomy, softly painted skin, subtly stylized facial features, detailed cinematic lighting. |
-| `anime` | High-quality Japanese anime illustration, clean expressive line art, detailed eyes, polished cel shading, coherent anatomy and detailed background. |
-
-**Persona appearance** — if the persona's `art_metadata` has an `appearance` key,
-it is injected into the generation prompt between the style preset and the subject.
-The `appearance` field is optional and additive — existing personas without it are
-unaffected.
-
-Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
-`resolve_image_gen()` in `model_config.rs`.
 
 ### `[tasks.chat_image_prompt_compose]` — image-prompt composer (opt-in)
 
