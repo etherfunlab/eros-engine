@@ -113,9 +113,21 @@ fn parse_response(body: &str, expected: usize, model: &str) -> Result<Vec<Vec<f3
         )));
     }
     let mut data = parsed.data;
-    // `index` is optional on the wire; when present on all rows, honour it.
+    // `index` is optional on the wire; when present on all rows, honour it —
+    // but only as the exact permutation 0..expected. A duplicate or shifted
+    // index set ([0,0], [1,2]) would silently associate vectors with the
+    // wrong inputs and persist them; that must be a loud provider error.
     if data.iter().all(|d| d.index.is_some()) {
         data.sort_by_key(|d| d.index.unwrap_or(usize::MAX));
+        for (i, d) in data.iter().enumerate() {
+            if d.index != Some(i) {
+                return Err(LlmError::Provider(format!(
+                    "embeddings: model {model} returned indices that are not the \
+                     permutation 0..{expected} — refusing to associate vectors with \
+                     inputs"
+                )));
+            }
+        }
     }
     let out: Vec<Vec<f32>> = data.into_iter().map(|d| d.embedding).collect();
     for v in &out {
@@ -413,6 +425,24 @@ mod tests {
             client.embed_batch(&[]).await.expect("ok"),
             Vec::<Vec<f32>>::new()
         );
+    }
+
+    #[test]
+    fn malformed_indices_are_rejected() {
+        // Duplicate ([0,0]) or shifted ([1,2]) index sets pass the count and
+        // dim checks but would misassociate vectors with inputs — must error.
+        let v = vec![0.0f32; 512];
+        for indices in [[0usize, 0], [1, 2]] {
+            let body = serde_json::json!({
+                "data": [
+                    { "embedding": v, "index": indices[0] },
+                    { "embedding": v, "index": indices[1] }
+                ]
+            })
+            .to_string();
+            let msg = parse_response(&body, 2, "m").unwrap_err().to_string();
+            assert!(msg.contains("permutation"), "{indices:?}: {msg}");
+        }
     }
 
     fn env_with<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
