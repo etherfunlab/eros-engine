@@ -681,6 +681,14 @@ pub fn apply_output_regex(
 pub struct TaskConfig {
     #[serde(default = "default_model_spec")]
     pub model: ModelSpec,
+    /// Embedding-only: recall-path model (voyage-4 series and above; pair-only
+    /// with `model_write`; mutually exclusive with `model`). Plain string —
+    /// round-robin/weighted shapes are type errors by design.
+    #[serde(default)]
+    pub model_read: Option<String>,
+    /// Embedding-only: storage-path model. See `model_read`.
+    #[serde(default)]
+    pub model_write: Option<String>,
     #[serde(default)]
     pub temperature: Option<f64>,
     /// Nucleus-sampling probability mass. Chat task only; task-level (tiers
@@ -824,6 +832,36 @@ pub struct ModelConfig {
     #[serde(default)]
     pub tasks: HashMap<String, TaskConfig>,
 }
+
+/// Where one embedding call goes (spec 2026-08-01-embedding-providers §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedRoute {
+    /// The built-in native Voyage client.
+    Voyage,
+    /// The built-in OpenRouter embeddings endpoint (URL overridable via
+    /// `[providers].openrouter.embeddings`).
+    OpenRouter,
+    /// A `[providers]` entry's `embeddings` URL.
+    Custom(String),
+}
+
+/// One resolved embedding target: bare model id + route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedTarget {
+    pub model: String,
+    pub route: EmbedRoute,
+}
+
+/// Resolved `[tasks.embedding]`: the read (recall / embed_query) and write
+/// (storage / embed_document) targets. Identical targets when a single
+/// `model` is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEmbedding {
+    pub read: EmbedTarget,
+    pub write: EmbedTarget,
+}
+
+const DEFAULT_EMBED_MODEL: &str = "voyage-3-lite";
 
 /// Resolved model parameters for an LLM call.
 ///
@@ -1866,6 +1904,59 @@ impl ModelConfig {
             .unwrap_or(true)
     }
 
+    /// Pure resolution of `[tasks.embedding]` — call after `validate_providers`
+    /// passed. Absent block, or a block with no model fields, resolves to the
+    /// legacy default (native Voyage, voyage-3-lite) on both sides.
+    pub fn resolve_embedding(&self) -> ResolvedEmbedding {
+        let task = self.tasks.get("embedding");
+        let target = |slug: &str| -> EmbedTarget {
+            match crate::provider::split_model_slug(slug) {
+                Ok((bare, None)) | Ok((bare, Some("voyage"))) => EmbedTarget {
+                    model: bare,
+                    route: EmbedRoute::Voyage,
+                },
+                Ok((bare, Some("openrouter"))) => EmbedTarget {
+                    model: bare,
+                    route: EmbedRoute::OpenRouter,
+                },
+                Ok((bare, Some(p))) => EmbedTarget {
+                    model: bare,
+                    route: EmbedRoute::Custom(p.to_string()),
+                },
+                // Unreachable post-boot (validation walked every slug).
+                Err(_) => EmbedTarget {
+                    model: slug.to_string(),
+                    route: EmbedRoute::Voyage,
+                },
+            }
+        };
+        if let Some(t) = task {
+            if let (Some(r), Some(w)) = (t.model_read.as_deref(), t.model_write.as_deref()) {
+                return ResolvedEmbedding {
+                    read: target(r),
+                    write: target(w),
+                };
+            }
+            if let ModelSpec::Fixed(m) = &t.model {
+                if !m.is_empty() {
+                    let one = target(m);
+                    return ResolvedEmbedding {
+                        read: one.clone(),
+                        write: one,
+                    };
+                }
+            }
+        }
+        let default = EmbedTarget {
+            model: DEFAULT_EMBED_MODEL.to_string(),
+            route: EmbedRoute::Voyage,
+        };
+        ResolvedEmbedding {
+            read: default.clone(),
+            write: default,
+        }
+    }
+
     /// Resolve the insight-extraction (facts stage) prompt bundle. `None` when
     /// `[tasks.insight_extraction]` is absent OR its `filter_prompt` is blank.
     pub fn resolve_insight_extract(&self) -> Option<ResolvedExtract> {
@@ -2092,12 +2183,18 @@ impl ModelConfig {
     }
 
     /// Boot gate for the `[providers]` block and every `@provider` model slug
-    /// (multi-provider spec §7). Checks, in order: provider-table shape
-    /// (charset, reserved name, non-empty URL), then a LITERAL full scan of
-    /// every candidate slug — `[defaults].fallback_model`, every task's and
-    /// tier's `model`/`fallback`, including every round-robin element and
-    /// weighted-table key. Referenced providers must have a non-empty
-    /// `<NAME>_API_KEY` in the environment (loud-fail, like VOYAGE_API_KEY).
+    /// (spec 2026-08-01-embedding-providers §2/§4/§6/§7). Checks, in order:
+    /// provider-table shape (charset, reserved name, non-empty URL);
+    /// `[defaults].ignore_providers` grammar; a task-aware LITERAL full scan
+    /// of every candidate slug — `[defaults].fallback_model`, every task's and
+    /// tier's `model`/`fallback`, `[tasks.embedding]`'s `model`/`model_read`/
+    /// `model_write`, including every round-robin element and weighted-table
+    /// key — where `@voyage` is legal only on embedding-task slugs and every
+    /// other referenced provider must have a non-empty `<NAME>_API_KEY` in the
+    /// environment; `[tasks.embedding]`'s structural rules (model vs.
+    /// model_read/model_write exclusivity, no fallback/tiers, voyage-4+ gate
+    /// on the read/write pair); and finally VOYAGE_API_KEY, required iff the
+    /// resolved embedding config routes through the built-in Voyage client.
     pub fn validate_providers(&self) -> Result<(), String> {
         self.validate_providers_with(|k| std::env::var(k).ok())
     }
@@ -2167,23 +2264,40 @@ impl ModelConfig {
             }
         }
 
-        // 2. Literal full scan of every candidate slug.
-        let mut slugs: Vec<(String, &str)> = Vec::new();
+        // 2. Literal full scan of every candidate slug. The third element flags
+        // an embedding-task slug: `[tasks.embedding].model` (and, below,
+        // `.model_read`/`.model_write`) are the only entries where `@voyage`
+        // is legal and where routing demands an `embeddings` URL rather than
+        // a `chat` one.
+        let mut slugs: Vec<(String, &str, bool)> = Vec::new();
         if let Some(fb) = self.defaults.fallback_model.as_deref() {
             if !fb.is_empty() {
-                slugs.push(("[defaults].fallback_model".to_string(), fb));
+                slugs.push(("[defaults].fallback_model".to_string(), fb, false));
             }
         }
         let mut task_names: Vec<&String> = self.tasks.keys().collect();
         task_names.sort();
         for name in task_names {
             let task = &self.tasks[name];
+            let is_embedding = name == "embedding";
             for id in task.model.candidate_ids() {
-                slugs.push((format!("[tasks.{name}].model"), id));
+                slugs.push((format!("[tasks.{name}].model"), id, is_embedding));
             }
             if let Some(fb) = &task.fallback {
                 for id in fb.candidate_ids() {
-                    slugs.push((format!("[tasks.{name}].fallback"), id));
+                    slugs.push((format!("[tasks.{name}].fallback"), id, is_embedding));
+                }
+            }
+            if is_embedding {
+                if let Some(m) = task.model_read.as_deref() {
+                    if !m.is_empty() {
+                        slugs.push(("[tasks.embedding].model_read".to_string(), m, true));
+                    }
+                }
+                if let Some(m) = task.model_write.as_deref() {
+                    if !m.is_empty() {
+                        slugs.push(("[tasks.embedding].model_write".to_string(), m, true));
+                    }
                 }
             }
             let mut tier_names: Vec<&String> = task.tiers.keys().collect();
@@ -2192,40 +2306,143 @@ impl ModelConfig {
                 let t = &task.tiers[tier];
                 if let Some(m) = &t.model {
                     for id in m.candidate_ids() {
-                        slugs.push((format!("[tasks.{name}.tiers.{tier}].model"), id));
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].model"), id, false));
                     }
                 }
                 if let Some(fb) = &t.fallback {
                     for id in fb.candidate_ids() {
-                        slugs.push((format!("[tasks.{name}.tiers.{tier}].fallback"), id));
+                        slugs.push((format!("[tasks.{name}.tiers.{tier}].fallback"), id, false));
                     }
                 }
             }
         }
 
-        for (at, slug) in slugs {
+        for (at, slug, is_embedding) in slugs {
             let (_, provider) =
                 crate::provider::split_model_slug(slug).map_err(|e| format!("{at}: {e}"))?;
-            if let Some(p) = provider {
-                if !self.providers.contains_key(p) {
-                    let mut declared: Vec<&str> =
-                        self.providers.keys().map(String::as_str).collect();
-                    declared.sort();
+            match provider {
+                None => {}
+                // Built-in alias: valid everywhere a provider suffix is legal,
+                // no [providers] entry and no extra key check
+                // ($OPENROUTER_API_KEY is unconditionally required for chat).
+                Some("openrouter") => {}
+                Some("voyage") if is_embedding => {}
+                Some("voyage") => {
                     return Err(format!(
-                        "{at}: `{slug}` names provider `{p}`, which is not declared in \
-                         [providers] (declared: {declared:?}). If the `@` is part of the \
-                         model id, escape it as `\\@` (in TOML double quotes: `\"\\\\@\"`)."
+                        "{at}: `{slug}` routes to `voyage`, which serves embeddings only — \
+                         `@voyage` is valid on [tasks.embedding] model fields and nowhere else"
                     ));
                 }
-                let var = format!("{}_API_KEY", p.to_uppercase());
-                if env(&var).is_none_or(|v| v.is_empty()) {
-                    return Err(format!(
-                        "{at}: `{slug}` routes to provider `{p}` but ${var} is unset or \
-                         empty — eros-engine refuses to boot rather than fail at request \
-                         time"
-                    ));
+                Some(p) => {
+                    let Some(entry) = self.providers.get(p) else {
+                        let mut declared: Vec<&str> =
+                            self.providers.keys().map(String::as_str).collect();
+                        declared.sort();
+                        return Err(format!(
+                            "{at}: `{slug}` names provider `{p}`, which is not declared in \
+                             [providers] (declared: {declared:?}). If the `@` is part of the \
+                             model id, escape it as `\\@` (in TOML double quotes: `\"\\\\@\"`)."
+                        ));
+                    };
+                    if is_embedding && entry.embeddings.is_none() {
+                        return Err(format!(
+                            "{at}: `{slug}` routes embedding traffic to `{p}`, but \
+                             [providers].{p} declares no `embeddings` URL"
+                        ));
+                    }
+                    if !is_embedding && entry.chat.is_none() {
+                        return Err(format!(
+                            "{at}: `{slug}` routes chat traffic to `{p}`, but \
+                             [providers].{p} declares no `chat` URL"
+                        ));
+                    }
+                    let var = format!("{}_API_KEY", p.to_uppercase());
+                    if env(&var).is_none_or(|v| v.is_empty()) {
+                        return Err(format!(
+                            "{at}: `{slug}` routes to provider `{p}` but ${var} is unset or \
+                             empty — eros-engine refuses to boot rather than fail at request \
+                             time"
+                        ));
+                    }
                 }
             }
+        }
+
+        // 3. [tasks.embedding]-specific structure (spec §2/§6).
+        if let Some(t) = self.tasks.get("embedding") {
+            let model_set = !t.model.candidate_ids().is_empty();
+            let pair = (t.model_read.as_deref(), t.model_write.as_deref());
+            if model_set && (pair.0.is_some() || pair.1.is_some()) {
+                return Err(
+                    "[tasks.embedding]: `model` and `model_read`/`model_write` are mutually \
+                     exclusive — configure one or the other"
+                        .to_string(),
+                );
+            }
+            if pair.0.is_some() != pair.1.is_some() {
+                return Err(
+                    "[tasks.embedding]: `model_read` and `model_write` must appear together \
+                     (a lone half would leave the other path on an unspecified model)"
+                        .to_string(),
+                );
+            }
+            if model_set && !matches!(t.model, ModelSpec::Fixed(_)) {
+                return Err(
+                    "[tasks.embedding].model must be a single fixed id — round-robin and \
+                     weighted forms would interleave incompatible vector spaces"
+                        .to_string(),
+                );
+            }
+            if t.fallback.is_some() {
+                return Err(
+                    "[tasks.embedding]: `fallback` is not supported — a fallback model would \
+                     write vectors the primary cannot compare. Delete the key."
+                        .to_string(),
+                );
+            }
+            if !t.tiers.is_empty() {
+                return Err(
+                    "[tasks.embedding]: `tiers` are not supported on the embedding task. \
+                     Delete the block."
+                        .to_string(),
+                );
+            }
+            for (field, slug) in [("model_read", pair.0), ("model_write", pair.1)] {
+                let Some(slug) = slug else { continue };
+                let (bare, provider) = crate::provider::split_model_slug(slug)
+                    .map_err(|e| format!("[tasks.embedding].{field}: {e}"))?;
+                if !matches!(provider, None | Some("voyage")) {
+                    return Err(format!(
+                        "[tasks.embedding].{field}: `{slug}` — model_read/model_write are \
+                         Voyage-only (bare id or `@voyage`); other providers cannot \
+                         guarantee a shared vector space"
+                    ));
+                }
+                match voyage_model_generation(&bare) {
+                    Some(n) if n >= 4.0 => {}
+                    _ => {
+                        return Err(format!(
+                            "[tasks.embedding].{field}: `{bare}` — the read/write split \
+                             requires the voyage-4 series or above (a shared vector space \
+                             across model sizes); voyage-3.x and domain models refuse to \
+                             boot rather than silently write incomparable vectors"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 4. VOYAGE_API_KEY: required iff a Voyage backend is in play (spec §7).
+        let resolved = self.resolve_embedding();
+        let voyage_in_play =
+            resolved.read.route == EmbedRoute::Voyage || resolved.write.route == EmbedRoute::Voyage;
+        if voyage_in_play && env("VOYAGE_API_KEY").is_none_or(|v| v.trim().is_empty()) {
+            return Err(
+                "VOYAGE_API_KEY is unset or empty but the embedding config resolves to \
+                 the built-in Voyage client — eros-engine refuses to boot rather than \
+                 silently disable embeddings"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -4467,7 +4684,11 @@ filter_prompt = "只根据产品资料作答。"
             "[defaults]\nignore_providers = [\"bad-a@openrouter\", \"bad-b@openrouter\"]\n",
         )
         .unwrap();
-        assert!(cfg.validate_providers_with(|_| None).is_ok());
+        // No [tasks.embedding] ⇒ the default embedding route is the built-in
+        // Voyage client, so validation now also needs VOYAGE_API_KEY.
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
         assert_eq!(cfg.ignore_provider_wire_slugs(), vec!["bad-a", "bad-b"]);
     }
 
@@ -5673,7 +5894,11 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     fn providers_absent_is_empty_and_valid() {
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"m\"\n").unwrap();
         assert!(cfg.providers.is_empty());
-        assert!(cfg.validate_providers_with(no_env).is_ok());
+        // No [tasks.embedding] ⇒ resolves to the default Voyage route, which
+        // now needs VOYAGE_API_KEY.
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
     }
 
     #[test]
@@ -5682,7 +5907,9 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[providers]\nopenrouter = { embeddings = \"http://proxy/v1/embeddings\" }\n",
         )
         .unwrap();
-        assert!(cfg.validate_providers_with(|_| None).is_ok());
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
     }
 
     #[test]
@@ -5722,7 +5949,11 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"plain/m\"\n",
         )
         .unwrap();
-        assert!(cfg.validate_providers_with(no_env).is_ok());
+        // No [tasks.embedding] ⇒ resolves to the default Voyage route, which
+        // now needs VOYAGE_API_KEY.
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
     }
 
     #[test]
@@ -5754,7 +5985,10 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_companion]\nmodel=\"m@venice\"\nfallback=[\"other/m\"]\n",
         )
         .unwrap();
-        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        // No [tasks.embedding] ⇒ resolves to the default Voyage route, which
+        // now needs VOYAGE_API_KEY alongside VENICE_API_KEY.
+        let env =
+            |k: &str| (k == "VENICE_API_KEY" || k == "VOYAGE_API_KEY").then(|| "sk-v".to_string());
         assert!(cfg.validate_providers_with(env).is_ok());
     }
 
@@ -5816,7 +6050,10 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             "[providers]\nvenice = { chat = \"https://x/v1\" }\n[tasks.chat_image_prompt_compose]\nmodel=\"m@venice\"\nfilter_prompt=\"compose it\"\n",
         )
         .unwrap();
-        let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
+        // No [tasks.embedding] ⇒ resolves to the default Voyage route, which
+        // now needs VOYAGE_API_KEY alongside VENICE_API_KEY.
+        let env =
+            |k: &str| (k == "VENICE_API_KEY" || k == "VOYAGE_API_KEY").then(|| "sk-v".to_string());
         assert!(cfg.validate_providers_with(env).is_ok());
     }
 
@@ -5896,5 +6133,194 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert!(map.contains_key("venice"));
         assert!(!map.contains_key("local"));
         assert_eq!(map["venice"].headers.get("X-Team").unwrap(), "companion");
+    }
+
+    // ---- [tasks.embedding] routing + resolve_embedding (spec 2026-08-01-embedding-providers §2/§3/§6) ----
+
+    /// env closure granting every key, for tests that target non-key rules.
+    fn env_all(k: &str) -> Option<String> {
+        let _ = k;
+        Some("key".to_string())
+    }
+
+    #[test]
+    fn at_openrouter_alias_passes_on_chat_tasks() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"x-ai/grok-4.20@openrouter\"\n\
+             fallback = [\"deepseek/deepseek-v4-flash@openrouter\"]\n",
+        )
+        .unwrap();
+        // No [tasks.embedding] ⇒ resolves to the default Voyage route, which
+        // needs VOYAGE_API_KEY — this test targets the @openrouter alias, not
+        // the key check.
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn at_voyage_on_chat_task_is_rejected() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"voyage-4@voyage\"\n")
+                .unwrap();
+        let msg = cfg.validate_providers_with(env_all).unwrap_err();
+        assert!(
+            msg.contains("embedding"),
+            "should say voyage is embeddings-only: {msg}"
+        );
+    }
+
+    #[test]
+    fn chat_ref_to_embeddings_only_entry_is_rejected() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nlocal = { embeddings = \"http://e/v1/embeddings\" }\n\
+             [tasks.chat_companion]\nmodel = \"m@local\"\n",
+        )
+        .unwrap();
+        let msg = cfg.validate_providers_with(env_all).unwrap_err();
+        assert!(msg.contains("chat"), "{msg}");
+    }
+
+    #[test]
+    fn embedding_ref_to_chat_only_entry_is_rejected() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nvenice = { chat = \"https://x/c\" }\n\
+             [tasks.embedding]\nmodel = \"bge-m3@venice\"\n",
+        )
+        .unwrap();
+        let msg = cfg.validate_providers_with(env_all).unwrap_err();
+        assert!(msg.contains("embeddings"), "{msg}");
+    }
+
+    #[test]
+    fn embedding_bare_model_means_voyage_and_needs_voyage_key() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.embedding]\nmodel = \"voyage-3-lite\"\n").unwrap();
+        // No VOYAGE_API_KEY in env ⇒ refuse.
+        let msg = cfg.validate_providers_with(|_| None).unwrap_err();
+        assert!(msg.contains("VOYAGE_API_KEY"), "{msg}");
+        // With the key ⇒ pass.
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn embedding_at_openrouter_does_not_need_voyage_key() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel = \"openai/text-embedding-3-small@openrouter\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(|_| None).is_ok());
+    }
+
+    #[test]
+    fn embedding_model_and_pair_are_mutually_exclusive() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel = \"voyage-3-lite\"\nmodel_read = \"voyage-4-lite\"\nmodel_write = \"voyage-4\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_providers_with(env_all).is_err());
+    }
+
+    #[test]
+    fn embedding_half_pair_is_rejected() {
+        let cfg = ModelConfig::from_toml_str("[tasks.embedding]\nmodel_read = \"voyage-4-lite\"\n")
+            .unwrap();
+        let msg = cfg.validate_providers_with(env_all).unwrap_err();
+        assert!(msg.contains("model_write"), "{msg}");
+    }
+
+    #[test]
+    fn embedding_pair_below_voyage_4_is_rejected() {
+        for bad in ["voyage-3.5-lite", "voyage-code-3", "bge-m3"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.embedding]\nmodel_read = \"{bad}\"\nmodel_write = \"voyage-4\"\n"
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate_providers_with(env_all).is_err(),
+                "{bad} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_pair_rejects_non_voyage_provider_suffix() {
+        for bad in ["voyage-4@openrouter", "voyage-4@local"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[providers]\nlocal = {{ embeddings = \"http://e/v1/embeddings\" }}\n\
+                 [tasks.embedding]\nmodel_read = \"{bad}\"\nmodel_write = \"voyage-4\"\n"
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate_providers_with(env_all).is_err(),
+                "{bad} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_pair_accepts_explicit_at_voyage() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel_read = \"voyage-4-lite@voyage\"\nmodel_write = \"voyage-4\"\n",
+        )
+        .unwrap();
+        assert!(cfg
+            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn embedding_model_rejects_round_robin_weighted_fallback_tiers() {
+        for toml in [
+            "[tasks.embedding]\nmodel = [\"voyage-3-lite\", \"voyage-4\"]\n",
+            "[tasks.embedding]\nmodel = { \"voyage-3-lite\" = 0.5, \"voyage-4\" = 0.5 }\n",
+            "[tasks.embedding]\nmodel = \"voyage-3-lite\"\nfallback = \"voyage-4\"\n",
+            "[tasks.embedding]\nmodel = \"voyage-3-lite\"\n[tasks.embedding.tiers.pro]\nmodel = \"voyage-4\"\n",
+        ] {
+            let cfg = ModelConfig::from_toml_str(toml).unwrap();
+            assert!(
+                cfg.validate_providers_with(env_all).is_err(),
+                "must refuse: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_embedding_defaults_to_voyage_3_lite() {
+        for toml in ["", "[tasks.embedding]\n"] {
+            let cfg = ModelConfig::from_toml_str(toml).unwrap();
+            let r = cfg.resolve_embedding();
+            assert_eq!(r.read.model, "voyage-3-lite");
+            assert_eq!(r.write.model, "voyage-3-lite");
+            assert!(matches!(r.read.route, EmbedRoute::Voyage));
+            assert!(matches!(r.write.route, EmbedRoute::Voyage));
+        }
+    }
+
+    #[test]
+    fn resolve_embedding_single_model_routes() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers]\nlocal = { embeddings = \"http://e/v1/embeddings\" }\n\
+             [tasks.embedding]\nmodel = \"bge-m3@local\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_embedding();
+        assert_eq!(r.read.model, "bge-m3");
+        assert!(matches!(r.read.route, EmbedRoute::Custom(ref n) if n == "local"));
+        assert_eq!(r.write.model, "bge-m3");
+    }
+
+    #[test]
+    fn resolve_embedding_pair_splits_read_write() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel_read = \"voyage-4-lite\"\nmodel_write = \"voyage-4\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_embedding();
+        assert_eq!(r.read.model, "voyage-4-lite");
+        assert_eq!(r.write.model, "voyage-4");
+        assert!(matches!(r.read.route, EmbedRoute::Voyage));
     }
 }
