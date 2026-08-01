@@ -327,6 +327,10 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    if let Err(msg) = model_config.validate_removed_tasks() {
+        anyhow::bail!(msg);
+    }
+
     // Skip when the master switch is off — WORLD_DISABLED must be able to
     // isolate a staged/incomplete [tasks.world_director] section (the sweeper
     // won't spawn and injection is gated too, so a blank prompt is harmless).
@@ -496,6 +500,14 @@ mod tests {
             "shipped config must pass the prompt-variant boot gate: {:?}",
             cfg.validate_prompt_variants()
         );
+    }
+
+    #[test]
+    fn shipped_model_config_passes_removed_task_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_removed_tasks()
+            .expect("shipped example must not carry removed task blocks");
     }
 
     /// Regression for the boot-check ordering bug: `validate_extraction_prompts`

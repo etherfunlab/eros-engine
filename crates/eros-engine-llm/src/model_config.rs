@@ -2145,6 +2145,22 @@ impl ModelConfig {
             .collect()
     }
 
+    /// Reject config blocks for features that were removed, so an operator
+    /// upgrading across the removal cannot silently keep a block that no
+    /// longer does anything. Loud-fail, same shape as the other boot gates.
+    pub fn validate_removed_tasks(&self) -> Result<(), String> {
+        if self.tasks.contains_key("chat_image_generation") {
+            return Err(
+                "[tasks.chat_image_generation] was removed: the engine no longer draws \
+                 images. The chat stream emits an `image_request` frame and the consumer \
+                 calls its own image vendor; the draw endpoint \
+                 POST /comp/chat/{session_id}/image/stream is gone. Delete this block."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Boot gate, mirroring `validate_extraction_prompts`: any present world
     /// task section (`world_director` / `world_comment` / `world_reply` /
     /// `world_stories_director`) must carry a usable `filter_prompt`.
@@ -5557,6 +5573,27 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
         assert!(cfg.validate_providers_with(env).is_ok());
+    }
+
+    #[test]
+    fn removed_image_generation_task_refuses_boot() {
+        let cfg =
+            ModelConfig::from_toml_str("[tasks.chat_image_generation]\nmodel=\"img/m\"\n").unwrap();
+        let err = cfg.validate_removed_tasks().unwrap_err();
+        assert!(
+            err.contains("chat_image_generation"),
+            "message names the block: {err}"
+        );
+        assert!(
+            err.contains("image_request"),
+            "message points at the delegation frame: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_removed_tasks_ok_without_block() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel=\"x\"\n").unwrap();
+        assert!(cfg.validate_removed_tasks().is_ok());
     }
 
     #[test]
