@@ -56,7 +56,6 @@ temperature  = 0.85                         # optional, falls back to defaults.f
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
-dimensions   = 512                          # optional, embedding-only field
 
 [tasks.<name>.tiers.<tier>]
 model        = "<provider>/<model-id>"      # optional, overrides task-level model for this tier
@@ -71,7 +70,7 @@ Field details:
 | `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
-| `defaults.ignore_providers` | `Array<String>` | no | OpenRouter provider slugs to exclude from routing on **every** task. Sent as `provider.ignore` on each outbound call; `allow_fallbacks` remains `true` so the model is still served by any healthy provider. Use this when a specific provider returns garbled output for a model (e.g. undecoded byte-BPE text — issue #84). Find the offending slug via the OpenRouter generation API. Empty or absent means no exclusion. |
+| `defaults.ignore_providers` | `Array<String>` | no | OpenRouter provider slugs to exclude from routing on **every** task. Each entry must carry the `@openrouter` suffix (`"some-bad-provider-slug@openrouter"`) — a bare slug, any other `@<provider>` suffix, or malformed `@` grammar refuses to boot. The suffix is stripped before the wire: sent as `provider.ignore` (bare slug) on each outbound OpenRouter call only; custom providers and Voyage never receive it. `allow_fallbacks` remains `true` so the model is still served by any healthy provider. Use this when a specific provider returns garbled output for a model (e.g. undecoded byte-BPE text — issue #84). Find the offending slug via the OpenRouter generation API. Empty or absent means no exclusion. |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | yes | Primary model. String = fixed; array = round-robin; table = weighted random. See "Primary model selection". |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
@@ -80,37 +79,67 @@ Field details:
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
-| `tasks.<name>.dimensions` | `u32` | no | Embedding-only. Ignored by chat / insight tasks. |
 
-### `[providers]` — custom OpenAI-compatible endpoints (opt-in)
+### `[providers]` — custom chat/embeddings endpoints (opt-in)
 
 ```toml
 [providers]
-venice = "https://api.venice.ai/api/v1/chat/completions"
+venice = { chat = "https://api.venice.ai/api/v1/chat/completions" }
+mixed  = { chat = "https://x/v1/chat/completions", embeddings = "https://x/v1/embeddings" }
+local  = { embeddings = "http://127.0.0.1:8080/v1/embeddings" }
+
+[providers.proxy]           # TOML section form works too
+chat    = "https://proxy.internal/v1/chat/completions"
+headers = { "X-Team" = "companion", "X-Env" = "prod" }
 ```
 
-Declares additional chat-completions endpoints alongside the built-in
-OpenRouter client. Reference one by suffixing a model slug anywhere a
-`model` / `fallback` accepts one (any shape — fixed, round-robin, weighted):
+Each entry is a table with up to three keys — `chat` (an OpenAI-compatible
+chat-completions URL), `embeddings` (an OpenRouter-compatible embeddings
+URL — see [`https://openrouter.ai/docs/api_reference/embeddings`](https://openrouter.ai/docs/api_reference/embeddings)
+for the wire shape), and `headers` (sent verbatim on every request to this
+entry's endpoints). **A plain-string value is rejected**: the pre-0.9.4
+shape (`venice = "https://…"`) was dropped with no compatibility layer, and
+the boot error names the table form. `deny_unknown_fields` applies — an
+unknown key, an empty table, or an empty URL string also refuses the load.
+
+Declares additional endpoints alongside the built-in OpenRouter client.
+Reference one by suffixing a model slug anywhere a `model` / `fallback`
+accepts one (any shape — fixed, round-robin, weighted) on a chat-shaped
+task, or on `[tasks.embedding]`'s model fields for embeddings:
 
 ```toml
 [tasks.chat_companion]
-model = "venice-uncensored@venice"   # served by [providers].venice
+model = "venice-uncensored@venice"   # served by [providers].venice.chat
 fallback = ["x-ai/grok-4.20"]        # no suffix → built-in OpenRouter
+
+[tasks.embedding]
+model = "bge-m3@local"               # served by [providers].local.embeddings
 ```
 
 Rules, all enforced at boot (the engine refuses to boot on any violation):
 
-- **Names** match `[a-z0-9_]+`; `openrouter` is reserved (override the
-  built-in endpoint with the `OPENROUTER_BASE_URL` env var instead), and so
-  is `voyage` (`$VOYAGE_API_KEY` already belongs to the built-in embeddings
-  client).
-- **URL** is the complete chat-completions URL, posted verbatim — no path
-  joining.
+- **Names** match `[a-z0-9_]+`. `voyage` stays reserved — its native API is
+  not the OpenRouter-compatible embeddings format this mechanism speaks, and
+  `$VOYAGE_API_KEY` already belongs to the built-in native Voyage client.
+  `openrouter` is a valid, declarable name: it doesn't add a separate
+  provider, it **overrides the built-in OpenRouter endpoint URLs** per key
+  (see below).
+- **URLs** are complete and posted verbatim — no path joining. A provider
+  referenced from a chat-shaped task must declare `chat`; one referenced
+  from `[tasks.embedding]` must declare `embeddings`. A miss on either
+  refuses to boot, naming the slug, the entry, and the missing key.
+- **`headers`** (optional) is a table sent verbatim on every request to this
+  entry's endpoints (both `chat` and `embeddings`). `Authorization` and
+  `Content-Type` are engine-owned and refuse the load if declared
+  (case-insensitive) — a silently overridden `Authorization` is the worst
+  kind of footgun. Every other name/value must be valid HTTP header material
+  or the load refuses.
 - **API key** comes from the environment as `<NAME_UPPERCASED>_API_KEY`
-  (`venice` → `$VENICE_API_KEY`), required only for providers actually
+  (`venice` → `$VENICE_API_KEY`), one key covering both the `chat` and
+  `embeddings` endpoints of that entry, required only for providers actually
   referenced by some model slug. Declared-but-unreferenced entries need no
-  key.
+  key. `openrouter` keeps using the existing `$OPENROUTER_API_KEY` — the
+  naming convention degenerates to the var that already exists.
 - **Model ids are the provider's own slugs**, sent verbatim — the engine
   never translates model names between providers.
 - A literal `@` inside a model id is escaped `\@`. In a TOML double-quoted
@@ -119,16 +148,69 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
 - **Model-keyed tables use bare ids**: `model_name_display_override`,
   `output_regex` `models`, and `output_filter` trigger `models` match on the
   id *without* `@provider`.
-- **Wire shape**: custom providers receive a strict OpenAI chat-completions
+- **Wire shape**: custom providers receive a strict OpenAI-compatible
   subset. `[defaults].ignore_providers`, `[defaults].provider_sort`, and
-  per-task `reasoning` are **inert** on custom providers, and the OpenRouter
-  attribution headers are not sent to them.
+  per-task `reasoning` are **inert** on custom providers; they receive
+  exactly this entry's own declared `headers`, never the OpenRouter
+  attribution headers.
 - **Audit**: rows served by a custom provider record
   `model = "<upstream echo>@<name>"` and the provider's own `generation_id`
   verbatim — a `generation_id` join against OpenRouter's logs misses for
   those rows, and the `model` column says why.
 - Under `MODEL_CONFIG_DIR`, `[providers]` merges as one whole top-level key
   (like `[defaults]`, unlike `[tasks]`): all providers live in one file.
+
+#### Built-in endpoint overrides via `[providers].openrouter`
+
+```toml
+[providers.openrouter]
+embeddings = "http://my-proxy/v1/embeddings"
+headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
+```
+
+- Each present key (`chat` and/or `embeddings`) overrides that built-in URL;
+  each absent key keeps the built-in default
+  (`https://openrouter.ai/api/v1/chat/completions` /
+  `https://openrouter.ai/api/v1/embeddings`). This partial-override rule is
+  unique to `openrouter` — for ordinary entries a missing key is a boot
+  error when referenced, because there is no built-in default to fall back
+  to.
+- The override changes the URL **only**. Traffic through it remains the
+  full OpenRouter wire: `provider.ignore`, `provider_sort`, and per-task
+  `reasoning` are all still sent — unlike custom providers, which keep
+  receiving the strict OpenAI subset.
+- **Attribution headers now live here, and nowhere else.** No
+  `[providers.openrouter]` entry, or one without `headers`, means no
+  attribution headers are sent. The `OPENROUTER_APP_REFERER` /
+  `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` env vars are
+  **soft-deprecated**: a still-set value is silently ignored, never a boot
+  error — re-declare the same headers under `[providers].openrouter.headers`
+  instead (see [`llm-audit.md`](llm-audit.md) for the header/purpose
+  mapping).
+- The API key stays `$OPENROUTER_API_KEY`.
+- **`OPENROUTER_BASE_URL` no longer exists as an env var.** The only
+  override mechanism is `[providers].openrouter.chat` /
+  `[providers].openrouter.embeddings`. A still-set `OPENROUTER_BASE_URL` is
+  not read and causes no boot error — it's just an unrelated env var now.
+- `voyage` remains undeclarable in `[providers]` (see above).
+
+#### `[defaults].ignore_providers` — `@openrouter` required
+
+```toml
+[defaults]
+ignore_providers = ["some-bad-provider-slug@openrouter"]
+```
+
+Every entry must parse (the same `@`-suffix grammar as a model slug) to a
+non-empty upstream slug plus provider `openrouter`; a bare entry, any other
+`@<provider>` suffix, or malformed `@` grammar refuses to boot naming the
+entry and the required form. The wire is unchanged: `provider.ignore`
+carries the bare upstream slug, on OpenRouter traffic only — the mandatory
+suffix makes that scope part of the syntax; custom providers and Voyage
+never receive `provider.ignore`. `[defaults].provider_sort` is untouched (it
+has no per-entry syntax to scope). Breaking change for configs written
+before this suffix existed — the fix is appending `@openrouter` to each
+entry.
 
 ### `model_name_display_override` (chat task only)
 
@@ -381,7 +463,7 @@ input filter has no triggers, timing, or tiers).
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
-| `embedding` | reserved — `VoyageClient` reads its own `VOYAGE_API_KEY` and hard-codes `voyage-3-lite` | reserved |
+| `embedding` | `EmbeddingRouter::from_config()` at boot (`main.rs`), via `ModelConfig::resolve_embedding()` — routes `embed_query`/`embed_document`/`embed_documents` to native Voyage, the built-in OpenRouter embeddings endpoint, or a custom `[providers]` entry; absent block = native Voyage `voyage-3-lite` (unchanged pre-config behaviour) | live |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
@@ -389,7 +471,10 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
-`embedding` is vestigial — Voyage doesn't go through this path.
+`embedding` doesn't go through the generic `resolve()` path above — it has
+its own resolver, `ModelConfig::resolve_embedding()`, called once at boot
+from `main.rs` to build the `EmbeddingRouter`. See "`[tasks.embedding]` —
+active" below.
 
 ### `[tasks.pde_decision]` — opt-in LLM PDE judge
 
@@ -599,6 +684,84 @@ an `Error` frame instead.
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_product_qa()` in `model_config.rs`.
 
+### `[tasks.embedding]` — active
+
+`VoyageClient` used to hard-code `voyage-3-lite`; `[tasks.embedding]` is now
+consumed, and the embedding model, and which backend it routes to, are
+config-driven.
+
+```toml
+# Single model — read and write use the same backend.
+[tasks.embedding]
+model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
+# model = "openai/text-embedding-3-small@openrouter"
+# model = "bge-m3@local"                      # third-party, OpenRouter-compatible wire
+
+# OR: split read/write — voyage-4 series and above ONLY.
+#[tasks.embedding]
+#model_read  = "voyage-4-lite"   # recall path: embed_query, input_type "query"
+#model_write = "voyage-4"        # storage path: embed_document(s), input_type "document"
+```
+
+**Dimensions are fixed at 512, with no config knob.** The three pgvector
+columns are `VECTOR(512) NOT NULL`, the clients request 512 on the wire, and
+every response is length-checked. There used to be a `dimensions` field on
+`[tasks.<name>]` — it was never consumed and has been removed; a leftover
+`dimensions = 512` line in an existing config is now an inert unknown key
+(serde ignores it, exactly like any other stale key).
+
+| field | type | rules |
+|---|---|---|
+| `model` | single fixed string | bare ⇒ `@voyage`; `@openrouter` / `@<custom>` route to the OpenRouter-compatible wire; mutually exclusive with the pair |
+| `model_read` | `Option<String>` | pair-only, voyage-only, N ≥ 4 (see the gate below); serves `embed_query` |
+| `model_write` | `Option<String>` | pair-only, voyage-only, N ≥ 4; serves `embed_document` / `embed_documents` |
+
+Routing per suffix, resolved by `ModelConfig::resolve_embedding()`:
+
+| bare (no suffix) | `@openrouter` | `@voyage` | `@<custom>` |
+|---|---|---|---|
+| native Voyage | built-in OpenRouter embeddings endpoint (overridable, see `[providers].openrouter` above) | same as bare | `[providers].<name>.embeddings` (OpenRouter-compatible wire) |
+
+- `model_read` / `model_write` are plain `Option<String>` — array/table
+  shapes are type errors at parse time. `model_read = model_write` is legal
+  (redundant but harmless — equivalent to `model`). `@openrouter` and
+  `@<custom>` refuse to boot on `model_read`/`model_write` (only Voyage
+  guarantees a shared vector space across model sizes).
+- `[tasks.embedding]` **absent** ⇒ exactly the pre-config behaviour: native
+  Voyage, `voyage-3-lite`, no dimension parameter on the wire.
+- `model` must be a single fixed string; round-robin, weighted, `fallback`,
+  and `tiers` all refuse to boot (mixed/incompatible vector spaces would be
+  the result — the `chat_voice` fixed-only precedent).
+- The wire has no `input_type`: the query/document optimisation is a
+  Voyage-native nuance. Routing embedding off Voyage forfeits it.
+
+**The voyage-4 gate.** Applied to the bare id after stripping an optional
+`@voyage` suffix. The id must begin `voyage-` followed by a numeric segment
+(ASCII digits and dots only, ending at the next `-` or end of string) that
+parses as a finite number ≥ 4:
+
+- ✓ `voyage-4`, `voyage-4-lite`, `voyage-4.5-large`, `voyage-10`
+- ✗ `voyage-3.5-lite` (N = 3.5), `voyage-code-3` (no leading numeric segment
+  after `voyage-`), `voyage-inf`/`voyage-nan` (non-digit characters, and
+  non-finite even if they parsed), `bge-m3@local` (not voyage), any
+  `@openrouter` or custom-provider slug
+
+Only the voyage-4 series and above guarantee a shared vector space across
+model sizes — mixing a lower or non-numeric model into the pair would
+silently write vectors the read model cannot compare, so the gate is a boot
+refusal, not a docs footnote.
+
+**`VOYAGE_API_KEY`** is required iff the resolved read or write backend is
+Voyage (block absent ⇒ Voyage default ⇒ still required, so existing
+deployments see no change). A deployment that routes both read and write
+entirely off Voyage no longer needs the var.
+
+Call site: `crates/eros-engine-server/src/main.rs` builds
+`eros_engine_llm::embedding::EmbeddingRouter::from_config(&model_config)`
+once at boot; `AppState.embed: Arc<EmbeddingRouter>` serves `embed_query` /
+`embed_document` / `embed_documents` from `handlers.rs` / `post_process.rs`
+/ `dreaming.rs` / `world.rs` / `story.rs`, unchanged call shapes.
+
 ### Enabling / disabling extraction
 
 `insight_extraction` (per-turn fact mining) and `memory_extraction` (session-end
@@ -678,7 +841,7 @@ For the duration of `0.x`, the OSS engine commits to:
 1. **No removed fields.** Existing field names in `[defaults]` and `[tasks.<name>]` will not disappear.
 2. **No renamed fields.** `fallback` will not become `fallback_model`. `model` will not become `primary_model`. Etc.
 3. **No newly required fields.** Anything added is optional with a sensible default.
-4. **No removed task names from this list:** `chat_companion`, `insight_extraction`, `pde_decision`. Reserved task names (`embedding`) may shift if a real implementation lands and supersedes their current placeholder semantics; that change will be called out in the changelog.
+4. **No removed task names from this list:** `chat_companion`, `insight_extraction`, `pde_decision`, `embedding`.
 5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only.
 6. **`model` accepts a string, array (round-robin), or table (weighted).** A plain string remains valid forever; the array/table forms are an additive widening.
 
@@ -708,10 +871,21 @@ What may still change without notice:
   extract. The `filtered` flag is `true` when either the regex strip or the LLM
   filter (or both) produced non-raw output. See "`output_regex` — deterministic
   per-model regex strip" above.
+- **`[tasks.embedding]` is now active** (previously reserved and unconsumed).
+  Breaking changes bundled with the activation: `[providers]` values are now
+  tables, not plain strings (the string shape is rejected with no compat
+  layer); `[defaults].ignore_providers` entries now require the
+  `@openrouter` suffix; the `OPENROUTER_BASE_URL` env var is gone (use
+  `[providers].openrouter.chat`/`.embeddings`); the `OPENROUTER_APP_*` env
+  vars are soft-deprecated (silently ignored, use
+  `[providers].openrouter.headers`); the `dimensions` field on
+  `[tasks.<name>]` was removed (dims are hard-coded 512; a leftover
+  `dimensions = 512` line is now an inert unknown key). See "`[providers]`"
+  and "`[tasks.embedding]` — active" above.
 
 ## What this config does NOT control
 
-- **Voyage embedding** — `VoyageClient` hard-codes `voyage-3-lite` and reads `VOYAGE_API_KEY` directly. The `[tasks.embedding]` block is reserved for a future generalisation.
+- **Voyage's own base URL** — the native Voyage wire always posts to Voyage's canonical endpoint; only the model id is configurable, via `[tasks.embedding]`. Route around Voyage entirely with an `@openrouter` or custom `[providers]` suffix instead.
 - **PDE decisions (default path)** — the rule engine in `eros-engine-core/src/pde.rs` runs unconditionally when no `filter_prompt` is set. Set `[tasks.pde_decision].filter_prompt` to activate the opt-in LLM judge; the rule engine then serves as fallback + hard-safety guardrails.
 - **OpenRouter API key** — read directly from `OPENROUTER_API_KEY`, not the config file.
 - **Per-call streaming / response format flags** — fixed in `OpenRouterClient`.

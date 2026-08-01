@@ -56,7 +56,6 @@ temperature  = 0.85                         # optional, falls back to defaults.f
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
-dimensions   = 512                          # optional, embedding-only field
 
 [tasks.<name>.tiers.<tier>]
 model        = "<provider>/<model-id>"      # optional, overrides task-level model for this tier
@@ -71,7 +70,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `defaults.fallback_model` | `String` | 否 | 任务配置未提供 model 时使用的最终 fallback。若仍然缺失，代码使用编译时内置默认值 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 优先级相同；编译时内置默认值为 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 优先级相同；编译时内置默认值为 `200`。 |
-| `defaults.ignore_providers` | `Array<String>` | 否 | 要从**每个**任务的路由中排除的 OpenRouter provider slug。每次对外调用时作为 `provider.ignore` 发送；`allow_fallbacks` 仍为 `true`，因此模型仍可由任意健康的 provider 提供。某个 provider 为模型返回乱码时（例如未解码的 byte-BPE 文本——issue #84），可使用此字段。通过 OpenRouter generation API 查找有问题的 slug。为空或缺失表示不排除任何 provider。 |
+| `defaults.ignore_providers` | `Array<String>` | 否 | 要从**每个**任务的路由中排除的 OpenRouter provider slug。每个条目必须带 `@openrouter` 后缀（`"some-bad-provider-slug@openrouter"`）——裸 slug、其他 `@<provider>` 后缀、或格式错误的 `@` 语法都会拒绝启动。发到 wire 前会剥掉后缀：只作为 `provider.ignore`（裸 slug）发给 OpenRouter 调用；自定义 provider 和 Voyage 永远不会收到它。`allow_fallbacks` 仍为 `true`，因此模型仍可由任意健康的 provider 提供。某个 provider 为模型返回乱码时（例如未解码的 byte-BPE 文本——issue #84），可使用此字段。通过 OpenRouter generation API 查找有问题的 slug。为空或缺失表示不排除任何 provider。 |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。参见“主模型选择”。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主调用失败时由 `OpenRouterClient` 使用的次要模型。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
@@ -80,34 +79,62 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
-| `tasks.<name>.dimensions` | `u32` | 否 | 仅用于 embedding。chat / insight 任务会忽略。 |
 
-### `[providers]` — 自定义 OpenAI 兼容端点（opt-in）
+### `[providers]` — 自定义 chat/embeddings 端点（opt-in）
 
 ```toml
 [providers]
-venice = "https://api.venice.ai/api/v1/chat/completions"
+venice = { chat = "https://api.venice.ai/api/v1/chat/completions" }
+mixed  = { chat = "https://x/v1/chat/completions", embeddings = "https://x/v1/embeddings" }
+local  = { embeddings = "http://127.0.0.1:8080/v1/embeddings" }
+
+[providers.proxy]           # TOML section 写法也可以
+chat    = "https://proxy.internal/v1/chat/completions"
+headers = { "X-Team" = "companion", "X-Env" = "prod" }
 ```
 
-在内置 OpenRouter client 之外声明额外的 chat-completions 端点。在任何接受
+每个条目都是一张表，最多三个 key——`chat`（OpenAI 兼容的
+chat-completions URL）、`embeddings`（OpenRouter 兼容的 embeddings
+URL，wire 形态见
+[`https://openrouter.ai/docs/api_reference/embeddings`](https://openrouter.ai/docs/api_reference/embeddings)）、
+以及 `headers`（原样发到该条目所有端点的每个请求上）。**字符串值会被拒绝**：
+0.9.4 之前的写法（`venice = "https://…"`）已彻底移除、无兼容层，启动报错
+会指出正确的表写法。适用 `deny_unknown_fields`——未知 key、空表、空
+URL 字符串同样拒绝加载。
+
+在内置 OpenRouter client 之外声明额外的端点。在任何接受
 `model` / `fallback` 的位置（三种形态：固定、轮询、加权）给模型 slug 加
-`@<name>` 后缀即可引用：
+`@<name>` 后缀即可引用（chat 类任务）；embedding 则在
+`[tasks.embedding]` 的模型字段上加后缀：
 
 ```toml
 [tasks.chat_companion]
-model = "venice-uncensored@venice"   # 由 [providers].venice 提供服务
+model = "venice-uncensored@venice"   # 由 [providers].venice.chat 提供服务
 fallback = ["x-ai/grok-4.20"]        # 无后缀 → 内置 OpenRouter
+
+[tasks.embedding]
+model = "bge-m3@local"               # 由 [providers].local.embeddings 提供服务
 ```
 
 以下规则全部在启动时强制校验（任一违反即拒绝启动）：
 
-- **名称**匹配 `[a-z0-9_]+`；`openrouter` 为保留字（覆盖内置端点请用
-  `OPENROUTER_BASE_URL` 环境变量），`voyage` 同为保留字（`$VOYAGE_API_KEY`
-  已属于内置 embeddings 客户端）。
-- **URL** 为完整的 chat-completions 地址，原样 POST，引擎不做任何路径拼接。
+- **名称**匹配 `[a-z0-9_]+`。`voyage` 仍为保留字——它的原生 API 不是本
+  机制所讲的 OpenRouter 兼容 embeddings 格式，且 `$VOYAGE_API_KEY` 已属于
+  内置的原生 Voyage 客户端。`openrouter` 是可以声明的合法名字：它不新增
+  一个独立 provider，而是**按 key 覆盖内置的 OpenRouter 端点 URL**（见下）。
+- **URL** 完整、原样 POST——引擎不做任何路径拼接。被 chat 类任务引用的
+  provider 必须声明 `chat`；被 `[tasks.embedding]` 引用的必须声明
+  `embeddings`。缺失其一即拒绝启动，并点名 slug、条目和缺失的 key。
+- **`headers`**（可选）是原样发到该条目所有端点（`chat` 和
+  `embeddings` 都算）每个请求上的表。`Authorization` 和 `Content-Type`
+  是引擎自有的，声明它们（不区分大小写）即拒绝加载——静默覆盖
+  `Authorization` 是最糟糕的那种坑。其余每个 name/value 都必须是合法的
+  HTTP header，否则拒绝加载。
 - **API key** 来自环境变量 `<大写名称>_API_KEY`（`venice` →
-  `$VENICE_API_KEY`），仅对被模型 slug 实际引用的 provider 强制要求；
-  已声明但未引用的条目无需 key。
+  `$VENICE_API_KEY`），一个 key 同时覆盖该条目的 `chat` 和 `embeddings`
+  端点，仅对被某个模型 slug 实际引用的 provider 强制要求；已声明但未引用
+  的条目无需 key。`openrouter` 继续用现有的 `$OPENROUTER_API_KEY`——命名
+  约定退化为那个本来就存在的变量。
 - **模型 id 用该 provider 自己的 slug**，原样上线——引擎从不在 provider
   之间转译模型名。
 - 模型 id 中的字面 `@` 用 `\@` 转义。TOML 双引号字符串写作
@@ -115,15 +142,62 @@ fallback = ["x-ai/grok-4.20"]        # 无后缀 → 内置 OpenRouter
 - **按模型匹配的表用裸 id**：`model_name_display_override`、`output_regex`
   的 `models`、`output_filter` trigger 的 `models`，匹配时都不带
   `@provider`。
-- **wire 形态**：自定义 provider 收到严格的 OpenAI chat-completions 子集。
+- **wire 形态**：自定义 provider 收到严格的 OpenAI 兼容子集。
   `[defaults].ignore_providers`、`[defaults].provider_sort` 和任务级
-  `reasoning` 对自定义 provider **不生效**，OpenRouter 归因标头也不会发送。
+  `reasoning` 对自定义 provider **不生效**；它们只收到该条目自己声明的
+  `headers`，绝不会收到 OpenRouter 归因标头。
 - **审计**：自定义 provider 服务的行记录
   `model = "<上游回显>@<name>"`，`generation_id` 原样存 provider 返回的
   id——用 `generation_id` 去 join OpenRouter 日志时这些行会 miss，
   `model` 列会说明原因。
 - 使用 `MODEL_CONFIG_DIR` 时，`[providers]` 作为单个顶层 key 整体合并
   （同 `[defaults]`，不同于 `[tasks]`）：所有 provider 必须写在同一个文件里。
+
+#### 通过 `[providers].openrouter` 覆盖内置端点
+
+```toml
+[providers.openrouter]
+embeddings = "http://my-proxy/v1/embeddings"
+headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "Eros" }
+```
+
+- 声明的每个 key（`chat` 和/或 `embeddings`）覆盖对应的内置 URL；缺失的
+  key 保留内置默认值（`https://openrouter.ai/api/v1/chat/completions` /
+  `https://openrouter.ai/api/v1/embeddings`）。这条“部分覆盖”规则只对
+  `openrouter` 生效——普通条目缺 key 且被引用时是启动报错，因为它没有内置
+  默认值可以兜底。
+- 覆盖**只**改变 URL。流量走的仍然是完整的 OpenRouter wire：
+  `provider.ignore`、`provider_sort`、任务级 `reasoning` 全部照常发送——
+  和只收到严格 OpenAI 子集的自定义 provider 不同。
+- **归因 header 现在只从这里来。** 没有 `[providers.openrouter]` 条目，
+  或有条目但没写 `headers`，就不发任何归因 header。
+  `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` /
+  `OPENROUTER_APP_CATEGORIES` 环境变量**软废弃**：仍然设置也会被静默
+  忽略，不是启动报错——请把同样的 header 改到
+  `[providers.openrouter].headers` 下（对应关系见
+  [`llm-audit.zh.md`](llm-audit.zh.md)）。
+- API key 仍然是 `$OPENROUTER_API_KEY`。
+- **`OPENROUTER_BASE_URL` 环境变量已不存在。** 唯一的覆盖方式是
+  `[providers].openrouter.chat` / `[providers].openrouter.embeddings`。仍然
+  设置 `OPENROUTER_BASE_URL` 不会被读取，也不会导致启动报错——它现在只是
+  一个无关的环境变量。
+- `voyage` 仍不能在 `[providers]` 中声明（见上文）。
+
+#### `[defaults].ignore_providers` — 必须带 `@openrouter`
+
+```toml
+[defaults]
+ignore_providers = ["some-bad-provider-slug@openrouter"]
+```
+
+每个条目都必须能解析出（与模型 slug 相同的 `@` 后缀语法）一个非空的上游
+slug 加 provider `openrouter`；裸条目、其他 `@<provider>` 后缀、或格式
+错误的 `@` 语法都会拒绝启动，并点名该条目和正确写法。wire 行为不变：
+`provider.ignore` 只带裸上游 slug，只发给 OpenRouter 流量——强制后缀把这个
+作用范围写进了语法本身；自定义 provider 和 Voyage 永远不会收到
+`provider.ignore`。`[defaults].provider_sort` 不受影响（它没有 per-entry
+语法可限定范围）。对在这个后缀出现之前写好的配置是破坏性变更——修复方式
+是给每个条目加上 `@openrouter`。
 
 ### `model_name_display_override`（仅限 chat 任务）
 
@@ -331,7 +405,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
-| `embedding` | 保留——`VoyageClient` 读取自己的 `VOYAGE_API_KEY` 并 hard-code `voyage-3-lite` | reserved |
+| `embedding` | 启动时的 `EmbeddingRouter::from_config()`（`main.rs`），经由 `ModelConfig::resolve_embedding()`——把 `embed_query`/`embed_document`/`embed_documents` 路由到原生 Voyage、内置 OpenRouter embeddings 端点、或某个 `[providers]` 条目；块缺失 = 原生 Voyage `voyage-3-lite`（与引入配置前的行为一致） | live |
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
@@ -339,7 +413,9 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（图片提示词改写器，opt-in，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 
-`embedding` 已无实际作用——Voyage 不经过此路径。
+`embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器
+`ModelConfig::resolve_embedding()`，在 `main.rs` 启动时调用一次来构建
+`EmbeddingRouter`。见下文“`[tasks.embedding]` — 已激活”。
 
 ### `[tasks.pde_decision]` — opt-in LLM PDE 判断器
 
@@ -497,6 +573,79 @@ filter_prompt = """
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过
 `model_config.rs` 中的 `resolve_product_qa()`。
 
+### `[tasks.embedding]` — 已激活
+
+`VoyageClient` 以前 hard-code `voyage-3-lite`；现在 `[tasks.embedding]`
+真正被消费，embedding 模型本身、以及它路由到哪个后端，都由配置驱动。
+
+```toml
+# 单模型——read 和 write 用同一个后端。
+[tasks.embedding]
+model = "voyage-3-lite"                       # ≡ "voyage-3-lite@voyage"
+# model = "openai/text-embedding-3-small@openrouter"
+# model = "bge-m3@local"                      # 第三方，OpenRouter 兼容 wire
+
+# 或者：拆分 read/write——仅限 voyage-4 系列及以上。
+#[tasks.embedding]
+#model_read  = "voyage-4-lite"   # 召回路径：embed_query，input_type "query"
+#model_write = "voyage-4"        # 存储路径：embed_document(s)，input_type "document"
+```
+
+**维度固定为 512，没有配置开关。** pgvector 的三个列都是
+`VECTOR(512) NOT NULL`，client 在 wire 上请求的也是 512，且每次响应都会
+做长度校验。以前 `[tasks.<name>]` 上有一个 `dimensions` 字段——它从未被
+消费，现已移除；已有配置里残留的 `dimensions = 512` 行，现在只是一个被
+静默忽略的未知 key（和其他过期 key 一样，serde 直接忽略）。
+
+| 字段 | 类型 | 规则 |
+|---|---|---|
+| `model` | 单个固定字符串 | 裸 id ⇒ `@voyage`；`@openrouter` / `@<custom>` 路由到 OpenRouter 兼容 wire；与 read/write 对互斥 |
+| `model_read` | `Option<String>` | 仅限 read/write 对使用，仅限 Voyage，N ≥ 4（见下方的 gate）；服务 `embed_query` |
+| `model_write` | `Option<String>` | 仅限 read/write 对使用，仅限 Voyage，N ≥ 4；服务 `embed_document` / `embed_documents` |
+
+按后缀路由，由 `ModelConfig::resolve_embedding()` 解析：
+
+| 裸 id（无后缀） | `@openrouter` | `@voyage` | `@<custom>` |
+|---|---|---|---|
+| 原生 Voyage | 内置 OpenRouter embeddings 端点（可覆盖，见上文 `[providers].openrouter`） | 同裸 id | `[providers].<name>.embeddings`（OpenRouter 兼容 wire） |
+
+- `model_read` / `model_write` 是普通的 `Option<String>`——数组/表形态在
+  解析时就是类型错误。`model_read = model_write` 合法（虽然多余但无害——
+  等价于 `model`）。`@openrouter` 和 `@<custom>` 在 `model_read`/
+  `model_write` 上会拒绝启动（只有 Voyage 能保证跨模型体量共享一个向量
+  空间）。
+- `[tasks.embedding]` **缺失** ⇒ 与引入配置前完全一致的行为：原生
+  Voyage、`voyage-3-lite`、wire 上不带 dimension 参数。
+- `model` 必须是单个固定字符串；round-robin、weighted、`fallback`、
+  `tiers` 全部拒绝启动（否则会产生混合/不兼容的向量空间——沿用
+  `chat_voice` 仅固定字符串的先例）。
+- wire 上没有 `input_type`：query/document 的优化是 Voyage 原生的特性。
+  把 embedding 路由离开 Voyage 就放弃了这个优化。
+
+**voyage-4 gate。** 应用于剥掉可选 `@voyage` 后缀之后的裸 id。该 id 必须
+以 `voyage-` 开头，后接一个数字段（只能是 ASCII 数字和点号，到下一个 `-`
+或字符串末尾为止），且该数字段能解析为一个 ≥ 4 的有限数：
+
+- ✓ `voyage-4`、`voyage-4-lite`、`voyage-4.5-large`、`voyage-10`
+- ✗ `voyage-3.5-lite`（N = 3.5）、`voyage-code-3`（`voyage-` 后面没有
+  紧跟数字段）、`voyage-inf`/`voyage-nan`（含非数字字符，且即便解析出来
+  也不是有限数）、`bge-m3@local`（不是 voyage）、任何 `@openrouter` 或
+  自定义 provider 的 slug
+
+只有 voyage-4 系列及以上才能保证跨模型体量共享同一个向量空间——把一个
+更低版本或非数字的模型混进 read/write 对，会静默写入 read 模型无法比较
+的向量，所以这里是启动拒绝，不只是文档脚注。
+
+**`VOYAGE_API_KEY`** 仅当解析出的 read 或 write 后端是 Voyage 时才要求
+（块缺失 ⇒ 默认走 Voyage ⇒ 依然要求，现有部署行为不变）。把 read 和
+write 全部路由离开 Voyage 的部署不再需要这个变量。
+
+调用点：`crates/eros-engine-server/src/main.rs` 在启动时构建一次
+`eros_engine_llm::embedding::EmbeddingRouter::from_config(&model_config)`；
+`AppState.embed: Arc<EmbeddingRouter>` 为 `handlers.rs` / `post_process.rs`
+/ `dreaming.rs` / `world.rs` / `story.rs` 里的 `embed_query` /
+`embed_document` / `embed_documents` 提供服务，调用形态不变。
+
 ### 启用/禁用 extraction
 
 `insight_extraction`（每轮事实挖掘）和 `memory_extraction`（会话结束时的 dreaming sweeper）由其 `[tasks.*_extraction]` **章节是否存在**控制：
@@ -567,7 +716,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 1. **不删除字段。** `[defaults]` 和 `[tasks.<name>]` 中现有的字段名不会消失。
 2. **不重命名字段。** `fallback` 不会变为 `fallback_model`，`model` 不会变为 `primary_model`，以此类推。
 3. **不新增必填字段。** 任何新增字段都是可选的，并具有合理默认值。
-4. **不从此列表中删除任务名：**`chat_companion`、`insight_extraction`、`pde_decision`。若真实实现落地并取代 reserved 任务名（`embedding`）当前的占位语义，reserved 任务名可能发生变化；该变更会在 changelog 中说明。
+4. **不从此列表中删除任务名：**`chat_companion`、`insight_extraction`、`pde_decision`、`embedding`。
 5. **解析优先级固定。** 对于 `model`/`fallback`/`allow_traits`，优先级为 `matched tier > task default block > [defaults] > compiled-in fallback`。`temperature`/`max_tokens` 仅限任务级。
 6. **`model` 接受字符串、数组（round-robin）或表（weighted）。** 普通字符串将始终有效；数组/表形式属于扩展能力。
 
@@ -586,10 +735,19 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 - `[tasks.chat_output_filter]`（新任务）：在 0.x 中新增。默认缺失（filter 不生效）。参见上文“`output_filter` — 二次回复改写”。
 - SSE `final` frame 字段 `filtered`、`retries_chat`、`retries_filter`、`prompt_injected`、`tier`：在 0.x 中新增。
 - `output_regex`（可选数组，位于 `[tasks.chat_companion]`）：在 0.x 中新增。仅限任务级（无 per-tier 覆盖）。在客户端看到回复之前、LLM `output_filter` 之前、提取之前应用的确定性 regex 过滤。regex 过滤或 LLM filter（或两者）产生非原始输出时，`filtered` 标志均为 `true`。参见上文"`output_regex` — 确定性 per-model 正则过滤"。
+- **`[tasks.embedding]` 现已激活**（此前是保留、未被消费的占位）。随激活
+  一起打包的破坏性变更：`[providers]` 的值现在是表，不再是纯字符串（字符串
+  写法会被拒绝、无兼容层）；`[defaults].ignore_providers` 的条目现在必须带
+  `@openrouter` 后缀；`OPENROUTER_BASE_URL` 环境变量已移除（改用
+  `[providers].openrouter.chat`/`.embeddings`）；`OPENROUTER_APP_*` 环境变量
+  软废弃（静默忽略，改用 `[providers].openrouter.headers`）；
+  `[tasks.<name>]` 上的 `dimensions` 字段已移除（维度固定为 512；已有配置
+  里残留的 `dimensions = 512` 行现在是被忽略的未知 key）。详见上文
+  “`[providers]`”和“`[tasks.embedding]` — 已激活”。
 
 ## 此配置不控制的内容
 
-- **Voyage embedding**——`VoyageClient` hard-code `voyage-3-lite` 并直接读取 `VOYAGE_API_KEY`。`[tasks.embedding]` 块为将来的通用化保留。
+- **Voyage 自己的 base URL**——原生 Voyage wire 始终打到 Voyage 的官方端点；只有模型 id 可以配置，通过 `[tasks.embedding]`。要完全绕开 Voyage，改用 `@openrouter` 或自定义 `[providers]` 后缀。
 - **PDE 决策（默认路径）**——未设置 `filter_prompt` 时，`eros-engine-core/src/pde.rs` 中的规则引擎无条件运行。设置 `[tasks.pde_decision].filter_prompt` 可激活 opt-in LLM 判断器；此时规则引擎充当 fallback + 硬安全 guardrail。
 - **OpenRouter API key**——直接从 `OPENROUTER_API_KEY` 读取，而非从配置文件读取。
 - **每次调用的 streaming / response format 标志**——在 `OpenRouterClient` 中固定。

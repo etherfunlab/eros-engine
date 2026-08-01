@@ -3,8 +3,8 @@
 eros-engine exposes an opaque OpenRouter passthrough on the streaming
 chat endpoint. Three caller-supplied fields ride to
 `openrouter.ai/api/v1/chat/completions` unchanged, three OpenRouter wire
-echoes come back on the SSE `done` frame, and two deployer-set env vars
-add app-attribution headers to every outbound call.
+echoes come back on the SSE `done` frame, and a deployer-declared
+`headers` table adds app-attribution headers to every outbound call.
 
 The engine never inspects content. PII scrubbing, hashing, and
 metadata semantics are the caller's responsibility.
@@ -114,25 +114,45 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 
 ## App-attribution headers
 
-Three optional env vars add headers to every outbound OpenRouter call:
+Declare a `headers` table on `[providers.openrouter]` in the model config
+(`docs/model-config.md` → "Built-in endpoint overrides via
+`[providers].openrouter`") to add headers to every outbound OpenRouter
+call:
 
-| Env                         | Header                    | Purpose                                          |
-|-----------------------------|---------------------------|--------------------------------------------------|
-| `OPENROUTER_APP_REFERER`    | `HTTP-Referer`            | App identifier on OpenRouter dashboards          |
-| `OPENROUTER_APP_TITLE`      | `X-OpenRouter-Title`      | Display name in OpenRouter app analytics         |
-| `OPENROUTER_APP_CATEGORIES` | `X-OpenRouter-Categories` | Comma-separated marketplace categories           |
+```toml
+[providers.openrouter]
+headers = {
+  "HTTP-Referer" = "https://eros.example",
+  "X-OpenRouter-Title" = "Eros",
+  "X-OpenRouter-Categories" = "companion,roleplay",
+}
+```
 
-All unset → today's behaviour (no attribution headers). They are set
-per deployment, not per request — App-Attribution is intended for
-app-level aggregation. Per-user attribution belongs in `audit.user`.
+| Purpose-built header      | Meaning                                          |
+|----------------------------|--------------------------------------------------|
+| `HTTP-Referer`             | App identifier on OpenRouter dashboards          |
+| `X-OpenRouter-Title`       | Display name in OpenRouter app analytics         |
+| `X-OpenRouter-Categories`  | Comma-separated marketplace categories           |
 
-`OPENROUTER_APP_CATEGORIES` is passed through verbatim; OpenRouter
-silently ignores unrecognised values and only honours it when
-`OPENROUTER_APP_REFERER` is also set.
+No `[providers.openrouter]` entry, or one without `headers` → today's
+behaviour (no attribution headers). They are set per deployment, not per
+request — App-Attribution is intended for app-level aggregation. Per-user
+attribution belongs in `audit.user`.
 
-Invalid values (control characters, non-ASCII outside header rules)
-are dropped at construction time with a `tracing::warn!`; the client
-still works.
+`X-OpenRouter-Categories` is passed through verbatim; OpenRouter silently
+ignores unrecognised values and only honours it when `HTTP-Referer` is
+also set.
+
+Header names/values are validated at boot — engine-owned names
+(`Authorization`, `Content-Type`, case-insensitive) or anything that isn't
+valid HTTP header material refuses the load, rather than the older
+construction-time warn-and-drop.
+
+**Migration note:** the `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` /
+`OPENROUTER_APP_CATEGORIES` env vars are soft-deprecated — a still-set
+value is silently ignored, never a boot error, but it no longer does
+anything. Re-declare the same headers under `[providers.openrouter].headers`
+as shown above.
 
 ## What the engine does NOT do
 

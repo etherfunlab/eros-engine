@@ -3,8 +3,8 @@
 eros-engine 在流式 chat 路由上暴露一个不透明的 OpenRouter 透传层。
 三个 caller 提供的字段原样发给
 `openrouter.ai/api/v1/chat/completions`，三个 OpenRouter 的 wire 回显
-在 SSE `done` 帧里带回来，两个 deployer 设的环境变量会给每次出站调用都
-带上 app-attribution headers。
+在 SSE `done` 帧里带回来，一个 deployer 声明的 `headers` 表会给每次出站
+调用都带上 app-attribution headers。
 
 引擎不解读内容。PII 脱敏、hash、metadata 语义都是 caller 的责任。
 
@@ -99,23 +99,41 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 
 ## App-attribution headers
 
-三个可选环境变量给每次出站 OpenRouter 调用加 header：
+在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表（见
+`docs/model-config.zh.md` → “通过 `[providers].openrouter` 覆盖内置
+端点”），就能给每次出站 OpenRouter 调用加 header：
 
-| Env                         | Header                    | 用途                                          |
-|-----------------------------|---------------------------|-----------------------------------------------|
-| `OPENROUTER_APP_REFERER`    | `HTTP-Referer`            | OpenRouter 仪表盘上的 app 标识                |
-| `OPENROUTER_APP_TITLE`      | `X-OpenRouter-Title`      | OpenRouter app analytics 里显示的名字         |
-| `OPENROUTER_APP_CATEGORIES` | `X-OpenRouter-Categories` | 逗号分隔的 marketplace 分类                   |
+```toml
+[providers.openrouter]
+headers = {
+  "HTTP-Referer" = "https://eros.example",
+  "X-OpenRouter-Title" = "Eros",
+  "X-OpenRouter-Categories" = "companion,roleplay",
+}
+```
 
-都不设 → 维持现状（不发任何 attribution header）。它们是
-deployment 级别的设置，不是 per-request —— App-Attribution 的目的是
-app-level 聚合。Per-user 维度走 `audit.user`。
+| 常用 header                | 用途                                          |
+|-----------------------------|-----------------------------------------------|
+| `HTTP-Referer`              | OpenRouter 仪表盘上的 app 标识                |
+| `X-OpenRouter-Title`        | OpenRouter app analytics 里显示的名字         |
+| `X-OpenRouter-Categories`   | 逗号分隔的 marketplace 分类                   |
 
-`OPENROUTER_APP_CATEGORIES` 原样透传；OpenRouter 对无法识别的值静默
-忽略，且只有在同时设了 `OPENROUTER_APP_REFERER` 时才生效。
+没有 `[providers.openrouter]` 条目，或者有条目但没写 `headers` → 维持
+现状（不发任何 attribution header）。这是 deployment 级别的设置，不是
+per-request —— App-Attribution 的目的是 app-level 聚合。Per-user 维度走
+`audit.user`。
 
-非法值（控制字符、非 ASCII 之类）在构造时被丢弃并打一条
-`tracing::warn!`，client 仍然可用。
+`X-OpenRouter-Categories` 原样透传；OpenRouter 对无法识别的值静默忽略，
+且只有在同时设了 `HTTP-Referer` 时才生效。
+
+header 的 name/value 在启动时就会校验：引擎自有的 name
+（`Authorization`、`Content-Type`，不分大小写）或者不合法的 HTTP header
+material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-drop。
+
+**迁移提示：**`OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` /
+`OPENROUTER_APP_CATEGORIES` 环境变量已软废弃——仍然设置也会被静默忽略，
+不是启动报错，但也不再起任何作用。请把同样的 header 按上面的写法迁到
+`[providers.openrouter].headers` 下。
 
 ## 引擎不做的事
 

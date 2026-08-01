@@ -11,7 +11,7 @@
 
 - Postgres 16+，裝了 `pgvector` extension（≥ 0.7）。
 - 一個 OpenRouter 賬號（`OPENROUTER_API_KEY`）。
-- 一個 Voyage AI 賬號（`VOYAGE_API_KEY`）。
+- 一個 Voyage AI 賬號（`VOYAGE_API_KEY`）——除非 `[tasks.embedding]` 把 read 和 write 都路由离开 Voyage，否则必需（见 [model-config.zh.md](model-config.zh.md)）；默认配置（没有 `[tasks.embedding]` 块）仍然需要它。
 - 要麼 Supabase 項目（默認 JWT auth 用），要麼你自己的 JWT 簽發者（實現 `AuthValidator`）。
 
 ## 子命令
@@ -101,10 +101,7 @@ eros-engine-store = "0.9"
 
 ```rust
 let pool = eros_engine_store::pool::build(&database_url).await?;
-let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(
-    or_key,
-    eros_engine_llm::openrouter::AppAttribution::default(),
-);
+let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(or_key);
 let voyage = eros_engine_llm::voyage::VoyageClient::new(voyage_key);
 
 let affinity_repo = eros_engine_store::affinity::AffinityRepo { pool: &pool };
@@ -257,7 +254,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 
 - **环境变量：**完整的变量清单在 [`.env.example`](../.env.example)；该文件刻意精简——细节以本指南和 [model-config.zh.md](model-config.zh.md) 为准。
 - **后台 sweeper：**`serve` 还会跑 dreaming-lite（会话结束记忆分类器）和 insight 快照两个 sweeper。都可选：`DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` 关掉，不影响聊天路径。dreaming 每 `DREAMING_TICK_SECS`（默认 300）秒醒一次，分类空闲至少 `DREAMING_IDLE_SECS`（默认 1800）秒的会话；分类认领超过 `DREAMING_CLAIM_STALE_SECS`（默认 600）秒视为 worker 崩溃、可被重新认领。快照 sweeper 按 6 段 cron `SNAPSHOT_CRON`（默认 `0 0 23 * * *`）在 `SNAPSHOT_TZ`（默认 `Asia/Singapore`）时区运行；cron 解析失败则 sweeper 不启动（聊天路径不受影响），时区解析失败回退默认值。
-- **OpenRouter 归因（可选）：**`OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` 会给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不设则保持匿名。`OPENROUTER_APP_CATEGORIES`（逗号分隔）仅在设置了 referer 时生效；无法识别的值会被静默忽略。
+- **OpenRouter 归因（可选）：**在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表——`HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`——给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不写这个条目（或不写它的 `headers` key）就保持匿名。见 [model-config.zh.md → 通过 `[providers].openrouter` 覆盖内置端点](model-config.zh.md#通过-providersopenrouter-覆盖内置端点)。旧的 `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` 环境变量已软废弃：仍然设置也只会被静默忽略，不是启动报错；`OPENROUTER_BASE_URL` 则彻底移除——改用 `[providers].openrouter.chat` / `.embeddings` 覆盖端点 URL。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
 - **Affinity debug：** `GET /comp/affinity/{session_id}` 受 `EXPOSE_AFFINITY_DEBUG=true` 控制。生產部署一般關掉；如果你的前端要實時畫好感度雷達圖，再打開。

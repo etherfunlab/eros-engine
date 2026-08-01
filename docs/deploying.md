@@ -11,7 +11,7 @@ Two supported paths, in order of effort:
 
 - Postgres 16+ with the `pgvector` extension (≥ 0.7).
 - An OpenRouter account (`OPENROUTER_API_KEY`).
-- A Voyage AI account (`VOYAGE_API_KEY`).
+- A Voyage AI account (`VOYAGE_API_KEY`) — required unless `[tasks.embedding]` routes both read and write off Voyage (see [Model config](model-config.md)); the default (no `[tasks.embedding]` block) still needs it.
 - Either a Supabase project (for default JWT auth) or your own JWT issuer (implement `AuthValidator`).
 
 ## Subcommands
@@ -101,10 +101,7 @@ Then construct a pool, repos, LLM clients, and write your own dispatch layer:
 
 ```rust
 let pool = eros_engine_store::pool::build(&database_url).await?;
-let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(
-    or_key,
-    eros_engine_llm::openrouter::AppAttribution::default(),
-);
+let openrouter = eros_engine_llm::openrouter::OpenRouterClient::new(or_key);
 let voyage = eros_engine_llm::voyage::VoyageClient::new(voyage_key);
 
 let affinity_repo = eros_engine_store::affinity::AffinityRepo { pool: &pool };
@@ -264,7 +261,7 @@ call. Details, data model, and the boot-validation rules are in
 
 - **Env vars:** the complete variable list lives in [`.env.example`](../.env.example); it is deliberately terse — details live in this guide and in [model-config.md](model-config.md).
 - **Background sweepers:** `serve` also runs the dreaming-lite (session-end memory classifier) and insight-snapshot sweepers. Both are optional: `DREAMING_DISABLED=1` / `SNAPSHOT_DISABLED=1` turn them off without affecting the chat path. Dreaming wakes every `DREAMING_TICK_SECS` (default 300) and classifies sessions idle for at least `DREAMING_IDLE_SECS` (default 1800); a classification claim older than `DREAMING_CLAIM_STALE_SECS` (default 600) is treated as a crashed worker and re-claimed. The snapshot sweeper runs on a 6-field cron `SNAPSHOT_CRON` (default `0 0 23 * * *`) in `SNAPSHOT_TZ` (default `Asia/Singapore`); an unparseable cron means the sweeper never starts (chat path unaffected), and an unparseable zone falls back to the default.
-- **OpenRouter attribution (optional):** `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` add attribution headers to every outbound OpenRouter call so the deployment shows up on OpenRouter's app dashboard; leave unset to stay anonymous. `OPENROUTER_APP_CATEGORIES` (comma-separated) only takes effect alongside the referer; unrecognised values are silently ignored.
+- **OpenRouter attribution (optional):** declare a `headers` table under `[providers.openrouter]` in the model config — `HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories` — to add attribution headers to every outbound OpenRouter call so the deployment shows up on OpenRouter's app dashboard; leave the entry (or its `headers` key) absent to stay anonymous. See [Model config → Built-in endpoint overrides](model-config.md#built-in-endpoint-overrides-via-providersopenrouter). The old `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` env vars are soft-deprecated: still-set values are silently ignored, never a boot error, and `OPENROUTER_BASE_URL` has been removed outright — override the endpoint URL via `[providers].openrouter.chat` / `.embeddings` instead.
 - **Health probe:** `GET /healthz` returns 200 with `{ status: "ok", service, version, timestamp }`. Wire this into your platform's health check.
 - **OpenAPI / Scalar:** `GET /docs` serves a live Scalar reference. The raw OpenAPI JSON is not served over HTTP — dump it with the `print-openapi` subcommand.
 - **Affinity debug:** `GET /comp/affinity/{session_id}` is gated by `EXPOSE_AFFINITY_DEBUG=true`. Production deploys typically leave it off; turn it on if your frontend renders a live radar of the affinity vector.
