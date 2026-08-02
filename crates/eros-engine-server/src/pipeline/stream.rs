@@ -1756,6 +1756,27 @@ async fn run_pde_decision(
     }
 }
 
+/// Whether an image action is possible this turn.
+///
+/// Two independent facts must both hold: the request carries an `image` block
+/// (the consumer signalling "I handle images this turn" — the engine holds no
+/// image configuration and never draws), and `[tasks.chat_image_prompt_compose]`
+/// is configured. The composer became mandatory when the judge stopped writing
+/// seeds (#212): with no seed and no composer, nothing can produce an image
+/// prompt at all.
+///
+/// The check is the task section's PRESENCE, deliberately not a
+/// `resolve_image_prompt_compose(..)` call: that resolver reaches
+/// `self.resolve(COMPOSE_TASK, None)`, which advances the round-robin model
+/// cursor as a side effect, so calling it merely to answer a capability
+/// question would skew which model later image turns actually pick.
+fn image_capability_available(
+    executor_available: bool,
+    model_config: &eros_engine_llm::model_config::ModelConfig,
+) -> bool {
+    executor_available && model_config.has_task("chat_image_prompt_compose")
+}
+
 /// Map the judge's proposed action to the acted `ActionType`, applying the
 /// hard-safety ghost guardrail (`ghost::ghost_permitted`) and the image-degrade.
 /// Does NOT apply the `ghosting` kill-switch (that is a path-wide final gate).
@@ -2977,9 +2998,11 @@ pub fn run_stream(
         // Delegate-only: the chat stream never draws, so image-action
         // availability keys on the PRESENCE of the request `image` block (the
         // consumer signalling "I handle images this turn"). The engine holds
-        // no image configuration at all.
+        // no image configuration at all. Image capability = that PLUS a
+        // composer configured to write the prompt (#212).
         let req_image = user_msg.image.as_ref();
-        let image_executor_available = req_image.is_some();
+        let image_executor_available =
+            image_capability_available(req_image.is_some(), &state.model_config);
         let force_image = req_image.is_some_and(|i| i.force) && !is_tip;
         // Skip resolution on tip turns: the judge won't run, and resolve_pde()
         // advances the round-robin model cursor as a side effect — resolving on a
@@ -4758,6 +4781,33 @@ mod tests {
             guard_action(PdeAction::ReplyTextImage, &aff, &sig, false, false),
             ActionType::ReplyText
         );
+    }
+
+    #[test]
+    fn image_capability_requires_a_configured_composer() {
+        use eros_engine_llm::model_config::ModelConfig;
+        // Executor present (request carries an `image` block) but no composer task.
+        let no_composer =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").expect("parses");
+        assert!(
+            !image_capability_available(true, &no_composer),
+            "no composer task ⇒ no image capability: nothing can write a prompt"
+        );
+        // Composer configured ⇒ capability follows the executor.
+        let with_composer =
+            ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
+                .expect("parses");
+        assert!(image_capability_available(true, &with_composer));
+        assert!(
+            !image_capability_available(false, &with_composer),
+            "no executor ⇒ no capability, unchanged"
+        );
+        // A variant-shaped filter_prompt is still a configured composer.
+        let variants = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"X\" }\n",
+        )
+        .expect("parses");
+        assert!(image_capability_available(true, &variants));
     }
 
     #[test]

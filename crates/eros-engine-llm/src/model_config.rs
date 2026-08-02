@@ -1902,6 +1902,13 @@ impl ModelConfig {
         Ok(())
     }
 
+    /// Whether a `[tasks.<name>]` section exists at all, independent of its
+    /// contents. Used by capability gates that must distinguish "not configured"
+    /// from "configured but inert this turn".
+    pub fn has_task(&self, name: &str) -> bool {
+        self.tasks.contains_key(name)
+    }
+
     /// Resolve the image-prompt composer task. `None` (composer does not run)
     /// when `[tasks.chat_image_prompt_compose]` is absent, **or** when the
     /// caller passed the reserved `raw` variant — the two are indistinguishable
