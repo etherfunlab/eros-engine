@@ -307,6 +307,7 @@ async fn direct_world(
         response_format: resolved
             .structured_output
             .then(|| world_director_response_format(town)),
+        task: Some(WORLD_TASK.into()),
         ..Default::default()
     };
     let raw = state

@@ -661,6 +661,7 @@ async fn evaluate_affinity(
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
+        task: Some(AFFINITY_TASK.into()),
         ..Default::default()
     };
 
@@ -878,6 +879,7 @@ async fn extract_facts(
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
+        task: Some(INSIGHT_TASK.into()),
         ..Default::default()
     };
 
@@ -969,6 +971,7 @@ async fn extract_structured_insights(
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
+        task: Some(INSIGHT_TASK.into()),
         ..Default::default()
     };
 

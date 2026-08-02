@@ -267,6 +267,7 @@ fn assemble_chat_request(
         session_id: audit_session,
         metadata: audit_metadata,
         reasoning: resolved.reasoning,
+        task: Some(CHAT_TASK.into()),
         ..Default::default()
     }
 }

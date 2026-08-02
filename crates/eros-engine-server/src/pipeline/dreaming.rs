@@ -215,6 +215,7 @@ async fn classify_session(
         max_tokens: resolved.max_tokens,
         user: Some(SYSTEM_AUDIT_USER.into()),
         reasoning: resolved.reasoning,
+        task: Some(MEMORY_TASK.into()),
         ..Default::default()
     };
     let raw = state

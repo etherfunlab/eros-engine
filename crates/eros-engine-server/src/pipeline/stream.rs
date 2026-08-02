@@ -1396,6 +1396,7 @@ async fn run_output_filter(
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
             reasoning: f.reasoning.clone(),
+            task: Some("chat_output_filter".into()),
             ..Default::default()
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
@@ -1681,6 +1682,7 @@ async fn run_pde_decision(
             max_tokens: p.max_tokens,
             reasoning: p.reasoning.clone(),
             response_format: response_format.clone(),
+            task: Some("pde_decision".into()),
             ..Default::default()
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, client.execute(req)).await {
@@ -2232,6 +2234,7 @@ async fn run_input_filter(
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
             reasoning: f.reasoning.clone(),
+            task: Some("chat_input_filter".into()),
             ..Default::default()
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
@@ -2360,6 +2363,7 @@ async fn run_image_prompt_compose(
             temperature: c.temperature as f32,
             max_tokens: c.max_tokens,
             reasoning: c.reasoning.clone(),
+            task: Some("chat_image_prompt_compose".into()),
             ..Default::default()
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
@@ -3101,6 +3105,7 @@ pub fn run_stream(
                     temperature: p.temperature as f32,
                     max_tokens: p.max_tokens,
                     reasoning: p.reasoning.clone(),
+                    task: Some("chat_product_qa".into()),
                     ..Default::default()
                 };
                 'candidates: for model_id in candidates {
@@ -5999,6 +6004,105 @@ data: [DONE]\n\n";
         assert_eq!(img["compose_variant"], "b");
         assert_eq!(img["compose_model"], "served/model");
         assert_eq!(img["compose_generation_id"], "gen-xyz");
+    }
+
+    /// Spec 2026-08-02-provider-body-params: an [[providers.openrouter.body]]
+    /// rule scoped to a task reaches that task's wire body end-to-end
+    /// (config parse → boot accessor → client → per-attempt merge).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn provider_body_rule_reaches_the_wire_for_its_task(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ENRICHED"}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n\
+                 [[providers.openrouter.body]]\n\
+                 tasks = [\"chat_image_prompt_compose\"]\n\
+                 params = { venice_parameters = { include_venice_system_prompt = false } }\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            )
+            .with_openrouter_body_rules(state.model_config.openrouter_body_rules()),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    image_prompt: Some("a beach at sunset".into()),
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "image-only turn makes exactly one call (the composer)"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["venice_parameters"]["include_venice_system_prompt"],
+            serde_json::Value::Bool(false),
+            "task-scoped body rule must reach the composer wire"
+        );
+        assert_eq!(body["messages"][0]["role"], "system", "engine body intact");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

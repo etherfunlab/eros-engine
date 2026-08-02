@@ -209,6 +209,7 @@ async fn run_comment_round(
         response_format: resolved
             .structured_output
             .then(world_comment_response_format),
+        task: Some("world_comment".into()),
         ..Default::default()
     };
     let raw = state
@@ -319,6 +320,7 @@ async fn run_reply(
         max_tokens: resolved.max_tokens,
         user: Some(WORLD_AUDIT_USER.into()),
         reasoning: resolved.reasoning.clone(),
+        task: Some("world_reply".into()),
         ..Default::default()
     };
     let raw = state
