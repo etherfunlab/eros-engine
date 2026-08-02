@@ -2316,6 +2316,40 @@ impl ModelConfig {
         }
         Ok(())
     }
+
+    /// Boot gate for `[tasks.affinity_evaluation].filter_prompt` — a key that
+    /// parses but is never read.
+    ///
+    /// The affinity evaluator's prompt is engine-owned by design (issue #210):
+    /// it interpolates per-turn context the config layer cannot express, and
+    /// affinity is what PDE thresholds, scope gating, and `[emotional_context]`
+    /// all consume — so a downstream rewrite of the evaluator's contract breaks
+    /// behaviour the operator cannot see. Rather than add a resolver, refuse to
+    /// boot, consistent with `validate_prompt_variants`: dead config must never
+    /// silently no-op.
+    ///
+    /// Rejects the key in EVERY shape, blank included. Blank leniency
+    /// ("commented out" ⇒ built-in default) exists for keys that are actually
+    /// read; here it would reproduce the exact silence this gate removes.
+    /// Every other `[tasks.affinity_evaluation]` field (model, fallback,
+    /// temperature, max_tokens, reasoning) stays configurable.
+    pub fn validate_affinity_prompt_unset(&self) -> Result<(), String> {
+        const AFFINITY_TASK: &str = "affinity_evaluation";
+        let has_prompt = self
+            .tasks
+            .get(AFFINITY_TASK)
+            .is_some_and(|t| t.filter_prompt.is_some());
+        if has_prompt {
+            return Err(format!(
+                "[tasks.{AFFINITY_TASK}].filter_prompt is set, but the affinity evaluator's \
+                 prompt is engine-owned and deliberately not configurable — it was never read, \
+                 and eros-engine refuses to boot rather than let it silently no-op. Remove the \
+                 key; model/fallback/temperature/max_tokens/reasoning remain configurable. \
+                 Rationale: https://github.com/etherfunlab/eros-engine/issues/210"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Every task name the chat/completions pipeline can present to the
@@ -5980,6 +6014,69 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             !e.contains("blank key"),
             "must not be reported as the blank-key case: {e}"
         );
+    }
+
+    // ─── validate_affinity_prompt_unset ──────────────────────────────────
+    #[test]
+    fn affinity_filter_prompt_absent_boots() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"m\"\ntemperature = 0.3\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_affinity_prompt_unset().is_ok());
+    }
+
+    #[test]
+    fn affinity_task_absent_boots() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.validate_affinity_prompt_unset().is_ok());
+    }
+
+    #[test]
+    fn affinity_filter_prompt_set_refuses_to_boot() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"m\"\nfilter_prompt = \"score the turn\"\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_affinity_prompt_unset()
+            .expect_err("a set filter_prompt must refuse to boot");
+        assert!(
+            err.contains("[tasks.affinity_evaluation].filter_prompt"),
+            "{err}"
+        );
+        assert!(err.contains("refuses to boot"), "{err}");
+        assert!(
+            err.contains("issues/210"),
+            "error must point at the issue: {err}"
+        );
+    }
+
+    #[test]
+    fn affinity_blank_filter_prompt_also_refuses_to_boot() {
+        // Blank is NOT the lenient "commented out" case here: the key is dead
+        // config in every shape, so silence would be the very failure #210 is
+        // about.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_affinity_prompt_unset().is_err());
+    }
+
+    #[test]
+    fn affinity_variant_shaped_filter_prompt_refuses_with_the_affinity_message() {
+        // A table-shaped value would ALSO trip validate_prompt_variants, but
+        // main runs this gate first so the operator is told the accurate
+        // thing: affinity's prompt is not configurable at all.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.affinity_evaluation]\nmodel = \"m\"\nfilter_prompt = { a = \"X\" }\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_affinity_prompt_unset()
+            .expect_err("must refuse");
+        assert!(err.contains("engine-owned"), "{err}");
     }
 
     // ─── resolve_image_prompt_compose: variants + raw ────────────────────

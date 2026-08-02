@@ -277,6 +277,17 @@ async fn run_server() -> Result<()> {
     // unset" (telling an operator who just set it to set it) instead of the
     // accurate "uses a variant shape, but only [tasks.chat_image_prompt_compose]
     // reads variants" from `validate_prompt_variants`.
+    //
+    // Dead-config gate for the affinity evaluator (#210). Runs BEFORE the
+    // variant-shape gate: this check is shape-independent (it only asks
+    // whether the key exists), so a table-shaped filter_prompt under
+    // [tasks.affinity_evaluation] gets the accurate "affinity's prompt is not
+    // configurable" message instead of the generic "only the composer reads
+    // variants" one.
+    if let Err(msg) = model_config.validate_affinity_prompt_unset() {
+        anyhow::bail!(msg);
+    }
+
     if let Err(msg) = model_config.validate_prompt_variants() {
         anyhow::bail!(msg);
     }
@@ -482,6 +493,17 @@ mod tests {
             "shipped config must pass the prompt-variant boot gate: {:?}",
             cfg.validate_prompt_variants()
         );
+    }
+
+    /// The shipped example's [tasks.affinity_evaluation] block carries model /
+    /// fallback / temperature / max_tokens and deliberately NO filter_prompt —
+    /// it MUST pass the affinity dead-config gate, or `main` bails (#210).
+    #[test]
+    fn shipped_model_config_satisfies_affinity_prompt_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_affinity_prompt_unset()
+            .expect("shipped example must not set an affinity filter_prompt");
     }
 
     #[test]

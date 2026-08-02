@@ -520,6 +520,11 @@ max_tokens  = 400
 # claude-haiku-4.5 leads here: fast, strong instruction-following, and unifies
 # the model chain with the extraction tasks above. deepseek-v4-flash +
 # gemini-3.1-flash-lite fallback keep it alive if Anthropic is down.
+#
+# NOTE: this task takes NO filter_prompt. The evaluator's prompt is engine-owned
+# (it is written in the character's first-person voice and interpolates per-turn
+# context), and setting the key here refuses to boot rather than no-op silently.
+# See issue #210.
 [tasks.affinity_evaluation]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash", "google/gemini-3.1-flash-lite"]
