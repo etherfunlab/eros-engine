@@ -34,23 +34,24 @@ import from `voice.rs` entirely.
 
 - No affinity row ⇒ no line (unchanged).
 - With a row: always emit **one** line (thin-prompt intent unchanged) —
-  a base phrase from `bond_label()`, plus a romance clause appended in the
-  same line when `chemistry_label()` is **Crush or higher** (tier ≥ 3).
+  a base phrase from `bond_label()`, plus the `chemistry_label()` tier's
+  clause appended in the same line (every tier appends; the low tiers'
+  clause explicitly holds romance back).
 
-| bond tier | base phrase |
-| --- | --- |
-| Acquaintance | "You two are still getting to know each other; keep it light." |
-| Friend | "You two are friends; be warm and natural." |
-| CloseFriend | "You two are close friends; be warm and familiar." |
-| Confidant | "You two trust each other deeply; speak openly and at ease." |
-| Soulmate | "You two know each other inside out; total comfort and familiarity." |
+| bond tier     | base phrase |
+|---------------|-------------|
+| Acquaintance  | "You two are still getting to know each other; keep it light and natural." |
+| Friend        | "You two are friends; be warm, easy, and natural." |
+| CloseFriend   | "You two are close friends; be warm, familiar, and comfortable." |
+| Confidant     | "You two trust each other deeply; speak openly, at ease, and with quiet closeness." |
+| Soulmate      | "You two know each other inside out; total comfort, familiarity, and unspoken understanding." |
 
-| chemistry tier | appended clause |
-| --- | --- |
-| Spark / Flirtation | (none — deliberately more conservative than the legacy `SlowBurn` fold: early chemistry must not push the voice tone toward romance) |
-| Crush | "There's a growing attraction between you; let a little flirtation through." |
-| Lover | "You share a romantic bond; be affectionate." |
-| Beloved | "You two are deeply in love; be openly affectionate." |
+| chemistry tier     | appended clause |
+|--------------------|-----------------|
+| Spark / Flirtation | "A faint, unspoken spark exists between you. Keep it subtle — light teasing is allowed, but do not lean into romance or seduction yet." |
+| Crush              | "There's a clear and growing attraction between you. Let soft flirtation and quiet allure color your words. Be teasing, a little magnetic, but still restrained." |
+| Lover              | "You share a romantic and physical bond. Be affectionate, intimate, and gently alluring. Your voice and manner should feel warm, close, and quietly seductive." |
+| Beloved            | "You two are deeply in love and highly attuned to each other. Be openly affectionate, sensual, and alluring. Speak with natural intimacy, quiet desire, and magnetic ease — as if the other person is already yours." |
 
 ### Behaviour changes (accepted)
 
@@ -78,9 +79,11 @@ Only `crates/eros-engine-server/src/pipeline/voice.rs`:
 
 - Replace the `affinity_with(label)` test helper with an axis-value
   constructor that lands on target tiers.
-- Cases: no affinity ⇒ no line; fresh (all-zero) row ⇒ Acquaintance line;
-  high bond + low chemistry ⇒ no romance wording; high chemistry ⇒
-  affectionate clause present; boundary: chemistry tier 2 appends nothing.
+- Cases: no affinity ⇒ no line; fresh (all-zero) row ⇒ Acquaintance base +
+  the subtle Spark/Flirtation clause; high bond + low chemistry ⇒ the
+  restrained clause, no Crush-and-up wording; high chemistry ⇒ affectionate
+  clause present; boundary: tier 2 (Flirtation) still uses the subtle
+  clause, tier 3 (Crush) switches to the attraction clause.
 
 ## Out of scope
 
