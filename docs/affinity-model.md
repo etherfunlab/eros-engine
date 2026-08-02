@@ -209,6 +209,18 @@ shape:
 EMA smoothing and time decay are **unchanged** — only the cap and prompt
 guidance changed.
 
+**Register and `reason` hygiene.** The evaluator prompt is written in the
+character's own first-person voice ("you are this character; how did this turn
+change how you feel about him?"), not as a third-person analytical judge, and
+is sent as a static `system` instruction plus a per-turn `user` payload. Its
+`reason` rules forbid system vocabulary (AI/assistant/model, refusal, policy)
+and forbid endorsing a canned refusal that reached the reply. This is
+load-bearing: `reason` is persisted to `companion_affinity_events.context` and
+re-injected into later system prompts as `[emotional_context]`, so an
+evaluator that rationalises a refusal writes that stance into persona state.
+The prompt is engine-owned and deliberately not configurable — see
+`docs/superpowers/specs/2026-08-02-affinity-eval-hygiene-design.md`.
+
 ## Persistence
 
 ### Generated columns

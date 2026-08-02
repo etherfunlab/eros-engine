@@ -624,6 +624,32 @@ fn build_affinity_context(reason: &str, skip_reason: Option<&str>) -> serde_json
     serde_json::Value::Object(map)
 }
 
+/// Build the affinity evaluator's two-message request: the static in-character
+/// instruction as `system`, this turn's data as `user`. Split out as a pure
+/// function so the call shape is unit-testable without an `AppState`.
+fn affinity_eval_messages(
+    persona_name: &str,
+    affinity: &eros_engine_core::affinity::Affinity,
+    user_msg: &str,
+    assistant_msg: &str,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "system".into(),
+            content: crate::prompt::affinity_eval_system_prompt().to_string(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: crate::prompt::affinity_eval_user_payload(
+                persona_name,
+                affinity,
+                user_msg,
+                assistant_msg,
+            ),
+        },
+    ]
+}
+
 /// Run the haiku affinity evaluator for one Reply turn. Returns the clamped
 /// per-axis LLM deltas, the snapped absolute patience read (`None` when the
 /// model omitted it), and the model's reason. Any failure (LLM error,
@@ -647,16 +673,11 @@ async fn evaluate_affinity(
 ) {
     use eros_engine_core::affinity::AffinityDeltas;
 
-    let prompt =
-        crate::prompt::affinity_eval_prompt(persona_name, affinity, user_msg, assistant_msg);
     let resolved = state.model_config.resolve(AFFINITY_TASK, None);
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: prompt,
-        }],
+        messages: affinity_eval_messages(persona_name, affinity, user_msg, assistant_msg),
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
         user: audit_user.map(String::from),
@@ -1975,6 +1996,51 @@ mod tests {
         assert!(
             (patience - 0.93).abs() < 1e-9,
             "patience_target set directly through the server layer (not 0.53); got {patience}"
+        );
+    }
+
+    fn fixture_eval_affinity() -> eros_engine_core::affinity::Affinity {
+        let now = chrono::Utc::now();
+        eros_engine_core::affinity::Affinity {
+            id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            instance_id: Uuid::nil(),
+            warmth: 0.42,
+            trust: 0.31,
+            intrigue: 0.55,
+            intimacy: 0.22,
+            patience: 0.66,
+            tension: 0.13,
+            ghost_streak: 0,
+            last_ghost_at: None,
+            total_ghosts: 0,
+            relationship_label: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn affinity_eval_messages_is_system_then_user() {
+        let a = fixture_eval_affinity();
+        let msgs = affinity_eval_messages("Mia", &a, "我今天好累", "抱抱你");
+        assert_eq!(msgs.len(), 2, "instructions and data are separate messages");
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        // The static instruction goes in the system slot verbatim.
+        assert_eq!(
+            msgs[0].content,
+            crate::prompt::affinity_eval_system_prompt()
+        );
+        // The per-turn data goes in the user slot.
+        assert!(msgs[1].content.contains("角色名：Mia"));
+        assert!(msgs[1].content.contains("对方：我今天好累"));
+        assert!(msgs[1].content.contains("Mia：抱抱你"));
+        // The turn's data must NOT be smuggled into the system message.
+        assert!(
+            !msgs[0].content.contains("我今天好累"),
+            "system message must stay static across turns"
         );
     }
 }

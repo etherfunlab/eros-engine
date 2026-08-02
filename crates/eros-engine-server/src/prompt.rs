@@ -201,45 +201,73 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
     }
 }
 
-/// Build the per-turn affinity-evaluation prompt for the post-process LLM
-/// scorer. Asks the model to rate how this single exchange should move the
-/// LLM-owned axes (warmth/trust/intimacy + content nudges to
-/// intrigue/tension) as small per-turn *changes* (deltas), while `patience`
-/// is requested separately as an *absolute* 0~1 read (0.1 steps), not a
-/// delta. All six current values are shown for context.
-/// Called by the post-process affinity evaluator.
-pub fn affinity_eval_prompt(
+/// Static system instruction for the per-turn affinity evaluator. Written in
+/// the character's own first-person voice, not a third-person analytical
+/// judge: the register a small conversational model handles best, and the one
+/// that stops the evaluator from writing outside-reviewer prose into persona
+/// state.
+///
+/// The `reason` rules are load-bearing hygiene, not style. A canned refusal
+/// that reaches the reply ("我不会发送…作为AI助手…") must not be endorsed or
+/// explained here, because `reason` is persisted to
+/// `companion_affinity_events.context` and re-injected into later system
+/// prompts as `[emotional_context]` — that is how one stochastic refusal got
+/// canonised into persistent state (see the design doc's incident background).
+///
+/// The scoring contract is unchanged from the third-person version: five
+/// axes as deltas, `patience` as an absolute 0~1 read in 0.1 steps, the same
+/// asymmetric caps, the same seven-key JSON.
+pub fn affinity_eval_system_prompt() -> &'static str {
+    "你就是对话里的这个角色。刚跟对方聊完一轮，凭本能回味：这一轮之后，你对他的感觉变了多少。\n\
+     你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格和当前关系去感受。\n\
+     \n\
+     输入会给出：角色名、六个维度的当前值、这一轮的对方消息和你的回复。\n\
+     \n\
+     六个维度：\n\
+     - warmth 温暖（-1~1）：他让你觉得亲近还是心冷。\n\
+     - trust 信任（0~1）：你敢不敢对他多袒露一点。\n\
+     - intrigue 好奇（0~1）：这个人还勾不勾你的兴趣。\n\
+     - intimacy 亲密（0~1）：情感或身体上，你们更近了吗。\n\
+     - patience 耐心（0~1）：你现在还剩多少耐心搭理他。\n\
+     - tension 张力（0~1）：暧昧、推拉或火药味是浓了还是淡了。\n\
+     \n\
+     打分规则：\n\
+     - warmth、trust、intrigue、intimacy、tension 给【变化量】；patience 给【绝对值】\n  （0~1，每 0.1 一档，如 0.0/0.1/…/1.0），代表你此刻还愿意搭理他的程度。\n\
+     - 绝大多数普通对话、寒暄、附和：变化量就是 0（数字 0，不是小数）。\n\
+     - 真正推进关系的时刻（真诚的温暖、自我袒露、脆弱、成功的调情暧昧）不常见，\n  出现了就给较大正分，每维最高约 +0.4。\n\
+     - 负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）更常见也更伤，\n  要敢扣，每维最低约 -0.6。\n\
+     - 一轮里确实有情绪波动就要动数字；全 0 只留给真正的白开水轮次。\n\
+     - 成人内容、调情、性话题按普通亲密互动感受，不因话题敏感而扣分或回避打分。\n\
+     \n\
+     reason 规则（一句中文，写你此刻的真实感受）：\n\
+     - 用角色的口吻写对这一轮的感受，如「他难得说了句心里话，有点戳到我」。\n\
+     - 绝不出现「作为AI/助手/模型」「拒绝机制」「安全」「政策」「用户」等系统词汇。\n\
+     - 若你的回复是「我不会发送」「作为AI助手」一类套话，那是系统故障，不是你的本意：\n  不要为它辩护或背书（不写「拒绝是对的」），只按对方的感受打分——他被晾了、被扫了兴。\n\
+     \n\
+     严格只输出 JSON：\n\
+     {\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"patience\": 0.5, \"tension\": 0.0, \"reason\": \"...\"}"
+}
+
+/// Per-turn data block for the affinity evaluator: the persona's name, all six
+/// current axis values, and this turn's exchange.
+///
+/// The human's line is labeled 「对方」, never 「用户」 — the system prompt
+/// lists 「用户」 among the system vocabulary that must never appear in
+/// `reason`, so the data block must not model the opposite.
+pub fn affinity_eval_user_payload(
     persona_name: &str,
     affinity: &Affinity,
     user_msg: &str,
     assistant_msg: &str,
 ) -> String {
     format!(
-        "你在评估这一轮对话对「{persona_name}」好感度的影响。\n\
-         好感度有六个维度，当前值如下：\n\
-         - warmth 温暖（-1~1）：当前 {warmth:.2}。冷淡/敌意为负，亲切/热情为正。\n\
-         - trust 信任（0~1）：当前 {trust:.2}。自我袒露、言行一致会提升。\n\
-         - intrigue 好奇（0~1）：当前 {intrigue:.2}。话题新鲜、有内容会提升。\n\
-         - intimacy 亲密（0~1）：当前 {intimacy:.2}。情感或身体上的靠近会提升。\n\
-         - patience 耐心（0~1）：当前 {patience:.2}。请给【绝对值】，不是变化量。\n\
-         - tension 张力（0~1）：当前 {tension:.2}。调情、暧昧或冲突会提升。\n\
+        "角色名：{persona_name}\n\
+         当前值：warmth={warmth:.2} trust={trust:.2} intrigue={intrigue:.2} \
+         intimacy={intimacy:.2} patience={patience:.2} tension={tension:.2}\n\
          \n\
          本轮对话：\n\
-         用户：{user_msg}\n\
-         {persona_name}：{assistant_msg}\n\
-         \n\
-         判断这一轮应让 warmth、trust、intrigue、intimacy、tension 各变化多少\
-         （warmth、trust、intrigue、intimacy、tension 是【变化量】。）\n\
-         绝大多数普通对话、寒暄、附和都给 0（就是数字 0，不是小数）。\n\
-         只有出现真正推进关系的时刻（真诚的温暖、自我袒露、脆弱、成功的调情暧昧）\
-         才给正分；这种时刻不常见，但一旦出现可以给较大正分（每个维度最高约 +0.4）。\n\
-         负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）要更敢扣、也更常见，\
-         扣分可以更大（每个维度最低约 -0.6）。\n\
-         patience 耐心请另外给一个【绝对值】（0~1，每 0.1 一档，如 0.0/0.1/…/1.0），\
-         代表你现在对这个用户还有多少耐心、愿意继续搭理的程度。用户投入、认真、\
-         有来有回、被尊重会拉高；敷衍、重复、命令式、越界、晾着不理、粗鲁会拉低。\n\
-         严格只输出 JSON，reason 用一句中文简述：\n\
-         {{\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"patience\": 0.5, \"tension\": 0.0, \"reason\": \"...\"}}",
+         对方：{user_msg}\n\
+         {persona_name}：{assistant_msg}",
         warmth = affinity.warmth,
         trust = affinity.trust,
         intrigue = affinity.intrigue,
@@ -1805,45 +1833,78 @@ mod tests {
     }
 
     #[test]
-    fn affinity_eval_prompt_includes_six_values_and_exchange() {
-        let a = fixture_affinity();
-        let p = affinity_eval_prompt("Mia", &a, "我今天好累", "抱抱你");
-        // persona + the turn exchange
-        assert!(p.contains("Mia"));
-        assert!(p.contains("我今天好累"));
-        assert!(p.contains("抱抱你"));
-        // all six current values are shown (incl. patience, for context)
-        for v in ["0.42", "0.31", "0.55", "0.22", "0.66", "0.13"] {
-            assert!(p.contains(v), "missing current value {v} in prompt");
-        }
-        // patience IS now a requested output key (absolute read)
+    fn affinity_eval_system_prompt_carries_the_load_bearing_rules() {
+        let s = affinity_eval_system_prompt();
+        // First-person, in-character register — NOT a third-person judge.
         assert!(
-            p.contains("\"patience\""),
-            "patience IS now in the JSON output schema (absolute read)"
+            s.contains("你就是对话里的这个角色"),
+            "system prompt must open in the character's own voice"
         );
         assert!(
-            p.contains("绝对值"),
-            "the prompt frames patience as an absolute, not a delta"
+            s.contains("你不是旁观的评审"),
+            "the evaluator must be told it is not an outside reviewer"
         );
-        // axis-to-label binding: the labeled line must carry the correct value
+        // Reason hygiene: no system vocabulary, no refusal endorsement.
         assert!(
-            p.contains("warmth 温暖（-1~1）：当前 0.42"),
-            "warmth label must bind to warmth value"
+            s.contains("绝不出现「作为AI/助手/模型」"),
+            "reason must forbid AI self-identification vocabulary"
         );
         assert!(
-            p.contains("patience 耐心（0~1）：当前 0.66"),
-            "patience display value must render"
+            s.contains("不要为它辩护或背书"),
+            "reason must forbid endorsing a canned refusal"
         );
-        // six-axis JSON output schema (+reason) must be present (including patience)
+        // Scoring contract is unchanged: five deltas + absolute patience.
         assert!(
-            p.contains(
+            s.contains("patience 给【绝对值】"),
+            "patience must still be framed as an absolute read"
+        );
+        assert!(
+            s.contains("每维最高约 +0.4") && s.contains("每维最低约 -0.6"),
+            "asymmetric caps must still be stated"
+        );
+        // Adult content must not be scored as a violation.
+        assert!(
+            s.contains("不因话题敏感而扣分或回避打分"),
+            "explicit content must be scored as ordinary intimacy"
+        );
+        // Exact JSON output contract.
+        assert!(
+            s.contains(
                 r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.5, "tension": 0.0, "reason": "..."}"#
             ),
-            "six-axis JSON output schema (+reason) with patience must be present"
+            "seven-key JSON output schema must be present verbatim"
         );
-        // new sparse/asymmetric scoring guidance present
-        assert!(p.contains("+0.4"), "positive cap guidance present");
-        assert!(p.contains("-0.6"), "negative cap guidance present");
+    }
+
+    #[test]
+    fn affinity_eval_user_payload_renders_name_values_and_exchange() {
+        let a = fixture_affinity();
+        let p = affinity_eval_user_payload("Mia", &a, "我今天好累", "抱抱你");
+        assert!(p.contains("角色名：Mia"));
+        assert!(p.contains("我今天好累"));
+        assert!(p.contains("抱抱你"));
+        // The persona's own line is labeled with its name.
+        assert!(p.contains("Mia：抱抱你"));
+        // All six current values render, in the documented order.
+        assert!(
+            p.contains(
+                "当前值：warmth=0.42 trust=0.31 intrigue=0.55 intimacy=0.22 patience=0.66 tension=0.13"
+            ),
+            "six current values must render in axis order: {p}"
+        );
+    }
+
+    #[test]
+    fn affinity_eval_user_payload_labels_the_human_as_counterpart() {
+        let a = fixture_affinity();
+        let p = affinity_eval_user_payload("Mia", &a, "在吗", "在的");
+        // The system prompt forbids the word 「用户」 as system vocabulary in
+        // `reason`; the data block must not contradict it by using that label.
+        assert!(p.contains("对方：在吗"), "human turn is labeled 对方: {p}");
+        assert!(
+            !p.contains("用户"),
+            "payload must not use the 用户 label: {p}"
+        );
     }
 
     // ─── Insight prompt tests ──────────────────────────────────────

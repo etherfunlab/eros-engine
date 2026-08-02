@@ -147,6 +147,15 @@ effective_delta = raw.clamp(NEG_CAP, POS_CAP)
 
 EMA 平滑和时间衰退**不变**——只有上限和 prompt 指引发生了变化。
 
+**语域与 `reason` 卫生规则。** 评估器 prompt 用角色的第一人称写（「你就是这个角色，
+这一轮之后你对他的感觉变了多少」），不是第三人称分析型评审；调用时拆成静态 `system`
+指令 + 每轮 `user` 数据两条消息。`reason` 规则禁止出现系统词汇（AI／助手／模型、拒绝
+机制、政策等），也禁止为回复里出现的套话式拒绝辩护。这条规则是有承重作用的：`reason`
+会写入 `companion_affinity_events.context`，并作为 `[emotional_context]` 重新注入后续
+系统提示——评估器若为一次拒绝找理由，那个立场就被写进了角色的持久状态。该 prompt 由
+引擎持有，刻意不可配置，见
+`docs/superpowers/specs/2026-08-02-affinity-eval-hygiene-design.md`。
+
 ## 持久化
 
 ### 生成列
