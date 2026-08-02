@@ -1959,6 +1959,13 @@
           },
           "content": {
             "type": "string"
+          },
+          "relationship_scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which halves of the relationship line to inject this turn:\n`none | bond | chemistry | both`. Omitted ⇒ `both`."
           }
         }
       }
