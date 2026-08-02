@@ -737,6 +737,9 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 在 `0.x` 期间，OSS 引擎承诺：
 
 1. **不删除字段。** `[defaults]` 和 `[tasks.<name>]` 中现有的字段名不会消失。
+   （目前的例外，均已在上文记录：`[tasks.embedding].dimensions`——已移除，
+   现在是被静默忽略的未知 key；`[defaults].ignore_providers` /
+   `.provider_sort`——已移除，残留 key 会拒绝启动并给出迁移提示。）
 2. **不重命名字段。** `fallback` 不会变为 `fallback_model`，`model` 不会变为 `primary_model`，以此类推。
 3. **不新增必填字段。** 任何新增字段都是可选的，并具有合理默认值。
 4. **不从此列表中删除任务名：**`chat_companion`、`insight_extraction`、`pde_decision`、`embedding`。

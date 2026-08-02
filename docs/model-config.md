@@ -879,6 +879,10 @@ After the primary is selected, any occurrence of that exact id is removed from t
 For the duration of `0.x`, the OSS engine commits to:
 
 1. **No removed fields.** Existing field names in `[defaults]` and `[tasks.<name>]` will not disappear.
+   (Exceptions to date, both documented above: `[tasks.embedding].dimensions`
+   — removed, now a silently-ignored inert unknown key; `[defaults].ignore_providers`
+   / `.provider_sort` — removed, a leftover key refuses to boot with a
+   migration message.)
 2. **No renamed fields.** `fallback` will not become `fallback_model`. `model` will not become `primary_model`. Etc.
 3. **No newly required fields.** Anything added is optional with a sensible default.
 4. **No removed task names from this list:** `chat_companion`, `insight_extraction`, `pde_decision`, `embedding`.
