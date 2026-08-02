@@ -2601,6 +2601,36 @@ struct DelegatedImagePrompt {
     compose_generation_id: Option<String>,
 }
 
+/// Guards a speculatively-spawned `tokio::task::JoinHandle` so it is aborted
+/// if it's ever dropped without being joined. Dropping a `JoinHandle` on its
+/// own does NOT cancel the task — it keeps running to completion in the
+/// background, discarding its result. `reply_text_image` spawns the image
+/// composer early (concurrently with the chat call) so its latency hides
+/// underneath, but the turn that spawned it can end several ways before
+/// reaching the join point (an error frame, a ghost-fallback turn with no
+/// produced row to attach an image to, the whole stream being dropped by a
+/// disconnected client, ...). None of those turns will ever emit an image
+/// frame, so an in-flight compose call at that point has no consumer left —
+/// letting it run to completion would just waste an LLM round trip. Wrapping
+/// the handle in this guard means every current AND future early exit aborts
+/// the task automatically, instead of requiring each one to remember to.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    /// Take the handle to await it. Once taken, the guard no longer aborts.
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.0.take()
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// Resolve the per-turn image inputs, generate the subject via the composer
 /// LLM, and wrap the result into the final wire prompt.
 ///
@@ -3670,7 +3700,7 @@ pub fn run_stream(
                 //
                 // `reply_image` is deliberately excluded: it has no text task to
                 // overlap with and returns early via `image_only_done`.
-                let compose_handle: Option<tokio::task::JoinHandle<DelegatedImagePrompt>> =
+                let mut compose_handle: AbortOnDrop<DelegatedImagePrompt> =
                     if matches!(plan.action_type, ActionType::ReplyTextImage) {
                         let state_c = (*state).clone();
                         let persona_c = input.persona.clone();
@@ -3678,7 +3708,7 @@ pub fn run_stream(
                         let req_image_c = req_image.cloned();
                         let scene_c = pde_transcript.transcript.clone();
                         let latest_c = effective_user_msg.clone();
-                        Some(tokio::spawn(async move {
+                        AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
                                 &persona_c,
@@ -3688,9 +3718,9 @@ pub fn run_stream(
                                 &latest_c,
                             )
                             .await
-                        }))
+                        })))
                     } else {
-                        None
+                        AbortOnDrop(None)
                     };
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
@@ -3700,9 +3730,13 @@ pub fn run_stream(
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
-                        if let Some(h) = compose_handle.as_ref() {
-                            h.abort();
-                        }
+                        // Dropping `compose_handle` here (via the enclosing
+                        // `return` below) aborts the spawned compose task
+                        // through `AbortOnDrop`'s `Drop` impl — no manual
+                        // `.abort()` needed, and every OTHER early exit
+                        // between here and the join point (chat-burst error,
+                        // ghost fallback with no produced row, client
+                        // disconnect) gets the same coverage for free.
                         yield ProtocolFrame::Error {
                             code: StreamErrorCode::Internal,
                             retryable: false,
@@ -3823,7 +3857,7 @@ pub fn run_stream(
                         // it has almost always finished, so this await is ~free.
                         // A panicked or cancelled task degrades exactly like a
                         // failed compose — never a dropped frame.
-                        let img = match compose_handle {
+                        let img = match compose_handle.take() {
                             Some(h) => match h.await {
                                 Ok(v) => v,
                                 Err(e) => {
