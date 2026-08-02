@@ -70,7 +70,6 @@ Field details:
 | `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
-| `defaults.ignore_providers` | `Array<String>` | no | OpenRouter provider slugs to exclude from routing on **every** task. Each entry must carry the `@openrouter` suffix (`"some-bad-provider-slug@openrouter"`) — a bare slug, any other `@<provider>` suffix, or malformed `@` grammar refuses to boot. The suffix is stripped before the wire: sent as `provider.ignore` (bare slug) on each outbound OpenRouter call only; custom providers and Voyage never receive it. `allow_fallbacks` remains `true` so the model is still served by any healthy provider. Use this when a specific provider returns garbled output for a model (e.g. undecoded byte-BPE text — issue #84). Find the offending slug via the OpenRouter generation API. Empty or absent means no exclusion. |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | yes | Primary model. String = fixed; array = round-robin; table = weighted random. See "Primary model selection". |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
@@ -79,6 +78,11 @@ Field details:
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
+
+**`defaults.ignore_providers` and `defaults.provider_sort` are removed.** A
+leftover key of either name refuses to boot with a migration message
+pointing at the `[[providers.<name>.body]]` replacement — see "custom body
+parameters" under `[providers]` below.
 
 ### `[providers]` — custom chat/embeddings endpoints (opt-in)
 
@@ -149,10 +153,10 @@ Rules, all enforced at boot (the engine refuses to boot on any violation):
   `output_regex` `models`, and `output_filter` trigger `models` match on the
   id *without* `@provider`.
 - **Wire shape**: custom providers receive a strict OpenAI-compatible
-  subset. `[defaults].ignore_providers`, `[defaults].provider_sort`, and
-  per-task `reasoning` are **inert** on custom providers; they receive
-  exactly this entry's own declared `headers`, never the OpenRouter
-  attribution headers.
+  subset. Per-task `reasoning` is **inert** on custom providers — they
+  receive exactly this entry's own declared `headers` and any
+  `[[providers.<name>.body]]` rules declared on that same entry (see
+  below), never the OpenRouter attribution headers.
 - **Audit**: rows served by a custom provider record
   `model = "<upstream echo>@<name>"` and the provider's own `generation_id`
   verbatim — a `generation_id` join against OpenRouter's logs misses for
@@ -176,9 +180,10 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   error when referenced, because there is no built-in default to fall back
   to.
 - The override changes the URL **only**. Traffic through it remains the
-  full OpenRouter wire: `provider.ignore`, `provider_sort`, and per-task
-  `reasoning` are all still sent — unlike custom providers, which keep
-  receiving the strict OpenAI subset.
+  full OpenRouter wire: per-task `reasoning` is still sent, and any
+  `[[providers.openrouter.body]]` rules (see below) merge into the request
+  body — unlike custom providers, which keep receiving the strict OpenAI
+  subset with `reasoning` inert.
 - **Attribution headers now live here, and nowhere else.** No
   `[providers.openrouter]` entry, or one without `headers`, means no
   attribution headers are sent. The `OPENROUTER_APP_REFERER` /
@@ -194,23 +199,40 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   not read and causes no boot error — it's just an unrelated env var now.
 - `voyage` remains undeclarable in `[providers]` (see above).
 
-#### `[defaults].ignore_providers` — `@openrouter` required
+#### `[[providers.<name>.body]]` — custom body parameters
+
+Deployer-defined JSON merged into the chat/completions request body, per
+task. `params` is passed through verbatim (TOML → JSON) — the engine never
+interprets it. `tasks` scopes the rule to specific engine task names
+(exact, case-sensitive; see the task table below); omit it to apply to
+every chat task this provider serves. Rules apply in declaration order,
+later rules win on key conflicts, and merged params win over engine-built
+fields — declaring `reasoning` on the `openrouter` entry therefore
+overrides `[tasks.*].reasoning` for the scoped tasks. `model`, `messages`,
+and `stream` are engine-owned and refuse to boot. A rule naming
+`chat_vision` or `embedding` warns and never applies (those calls build
+their own bodies). Custom providers must declare `chat` to use body rules;
+the reserved `openrouter` entry may declare rules alone.
 
 ```toml
-[defaults]
-ignore_providers = ["some-bad-provider-slug@openrouter"]
+[providers.venice]
+chat = "https://api.venice.ai/api/v1/chat/completions"
+
+[[providers.venice.body]]
+tasks  = ["chat_companion", "chat_output_filter"]
+params = { venice_parameters = { include_venice_system_prompt = false } }
+
+[[providers.openrouter.body]]
+params = { provider = { ignore = ["some-bad-provider"], sort = "price" } }
 ```
 
-Every entry must parse (the same `@`-suffix grammar as a model slug) to a
-non-empty upstream slug plus provider `openrouter`; a bare entry, any other
-`@<provider>` suffix, or malformed `@` grammar refuses to boot naming the
-entry and the required form. The wire is unchanged: `provider.ignore`
-carries the bare upstream slug, on OpenRouter traffic only — the mandatory
-suffix makes that scope part of the syntax; custom providers and Voyage
-never receive `provider.ignore`. `[defaults].provider_sort` is untouched (it
-has no per-entry syntax to scope). Breaking change for configs written
-before this suffix existed — the fix is appending `@openrouter` to each
-entry.
+The second example is the replacement for the removed
+`[defaults].ignore_providers` / `[defaults].provider_sort` keys: OpenRouter
+routing prefs are now ordinary body params (bare OpenRouter provider slugs,
+no `@openrouter` suffix), scopable per task like any other rule. The old
+keys refuse to boot with this migration message. Note the removed keys also
+fed the `chat_vision` body; body rules do not cover vision, so vision calls
+no longer send `provider` prefs at all.
 
 ### `model_name_display_override` (chat task only)
 
@@ -900,6 +922,14 @@ What may still change without notice:
   `[tasks.<name>]` was removed (dims are hard-coded 512; a leftover
   `dimensions = 512` line is now an inert unknown key). See "`[providers]`"
   and "`[tasks.embedding]` — active" above.
+- **`[defaults].ignore_providers` and `[defaults].provider_sort` are
+  removed** (the entry above described their earlier mandatory
+  `@openrouter`-suffix form). OpenRouter routing prefs are now
+  `[[providers.<name>.body]]` rules on the `openrouter` entry — see
+  "`[[providers.<name>.body]]` — custom body parameters" above. A leftover
+  key refuses to boot with a migration message. The removed keys also fed
+  the `chat_vision` request body; body rules are chat-only, so vision calls
+  no longer send `provider` prefs.
 
 ## What this config does NOT control
 

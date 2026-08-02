@@ -6,22 +6,10 @@
 # If the selected primary also appears in `fallback`, it is auto-skipped.
 
 # ── Global defaults (optional) ───────────────────────────────────────────────
-# Cross-task settings. `ignore_providers` excludes OpenRouter provider slugs
-# from routing on EVERY task (issue #84: one provider returned undecoded
-# byte-level-BPE text for thedrummer/cydonia-24b-v4.1). Sent as provider.ignore
-# on every call; allow_fallbacks stays true so the model is still served by a
-# healthy provider. Find the offending slug via OpenRouter's generation API.
-# Empty/unset = no exclusion.
-#
-# `provider_sort` (optional) sets OpenRouter's provider routing sort on EVERY
-# task: "price" | "throughput" | "latency". Unset (default) keeps OpenRouter's
-# price-based load balancing. Setting it trades cost for the chosen axis —
-# "latency" favours TTFT for chat; note it disables price load-balancing, so
-# watch cost and success rate separately.
-#[defaults]
-#ignore_providers = ["some-bad-provider-slug@openrouter"]
-# Entries MUST carry the @openrouter suffix — the exclusion list acts on OpenRouter routing only.
-#provider_sort = "latency"
+# OpenRouter routing prefs (formerly [defaults].ignore_providers /
+# [defaults].provider_sort here) are removed — they're now
+# [[providers.<name>.body]] rules. See the example under "Custom providers"
+# below.
 #
 # ── Custom providers (optional) ──────────────────────────────────────────────
 # Route model slugs to your own endpoints. Each entry is a table with up to
@@ -61,10 +49,24 @@
 #   literal "@" inside a model id is escaped "\@" (in TOML: "weird\\@vendor/m").
 # - Model-keyed tables (`display`, `output_regex` models, `output_filter`
 #   trigger models) always use the BARE id, never "id@provider".
-# - Custom providers receive a strict OpenAI-compatible request:
-#   [defaults].ignore_providers / provider_sort and per-task `reasoning` are
-#   inert for them; they receive exactly the headers you declare.
+# - Custom providers receive a strict OpenAI-compatible request: per-task
+#   `reasoning` is inert for them; they receive exactly the headers (and any
+#   [[providers.<name>.body]] rules, see below) you declare for that entry.
 # - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
+#
+# Per-provider custom body parameters (chat/completions only). `params` is
+# merged into the request body verbatim; `tasks` scopes the rule (omit = all
+# chat tasks on this provider). Later rules win; params win over engine
+# fields. model/messages/stream are engine-owned (boot refusal).
+#[[providers.venice.body]]
+#tasks  = ["chat_companion"]
+#params = { venice_parameters = { include_venice_system_prompt = false } }
+#
+# OpenRouter routing prefs (the former [defaults].ignore_providers /
+# provider_sort) are now body params on the reserved openrouter entry —
+# bare provider slugs, no @openrouter suffix:
+#[[providers.openrouter.body]]
+#params = { provider = { ignore = ["some-bad-provider"], sort = "latency" } }
 #
 # One-off repair of rows already persisted with byte-BPE garble (run manually,
 # NOT a migration — the engine refuses to own downstream prod data). Repairs the

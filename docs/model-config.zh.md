@@ -70,7 +70,6 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `defaults.fallback_model` | `String` | 否 | 任务配置未提供 model 时使用的最终 fallback。若仍然缺失，代码使用编译时内置默认值 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 优先级相同；编译时内置默认值为 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 优先级相同；编译时内置默认值为 `200`。 |
-| `defaults.ignore_providers` | `Array<String>` | 否 | 要从**每个**任务的路由中排除的 OpenRouter provider slug。每个条目必须带 `@openrouter` 后缀（`"some-bad-provider-slug@openrouter"`）——裸 slug、其他 `@<provider>` 后缀、或格式错误的 `@` 语法都会拒绝启动。发到 wire 前会剥掉后缀：只作为 `provider.ignore`（裸 slug）发给 OpenRouter 调用；自定义 provider 和 Voyage 永远不会收到它。`allow_fallbacks` 仍为 `true`，因此模型仍可由任意健康的 provider 提供。某个 provider 为模型返回乱码时（例如未解码的 byte-BPE 文本——issue #84），可使用此字段。通过 OpenRouter generation API 查找有问题的 slug。为空或缺失表示不排除任何 provider。 |
 | `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。参见“主模型选择”。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主调用失败时由 `OpenRouterClient` 使用的次要模型。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
@@ -79,6 +78,10 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
+
+**`defaults.ignore_providers` 和 `defaults.provider_sort` 已移除。** 残留
+其中任一 key 会拒绝启动，报错信息指向 `[[providers.<name>.body]]` 替代
+方案——参见下文 `[providers]` 一节的“自定义 body 参数”。
 
 ### `[providers]` — 自定义 chat/embeddings 端点（opt-in）
 
@@ -142,10 +145,10 @@ model = "bge-m3@local"               # 由 [providers].local.embeddings 提供�
 - **按模型匹配的表用裸 id**：`model_name_display_override`、`output_regex`
   的 `models`、`output_filter` trigger 的 `models`，匹配时都不带
   `@provider`。
-- **wire 形态**：自定义 provider 收到严格的 OpenAI 兼容子集。
-  `[defaults].ignore_providers`、`[defaults].provider_sort` 和任务级
-  `reasoning` 对自定义 provider **不生效**；它们只收到该条目自己声明的
-  `headers`，绝不会收到 OpenRouter 归因标头。
+- **wire 形态**：自定义 provider 收到严格的 OpenAI 兼容子集。任务级
+  `reasoning` 对自定义 provider **不生效**——它们只收到该条目自己声明的
+  `headers`，以及该条目自己声明的 `[[providers.<name>.body]]` 规则（见
+  下文），绝不会收到 OpenRouter 归因标头。
 - **审计**：自定义 provider 服务的行记录
   `model = "<上游回显>@<name>"`，`generation_id` 原样存 provider 返回的
   id——用 `generation_id` 去 join OpenRouter 日志时这些行会 miss，
@@ -166,9 +169,10 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   `https://openrouter.ai/api/v1/embeddings`）。这条“部分覆盖”规则只对
   `openrouter` 生效——普通条目缺 key 且被引用时是启动报错，因为它没有内置
   默认值可以兜底。
-- 覆盖**只**改变 URL。流量走的仍然是完整的 OpenRouter wire：
-  `provider.ignore`、`provider_sort`、任务级 `reasoning` 全部照常发送——
-  和只收到严格 OpenAI 子集的自定义 provider 不同。
+- 覆盖**只**改变 URL。流量走的仍然是完整的 OpenRouter wire：任务级
+  `reasoning` 照常发送，任何 `[[providers.openrouter.body]]` 规则（见
+  下文）也会合并进请求体——和只收到严格 OpenAI 子集、`reasoning` 不生效
+  的自定义 provider 不同。
 - **归因 header 现在只从这里来。** 没有 `[providers.openrouter]` 条目，
   或有条目但没写 `headers`，就不发任何归因 header。
   `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` /
@@ -183,21 +187,37 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
   一个无关的环境变量。
 - `voyage` 仍不能在 `[providers]` 中声明（见上文）。
 
-#### `[defaults].ignore_providers` — 必须带 `@openrouter`
+#### `[[providers.<name>.body]]` — 自定义 body 参数
+
+部署方自定义的 JSON，按任务合并进 chat/completions 请求体。`params` 原样
+透传（TOML → JSON）——引擎从不解读它的内容。`tasks` 把规则限定到指定的
+引擎任务名（精确匹配，区分大小写；任务名表见下文）；省略则应用于该
+provider 服务的所有 chat 任务。规则按声明顺序生效，后面的规则在 key 冲突
+时获胜，且合并进的 params 会覆盖引擎自己构建的字段——例如在 `openrouter`
+条目上声明 `reasoning`，就会覆盖被该规则限定的任务上的
+`[tasks.*].reasoning`。`model`、`messages`、`stream` 是引擎自有字段，声明
+它们会拒绝启动。规则若指名 `chat_vision` 或 `embedding` 会记录警告且永不
+生效（这两类调用自己构建请求体）。自定义 provider 必须声明 `chat` 才能使用
+body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖端点。
 
 ```toml
-[defaults]
-ignore_providers = ["some-bad-provider-slug@openrouter"]
+[providers.venice]
+chat = "https://api.venice.ai/api/v1/chat/completions"
+
+[[providers.venice.body]]
+tasks  = ["chat_companion", "chat_output_filter"]
+params = { venice_parameters = { include_venice_system_prompt = false } }
+
+[[providers.openrouter.body]]
+params = { provider = { ignore = ["some-bad-provider"], sort = "price" } }
 ```
 
-每个条目都必须能解析出（与模型 slug 相同的 `@` 后缀语法）一个非空的上游
-slug 加 provider `openrouter`；裸条目、其他 `@<provider>` 后缀、或格式
-错误的 `@` 语法都会拒绝启动，并点名该条目和正确写法。wire 行为不变：
-`provider.ignore` 只带裸上游 slug，只发给 OpenRouter 流量——强制后缀把这个
-作用范围写进了语法本身；自定义 provider 和 Voyage 永远不会收到
-`provider.ignore`。`[defaults].provider_sort` 不受影响（它没有 per-entry
-语法可限定范围）。对在这个后缀出现之前写好的配置是破坏性变更——修复方式
-是给每个条目加上 `@openrouter`。
+第二个例子就是被移除的 `[defaults].ignore_providers` /
+`[defaults].provider_sort` 的替代写法：OpenRouter 路由偏好现在是普通的
+body 参数（裸 OpenRouter provider slug，不带 `@openrouter` 后缀），可以像
+任何其他规则一样按任务限定范围。旧的两个 key 会拒绝启动，并给出这条迁移
+提示。注意被移除的两个 key 以前也会喂给 `chat_vision` 的请求体；body 规则
+不覆盖 vision，所以 vision 调用现在完全不再发送 `provider` 偏好。
 
 ### `model_name_display_override`（仅限 chat 任务）
 
@@ -747,6 +767,12 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
   `[tasks.<name>]` 上的 `dimensions` 字段已移除（维度固定为 512；已有配置
   里残留的 `dimensions = 512` 行现在是被忽略的未知 key）。详见上文
   “`[providers]`”和“`[tasks.embedding]` — 已激活”。
+- **`[defaults].ignore_providers` 和 `[defaults].provider_sort` 已移除**
+  （上一条记录了它们早先强制带 `@openrouter` 后缀的写法）。OpenRouter
+  路由偏好现在是 `openrouter` 条目上的 `[[providers.<name>.body]]` 规则——
+  参见上文“`[[providers.<name>.body]]` — 自定义 body 参数”。残留 key 会
+  拒绝启动并给出迁移提示。被移除的两个 key 以前也会喂给 `chat_vision` 的
+  请求体；body 规则只覆盖 chat，所以 vision 调用不再发送 `provider` 偏好。
 
 ## 此配置不控制的内容
 
