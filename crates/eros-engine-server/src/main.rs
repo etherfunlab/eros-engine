@@ -269,16 +269,7 @@ async fn run_server() -> Result<()> {
         }
     });
 
-    // Prompt-variant shape gate runs FIRST, before the resolver-based checks
-    // below (extraction / product_qa). Those detect "unset" via
-    // `PromptSpec::as_plain()`, under which a variant shape (array/table)
-    // reads as `None` — so a variant-shaped filter_prompt misplaced under, say,
-    // [tasks.insight_extraction] would otherwise surface as "filter_prompt is
-    // unset" (telling an operator who just set it to set it) instead of the
-    // accurate "uses a variant shape, but only [tasks.chat_image_prompt_compose]
-    // reads variants" from `validate_prompt_variants`.
-    //
-    // Dead-config gate for the affinity evaluator (#210). Runs BEFORE the
+    // Dead-config gate for the affinity evaluator (#210). Runs before the
     // variant-shape gate: this check is shape-independent (it only asks
     // whether the key exists), so a table-shaped filter_prompt under
     // [tasks.affinity_evaluation] gets the accurate "affinity's prompt is not
@@ -288,6 +279,14 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Prompt-variant shape gate runs before the resolver-based checks below
+    // (extraction / product_qa). Those detect "unset" via
+    // `PromptSpec::as_plain()`, under which a variant shape (array/table)
+    // reads as `None` — so a variant-shaped filter_prompt misplaced under, say,
+    // [tasks.insight_extraction] would otherwise surface as "filter_prompt is
+    // unset" (telling an operator who just set it to set it) instead of the
+    // accurate "uses a variant shape, but only [tasks.chat_image_prompt_compose]
+    // reads variants" from `validate_prompt_variants`.
     if let Err(msg) = model_config.validate_prompt_variants() {
         anyhow::bail!(msg);
     }
