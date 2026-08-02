@@ -590,7 +590,9 @@ Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 **Audit.** A successful composer call writes three keys into the image
 turn's `chat_messages.metadata.image`: `compose_variant` (which
 `filter_prompt` key/index was selected; absent for a plain/built-in
-prompt), `compose_model` (the model that answered), and
+prompt; recorded as supplied (trimmed), not normalized — e.g. for the
+indexed shape, `"01"` selects index 1 and is audited as `"01"`),
+`compose_model` (the model that answered), and
 `compose_generation_id`. All three are absent when no compose succeeded
 (`raw`, fail-open, task not configured) — same NULL semantics as the
 affinity audit trio. Usage/cost is not persisted; reconcile via the

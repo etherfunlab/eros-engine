@@ -5945,7 +5945,7 @@ data: [DONE]\n\n";
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_success_persists_audit_trio(pool: PgPool) {
         use wiremock::ResponseTemplate;
-        let (reqs, _frames) = run_variant_turn(
+        let (reqs, frames) = run_variant_turn(
             &pool,
             Some("b"),
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5956,6 +5956,32 @@ data: [DONE]\n\n";
         )
         .await;
         assert_eq!(reqs.len(), 1, "composer is the only provider call");
+
+        // final-review finding — this is the only place the
+        // `ComposeOutcome.text → wire` seam is pinned; the DB `prompt` stays
+        // the seed by design (asserted below).
+        let composed_b64 = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt, ..
+                } => Some(composed_prompt.clone()),
+                _ => None,
+            })
+            .expect("image_request present");
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("ENRICHED SUBJECT"),
+            "composed wire prompt must carry the composer's enriched text, got {composed}"
+        );
 
         // sqlx::test gives this test its own database — the one assistant row
         // is the image turn's.
