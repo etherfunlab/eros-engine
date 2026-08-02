@@ -2153,25 +2153,33 @@ const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
 
 /// Render an assistant transcript line. Image turns persist empty `content`
 /// with the image facts under `metadata.image`; surface a terse marker so the
-/// judge / input filter see that an image was sent (and what it depicted)
+/// judge / input filter see that an image was sent (and roughly what it showed)
 /// instead of a blank `AI:` line. Non-image assistant rows fall back to
 /// `content`. Pure.
+///
+/// The description comes from `metadata.image.caption` — a short line written
+/// by the composer for exactly this purpose. It is deliberately NOT
+/// `metadata.image.prompt`: that is the image-generation subject, which leads
+/// with style-preset and appearance boilerplate and is long enough that echoing
+/// it dominated the judge's context. When no caption exists (rows written before
+/// captions shipped, a composer reply that carried none, a failed compose) the
+/// marker stays bare rather than falling back to the prompt — the anti-spam
+/// brake rides on `[近期图片]`'s counts, which do not depend on this text.
 fn assistant_transcript_line(content: &str, metadata: Option<&serde_json::Value>) -> String {
     if let Some(img) = metadata.and_then(|m| m.get("image")) {
-        let subject = img
-            .get("prompt")
+        let caption = img
+            .get("caption")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("（无描述）");
+            .filter(|s| !s.is_empty());
         let ar = img
             .get("aspect_ratio")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        return if ar.is_empty() {
-            format!("（发送了一张图片：{subject}）")
-        } else {
-            format!("（发送了一张图片：{subject}，画幅 {ar}）")
+        return match (caption, ar.is_empty()) {
+            (None, _) => "（发送了一张图片）".to_string(),
+            (Some(c), true) => format!("（发送了一张图片：{c}）"),
+            (Some(c), false) => format!("（发送了一张图片：{c}，画幅 {ar}）"),
         };
     }
     content.to_string()
@@ -4490,27 +4498,41 @@ mod tests {
 
     #[test]
     fn assistant_transcript_line_marks_image_turns() {
-        // image turn: empty content, facts under metadata.image
-        let meta =
-            serde_json::json!({"image":{"prompt":"on the beach at sunset","aspect_ratio":"3:4"}});
+        // image turn with a caption: the CAPTION surfaces, never the prompt
+        let meta = serde_json::json!({"image":{
+            "prompt":"Photorealistic, ultra-detailed, on the beach at sunset",
+            "caption":"在沙滩看日落",
+            "aspect_ratio":"3:4"
+        }});
         let line = assistant_transcript_line("", Some(&meta));
+        assert!(line.contains("在沙滩看日落"), "caption surfaced: {line}");
         assert!(
-            line.contains("on the beach at sunset"),
-            "subject surfaced: {line}"
+            !line.contains("Photorealistic"),
+            "the image prompt must never reach the transcript: {line}"
         );
         assert!(line.contains("3:4"), "aspect surfaced: {line}");
-        assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
-        // image turn without aspect_ratio: still marks, no panic
-        let meta2 = serde_json::json!({"image":{"prompt":"a portrait"}});
-        assert!(assistant_transcript_line("", Some(&meta2)).contains("a portrait"));
+        // image turn WITHOUT a caption: bare marker, never a prompt fallback
+        let meta2 = serde_json::json!({"image":{"prompt":"a very long english image prompt"}});
+        let line2 = assistant_transcript_line("", Some(&meta2));
+        assert_eq!(
+            line2, "（发送了一张图片）",
+            "bare marker when caption absent: {line2}"
+        );
+
+        // blank caption counts as absent
+        let meta3 = serde_json::json!({"image":{"prompt":"x","caption":"  "}});
+        assert_eq!(
+            assistant_transcript_line("", Some(&meta3)),
+            "（发送了一张图片）"
+        );
 
         // plain text turn: content passes through unchanged
         assert_eq!(assistant_transcript_line("hi there", None), "hi there");
 
         // metadata present but no image key: content passes through
-        let meta3 = serde_json::json!({"tip": 5});
-        assert_eq!(assistant_transcript_line("hello", Some(&meta3)), "hello");
+        let meta4 = serde_json::json!({"tip": 5});
+        assert_eq!(assistant_transcript_line("hello", Some(&meta4)), "hello");
     }
 
     /// Build a `JudgeTranscript` from (role, content, metadata) triples,
@@ -6316,6 +6338,69 @@ data: [DONE]\n\n";
         assert_eq!(img["compose_variant"], "b");
         assert_eq!(img["compose_model"], "served/model");
         assert_eq!(img["compose_generation_id"], "gen-xyz");
+    }
+
+    /// Sibling of `compose_success_persists_audit_trio`, but the mock composer
+    /// returns real JSON (`{"prompt":..., "caption":...}`) instead of plain
+    /// text, so `caption` is actually populated end to end. Proves the seam
+    /// neither the parser unit tests (`parse_compose_reply`) nor the marker
+    /// unit tests (`assistant_transcript_line` / `model_facing_assistant_text`)
+    /// exercise on their own: a real composer reply persists `caption` to the
+    /// row, and both history-facing renders surface it — never the prompt.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_success_with_json_caption_surfaces_in_both_renders(pool: PgPool) {
+        use wiremock::ResponseTemplate;
+        let (reqs, _frames) = run_variant_turn(
+            &pool,
+            Some("b"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-cap",
+                "model": "served/model",
+                "choices": [{"message": {"content":
+                    r#"{"prompt":"on a rooftop at dusk","caption":"在天台看夕阳"}"#
+                }}],
+            })),
+        )
+        .await;
+        assert_eq!(reqs.len(), 1, "composer is the only provider call");
+
+        // sqlx::test gives this test its own database — the one assistant row
+        // is the image turn's.
+        let row: eros_engine_store::chat::ChatMessage =
+            sqlx::query_as("SELECT * FROM engine.chat_messages WHERE role = 'assistant'")
+                .fetch_one(&pool)
+                .await
+                .expect("assistant image row persisted");
+
+        let img = &row.metadata.as_ref().expect("metadata present")["image"];
+        assert_eq!(img["prompt"], "on a rooftop at dusk");
+        assert_eq!(
+            img["caption"], "在天台看夕阳",
+            "composer's caption persisted"
+        );
+
+        // Both history-facing renders surface the caption, never the prompt.
+        let content = row.content.clone();
+        let metadata = row.metadata.clone();
+        let transcript_line = assistant_transcript_line(&content, metadata.as_ref());
+        assert!(
+            transcript_line.contains("在天台看夕阳"),
+            "judge transcript surfaces the caption: {transcript_line}"
+        );
+        assert!(
+            !transcript_line.contains("rooftop"),
+            "the prompt must never reach the judge transcript: {transcript_line}"
+        );
+
+        let model_text = crate::pipeline::handlers::model_facing_assistant_text(row);
+        assert!(
+            model_text.contains("在天台看夕阳"),
+            "chat history surfaces the caption: {model_text}"
+        );
+        assert!(
+            !model_text.contains("rooftop"),
+            "the prompt must never reach the chat model's history: {model_text}"
+        );
     }
 
     /// Spec 2026-08-02-provider-body-params: an [[providers.openrouter.body]]
@@ -12245,9 +12330,9 @@ data: [DONE]\n\n"
 
     #[test]
     fn delegated_marker_preserves_image_awareness() {
-        // Subject under `prompt` (the key assistant_transcript_line reads),
-        // plus aspect — and NOTHING else (no caption / composed prompt / model
-        // / gen id).
+        // Subject under `prompt` (persisted, but NOT what
+        // `assistant_transcript_line` reads — see below), plus aspect — and
+        // NOTHING else (no caption / composed prompt / model / gen id).
         let marker =
             build_delegated_image_marker("beach at sunset", None, Some("3:4"), None, None, None);
         assert_eq!(marker["prompt"], "beach at sunset");
@@ -12257,18 +12342,26 @@ data: [DONE]\n\n"
             2,
             "marker must be minimal"
         );
-        // The §5 regression guard: transcript still annotates it as a prior image.
+        // The §5 regression guard: transcript still annotates it as a prior
+        // image. With no caption, that annotation is the bare marker — the
+        // subject/aspect do NOT surface (caption contract: never fall back
+        // to `prompt`).
         let wrapped = serde_json::json!({ "image": marker });
         let line = assistant_transcript_line("", Some(&wrapped));
-        assert!(line.contains("beach at sunset"), "subject surfaced: {line}");
-        assert!(line.contains("3:4"), "aspect surfaced: {line}");
+        assert_eq!(
+            line, "（发送了一张图片）",
+            "bare marker when caption absent: {line}"
+        );
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
-        // No aspect => still a valid one-key marker that annotates.
+        // No aspect => still a valid one-key marker that annotates (bare, same reason).
         let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None);
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
-        assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
+        assert_eq!(
+            assistant_transcript_line("", Some(&w2)),
+            "（发送了一张图片）"
+        );
     }
 
     /// Spec 2026-08-02: a successful composer call adds exactly three audit

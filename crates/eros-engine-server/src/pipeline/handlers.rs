@@ -110,19 +110,25 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 }
 
 /// Model-facing text for an assistant history row: the stored `content`, with a
-/// `[你给对方发送了一张照片：{prompt}]` marker appended when `metadata.image.prompt`
-/// is present. Used by `assemble_chat_request` so the model knows it previously
+/// `[你给对方发送了一张照片：{caption}]` marker appended when `metadata.image` is
+/// present. Used by `assemble_chat_request` so the model knows it previously
 /// sent an image in that turn.
 pub(crate) fn model_facing_assistant_text(msg: eros_engine_store::chat::ChatMessage) -> String {
     let mut text = msg.content;
-    if let Some(prompt) = msg
-        .metadata
-        .as_ref()
-        .and_then(|md| md.get("image"))
-        .and_then(|img| img.get("prompt"))
-        .and_then(|p| p.as_str())
-    {
-        let marker = format!("[你给对方发送了一张照片：{prompt}]");
+    if let Some(img) = msg.metadata.as_ref().and_then(|md| md.get("image")) {
+        let caption = img
+            .get("caption")
+            .and_then(|p| p.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // Caption, never `prompt`: the prompt is the image-generation string
+        // (style boilerplate + appearance + subject) and injecting it here put
+        // long English prompt text into a Chinese roleplay history, which
+        // models then echoed. No caption ⇒ bare marker, no fallback.
+        let marker = match caption {
+            Some(c) => format!("[你给对方发送了一张照片：{c}]"),
+            None => "[你给对方发送了一张照片]".to_string(),
+        };
         if text.trim().is_empty() {
             text = marker;
         } else {
@@ -1967,26 +1973,32 @@ mod tests {
     }
 
     #[test]
-    fn assistant_row_with_image_prompt_appends_marker() {
+    fn assistant_row_with_image_caption_appends_marker() {
         let row = assistant_row(
             "这是我的回复",
-            Some(serde_json::json!({ "image": { "prompt": "smiling in a cafe" } })),
+            Some(serde_json::json!({ "image": {
+                "prompt": "Photorealistic, ultra-detailed, smiling in a cafe",
+                "caption": "在咖啡店笑着"
+            }})),
         );
         let out = model_facing_assistant_text(row);
         assert!(out.contains("这是我的回复"));
-        assert!(out.contains("[你给对方发送了一张照片：smiling in a cafe]"));
-        // marker is appended after two newlines
-        assert!(out.contains("这是我的回复\n\n[你给对方发送了一张照片：smiling in a cafe]"));
+        assert!(out.contains("[你给对方发送了一张照片：在咖啡店笑着]"));
+        assert!(
+            !out.contains("Photorealistic"),
+            "the image prompt must never reach the chat model's history: {out}"
+        );
+        assert!(out.contains("这是我的回复\n\n[你给对方发送了一张照片：在咖啡店笑着]"));
     }
 
     #[test]
-    fn assistant_row_empty_content_with_image_prompt_uses_marker_only() {
+    fn assistant_row_without_caption_uses_bare_marker() {
         let row = assistant_row(
             "",
-            Some(serde_json::json!({ "image": { "prompt": "sunset on the beach" } })),
+            Some(serde_json::json!({ "image": { "prompt": "a long english image prompt" } })),
         );
         let out = model_facing_assistant_text(row);
-        assert_eq!(out, "[你给对方发送了一张照片：sunset on the beach]");
+        assert_eq!(out, "[你给对方发送了一张照片]");
     }
 
     #[test]
@@ -1995,13 +2007,21 @@ mod tests {
         assert_eq!(model_facing_assistant_text(row), "普通回复");
     }
 
+    /// Even when `image` carries neither `prompt` nor `caption` (e.g. an older
+    /// row shape, or a `url`-only marker), the mere presence of the `image`
+    /// key means a picture was sent — the bare marker still appends. This
+    /// mirrors `assistant_transcript_line`'s guard (keyed on `image` presence,
+    /// not on any particular field inside it).
     #[test]
-    fn assistant_row_image_metadata_without_prompt_unchanged() {
+    fn assistant_row_image_metadata_without_caption_or_prompt_appends_bare_marker() {
         let row = assistant_row(
             "普通回复",
             Some(serde_json::json!({ "image": { "url": "https://x/y.png" } })),
         );
-        assert_eq!(model_facing_assistant_text(row), "普通回复");
+        assert_eq!(
+            model_facing_assistant_text(row),
+            "普通回复\n\n[你给对方发送了一张照片]"
+        );
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`
