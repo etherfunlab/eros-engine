@@ -77,9 +77,14 @@ gating which halves of the relationship line the voice prompt injects.
   - `bond` — base phrase only.
   - `chemistry` — the chemistry clause alone as the line.
   - `both` (default) — base + clause, i.e. the behaviour above.
-- Deliberately **no** voice-side scope audit metadata: the voice persist
-  path is thin fixed-arg (no metadata channel); chat's raw-scope audit
-  recording is not ported.
+- Audit: the voice **assistant row's** `metadata` always records the
+  post-resolve scope — `{"relationship_scope": "both"}` etc. — mirroring
+  how chat writes post-resolve `memory_scope` / `affinity_scope` on its
+  assistant rows. `insert_voice_assistant_message` gains a
+  `metadata: Option<&serde_json::Value>` parameter (the column already
+  exists on `chat_messages`). Chat's *raw*-value user-row audit
+  (`memory_scope_raw`) is still not ported — one post-resolve key on the
+  assistant row is enough for the thin path.
 
 ### Behaviour changes (accepted)
 
@@ -103,12 +108,15 @@ gating which halves of the relationship line the voice prompt injects.
   still say "cached `relationship_label`".
 - `crates/eros-engine-server/src/routes/voice.rs` — request field +
   resolve.
+- `crates/eros-engine-store/src/chat.rs` —
+  `insert_voice_assistant_message` gains a `metadata` parameter, bound
+  into the INSERT's column list.
 - `crates/eros-engine-server/openapi.json` — regenerated snapshot (new
   request field + schema).
 - `docs/api-reference.md` — currently has **no voice coverage at all**;
   catch it up (see below).
 
-`store` / `dto` are untouched.
+`dto` is untouched.
 
 ## Docs: `api-reference.md` voice section
 
@@ -141,6 +149,9 @@ the rest of the file) covering:
   `bond` ⇒ base only, no chemistry wording; `chemistry` ⇒ clause only, no
   bond wording; omitted field ⇒ behaves as `both`; invalid string ⇒ 422
   (route test).
+- Metadata audit: the voice-turn integration test asserts the persisted
+  assistant row has `metadata->>'relationship_scope'` = the resolved
+  value (`both` when the field is omitted).
 
 ## Out of scope
 
