@@ -485,6 +485,11 @@ input filter has no triggers, timing, or tiers).
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
+| `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
+| `world_director` | `pipeline::world::sweeper` via `resolve_world_director()` (background per-owner world-state director round; off when the task block is absent/blank, `WORLD_DISABLED` is set, or `WORLD_TICK_SECS=0`) | live (opt-in) |
+| `world_stories_director` | `pipeline::story::run_stories_scan`, invoked from `pipeline::world::sweeper` via `resolve_world_stories_director()` (per-owner story round, gated on `world_director` also being configured; off when the task block is absent/blank or `WORLD_STORIES_DISABLED` is set) | live (opt-in) |
+| `world_comment` | `pipeline::world_town::sweeper` via `resolve_world_comment()` (hourly world-town comment round; off when the task block is absent/blank, `WORLD_DISABLED`, or `WORLD_TOWN_DISABLED` is set) | live (opt-in) |
+| `world_reply` | `pipeline::world_town::sweeper` via `resolve_world_reply()` (debounced/cooldown/capped responder reply to user comments on world-town posts; off when the task block is absent/blank, `WORLD_DISABLED`, or `WORLD_TOWN_DISABLED` is set) | live (opt-in) |
 | `embedding` | `EmbeddingRouter::from_config()` at boot (`main.rs`), via `ModelConfig::resolve_embedding()` — routes `embed_query`/`embed_document`/`embed_documents` to native Voyage, the built-in OpenRouter embeddings endpoint, or a custom `[providers]` entry; absent block = native Voyage `voyage-4-lite` | live |
 
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:

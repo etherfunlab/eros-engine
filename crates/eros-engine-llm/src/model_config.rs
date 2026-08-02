@@ -2322,6 +2322,9 @@ impl ModelConfig {
 /// body-rules matcher (`ChatRequest.task`). Used ONLY for the boot-time typo
 /// warning on `[[providers.*.body]].tasks` — matching itself is plain string
 /// equality, so an unlisted name warns, never errors.
+///
+/// When adding an engine task, add its name here AND set `ChatRequest.task`
+/// at its pipeline call site.
 pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "chat_companion",
     "chat_output_filter",
@@ -5400,6 +5403,34 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
+    fn from_toml_dir_preserves_provider_body_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            "providers.toml",
+            "[providers.venice]\nchat = \"https://v/chat\"\n\
+             [[providers.venice.body]]\ntasks = [\"chat_companion\"]\n\
+             params = { venice_parameters = { include_venice_system_prompt = false } }\n",
+        );
+        write_cfg(
+            tmp.path(),
+            "chat.toml",
+            "[tasks.chat_companion]\nmodel = \"p/chat\"\n",
+        );
+        let cfg = ModelConfig::from_toml_dir(tmp.path()).unwrap();
+        let body = cfg.providers["venice"].body.as_ref().unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(
+            body[0].tasks.as_deref(),
+            Some(&["chat_companion".to_string()][..])
+        );
+        assert_eq!(
+            body[0].params["venice_parameters"]["include_venice_system_prompt"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
     fn from_toml_dir_ignores_dotfiles_subdirs_and_non_toml() {
         let tmp = tempfile::tempdir().unwrap();
         write_cfg(tmp.path(), "base.toml", "[tasks.a]\nmodel = \"p/a\"\n");
@@ -6596,7 +6627,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("param"),
+            err.contains("`param`"),
             "unknown rule key must be named: {err}"
         );
     }

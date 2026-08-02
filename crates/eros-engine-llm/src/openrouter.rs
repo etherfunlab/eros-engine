@@ -554,7 +554,7 @@ impl OpenRouterClient {
     }
 
     /// Install the `[providers]` endpoint map (multi-provider spec §3).
-    /// Consuming builder, boot-chained at boot.
+    /// Consuming builder, chained at boot.
     pub fn with_providers(
         mut self,
         providers: HashMap<String, crate::provider::ProviderEndpoint>,

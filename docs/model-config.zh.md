@@ -425,6 +425,11 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
+| `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
+| `world_director` | `pipeline::world::sweeper`，经由 `resolve_world_director()`（后台按 owner 逐一执行的世界状态 director 轮次；任务块缺失/空白、设置了 `WORLD_DISABLED`，或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
+| `world_stories_director` | `pipeline::story::run_stories_scan`，由 `pipeline::world::sweeper` 调用，经由 `resolve_world_stories_director()`（按 owner 逐一执行的故事轮次，还要求 `world_director` 已配置；任务块缺失/空白，或设置了 `WORLD_STORIES_DISABLED` 时关闭） | live（opt-in） |
+| `world_comment` | `pipeline::world_town::sweeper`，经由 `resolve_world_comment()`（每小时一次的 world-town 评论轮次；任务块缺失/空白，或设置了 `WORLD_DISABLED`、`WORLD_TOWN_DISABLED` 时关闭） | live（opt-in） |
+| `world_reply` | `pipeline::world_town::sweeper`，经由 `resolve_world_reply()`（对 world-town 帖子上用户评论的去抖/冷却/限额 responder 回复；任务块缺失/空白，或设置了 `WORLD_DISABLED`、`WORLD_TOWN_DISABLED` 时关闭） | live（opt-in） |
 | `embedding` | 启动时的 `EmbeddingRouter::from_config()`（`main.rs`），经由 `ModelConfig::resolve_embedding()`——把 `embed_query`/`embed_document`/`embed_documents` 路由到原生 Voyage、内置 OpenRouter embeddings 端点、或某个 `[providers]` 条目；块缺失 = 原生 Voyage `voyage-4-lite` | live |
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
