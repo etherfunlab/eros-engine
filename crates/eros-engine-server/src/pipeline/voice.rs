@@ -286,6 +286,7 @@ pub fn run_voice_turn(
                     usage_full.as_ref(),
                     last_gen_id.as_deref(),
                     truncated,
+                    None,
                 )
                 .await
             {

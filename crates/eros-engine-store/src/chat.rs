@@ -989,12 +989,13 @@ impl<'a> ChatRepo<'a> {
         usage: Option<&serde_json::Value>,
         generation_id: Option<&str>,
         truncated: bool,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO engine.chat_messages \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
-              generation_id, assistant_action_type, channel) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice')",
+              generation_id, assistant_action_type, channel, metadata) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9)",
         )
         .bind(id)
         .bind(session_id)
@@ -1004,6 +1005,7 @@ impl<'a> ChatRepo<'a> {
         .bind(model)
         .bind(usage)
         .bind(generation_id)
+        .bind(metadata)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -2991,19 +2993,23 @@ mod tests {
             None,
             Some("gen-1"),
             false,
+            Some(&serde_json::json!({"relationship_scope": "both"})),
         )
         .await
         .unwrap();
-        let (role, aat, channel): (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT role, assistant_action_type, channel FROM engine.chat_messages WHERE id = $1",
-        )
-        .bind(aid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (role, aat, channel, scope): (String, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT role, assistant_action_type, channel, metadata->>'relationship_scope' \
+                 FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(aid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(role, "assistant");
         assert_eq!(aat.as_deref(), Some("reply"));
         assert_eq!(channel.as_deref(), Some("voice"));
+        assert_eq!(scope.as_deref(), Some("both"));
 
         // history() returns both, chronologically, and content survives.
         let h = repo.history(session_id, 10, 0).await.unwrap();
