@@ -301,7 +301,13 @@ frame (below) — the chat stream never resolves it to a URL itself. The
 `previous`-with-no-image → `face` fallback, and the `face_ref_url` /
 `prev_image_url` reference URLs, belong to the consumer's own image-vendor
 call (the engine has no draw endpoint). The persisted `metadata.image` marker
-records only the seed subject and aspect ratio, not the reference kind.
+records the seed subject and aspect ratio, plus — only when the composer LLM
+call succeeded — the audit trio `compose_variant` (the `filter_prompt`
+key/index that was selected, absent for a plain or built-in prompt),
+`compose_model`, and `compose_generation_id`. Absence of the trio means the
+turn had no successful compose (`raw`, fail-open degradation, or composer not
+configured). The composed prompt itself is never persisted — storing it is
+the consumer's job. The reference kind is not recorded.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
 unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.

@@ -5947,21 +5947,33 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap();
         assert_eq!(
-            keyed.resolve_image_prompt_compose(Some("b")).unwrap().variant_key,
+            keyed
+                .resolve_image_prompt_compose(Some("b"))
+                .unwrap()
+                .variant_key,
             Some("b".to_string())
         );
         assert_eq!(
-            keyed.resolve_image_prompt_compose(Some("zzz")).unwrap().variant_key,
+            keyed
+                .resolve_image_prompt_compose(Some("zzz"))
+                .unwrap()
+                .variant_key,
             None,
             "miss falls back to the built-in prompt — no variant to audit"
         );
         assert_eq!(
-            keyed.resolve_image_prompt_compose(None).unwrap().variant_key,
+            keyed
+                .resolve_image_prompt_compose(None)
+                .unwrap()
+                .variant_key,
             None
         );
         // Whitespace-padded variant is trimmed before select — key must match.
         assert_eq!(
-            keyed.resolve_image_prompt_compose(Some(" b \n")).unwrap().variant_key,
+            keyed
+                .resolve_image_prompt_compose(Some(" b \n"))
+                .unwrap()
+                .variant_key,
             Some("b".to_string())
         );
 
@@ -5972,11 +5984,17 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap();
         assert_eq!(
-            indexed.resolve_image_prompt_compose(Some("1")).unwrap().variant_key,
+            indexed
+                .resolve_image_prompt_compose(Some("1"))
+                .unwrap()
+                .variant_key,
             Some("1".to_string())
         );
         assert_eq!(
-            indexed.resolve_image_prompt_compose(Some("9")).unwrap().variant_key,
+            indexed
+                .resolve_image_prompt_compose(Some("9"))
+                .unwrap()
+                .variant_key,
             None
         );
 
@@ -5988,16 +6006,20 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap();
         assert_eq!(
-            plain.resolve_image_prompt_compose(Some("b")).unwrap().variant_key,
+            plain
+                .resolve_image_prompt_compose(Some("b"))
+                .unwrap()
+                .variant_key,
             None
         );
 
         // No filter_prompt at all → built-in prompt, no variant.
-        let bare = ModelConfig::from_toml_str(
-            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n",
-        )
-        .unwrap();
-        assert_eq!(bare.resolve_image_prompt_compose(None).unwrap().variant_key, None);
+        let bare = ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
+            .unwrap();
+        assert_eq!(
+            bare.resolve_image_prompt_compose(None).unwrap().variant_key,
+            None
+        );
     }
 
     // ─── compose_variant_log_event: the warn/debug guards, pinned directly ──

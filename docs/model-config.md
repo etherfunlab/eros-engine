@@ -587,6 +587,17 @@ than sit there unreachable.
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_prompt_compose()` in `model_config.rs`.
 
+**Audit.** A successful composer call writes three keys into the image
+turn's `chat_messages.metadata.image`: `compose_variant` (which
+`filter_prompt` key/index was selected; absent for a plain/built-in
+prompt), `compose_model` (the model that answered), and
+`compose_generation_id`. All three are absent when no compose succeeded
+(`raw`, fail-open, task not configured) — same NULL semantics as the
+affinity audit trio. Usage/cost is not persisted; reconcile via the
+generation id against your provider's logs. The composed prompt is not
+persisted (consumer-side by design). Spec:
+`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`.
+
 ### `[tasks.chat_vision]` — image input (vision pre-stage, opt-in)
 
 When a chat turn carries an `image_url`, the engine runs `resolve_vision()` to

@@ -11818,17 +11818,20 @@ data: [DONE]\n\n"
         assert_eq!(m.as_object().unwrap().len(), 5);
 
         // No generation id from the provider → key absent, not null.
-        let m2 = build_delegated_image_marker(
-            "beach at sunset",
-            None,
-            None,
-            Some("served/model"),
-            None,
-        );
+        let m2 =
+            build_delegated_image_marker("beach at sunset", None, None, Some("served/model"), None);
         assert_eq!(m2["compose_model"], "served/model");
-        assert!(m2.as_object().unwrap().get("compose_generation_id").is_none());
+        assert!(m2
+            .as_object()
+            .unwrap()
+            .get("compose_generation_id")
+            .is_none());
         assert!(m2.as_object().unwrap().get("compose_variant").is_none());
-        assert_eq!(m2.as_object().unwrap().len(), 2, "prompt + compose_model only");
+        assert_eq!(
+            m2.as_object().unwrap().len(),
+            2,
+            "prompt + compose_model only"
+        );
     }
 
     #[test]
