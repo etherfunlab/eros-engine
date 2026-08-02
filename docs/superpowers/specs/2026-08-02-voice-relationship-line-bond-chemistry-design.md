@@ -53,6 +53,34 @@ import from `voice.rs` entirely.
 | Lover              | "You share a romantic and physical bond. Be affectionate, intimate, and gently alluring. Your voice and manner should feel warm, close, and quietly seductive." |
 | Beloved            | "You two are deeply in love and highly attuned to each other. Be openly affectionate, sensual, and alluring. Speak with natural intimacy, quiet desire, and magnetic ease — as if the other person is already yours." |
 
+### Per-turn `relationship_scope` (voice request switch)
+
+Mirror of the chat turn's `memory_scope`: a caller-supplied per-turn switch
+gating which halves of the relationship line the voice prompt injects.
+
+- New enum in `eros-engine-core/src/scope.rs` (the per-request injection
+  scope home), derives matching `MemoryScope` (`snake_case` serde,
+  `Default`):
+
+  ```rust
+  pub enum RelationshipScope { None, Bond, Chemistry, #[default] Both }
+  ```
+
+- `VoiceTurnRequest` gains
+  `#[serde(default)] #[schema(value_type = Option<String>)]
+  pub relationship_scope: Option<RelationshipScope>`; the route resolves
+  `unwrap_or_default()` and threads it through `VoiceTurn` into
+  `build_voice_prompt`. An invalid string ⇒ 422 (same behaviour as chat's
+  `memory_scope`).
+- Semantics (`relationship_line(a, scope) -> Option<String>`):
+  - `none` — no line, even with an affinity row.
+  - `bond` — base phrase only.
+  - `chemistry` — the chemistry clause alone as the line.
+  - `both` (default) — base + clause, i.e. the behaviour above.
+- Deliberately **no** voice-side scope audit metadata: the voice persist
+  path is thin fixed-arg (no metadata channel); chat's raw-scope audit
+  recording is not ported.
+
 ### Behaviour changes (accepted)
 
 1. Old rows cached with `frenemy` / stale heuristic labels no longer affect
@@ -66,14 +94,39 @@ import from `voice.rs` entirely.
 
 ## Code changes
 
-Only `crates/eros-engine-server/src/pipeline/voice.rs`:
+- `crates/eros-engine-core/src/scope.rs` — add `RelationshipScope`.
+- `crates/eros-engine-server/src/pipeline/voice.rs` — import
+  `BondLabel, ChemistryLabel` instead of `RelationshipLabel`;
+  `relationship_line(a: &Affinity, scope: RelationshipScope) ->
+  Option<String>`; `build_voice_prompt` gains the `scope` parameter;
+  `VoiceTurn` carries `relationship_scope`; update the doc comments that
+  still say "cached `relationship_label`".
+- `crates/eros-engine-server/src/routes/voice.rs` — request field +
+  resolve.
+- `crates/eros-engine-server/openapi.json` — regenerated snapshot (new
+  request field + schema).
+- `docs/api-reference.md` — currently has **no voice coverage at all**;
+  catch it up (see below).
 
-- Import `BondLabel, ChemistryLabel` instead of `RelationshipLabel`.
-- `relationship_line(a: &Affinity) -> String`; call site becomes
-  `affinity.map(relationship_line)`.
-- Update the doc comments that still say "cached `relationship_label`".
+`store` / `dto` are untouched.
 
-`core` / `store` / `dto` are untouched.
+## Docs: `api-reference.md` voice section
+
+Add a `## Voice` section (after "Chat lifecycle", same curl + JSON style as
+the rest of the file) covering:
+
+- `POST /comp/voice/{session_id}/turn/stream` — request body (`content`,
+  `client_msg_id` 26..36 ASCII, optional `relationship_scope`:
+  `none | bond | chemistry | both`, default `both`), SSE frame set
+  (`delta`* then terminal `done`, or a single `error`; **no** `meta`, no
+  `action_type`), and the thin-prompt behaviour (persona + voice directive
+  + one relationship line; no recall/memories/heavy blocks).
+- The channel-scoped session rule: the endpoint only accepts
+  voice-channel sessions; voice clients obtain one via `chat/start` with
+  `channel: "voice"`.
+- Also document the `channel` field (`"text"` default / `"voice"`) in the
+  existing `POST /comp/chat/start` section — it is missing today and is
+  the voice on-ramp.
 
 ## Testing
 
@@ -84,6 +137,10 @@ Only `crates/eros-engine-server/src/pipeline/voice.rs`:
   restrained clause, no Crush-and-up wording; high chemistry ⇒ affectionate
   clause present; boundary: tier 2 (Flirtation) still uses the subtle
   clause, tier 3 (Crush) switches to the attraction clause.
+- Scope cases (all with an affinity row present): `none` ⇒ no line;
+  `bond` ⇒ base only, no chemistry wording; `chemistry` ⇒ clause only, no
+  bond wording; omitted field ⇒ behaves as `both`; invalid string ⇒ 422
+  (route test).
 
 ## Out of scope
 
