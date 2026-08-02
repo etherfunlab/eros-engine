@@ -1589,7 +1589,7 @@
               "string",
               "null"
             ],
-            "description": "Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use\nfor this turn: an index (`\"0\"`, `\"1\"`) for the array shape, or a key\n(`\"a\"`, `\"b\"`) for the table shape. Ignored when that task configures a\nsingle plain prompt.\n\n`\"raw\"` (case-insensitive) is reserved: it skips the composer LLM\nentirely, saving one LLM call.\n\nAn unknown index/key falls back to the engine's built-in composer\nprompt — it is never an error."
+            "description": "Which `[tasks.chat_image_prompt_compose].filter_prompt` variant to use\nfor this turn: an index (`\"0\"`, `\"1\"`) for the array shape, or a key\n(`\"a\"`, `\"b\"`) for the table shape. Ignored when that task configures a\nsingle plain prompt.\n\n`\"raw\"` carries no special meaning — it selects a prompt only if a\ndeployment actually configures one under that key.\n\nAn unknown index/key falls back to the engine's built-in composer\nprompt — it is never an error."
           },
           "style": {
             "type": [
