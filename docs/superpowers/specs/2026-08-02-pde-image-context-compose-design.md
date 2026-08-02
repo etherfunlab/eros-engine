@@ -57,6 +57,18 @@ conversation-history characters from only 12.8% of turns.
   decisions the judge handles fine. They are also *not* moved into the
   composer's JSON — a picture's framing is a turn-level interaction decision,
   not part of describing the picture.
+- **The seed concept is deleted outright, not just relocated.** With the judge
+  no longer writing one, the only other seed source was the client
+  (`image.image_prompt`) — and clients neither need nor are permitted to hand
+  the engine a prompt. So that request field goes too, the composer payload
+  loses its `[画面主题种子]` section, and `resolve_image_turn_inputs` stops
+  resolving a subject at all. The composer generates from context, full stop.
+- **`"raw"` stops being a reserved `prompt_variant`.** It existed to mean "skip
+  the composer and draw the seed verbatim", which is incoherent once no seed
+  exists. After this change `"raw"` is an ordinary variant name: it hits only
+  if a deployment actually configures a variant keyed `raw`, and misses like
+  any other unknown key. The boot gate that refused such a key is removed with
+  it.
 - **`reply_text_image` must fan out**: composer and chat fire concurrently and
   assemble at the end. Today they are serial (the composer starts only after
   the text stream's `done`), adding a full LLM round trip to the turn.
@@ -151,30 +163,60 @@ key from a non-strict provider deserializes away harmlessly.
 The effective image availability for a turn becomes
 `image_executor_available && [tasks.chat_image_prompt_compose] exists`. The
 gate is the **task section's presence** (a config-level fact), NOT a
-`resolve_image_prompt_compose(..)` call — that resolver also returns `None`
-for the reserved `raw` variant, which must not read as "no image capability".
+`resolve_image_prompt_compose(..)` call: that resolver reaches
+`self.resolve(COMPOSE_TASK, None)`, which advances the round-robin model
+cursor as a side effect, so calling it merely to answer a capability question
+would skew which model later image turns actually pick.
+
 Without the composer task, `[图片能力] 本轮可发图=否` and `guard_action`
 downgrades image verdicts exactly as it does today when the executor is
 absent.
 
-The `raw` variant keeps its meaning: composer skipped, the client's
-`req_image.image_prompt` used verbatim — now the only remaining seed source.
-`raw` produces no caption (nothing wrote one), so its rows render the bare
-marker per §2.
+### `"raw"` is no longer a reserved variant
+
+`resolve_image_prompt_compose` currently short-circuits to `None` when the
+client's `prompt_variant` is `"raw"` (case-insensitive), meaning "skip the
+composer, draw the seed as-is"; `check_variant_shape` correspondingly refuses
+to boot on a config that defines a variant keyed `raw`. Both go away.
+
+With no seed there is nothing to draw as-is, so the escape hatch is
+incoherent. After this change `"raw"` is an ordinary variant name: it selects
+a prompt only if a deployment actually configures one under that key, and
+otherwise misses like any unknown key — falling back to the built-in prompt,
+which is never an error. The boot refusal is deleted so that key becomes
+configurable.
+
+Removing the short-circuit also makes `resolve_image_prompt_compose` return
+`None` for exactly one reason — the task section is absent — which is what
+lets the capability gate above be stated so simply.
+
+**No `prompt_variant` supplied** already resolves to the built-in prompt for
+the variant shapes (`PromptSpec::select` returns `None` for `Indexed`/`Keyed`
+without a variant), and to the configured string for a `Plain` `filter_prompt`
+— a plain prompt is the deployment's single chosen prompt, not a variant miss.
+That behaviour is unchanged and needs no code.
 
 ### Composer contract: EXPAND → GENERATE, and a second output field
 
 `compose_user_payload` (`stream.rs:2294`) gains the partner's latest message —
 the information the seed used to carry (the shared transcript deliberately
-excludes the current turn):
+excludes the current turn) — and **loses the seed section entirely**:
 
 ```
-[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}
+[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}
 ```
 
-`seed_subject` now resolves from `req_image.image_prompt` only (an explicit
-client override; usually empty — rendered as 「（无）」 like the other empty
-sections). `resolve_image_turn_inputs` loses its `plan.image_prompt` arm.
+`resolve_image_turn_inputs` stops resolving a subject at all: its
+`plan.image_prompt` arm goes with the judge's seed, and its
+`req_image.image_prompt` arm goes with the request field (below). What remains
+is style and aspect ratio.
+
+`ImageReplyParams.image_prompt` is **removed from the request type**, and with
+it from `openapi.json` and both API references. It was documented as the
+subject for the forced-image path, but a client neither needs nor is permitted
+to hand the engine an image prompt — the composer decides what the picture
+shows. A client that keeps sending the field is unaffected: it deserializes
+away like any unknown key.
 
 The composer returns JSON:
 
@@ -208,17 +250,15 @@ You compose the image for a picture the character is sending in a chat, and
 you return JSON with exactly two fields: "prompt" and "caption".
 
 You receive the character's appearance, the recent scene, the partner's latest
-message, an optional explicit subject, a visual style, and a target aspect
-ratio, each as a labeled section.
+message, a visual style, and a target aspect ratio, each as a labeled section.
 
 "prompt" is the image-generation prompt: decide what the picture shows from
-the latest message and the scene; when the explicit subject is non-empty it
-states what the picture must show — honor it fully. Produce one coherent,
+the partner's latest message and the recent scene. Produce one coherent,
 detailed, vivid prompt that faithfully preserves the appearance and fits the
-style and aspect ratio, delivering the full intent and tone of the request. Do
-not soften, sanitize, downgrade, omit, censor, or refuse any part of it, and
-do not add safety warnings, disclaimers, or moderation of your own — content
-policy is the responsibility of the image provider and the downstream
+style and aspect ratio, delivering the full intent and tone of what was asked
+for. Do not soften, sanitize, downgrade, omit, censor, or refuse any part of
+it, and do not add safety warnings, disclaimers, or moderation of your own —
+content policy is the responsibility of the image provider and the downstream
 consumer, not this step.
 
 "caption" is one short line, in the language the conversation is in, saying
@@ -240,8 +280,16 @@ fallback above.
 
 - `metadata.image.prompt` — the composer's `prompt` (subject). **Field meaning
   is unchanged**; only its source moves from the judge's seed to the composer.
+  This deliberately reverses the decision in #211 that pinned it to the seed:
+  that choice existed to keep the *short* string in the database for the
+  history marker, a job `caption` now does, and with no seed left the field
+  would otherwise be empty on every image turn.
 - `metadata.image.caption` — the composer's `caption`, omitted when absent.
 - the existing `aspect_ratio` and `compose_*` audit keys, unchanged.
+
+Two paths now reach the marker, not three: a successful compose (subject and
+caption both present) and a failed one (subject empty, no caption). The former
+`raw` path is gone with the reserved variant.
 
 The composed wire string is **not** persisted by the engine. It is delivered
 on the `image_request` frame, which is also **not** extended with `caption` —
@@ -343,11 +391,13 @@ Serial LLM hops on the turn drop from 3 to 2.
   empty transcript — and now zero counts, rendering as `已发图=0 张`, the same
   "no recent images" signal an empty transcript gives the judge today.
 - The composer keeps its fail-open chain (per-model timeout → next model). With
-  no seed to fall back to, a fully-failed compose degrades to an empty subject:
-  `compose_image_prompt(style, persona, "")` yields a persona-appearance
-  portrait prompt, and no caption is persisted (bare marker, §2). Logged at
-  warn. The degraded *outcome* changes from "the judge's softened seed" to
-  "generic portrait"; the failure *rate* is unchanged (same chain).
+  the seed concept deleted there is nothing to fall back to, so a fully-failed
+  compose degrades to an empty subject: `compose_image_prompt(style, persona,
+  "")` yields a persona-appearance portrait prompt, and no caption is persisted
+  (bare marker, §2). Logged at warn. The degraded *outcome* changes from "the
+  judge's softened seed" to "generic portrait"; the failure *rate* is unchanged
+  (same chain). This is now the ONLY degraded image path — a turn either gets a
+  composed picture or a portrait.
 - A panicked or cancelled composer task surfaces at the join as
   `Err(JoinError)` and maps to the same degradation — never a dropped frame.
 - If the text path returns early before the join (e.g. `build_reply_request`
@@ -374,12 +424,19 @@ Serial LLM hops on the turn drop from 3 to 2.
 - Composer parsing: direct JSON; JSON wrapped in prose; and a plain-text reply
   → whole reply becomes `prompt`, caption `None`.
 - Image availability: composer task absent ⇒ 可发图=否 and image actions
-  guarded to text; present ⇒ 是. The `raw` variant must NOT read as absent.
-- Composer payload includes `[对方最新消息]`; the seed section renders 「（无）」
-  when there is no client override.
+  guarded to text; present ⇒ 是.
+- `"raw"` is no longer reserved: a config defining a variant keyed `raw` boots
+  and that variant is selectable; `prompt_variant = "raw"` with no such key
+  configured resolves to the built-in prompt (a miss, not a skip and not an
+  error); and `resolve_image_prompt_compose` returns `None` only when the task
+  section is absent.
+- Composer payload includes `[对方最新消息]` and no longer has a seed section.
 - Metadata: `prompt` is the composer subject, `caption` present on the compose
-  path and omitted on the `raw` and failure paths; no `composed_prompt` key is
-  written; the `image_request` frame carries no caption.
+  path and omitted on the failure path; no `composed_prompt` key is written;
+  the `image_request` frame carries no caption. At least one DB-backed test
+  must drive a real JSON composer reply through to a persisted row and assert
+  `metadata.image.caption` — the unit tests cover the parser and the marker
+  builder, but not the seam between them.
 - Affinity proxy: `affinity_eval_text` returns the caption on an image turn
   when one exists, and `[发送了一张照片]` when it does not; `plan_bg.image_caption`
   is populated on both the `reply_image` and `reply_text_image` paths before
