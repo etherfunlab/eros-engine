@@ -1156,6 +1156,11 @@ pub struct ResolvedImagePromptCompose {
     pub compose_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// The Keyed key / Indexed index that selected `compose_prompt`, for the
+    /// `metadata.image.compose_variant` audit key. `None` when there was no
+    /// variant selection to speak of: `Plain`, no `filter_prompt`, or a miss
+    /// (built-in prompt fallback).
+    pub variant_key: Option<String>,
 }
 
 /// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
@@ -1893,6 +1898,13 @@ impl ModelConfig {
             .filter_prompt
             .as_ref()
             .and_then(|s| s.select(variant));
+        // Audit value, NOT derivable from `selected` alone: `Plain` returns
+        // `Some` from `select()` regardless of the supplied variant, but has
+        // no variant selection to audit.
+        let variant_key = match task_cfg.filter_prompt.as_ref() {
+            None | Some(PromptSpec::Plain(_)) => None,
+            Some(_) => selected.and(variant).map(str::to_string),
+        };
         // The warn/debug decision is a pure function of (selected, variant,
         // has a filter_prompt at all) — pulled out of the tracing call so it
         // can be unit-tested directly, without a tracing subscriber, and so a
@@ -1939,6 +1951,7 @@ impl ModelConfig {
             compose_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            variant_key,
         })
     }
 }
@@ -5919,6 +5932,72 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         let c =
             cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n");
         assert!(c.resolve_image_prompt_compose(Some(" raw \n")).is_none());
+    }
+
+    /// `variant_key` surfaces WHICH variant selected the prompt — the audit
+    /// value persisted to `metadata.image.compose_variant`. `Some` iff a
+    /// Keyed/Indexed entry was actually hit; `Plain` and the built-in
+    /// fallback have a single prompt (no "which variant" to answer).
+    #[test]
+    fn resolve_image_prompt_compose_variant_key_semantics() {
+        // Keyed: hit → Some(key); miss → None (built-in prompt fallback).
+        let keyed = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+             filter_prompt = { a = \"AAA\", b = \"BBB\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keyed.resolve_image_prompt_compose(Some("b")).unwrap().variant_key,
+            Some("b".to_string())
+        );
+        assert_eq!(
+            keyed.resolve_image_prompt_compose(Some("zzz")).unwrap().variant_key,
+            None,
+            "miss falls back to the built-in prompt — no variant to audit"
+        );
+        assert_eq!(
+            keyed.resolve_image_prompt_compose(None).unwrap().variant_key,
+            None
+        );
+        // Whitespace-padded variant is trimmed before select — key must match.
+        assert_eq!(
+            keyed.resolve_image_prompt_compose(Some(" b \n")).unwrap().variant_key,
+            Some("b".to_string())
+        );
+
+        // Indexed: hit → Some(index string).
+        let indexed = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+             filter_prompt = [\"ZERO\", \"ONE\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            indexed.resolve_image_prompt_compose(Some("1")).unwrap().variant_key,
+            Some("1".to_string())
+        );
+        assert_eq!(
+            indexed.resolve_image_prompt_compose(Some("9")).unwrap().variant_key,
+            None
+        );
+
+        // Plain: always None, even when a variant was supplied (select() returns
+        // the prompt regardless — there is no variant selection to audit).
+        let plain = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
+             filter_prompt = \"PLAIN\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            plain.resolve_image_prompt_compose(Some("b")).unwrap().variant_key,
+            None
+        );
+
+        // No filter_prompt at all → built-in prompt, no variant.
+        let bare = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        assert_eq!(bare.resolve_image_prompt_compose(None).unwrap().variant_key, None);
     }
 
     // ─── compose_variant_log_event: the warn/debug guards, pinned directly ──
