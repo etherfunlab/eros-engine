@@ -664,7 +664,10 @@ impl<'de> Deserialize<'de> for ProviderEntry {
 impl ProviderEntry {
     /// True when nothing at all is declared (all-`None`).
     pub fn is_empty(&self) -> bool {
-        self.chat.is_none() && self.embeddings.is_none() && self.headers.is_none() && self.body.is_none()
+        self.chat.is_none()
+            && self.embeddings.is_none()
+            && self.headers.is_none()
+            && self.body.is_none()
     }
 
     /// Boot gate for the `headers` table: engine-owned names are rejected
@@ -6439,7 +6442,10 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("param"), "unknown rule key must be named: {err}");
+        assert!(
+            err.contains("param"),
+            "unknown rule key must be named: {err}"
+        );
     }
 
     #[test]
