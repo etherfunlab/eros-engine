@@ -43,6 +43,18 @@ impl MemoryScope {
     }
 }
 
+/// Caller-supplied voice relationship-line scope (voice turns only): which
+/// halves of the bond/chemistry relationship line to inject this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipScope {
+    None,
+    Bond,
+    Chemistry,
+    #[default]
+    Both,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityAxis {
@@ -249,6 +261,24 @@ mod tests {
             "\"neutral_and_relationship\""
         );
         assert!(serde_json::from_str::<MemoryScope>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn relationship_scope_default_is_both() {
+        assert_eq!(RelationshipScope::default(), RelationshipScope::Both);
+    }
+
+    #[test]
+    fn relationship_scope_serde_snake_case() {
+        for (v, s) in [
+            (RelationshipScope::None, "\"none\""),
+            (RelationshipScope::Bond, "\"bond\""),
+            (RelationshipScope::Chemistry, "\"chemistry\""),
+            (RelationshipScope::Both, "\"both\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), s);
+            assert_eq!(serde_json::from_str::<RelationshipScope>(s).unwrap(), v);
+        }
     }
 
     #[test]
