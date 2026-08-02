@@ -2566,11 +2566,13 @@ fn resolve_image_turn_inputs(
 /// absent: it is consumed internally by `compose_image_prompt` and neither
 /// caller uses it afterwards.
 struct DelegatedImagePrompt {
-    /// Seed subject — feeds `build_delegated_image_marker`'s `prompt` key. This
-    /// is deliberately the SEED, not the composer's enriched/generated text
-    /// (that lives only in `composed_prompt`, on the wire): keeps the
-    /// persisted marker compact regardless of composer outcome.
-    seed_subject: String,
+    /// What described the picture — feeds `build_delegated_image_marker`'s
+    /// `prompt` key. The composer's decided subject on the compose path
+    /// (spec 2026-08-02: this is deliberately the SHORT subject, not the
+    /// composed wire string — that lives only in `composed_prompt`, below, and
+    /// is never persisted); the client's explicit override on `raw` (composer
+    /// skipped); empty on a failed compose.
+    subject: String,
     /// Short description of the picture, persisted as `metadata.image.caption`
     /// and read by every history-facing render. `None` on a failed compose or
     /// when the task is not configured.
@@ -2636,7 +2638,7 @@ async fn build_delegated_image_prompt(
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
     DelegatedImagePrompt {
-        seed_subject: inputs.seed_subject,
+        subject: final_subject,
         caption,
         aspect_ratio: inputs.aspect_ratio,
         composed_prompt,
@@ -3434,7 +3436,7 @@ pub fn run_stream(
                         &user_msg.content,
                     )
                     .await;
-                    let subject = img.seed_subject;
+                    let subject = img.subject;
                     let aspect = img.aspect_ratio;
                     let composed_prompt = img.composed_prompt;
                     // Persist the marker (subject + caption + aspect + compose
@@ -3764,7 +3766,7 @@ pub fn run_stream(
                             &user_msg.content,
                         )
                         .await;
-                        let subject = img.seed_subject;
+                        let subject = img.subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
                         // Merge the marker (subject + caption + aspect + compose
@@ -6249,10 +6251,14 @@ data: [DONE]\n\n";
         assert!(img.get("compose_generation_id").is_none());
     }
 
-    /// Spec 2026-08-02: a SUCCESSFUL composer call persists the audit trio to
-    /// `metadata.image` — the selected variant key, the served model, and the
-    /// generation id — while `prompt` keeps the SEED subject (the composed
-    /// text goes only on the wire).
+    /// Spec 2026-08-02 (revised): a SUCCESSFUL composer call persists the
+    /// audit trio to `metadata.image` — the selected variant key, the served
+    /// model, and the generation id — AND `prompt` now carries the composer's
+    /// subject, not the pre-compose seed. The original design pinned `prompt`
+    /// to the seed to keep the DB row short; that job now belongs to
+    /// `caption`, so `prompt` is free to reflect what the composer actually
+    /// decided. The composed WIRE prompt (style preset + appearance + this
+    /// subject) is still never persisted — it goes out on the wire only.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_success_persists_audit_trio(pool: PgPool) {
         use wiremock::ResponseTemplate;
@@ -6268,9 +6274,9 @@ data: [DONE]\n\n";
         .await;
         assert_eq!(reqs.len(), 1, "composer is the only provider call");
 
-        // final-review finding — this is the only place the
-        // `ComposeOutcome.text → wire` seam is pinned; the DB `prompt` stays
-        // the seed by design (asserted below).
+        // The composer's plain-text reply ("ENRICHED SUBJECT", no JSON) parses
+        // as the whole reply becoming `prompt` with no caption (migration
+        // fallback) — so both the wire and the DB below carry it.
         let composed_b64 = frames
             .iter()
             .find_map(|f| match f {
@@ -6304,8 +6310,8 @@ data: [DONE]\n\n";
         .expect("assistant image row persisted");
         let img = &meta["image"];
         assert_eq!(
-            img["prompt"], "a beach at sunset",
-            "seed subject, not the composed text"
+            img["prompt"], "ENRICHED SUBJECT",
+            "prompt is the composer's subject, not the pre-compose seed"
         );
         assert_eq!(img["compose_variant"], "b");
         assert_eq!(img["compose_model"], "served/model");
