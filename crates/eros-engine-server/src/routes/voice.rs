@@ -35,6 +35,11 @@ const SSE_KEEPALIVE_SECS: u64 = 15;
 pub struct VoiceTurnRequest {
     pub content: String,
     pub client_msg_id: String,
+    /// Which halves of the relationship line to inject this turn:
+    /// `none | bond | chemistry | both`. Omitted ⇒ `both`.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub relationship_scope: Option<RelationshipScope>,
 }
 
 fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
@@ -201,7 +206,7 @@ pub async fn voice_turn_stream(
         session_id,
         instance_id,
         user_message_id,
-        relationship_scope: RelationshipScope::default(),
+        relationship_scope: req.relationship_scope.unwrap_or_default(),
     };
     let proto = run_voice_turn(Arc::new(state.clone()), turn, resolved);
 
@@ -321,6 +326,26 @@ mod tests {
             session_id,
             &jwt,
             json!({"content":"","client_msg_id":"01J2222222222222222222222A"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_422_when_relationship_scope_invalid(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let jwt = mint_jwt(user_id);
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "relationship_scope": "romance"
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
