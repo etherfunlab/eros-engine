@@ -158,18 +158,33 @@ fn build_image_request_frame(
     }
 }
 
-/// Minimal `metadata.image` marker for a delegated image turn. Stores ONLY the
-/// PDE seed subject (under `prompt`, the key `assistant_transcript_line` reads)
-/// and the aspect ratio — deliberately NOT the composed wire prompt, model,
-/// generation id, url, or success/failure. Preserves the PDE image-awareness
-/// transcript (§5) while leaving the draw result with the consumer. Pure.
+/// `metadata.image` marker for a delegated image turn. Always stores the PDE
+/// seed subject (under `prompt`, the key `assistant_transcript_line` reads)
+/// and the aspect ratio; when the composer LLM call SUCCEEDED it also stores
+/// the audit trio `compose_variant` / `compose_model` / `compose_generation_id`
+/// (spec 2026-08-02; absence = no successful compose this turn — raw skip,
+/// fail-open, or task not configured). Deliberately NOT stored: the composed
+/// wire prompt (the consumer's job), url, or success/failure of the draw.
+/// Pure.
 fn build_delegated_image_marker(
     seed_subject: &str,
     aspect_ratio: Option<&str>,
+    compose_variant: Option<&str>,
+    compose_model: Option<&str>,
+    compose_generation_id: Option<&str>,
 ) -> serde_json::Value {
     let mut m = serde_json::json!({ "prompt": seed_subject });
     if let Some(ar) = aspect_ratio.filter(|s| !s.is_empty()) {
         m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
+    }
+    if let Some(v) = compose_variant.filter(|s| !s.is_empty()) {
+        m["compose_variant"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = compose_model.filter(|s| !s.is_empty()) {
+        m["compose_model"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(v) = compose_generation_id.filter(|s| !s.is_empty()) {
+        m["compose_generation_id"] = serde_json::Value::String(v.to_string());
     }
     m
 }
@@ -3250,7 +3265,7 @@ pub fn run_stream(
                     // marker (seed subject + aspect) so the PDE stays image-aware
                     // (§5); the composed prompt and the draw result live with the
                     // consumer.
-                    let marker = build_delegated_image_marker(&subject, aspect.as_deref());
+                    let marker = build_delegated_image_marker(&subject, aspect.as_deref(), None, None, None);
                     let row = eros_engine_store::chat::AssistantInsert {
                         id: msg_uuid,
                         content: String::new(),
@@ -3571,7 +3586,7 @@ pub fn run_stream(
                         // onto the already-persisted text row so the PDE stays
                         // image-aware (§5). The text already reached the client;
                         // `final` follows below.
-                        let marker = build_delegated_image_marker(&subject, aspect.as_deref());
+                        let marker = build_delegated_image_marker(&subject, aspect.as_deref(), None, None, None);
                         if let Err(e) = chat_repo
                             .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
                             .await
@@ -11647,7 +11662,7 @@ data: [DONE]\n\n"
     fn delegated_marker_preserves_image_awareness() {
         // Seed subject under `prompt` (the key assistant_transcript_line reads),
         // plus aspect — and NOTHING else (no composed prompt / model / gen id).
-        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"));
+        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"), None, None, None);
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
         assert_eq!(
@@ -11663,10 +11678,42 @@ data: [DONE]\n\n"
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
         // No aspect => still a valid one-key marker that annotates.
-        let m2 = build_delegated_image_marker("a portrait", None);
+        let m2 = build_delegated_image_marker("a portrait", None, None, None, None);
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
         assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
+    }
+
+    /// Spec 2026-08-02: a successful composer call adds exactly three audit
+    /// keys to the marker; absent values (no gen id) omit the key — no nulls.
+    #[test]
+    fn delegated_marker_carries_compose_audit_when_present() {
+        let m = build_delegated_image_marker(
+            "beach at sunset",
+            Some("3:4"),
+            Some("b"),
+            Some("served/model"),
+            Some("gen-xyz"),
+        );
+        assert_eq!(m["prompt"], "beach at sunset");
+        assert_eq!(m["aspect_ratio"], "3:4");
+        assert_eq!(m["compose_variant"], "b");
+        assert_eq!(m["compose_model"], "served/model");
+        assert_eq!(m["compose_generation_id"], "gen-xyz");
+        assert_eq!(m.as_object().unwrap().len(), 5);
+
+        // No generation id from the provider → key absent, not null.
+        let m2 = build_delegated_image_marker(
+            "beach at sunset",
+            None,
+            None,
+            Some("served/model"),
+            None,
+        );
+        assert_eq!(m2["compose_model"], "served/model");
+        assert!(m2.as_object().unwrap().get("compose_generation_id").is_none());
+        assert!(m2.as_object().unwrap().get("compose_variant").is_none());
+        assert_eq!(m2.as_object().unwrap().len(), 2, "prompt + compose_model only");
     }
 
     #[test]
