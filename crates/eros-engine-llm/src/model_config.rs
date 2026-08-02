@@ -498,14 +498,13 @@ pub struct TierConfig {
     pub retry_depth: Option<u32>,
 }
 
-/// The `[defaults]` section — cross-task fallbacks and provider routing.
+/// The `[defaults]` section — cross-task fallbacks.
 ///
-/// **Construct with struct-update syntax** — `DefaultConfig { ignore_providers:
-/// vec![…], ..Default::default() }` — never a bare exhaustive literal. New
-/// optional fields are added here in minor releases (`ignore_providers`
-/// pre-v0.6.1, `provider_sort` v0.8.4) and a bare literal breaks on every such
-/// upgrade; `..Default::default()` is the supported construction pattern
-/// (issue #188).
+/// **Construct with struct-update syntax** — `DefaultConfig { fallback_model:
+/// Some(…), ..Default::default() }` — never a bare exhaustive literal. New
+/// optional fields are added here in minor releases and a bare literal breaks
+/// on every such upgrade; `..Default::default()` is the supported
+/// construction pattern (issue #188).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultConfig {
     #[serde(default)]
@@ -514,17 +513,17 @@ pub struct DefaultConfig {
     pub fallback_temperature: Option<f64>,
     #[serde(default)]
     pub fallback_max_tokens: Option<u32>,
-    /// OpenRouter provider slugs to exclude from routing on EVERY task
-    /// (issue #84). Each slug MUST carry the @openrouter suffix (the exclusion
-    /// list acts on OpenRouter routing only). Sent as `provider.ignore` on every
-    /// outbound call; the client reads this once at boot. Empty = no exclusion.
+    /// REMOVED (spec 2026-08-02-provider-body-params) — parsed only so
+    /// `validate_providers` can refuse boot with a migration message pointing
+    /// at `[[providers.openrouter.body]]`; never read anywhere else.
     #[serde(default)]
+    #[doc(hidden)]
     pub ignore_providers: Vec<String>,
-    /// OpenRouter `provider.sort` routing preference applied on EVERY task:
-    /// `"price"` / `"throughput"` / `"latency"`. `None` (absent) omits the
-    /// field, keeping OpenRouter's default price-based load balancing. Setting
-    /// it trades cost for the chosen axis — a deployer decision, off by default.
+    /// REMOVED (spec 2026-08-02-provider-body-params) — parsed only so
+    /// `validate_providers` can refuse boot with a migration message pointing
+    /// at `[[providers.openrouter.body]]`; never read anywhere else.
     #[serde(default)]
+    #[doc(hidden)]
     pub provider_sort: Option<String>,
 }
 
@@ -2317,13 +2316,62 @@ impl ModelConfig {
         }
         Ok(())
     }
+}
 
+/// Every task name the chat/completions pipeline can present to the
+/// body-rules matcher (`ChatRequest.task`). Used ONLY for the boot-time typo
+/// warning on `[[providers.*.body]].tasks` — matching itself is plain string
+/// equality, so an unlisted name warns, never errors.
+pub const KNOWN_CHAT_TASKS: &[&str] = &[
+    "chat_companion",
+    "chat_output_filter",
+    "chat_input_filter",
+    "chat_voice",
+    "chat_image_prompt_compose",
+    "chat_product_qa",
+    "pde_decision",
+    "insight_extraction",
+    "memory_extraction",
+    "affinity_evaluation",
+    "world_director",
+    "world_stories_director",
+    "world_comment",
+    "world_reply",
+];
+
+/// Tasks that make outbound calls but build their own bodies — body rules
+/// never reach them (spec: chat/completions `WireRequest` paths only).
+const BODY_UNSUPPORTED_TASKS: &[&str] = &["chat_vision", "embedding"];
+
+/// Pure warn-decision for one `[[providers.*.body]].tasks` entry —
+/// unit-testable without a tracing subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyTaskWarning {
+    /// A real engine task whose body this mechanism does not cover.
+    Unsupported,
+    /// Not an engine task name at all — probably a typo.
+    Unknown,
+}
+
+fn body_rule_task_warning(task: &str) -> Option<BodyTaskWarning> {
+    if BODY_UNSUPPORTED_TASKS.contains(&task) {
+        Some(BodyTaskWarning::Unsupported)
+    } else if !KNOWN_CHAT_TASKS.contains(&task) {
+        Some(BodyTaskWarning::Unknown)
+    } else {
+        None
+    }
+}
+
+impl ModelConfig {
     /// Boot gate for the `[providers]` block and every `@provider` model slug
     /// (spec 2026-08-01-embedding-providers §2/§4/§6/§7). Checks, in order:
     /// provider-table shape (charset, reserved name, non-empty URL);
-    /// `[defaults].ignore_providers` grammar; a task-aware LITERAL full scan
-    /// of every candidate slug — `[defaults].fallback_model`, every task's and
-    /// tier's `model`/`fallback`, `[tasks.embedding]`'s `model`/`model_read`/
+    /// per-entry body-rule structure (§2026-08-02-provider-body-params);
+    /// removed `[defaults]` provider-routing prefs (tombstone refusal); a
+    /// task-aware LITERAL full scan of every candidate slug —
+    /// `[defaults].fallback_model`, every task's and tier's
+    /// `model`/`fallback`, `[tasks.embedding]`'s `model`/`model_read`/
     /// `model_write`, including every round-robin element and weighted-table
     /// key — where `@voyage` is legal only on embedding-task slugs and every
     /// other referenced provider must have a non-empty `<NAME>_API_KEY` in the
@@ -2364,8 +2412,8 @@ impl ModelConfig {
             if self.providers[name].is_empty() {
                 return Err(format!(
                     "[providers].{name}: entry is empty — declare at least one of \
-                     `chat = \"<url>\"` or `embeddings = \"<url>\"` (or `headers` on \
-                     the `openrouter` entry)"
+                     `chat = \"<url>\"` or `embeddings = \"<url>\"` (or `headers` / \
+                     `body` on the `openrouter` entry)"
                 ));
             }
             if let Some(url) = self.providers[name].chat.as_deref() {
@@ -2379,25 +2427,70 @@ impl ModelConfig {
                 }
             }
             self.providers[name].validate_headers(name)?;
-        }
 
-        // 1.5. [defaults].ignore_providers must carry @openrouter (spec §4): the
-        // knob acts on OpenRouter routing only, and the mandatory suffix makes
-        // that scope part of the syntax.
-        for entry in &self.defaults.ignore_providers {
-            let (bare, provider) = crate::provider::split_model_slug(entry)
-                .map_err(|e| format!("[defaults].ignore_providers: {e}"))?;
-            match provider {
-                Some("openrouter") if !bare.is_empty() => {}
-                _ => {
+            if let Some(rules) = &self.providers[name].body {
+                if name != "openrouter" && self.providers[name].chat.is_none() {
                     return Err(format!(
-                        "[defaults].ignore_providers: `{entry}` must be written \
-                         `<upstream-slug>@openrouter` — the exclusion list acts on \
-                         OpenRouter routing only (custom providers and Voyage never \
-                         receive provider.ignore)"
+                        "[providers].{name}: declares body rules but no `chat` URL — \
+                         body params apply to chat/completions calls only (the reserved \
+                         `openrouter` entry may omit `chat`; the built-in URL serves it)"
                     ));
                 }
+                for (i, rule) in rules.iter().enumerate() {
+                    if rule.params.is_empty() {
+                        return Err(format!(
+                            "[providers].{name}.body[{i}].params: table is empty"
+                        ));
+                    }
+                    for key in ["model", "messages", "stream"] {
+                        if rule.params.contains_key(key) {
+                            return Err(format!(
+                                "[providers].{name}.body[{i}].params: `{key}` is engine-owned \
+                                 wire structure and cannot be overridden"
+                            ));
+                        }
+                    }
+                    if let Some(tasks) = &rule.tasks {
+                        if tasks.is_empty() {
+                            return Err(format!(
+                                "[providers].{name}.body[{i}].tasks: empty array — omit the \
+                                 key to mean \"all chat tasks\""
+                            ));
+                        }
+                        for t in tasks {
+                            match body_rule_task_warning(t) {
+                                Some(BodyTaskWarning::Unsupported) => tracing::warn!(
+                                    provider = %name, task = %t,
+                                    "[providers] body rule names a task this mechanism does \
+                                     not cover — it will never apply"
+                                ),
+                                Some(BodyTaskWarning::Unknown) => tracing::warn!(
+                                    provider = %name, task = %t,
+                                    "[providers] body rule names an unknown task — matching \
+                                     is exact, check for a typo"
+                                ),
+                                None => {}
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // 1.5. Removed [defaults] keys (spec 2026-08-02-provider-body-params):
+        // the fields still PARSE (tombstones) purely so an operator upgrading
+        // across the removal gets this message instead of a silently dead key.
+        if !self.defaults.ignore_providers.is_empty() || self.defaults.provider_sort.is_some() {
+            return Err(
+                "[defaults].ignore_providers / [defaults].provider_sort were removed: \
+                 provider routing prefs are now ordinary body params on the reserved \
+                 `openrouter` entry —\n\
+                 [[providers.openrouter.body]]\n\
+                 params = { provider = { ignore = [\"<slug>\"], sort = \"price\" } }\n\
+                 (bare OpenRouter provider slugs — no @openrouter suffix; add \
+                 tasks = [\"…\"] to scope the rule). Delete the [defaults] keys."
+                    .to_string(),
+            );
         }
 
         // 2. Literal full scan of every candidate slug. The third element flags
@@ -4777,21 +4870,6 @@ filter_prompt = "只根据产品资料作答。"
     }
 
     #[test]
-    fn defaults_ignore_providers_parses() {
-        let toml = r#"
-            [defaults]
-            ignore_providers = ["BadHost@openrouter", "AnotherHost@openrouter"]
-            [tasks.chat_companion]
-            model = "x/y"
-        "#;
-        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
-        assert_eq!(
-            cfg.defaults.ignore_providers,
-            vec!["BadHost@openrouter", "AnotherHost@openrouter"]
-        );
-    }
-
-    #[test]
     fn defaults_ignore_providers_absent_is_empty() {
         let toml = r#"
             [tasks.chat_companion]
@@ -4799,6 +4877,101 @@ filter_prompt = "只根据产品资料作答。"
         "#;
         let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert!(cfg.defaults.ignore_providers.is_empty());
+    }
+
+    #[test]
+    fn removed_defaults_prefs_refuse_boot() {
+        for src in [
+            "[defaults]\nignore_providers = [\"bad@openrouter\"]\n",
+            "[defaults]\nprovider_sort = \"latency\"\n",
+        ] {
+            let cfg = ModelConfig::from_toml_str(src).unwrap();
+            let err = cfg
+                .validate_providers_with(|_| Some("k".into()))
+                .unwrap_err();
+            assert!(
+                err.contains("[[providers.openrouter.body]]"),
+                "removal error must teach the replacement: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_rule_empty_params_refuses() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers.venice]\nchat = \"https://v/chat\"\n\
+             [[providers.venice.body]]\nparams = { }\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_providers_with(|_| Some("k".into()))
+            .unwrap_err();
+        assert!(err.contains("body[0].params"), "{err}");
+    }
+
+    #[test]
+    fn body_rule_structural_keys_refuse() {
+        for key in ["model", "messages", "stream"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[providers.venice]\nchat = \"https://v/chat\"\n\
+                 [[providers.venice.body]]\nparams = {{ {key} = \"x\" }}\n"
+            ))
+            .unwrap();
+            let err = cfg
+                .validate_providers_with(|_| Some("k".into()))
+                .unwrap_err();
+            assert!(err.contains("engine-owned"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn body_rule_empty_tasks_refuses() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers.venice]\nchat = \"https://v/chat\"\n\
+             [[providers.venice.body]]\ntasks = []\nparams = { a = 1 }\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_providers_with(|_| Some("k".into()))
+            .unwrap_err();
+        assert!(err.contains("tasks"), "{err}");
+    }
+
+    #[test]
+    fn body_without_chat_refuses_for_custom_but_not_openrouter() {
+        let custom = ModelConfig::from_toml_str(
+            "[providers.venice]\nembeddings = \"https://v/emb\"\n\
+             [[providers.venice.body]]\nparams = { a = 1 }\n",
+        )
+        .unwrap();
+        assert!(custom
+            .validate_providers_with(|_| Some("k".into()))
+            .unwrap_err()
+            .contains("no `chat` URL"));
+
+        let openrouter =
+            ModelConfig::from_toml_str("[[providers.openrouter.body]]\nparams = { a = 1 }\n")
+                .unwrap();
+        assert!(openrouter
+            .validate_providers_with(|_| Some("k".into()))
+            .is_ok());
+    }
+
+    #[test]
+    fn body_rule_task_warning_semantics() {
+        assert_eq!(body_rule_task_warning("chat_companion"), None);
+        assert_eq!(
+            body_rule_task_warning("chat_vision"),
+            Some(BodyTaskWarning::Unsupported)
+        );
+        assert_eq!(
+            body_rule_task_warning("embedding"),
+            Some(BodyTaskWarning::Unsupported)
+        );
+        assert_eq!(
+            body_rule_task_warning("chat_companon"),
+            Some(BodyTaskWarning::Unknown)
+        );
     }
 
     #[test]
@@ -4831,56 +5004,25 @@ filter_prompt = "只根据产品资料作答。"
     }
 
     #[test]
-    fn ignore_providers_require_openrouter_suffix() {
-        let cfg =
-            ModelConfig::from_toml_str("[defaults]\nignore_providers = [\"bad-slug\"]\n").unwrap();
-        let msg = cfg.validate_providers_with(|_| None).unwrap_err();
-        assert!(
-            msg.contains("@openrouter"),
-            "must teach the new form: {msg}"
-        );
-    }
-
-    #[test]
-    fn ignore_providers_reject_other_provider_suffix() {
-        let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = { chat = \"https://x/c\" }\n\
-             [defaults]\nignore_providers = [\"bad-slug@venice\"]\n",
-        )
-        .unwrap();
-        assert!(cfg.validate_providers_with(|_| None).is_err());
-    }
-
-    #[test]
     fn ignore_providers_wire_slugs_are_stripped() {
+        // `validate_providers_with` now refuses whenever `ignore_providers` is
+        // non-empty (removed-defaults tombstone) — that refusal is covered by
+        // `removed_defaults_prefs_refuse_boot`. This test only pins the
+        // still-live stripping helper (dies with it in Task 3).
         let cfg = ModelConfig::from_toml_str(
             "[defaults]\nignore_providers = [\"bad-a@openrouter\", \"bad-b@openrouter\"]\n",
         )
         .unwrap();
-        // No [tasks.embedding] ⇒ the default embedding route is the built-in
-        // Voyage client, so validation now also needs VOYAGE_API_KEY.
-        assert!(cfg
-            .validate_providers_with(|k| (k == "VOYAGE_API_KEY").then(|| "k".to_string()))
-            .is_ok());
         assert_eq!(cfg.ignore_provider_wire_slugs(), vec!["bad-a", "bad-b"]);
     }
 
     #[test]
-    fn defaults_provider_sort_parses_and_defaults_none() {
-        let with = r#"
-            [defaults]
-            provider_sort = "latency"
+    fn defaults_provider_sort_absent_is_none() {
+        let toml = r#"
             [tasks.chat_companion]
             model = "x/y"
         "#;
-        let cfg = ModelConfig::from_toml_str(with).expect("parse");
-        assert_eq!(cfg.defaults.provider_sort.as_deref(), Some("latency"));
-
-        let without = r#"
-            [tasks.chat_companion]
-            model = "x/y"
-        "#;
-        let cfg = ModelConfig::from_toml_str(without).expect("parse");
+        let cfg = ModelConfig::from_toml_str(toml).expect("parse");
         assert!(cfg.defaults.provider_sort.is_none());
     }
 
