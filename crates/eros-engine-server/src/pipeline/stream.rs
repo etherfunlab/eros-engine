@@ -158,22 +158,27 @@ fn build_image_request_frame(
     }
 }
 
-/// `metadata.image` marker for a delegated image turn. Always stores the PDE
-/// seed subject (under `prompt`, the key `assistant_transcript_line` reads)
-/// and the aspect ratio; when the composer LLM call SUCCEEDED it also stores
-/// the audit trio `compose_variant` / `compose_model` / `compose_generation_id`
-/// (spec 2026-08-02; absence = no successful compose this turn — raw skip,
+/// `metadata.image` marker for a delegated image turn. Always stores the
+/// composer's subject (under `prompt`, the key `assistant_transcript_line`
+/// reads) and the aspect ratio; stores `caption` when the composer produced
+/// one; when the composer LLM call SUCCEEDED it also stores the audit trio
+/// `compose_variant` / `compose_model` / `compose_generation_id` (spec
+/// 2026-08-02; absence = no successful compose this turn — raw skip,
 /// fail-open, or task not configured). Deliberately NOT stored: the composed
 /// wire prompt (the consumer's job), url, or success/failure of the draw.
 /// Pure.
 fn build_delegated_image_marker(
-    seed_subject: &str,
+    subject: &str,
+    caption: Option<&str>,
     aspect_ratio: Option<&str>,
     compose_variant: Option<&str>,
     compose_model: Option<&str>,
     compose_generation_id: Option<&str>,
 ) -> serde_json::Value {
-    let mut m = serde_json::json!({ "prompt": seed_subject });
+    let mut m = serde_json::json!({ "prompt": subject });
+    if let Some(c) = caption.filter(|s| !s.trim().is_empty()) {
+        m["caption"] = serde_json::Value::String(c.to_string());
+    }
     if let Some(ar) = aspect_ratio.filter(|s| !s.is_empty()) {
         m["aspect_ratio"] = serde_json::Value::String(ar.to_string());
     }
@@ -2352,26 +2357,64 @@ async fn run_input_filter(
     None // chain exhausted → keep
 }
 
-/// Assemble the composer's user message from the appearance, recent scene, seed
-/// subject, style, and aspect ratio. Pure (kept separate so it is testable
-/// without a network call).
+/// Assemble the composer's user message from the appearance, recent scene,
+/// latest user message, seed subject, style, and aspect ratio. Pure (kept
+/// separate so it is testable without a network call).
 fn compose_user_payload(
     appearance: &str,
     recent_scene: &str,
+    latest_user_msg: &str,
     seed_subject: &str,
     style: &str,
     aspect_ratio: &str,
 ) -> String {
     format!(
-        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
-/// A SUCCESSFUL composer call's result: the enriched subject plus the audit
-/// values persisted to `metadata.image` (spec 2026-08-02). Mirrors
-/// `VisionOutcome`.
+/// The composer's JSON contract.
+#[derive(serde::Deserialize)]
+struct ComposeReply {
+    prompt: String,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// Parse a composer reply into `(prompt, caption)`.
+///
+/// Direct JSON first, then a balanced JSON block in prose (same ladder as
+/// `parse_pde_verdict`). **A reply that is neither becomes the prompt with no
+/// caption** — deliberate, and load-bearing for migration: a deployment that
+/// ships this version without rewriting its EXPAND-era composer `filter_prompt`
+/// still gets working images (degraded, since that prompt aims at a seed that
+/// is now usually empty), just bare markers until the prompt is updated.
+///
+/// A blank caption is normalised to `None`; callers must not persist `""`.
+fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
+    let parsed = serde_json::from_str::<ComposeReply>(raw).ok().or_else(|| {
+        super::find_json_block(raw).and_then(|b| serde_json::from_str::<ComposeReply>(b).ok())
+    });
+    match parsed {
+        Some(r) => {
+            let caption = r
+                .caption
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty());
+            (r.prompt.trim().to_string(), caption)
+        }
+        None => (raw.trim().to_string(), None),
+    }
+}
+
+/// A SUCCESSFUL composer call's result: the picture subject, the short caption
+/// for history-facing renders, plus the audit values persisted to
+/// `metadata.image` (spec 2026-08-02). Mirrors `VisionOutcome`.
 struct ComposeOutcome {
-    text: String,
+    prompt: String,
+    /// One short line describing what the picture shows, for the chat history
+    /// and the judge transcript. `None` when the model gave none.
+    caption: Option<String>,
     /// Model that actually answered: `resp.model`, falling back to the
     /// attempted model id (same idiom as the vision audit).
     model: String,
@@ -2381,17 +2424,19 @@ struct ComposeOutcome {
     variant: Option<String>,
 }
 
-/// Enrich the image subject via the optional composer LLM. Walks
-/// `[model] + fallback` on transport failure (error/timeout/empty); returns the
-/// trimmed enriched subject plus the audit trio on first success, or `None`
-/// (caller falls back to the seed). Never blocks or fails the image turn.
-/// Mirrors `run_input_filter`.
+/// Generate the image prompt (and its caption) via the optional composer LLM.
+/// Walks `[model] + fallback` on transport failure (error/timeout/empty);
+/// returns the parsed prompt/caption plus the audit trio on first success, or
+/// `None` (caller falls back to the seed). Never blocks or fails the image
+/// turn. Mirrors `run_input_filter`.
+#[allow(clippy::too_many_arguments)]
 async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     persona: &eros_engine_core::persona::CompanionPersona,
     seed_subject: &str,
     recent_scene: &str,
+    latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
 ) -> Option<ComposeOutcome> {
@@ -2405,8 +2450,13 @@ async fn run_image_prompt_compose(
     } else {
         recent_scene
     };
+    let latest = if latest_user_msg.trim().is_empty() {
+        "（无）"
+    } else {
+        latest_user_msg
+    };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    let user_payload = compose_user_payload(appearance, scene, seed_subject, style, ar);
+    let user_payload = compose_user_payload(appearance, scene, latest, seed_subject, style, ar);
     let chain: Vec<String> = std::iter::once(c.model.clone())
         .chain(c.fallback_model.iter().cloned())
         .collect();
@@ -2447,8 +2497,14 @@ async fn run_image_prompt_compose(
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
             continue;
         }
+        let (prompt, caption) = parse_compose_reply(&text);
+        if prompt.is_empty() {
+            tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
+            continue;
+        }
         return Some(ComposeOutcome {
-            text,
+            prompt,
+            caption,
             model: resp.model.unwrap_or_else(|| model_id.clone()),
             generation_id: resp.generation_id,
             variant: c.variant_key.clone(),
@@ -2510,8 +2566,15 @@ fn resolve_image_turn_inputs(
 /// absent: it is consumed internally by `compose_image_prompt` and neither
 /// caller uses it afterwards.
 struct DelegatedImagePrompt {
-    /// Seed subject — feeds `build_delegated_image_marker`.
+    /// Seed subject — feeds `build_delegated_image_marker`'s `prompt` key. This
+    /// is deliberately the SEED, not the composer's enriched/generated text
+    /// (that lives only in `composed_prompt`, on the wire): keeps the
+    /// persisted marker compact regardless of composer outcome.
     seed_subject: String,
+    /// Short description of the picture, persisted as `metadata.image.caption`
+    /// and read by every history-facing render. `None` on a failed compose or
+    /// when the task is not configured.
+    caption: Option<String>,
     /// Effective aspect ratio — feeds the marker and the wire frame.
     aspect_ratio: Option<String>,
     /// Final wire prompt — feeds the wire frame.
@@ -2535,6 +2598,7 @@ async fn build_delegated_image_prompt(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
     pde_transcript: &str,
+    latest_user_msg: &str,
 ) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
@@ -2550,6 +2614,7 @@ async fn build_delegated_image_prompt(
                 persona,
                 &inputs.seed_subject,
                 pde_transcript,
+                latest_user_msg,
                 inputs.aspect_ratio.as_deref(),
                 &style_str,
             )
@@ -2557,14 +2622,22 @@ async fn build_delegated_image_prompt(
         }
         None => None,
     };
-    let (final_subject, compose_variant, compose_model, compose_generation_id) = match compose {
-        Some(o) => (o.text, o.variant, Some(o.model), o.generation_id),
-        None => (inputs.seed_subject.clone(), None, None, None),
-    };
+    let (final_subject, caption, compose_variant, compose_model, compose_generation_id) =
+        match compose {
+            Some(o) => (
+                o.prompt,
+                o.caption,
+                o.variant,
+                Some(o.model),
+                o.generation_id,
+            ),
+            None => (inputs.seed_subject.clone(), None, None, None, None),
+        };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
     DelegatedImagePrompt {
         seed_subject: inputs.seed_subject,
+        caption,
         aspect_ratio: inputs.aspect_ratio,
         composed_prompt,
         compose_variant,
@@ -3358,17 +3431,19 @@ pub fn run_stream(
                         &plan,
                         req_image,
                         &pde_transcript.transcript,
+                        &user_msg.content,
                     )
                     .await;
                     let subject = img.seed_subject;
                     let aspect = img.aspect_ratio;
                     let composed_prompt = img.composed_prompt;
-                    // Persist the marker (seed subject + aspect + compose
+                    // Persist the marker (subject + caption + aspect + compose
                     // audit trio on success) so the PDE stays image-aware
                     // (§5); the composed prompt and the draw result live with
                     // the consumer.
                     let marker = build_delegated_image_marker(
                         &subject,
+                        img.caption.as_deref(),
                         aspect.as_deref(),
                         img.compose_variant.as_deref(),
                         img.compose_model.as_deref(),
@@ -3686,17 +3761,19 @@ pub fn run_stream(
                             &plan,
                             req_image,
                             &pde_transcript.transcript,
+                            &user_msg.content,
                         )
                         .await;
                         let subject = img.seed_subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
-                        // Merge the marker (seed subject + aspect + compose
+                        // Merge the marker (subject + caption + aspect + compose
                         // audit trio on success) onto the already-persisted
                         // text row so the PDE stays image-aware (§5). The text
                         // already reached the client; `final` follows below.
                         let marker = build_delegated_image_marker(
                             &subject,
+                            img.caption.as_deref(),
                             aspect.as_deref(),
                             img.compose_variant.as_deref(),
                             img.compose_model.as_deref(),
@@ -4022,6 +4099,7 @@ mod tests {
         let p = compose_user_payload(
             "freckled, red hair",
             "（无）",
+            "（无）",
             "on a rooftop",
             "realistic",
             "9:16",
@@ -4031,6 +4109,77 @@ mod tests {
         assert!(p.contains("on a rooftop"));
         assert!(p.contains("realistic"));
         assert!(p.contains("9:16"));
+    }
+
+    #[test]
+    fn compose_user_payload_includes_latest_user_message() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "给我看看你现在的样子",
+            "on a rooftop",
+            "realistic",
+            "9:16",
+        );
+        assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
+        assert!(p.contains("[画面主题种子]\non a rooftop"), "{p}");
+    }
+
+    #[test]
+    fn parse_compose_reply_reads_direct_json() {
+        let (p, c) =
+            parse_compose_reply(r#"{"prompt":"on a rooftop at dusk","caption":"在天台看夕阳"}"#);
+        assert_eq!(p, "on a rooftop at dusk");
+        assert_eq!(c.as_deref(), Some("在天台看夕阳"));
+    }
+
+    #[test]
+    fn parse_compose_reply_salvages_json_in_prose() {
+        let raw = "Sure! Here you go:\n{\"prompt\":\"a selfie in a cafe\",\"caption\":\"咖啡店自拍\"}\nHope that helps.";
+        let (p, c) = parse_compose_reply(raw);
+        assert_eq!(p, "a selfie in a cafe");
+        assert_eq!(c.as_deref(), Some("咖啡店自拍"));
+    }
+
+    #[test]
+    fn parse_compose_reply_plain_text_becomes_prompt_with_no_caption() {
+        // Migration fallback: an EXPAND-era composer prompt still yields a
+        // working image prompt, just no caption.
+        let (p, c) = parse_compose_reply("  a windswept portrait on the cliffs  ");
+        assert_eq!(p, "a windswept portrait on the cliffs");
+        assert_eq!(c, None);
+    }
+
+    #[test]
+    fn parse_compose_reply_blank_caption_is_none() {
+        let (p, c) = parse_compose_reply(r#"{"prompt":"x","caption":"   "}"#);
+        assert_eq!(p, "x");
+        assert_eq!(c, None, "a blank caption is absent, not empty-string");
+    }
+
+    #[test]
+    fn delegated_image_marker_carries_caption_when_present() {
+        let m = build_delegated_image_marker(
+            "on a rooftop",
+            Some("在天台"),
+            Some("3:4"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m["prompt"], "on a rooftop");
+        assert_eq!(m["caption"], "在天台");
+        assert_eq!(m["aspect_ratio"], "3:4");
+    }
+
+    #[test]
+    fn delegated_image_marker_omits_absent_caption() {
+        let m = build_delegated_image_marker("on a rooftop", None, None, None, None, None);
+        assert_eq!(m["prompt"], "on a rooftop");
+        assert!(
+            m.get("caption").is_none(),
+            "absent caption must not be written: {m}"
+        );
     }
 
     // ─── resolve_image_turn_inputs ───────────────────────────────────────
@@ -12090,9 +12239,11 @@ data: [DONE]\n\n"
 
     #[test]
     fn delegated_marker_preserves_image_awareness() {
-        // Seed subject under `prompt` (the key assistant_transcript_line reads),
-        // plus aspect — and NOTHING else (no composed prompt / model / gen id).
-        let marker = build_delegated_image_marker("beach at sunset", Some("3:4"), None, None, None);
+        // Subject under `prompt` (the key assistant_transcript_line reads),
+        // plus aspect — and NOTHING else (no caption / composed prompt / model
+        // / gen id).
+        let marker =
+            build_delegated_image_marker("beach at sunset", None, Some("3:4"), None, None, None);
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
         assert_eq!(
@@ -12108,7 +12259,7 @@ data: [DONE]\n\n"
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
         // No aspect => still a valid one-key marker that annotates.
-        let m2 = build_delegated_image_marker("a portrait", None, None, None, None);
+        let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None);
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
         assert!(assistant_transcript_line("", Some(&w2)).contains("a portrait"));
@@ -12120,6 +12271,7 @@ data: [DONE]\n\n"
     fn delegated_marker_carries_compose_audit_when_present() {
         let m = build_delegated_image_marker(
             "beach at sunset",
+            None,
             Some("3:4"),
             Some("b"),
             Some("served/model"),
@@ -12133,8 +12285,14 @@ data: [DONE]\n\n"
         assert_eq!(m.as_object().unwrap().len(), 5);
 
         // No generation id from the provider → key absent, not null.
-        let m2 =
-            build_delegated_image_marker("beach at sunset", None, None, Some("served/model"), None);
+        let m2 = build_delegated_image_marker(
+            "beach at sunset",
+            None,
+            None,
+            None,
+            Some("served/model"),
+            None,
+        );
         assert_eq!(m2["compose_model"], "served/model");
         assert!(m2
             .as_object()

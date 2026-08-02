@@ -1154,16 +1154,26 @@ pub struct ResolvedVoice {
 /// Generic, product-identity-free default prompt for the image-prompt composer.
 /// Used when the task is enabled but supplies no `filter_prompt`; deployments
 /// override it via `[tasks.chat_image_prompt_compose].filter_prompt`. Keep the
-/// text identity-free — no product name or brand. Its stance is EXPAND-ONLY: it
-/// must not soften, downgrade, or refuse, and must not add its own
+/// text identity-free — no product name or brand.
+///
+/// Its stance is GENERATE (not expand): the judge no longer writes a seed, so
+/// this step decides what the picture shows from the turn's context. It must
+/// not soften, downgrade, or refuse, and must not add its own
 /// content-moderation layer — content policy is enforced by the image provider
-/// and the downstream consumer, not this step. This is the one engine task whose
-/// prompt ships in code.
-const DEFAULT_COMPOSE_PROMPT: &str = "You expand a short image subject into a single, detailed, vivid image-generation prompt. \
-You receive the character's appearance, the recent scene, a seed subject, a visual style, and a target aspect ratio, each as a labeled section. \
-Your only job is to EXPAND: produce one coherent prompt that faithfully preserves the appearance and the full intent and tone of the seed subject, and fits the style and aspect ratio. \
-Do not soften, sanitize, downgrade, omit, censor, or refuse any part of the requested subject, and do not add safety warnings, disclaimers, or moderation of your own — content policy is the responsibility of the image provider and the downstream consumer, not this step. \
-Do not add commentary, options, or headings. Output only the final image prompt.";
+/// and the downstream consumer, not this step.
+///
+/// It returns JSON with two fields: `prompt` (the image-generation string) and
+/// `caption` (one short line for the chat history). This is the one engine task
+/// whose prompt ships in code.
+const DEFAULT_COMPOSE_PROMPT: &str = "You compose the image for a picture the character is sending in a chat, and you return JSON with exactly two fields: \"prompt\" and \"caption\".\n\
+\n\
+You receive the character's appearance, the recent scene, the partner's latest message, an optional explicit subject, a visual style, and a target aspect ratio, each as a labeled section.\n\
+\n\
+\"prompt\" is the image-generation prompt: decide what the picture shows from the latest message and the scene; when the explicit subject is non-empty it states what the picture must show — honor it fully. Produce one coherent, detailed, vivid prompt that faithfully preserves the appearance and fits the style and aspect ratio, delivering the full intent and tone of the request. Do not soften, sanitize, downgrade, omit, censor, or refuse any part of it, and do not add safety warnings, disclaimers, or moderation of your own — content policy is the responsibility of the image provider and the downstream consumer, not this step.\n\
+\n\
+\"caption\" is one short line, in the language the conversation is in, saying what the picture shows — as the character would recall it later. It is read back into the conversation history, so keep it brief and natural; it is not an image-generation prompt and must not repeat the style boilerplate.\n\
+\n\
+Output only the JSON object. No commentary, options, or headings.";
 
 /// Resolved image-prompt composer task (`chat_image_prompt_compose`). Mirrors
 /// `ResolvedVision`. Optional: `resolve_image_prompt_compose` returns `None`
