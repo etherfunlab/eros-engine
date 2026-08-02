@@ -116,7 +116,12 @@ whole top-level key (`model_config.rs:1405`).
 | `ProviderPrefs`, `provider_prefs()` | `openrouter.rs:279`, `:642` |
 | `WireRequest.provider` | field within `openrouter.rs:287-313` |
 | `OpenRouterClient::with_ignore_providers`, `::with_provider_sort` (+ fields) | `openrouter.rs:513-561` region |
+| vision-body prefs injection (`execute_vision` merges `provider_prefs()` into the built-in-endpoint vision body) | `openrouter.rs:791-797` |
 | boot wiring of the two builders | `main.rs:357-364` |
+
+Consequence of the vision row (found during planning): `chat_vision` calls
+lose `provider.ignore`/`sort` entirely — body rules are chat-only and do not
+replace them there. Accepted; revisit only if a vision routing need appears.
 
 ## 4. Tests
 
