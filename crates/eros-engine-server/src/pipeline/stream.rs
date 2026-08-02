@@ -3607,6 +3607,14 @@ pub fn run_stream(
                 // Skip tipped turns too: a tip persists as role='gift_user' whose
                 // "(打赏 $X)" marker / typed message should reach the model as-is,
                 // not be rewritten by the filter — running it would waste the call.
+                //
+                // The text the model will actually see this turn. The input
+                // filter persists its rewrite and `build_reply_request` re-reads
+                // it from the DB; the composer runs concurrently and must not
+                // pay a second read, so track it locally. Keeping the composer
+                // on the SAME text as the chat model is what stops the picture
+                // drifting from the reply.
+                let mut effective_user_msg = user_msg.content.clone();
                 if user_msg.tips_amount_usd.is_none() {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
@@ -3636,6 +3644,7 @@ pub fn run_stream(
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
                         {
+                            effective_user_msg = rw.rewritten_text.clone();
                             if let Err(e) = chat_repo
                                 .set_user_input_rewrite(
                                     user_msg.user_message_id,
@@ -3651,6 +3660,38 @@ pub fn run_stream(
                         }
                     }
                 }
+                // ── Concurrent image composition (reply_text_image only) ──────
+                // Fired here, after the input filter (so the composer sees the
+                // same text as the chat model) and before build_reply_request —
+                // which alone does a 20-row history fetch, an embedding call and
+                // memory/world recall before the chat stream even starts. One
+                // short composer call hides completely underneath, taking the
+                // turn's serial LLM hops from 3 to 2.
+                //
+                // `reply_image` is deliberately excluded: it has no text task to
+                // overlap with and returns early via `image_only_done`.
+                let compose_handle: Option<tokio::task::JoinHandle<DelegatedImagePrompt>> =
+                    if matches!(plan.action_type, ActionType::ReplyTextImage) {
+                        let state_c = (*state).clone();
+                        let persona_c = input.persona.clone();
+                        let plan_c = plan.clone();
+                        let req_image_c = req_image.cloned();
+                        let scene_c = pde_transcript.transcript.clone();
+                        let latest_c = effective_user_msg.clone();
+                        Some(tokio::spawn(async move {
+                            build_delegated_image_prompt(
+                                &state_c,
+                                &persona_c,
+                                &plan_c,
+                                req_image_c.as_ref(),
+                                &scene_c,
+                                &latest_c,
+                            )
+                            .await
+                        }))
+                    } else {
+                        None
+                    };
                 let req_res = crate::pipeline::handlers::build_reply_request(
                     &state, &input, &plan,
                     user_msg.session_id, user_msg.user_id, user_msg.instance_id,
@@ -3659,6 +3700,9 @@ pub fn run_stream(
                 let (req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
+                        if let Some(h) = compose_handle.as_ref() {
+                            h.abort();
+                        }
                         yield ProtocolFrame::Error {
                             code: StreamErrorCode::Internal,
                             retryable: false,
@@ -3775,15 +3819,38 @@ pub fn run_stream(
                     if let Some(last) = produced.last() {
                         let msg_uuid = last.message_id;
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
-                        let img = build_delegated_image_prompt(
-                            &state,
-                            &input.persona,
-                            &plan,
-                            req_image,
-                            &pde_transcript.transcript,
-                            &user_msg.content,
-                        )
-                        .await;
+                        // The composer was spawned before the chat call; by now
+                        // it has almost always finished, so this await is ~free.
+                        // A panicked or cancelled task degrades exactly like a
+                        // failed compose — never a dropped frame.
+                        let img = match compose_handle {
+                            Some(h) => match h.await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("image-compose task failed: {e}");
+                                    build_delegated_image_prompt(
+                                        &state,
+                                        &input.persona,
+                                        &plan,
+                                        req_image,
+                                        &pde_transcript.transcript,
+                                        &effective_user_msg,
+                                    )
+                                    .await
+                                }
+                            },
+                            None => {
+                                build_delegated_image_prompt(
+                                    &state,
+                                    &input.persona,
+                                    &plan,
+                                    req_image,
+                                    &pde_transcript.transcript,
+                                    &effective_user_msg,
+                                )
+                                .await
+                            }
+                        };
                         let subject = img.subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
