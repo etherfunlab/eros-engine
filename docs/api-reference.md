@@ -55,6 +55,11 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 `is_new=false` if you call `/start` again with the same `genome_id` for the same user — the engine resumes the existing session rather than creating a duplicate.
 
+Optional `channel` field: `"text"` (default) or `"voice"`. Start/resume is
+channel-scoped — a voice-channel start never resumes a text session (and
+vice versa). Voice clients must obtain their session here with
+`"channel": "voice"` before calling the voice turn endpoint.
+
 ### `POST /comp/chat/{session_id}/message/stream`
 
 Streaming chat turn. Returns `text/event-stream` with the
@@ -348,6 +353,46 @@ carries an optional `channel` field — `"product_qa"` marks an
 out-of-character product answer (excluded from companion context/memory,
 same as its live-stream `action_type`); the field is omitted for normal
 turns.
+
+## Voice
+
+### `POST /comp/voice/{session_id}/turn/stream`
+
+Lean voice-channel turn: one transcribed user utterance in, one streamed
+text reply out. STT and TTS are entirely the caller's job — the engine
+never touches audio (see the
+[voice-call parts design spec](superpowers/specs/2026-07-07-voice-call-parts-design.md)).
+
+Returns `text/event-stream` with a reduced frame set: `delta`* then a
+terminal `done`, or a single `error` — the same frame shapes as the chat
+message stream above, but with **no** `meta` frame and no `action_type`.
+
+The session must be a **voice-channel** session (`409 wrong_channel`
+otherwise) — obtain one via `POST /comp/chat/start` with
+`"channel": "voice"`. Voice is opt-in per deployment: without a
+`[tasks.chat_voice]` block in the model config the endpoint returns
+`501 voice_disabled`.
+
+The prompt is deliberately thin: persona + voice directive + one
+relationship line derived from the session's affinity (bond/chemistry
+tiers). No vector recall, no memories, no traits/scopes/heavy blocks.
+
+Body fields:
+
+- `content` — the user utterance. Max 4096 chars.
+- `client_msg_id` — 26..36 ASCII-printable chars (any UUID or ULID).
+  Replaying the same `(session_id, client_msg_id)` returns `409 duplicate`
+  rather than generating a second reply.
+- `relationship_scope` (optional) — which halves of the relationship line
+  to inject this turn: `"none"`, `"bond"`, `"chemistry"`, `"both"`
+  (default `"both"`). The resolved value is recorded on the assistant
+  row's `metadata.relationship_scope`.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
 
 ## Profile
 
