@@ -350,17 +350,14 @@ async fn run_server() -> Result<()> {
     };
 
     // OpenRouter client is constructed after model_config so we can wire in the
-    // global provider routing prefs from [defaults] (exclusion list + optional
-    // sort), the [providers] endpoint map, and the [providers].openrouter
-    // entry (chat URL override + default headers, replacing the old
-    // OPENROUTER_BASE_URL / OPENROUTER_APP_* env vars).
+    // [providers] endpoint map and the [providers].openrouter entry (chat URL
+    // override + default headers, replacing the old OPENROUTER_BASE_URL /
+    // OPENROUTER_APP_* env vars).
     let openrouter = Arc::new(
         eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key)
             .with_openrouter_chat_url(model_config.openrouter_chat_url())
             .with_openrouter_headers(model_config.openrouter_header_map())
-            .with_providers(model_config.build_providers())
-            .with_ignore_providers(model_config.ignore_provider_wire_slugs())
-            .with_provider_sort(model_config.defaults.provider_sort.clone()),
+            .with_providers(model_config.build_providers()),
     );
 
     // Computed once at boot, before model_config is moved into the state

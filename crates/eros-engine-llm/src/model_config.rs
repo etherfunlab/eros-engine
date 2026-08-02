@@ -2707,22 +2707,6 @@ impl ModelConfig {
             .collect()
     }
 
-    /// `[defaults].ignore_providers` with the mandatory `@openrouter` suffix
-    /// stripped — what `provider.ignore` carries on the wire. Call only after
-    /// `validate_providers` passed; entries that fail the grammar are skipped
-    /// (unreachable post-boot).
-    pub fn ignore_provider_wire_slugs(&self) -> Vec<String> {
-        self.defaults
-            .ignore_providers
-            .iter()
-            .filter_map(|e| {
-                crate::provider::split_model_slug(e)
-                    .ok()
-                    .map(|(bare, _)| bare)
-            })
-            .collect()
-    }
-
     /// `[providers].openrouter.chat`, if declared — the built-in chat URL
     /// override (spec §4).
     pub fn openrouter_chat_url(&self) -> Option<String> {
@@ -5001,19 +4985,6 @@ filter_prompt = "只根据产品资料作答。"
         // "4e2" parses as 400.0 (scientific notation) — well past the N >= 4
         // gate, but "e" isn't a version-number character.
         assert_eq!(voyage_model_generation("voyage-4e2"), None);
-    }
-
-    #[test]
-    fn ignore_providers_wire_slugs_are_stripped() {
-        // `validate_providers_with` now refuses whenever `ignore_providers` is
-        // non-empty (removed-defaults tombstone) — that refusal is covered by
-        // `removed_defaults_prefs_refuse_boot`. This test only pins the
-        // still-live stripping helper (dies with it in Task 3).
-        let cfg = ModelConfig::from_toml_str(
-            "[defaults]\nignore_providers = [\"bad-a@openrouter\", \"bad-b@openrouter\"]\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.ignore_provider_wire_slugs(), vec!["bad-a", "bad-b"]);
     }
 
     #[test]
