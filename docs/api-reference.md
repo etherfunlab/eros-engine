@@ -273,7 +273,6 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
           "force": true,
           "mode": "text_image",
           "style": "realistic",
-          "image_prompt": "warm candid selfie, soft indoor light",
           "aspect_ratio": "3:4"
         }
       }' \
@@ -291,9 +290,8 @@ draws on the chat stream).
 | `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
-| `image_prompt` | `String` | PDE judge / user text | Subject for the forced path. On the PDE path the judge's own `image_prompt` is used. |
 | `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
-| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely and draws the seed subject as-is. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
+| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely, saving one LLM call. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
 (`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
@@ -301,7 +299,7 @@ frame (below) — the chat stream never resolves it to a URL itself. The
 `previous`-with-no-image → `face` fallback, and the `face_ref_url` /
 `prev_image_url` reference URLs, belong to the consumer's own image-vendor
 call (the engine has no draw endpoint). The persisted `metadata.image` marker
-records the seed subject and aspect ratio, plus — only when the composer LLM
+records the composer's picture subject and the aspect ratio, plus — only when the composer LLM
 call succeeded — the audit trio `compose_variant` (the `filter_prompt`
 key/index that was selected, absent for a plain or built-in prompt),
 `compose_model`, and `compose_generation_id`. Absence of the trio means the

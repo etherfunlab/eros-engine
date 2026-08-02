@@ -2360,18 +2360,17 @@ async fn run_input_filter(
 }
 
 /// Assemble the composer's user message from the appearance, recent scene,
-/// latest user message, seed subject, style, and aspect ratio. Pure (kept
-/// separate so it is testable without a network call).
+/// latest user message, style, and aspect ratio. Pure (kept separate so it is
+/// testable without a network call).
 fn compose_user_payload(
     appearance: &str,
     recent_scene: &str,
     latest_user_msg: &str,
-    seed_subject: &str,
     style: &str,
     aspect_ratio: &str,
 ) -> String {
     format!(
-        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[画面主题种子]\n{seed_subject}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
@@ -2429,14 +2428,12 @@ struct ComposeOutcome {
 /// Generate the image prompt (and its caption) via the optional composer LLM.
 /// Walks `[model] + fallback` on transport failure (error/timeout/empty);
 /// returns the parsed prompt/caption plus the audit trio on first success, or
-/// `None` (caller falls back to the seed). Never blocks or fails the image
-/// turn. Mirrors `run_input_filter`.
-#[allow(clippy::too_many_arguments)]
+/// `None` (caller falls back to an empty subject — the portrait path). Never
+/// blocks or fails the image turn. Mirrors `run_input_filter`.
 async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     persona: &eros_engine_core::persona::CompanionPersona,
-    seed_subject: &str,
     recent_scene: &str,
     latest_user_msg: &str,
     aspect_ratio: Option<&str>,
@@ -2458,7 +2455,7 @@ async fn run_image_prompt_compose(
         latest_user_msg
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    let user_payload = compose_user_payload(appearance, scene, latest, seed_subject, style, ar);
+    let user_payload = compose_user_payload(appearance, scene, latest, style, ar);
     let chain: Vec<String> = std::iter::once(c.model.clone())
         .chain(c.fallback_model.iter().cloned())
         .collect();
@@ -2515,18 +2512,22 @@ async fn run_image_prompt_compose(
     None
 }
 
-/// The three per-turn image inputs, resolved from plan → request.
+/// The two per-turn image inputs, resolved from plan → request. There is no
+/// subject field: the composer decides what the picture shows from turn
+/// context alone.
 struct ImageTurnInputs {
-    seed_subject: String,
     style: eros_engine_llm::model_config::StyleKey,
     aspect_ratio: Option<String>,
 }
 
-/// Pure: resolve the seed subject, style, and aspect ratio for a delegated
-/// image turn. Precedence per field:
-/// - subject: `req_image.image_prompt` → `""` (the judge no longer writes one)
-/// - style:   `req_image.style` → type default (`Realistic`)
-/// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
+/// Pure: resolve the style and aspect ratio for a delegated image turn.
+/// Precedence per field:
+/// - style:  `req_image.style` → type default (`Realistic`)
+/// - aspect: `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
+///
+/// There is no subject input here: the judge no longer writes a seed (#212
+/// Task 4) and the client can no longer supply one either (#212 Task 5) — the
+/// composer decides what the picture shows from turn context alone.
 ///
 /// Blank strings count as absent at the plan and request levels. There are no
 /// config-level defaults: the engine carries no image configuration, so style
@@ -2535,11 +2536,6 @@ fn resolve_image_turn_inputs(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
 ) -> ImageTurnInputs {
-    let seed_subject = req_image
-        .and_then(|i| i.image_prompt.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("")
-        .to_string();
     let style = req_image.and_then(|i| i.style).unwrap_or_default();
     let aspect_ratio = plan
         .aspect_ratio
@@ -2552,7 +2548,6 @@ fn resolve_image_turn_inputs(
         })
         .map(str::to_string);
     ImageTurnInputs {
-        seed_subject,
         style,
         aspect_ratio,
     }
@@ -2566,8 +2561,9 @@ struct DelegatedImagePrompt {
     /// `prompt` key. The composer's decided subject on the compose path
     /// (spec 2026-08-02: this is deliberately the SHORT subject, not the
     /// composed wire string — that lives only in `composed_prompt`, below, and
-    /// is never persisted); the client's explicit override on `raw` (composer
-    /// skipped); empty on a failed compose.
+    /// is never persisted); empty when the composer is skipped (not
+    /// configured, or `raw`) or the compose call fails — there is no seed left
+    /// to fall back to, so an empty subject is the portrait fallback (#212).
     subject: String,
     /// Short description of the picture, persisted as `metadata.image.caption`
     /// and read by every history-facing render. `None` on a failed compose or
@@ -2584,12 +2580,14 @@ struct DelegatedImagePrompt {
     compose_generation_id: Option<String>,
 }
 
-/// Resolve the per-turn image inputs, optionally enrich the subject via the
-/// composer LLM, and wrap the result into the final wire prompt.
+/// Resolve the per-turn image inputs, generate the subject via the composer
+/// LLM, and wrap the result into the final wire prompt.
 ///
 /// The composer is skipped entirely when it is not configured. It is fail-open
-/// throughout: a model error, timeout, or empty reply degrades to the seed
-/// subject and never blocks the image turn.
+/// throughout: a model error, timeout, or empty reply degrades to an empty
+/// subject — there is nothing left to fall back to — and never blocks the
+/// image turn. `compose_image_prompt` turns that empty subject into a plain
+/// persona-appearance portrait prompt (#212).
 async fn build_delegated_image_prompt(
     state: &AppState,
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -2610,7 +2608,6 @@ async fn build_delegated_image_prompt(
                 state,
                 &c,
                 persona,
-                &inputs.seed_subject,
                 pde_transcript,
                 latest_user_msg,
                 inputs.aspect_ratio.as_deref(),
@@ -2629,7 +2626,7 @@ async fn build_delegated_image_prompt(
                 Some(o.model),
                 o.generation_id,
             ),
-            None => (inputs.seed_subject.clone(), None, None, None, None),
+            None => (String::new(), None, None, None, None),
         };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
@@ -3088,9 +3085,9 @@ pub fn run_stream(
 
         // Forced-image override — wins over the PDE/ghost result. Applied AFTER
         // the kill-switch so a client-forced image is never suppressed to ghost.
-        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. The
-        // client's explicit subject still reaches the composer via
-        // `resolve_image_turn_inputs`, which reads `req_image.image_prompt`.
+        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. There
+        // is no subject to carry through here — the composer decides what the
+        // picture shows from turn context alone (`resolve_image_turn_inputs`).
         if force_image {
             let action = match req_image.map(|i| &i.mode) {
                 Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
@@ -4102,13 +4099,11 @@ mod tests {
             "freckled, red hair",
             "（无）",
             "（无）",
-            "on a rooftop",
             "realistic",
             "9:16",
         );
         assert!(p.contains("freckled, red hair"));
         assert!(p.contains("（无）"));
-        assert!(p.contains("on a rooftop"));
         assert!(p.contains("realistic"));
         assert!(p.contains("9:16"));
     }
@@ -4119,12 +4114,29 @@ mod tests {
             "freckled, red hair",
             "（无）",
             "给我看看你现在的样子",
-            "on a rooftop",
             "realistic",
             "9:16",
         );
         assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
-        assert!(p.contains("[画面主题种子]\non a rooftop"), "{p}");
+    }
+
+    #[test]
+    fn compose_user_payload_has_no_seed_section() {
+        let p = compose_user_payload(
+            "freckled, red hair",
+            "（无）",
+            "给我看看你现在的样子",
+            "realistic",
+            "9:16",
+        );
+        assert!(
+            !p.contains("画面主题种子"),
+            "the seed concept is deleted — no seed section may render: {p}"
+        );
+        assert!(p.contains("[对方最新消息]\n给我看看你现在的样子"), "{p}");
+        assert!(p.contains("[人物外观]\nfreckled, red hair"), "{p}");
+        assert!(p.contains("[风格]\nrealistic"), "{p}");
+        assert!(p.contains("[画幅]\n9:16"), "{p}");
     }
 
     #[test]
@@ -4201,12 +4213,10 @@ mod tests {
     }
 
     fn img_params(
-        image_prompt: Option<&str>,
         style: Option<eros_engine_llm::model_config::StyleKey>,
         aspect: Option<&str>,
     ) -> crate::routes::companion_stream::ImageReplyParams {
         crate::routes::companion_stream::ImageReplyParams {
-            image_prompt: image_prompt.map(str::to_string),
             style,
             aspect_ratio: aspect.map(str::to_string),
             ..Default::default()
@@ -4214,28 +4224,10 @@ mod tests {
     }
 
     #[test]
-    fn image_turn_subject_comes_only_from_request() {
-        // The judge no longer writes a seed; the request is the only source.
-        let params = img_params(Some("from request"), None, None);
-        let r = resolve_image_turn_inputs(&img_plan(None), Some(&params));
-        assert_eq!(r.seed_subject, "from request");
-
-        // neither ⇒ empty string
-        let r = resolve_image_turn_inputs(&img_plan(None), None);
-        assert_eq!(r.seed_subject, "");
-
-        // blank request value ⇒ falls through to empty string too, not the
-        // blank string itself (the request-level blank filter must still fire).
-        let blank_params = img_params(Some("   "), None, None);
-        let r = resolve_image_turn_inputs(&img_plan(None), Some(&blank_params));
-        assert_eq!(r.seed_subject, "");
-    }
-
-    #[test]
     fn image_turn_style_prefers_request_then_default() {
         use eros_engine_llm::model_config::StyleKey;
 
-        let params = img_params(None, Some(StyleKey::SemiRealistic), None);
+        let params = img_params(Some(StyleKey::SemiRealistic), None);
         let r = resolve_image_turn_inputs(&img_plan(None), Some(&params));
         assert_eq!(r.style, StyleKey::SemiRealistic, "request wins");
 
@@ -4245,7 +4237,7 @@ mod tests {
 
     #[test]
     fn image_turn_aspect_prefers_plan_then_request_then_none() {
-        let params = img_params(None, None, Some("16:9"));
+        let params = img_params(None, Some("16:9"));
 
         let r = resolve_image_turn_inputs(&img_plan(Some("3:4")), Some(&params));
         assert_eq!(r.aspect_ratio.as_deref(), Some("3:4"), "plan wins");
@@ -4261,7 +4253,7 @@ mod tests {
         assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
 
         // Blank request value ⇒ the request-level blank filter still fires.
-        let blank_params = img_params(None, None, Some("  "));
+        let blank_params = img_params(None, Some("  "));
         let r = resolve_image_turn_inputs(&img_plan(None), Some(&blank_params));
         assert_eq!(r.aspect_ratio, None, "blank request ⇒ None");
     }
@@ -5969,7 +5961,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6006,7 +5997,8 @@ data: [DONE]\n\n";
             .expect("meta present");
         assert_eq!(action, FrameActionType::ReplyImage);
         assert!(model.is_none(), "delegated meta carries no model");
-        // image_request: face ref + base64 composed wire prompt containing the subject.
+        // image_request: face ref + base64 composed wire prompt (no composer
+        // configured and no seed left ⇒ portrait fallback: style preset only).
         let (composed_b64, image_ref) = frames
             .iter()
             .find_map(|f| match f {
@@ -6028,13 +6020,15 @@ data: [DONE]\n\n";
             )
             .unwrap()
         };
-        assert!(
-            composed.contains("a beach at sunset"),
-            "composed wire prompt should contain the subject: {composed}"
+        assert_eq!(
+            composed,
+            eros_engine_llm::model_config::STYLE_REALISTIC,
+            "no composer configured and no seed ⇒ portrait fallback (style preset only): {composed}"
         );
 
-        // Persistence: minimal marker only (seed subject under `prompt`), and NOT
-        // the composed wire prompt / model / generation_id / url.
+        // Persistence: minimal marker only (empty subject under `prompt`,
+        // portrait fallback), and NOT the composed wire prompt / model /
+        // generation_id / url.
         let meta_row: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
@@ -6046,8 +6040,8 @@ data: [DONE]\n\n";
         .unwrap();
         let img = meta_row.expect("assistant row has metadata")["image"].clone();
         assert_eq!(
-            img["prompt"], "a beach at sunset",
-            "marker keeps the seed subject"
+            img["prompt"], "",
+            "no compose configured and no seed ⇒ empty subject (portrait fallback)"
         );
         assert!(img.get("model").is_none(), "marker must not store a model");
         assert!(
@@ -6058,7 +6052,7 @@ data: [DONE]\n\n";
         assert_ne!(
             img["prompt"],
             serde_json::json!(composed),
-            "the composed wire prompt must not be persisted (only the seed subject)"
+            "the composed wire prompt (style preset) must not be persisted as the marker subject"
         );
     }
 
@@ -6150,7 +6144,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     prompt_variant: prompt_variant.map(str::to_string),
                     ..Default::default()
                 }),
@@ -6171,8 +6164,9 @@ data: [DONE]\n\n";
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn prompt_variant_selects_the_configured_composer_prompt(pool: PgPool) {
         use wiremock::ResponseTemplate;
-        // 500 on every call: the composer fails open to the seed subject. This
-        // test asserts on what was SENT, so the response body is irrelevant.
+        // 500 on every call: the composer fails open to an empty subject —
+        // there is no seed left to fall back to. This test asserts on what was
+        // SENT, so the response body is irrelevant.
         let (reqs, _frames) = run_variant_turn(&pool, Some("b"), ResponseTemplate::new(500)).await;
         assert_eq!(
             reqs.len(),
@@ -6189,7 +6183,7 @@ data: [DONE]\n\n";
         );
 
         // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
-        // the audit keys, and `prompt` is the seed subject as before.
+        // the audit keys, and `prompt` is the empty subject (portrait fallback).
         let meta: serde_json::Value = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
         )
@@ -6197,14 +6191,17 @@ data: [DONE]\n\n";
         .await
         .expect("assistant image row persisted");
         let img = meta["image"].as_object().expect("image marker present");
-        assert_eq!(img["prompt"], "a beach at sunset");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("compose_variant").is_none());
         assert!(img.get("compose_model").is_none());
         assert!(img.get("compose_generation_id").is_none());
     }
 
-    /// `prompt_variant = "raw"` must make ZERO provider calls and pass the seed
-    /// subject through to the wire prompt verbatim.
+    /// `prompt_variant = "raw"` must still make ZERO provider calls (this
+    /// task does not touch the `"raw"` short-circuit itself — see #212 Task 6
+    /// for its eventual removal). With the client-side seed deleted there is
+    /// nothing left to draw "as-is": the turn now degrades to the same
+    /// empty-subject portrait fallback as a failed compose.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn prompt_variant_raw_skips_the_composer(pool: PgPool) {
         use wiremock::ResponseTemplate;
@@ -6235,13 +6232,14 @@ data: [DONE]\n\n";
             )
             .unwrap()
         };
-        assert!(
-            composed.contains("a beach at sunset"),
-            "raw must pass the seed subject through: {composed}"
+        assert_eq!(
+            composed,
+            eros_engine_llm::model_config::STYLE_REALISTIC,
+            "raw skips the composer and there is no seed ⇒ portrait fallback: {composed}"
         );
 
         // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
-        // the audit keys, and `prompt` is the seed subject as before.
+        // the audit keys, and `prompt` is the empty subject (portrait fallback).
         let meta: serde_json::Value = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
         )
@@ -6249,7 +6247,7 @@ data: [DONE]\n\n";
         .await
         .expect("assistant image row persisted");
         let img = meta["image"].as_object().expect("image marker present");
-        assert_eq!(img["prompt"], "a beach at sunset");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("compose_variant").is_none());
         assert!(img.get("compose_model").is_none());
         assert!(img.get("compose_generation_id").is_none());
@@ -6459,7 +6457,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     mode: crate::routes::companion_stream::ImageMode::ImageOnly,
-                    image_prompt: Some("a beach at sunset".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6561,7 +6558,6 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams {
                     force: true,
                     // default mode = TextImage ⇒ ReplyTextImage
-                    image_prompt: Some("in a red dress".into()),
                     ..Default::default()
                 }),
                 history_anchor: Default::default(),
@@ -6622,7 +6618,8 @@ data: [DONE]\n\n";
         assert_eq!(action, FrameActionType::ReplyTextImage);
 
         // The minimal marker was MERGED onto the assistant TEXT row (content
-        // non-empty), carrying only the seed subject.
+        // non-empty), carrying only the empty subject (no composer configured
+        // and no seed left ⇒ portrait fallback).
         let row: (String, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT content, metadata FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant' \
@@ -6634,7 +6631,7 @@ data: [DONE]\n\n";
         .unwrap();
         assert!(!row.0.is_empty(), "the text reply row has content");
         let img = row.1.expect("row has metadata")["image"].clone();
-        assert_eq!(img["prompt"], "in a red dress");
+        assert_eq!(img["prompt"], "");
         assert!(img.get("model").is_none(), "marker must not store a model");
         assert!(
             img.get("generation_id").is_none(),
