@@ -249,6 +249,37 @@ the frame carries what is needed to draw (prompt, aspect ratio, image ref);
 the caption belongs to chat history and a downstream that wants it reads it
 from the message row.
 
+### The affinity proxy moves to the caption
+
+`ActionPlan.image_prompt` has a consumer beyond image composition:
+`affinity_eval_text` (`post_process.rs:523`, called at `post_process.rs:113`)
+uses it as the assistant-content proxy on image turns, so a photo-send still
+moves affinity instead of tripping the `empty_assistant` gate.
+
+With the judge no longer writing a seed, that field would be `None` on every
+judge-driven image turn and every photo would evaluate as the generic
+`[发送了一张照片]`. The caption is the natural — and strictly better —
+replacement: a short natural-language line, in the conversation's language,
+describing what the picture showed, which is exactly what the first-person
+affinity evaluator (#210) wants to read.
+
+So:
+
+- `ActionPlan.image_prompt` is **renamed** `image_caption`, redocumented as
+  "what the picture showed, for post-process affinity", and `plan_for` loses
+  its `image_prompt` parameter (nothing can supply a caption at decision time —
+  the composer has not run yet).
+- The stream sets `plan_bg.image_caption` after the composer resolves, on both
+  image paths, at the point it already mutates the plan before spawning
+  post-process (`stream.rs:3675`).
+- `affinity_eval_text` reads `image_caption`. Its existing blank/absent
+  behaviour is unchanged: it falls back to `[发送了一张照片]`, which is exactly
+  §2's bare-marker rule expressed for the affinity path.
+
+Note this makes the plan's field genuinely unused for composition —
+`resolve_image_turn_inputs` reads `req_image.image_prompt` directly, and the
+forced-image path was already passing that same value through the plan.
+
 ### Concurrency on `reply_text_image`
 
 Today the composer runs only after the text stream's `done`
@@ -349,6 +380,10 @@ Serial LLM hops on the turn drop from 3 to 2.
 - Metadata: `prompt` is the composer subject, `caption` present on the compose
   path and omitted on the `raw` and failure paths; no `composed_prompt` key is
   written; the `image_request` frame carries no caption.
+- Affinity proxy: `affinity_eval_text` returns the caption on an image turn
+  when one exists, and `[发送了一张照片]` when it does not; `plan_bg.image_caption`
+  is populated on both the `reply_image` and `reply_text_image` paths before
+  post-process is spawned.
 - Concurrency: `latest_user_msg` equals the input filter's rewrite when one
   fired and the raw content when none did; `reply_text_image` sqlx stream test
   asserts frame order `meta → delta* → done → image → final` is unchanged with
