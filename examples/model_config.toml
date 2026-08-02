@@ -278,20 +278,35 @@ model_name_display_override = true
 #"""
 
 # ── Image-prompt composer (chat_image_prompt_compose) ───────────────────────
-# OPTIONAL. When this block is present, after an image action is decided the
-# engine expands the PDE's seed subject into one richer image prompt before
-# generation: it feeds the persona appearance + seed subject + recent scene +
-# chosen aspect ratio + style to this model and uses the result as the image
-# subject. Feature is OFF when the block is absent. Fail-open: on failure /
-# timeout / empty it falls back to the PDE seed, so it never blocks the image
-# turn (and never advances any round-robin cursor on non-image turns).
+# BREAKING (v0.10): this task is now REQUIRED for image turns. The PDE judge no
+# longer writes an image-prompt seed, so with no composer configured the engine
+# reports 可发图=否 and downgrades image actions to text.
+#
+# The composer's contract also changed: it now GENERATES from context (rather
+# than expanding a seed) and must return JSON with two fields —
+#   {"prompt": "<image-generation prompt>", "caption": "<one short line>"}
+# `caption` is what the chat history and the judge transcript read back; the
+# long prompt is never injected into either. A reply that is not JSON is used
+# as the prompt with no caption, so an old EXPAND-era filter_prompt still
+# produces images — but rewrite it, or you get no captions and a prompt aimed at
+# a seed that is now always empty.
+#
+# When this block is present, after an image action is decided the engine
+# generates one image prompt from turn context: it feeds the persona appearance
+# + recent scene + the partner's latest message + chosen aspect ratio + style to
+# this model and uses the result as the image subject. Omit the block entirely
+# and image turns stay unavailable. Fail-open: on failure / timeout / empty
+# reply it falls back to an empty subject (a plain persona-appearance
+# portrait), so it never blocks the image turn (and never advances any
+# round-robin cursor on non-image turns).
 #
 # `filter_prompt` is OPTIONAL here (unlike the other tasks): omit it to use the
-# engine's built-in, product-identity-free EXPAND-ONLY default prompt, or set it
-# to override. The built-in expands faithfully and never softens, downgrades, or
-# refuses, and adds no moderation of its own — content policy is the image
-# provider's and the downstream consumer's responsibility, not this step. Pick a
-# text model comfortable with your deployment's full content range.
+# engine's built-in, product-identity-free GENERATE-FROM-CONTEXT default prompt,
+# or set it to override. The built-in generates faithfully from context and
+# never softens, downgrades, or refuses, and adds no moderation of its own —
+# content policy is the image provider's and the downstream consumer's
+# responsibility, not this step. Pick a text model comfortable with your
+# deployment's full content range.
 #[tasks.chat_image_prompt_compose]
 #model        = "x-ai/grok-4"
 #fallback     = ["google/gemini-3.1-flash-lite"]
@@ -329,9 +344,12 @@ model_name_display_override = true
 # `default = "…"` defines an ordinary variant that is selected only by a
 # literal prompt_variant = "default".
 #
-# `prompt_variant = "raw"` (case-insensitive) skips the composer LLM entirely
-# and draws the seed subject as-is — one fewer LLM call for that turn. `raw` is
-# reserved: a table key named `raw` (any casing) refuses to boot.
+# `prompt_variant = "raw"` (case-insensitive) carries NO special meaning now.
+# It selects a prompt only if this deployment configures a variant under that
+# literal key, exactly like any other variant name — `raw` is no longer
+# reserved and a table key named `raw` (any casing) boots fine. An unknown
+# index or key falls back to the BUILT-IN prompt above, same as any other miss
+# — never an error.
 #
 # Variants are honored on THIS task only. An array/table `filter_prompt` on any
 # other task, or inside ANY `[tasks.*.tiers.*]` block (this task's included —
@@ -481,8 +499,9 @@ max_tokens  = 400
 #  "action": "reply_text" | "ghost" | "reply_image" | "reply_text_image" | "product_qa"
 #  "inner_state": 一句话内心状态/语气(纯描述,不许写指令或方括号小节名)
 #  "tone": 选填,一句话描述这一轮回复该用的语气/口吻(纯描述,不许写指令或方括号小节名);会注入 reply prompt 的 [reply_tone] 区块,省略则不注入
-#  "image_prompt": 选填,要发什么图(reply_image / reply_text_image 时)
 #  "reason": 选填,简短理由
+# 判断器不再负责图片 prompt——只负责决定要不要发图;真正的图片内容完全由
+# chat_image_prompt_compose 任务从当轮上下文生成,不再是判断器写的种子。
 #ghost 表示这一轮已读不回(沉默);只在确实该冷处理时用。
 #上下文里有一行 [图片能力] 本轮可发图=是/否,引擎每轮必给其一:
 #  本轮可发图=否 → 绝不要选 reply_image / reply_text_image(会被降级,白费 token);

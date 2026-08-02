@@ -419,7 +419,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights`（事实挖掘 + JSONB 合并） | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
-| `chat_image_prompt_compose` | `pipeline::stream`（opt-in 图片提示词改写器；在图片生成前扩写 PDE 的种子主题；存在此任务块时激活） | live（opt-in） |
+| `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动，见 issue #210） | live |
@@ -436,7 +436,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（图片提示词改写器，opt-in，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 
 `embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器
 `ModelConfig::resolve_embedding()`，在 `main.rs` 启动时调用一次来构建
@@ -447,10 +447,10 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：
 
 - LLM 接收最近的对话、关系状态和对话信号，并返回 JSON verdict，其中包含：
-  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（请求包含 `image` 块时图片变体才可用——调用方以此声明本轮由自己处理图片；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
+  - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（图片变体需要同时满足两个条件——请求包含 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置，因为判断器本身不写图片 prompt；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `tone`（选填）：这一轮回复该用的语气/口吻，一句话——在文本类动作上注入 reply prompt 的 `[reply_tone]` 区块；缺省则不注入
-  - `image_prompt`、`reason`：可选
+  - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 两次，ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
@@ -459,11 +459,21 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
 
-### `[tasks.chat_image_prompt_compose]` — 图片提示词改写器（opt-in）
+### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 
-PDE 在选动作、定 `inner_state` 的同时，还要在很紧的 token 预算里写一个简短的种子 `image_prompt`。配置此任务块后，引擎会在**决定出图之后、生成之前**单独跑一次改写器：把人格外观、最近场景、PDE 种子主题、所选 style 和目标宽高比交给该模型，用扩写后的结果作为图片主体（随 `image_request` 帧的 `composed_prompt` 下发；持久化的 `metadata.image.prompt` 标记保留 PDE 种子提示词）。PDE 的原始种子单独保留在决策审计里。
+PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
 
-该功能**默认关闭**，仅当此块存在时激活。它是 **fail-open** 的：改写器失败 / 超时 / 输出为空时，引擎回退到 PDE 种子原值，绝不阻塞或失败图片轮次。该任务**仅在图片轮次按需解析**，因此不会在文本/ghost 轮次推进 `model` 的 round-robin 游标。
+**这个任务现在是图片轮次的必需项。** 不配置 `[tasks.chat_image_prompt_compose]`，引擎就没有任何办法产出图片 prompt：它会向判断器报告 `本轮可发图=否`（图片能力为假），并把任何 `reply_image` / `reply_text_image` 提案降级为 `reply_text`。要让图片轮次可用，必须配置这个块。
+
+**线上契约。** 合成器必须回复恰好两个字段的 JSON：
+
+```json
+{"prompt": "<image-generation prompt>", "caption": "<one short line>"}
+```
+
+`prompt` 是引擎用来出图的图片主体。`caption` 是一句自然语言描述这张图片的简短文字——它会落到 `metadata.image.caption`，也是聊天历史和 judge transcript 唯一会读回的字段；长的 `prompt` 从不注入这两者中的任何一个。回复解析不出 JSON（包括嵌在散文里的 JSON block）时，整段回复原样当作 `prompt` 使用，没有 caption——所以一个还停留在 #212 之前"扩写种子"契约上的旧 `filter_prompt`，依然能出图（降级：没有 caption，且 prompt 是照着一个如今永远为空的种子写的）。按上面的契约改写它，才能拿回 caption。
+
+该功能是 **fail-open** 的：合成器失败 / 超时 / 输出为空时，引擎回退到空主体——`compose_image_prompt` 会把空主体变成一句纯人格外观的肖像 prompt——所以合成器故障只会降低出图质量，绝不阻塞或失败图片轮次。该任务**仅在图片轮次按需解析**，因此不会在文本/ghost 轮次推进 `model` 的 round-robin 游标。
 
 ```toml
 [tasks.chat_image_prompt_compose]
@@ -479,15 +489,15 @@ max_tokens   = 700
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `model` | `ModelSpec`（字符串 \| 数组 \| 表） | 缺失 | 改写器模型（与 `chat_companion.model` 同样三种形态）。 |
+| `model` | `ModelSpec`（字符串 \| 数组 \| 表） | 缺失 | 合成器模型（与 `chat_companion.model` 同样三种形态）。 |
 | `fallback` | `String` \| `Array<String>` | `[]` | 顺序重试链（FallbackSpec），按 `retry_depth` 截断。 |
 | `retry_depth` | `u32` | `1` | primary + 这么多个 fallback。 |
-| `temperature` | `f64` | 任务默认 | 改写器调用的采样温度。 |
-| `max_tokens` | `u32` | 任务默认 | 改写器调用的 token 上限。 |
+| `temperature` | `f64` | 任务默认 | 合成器调用的采样温度。 |
+| `max_tokens` | `u32` | 任务默认 | 合成器调用的 token 上限。 |
 | `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
-**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），改写器自带一个通用、**不含产品身份**的内置默认。它的立场是**只扩写**：忠实地把种子主题和外观扩成详细提示词，**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它；空白/缺失则回退到它。
+**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
 
 **变体（variants）。** 这是**唯一**一个 `filter_prompt` 接受纯字符串以外形态的任务。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
 
@@ -497,7 +507,7 @@ filter_prompt = ["…", "…"]                # 按下标选：prompt_variant = 
 filter_prompt = { a = "…", b = "…" }      # 按 key 选：  prompt_variant = "a" / "b"
 ```
 
-改写器提示词通常又长又多段，而 TOML 1.0.0 本就不建议把 inline table 拆成多行——所以按
+合成器提示词通常又长又多段，而 TOML 1.0.0 本就不建议把 inline table 拆成多行——所以按
 key 选的形态也可以写成标准（非 inline）表，一个 key 一个 section：
 
 ```toml
@@ -512,11 +522,13 @@ b = """
 
 没有命中都会回退到上面的**内置**提示词，不存在"取第一项"这种行为——但两种"没命中"的记录方式不同。**没传** `prompt_variant` 属于静默回退（最常见的情况：既然没人要求选变体，也就没什么好警告的）。**明确传了但没命中**的变体——下标越界、key 不存在——同样回退，但会额外记一条 `warn` 日志，因为调用方指定了变体却没用上，值得被看到。也没有保留的 `default` key：写 `default = "…"` 只是定义了一个普通变体，只有字面量 `prompt_variant = "default"` 才会命中它。
 
-`prompt_variant = "raw"`（大小写不敏感）会完全跳过改写器 LLM，直接用种子主题原样出图——这一轮少一次 LLM 调用。`raw` 是保留字：表里若出现字面量为 `raw` 的 key（任意大小写）会拒绝启动。
+`prompt_variant = "raw"` 不带任何特殊含义。它和其他任意变体名一样，只有当该部署把某个变体配置在这个字面量 key 下（不论大小写）时才会命中；下标/key 没命中——包括未配置的 `"raw"`——都会像其他任何 miss 一样回退到上面的内置提示词，绝不报错。`raw` 不再是保留字：表里出现字面量为 `raw` 的 key 可以正常启动。
 
-变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt`，或**任何** `[tasks.*.tiers.*]` 块（包括本任务自己的 tiers——改写器解析时永远不走 tier）里的数组/表形态，都会拒绝启动，而不是留在那里永远选不到。
+变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt`，或**任何** `[tasks.*.tiers.*]` 块（包括本任务自己的 tiers——合成器解析时永远不走 tier）里的数组/表形态，都会拒绝启动，而不是留在那里永远选不到。
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_prompt_compose()`。
+
+**审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。用量/费用不落库；请用 generation id 去你的供应商日志里对账。长的 `prompt` 本身不持久化（按设计交给消费方自己留存）。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`。
 
 ### `[tasks.chat_vision]` — 图片输入（视觉预处理阶段，opt-in）
 

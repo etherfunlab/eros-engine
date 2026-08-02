@@ -479,7 +479,7 @@ input filter has no triggers, timing, or tiers).
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
 | `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
-| `chat_image_prompt_compose` | `pipeline::stream` (opt-in image-prompt composer; expands the PDE seed subject before image generation; activated when this task block is present) | live (opt-in) |
+| `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot, see issue #210) | live |
@@ -496,7 +496,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
-- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, opt-in, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` doesn't go through the generic `resolve()` path above — it has
 its own resolver, `ModelConfig::resolve_embedding()`, called once at boot
@@ -508,10 +508,10 @@ active" below.
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:
 
 - The LLM receives the recent conversation, relationship state, and conversation signals, and returns a JSON verdict with:
-  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block — the consumer signalling it handles images this turn; otherwise they degrade to `reply_text`. The chat stream never draws — it emits an `image_request` frame and the consumer calls its own image vendor. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
+  - `action`: `"reply_text"` | `"ghost"` | `"reply_image"` | `"reply_text_image"` | `"product_qa"` (image variants are available when the request includes an `image` block AND `[tasks.chat_image_prompt_compose]` is configured — both must hold, since the judge itself writes no image prompt; otherwise they degrade to `reply_text`. The chat stream never draws — it emits an `image_request` frame and the consumer calls its own image vendor. `product_qa` is available only when `[tasks.chat_product_qa]` is fully enabled — see below; unavailable proposals degrade to `reply_text`, never upgrade.)
   - `inner_state`: a short mood/tone description folded into the reply prompt
   - `tone` (optional): a short delivery directive for this turn's reply — injected into the reply prompt as a `[reply_tone]` section on text-bearing actions; omitted when absent
-  - `image_prompt`, `reason`: optional
+  - `reason`: optional
 - **Fail-open:** any LLM timeout or error falls back to the rule engine — the LLM judge never blocks a chat response.
 - **Hard-safety guardrails** (enforced after the LLM verdict, before the rule-engine fallback): never ghost in the first 10 messages, never ghost twice in a row, one-hour ghost cooldown.
 - Every judge call is audited to `companion_decision_events`.
@@ -520,23 +520,47 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
-### `[tasks.chat_image_prompt_compose]` — image-prompt composer (opt-in)
+### `[tasks.chat_image_prompt_compose]` — image-prompt composer (required for image turns)
 
-The PDE writes a terse seed `image_prompt` while also choosing the action and
-`inner_state` on a tight token budget. When this task block is present, the
-engine runs a dedicated composer **after** an image action is decided and
-**before** generation: it sends the model the persona appearance, the recent
-scene, the PDE seed subject, the chosen style, and the target aspect ratio, and
-uses the expanded result as the image subject (carried in the `image_request`
-frame's `composed_prompt`; the persisted `metadata.image.prompt` marker keeps
-the PDE seed subject). The PDE's original seed is preserved separately in the
-decision audit.
+The PDE judge no longer writes an image-prompt seed — it only decides the
+action, `inner_state`, and (on an image action) the reference/aspect-ratio
+inputs. Producing the actual image prompt is entirely this task's job: when an
+image action is decided, the engine runs the composer **after** the decision
+and **before** generation, feeding it the persona appearance, the recent
+scene, the partner's latest message, the chosen style, and the target aspect
+ratio. The composer **generates** the prompt from that context — it does not
+expand a seed, because none exists anymore.
 
-The feature is **off by default** and activates only when this block exists.
-It is **fail-open**: on composer failure / timeout / empty output the engine
-falls back to the PDE seed unchanged, so it never blocks or fails the image
-turn. The task is resolved **lazily, only on image turns**, so it never advances
-a `model` round-robin cursor on text/ghost turns.
+**This task is now REQUIRED for image turns.** Without
+`[tasks.chat_image_prompt_compose]` configured, the engine has no way to
+produce an image prompt at all: it reports `本轮可发图=否` (image capability
+false) to the judge and downgrades any `reply_image` / `reply_text_image`
+proposal to `reply_text`. Configure this block to make image turns possible.
+
+**Wire contract.** The composer must reply with JSON carrying exactly two
+fields:
+
+```json
+{"prompt": "<image-generation prompt>", "caption": "<one short line>"}
+```
+
+`prompt` is the image subject the engine uses for generation. `caption` is a
+short, natural-language line describing the picture — it is what gets
+persisted to `metadata.image.caption` and is the only thing the chat history
+and the judge transcript ever read back; the long `prompt` is never injected
+into either. A reply that fails to parse as JSON (or as a JSON block embedded
+in prose) is used **as the prompt, with no caption** — so an old EXPAND-era
+`filter_prompt`, written for the pre-#212 seed-expansion contract, still
+produces images (degraded: no caption, and a prompt written to expand a seed
+that is now always empty). Rewrite it to the contract above to get captions
+back.
+
+The feature is **fail-open**: on composer failure / timeout / empty reply the
+engine falls back to an empty subject — `compose_image_prompt` turns that into
+a plain persona-appearance portrait prompt — so a broken composer degrades
+image quality rather than blocking or failing the image turn. The task is
+resolved **lazily, only on image turns**, so it never advances a `model`
+round-robin cursor on text/ghost turns.
 
 ```toml
 [tasks.chat_image_prompt_compose]
@@ -562,11 +586,13 @@ max_tokens   = 700
 
 **Built-in default prompt.** Unlike every other task (whose prompt must come from
 config), the composer ships a generic, **product-identity-free** built-in
-default. Its stance is **expand-only**: it faithfully expands the seed subject and
-appearance into a detailed prompt and does **not** soften, downgrade, censor, or
-refuse, and adds no content-moderation layer of its own — moderation is delegated
-to the image-model provider and the downstream deployment, not this step. A
-non-blank `filter_prompt` overrides it; a blank/absent one falls back to it.
+default. It **generates** the prompt and caption straight from context —
+persona appearance, recent scene, the partner's latest message, style, aspect
+ratio — and does **not** soften, downgrade, censor, or refuse, and adds no
+content-moderation layer of its own — moderation is delegated to the
+image-model provider and the downstream deployment, not this step. A
+non-blank `filter_prompt` overrides it (and must honor the JSON contract
+above); a blank/absent one falls back to it.
 
 **Variants.** This is the **only** task whose `filter_prompt` accepts more than a
 plain string. The consumer picks one per chat turn via `image.prompt_variant` on
@@ -602,9 +628,12 @@ variant the caller asked for and didn't get is worth surfacing. There is no
 reserved `default` key: writing `default = "…"` defines an ordinary variant,
 selected only by a literal `prompt_variant = "default"`.
 
-`prompt_variant = "raw"` (case-insensitive) skips the composer LLM entirely and
-draws the seed subject as-is — one fewer LLM call for that turn. `raw` is
-reserved: a table key literally named `raw` (any casing) refuses to boot.
+`prompt_variant = "raw"` carries **no special meaning**. It is an ordinary
+variant name like any other: it selects a prompt only if this deployment
+configures a variant under that literal key (any casing), and an unknown
+index or key — `"raw"` included, if unconfigured — falls back to the built-in
+prompt above like any other miss, never an error. `raw` is not reserved: a
+table key literally named `raw` boots fine.
 
 Variants are honored on this task only. An array/table `filter_prompt` on any
 other task, or inside **any** `[tasks.*.tiers.*]` block (this task's own tiers
@@ -614,16 +643,22 @@ than sit there unreachable.
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_prompt_compose()` in `model_config.rs`.
 
-**Audit.** A successful composer call writes three keys into the image
+**Audit.** A successful composer call — including the non-JSON fallback path
+above, which still counts as success — writes three keys into the image
 turn's `chat_messages.metadata.image`: `compose_variant` (which
 `filter_prompt` key/index was selected; absent for a plain/built-in
 prompt; recorded as supplied (trimmed), not normalized — e.g. for the
 indexed shape, `"01"` selects index 1 and is audited as `"01"`),
 `compose_model` (the model that answered), and
-`compose_generation_id`. All three are absent when no compose succeeded
-(`raw`, fail-open, task not configured) — same NULL semantics as the
-affinity audit trio. Usage/cost is not persisted; reconcile via the
-generation id against your provider's logs. The composed prompt is not
+`compose_generation_id`. All three are absent only when the composer call
+itself failed (fail-open degradation) or the task isn't configured — same
+NULL semantics as the affinity audit trio (`raw` carries no special meaning
+anymore, so it is not a distinct case here). The composer's `caption` is
+persisted separately as `metadata.image.caption`: set whenever the reply
+parsed as JSON with a non-blank `caption` field, and `None` otherwise —
+including on a successful-but-non-JSON reply, where the whole reply becomes
+`prompt` with no caption. Usage/cost is not persisted; reconcile via the
+generation id against your provider's logs. The long `prompt` itself is not
 persisted (consumer-side by design). Spec:
 `docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`.
 

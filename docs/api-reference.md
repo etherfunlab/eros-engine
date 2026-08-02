@@ -291,7 +291,7 @@ draws on the chat stream).
 | `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
-| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` (case-insensitive) skips the composer LLM entirely, saving one LLM call. An index/key that doesn't match falls back to the engine's built-in composer prompt — never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
+| `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` carries no special meaning: it selects a prompt only if the deployment configures a variant under that literal key, exactly like any other name. An index/key that doesn't match — `"raw"` included — falls back to the engine's built-in composer prompt, never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
 
 **Reference selection (`image_ref`).** The PDE verdict carries `image_ref`
 (`"face"` | `"previous"`, default `"face"`) and rides on the `image_request`
@@ -299,13 +299,16 @@ frame (below) — the chat stream never resolves it to a URL itself. The
 `previous`-with-no-image → `face` fallback, and the `face_ref_url` /
 `prev_image_url` reference URLs, belong to the consumer's own image-vendor
 call (the engine has no draw endpoint). The persisted `metadata.image` marker
-records the composer's picture subject and the aspect ratio, plus — only when the composer LLM
-call succeeded — the audit trio `compose_variant` (the `filter_prompt`
-key/index that was selected, absent for a plain or built-in prompt),
-`compose_model`, and `compose_generation_id`. Absence of the trio means the
-turn had no successful compose (`raw`, fail-open degradation, or composer not
-configured). The composed prompt itself is never persisted — storing it is
-the consumer's job. The reference kind is not recorded.
+records the composer's picture subject, the aspect ratio, and its `caption`
+(the short line the composer returned alongside the prompt, or `None` when it
+gave none — the chat history and the judge transcript read back only the
+caption, never the long prompt), plus — only when the composer LLM call
+succeeded — the audit trio `compose_variant` (the `filter_prompt` key/index
+that was selected, absent for a plain or built-in prompt), `compose_model`,
+and `compose_generation_id`. Absence of the trio means the turn had no
+successful compose (fail-open degradation, or composer not configured). The
+composed prompt itself is never persisted — storing it is the consumer's job.
+The reference kind is not recorded.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
 unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
