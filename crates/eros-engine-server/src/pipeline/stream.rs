@@ -2300,10 +2300,25 @@ fn compose_user_payload(
     )
 }
 
+/// A SUCCESSFUL composer call's result: the enriched subject plus the audit
+/// values persisted to `metadata.image` (spec 2026-08-02). Mirrors
+/// `VisionOutcome`.
+struct ComposeOutcome {
+    text: String,
+    /// Model that actually answered: `resp.model`, falling back to the
+    /// attempted model id (same idiom as the vision audit).
+    model: String,
+    generation_id: Option<String>,
+    /// `ResolvedImagePromptCompose::variant_key`, carried so the call site
+    /// doesn't need the resolved config in scope.
+    variant: Option<String>,
+}
+
 /// Enrich the image subject via the optional composer LLM. Walks
 /// `[model] + fallback` on transport failure (error/timeout/empty); returns the
-/// trimmed enriched subject on first success, or `None` (caller falls back to
-/// the seed). Never blocks or fails the image turn. Mirrors `run_input_filter`.
+/// trimmed enriched subject plus the audit trio on first success, or `None`
+/// (caller falls back to the seed). Never blocks or fails the image turn.
+/// Mirrors `run_input_filter`.
 async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
@@ -2312,7 +2327,7 @@ async fn run_image_prompt_compose(
     recent_scene: &str,
     aspect_ratio: Option<&str>,
     style: &str,
-) -> Option<String> {
+) -> Option<ComposeOutcome> {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
@@ -2364,7 +2379,12 @@ async fn run_image_prompt_compose(
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
             continue;
         }
-        return Some(text);
+        return Some(ComposeOutcome {
+            text,
+            model: resp.model.unwrap_or_else(|| model_id.clone()),
+            generation_id: resp.generation_id,
+            variant: c.variant_key.clone(),
+        });
     }
     None
 }
@@ -2428,6 +2448,11 @@ struct DelegatedImagePrompt {
     aspect_ratio: Option<String>,
     /// Final wire prompt — feeds the wire frame.
     composed_prompt: String,
+    /// Audit trio — `Some` only when the composer call succeeded; feeds the
+    /// marker's `compose_*` keys (spec 2026-08-02).
+    compose_variant: Option<String>,
+    compose_model: Option<String>,
+    compose_generation_id: Option<String>,
 }
 
 /// Resolve the per-turn image inputs, optionally enrich the subject via the
@@ -2449,19 +2474,24 @@ async fn build_delegated_image_prompt(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "realistic".to_string());
     let variant = req_image.and_then(|i| i.prompt_variant.as_deref());
-    let final_subject = match state.model_config.resolve_image_prompt_compose(variant) {
-        Some(c) => run_image_prompt_compose(
-            state,
-            &c,
-            persona,
-            &inputs.seed_subject,
-            pde_transcript,
-            inputs.aspect_ratio.as_deref(),
-            &style_str,
-        )
-        .await
-        .unwrap_or_else(|| inputs.seed_subject.clone()),
-        None => inputs.seed_subject.clone(),
+    let compose = match state.model_config.resolve_image_prompt_compose(variant) {
+        Some(c) => {
+            run_image_prompt_compose(
+                state,
+                &c,
+                persona,
+                &inputs.seed_subject,
+                pde_transcript,
+                inputs.aspect_ratio.as_deref(),
+                &style_str,
+            )
+            .await
+        }
+        None => None,
+    };
+    let (final_subject, compose_variant, compose_model, compose_generation_id) = match compose {
+        Some(o) => (o.text, o.variant, Some(o.model), o.generation_id),
+        None => (inputs.seed_subject.clone(), None, None, None),
     };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
@@ -2469,6 +2499,9 @@ async fn build_delegated_image_prompt(
         seed_subject: inputs.seed_subject,
         aspect_ratio: inputs.aspect_ratio,
         composed_prompt,
+        compose_variant,
+        compose_model,
+        compose_generation_id,
     }
 }
 
@@ -3261,11 +3294,17 @@ pub fn run_stream(
                     let subject = img.seed_subject;
                     let aspect = img.aspect_ratio;
                     let composed_prompt = img.composed_prompt;
-                    // Persist an empty-content row carrying ONLY the minimal
-                    // marker (seed subject + aspect) so the PDE stays image-aware
-                    // (§5); the composed prompt and the draw result live with the
-                    // consumer.
-                    let marker = build_delegated_image_marker(&subject, aspect.as_deref(), None, None, None);
+                    // Persist the marker (seed subject + aspect + compose
+                    // audit trio on success) so the PDE stays image-aware
+                    // (§5); the composed prompt and the draw result live with
+                    // the consumer.
+                    let marker = build_delegated_image_marker(
+                        &subject,
+                        aspect.as_deref(),
+                        img.compose_variant.as_deref(),
+                        img.compose_model.as_deref(),
+                        img.compose_generation_id.as_deref(),
+                    );
                     let row = eros_engine_store::chat::AssistantInsert {
                         id: msg_uuid,
                         content: String::new(),
@@ -3582,11 +3621,17 @@ pub fn run_stream(
                         let subject = img.seed_subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
-                        // Merge ONLY the minimal marker (seed subject + aspect)
-                        // onto the already-persisted text row so the PDE stays
-                        // image-aware (§5). The text already reached the client;
-                        // `final` follows below.
-                        let marker = build_delegated_image_marker(&subject, aspect.as_deref(), None, None, None);
+                        // Merge the marker (seed subject + aspect + compose
+                        // audit trio on success) onto the already-persisted
+                        // text row so the PDE stays image-aware (§5). The text
+                        // already reached the client; `final` follows below.
+                        let marker = build_delegated_image_marker(
+                            &subject,
+                            aspect.as_deref(),
+                            img.compose_variant.as_deref(),
+                            img.compose_model.as_deref(),
+                            img.compose_generation_id.as_deref(),
+                        );
                         if let Err(e) = chat_repo
                             .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
                             .await
@@ -5722,17 +5767,16 @@ data: [DONE]\n\n";
     async fn run_variant_turn(
         pool: &PgPool,
         prompt_variant: Option<&str>,
+        composer_response: wiremock::ResponseTemplate,
     ) -> (Vec<wiremock::Request>, Vec<ProtocolFrame>) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::path as wm_path;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
-        // 500 on every call: the composer fails open to the seed subject. These
-        // tests assert on what was SENT, so the response body is irrelevant.
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(composer_response)
             .mount(&mock)
             .await;
 
@@ -5809,7 +5853,10 @@ data: [DONE]\n\n";
     /// `PromptSpec::select`.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn prompt_variant_selects_the_configured_composer_prompt(pool: PgPool) {
-        let (reqs, _frames) = run_variant_turn(&pool, Some("b")).await;
+        use wiremock::ResponseTemplate;
+        // 500 on every call: the composer fails open to the seed subject. This
+        // test asserts on what was SENT, so the response body is irrelevant.
+        let (reqs, _frames) = run_variant_turn(&pool, Some("b"), ResponseTemplate::new(500)).await;
         assert_eq!(
             reqs.len(),
             1,
@@ -5829,7 +5876,10 @@ data: [DONE]\n\n";
     /// subject through to the wire prompt verbatim.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn prompt_variant_raw_skips_the_composer(pool: PgPool) {
-        let (reqs, frames) = run_variant_turn(&pool, Some("raw")).await;
+        use wiremock::ResponseTemplate;
+        // 500 on every call: "raw" must make no call at all, so the response
+        // body is irrelevant — this only proves ZERO requests were sent.
+        let (reqs, frames) = run_variant_turn(&pool, Some("raw"), ResponseTemplate::new(500)).await;
         assert!(
             reqs.is_empty(),
             "raw must make no composer call, got {} request(s)",
@@ -5858,6 +5908,43 @@ data: [DONE]\n\n";
             composed.contains("a beach at sunset"),
             "raw must pass the seed subject through: {composed}"
         );
+    }
+
+    /// Spec 2026-08-02: a SUCCESSFUL composer call persists the audit trio to
+    /// `metadata.image` — the selected variant key, the served model, and the
+    /// generation id — while `prompt` keeps the SEED subject (the composed
+    /// text goes only on the wire).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_success_persists_audit_trio(pool: PgPool) {
+        use wiremock::ResponseTemplate;
+        let (reqs, _frames) = run_variant_turn(
+            &pool,
+            Some("b"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-xyz",
+                "model": "served/model",
+                "choices": [{"message": {"content": "ENRICHED SUBJECT"}}],
+            })),
+        )
+        .await;
+        assert_eq!(reqs.len(), 1, "composer is the only provider call");
+
+        // sqlx::test gives this test its own database — the one assistant row
+        // is the image turn's.
+        let meta: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("assistant image row persisted");
+        let img = &meta["image"];
+        assert_eq!(
+            img["prompt"], "a beach at sunset",
+            "seed subject, not the composed text"
+        );
+        assert_eq!(img["compose_variant"], "b");
+        assert_eq!(img["compose_model"], "served/model");
+        assert_eq!(img["compose_generation_id"], "gen-xyz");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
