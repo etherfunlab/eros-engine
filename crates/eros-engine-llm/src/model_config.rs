@@ -528,21 +528,38 @@ pub struct DefaultConfig {
     pub provider_sort: Option<String>,
 }
 
+/// One `[[providers.<name>.body]]` rule (spec 2026-08-02-provider-body-params):
+/// opaque params merged into the chat/completions wire body for the tasks it
+/// names. `tasks` omitted ⇒ every chat task this provider serves; `params` is
+/// TOML→JSON passthrough the engine never interprets. Rules apply in
+/// declaration order; later rules win on key conflicts, and the merged params
+/// win over engine-built wire fields. Structural validation (non-empty params,
+/// engine-owned-key refusal, task-name warnings) lives in `validate_providers`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyRule {
+    #[serde(default)]
+    pub tasks: Option<Vec<String>>,
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
 /// One `[providers]` entry (spec 2026-08-01-embedding-providers §1). URLs are
 /// complete and posted verbatim — no path joining. `headers` are sent verbatim
 /// on every request to this entry's endpoints (both `chat` and `embeddings`);
 /// `Authorization`/`Content-Type` are engine-owned and rejected at boot.
 /// `BTreeMap` so validation-error ordering is deterministic across restarts.
 ///
+/// `Eq` is dropped: `serde_json::Value` is not `Eq`.
 /// `Deserialize` is hand-written (below) rather than derived: the 0.9.3
 /// shape was a plain string, and a config still written that way must not
 /// see a generic serde "invalid type: string ..., expected struct
 /// ProviderEntry" — it should see the table form it needs to switch to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderEntry {
     pub chat: Option<String>,
     pub embeddings: Option<String>,
     pub headers: Option<BTreeMap<String, String>>,
+    pub body: Option<Vec<BodyRule>>,
 }
 
 /// Error taught to an operator whose `[providers]` entry is still the 0.9.3
@@ -569,6 +586,8 @@ impl<'de> Deserialize<'de> for ProviderEntry {
             embeddings: Option<String>,
             #[serde(default)]
             headers: Option<BTreeMap<String, String>>,
+            #[serde(default)]
+            body: Option<Vec<BodyRule>>,
         }
 
         struct ProviderEntryVisitor;
@@ -633,6 +652,7 @@ impl<'de> Deserialize<'de> for ProviderEntry {
                     chat: table.chat,
                     embeddings: table.embeddings,
                     headers: table.headers,
+                    body: table.body,
                 })
             }
         }
@@ -644,7 +664,7 @@ impl<'de> Deserialize<'de> for ProviderEntry {
 impl ProviderEntry {
     /// True when nothing at all is declared (all-`None`).
     pub fn is_empty(&self) -> bool {
-        self.chat.is_none() && self.embeddings.is_none() && self.headers.is_none()
+        self.chat.is_none() && self.embeddings.is_none() && self.headers.is_none() && self.body.is_none()
     }
 
     /// Boot gate for the `headers` table: engine-owned names are rejected
@@ -6385,6 +6405,50 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         assert!(map.contains_key("venice"));
         assert!(!map.contains_key("local"));
         assert_eq!(map["venice"].headers.get("X-Team").unwrap(), "companion");
+    }
+
+    #[test]
+    fn provider_body_rules_parse() {
+        let cfg = ModelConfig::from_toml_str(
+            "[providers.venice]\nchat = \"https://v/chat\"\n\
+             [[providers.venice.body]]\ntasks = [\"chat_companion\"]\n\
+             params = { venice_parameters = { include_venice_system_prompt = false } }\n\
+             [[providers.venice.body]]\n\
+             params = { reasoning = { max_tokens = 512 } }\n",
+        )
+        .unwrap();
+        let body = cfg.providers["venice"].body.as_ref().unwrap();
+        assert_eq!(body.len(), 2);
+        assert_eq!(
+            body[0].tasks.as_deref(),
+            Some(&["chat_companion".to_string()][..])
+        );
+        assert_eq!(
+            body[0].params["venice_parameters"]["include_venice_system_prompt"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(body[1].tasks.is_none(), "omitted tasks parses as None");
+        assert_eq!(body[1].params["reasoning"]["max_tokens"], 512);
+    }
+
+    #[test]
+    fn provider_body_rule_unknown_key_is_rejected() {
+        let err = ModelConfig::from_toml_str(
+            "[providers.venice]\nchat = \"https://v/chat\"\n\
+             [[providers.venice.body]]\nparam = { a = 1 }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("param"), "unknown rule key must be named: {err}");
+    }
+
+    #[test]
+    fn provider_entry_with_only_body_is_not_empty() {
+        let cfg = ModelConfig::from_toml_str(
+            "[[providers.openrouter.body]]\nparams = { transforms = [\"middle-out\"] }\n",
+        )
+        .unwrap();
+        assert!(!cfg.providers["openrouter"].is_empty());
     }
 
     // ---- [tasks.embedding] routing + resolve_embedding (spec 2026-08-01-embedding-providers §2/§3/§6) ----
