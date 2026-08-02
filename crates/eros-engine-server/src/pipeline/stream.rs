@@ -5870,6 +5870,20 @@ data: [DONE]\n\n";
             "composer must use variant b, got {}",
             body["messages"][0]["content"]
         );
+
+        // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
+        // the audit keys, and `prompt` is the seed subject as before.
+        let meta: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("assistant image row persisted");
+        let img = meta["image"].as_object().expect("image marker present");
+        assert_eq!(img["prompt"], "a beach at sunset");
+        assert!(img.get("compose_variant").is_none());
+        assert!(img.get("compose_model").is_none());
+        assert!(img.get("compose_generation_id").is_none());
     }
 
     /// `prompt_variant = "raw"` must make ZERO provider calls and pass the seed
@@ -5908,6 +5922,20 @@ data: [DONE]\n\n";
             composed.contains("a beach at sunset"),
             "raw must pass the seed subject through: {composed}"
         );
+
+        // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
+        // the audit keys, and `prompt` is the seed subject as before.
+        let meta: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("assistant image row persisted");
+        let img = meta["image"].as_object().expect("image marker present");
+        assert_eq!(img["prompt"], "a beach at sunset");
+        assert!(img.get("compose_variant").is_none());
+        assert!(img.get("compose_model").is_none());
+        assert!(img.get("compose_generation_id").is_none());
     }
 
     /// Spec 2026-08-02: a SUCCESSFUL composer call persists the audit trio to
