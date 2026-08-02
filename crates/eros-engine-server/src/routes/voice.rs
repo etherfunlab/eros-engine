@@ -15,6 +15,7 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::scope::RelationshipScope;
 use eros_engine_store::chat::{ChatRepo, VoiceUserInsert};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -200,6 +201,7 @@ pub async fn voice_turn_stream(
         session_id,
         instance_id,
         user_message_id,
+        relationship_scope: RelationshipScope::default(),
     };
     let proto = run_voice_turn(Arc::new(state.clone()), turn, resolved);
 

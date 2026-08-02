@@ -7,8 +7,9 @@ use std::sync::Arc;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use eros_engine_core::affinity::{Affinity, RelationshipLabel};
+use eros_engine_core::affinity::{Affinity, BondLabel, ChemistryLabel};
 use eros_engine_core::persona::PersonaGenome;
+use eros_engine_core::scope::RelationshipScope;
 use eros_engine_llm::model_config::ResolvedVoice;
 use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
 use eros_engine_store::affinity::AffinityRepo;
@@ -21,38 +22,68 @@ use crate::pipeline::stream::{
 use crate::state::AppState;
 
 /// Assemble the thin voice system prompt: persona + voice directive + one
-/// optional relationship line. Deliberately excludes recall, memories, traits,
+/// optional relationship line (bond/chemistry-derived, gated by
+/// `relationship_scope`). Deliberately excludes recall, memories, traits,
 /// scopes, and every heavy block the text path's `build_prompt` composes.
 pub fn build_voice_prompt(
     genome: &PersonaGenome,
     directive: &str,
     affinity: Option<&Affinity>,
+    relationship_scope: RelationshipScope,
 ) -> String {
-    let mut s = String::with_capacity(genome.system_prompt.len() + directive.len() + 96);
+    let mut s = String::with_capacity(genome.system_prompt.len() + directive.len() + 384);
     s.push_str(&genome.system_prompt);
     s.push_str("\n\n");
     s.push_str(directive);
-    if let Some(line) = affinity.and_then(relationship_line) {
+    if let Some(line) = affinity.and_then(|a| relationship_line(a, relationship_scope)) {
         s.push_str("\n\n");
         s.push_str(&line);
     }
     s
 }
 
-/// One short relationship-tone line from the cached `relationship_label`.
-/// `None` (fresh affinity, no label yet) ⇒ no line.
-fn relationship_line(affinity: &Affinity) -> Option<String> {
-    let phrase = match &affinity.relationship_label {
-        Some(RelationshipLabel::Stranger) => {
-            "You two are still getting to know each other; keep it light."
+/// One relationship-tone line, derived at read time from the affinity row's
+/// bond/chemistry tiers — never from the cached `relationship_label`, which
+/// the voice path (no per-turn affinity eval) would leave stale forever.
+/// `scope` gates which halves are injected.
+fn relationship_line(affinity: &Affinity, scope: RelationshipScope) -> Option<String> {
+    let base = || {
+        match affinity.bond_label() {
+        BondLabel::Acquaintance => {
+            "You two are still getting to know each other; keep it light and natural."
         }
-        Some(RelationshipLabel::Friend) => "You two are close friends; be warm and familiar.",
-        Some(RelationshipLabel::Romantic) => "You share a romantic bond; be affectionate.",
-        Some(RelationshipLabel::Frenemy) => "Your dynamic is playful and a little combative.",
-        Some(RelationshipLabel::SlowBurn) => "There's a slow-building closeness between you.",
-        None => return None,
+        BondLabel::Friend => "You two are friends; be warm, easy, and natural.",
+        BondLabel::CloseFriend => "You two are close friends; be warm, familiar, and comfortable.",
+        BondLabel::Confidant => {
+            "You two trust each other deeply; speak openly, at ease, and with quiet closeness."
+        }
+        BondLabel::Soulmate => {
+            "You two know each other inside out; total comfort, familiarity, and unspoken understanding."
+        }
+    }
     };
-    Some(phrase.to_string())
+    let clause = || {
+        match affinity.chemistry_label() {
+        ChemistryLabel::Spark | ChemistryLabel::Flirtation => {
+            "A faint, unspoken spark exists between you. Keep it subtle — light teasing is allowed, but do not lean into romance or seduction yet."
+        }
+        ChemistryLabel::Crush => {
+            "There's a clear and growing attraction between you. Let soft flirtation and quiet allure color your words. Be teasing, a little magnetic, but still restrained."
+        }
+        ChemistryLabel::Lover => {
+            "You share a romantic and physical bond. Be affectionate, intimate, and gently alluring. Your voice and manner should feel warm, close, and quietly seductive."
+        }
+        ChemistryLabel::Beloved => {
+            "You two are deeply in love and highly attuned to each other. Be openly affectionate, sensual, and alluring. Speak with natural intimacy, quiet desire, and magnetic ease — as if the other person is already yours."
+        }
+    }
+    };
+    match scope {
+        RelationshipScope::None => None,
+        RelationshipScope::Bond => Some(base().to_string()),
+        RelationshipScope::Chemistry => Some(clause().to_string()),
+        RelationshipScope::Both => Some(format!("{} {}", base(), clause())),
+    }
 }
 
 /// Inputs for one voice turn. The user utterance is already persisted (by the
@@ -62,6 +93,7 @@ pub struct VoiceTurn {
     pub session_id: Uuid,
     pub instance_id: Uuid,
     pub user_message_id: Uuid,
+    pub relationship_scope: RelationshipScope,
 }
 
 /// Recent turns fed to the model on a voice turn. Shorter than the text path to
@@ -117,8 +149,12 @@ pub fn run_voice_turn(
             }
         };
 
-        let system_prompt =
-            build_voice_prompt(&persona.genome, &resolved.directive, affinity.as_ref());
+        let system_prompt = build_voice_prompt(
+            &persona.genome,
+            &resolved.directive,
+            affinity.as_ref(),
+            turn.relationship_scope,
+        );
 
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(WireMessage { role: "system".into(), content: system_prompt });
@@ -275,6 +311,7 @@ pub fn run_voice_turn(
         // gets the FULL unfiltered usage; the wire `Done` frame below gets a
         // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        let scope_metadata = serde_json::json!({ "relationship_scope": turn.relationship_scope });
         if !acc.is_empty() {
             if let Err(e) = chat_repo
                 .insert_voice_assistant_message(
@@ -286,7 +323,7 @@ pub fn run_voice_turn(
                     usage_full.as_ref(),
                     last_gen_id.as_deref(),
                     truncated,
-                    None,
+                    Some(&scope_metadata),
                 )
                 .await
             {
@@ -326,49 +363,129 @@ mod tests {
         }
     }
 
-    fn affinity_with(label: Option<RelationshipLabel>) -> Affinity {
+    /// Affinity row landing on chosen tiers via raw axis values; cached
+    /// relationship_label deliberately None — the line must not read it.
+    fn affinity_at(
+        warmth: f64,
+        trust: f64,
+        intrigue: f64,
+        intimacy: f64,
+        tension: f64,
+    ) -> Affinity {
         let now = Utc::now();
         Affinity {
             id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
             instance_id: Uuid::new_v4(),
-            warmth: 0.0,
-            trust: 0.0,
-            intrigue: 0.0,
-            intimacy: 0.0,
-            patience: 0.0,
-            tension: 0.0,
+            warmth,
+            trust,
+            intrigue,
+            intimacy,
+            patience: 0.5,
+            tension,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
-            relationship_label: label,
+            relationship_label: None,
             created_at: now,
             updated_at: now,
         }
     }
 
     #[test]
-    fn includes_persona_and_directive() {
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", None);
-        assert!(p.contains("You are Mia."));
-        assert!(p.contains("DIRECTIVE"));
-        // No affinity ⇒ no relationship line.
-        assert!(!p.contains("romantic"));
-    }
-
-    #[test]
-    fn appends_relationship_line_when_labelled() {
-        let a = affinity_with(Some(RelationshipLabel::Romantic));
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a));
-        assert!(p.contains("romantic bond"));
-    }
-
-    #[test]
-    fn no_relationship_line_when_label_none() {
-        let a = affinity_with(None);
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a));
+    fn includes_persona_and_directive_without_affinity() {
+        let p = build_voice_prompt(&genome(), "DIRECTIVE", None, RelationshipScope::default());
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
+    }
+
+    #[test]
+    fn fresh_affinity_gets_acquaintance_and_spark_line() {
+        // bond 0 ⇒ tier 1 Acquaintance; chemistry 0 ⇒ tier 1 Spark.
+        let a = affinity_at(0.0, 0.0, 0.0, 0.0, 0.0);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            Some(&a),
+            RelationshipScope::default(),
+        );
+        assert!(p.contains("still getting to know each other"));
+        assert!(p.contains("faint, unspoken spark"));
+    }
+
+    #[test]
+    fn high_bond_low_chemistry_keeps_romance_restrained() {
+        // bond (0.9+0.9+0.9)/3 = 0.9 ⇒ tier 5 Soulmate;
+        // chemistry (0.9+0+0)/3 = 0.3 ⇒ tier 2 Flirtation.
+        let a = affinity_at(0.9, 0.9, 0.9, 0.0, 0.0);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            Some(&a),
+            RelationshipScope::default(),
+        );
+        assert!(p.contains("know each other inside out"));
+        assert!(p.contains("do not lean into romance or seduction yet"));
+        assert!(!p.contains("growing attraction"));
+        assert!(!p.contains("quietly seductive"));
+        assert!(!p.contains("deeply in love"));
+    }
+
+    #[test]
+    fn high_chemistry_appends_affectionate_clause() {
+        // bond (0.9+0.2+0.2)/3 ≈ 0.433 ⇒ tier 3 CloseFriend;
+        // chemistry (0.9+0.9+0.9)/3 = 0.9 ⇒ tier 5 Beloved.
+        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            Some(&a),
+            RelationshipScope::default(),
+        );
+        assert!(p.contains("close friends"));
+        assert!(p.contains("deeply in love"));
+    }
+
+    #[test]
+    fn chemistry_boundary_switches_clause_at_crush() {
+        // (0+0.52+0.50)/3 ≈ 0.34 ⇒ tier 2: still the subtle clause.
+        let low = affinity_at(0.0, 0.0, 0.0, 0.52, 0.50);
+        let p_low = build_voice_prompt(&genome(), "D", Some(&low), RelationshipScope::default());
+        assert!(p_low.contains("faint, unspoken spark"));
+        assert!(!p_low.contains("growing attraction"));
+        // (0+0.54+0.54)/3 = 0.36 ⇒ tier 3: switches to the Crush clause.
+        let high = affinity_at(0.0, 0.0, 0.0, 0.54, 0.54);
+        let p_high = build_voice_prompt(&genome(), "D", Some(&high), RelationshipScope::default());
+        assert!(p_high.contains("growing attraction"));
+        assert!(!p_high.contains("faint, unspoken spark"));
+    }
+
+    #[test]
+    fn scope_none_suppresses_line() {
+        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
+        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a), RelationshipScope::None);
+        assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
+    }
+
+    #[test]
+    fn scope_bond_emits_base_only() {
+        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9); // CloseFriend / Beloved
+        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a), RelationshipScope::Bond);
+        assert!(p.contains("close friends"));
+        assert!(!p.contains("deeply in love"));
+    }
+
+    #[test]
+    fn scope_chemistry_emits_clause_only() {
+        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            Some(&a),
+            RelationshipScope::Chemistry,
+        );
+        assert!(!p.contains("close friends"));
+        assert!(p.contains("deeply in love"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -447,6 +564,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -478,6 +596,17 @@ data: [DONE]\n\n";
         .unwrap();
         assert_eq!(content, "hi there");
         assert_eq!(channel.as_deref(), Some("voice"));
+
+        // Resolved scope audited on the assistant row.
+        let scope_meta: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'relationship_scope' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scope_meta.as_deref(), Some("both"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -557,6 +686,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -687,6 +817,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -817,6 +948,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -940,6 +1072,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -1054,6 +1187,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
@@ -1174,6 +1308,7 @@ data: [DONE]\n\n";
                 session_id,
                 instance_id,
                 user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
             },
             resolved,
         )
