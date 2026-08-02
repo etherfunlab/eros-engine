@@ -50,7 +50,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_REPLY,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         };
@@ -69,7 +69,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         };
@@ -84,7 +84,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_PROACTIVE,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         };
@@ -100,7 +100,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             energy_cost: ENERGY_COST_APP_OPEN,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         };
@@ -114,7 +114,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         energy_cost: ENERGY_COST_REPLY,
         context_hints: vec![],
         reply_tone: None,
-        image_prompt: None,
+        image_caption: None,
         image_ref: ImageRef::Face,
         aspect_ratio: None,
     }
@@ -135,7 +135,6 @@ pub fn plan_for(
     action: ActionType,
     hints: Vec<String>,
     reply_tone: Option<String>,
-    image_prompt: Option<String>,
     image_ref: ImageRef,
     aspect_ratio: Option<String>,
 ) -> ActionPlan {
@@ -153,7 +152,7 @@ pub fn plan_for(
             } else {
                 reply_tone
             },
-            image_prompt,
+            image_caption: None,
             image_ref,
             aspect_ratio,
         },
@@ -164,7 +163,7 @@ pub fn plan_for(
             energy_cost: ENERGY_COST_GHOST,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         },
@@ -178,7 +177,7 @@ pub fn plan_for(
             energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: ImageRef::Face,
             aspect_ratio: None,
         },
@@ -476,7 +475,6 @@ mod tests {
             ActionType::ReplyText,
             vec!["有点开心".into()],
             None,
-            None,
             ImageRef::Face,
             None,
         );
@@ -493,7 +491,6 @@ mod tests {
             &input,
             ActionType::Ghost,
             vec!["想躲".into()],
-            None,
             None,
             ImageRef::Face,
             None,
@@ -512,23 +509,24 @@ mod tests {
             ActionType::ReplyTextImage,
             vec![],
             None,
-            Some("a selfie in a cafe".to_string()),
             ImageRef::Face,
             None,
         );
         assert_eq!(plan.action_type, ActionType::ReplyTextImage);
-        assert_eq!(plan.image_prompt.as_deref(), Some("a selfie in a cafe"));
+        assert_eq!(
+            plan.image_caption, None,
+            "no caption exists at decision time — the composer has not run"
+        );
 
         let ghost = plan_for(
             &input,
             ActionType::Ghost,
             vec![],
             None,
-            Some("ignored".into()),
             ImageRef::Face,
             None,
         );
-        assert_eq!(ghost.image_prompt, None, "ghost carries no image prompt");
+        assert_eq!(ghost.image_caption, None, "ghost carries no image prompt");
     }
 
     #[test]
@@ -539,7 +537,6 @@ mod tests {
             ActionType::ReplyImage,
             vec![],
             None,
-            Some("a subject".into()),
             ImageRef::Previous,
             Some("9:16".into()),
         );
@@ -552,7 +549,6 @@ mod tests {
             ActionType::Ghost,
             vec![],
             None,
-            Some("ignored".into()),
             ImageRef::Previous,
             Some("9:16".into()),
         );
@@ -570,7 +566,6 @@ mod tests {
             ActionType::ReplyText,
             vec![],
             tone.clone(),
-            None,
             ImageRef::Face,
             None,
         );
@@ -581,7 +576,6 @@ mod tests {
             ActionType::ReplyTextImage,
             vec![],
             tone.clone(),
-            Some("selfie".into()),
             ImageRef::Face,
             None,
         );
@@ -592,7 +586,6 @@ mod tests {
             ActionType::ReplyImage,
             vec![],
             tone.clone(),
-            Some("selfie".into()),
             ImageRef::Face,
             None,
         );
@@ -606,7 +599,6 @@ mod tests {
             ActionType::Ghost,
             vec![],
             tone,
-            None,
             ImageRef::Face,
             None,
         );
@@ -627,7 +619,6 @@ mod tests {
             ActionType::ProductQa,
             vec!["ignored".into()],
             Some("ignored".into()),
-            None,
             ImageRef::Face,
             None,
         );

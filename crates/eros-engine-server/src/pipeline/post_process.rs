@@ -102,19 +102,19 @@ pub async fn run(
             .collect::<Vec<_>>()
             .join("\n");
 
-        // For reply_image the assistant text is empty; use the plan's image_prompt
-        // as the assistant-content proxy so the photo-send still moves affinity.
-        // Subjectless image turns (blank image_prompt) fall back to a generic
+        // For reply_image the assistant text is empty; use the picture's
+        // caption as the assistant-content proxy so the photo-send still
+        // moves affinity. Captionless image turns fall back to a generic
         // photo marker so they are still evaluated rather than tripping the
         // `empty_assistant` gate.
         let eval_text = affinity_eval_text(
             plan.action_type,
             &assistant_msg,
-            plan.image_prompt.as_deref(),
+            plan.image_caption.as_deref(),
         );
 
         // Semantic eval gate: Reply turns only, with a non-trivial user message
-        // and a non-empty produced assistant message (or image_prompt proxy for
+        // and a non-empty produced assistant message (or image_caption proxy for
         // reply_image). Other actions (Proactive / Ghost) keep rule-only deltas
         // in v1. `pre_skip == None` ⇒ the gate passes and an eval call is
         // attempted; otherwise it carries the reason the trio will be NULL
@@ -515,25 +515,28 @@ const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 /// rule-only deltas (the spec §4.5 "timeout → default" path).
 const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The companion-reply text the affinity evaluator scores. Non-empty produced
-/// text wins. For an image turn with no produced text, use the judge's subject
-/// (`image_prompt`); if that is also blank, use a generic photo marker so a
-/// subjectless generated image is still evaluated rather than tripping the
-/// `empty_assistant` gate. Non-image turns with empty text yield "" (still skip).
+/// The text the affinity evaluator scores as "what the assistant said".
+///
+/// Image turns carry no assistant text, so the picture's caption stands in —
+/// otherwise a photo-send would trip the `empty_assistant` gate and never move
+/// affinity. A caption is a short natural-language line in the conversation's
+/// language, which is exactly the register the first-person evaluator reads.
+/// Captionless image turns (legacy rows, `raw` variant, failed compose) fall
+/// back to a generic photo marker so they are still evaluated.
 fn affinity_eval_text(
     action: ActionType,
     assistant_msg: &str,
-    image_prompt: Option<&str>,
+    image_caption: Option<&str>,
 ) -> String {
     if !assistant_msg.trim().is_empty() {
         return assistant_msg.to_string();
     }
     if matches!(action, ActionType::ReplyImage | ActionType::ReplyTextImage) {
-        let subject = image_prompt.map(str::trim).unwrap_or("");
-        if subject.is_empty() {
+        let caption = image_caption.map(str::trim).unwrap_or("");
+        if caption.is_empty() {
             return "[发送了一张照片]".to_string(); // consistent with the engine's Chinese image markers
         }
-        return subject.to_string();
+        return caption.to_string();
     }
     String::new()
 }
@@ -576,8 +579,9 @@ fn eval_skip_reason(
         // called. Exhaustiveness only.
         ActionType::ProductQa => Some("product_qa"),
         // Image variants route through the same gate as ReplyText. For reply_image
-        // the caller passes `image_prompt` as the assistant-content proxy so an
-        // image-send still moves affinity (assistant_empty=false when prompt is set).
+        // the caller passes `image_caption` as the assistant-content proxy so an
+        // image-send still moves affinity (assistant_empty=false when the caption
+        // is set — and the generic photo marker keeps it false even when it isn't).
         ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
             if user_msg_chars < AFFINITY_EVAL_MIN_CHARS {
                 Some("short_user_msg")
@@ -1348,7 +1352,7 @@ mod tests {
             None
         );
         // reply_image with empty assistant text but the caller supplies a non-empty
-        // proxy (assistant_empty=false because image_prompt is used) → not skipped
+        // proxy (assistant_empty=false because image_caption is used) → not skipped
         assert_eq!(eval_skip_reason(ActionType::ReplyImage, 10, false), None);
         // image reply with empty proxy → empty_assistant
         assert_eq!(
@@ -1372,27 +1376,28 @@ mod tests {
     }
 
     #[test]
-    fn affinity_eval_text_prefers_text_then_subject_then_marker() {
-        // produced text always wins
+    fn affinity_eval_text_prefers_text_then_caption_then_marker() {
+        // assistant text wins whenever present
         assert_eq!(
-            affinity_eval_text(ActionType::ReplyTextImage, "hi there", Some("a cat")),
-            "hi there"
+            affinity_eval_text(ActionType::ReplyTextImage, "我在这儿", Some("在天台")),
+            "我在这儿"
         );
-        // image turn, no text, with subject → subject
+        // image turn with no text: the caption is the proxy
         assert_eq!(
-            affinity_eval_text(ActionType::ReplyImage, "", Some("a selfie")),
-            "a selfie"
+            affinity_eval_text(ActionType::ReplyImage, "", Some("在天台看夕阳")),
+            "在天台看夕阳"
         );
-        // image turn, no text, no subject → generic marker (still evaluated)
+        // image turn with no text and no caption: generic marker, so the turn
+        // is still evaluated rather than tripping the empty_assistant gate
         assert_eq!(
             affinity_eval_text(ActionType::ReplyImage, "", None),
             "[发送了一张照片]"
         );
         assert_eq!(
-            affinity_eval_text(ActionType::ReplyImage, "", Some("  ")),
+            affinity_eval_text(ActionType::ReplyImage, "", Some("   ")),
             "[发送了一张照片]"
         );
-        // non-image empty text → empty (genuine empty reply still skips)
+        // non-image action with no text stays empty
         assert_eq!(affinity_eval_text(ActionType::ReplyText, "", None), "");
     }
 
@@ -1873,7 +1878,7 @@ mod tests {
             energy_cost: 0.0,
             context_hints: Vec::new(),
             reply_tone: None,
-            image_prompt: None,
+            image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
         };

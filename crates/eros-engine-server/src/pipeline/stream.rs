@@ -1518,7 +1518,8 @@ impl PdeAction {
 }
 
 /// Parsed judge verdict. `inner_state` is sanitized (`sanitize_inner_state`)
-/// before it reaches the prompt; `image_prompt`/`reason` are never injected.
+/// before it reaches the prompt; `reason` is never injected. The judge writes
+/// no image prompt — composition belongs to `chat_image_prompt_compose` (#212).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PdeVerdict {
     action: PdeAction,
@@ -1528,8 +1529,6 @@ pub(crate) struct PdeVerdict {
     /// inner_state before injection). `None` on old prompts / null verdicts.
     #[serde(default)]
     tone: Option<String>,
-    #[serde(default)]
-    image_prompt: Option<String>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -1621,13 +1620,12 @@ fn pde_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["action", "inner_state", "tone", "image_prompt", "reason", "image_ref", "aspect_ratio"],
+                "required": ["action", "inner_state", "tone", "reason", "image_ref", "aspect_ratio"],
                 "properties": {
                     "action": { "type": "string",
                         "enum": ["reply_text", "ghost", "reply_image", "reply_text_image", "product_qa"] },
                     "inner_state": { "type": "string" },
                     "tone": { "type": ["string", "null"] },
-                    "image_prompt": { "type": ["string", "null"] },
                     "reason": { "type": ["string", "null"] },
                     "image_ref": { "type": "string", "enum": ["face", "previous"] },
                     "aspect_ratio": { "type": ["string", "null"],
@@ -1809,7 +1807,6 @@ fn apply_ghosting_killswitch(
             ActionType::ReplyText,
             hints,
             None,
-            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         )
@@ -1964,8 +1961,6 @@ struct VerdictAudit<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tone: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_prompt: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     image_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1978,7 +1973,6 @@ impl<'a> From<&'a PdeVerdict> for VerdictAudit<'a> {
             action: v.action.as_str(),
             inner_state: &v.inner_state,
             tone: v.tone.as_deref(),
-            image_prompt: v.image_prompt.as_deref(),
             reason: v.reason.as_deref(),
             image_ref: match v.image_ref {
                 eros_engine_core::types::ImageRef::Face => "face",
@@ -2530,7 +2524,7 @@ struct ImageTurnInputs {
 
 /// Pure: resolve the seed subject, style, and aspect ratio for a delegated
 /// image turn. Precedence per field:
-/// - subject: `plan.image_prompt` → `req_image.image_prompt` → `""`
+/// - subject: `req_image.image_prompt` → `""` (the judge no longer writes one)
 /// - style:   `req_image.style` → type default (`Realistic`)
 /// - aspect:  `plan.aspect_ratio` → `req_image.aspect_ratio` → `None`
 ///
@@ -2541,15 +2535,9 @@ fn resolve_image_turn_inputs(
     plan: &eros_engine_core::types::ActionPlan,
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
 ) -> ImageTurnInputs {
-    let seed_subject = plan
-        .image_prompt
-        .as_deref()
+    let seed_subject = req_image
+        .and_then(|i| i.image_prompt.as_deref())
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            req_image
-                .and_then(|i| i.image_prompt.as_deref())
-                .filter(|s| !s.trim().is_empty())
-        })
         .unwrap_or("")
         .to_string();
     let style = req_image.and_then(|i| i.style).unwrap_or_default();
@@ -3067,23 +3055,20 @@ pub fn run_stream(
                                 .as_deref()
                                 .map(sanitize_inner_state)
                                 .filter(|s| !s.is_empty());
-                            // Capture the judge's image prompt while `v` is still
-                            // borrowed here (the run/verdict is moved into the
-                            // audit task below). Only image actions carry it.
+                            // Only image actions carry the judge's image_ref /
+                            // aspect_ratio; `v` is still borrowed here (the
+                            // run/verdict is moved into the audit task below).
                             let is_image = matches!(
                                 action,
                                 ActionType::ReplyImage | ActionType::ReplyTextImage
                             );
-                            let img_prompt = if is_image { v.image_prompt.clone() } else { None };
                             let img_ref = if is_image {
                                 v.image_ref
                             } else {
                                 eros_engine_core::types::ImageRef::Face
                             };
                             let img_aspect = if is_image { v.aspect_ratio.clone() } else { None };
-                            pde::plan_for(
-                                &input, action, hints, tone, img_prompt, img_ref, img_aspect,
-                            )
+                            pde::plan_for(&input, action, hints, tone, img_ref, img_aspect)
                         }
                         _ => pde::decide(&input), // fail-open
                     };
@@ -3103,8 +3088,9 @@ pub fn run_stream(
 
         // Forced-image override — wins over the PDE/ghost result. Applied AFTER
         // the kill-switch so a client-forced image is never suppressed to ghost.
-        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. Carries
-        // the client-supplied image prompt (not the judge's).
+        // ImageOnly ⇒ ReplyImage; otherwise (TextImage) ⇒ ReplyTextImage. The
+        // client's explicit subject still reaches the composer via
+        // `resolve_image_turn_inputs`, which reads `req_image.image_prompt`.
         if force_image {
             let action = match req_image.map(|i| &i.mode) {
                 Some(crate::routes::companion_stream::ImageMode::ImageOnly) => {
@@ -3117,7 +3103,6 @@ pub fn run_stream(
                 action,
                 plan.context_hints.clone(),
                 plan.reply_tone.clone(),
-                req_image.and_then(|i| i.image_prompt.clone()),
                 eros_engine_core::types::ImageRef::Face,
                 None,
             );
@@ -3427,6 +3412,7 @@ pub fn run_stream(
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
+                let mut image_only_caption: Option<String> = None;
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
                     // Delegate-only: compose the prompt and emit `image_request`;
@@ -3459,6 +3445,7 @@ pub fn run_stream(
                         img.compose_model.as_deref(),
                         img.compose_generation_id.as_deref(),
                     );
+                    image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
                         id: msg_uuid,
                         content: String::new(),
@@ -3482,7 +3469,8 @@ pub fn run_stream(
                         tracing::warn!("stream(image): persist failed: {e}");
                     }
                     // full_text="" so insight/memory extraction skips this row;
-                    // affinity uses plan.image_prompt as the proxy.
+                    // affinity uses plan.image_caption (set below, from the
+                    // picture's caption) as the proxy.
                     image_only_produced.push(crate::pipeline::post_process::ProducedMessage {
                         message_id: msg_uuid,
                         full_text: String::new(),
@@ -3528,7 +3516,8 @@ pub fn run_stream(
                     yield final_frame;
 
                     let state_bg = (*state).clone();
-                    let plan_bg = plan.clone();
+                    let mut plan_bg = plan.clone();
+                    plan_bg.image_caption = image_only_caption;
                     let event_bg = Event::UserMessage {
                         content: user_msg.content.clone(),
                         message_id: user_msg.user_message_id,
@@ -3761,6 +3750,7 @@ pub fn run_stream(
                 // order: meta → delta* → done → image → final. On image failure
                 // (or zero images / empty produced) we emit NO Image frame — the
                 // text reply already reached the client, so the turn is complete.
+                let mut image_caption: Option<String> = None;
                 if matches!(plan.action_type, ActionType::ReplyTextImage) {
                     if let Some(last) = produced.last() {
                         let msg_uuid = last.message_id;
@@ -3777,6 +3767,7 @@ pub fn run_stream(
                         let subject = img.subject;
                         let aspect = img.aspect_ratio;
                         let composed_prompt = img.composed_prompt;
+                        image_caption = img.caption.clone();
                         // Merge the marker (subject + caption + aspect + compose
                         // audit trio on success) onto the already-persisted
                         // text row so the PDE stays image-aware (§5). The text
@@ -3827,6 +3818,7 @@ pub fn run_stream(
                 if plan_bg.action_type == ActionType::ReplyImage {
                     plan_bg.action_type = ActionType::ReplyText;
                 }
+                plan_bg.image_caption = image_caption;
                 let event_bg = Event::UserMessage {
                     content: user_msg.content.clone(),
                     message_id: user_msg.user_message_id,
@@ -4194,10 +4186,7 @@ mod tests {
 
     // ─── resolve_image_turn_inputs ───────────────────────────────────────
 
-    fn img_plan(
-        image_prompt: Option<&str>,
-        aspect: Option<&str>,
-    ) -> eros_engine_core::types::ActionPlan {
+    fn img_plan(aspect: Option<&str>) -> eros_engine_core::types::ActionPlan {
         eros_engine_core::types::ActionPlan {
             action_type: ActionType::ReplyImage,
             reply_style: eros_engine_core::types::ReplyStyle::Neutral,
@@ -4205,7 +4194,7 @@ mod tests {
             energy_cost: 0.0,
             context_hints: vec![],
             reply_tone: None,
-            image_prompt: image_prompt.map(str::to_string),
+            image_caption: None,
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
         }
@@ -4225,26 +4214,20 @@ mod tests {
     }
 
     #[test]
-    fn image_turn_subject_prefers_plan_then_request_then_empty() {
+    fn image_turn_subject_comes_only_from_request() {
+        // The judge no longer writes a seed; the request is the only source.
         let params = img_params(Some("from request"), None, None);
-
-        // plan wins
-        let r = resolve_image_turn_inputs(&img_plan(Some("from plan"), None), Some(&params));
-        assert_eq!(r.seed_subject, "from plan");
-
-        // blank plan subject falls through to the request
-        let r = resolve_image_turn_inputs(&img_plan(Some("   "), None), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&params));
         assert_eq!(r.seed_subject, "from request");
 
         // neither ⇒ empty string
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), None);
         assert_eq!(r.seed_subject, "");
 
-        // blank request value, plan absent ⇒ falls through to empty string
-        // too, not the blank string itself (the request-level blank filter
-        // must still fire).
+        // blank request value ⇒ falls through to empty string too, not the
+        // blank string itself (the request-level blank filter must still fire).
         let blank_params = img_params(Some("   "), None, None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&blank_params));
         assert_eq!(r.seed_subject, "");
     }
 
@@ -4253,10 +4236,10 @@ mod tests {
         use eros_engine_llm::model_config::StyleKey;
 
         let params = img_params(None, Some(StyleKey::SemiRealistic), None);
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&params));
         assert_eq!(r.style, StyleKey::SemiRealistic, "request wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), None);
         assert_eq!(r.style, StyleKey::default(), "no request ⇒ type default");
     }
 
@@ -4264,22 +4247,22 @@ mod tests {
     fn image_turn_aspect_prefers_plan_then_request_then_none() {
         let params = img_params(None, None, Some("16:9"));
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("3:4")), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(Some("3:4")), Some(&params));
         assert_eq!(r.aspect_ratio.as_deref(), Some("3:4"), "plan wins");
 
-        let r = resolve_image_turn_inputs(&img_plan(None, Some("  ")), Some(&params));
+        let r = resolve_image_turn_inputs(&img_plan(Some("  ")), Some(&params));
         assert_eq!(
             r.aspect_ratio.as_deref(),
             Some("16:9"),
             "blank plan ⇒ request"
         );
 
-        let r = resolve_image_turn_inputs(&img_plan(None, None), None);
+        let r = resolve_image_turn_inputs(&img_plan(None), None);
         assert_eq!(r.aspect_ratio, None, "nothing anywhere ⇒ None");
 
         // Blank request value ⇒ the request-level blank filter still fires.
         let blank_params = img_params(None, None, Some("  "));
-        let r = resolve_image_turn_inputs(&img_plan(None, None), Some(&blank_params));
+        let r = resolve_image_turn_inputs(&img_plan(None), Some(&blank_params));
         assert_eq!(r.aspect_ratio, None, "blank request ⇒ None");
     }
 
@@ -4807,7 +4790,6 @@ mod tests {
             ActionType::Ghost,
             vec![],
             None,
-            None,
             eros_engine_core::types::ImageRef::Face,
             None,
         );
@@ -4837,7 +4819,6 @@ mod tests {
             &input,
             acted,
             hints.clone(),
-            None,
             None,
             eros_engine_core::types::ImageRef::Face,
             None,
@@ -6094,11 +6075,12 @@ data: [DONE]\n\n";
     /// returns `None` for an unconfigured task, so there is no config-side gate
     /// to lean on here. A longer message (e.g. "draw me", 7 chars) clears the
     /// length gate, and because `ReplyImage` proxies the assistant text with
-    /// `plan.image_prompt` (non-blank here), it would also clear the
-    /// empty-assistant gate — so the eval call fires, racing the test's
-    /// `mock.received_requests()` against a `tokio::spawn`ed task. Keeping the
-    /// content short makes "the composer is the only possible call" true by
-    /// construction, not by scheduling luck.
+    /// `plan.image_caption` — falling back to a generic marker when the
+    /// caption is absent, so the proxy text is always non-blank — it would
+    /// also clear the empty-assistant gate — so the eval call fires, racing
+    /// the test's `mock.received_requests()` against a `tokio::spawn`ed task.
+    /// Keeping the content short makes "the composer is the only possible
+    /// call" true by construction, not by scheduling luck.
     async fn run_variant_turn(
         pool: &PgPool,
         prompt_variant: Option<&str>,
@@ -10815,7 +10797,7 @@ data: [DONE]\n\n";
         assert_eq!(v["json_schema"]["name"], "pde_verdict");
         assert_eq!(v["json_schema"]["strict"], true);
         let req = v["json_schema"]["schema"]["required"].as_array().unwrap();
-        assert_eq!(req.len(), 7, "all seven properties required: {v}");
+        assert_eq!(req.len(), 6, "all six properties required: {v}");
         assert!(
             req.iter().any(|x| x == "image_ref"),
             "image_ref required: {v}"
@@ -10838,6 +10820,33 @@ data: [DONE]\n\n";
             actions.iter().any(|x| x == "product_qa"),
             "product_qa in action enum: {v}"
         );
+    }
+
+    #[test]
+    fn pde_response_format_has_no_image_prompt() {
+        let f = pde_response_format();
+        let schema = &f["json_schema"]["schema"];
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v == "image_prompt"),
+            "the judge must not be asked for an image prompt: {required:?}"
+        );
+        assert!(
+            schema["properties"].get("image_prompt").is_none(),
+            "image_prompt must be gone from properties"
+        );
+        // The two enums the judge still owns stay.
+        assert!(schema["properties"].get("image_ref").is_some());
+        assert!(schema["properties"].get("aspect_ratio").is_some());
+    }
+
+    #[test]
+    fn parse_pde_verdict_ignores_stray_image_prompt() {
+        // A non-strict provider may still emit the old key; it must not break parsing.
+        let j = r#"{"action":"reply_image","inner_state":"x","image_prompt":"leftover","image_ref":"previous","aspect_ratio":"9:16"}"#;
+        let v = parse_pde_verdict(j).expect("verdict parses despite the stray key");
+        assert_eq!(v.action, PdeAction::ReplyImage);
+        assert_eq!(v.aspect_ratio.as_deref(), Some("9:16"));
     }
 
     fn test_resolved_pde(models: Vec<String>) -> eros_engine_llm::model_config::ResolvedPde {

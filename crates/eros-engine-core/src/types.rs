@@ -157,9 +157,12 @@ pub struct ActionPlan {
     /// turns (reply_text / reply_text_image); `None` everywhere else — rule
     /// PDE, fail-open, tips, ghost, reply_image.
     pub reply_tone: Option<String>,
-    /// Subject for the image executor (`reply_image`/`reply_text_image`); `None`
-    /// for text/ghost/proactive. Carried from the PDE verdict or a forced turn.
-    pub image_prompt: Option<String>,
+    /// What the picture showed, for post-process affinity on image turns.
+    /// Written by the stream AFTER the composer resolves — always `None` at
+    /// decision time, since the composer has not run yet. `None` also on the
+    /// `raw` variant and on a failed compose, where the affinity evaluator
+    /// falls back to a generic photo marker.
+    pub image_caption: Option<String>,
     /// Which reference image an image turn builds on (avatar vs previous gen).
     /// `Face` for non-image actions.
     pub image_ref: ImageRef,
