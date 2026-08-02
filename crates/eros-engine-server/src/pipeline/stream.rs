@@ -6247,49 +6247,40 @@ data: [DONE]\n\n";
         assert!(img.get("compose_generation_id").is_none());
     }
 
-    /// `prompt_variant = "raw"` must still make ZERO provider calls (this
-    /// task does not touch the `"raw"` short-circuit itself — see #212 Task 6
-    /// for its eventual removal). With the client-side seed deleted there is
-    /// nothing left to draw "as-is": the turn now degrades to the same
-    /// empty-subject portrait fallback as a failed compose.
+    /// `prompt_variant = "raw"` used to be a reserved wire escape that skipped
+    /// the composer entirely. That escape is gone (#212 Task 6): with no seed
+    /// to draw verbatim, `"raw"` is an ordinary variant name. `run_variant_turn`
+    /// configures only `a` and `b`, so `"raw"` is a miss like any unconfigured
+    /// key — the composer still runs, on the built-in prompt.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn prompt_variant_raw_skips_the_composer(pool: PgPool) {
+    async fn prompt_variant_raw_falls_back_to_builtin_when_unconfigured(pool: PgPool) {
         use wiremock::ResponseTemplate;
-        // 500 on every call: "raw" must make no call at all, so the response
-        // body is irrelevant — this only proves ZERO requests were sent.
-        let (reqs, frames) = run_variant_turn(&pool, Some("raw"), ResponseTemplate::new(500)).await;
-        assert!(
-            reqs.is_empty(),
-            "raw must make no composer call, got {} request(s)",
-            reqs.len()
-        );
-
-        let composed_b64 = frames
-            .iter()
-            .find_map(|f| match f {
-                ProtocolFrame::ImageRequest {
-                    composed_prompt, ..
-                } => Some(composed_prompt.clone()),
-                _ => None,
-            })
-            .expect("image_request present");
-        let composed = {
-            use base64::Engine as _;
-            String::from_utf8(
-                base64::engine::general_purpose::STANDARD
-                    .decode(&composed_b64)
-                    .unwrap(),
-            )
-            .unwrap()
-        };
+        // 500 on every call: the composer fails open to an empty subject —
+        // there is no seed left to fall back to. This test asserts on what was
+        // SENT, so the response body is irrelevant.
+        let (reqs, _frames) =
+            run_variant_turn(&pool, Some("raw"), ResponseTemplate::new(500)).await;
         assert_eq!(
-            composed,
-            eros_engine_llm::model_config::STYLE_REALISTIC,
-            "raw skips the composer and there is no seed ⇒ portrait fallback: {composed}"
+            reqs.len(),
+            1,
+            "\"raw\" no longer skips the composer — it still makes the one provider call"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        assert_eq!(body["messages"][0]["role"], "system");
+        let sent = body["messages"][0]["content"]
+            .as_str()
+            .expect("system content is a string");
+        assert_ne!(sent, "PROMPT_A");
+        assert_ne!(sent, "PROMPT_B");
+        assert!(
+            sent.contains("You compose the image for a picture"),
+            "unconfigured \"raw\" key must fall back to the built-in prompt, got {sent}"
         );
 
-        // Spec 2026-08-02 absence semantics: no successful compose ⇒ none of
-        // the audit keys, and `prompt` is the empty subject (portrait fallback).
+        // Same fail-open shape as a configured-variant compose failure: no
+        // successful compose ⇒ none of the audit keys, and `prompt` is the
+        // empty subject (portrait fallback).
         let meta: serde_json::Value = sqlx::query_scalar(
             "SELECT metadata FROM engine.chat_messages WHERE role = 'assistant'",
         )

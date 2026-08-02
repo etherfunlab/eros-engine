@@ -198,9 +198,6 @@ impl PromptSpec {
     /// exact, case-sensitive key (`default` carries no special meaning). Every
     /// miss in a variant shape — absent, unparseable, out of range, unknown
     /// key — is `None`.
-    ///
-    /// `raw` is handled by the caller BEFORE this is reached; it never appears
-    /// here.
     pub fn select(&self, variant: Option<&str>) -> Option<&str> {
         match self {
             PromptSpec::Plain(s) => Some(s.as_str()),
@@ -258,12 +255,6 @@ fn check_variant_shape(task: &str, spec: &PromptSpec) -> Result<(), String> {
                         "has whitespace-padded key \"{k}\": its trimmed form differs from the raw \
                          key, but `select` matches a client's `image.prompt_variant` exactly — so \
                          neither \"{k}\" nor its trimmed form could ever select it"
-                    ));
-                }
-                if k.trim().eq_ignore_ascii_case("raw") {
-                    return refuse(format!(
-                        "uses the reserved key \"{k}\": \"raw\" is the wire value that skips the \
-                         composer entirely, so a prompt stored under it could never be selected"
                     ));
                 }
                 if v.trim().is_empty() {
@@ -1910,10 +1901,7 @@ impl ModelConfig {
     }
 
     /// Resolve the image-prompt composer task. `None` (composer does not run)
-    /// when `[tasks.chat_image_prompt_compose]` is absent, **or** when the
-    /// caller passed the reserved `raw` variant — the two are indistinguishable
-    /// by design, since both mean "use the seed subject verbatim"; `tracing`
-    /// tells them apart.
+    /// for exactly one reason: `[tasks.chat_image_prompt_compose]` is absent.
     ///
     /// `variant` is the client's per-turn `image.prompt_variant`, already
     /// trimmed by the caller. Selection is delegated to `PromptSpec::select`:
@@ -1928,10 +1916,6 @@ impl ModelConfig {
     ) -> Option<ResolvedImagePromptCompose> {
         const COMPOSE_TASK: &str = "chat_image_prompt_compose";
         let variant = variant.map(str::trim).filter(|v| !v.is_empty());
-        if variant.is_some_and(|v| v.eq_ignore_ascii_case("raw")) {
-            tracing::debug!("image-compose: variant \"raw\" — skipping composer");
-            return None;
-        }
         let task_cfg = self.tasks.get(COMPOSE_TASK)?;
         let selected = task_cfg
             .filter_prompt
@@ -2291,11 +2275,9 @@ impl ModelConfig {
     /// dead config — refuse to boot rather than let it silently no-op.
     ///
     /// Also enforces the structural rules for a variant container: non-empty,
-    /// no blank or whitespace-padded keys, no blank values, and no reserved
-    /// `raw` key (`raw` is the wire escape that skips the composer, so a
-    /// config key by that name could never be selected — and a padded key
-    /// like `" a "` could never be selected either, since `select` matches a
-    /// client's variant exactly).
+    /// no blank or whitespace-padded keys, no blank values (a padded key like
+    /// `" a "` could never be selected, since `select` matches a client's
+    /// variant exactly).
     ///
     /// Task names are visited in sorted order so the reported failure is
     /// deterministic across restarts (`self.tasks` is a `HashMap`).
@@ -6002,16 +5984,16 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn raw_is_a_reserved_key_case_insensitively() {
+    fn raw_is_an_ordinary_variant_key_and_boots() {
+        // "raw" used to be refused as a reserved wire escape. With no seed to
+        // draw verbatim, the escape is gone and the key is configurable.
         for key in ["raw", "Raw", "RAW"] {
-            let src = format!(
-                "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n\
-                 filter_prompt = {{ {key} = \"aaa\", b = \"bbb\" }}\n"
+            let toml = format!(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = {{ {key} = \"RAW PROMPT\" }}\n"
             );
-            let e = cfg(&src)
-                .validate_prompt_variants()
-                .expect_err("reserved key must refuse to boot");
-            assert!(e.contains("reserved"), "{e}");
+            let cfg = ModelConfig::from_toml_str(&toml).expect("parses");
+            cfg.validate_prompt_variants()
+                .unwrap_or_else(|e| panic!("key {key:?} must boot now: {e}"));
         }
     }
 
@@ -6167,38 +6149,71 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     #[test]
-    fn raw_skips_the_composer_in_every_shape() {
-        let sources = [
-            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = [\"AAA\"]\n",
-            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"AAA\" }\n",
-            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n",
-            // No filter_prompt at all (built-in prompt) — raw still wins.
-            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n",
-        ];
-        for src in sources {
-            let c = cfg(src);
-            for v in ["raw", "Raw", "RAW"] {
-                assert!(
-                    c.resolve_image_prompt_compose(Some(v)).is_none(),
-                    "{v} must skip the composer for: {src}"
-                );
-            }
-            // Sanity: without `raw` the composer is still resolved.
-            assert!(c.resolve_image_prompt_compose(None).is_some(), "{src}");
-        }
+    fn raw_variant_selects_a_configured_prompt() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { raw = \"RAW PROMPT\" }\n",
+        )
+        .expect("parses");
+        let r = cfg
+            .resolve_image_prompt_compose(Some("raw"))
+            .expect("composer resolves — \"raw\" no longer skips it");
+        assert_eq!(r.compose_prompt, "RAW PROMPT");
+        assert_eq!(r.variant_key.as_deref(), Some("raw"));
     }
 
     #[test]
-    fn raw_returns_none_whether_or_not_the_composer_is_configured() {
-        // NOTE: this does NOT pin the "raw check precedes the task lookup"
-        // ordering — `self.tasks.get(COMPOSE_TASK)?` early-returns `None` for
-        // an absent task regardless of which check runs first, so this test
-        // passes under both orderings. It only pins that `raw` still yields
-        // `None` (composer does not run) when the task block is absent, same
-        // as when it's present — a real behavior, just not evidence of order.
-        let c = cfg("[tasks.chat_companion]\nmodel = \"m\"\n");
-        assert!(c.resolve_image_prompt_compose(Some("raw")).is_none());
-        assert!(c.resolve_image_prompt_compose(None).is_none());
+    fn raw_variant_without_a_matching_key_falls_back_to_the_builtin() {
+        // An unknown variant is a miss, never a skip and never an error.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"A PROMPT\" }\n",
+        )
+        .expect("parses");
+        let r = cfg
+            .resolve_image_prompt_compose(Some("raw"))
+            .expect("composer still resolves");
+        assert_eq!(r.compose_prompt, DEFAULT_COMPOSE_PROMPT);
+        assert_eq!(r.variant_key, None);
+    }
+
+    #[test]
+    fn compose_resolves_none_only_when_the_task_is_absent() {
+        let absent =
+            ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").expect("parses");
+        assert!(absent.resolve_image_prompt_compose(None).is_none());
+        assert!(absent.resolve_image_prompt_compose(Some("raw")).is_none());
+
+        let present =
+            ModelConfig::from_toml_str("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\n")
+                .expect("parses");
+        assert!(present.resolve_image_prompt_compose(None).is_some());
+        assert!(present.resolve_image_prompt_compose(Some("raw")).is_some());
+        assert!(present
+            .resolve_image_prompt_compose(Some("anything"))
+            .is_some());
+    }
+
+    #[test]
+    fn no_variant_uses_the_builtin_for_variant_shapes() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = { a = \"A PROMPT\" }\n",
+        )
+        .expect("parses");
+        let r = cfg.resolve_image_prompt_compose(None).expect("resolves");
+        assert_eq!(r.compose_prompt, DEFAULT_COMPOSE_PROMPT);
+
+        // A PLAIN filter_prompt is the deployment's single chosen prompt, not a
+        // variant miss — it still wins with no variant supplied.
+        let plain = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"PLAIN PROMPT\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            plain
+                .resolve_image_prompt_compose(None)
+                .unwrap()
+                .compose_prompt,
+            "PLAIN PROMPT"
+        );
     }
 
     #[test]
@@ -6211,19 +6226,6 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
                 .compose_prompt,
             DEFAULT_COMPOSE_PROMPT
         );
-    }
-
-    #[test]
-    fn raw_variant_is_trimmed_before_the_raw_comparison() {
-        // Pins that the incoming variant is trimmed BEFORE the "raw" match,
-        // not after: `filter_prompt` is a non-blank Plain string here, so if
-        // trimming happened later (or not at all), " raw \n" would fail the
-        // exact `eq_ignore_ascii_case("raw")` comparison, fall through to
-        // normal selection, and this would resolve to `Some(..)` with
-        // compose_prompt = "custom" instead of `None`.
-        let c =
-            cfg("[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"custom\"\n");
-        assert!(c.resolve_image_prompt_compose(Some(" raw \n")).is_none());
     }
 
     /// `variant_key` surfaces WHICH variant selected the prompt — the audit

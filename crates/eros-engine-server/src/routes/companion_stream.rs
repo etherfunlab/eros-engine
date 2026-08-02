@@ -101,8 +101,8 @@ pub struct ImageReplyParams {
     /// (`"a"`, `"b"`) for the table shape. Ignored when that task configures a
     /// single plain prompt.
     ///
-    /// `"raw"` (case-insensitive) is reserved: it skips the composer LLM
-    /// entirely, saving one LLM call.
+    /// `"raw"` carries no special meaning — it selects a prompt only if a
+    /// deployment actually configures one under that key.
     ///
     /// An unknown index/key falls back to the engine's built-in composer
     /// prompt — it is never an error.
