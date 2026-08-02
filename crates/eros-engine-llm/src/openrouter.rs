@@ -93,6 +93,11 @@ pub struct ChatRequest {
     /// PDE-only: OpenRouter `response_format` (e.g. a json_schema object).
     /// `None` ⇒ omitted. Opaque passthrough; the caller builds the schema.
     pub response_format: Option<serde_json::Value>,
+    /// Engine task this call serves (`chat_companion`, `pde_decision`, …) —
+    /// config routing ONLY, never serialized to the wire. Selects which
+    /// `[[providers.<name>.body]]` rules apply. `None` (the `Default`) ⇒ no
+    /// task-scoped rule matches; unscoped rules still apply.
+    pub task: Option<String>,
 }
 
 /// One-shot multimodal *describe* request. Used only by the `chat_vision`
@@ -303,6 +308,14 @@ impl<'a> WireRequest<'a> {
     /// the wire entirely — one serialization path, no drift. NOTE: when
     /// adding a field to WireRequest, decide its fate here; the
     /// `custom_endpoint_wire_is_strict_openai_subset` test enforces it.
+    ///
+    /// Body rules merge AFTER this strip (spec 2026-08-02-provider-body-params
+    /// §4): a custom provider's declared `[[providers.<name>.body]]` params
+    /// may deliberately reintroduce a vendor field this strip just removed
+    /// (e.g. its own `reasoning` shape) — that is the supported way to send
+    /// provider-specific params, not a leak. The strict-subset lock
+    /// (`custom_endpoint_wire_is_strict_openai_subset`) only covers the
+    /// no-rules default.
     fn for_endpoint(mut self, ep: &Endpoint<'_>) -> Self {
         if ep.name.is_some() {
             self.session_id = None;
@@ -310,6 +323,34 @@ impl<'a> WireRequest<'a> {
             self.reasoning = None;
         }
         self
+    }
+}
+
+/// True when `rule` applies to a call serving `task` (spec
+/// 2026-08-02-provider-body-params): no `tasks` list ⇒ applies always;
+/// a task-scoped rule requires an exact, case-sensitive name match.
+fn rule_matches(rule: &crate::model_config::BodyRule, task: Option<&str>) -> bool {
+    match (&rule.tasks, task) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(list), Some(t)) => list.iter().any(|x| x == t),
+    }
+}
+
+/// Merge every matching rule's params into the serialized wire body:
+/// top-level shallow, declaration order, later wins — and the merged params
+/// win over engine-built fields (that ordering is what makes the
+/// `[providers.openrouter]` `reasoning` override `[tasks.*].reasoning`).
+/// Structural keys (`model`/`messages`/`stream`) were refused at boot. Pure.
+fn apply_body_rules(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    rules: &[crate::model_config::BodyRule],
+    task: Option<&str>,
+) {
+    for rule in rules.iter().filter(|r| rule_matches(r, task)) {
+        for (k, v) in &rule.params {
+            body.insert(k.clone(), v.clone());
+        }
     }
 }
 
@@ -433,6 +474,12 @@ pub struct OpenRouterClient {
     /// installed at boot via [`OpenRouterClient::with_providers`]. Arc so the
     /// client's Clone stays cheap.
     providers: Arc<HashMap<String, crate::provider::ProviderEndpoint>>,
+    /// `[providers].openrouter.body` rules for the built-in endpoint. Empty
+    /// by default; installed at boot via
+    /// [`OpenRouterClient::with_openrouter_body_rules`]. Custom `[providers]`
+    /// endpoints carry their own rules on `ProviderEndpoint.body_rules`
+    /// instead.
+    openrouter_body_rules: Vec<crate::model_config::BodyRule>,
     /// HTTP client WITHOUT the `[providers].openrouter.headers` default
     /// headers, used for every custom-provider post. Those default headers
     /// are baked into `http` at boot via [`OpenRouterClient::with_openrouter_headers`]
@@ -477,6 +524,7 @@ impl OpenRouterClient {
             api_key,
             base_url,
             providers: Arc::new(HashMap::new()),
+            openrouter_body_rules: Vec::new(),
         }
     }
 
@@ -512,6 +560,14 @@ impl OpenRouterClient {
         providers: HashMap<String, crate::provider::ProviderEndpoint>,
     ) -> Self {
         self.providers = Arc::new(providers);
+        self
+    }
+
+    /// Install `[providers].openrouter.body` rules for the built-in endpoint
+    /// (custom providers carry theirs on `ProviderEndpoint`). Consuming
+    /// builder, boot-chained.
+    pub fn with_openrouter_body_rules(mut self, rules: Vec<crate::model_config::BodyRule>) -> Self {
+        self.openrouter_body_rules = rules;
         self
     }
 }
@@ -630,6 +686,7 @@ impl OpenRouterClient {
                     req.metadata.as_ref(),
                     req.reasoning.as_ref(),
                     req.response_format.as_ref(),
+                    req.task.as_deref(),
                 )
                 .await
             {
@@ -852,6 +909,7 @@ impl OpenRouterClient {
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
         req_reasoning: Option<&ReasoningConfig>,
         req_response_format: Option<&serde_json::Value>,
+        req_task: Option<&str>,
     ) -> Result<ChatResponse, LlmError> {
         let (bare_model, ep) = self.resolve_endpoint(model)?;
         let wire = WireRequest {
@@ -871,11 +929,29 @@ impl OpenRouterClient {
         }
         .for_endpoint(&ep);
 
+        let rules: &[crate::model_config::BodyRule] = match ep.name {
+            None => &self.openrouter_body_rules,
+            Some(p) => self
+                .providers
+                .get(p)
+                .map(|e| e.body_rules.as_slice())
+                .unwrap_or(&[]),
+        };
         let mut builder = ep.http.post(ep.url).bearer_auth(ep.api_key);
         if let Some(h) = ep.headers {
             builder = builder.headers(h.clone());
         }
-        let resp = builder.json(&wire).send().await?;
+        let resp = if rules.iter().any(|r| rule_matches(r, req_task)) {
+            let mut v = serde_json::to_value(&wire)
+                .map_err(|e| LlmError::Config(format!("openrouter: wire serialize: {e}")))?;
+            let map = v
+                .as_object_mut()
+                .expect("WireRequest always serializes to a JSON object");
+            apply_body_rules(map, rules, req_task);
+            builder.json(&v).send().await?
+        } else {
+            builder.json(&wire).send().await?
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -990,6 +1066,15 @@ impl OpenRouterClient {
         }
         .for_endpoint(&ep);
 
+        let rules: &[crate::model_config::BodyRule] = match ep.name {
+            None => &self.openrouter_body_rules,
+            Some(p) => self
+                .providers
+                .get(p)
+                .map(|e| e.body_rules.as_slice())
+                .unwrap_or(&[]),
+        };
+        let req_task = req.task.as_deref();
         let started = std::time::Instant::now();
         let mut builder = ep
             .http
@@ -999,7 +1084,17 @@ impl OpenRouterClient {
         if let Some(h) = ep.headers {
             builder = builder.headers(h.clone());
         }
-        let resp = builder.json(&wire).send().await?;
+        let resp = if rules.iter().any(|r| rule_matches(r, req_task)) {
+            let mut v = serde_json::to_value(&wire)
+                .map_err(|e| LlmError::Config(format!("openrouter: wire serialize: {e}")))?;
+            let map = v
+                .as_object_mut()
+                .expect("WireRequest always serializes to a JSON object");
+            apply_body_rules(map, rules, req_task);
+            builder.json(&v).send().await?
+        } else {
+            builder.json(&wire).send().await?
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -1126,6 +1221,60 @@ mod tests {
         })
     }
 
+    fn rule(tasks: Option<&[&str]>, params: serde_json::Value) -> crate::model_config::BodyRule {
+        crate::model_config::BodyRule {
+            tasks: tasks.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            params: params.as_object().unwrap().clone(),
+        }
+    }
+
+    #[test]
+    fn rule_matching_semantics() {
+        let scoped = rule(Some(&["chat_companion"]), serde_json::json!({"a": 1}));
+        let open = rule(None, serde_json::json!({"b": 2}));
+        assert!(rule_matches(&scoped, Some("chat_companion")));
+        assert!(!rule_matches(&scoped, Some("pde_decision")));
+        assert!(
+            !rule_matches(&scoped, None),
+            "task-scoped rule never matches a task-less request"
+        );
+        assert!(rule_matches(&open, Some("anything")));
+        assert!(
+            rule_matches(&open, None),
+            "unscoped rule applies even without a task"
+        );
+    }
+
+    #[test]
+    fn apply_body_rules_merges_in_order_later_wins() {
+        let mut body = serde_json::json!({"model": "m", "temperature": 0.5})
+            .as_object()
+            .unwrap()
+            .clone();
+        let rules = [
+            rule(
+                None,
+                serde_json::json!({"venice_parameters": {"x": 1}, "temperature": 0.9}),
+            ),
+            rule(
+                Some(&["chat_companion"]),
+                serde_json::json!({"venice_parameters": {"x": 2}}),
+            ),
+            rule(Some(&["pde_decision"]), serde_json::json!({"never": true})),
+        ];
+        apply_body_rules(&mut body, &rules, Some("chat_companion"));
+        assert_eq!(
+            body["venice_parameters"]["x"], 2,
+            "later matching rule wins"
+        );
+        assert_eq!(
+            body["temperature"], 0.9,
+            "params win over engine-built fields"
+        );
+        assert_eq!(body["model"], "m", "untouched keys survive");
+        assert!(body.get("never").is_none(), "non-matching rule skipped");
+    }
+
     #[tokio::test]
     async fn client_sends_configured_openrouter_headers() {
         let server = MockServer::start().await;
@@ -1236,6 +1385,7 @@ mod tests {
                 base_url: format!("{}/v1/chat/completions", server.uri()),
                 api_key: "vk".into(),
                 headers: ep_headers,
+                body_rules: Vec::new(),
             },
         );
         let client = OpenRouterClient::with_base_url("test-key".into(), "http://unused/".into())
@@ -2355,6 +2505,7 @@ data: [DONE]\n\n";
                         base_url: format!("{}/v1/chat/completions", server_b.uri()),
                         api_key: "v-key".into(),
                         headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
                     },
                 )]));
         let req = ChatRequest {
@@ -2537,6 +2688,7 @@ data: [DONE]\n\n";
                     base_url: "https://venice.test/v1/chat/completions".into(),
                     api_key: "v-key".into(),
                     headers: reqwest::header::HeaderMap::new(),
+                    body_rules: Vec::new(),
                 },
             )]))
     }
@@ -2687,6 +2839,7 @@ data: [DONE]\n\n";
                         base_url: "https://venice.test/v1".into(),
                         api_key: String::new(),
                         headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
                     },
                 )]));
         assert!(matches!(
@@ -3013,6 +3166,7 @@ data: [DONE]\n\n";
                         base_url: format!("{}/v1/chat/completions", server_b.uri()),
                         api_key: "v-key".into(),
                         headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
                     },
                 )]));
         let resp = client
@@ -3303,6 +3457,7 @@ data: [DONE]\n\n";
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
                 headers: reqwest::header::HeaderMap::new(),
+                body_rules: Vec::new(),
             },
         )]));
         let mut meta = serde_json::Map::new();
@@ -3373,6 +3528,7 @@ data: [DONE]\n\n";
                         base_url: format!("{}/v1/chat/completions", server_b.uri()),
                         api_key: "v-key".into(),
                         headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
                     },
                 )]));
         let resp = client
@@ -3414,6 +3570,7 @@ data: [DONE]\n\n";
                         base_url: format!("{}/v1/chat/completions", server_b.uri()),
                         api_key: "v-key".into(),
                         headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
                     },
                 )]));
         let resp = client
@@ -3457,6 +3614,7 @@ data: [DONE]\n\n";
                 base_url: format!("{}/v1/chat/completions", server_b.uri()),
                 api_key: "v-key".into(),
                 headers: reqwest::header::HeaderMap::new(),
+                body_rules: Vec::new(),
             },
         )]));
         let resp = client
@@ -3516,5 +3674,304 @@ data: [DONE]\n\n";
             .await
             .expect("chain advances past the unresolvable candidate");
         assert_eq!(resp.reply, "ok");
+    }
+
+    // ---- [[providers.*.body]] merge (spec 2026-08-02-provider-body-params) ----
+
+    #[tokio::test]
+    async fn openrouter_body_rule_applies_for_its_task_and_overrides_reasoning() {
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            Some(&["chat_companion"]),
+            serde_json::json!({"transforms": ["middle-out"], "reasoning": {"max_tokens": 64}}),
+        )]);
+        client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 5,
+                reasoning: Some(ReasoningConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["transforms"][0], "middle-out");
+        assert_eq!(
+            body["reasoning"]["max_tokens"], 64,
+            "providers-block reasoning must beat [tasks.*] reasoning"
+        );
+        assert!(body.get("enabled").is_none());
+    }
+
+    #[tokio::test]
+    async fn body_rule_skipped_for_unlisted_task() {
+        // Identical setup to the previous test, but the request serves a task
+        // the rule does not list — nothing merges, and the request's own
+        // reasoning config survives untouched.
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            Some(&["chat_companion"]),
+            serde_json::json!({"transforms": ["middle-out"]}),
+        )]);
+        client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 5,
+                reasoning: Some(ReasoningConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                task: Some("pde_decision".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("transforms").is_none(),
+            "unlisted task must not merge"
+        );
+        assert_eq!(
+            body["reasoning"]["enabled"], true,
+            "request's own reasoning survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_provider_strips_then_merges() {
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/api/v1/chat/completions", mock.uri()),
+                api_key: "vk".into(),
+                headers: reqwest::header::HeaderMap::new(),
+                body_rules: vec![rule(
+                    None,
+                    serde_json::json!({
+                        "venice_parameters": {"include_venice_system_prompt": false},
+                        "reasoning": {"strip_thinking_response": true},
+                    }),
+                )],
+            },
+        );
+        let client = OpenRouterClient::with_base_url("k".into(), "http://unused".into())
+            .with_providers(providers);
+        let mut meta = serde_json::Map::new();
+        meta.insert("k".into(), serde_json::json!("v"));
+        client
+            .execute(ChatRequest {
+                model: "m@venice".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 5,
+                session_id: Some("s".into()),
+                metadata: Some(meta),
+                reasoning: Some(ReasoningConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(
+            body["venice_parameters"]["include_venice_system_prompt"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            body["reasoning"]["strip_thinking_response"], true,
+            "the RULE's reasoning shape — the request's was stripped first"
+        );
+        assert!(
+            body.get("session_id").is_none(),
+            "strip still runs before merge"
+        );
+        assert!(body.get("metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn body_rules_apply_on_stream_path() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            None,
+            serde_json::json!({"transforms": ["middle-out"]}),
+        )]);
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 5,
+            task: Some("chat_companion".into()),
+            ..Default::default()
+        };
+        let _stream = client.execute_stream_as(&req, "m").await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["transforms"][0], "middle-out");
+        assert_eq!(
+            body["stream"], true,
+            "structural key untouched by the merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_chain_resolves_rules_per_attempt() {
+        // Spec §2 per-attempt resolution: primary @venice fails (500), chain
+        // advances to built-in OpenRouter — each attempt carries ITS OWN
+        // provider's rules, never the other's.
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/venice/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/or/chat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                    {"choices": [{"message": {"content": "ok"}}]}
+                )),
+            )
+            .mount(&mock)
+            .await;
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "venice".to_string(),
+            crate::provider::ProviderEndpoint {
+                base_url: format!("{}/venice/chat", mock.uri()),
+                api_key: "vk".into(),
+                headers: reqwest::header::HeaderMap::new(),
+                body_rules: vec![rule(
+                    None,
+                    serde_json::json!({"venice_parameters": {"x": 1}}),
+                )],
+            },
+        );
+        let client = OpenRouterClient::with_base_url("k".into(), format!("{}/or/chat", mock.uri()))
+            .with_providers(providers)
+            .with_openrouter_body_rules(vec![rule(
+                None,
+                serde_json::json!({"transforms": ["middle-out"]}),
+            )]);
+        client
+            .execute(ChatRequest {
+                model: "m@venice".into(),
+                fallback_model: vec!["m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 5,
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "venice attempt then openrouter fallback");
+        let venice: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(venice["venice_parameters"]["x"], 1);
+        assert!(venice.get("transforms").is_none());
+        let or: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        assert_eq!(or["transforms"][0], "middle-out");
+        assert!(or.get("venice_parameters").is_none());
+    }
+
+    #[tokio::test]
+    async fn no_rules_wire_key_set_is_unchanged() {
+        // No rules configured ⇒ the serialized path is untouched and the key
+        // set is exactly today's minimal wire for this request shape.
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_response()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        client
+            .execute(ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 5,
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["max_tokens", "messages", "model", "temperature"],
+            "task must never serialize; no rules ⇒ no extra keys"
+        );
     }
 }

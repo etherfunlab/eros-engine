@@ -20,6 +20,9 @@ pub struct ProviderEndpoint {
     pub api_key: String,
     /// Config-declared custom headers, applied per-request. Empty by default.
     pub headers: reqwest::header::HeaderMap,
+    /// `[[providers.<name>.body]]` rules, applied per-request to chat bodies.
+    /// Empty by default.
+    pub body_rules: Vec<crate::model_config::BodyRule>,
 }
 
 impl fmt::Debug for ProviderEndpoint {
@@ -27,12 +30,15 @@ impl fmt::Debug for ProviderEndpoint {
     /// a panic message via `{:?}`, so it's redacted here rather than relying
     /// on every caller to remember not to print the field directly. Header
     /// VALUES may be sensitive too (e.g. a proxy auth token), so the whole
-    /// `headers` map is redacted rather than printed key-by-key.
+    /// `headers` map is redacted rather than printed key-by-key. `params`
+    /// are deployer config, not secrets, so `body_rules` is kept quiet as a
+    /// count rather than redacted outright.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderEndpoint")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("headers", &"<redacted>")
+            .field("body_rules", &self.body_rules.len())
             .finish()
     }
 }
@@ -148,6 +154,7 @@ mod tests {
             base_url: "https://api.venice.ai/chat/completions".to_string(),
             api_key: "sk-live-SUPER-SECRET-KEY".to_string(),
             headers: reqwest::header::HeaderMap::new(),
+            body_rules: Vec::new(),
         };
         let dbg = format!("{ep:?}");
         assert!(
@@ -167,6 +174,7 @@ mod tests {
             base_url: "https://api.venice.ai/chat/completions".to_string(),
             api_key: "sk-live-key".to_string(),
             headers,
+            body_rules: Vec::new(),
         };
         let dbg = format!("{ep:?}");
         assert!(

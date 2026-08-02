@@ -357,7 +357,8 @@ async fn run_server() -> Result<()> {
         eros_engine_llm::openrouter::OpenRouterClient::new(openrouter_key)
             .with_openrouter_chat_url(model_config.openrouter_chat_url())
             .with_openrouter_headers(model_config.openrouter_header_map())
-            .with_providers(model_config.build_providers()),
+            .with_providers(model_config.build_providers())
+            .with_openrouter_body_rules(model_config.openrouter_body_rules()),
     );
 
     // Computed once at boot, before model_config is moved into the state

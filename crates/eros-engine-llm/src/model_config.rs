@@ -2701,6 +2701,7 @@ impl ModelConfig {
                         base_url: chat,
                         api_key: key,
                         headers: entry.header_map(),
+                        body_rules: entry.body.clone().unwrap_or_default(),
                     },
                 ))
             })
@@ -2721,6 +2722,16 @@ impl ModelConfig {
         self.providers
             .get("openrouter")
             .map(|e| e.header_map())
+            .unwrap_or_default()
+    }
+
+    /// `[providers].openrouter.body` rules (empty when absent) — the built-in
+    /// endpoint's body rules, installed at boot via
+    /// `OpenRouterClient::with_openrouter_body_rules`.
+    pub fn openrouter_body_rules(&self) -> Vec<BodyRule> {
+        self.providers
+            .get("openrouter")
+            .and_then(|e| e.body.clone())
             .unwrap_or_default()
     }
 
@@ -6469,7 +6480,12 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     #[test]
     fn build_providers_maps_declared_entries() {
         let cfg = ModelConfig::from_toml_str(
-            "[providers]\nvenice = { chat = \"https://x/v1\" }\nother = { chat = \"https://y/v1\" }\n",
+            "[providers.venice]\n\
+             chat = \"https://x/v1\"\n\
+             [providers.other]\n\
+             chat = \"https://y/v1\"\n\
+             [[providers.venice.body]]\n\
+             params = { reasoning = { max_tokens = 64 } }\n",
         )
         .unwrap();
         let env = |k: &str| (k == "VENICE_API_KEY").then(|| "sk-v".to_string());
@@ -6479,6 +6495,30 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // Unreferenced/keyless entry still present, with an empty key —
         // resolve_endpoint's runtime guard covers the (unreachable) miss.
         assert_eq!(map["other"].api_key, "");
+        // build_providers_with carries the parsed [[providers.<name>.body]]
+        // rules onto ProviderEndpoint.body_rules verbatim.
+        assert_eq!(map["venice"].body_rules.len(), 1);
+        assert_eq!(
+            map["venice"].body_rules[0].params["reasoning"]["max_tokens"],
+            64
+        );
+        assert!(map["other"].body_rules.is_empty(), "no body ⇒ empty vec");
+    }
+
+    #[test]
+    fn openrouter_body_rules_returns_parsed_rules_or_empty() {
+        let with_rules = ModelConfig::from_toml_str(
+            "[providers.openrouter]\n\
+             [[providers.openrouter.body]]\n\
+             params = { transforms = [\"middle-out\"] }\n",
+        )
+        .unwrap();
+        let rules = with_rules.openrouter_body_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].params["transforms"][0], "middle-out");
+
+        let without = ModelConfig::from_toml_str("").unwrap();
+        assert!(without.openrouter_body_rules().is_empty());
     }
 
     #[test]
