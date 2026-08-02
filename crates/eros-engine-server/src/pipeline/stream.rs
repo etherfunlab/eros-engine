@@ -1884,7 +1884,7 @@ fn render_product_qa_pairs(pairs: &[(String, String)]) -> String {
 
 /// Build the judge's user payload from the shared transcript + the decision input.
 fn build_pde_ctx(
-    transcript: &str,
+    t: &JudgeTranscript,
     input: &eros_engine_core::types::DecisionInput,
     image_available: bool,
     product_qa_recent: Option<&str>,
@@ -1895,10 +1895,10 @@ fn build_pde_ctx(
         eros_engine_core::types::Event::UserMessage { content, .. } => content.as_str(),
         _ => "",
     };
-    let transcript = if transcript.trim().is_empty() {
+    let transcript = if t.transcript.trim().is_empty() {
         "（无）"
     } else {
-        transcript
+        t.transcript.as_str()
     };
     let brief = build_persona_brief(&input.persona);
     let persona_block = if brief.is_empty() {
@@ -1909,6 +1909,15 @@ fn build_pde_ctx(
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
+    // Engine-counted facts: the judge cannot reliably count image markers in
+    // the transcript, so state both numbers explicitly and tell it to trust
+    // this line over the markers.
+    let img_count = t.images_in_window;
+    let last_img = if t.last_assistant_is_image {
+        "是"
+    } else {
+        "否"
+    };
     // Product-QA lines render ONLY when the task is enabled this deployment —
     // old judge prompts see zero drift and pay zero tokens (unlike 图片能力,
     // whose negative is itself a signal). `Some("")` = enabled, no history yet.
@@ -1923,7 +1932,9 @@ fn build_pde_ctx(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
-         [图片能力] 本轮可发图={image_flag}\n{product_qa_section}\n\
+         [图片能力] 本轮可发图={image_flag}\n\
+         [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
+         {product_qa_section}\n\
          [用户最新消息]\n{latest}",
         a.warmth,
         a.trust,
@@ -2124,7 +2135,15 @@ struct InputRewrite {
     f_generation_id: Option<String>,
 }
 
-/// Recent rows fed to the rewrite LLM as `[最近对话]` context.
+/// Rows fed to the rewrite LLM as `[最近对话]` context, and the window the
+/// judge's `[近期图片]` counts cover.
+///
+/// NOTE the name is a misnomer kept for compatibility: `ChatRepo::history`
+/// applies `LIMIT` to **rows**, so this is the last 8 *messages* (roughly 4
+/// exchanges), not 8 turns. Anything rendered for a model must say messages.
+/// Renaming it and changing the window are both explicit non-goals of the
+/// image-context design — the issue's bench inherited exactly this window, so
+/// its measured numbers only transfer while the window holds.
 const INPUT_FILTER_CONTEXT_TURNS: i64 = 8;
 
 /// Render an assistant transcript line. Image turns persist empty `content`
@@ -2153,18 +2172,70 @@ fn assistant_transcript_line(content: &str, metadata: Option<&serde_json::Value>
     content.to_string()
 }
 
-/// Build the compact transcript block for the input filter, excluding the turn
-/// being rewritten. Best-effort: a DB error yields an empty transcript.
+/// The judge/input-filter context: the rendered transcript plus the two image
+/// facts the engine can compute exactly and the judge cannot count reliably.
+#[derive(Debug, Default, Clone)]
+struct JudgeTranscript {
+    transcript: String,
+    /// Assistant rows in the window carrying `metadata.image`.
+    images_in_window: usize,
+    /// The newest assistant row in the window is an image turn.
+    last_assistant_is_image: bool,
+}
+
+/// Row-by-row accumulator behind `JudgeTranscript`, split out so the counting
+/// is unit-testable without a database.
+#[derive(Debug, Default)]
+struct JudgeTranscriptAcc {
+    lines: Vec<String>,
+    images_in_window: usize,
+    last_assistant_is_image: bool,
+}
+
+impl JudgeTranscriptAcc {
+    /// Fold one already-filtered row (caller has skipped the current turn and
+    /// channel-marked rows). Rows arrive oldest→newest, so the assistant flag
+    /// is simply overwritten and ends up reflecting the newest assistant row.
+    fn push(&mut self, role: &str, content: &str, metadata: Option<&serde_json::Value>) {
+        let (label, text): (&str, String) = match role {
+            "user" | "gift_user" => ("用户", content.to_string()),
+            "assistant" => {
+                let is_image = metadata.and_then(|m| m.get("image")).is_some();
+                if is_image {
+                    self.images_in_window += 1;
+                }
+                self.last_assistant_is_image = is_image;
+                ("AI", assistant_transcript_line(content, metadata))
+            }
+            _ => return,
+        };
+        self.lines.push(format!("{label}: {text}"));
+    }
+
+    fn finish(self) -> JudgeTranscript {
+        JudgeTranscript {
+            transcript: self.lines.join("\n"),
+            images_in_window: self.images_in_window,
+            last_assistant_is_image: self.last_assistant_is_image,
+        }
+    }
+}
+
+/// Build the compact transcript block for the input filter and the PDE judge,
+/// excluding the turn being rewritten, and count the window's image turns
+/// while the rows are in hand (no second round trip). Best-effort: a DB error
+/// yields an empty transcript and zero counts — which reads to the judge as
+/// "no recent images", the same signal an empty transcript gives today.
 async fn build_input_filter_transcript(
     chat_repo: &ChatRepo<'_>,
     session_id: Uuid,
     current_user_message_id: Uuid,
-) -> String {
+) -> JudgeTranscript {
     let rows = chat_repo
         .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
         .await
         .unwrap_or_default();
-    let mut lines = Vec::new();
+    let mut acc = JudgeTranscriptAcc::default();
     for m in rows {
         if m.id == current_user_message_id {
             continue;
@@ -2177,20 +2248,13 @@ async fn build_input_filter_transcript(
         // User/gift rows use the EFFECTIVE text (a prior turn's own rewrite when
         // present) so the filter sees the same conversation the chat model does;
         // assistant rows use content (their pre_filter_content means the opposite).
-        let (label, text): (&str, String) = match m.role.as_str() {
-            "user" | "gift_user" => (
-                "用户",
-                crate::pipeline::handlers::effective_user_text(&m).to_string(),
-            ),
-            "assistant" => (
-                "AI",
-                assistant_transcript_line(&m.content, m.metadata.as_ref()),
-            ),
-            _ => continue,
+        let text = match m.role.as_str() {
+            "user" | "gift_user" => crate::pipeline::handlers::effective_user_text(&m).to_string(),
+            _ => m.content.clone(),
         };
-        lines.push(format!("{label}: {text}"));
+        acc.push(&m.role, &text, m.metadata.as_ref());
     }
-    lines.join("\n")
+    acc.finish()
 }
 
 /// Run the input-filter LLM over the raw user input with recent context.
@@ -2883,10 +2947,10 @@ pub fn run_stream(
         // Shared history transcript: built once, reused by the judge here AND the
         // input filter below (which previously fetched its own). `resolved_pde` is
         // already None on tip turns, so this only fires for a real judge turn.
-        let pde_transcript: String = if resolved_pde.is_some() {
+        let pde_transcript: JudgeTranscript = if resolved_pde.is_some() {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
-            String::new()
+            JudgeTranscript::default()
         };
         let mut killswitch_hints: Vec<String> = Vec::new();
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
@@ -3293,7 +3357,7 @@ pub fn run_stream(
                         &input.persona,
                         &plan,
                         req_image,
-                        &pde_transcript,
+                        &pde_transcript.transcript,
                     )
                     .await;
                     let subject = img.seed_subject;
@@ -3464,8 +3528,8 @@ pub fn run_stream(
                         // Two round-trips per reply turn — acceptable, not a hot loop.
                         // Reuse the PDE's transcript when it was built this turn;
                         // otherwise fetch (input-filter-only turns: PDE off).
-                        let transcript = if !pde_transcript.is_empty() {
-                            pde_transcript.clone()
+                        let transcript = if !pde_transcript.transcript.is_empty() {
+                            pde_transcript.transcript.clone()
                         } else {
                             build_input_filter_transcript(
                                 &chat_repo,
@@ -3473,6 +3537,7 @@ pub fn run_stream(
                                 user_msg.user_message_id,
                             )
                             .await
+                            .transcript
                         };
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
@@ -3620,7 +3685,7 @@ pub fn run_stream(
                             &input.persona,
                             &plan,
                             req_image,
-                            &pde_transcript,
+                            &pde_transcript.transcript,
                         )
                         .await;
                         let subject = img.seed_subject;
@@ -4295,6 +4360,98 @@ mod tests {
         // metadata present but no image key: content passes through
         let meta3 = serde_json::json!({"tip": 5});
         assert_eq!(assistant_transcript_line("hello", Some(&meta3)), "hello");
+    }
+
+    /// Build a `JudgeTranscript` from (role, content, metadata) triples,
+    /// exercising the same folding logic the DB path uses.
+    fn judge_transcript_from_parts(
+        rows: &[(&str, &str, Option<serde_json::Value>)],
+    ) -> JudgeTranscript {
+        let mut acc = JudgeTranscriptAcc::default();
+        for (role, content, meta) in rows {
+            acc.push(role, content, meta.as_ref());
+        }
+        acc.finish()
+    }
+
+    #[test]
+    fn judge_transcript_counts_images_and_last_flag() {
+        // 3 assistant rows, 2 of them image turns, newest one an image.
+        let rows = vec![
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"a"}})),
+            ),
+            ("assistant", "just text", None),
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"b"}})),
+            ),
+        ];
+        let t = judge_transcript_from_parts(&rows);
+        assert_eq!(t.images_in_window, 2);
+        assert!(t.last_assistant_is_image);
+    }
+
+    #[test]
+    fn judge_transcript_last_flag_false_when_newest_is_text() {
+        let rows = vec![
+            (
+                "assistant",
+                "",
+                Some(serde_json::json!({"image":{"prompt":"a"}})),
+            ),
+            ("assistant", "just text", None),
+        ];
+        let t = judge_transcript_from_parts(&rows);
+        assert_eq!(t.images_in_window, 1);
+        assert!(!t.last_assistant_is_image, "newest assistant row is text");
+    }
+
+    #[test]
+    fn judge_transcript_empty_is_zero() {
+        let t = judge_transcript_from_parts(&[]);
+        assert_eq!(t.images_in_window, 0);
+        assert!(!t.last_assistant_is_image);
+        assert_eq!(t.transcript, "");
+    }
+
+    #[test]
+    fn pde_ctx_renders_recent_image_facts_in_messages_not_turns() {
+        let input = fixture_decision_input();
+        let t = JudgeTranscript {
+            transcript: "用户：hi\nMia：hey".into(),
+            images_in_window: 2,
+            last_assistant_is_image: true,
+        };
+        let ctx = build_pde_ctx(&t, &input, true, None);
+        assert!(
+            ctx.contains("[近期图片] 最近8条消息内已发图=2 张；上一条 AI 消息是图片=是"),
+            "facts line must render with a message-based unit: {ctx}"
+        );
+        assert!(
+            ctx.contains("以本行计数为准"),
+            "the override clause must render: {ctx}"
+        );
+        // The unit must NOT claim turns — the window is rows.
+        assert!(!ctx.contains("轮内已发图"), "unit must not say 轮: {ctx}");
+    }
+
+    #[test]
+    fn pde_ctx_renders_recent_image_facts_negative_case() {
+        let input = fixture_decision_input();
+        let t = JudgeTranscript {
+            transcript: "用户：hi".into(),
+            images_in_window: 0,
+            last_assistant_is_image: false,
+        };
+        let ctx = build_pde_ctx(&t, &input, false, None);
+        assert!(
+            ctx.contains("[近期图片] 最近8条消息内已发图=0 张；上一条 AI 消息是图片=否"),
+            "the negative case is a signal too and must always render: {ctx}"
+        );
     }
 
     #[test]
@@ -10240,6 +10397,26 @@ data: [DONE]\n\n";
         }
     }
 
+    fn fixture_decision_input() -> eros_engine_core::types::DecisionInput {
+        use eros_engine_core::types::{DecisionInput, Event};
+        DecisionInput {
+            event: Event::UserMessage {
+                content: "在吗".into(),
+                message_id: Uuid::new_v4(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                history_anchor: Default::default(),
+            },
+            affinity: test_affinity(),
+            persona: test_persona(),
+            signals: test_signals(),
+        }
+    }
+
     #[test]
     fn persona_brief_renders_all_fields() {
         let mut p = test_persona(); // name = "Mia"
@@ -10294,7 +10471,11 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("用户：hi\nMia：hey", &input, true, None);
+        let t = JudgeTranscript {
+            transcript: "用户：hi\nMia：hey".into(),
+            ..Default::default()
+        };
+        let ctx = build_pde_ctx(&t, &input, true, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
         let rel_at = ctx.find("[关系状态]").expect("relationship block present");
         assert!(
@@ -10346,7 +10527,7 @@ data: [DONE]\n\n";
             persona: p,
             signals: test_signals(),
         };
-        let ctx = build_pde_ctx("", &input, false, None);
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
         assert!(!ctx.contains("[角色人格]"), "no persona block: {ctx}");
         assert!(
             ctx.starts_with("[最近对话]"),
@@ -10366,17 +10547,21 @@ data: [DONE]\n\n";
     #[test]
     fn pde_ctx_renders_product_qa_blocks_only_when_enabled() {
         let input = pde_test_input();
+        let t = JudgeTranscript {
+            transcript: "t".into(),
+            ..Default::default()
+        };
         // feature off → no lines at all
-        let off = build_pde_ctx("t", &input, true, None);
+        let off = build_pde_ctx(&t, &input, true, None);
         assert!(!off.contains("[产品咨询]"));
         assert!(!off.contains("[最近产品咨询]"));
         // on, no history → availability line only
-        let on_empty = build_pde_ctx("t", &input, true, Some(""));
+        let on_empty = build_pde_ctx(&t, &input, true, Some(""));
         assert!(on_empty.contains("[产品咨询] 本轮可答产品问题=是"));
         assert!(!on_empty.contains("[最近产品咨询]"));
         // on, with history → both blocks, before [用户最新消息]
         let recent = render_product_qa_pairs(&[("这是什么".into(), "这是……".into())]);
-        let on_recent = build_pde_ctx("t", &input, true, Some(&recent));
+        let on_recent = build_pde_ctx(&t, &input, true, Some(&recent));
         assert!(on_recent.contains("[最近产品咨询]\n用户: 这是什么\n回答: 这是……"));
         assert!(on_recent.find("[产品咨询]").unwrap() < on_recent.find("[用户最新消息]").unwrap());
     }
