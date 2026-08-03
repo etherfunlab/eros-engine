@@ -57,11 +57,26 @@ max_tokens   = 600                          # optional, falls back to defaults.f
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
 
-[tasks.<name>.tiers.<tier>]
+# Tier sub-tables are read by `chat_companion` and `chat_output_filter` ONLY —
+# see "Tier blocks are limited to two tasks" below.
+[tasks.chat_companion.tiers.<tier>]
 model        = "<provider>/<model-id>"      # optional, overrides task-level model for this tier
 fallback     = "<provider>/<model-id>"      # optional, overrides task-level fallback for this tier
 allow_traits = ["tag_a"]                    # optional, overrides task-level allow_traits for this tier
 ```
+
+#### Tier blocks are limited to two tasks
+
+Only two resolvers ever take a tier: `chat_companion`'s (the chat reply) and
+`chat_output_filter`'s. Every other task resolves tier-free, so a
+`[tasks.<other>.tiers.<tier>]` block could never be selected no matter what it
+contains.
+
+**The engine refuses to boot on such a block** rather than let it silently
+no-op (issue #215) — the whole block, not just `filter_prompt`, since `model`,
+`fallback`, `allow_traits`, `retry_depth`, `trigger` and `timing` are equally
+unreachable there. The fix is to move the settings up to `[tasks.<other>]`, or
+delete the block; it was never doing anything either way.
 
 Field details:
 
@@ -75,7 +90,7 @@ Field details:
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
 | `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
-| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. |
+| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
@@ -636,9 +651,10 @@ prompt above like any other miss, never an error. `raw` is not reserved: a
 table key literally named `raw` boots fine.
 
 Variants are honored on this task only. An array/table `filter_prompt` on any
-other task, or inside **any** `[tasks.*.tiers.*]` block (this task's own tiers
-included — the composer always resolves with no tier), refuses to boot rather
-than sit there unreachable.
+other task refuses to boot rather than sit there unreachable. This task's own
+`[tasks.chat_image_prompt_compose.tiers.*]` blocks refuse to boot in **any**
+shape — the composer always resolves with no tier, so the whole block is
+unreachable (see "Tier blocks are limited to two tasks" above).
 
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_image_prompt_compose()` in `model_config.rs`.
@@ -892,7 +908,7 @@ task default block > [defaults] > compiled-in fallback
 
 Where each step contributes:
 
-- **Matched tier block** — `[tasks.<name>.tiers.<tier>]`, where `<tier>` comes from the `tier` field of the chat request (regex `^[a-z0-9_]{1,32}$`). If the requested tier is absent or unknown (no matching sub-table), the task default block is used and a `tracing::warn!` is emitted.
+- **Matched tier block** — `[tasks.<name>.tiers.<tier>]`, where `<tier>` comes from the `tier` field of the chat request (regex `^[a-z0-9_]{1,32}$`). If the requested tier is absent or unknown (no matching sub-table), the task default block is used and a `tracing::warn!` is emitted. This step exists for `chat_companion` and `chat_output_filter` only — every other task skips straight to its default block, and carrying a tier block refuses to boot.
 - **Task default block** — `[tasks.<name>]`.
 - **`[defaults]`** — top-level defaults block.
 - **Compiled-in fallback** — `x-ai/grok-4-mini`, temperature `0.5`, max_tokens `200`. Hard-coded in `model_config.rs`.

@@ -130,6 +130,10 @@ model_name_display_override = true
 # these as a starting point, or define your own. A tier may override
 # model / fallback / allow_traits; `model` here also accepts the array
 # (round-robin) and table (weighted) forms shown at the top of this file.
+#
+# Tier blocks are read by THIS task and [tasks.chat_output_filter] only. Every
+# other task resolves without a tier, so a [tasks.<other>.tiers.*] block could
+# never be selected — the server refuses to boot on one instead of ignoring it.
 #[tasks.chat_companion.tiers.free]
 #model        = "z-ai/glm-4.5-air"
 #fallback     = ["thedrummer/cydonia-24b-v4.1","z-ai/glm-4.7-flash"]
@@ -352,9 +356,9 @@ model_name_display_override = true
 # — never an error.
 #
 # Variants are honored on THIS task only. An array/table `filter_prompt` on any
-# other task, or inside ANY `[tasks.*.tiers.*]` block (this task's included —
-# the composer resolves with no tier), refuses to boot rather than sit there
-# unreachable.
+# other task refuses to boot rather than sit there unreachable. A
+# [tasks.chat_image_prompt_compose.tiers.*] block refuses to boot in ANY shape:
+# the composer resolves with no tier, so the whole block is unreachable.
 #filter_prompt = """
 #…your override here…
 #"""

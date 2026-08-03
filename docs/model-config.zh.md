@@ -57,11 +57,24 @@ max_tokens   = 600                          # optional, falls back to defaults.f
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
 
-[tasks.<name>.tiers.<tier>]
+# Tier 子表只有 `chat_companion` 和 `chat_output_filter` 会读——见下方
+# “tier 块只对两个任务生效”。
+[tasks.chat_companion.tiers.<tier>]
 model        = "<provider>/<model-id>"      # optional, overrides task-level model for this tier
 fallback     = "<provider>/<model-id>"      # optional, overrides task-level fallback for this tier
 allow_traits = ["tag_a"]                    # optional, overrides task-level allow_traits for this tier
 ```
+
+#### tier 块只对两个任务生效
+
+引擎里只有两个 resolver 会带 tier 解析：`chat_companion`（聊天回复）和
+`chat_output_filter`。其余任务全部按无 tier 解析，所以
+`[tasks.<其他任务>.tiers.<tier>]` 块无论写什么都永远选不到。
+
+**引擎遇到这样的块会拒绝启动**，而不是让它静默无效（issue #215）。拒绝的是整个
+块而不只是 `filter_prompt`——`model`、`fallback`、`allow_traits`、
+`retry_depth`、`trigger`、`timing` 在那里同样不可达。处理办法是把这些设置挪到
+`[tasks.<其他任务>]` 任务级，或者直接删掉这个块；反正它本来就没起作用。
 
 字段详情：
 
@@ -75,7 +88,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 每任务的 token 上限。无 per-tier 覆盖。 |
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
-| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。 |
+| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
@@ -524,7 +537,7 @@ b = """
 
 `prompt_variant = "raw"` 不带任何特殊含义。它和其他任意变体名一样，只有当该部署把某个变体配置在这个字面量 key 下（不论大小写）时才会命中；下标/key 没命中——包括未配置的 `"raw"`——都会像其他任何 miss 一样回退到上面的内置提示词，绝不报错。`raw` 不再是保留字：表里出现字面量为 `raw` 的 key 可以正常启动。
 
-变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt`，或**任何** `[tasks.*.tiers.*]` 块（包括本任务自己的 tiers——合成器解析时永远不走 tier）里的数组/表形态，都会拒绝启动，而不是留在那里永远选不到。
+变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt` 都会拒绝启动，而不是留在那里永远选不到。本任务自己的 `[tasks.chat_image_prompt_compose.tiers.*]` 块则**不论写什么**都会拒绝启动——合成器解析时永远不走 tier，整个块都不可达（见上方"tier 块只对两个任务生效"）。
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_prompt_compose()`。
 
@@ -719,7 +732,7 @@ task default block > [defaults] > compiled-in fallback
 
 各层级的含义如下：
 
-- **匹配的 tier 块**——`[tasks.<name>.tiers.<tier>]`，其中 `<tier>` 来自 chat 请求的 `tier` 字段（正则 `^[a-z0-9_]{1,32}$`）。如果请求的 tier 缺失或未知（没有匹配的子表），则使用任务默认块，并发出 `tracing::warn!`。
+- **匹配的 tier 块**——`[tasks.<name>.tiers.<tier>]`，其中 `<tier>` 来自 chat 请求的 `tier` 字段（正则 `^[a-z0-9_]{1,32}$`）。如果请求的 tier 缺失或未知（没有匹配的子表），则使用任务默认块，并发出 `tracing::warn!`。这一层只对 `chat_companion` 和 `chat_output_filter` 存在——其余任务直接走各自的默认块，写了 tier 块会拒绝启动。
 - **任务默认块**——`[tasks.<name>]`。
 - **`[defaults]`**——顶层 defaults 块。
 - **编译时内置 fallback**——`x-ai/grok-4-mini`、temperature `0.5`、max_tokens `200`。在 `model_config.rs` 中 hard-code。
