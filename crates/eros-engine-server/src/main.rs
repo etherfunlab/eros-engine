@@ -316,6 +316,17 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Dead-config gate for tier blocks under tasks that never resolve with a
+    // tier (#215): only [tasks.chat_companion] and [tasks.chat_output_filter]
+    // are ever resolved with one. Runs AFTER validate_providers on purpose —
+    // that gate already refuses [tasks.embedding.tiers.*] with an
+    // embedding-specific message, and the ordering rule is the same one that
+    // puts validate_affinity_prompt_unset before validate_prompt_variants: the
+    // more specific message is the one the operator gets to see.
+    if let Err(msg) = model_config.validate_tier_blocks() {
+        anyhow::bail!(msg);
+    }
+
     // Embedding routing (spec 2026-08-01): read/write backends resolved from
     // [tasks.embedding] + [providers]. validate_providers has already gated
     // every failure mode; from_config re-checks keys defensively.
@@ -503,6 +514,17 @@ mod tests {
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_affinity_prompt_unset()
             .expect("shipped example must not set an affinity filter_prompt");
+    }
+
+    /// Every `[tasks.*.tiers.*]` block in the shipped example is commented out
+    /// (both `chat_companion`'s and `chat_output_filter`'s), so it MUST pass
+    /// the tier dead-config gate, or `main` bails (#215).
+    #[test]
+    fn shipped_model_config_satisfies_tier_block_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_tier_blocks()
+            .expect("shipped example must not carry a tier block on a non-tiering task");
     }
 
     #[test]

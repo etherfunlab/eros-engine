@@ -2349,7 +2349,62 @@ impl ModelConfig {
         }
         Ok(())
     }
+
+    /// Boot gate for `[tasks.<name>.tiers.<tier>]` blocks under tasks that
+    /// never resolve with a tier (issue #215).
+    ///
+    /// Only `TIER_CONSUMING_TASKS` ever reach a `TierConfig`; every other task
+    /// resolves tier-free, so a tier block under one parses, boots, and can
+    /// never be selected — dead config of exactly the kind
+    /// `validate_prompt_variants` and `validate_affinity_prompt_unset` refuse,
+    /// one level deeper in the tree.
+    ///
+    /// Gates the WHOLE block, not just `filter_prompt`: `model`, `fallback`,
+    /// `allow_traits`, `output_filter`, `trigger`, `timing` and `retry_depth`
+    /// are equally unreachable there.
+    ///
+    /// Task and tier names are visited in sorted order so the reported failure
+    /// is deterministic across restarts (`self.tasks` is a `HashMap`), matching
+    /// `validate_prompt_variants`.
+    pub fn validate_tier_blocks(&self) -> Result<(), String> {
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            if TIER_CONSUMING_TASKS.contains(&name.as_str()) {
+                continue;
+            }
+            let mut tier_names: Vec<&String> = self.tasks[name].tiers.keys().collect();
+            tier_names.sort();
+            let Some(tier_name) = tier_names.first() else {
+                continue;
+            };
+            let allowed = TIER_CONSUMING_TASKS
+                .iter()
+                .map(|t| format!("[tasks.{t}]"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            return Err(format!(
+                "[tasks.{name}.tiers.{tier_name}] is a tier block under a task that never \
+                 resolves with a tier — only {allowed} read tier blocks, so nothing in it could \
+                 ever be selected. eros-engine refuses to boot rather than let it silently \
+                 no-op. Move the settings to [tasks.{name}], or delete the block. Rationale: \
+                 https://github.com/etherfunlab/eros-engine/issues/215"
+            ));
+        }
+        Ok(())
+    }
 }
+
+/// Tasks whose config the engine ever resolves with a tier. Everything else
+/// resolves tier-free, so a `[tasks.<other>.tiers.*]` block is dead config —
+/// see `ModelConfig::validate_tier_blocks`.
+///
+/// The two consumers are `resolve(task, tier)` (`chat_companion`, called from
+/// `pipeline/handlers.rs`) and `resolve_output_filter(tier)`
+/// (`chat_output_filter`, called from `pipeline/stream.rs`). Every other
+/// resolver either passes `None` explicitly or takes no tier argument at all.
+/// If a future task starts resolving with a tier, add its name here.
+pub const TIER_CONSUMING_TASKS: &[&str] = &["chat_companion", "chat_output_filter"];
 
 /// Every task name the chat/completions pipeline can present to the
 /// body-rules matcher (`ChatRequest.task`). Used ONLY for the boot-time typo
@@ -6076,6 +6131,140 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
             .validate_affinity_prompt_unset()
             .expect_err("must refuse");
         assert!(err.contains("engine-owned"), "{err}");
+    }
+
+    // ─── validate_tier_blocks ────────────────────────────────────────────
+
+    #[test]
+    fn tier_blocks_boot_on_the_two_tier_consuming_tasks() {
+        // chat_companion: resolve(task, tier). chat_output_filter:
+        // resolve_output_filter(tier). Those two, and only those two, ever
+        // reach a TierConfig.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\n\
+             [tasks.chat_companion.tiers.gold]\nmodel = \"m2\"\n\
+             [tasks.chat_output_filter]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+             [tasks.chat_output_filter.tiers.gold]\nfilter_prompt = \"tier p\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_tier_blocks().is_ok());
+    }
+
+    #[test]
+    fn no_tier_blocks_anywhere_boots() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\n\
+             [tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_tier_blocks().is_ok());
+    }
+
+    #[test]
+    fn tier_block_under_a_non_tiering_task_refuses_to_boot() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+             [tasks.insight_extraction.tiers.premium]\nfilter_prompt = \"never read\"\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_tier_blocks()
+            .expect_err("a tier block under a non-tiering task must refuse to boot");
+        assert!(
+            err.contains("[tasks.insight_extraction.tiers.premium]"),
+            "error must name task and tier: {err}"
+        );
+        assert!(err.contains("refuses to boot"), "{err}");
+        assert!(
+            err.contains("issues/215"),
+            "error must point at the issue: {err}"
+        );
+    }
+
+    #[test]
+    fn tier_block_without_a_filter_prompt_also_refuses_to_boot() {
+        // The whole block is unreachable, not just `filter_prompt` — model /
+        // fallback / allow_traits / retry_depth / trigger / timing /
+        // output_filter are equally dead there.
+        for body in [
+            "model = \"m2\"",
+            "fallback = [\"m3\"]",
+            "allow_traits = [\"nsfw_boost\"]",
+            "retry_depth = 2",
+        ] {
+            let toml = format!(
+                "[tasks.chat_voice]\nmodel = \"m\"\n[tasks.chat_voice.tiers.gold]\n{body}\n"
+            );
+            let cfg = ModelConfig::from_toml_str(&toml).unwrap();
+            let err = match cfg.validate_tier_blocks() {
+                Ok(()) => panic!("must refuse: {toml}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("[tasks.chat_voice.tiers.gold]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_composers_own_tier_block_refuses_to_boot() {
+        // resolve_image_prompt_compose takes no tier, and stream.rs resolves
+        // the composer as resolve(COMPOSE_TASK, None) — the same deadness
+        // validate_prompt_variants already calls out for variant shapes,
+        // extended to every field.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+             [tasks.chat_image_prompt_compose.tiers.gold]\nfilter_prompt = \"p2\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_tier_blocks().is_err());
+    }
+
+    #[test]
+    fn tier_block_failure_is_deterministic() {
+        // self.tasks is a HashMap; the reported pair must not depend on its
+        // iteration order. Sorted-first task, then sorted-first tier.
+        let toml = "[tasks.world_reply]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                    [tasks.world_reply.tiers.zeta]\nmodel = \"m2\"\n\
+                    [tasks.world_reply.tiers.alpha]\nmodel = \"m2\"\n\
+                    [tasks.pde_decision]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\
+                    [tasks.pde_decision.tiers.gold]\nmodel = \"m2\"\n";
+        for _ in 0..8 {
+            let cfg = ModelConfig::from_toml_str(toml).unwrap();
+            let err = cfg.validate_tier_blocks().expect_err("must refuse");
+            assert!(err.contains("[tasks.pde_decision.tiers.gold]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn embedding_tier_block_keeps_the_embedding_specific_message() {
+        // `validate_providers` already refuses [tasks.embedding.tiers.*] with
+        // a task-specific message, and `main` runs it BEFORE
+        // `validate_tier_blocks` so the operator sees the specific reason
+        // rather than the generic "never resolves with a tier" one. Same
+        // ordering principle as validate_affinity_prompt_unset before
+        // validate_prompt_variants.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.embedding]\nmodel = \"voyage-3-lite\"\n\
+             [tasks.embedding.tiers.pro]\nmodel = \"voyage-4\"\n",
+        )
+        .unwrap();
+        let specific = cfg
+            .validate_providers_with(|_| Some("k".into()))
+            .expect_err("embedding tiers must refuse to boot");
+        assert!(
+            specific.contains("not supported on the embedding task"),
+            "{specific}"
+        );
+        // The generic gate also errors here — it just must not speak first.
+        assert!(cfg.validate_tier_blocks().is_err());
+    }
+
+    #[test]
+    fn tier_consuming_allowlist_is_exactly_the_two_resolvers() {
+        assert_eq!(
+            TIER_CONSUMING_TASKS,
+            ["chat_companion", "chat_output_filter"],
+            "adding a task here requires a resolver that actually passes a tier"
+        );
     }
 
     // ─── resolve_image_prompt_compose: variants + raw ────────────────────
