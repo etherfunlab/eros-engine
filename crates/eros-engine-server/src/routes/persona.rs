@@ -72,8 +72,12 @@ pub struct ComposeRequest {
     /// Lands in the `[对方最新消息]` slot. Required, non-empty after trim.
     pub content: String,
     /// Lands in the `[最近场景]` slot. Omitted or blank ⇒ `（无）`. A composer
-    /// *input*, not the prompt: the composer reads it and writes its own
-    /// subject — there is no verbatim injection channel.
+    /// *input*, not the prompt: the engine never copies it into
+    /// `composed_prompt` — only the composer's own output is assembled. That
+    /// is a routing property, not sanitization: the composer is a language
+    /// model reading caller-supplied text, so it can be steered by this slot
+    /// and can echo it back through the deltas and `subject`. Treat the output
+    /// as model-generated, not as trusted.
     #[serde(default)]
     pub scene: Option<String>,
     /// Same three presets as the chat path; default `realistic`.
@@ -292,11 +296,29 @@ pub async fn compose_image(
     .into_response())
 }
 
-/// Stream mode. The composer chain (`[model] + fallback`) is walked while
-/// OPENING the upstream stream, BEFORE the SSE response is constructed — so
-/// total failure is a real HTTP 502 and only a death after first byte becomes
-/// the in-band `error` frame (spec §3.6). Mirrors `run_image_prompt_compose`'s
-/// request shape so both modes hit the composer identically.
+/// A composer candidate that has proven itself by emitting its first content
+/// chunk. Carries that chunk (already consumed from `stream`, so it must be
+/// re-emitted) plus whatever audit fields the leading chunks latched.
+struct Opened {
+    /// The model id this attempt was sent as — the `done` frame's fallback
+    /// when the provider never echoes a served model.
+    attempted_model: String,
+    first: String,
+    served_model: Option<String>,
+    generation_id: Option<String>,
+    usage: Option<eros_engine_llm::openrouter::UsageBlock>,
+    stream: eros_engine_llm::openrouter::DeltaStream,
+    /// This candidate's remaining budget, shared by the open, the peek, and
+    /// the rest of the consumption.
+    deadline: tokio::time::Instant,
+}
+
+/// Stream mode. The composer chain (`[model] + fallback`) is walked BEFORE the
+/// SSE response is constructed, and a candidate only counts as opened once it
+/// has produced its first content chunk — so a fully-failed chain is a real
+/// HTTP 502 and only a death after that first chunk becomes the in-band
+/// `error` frame (spec §3.6). Mirrors `run_image_prompt_compose`'s request
+/// shape so both modes hit the composer identically.
 #[allow(clippy::too_many_arguments)]
 async fn compose_stream(
     state: AppState,
@@ -342,40 +364,108 @@ async fn compose_stream(
     let chain: Vec<String> = std::iter::once(resolved.model.clone())
         .chain(resolved.fallback_model.iter().cloned())
         .collect();
-    let mut opened: Option<(String, eros_engine_llm::openrouter::DeltaStream)> = None;
+    // A candidate counts as opened only once it has produced its FIRST content
+    // chunk. Merely getting a 200 back is not enough: a provider that accepts
+    // the call and then errors or EOFs without a token has produced nothing
+    // usable, and the non-stream mode would advance the chain on exactly that
+    // (its "empty reply; next" arm). Peeking here keeps the two modes'
+    // fallback behaviour identical and keeps a fully-failed chain a real
+    // pre-stream 502 rather than a 200 carrying an error frame.
+    let mut opened: Option<Opened> = None;
     for model_id in chain {
-        match tokio::time::timeout(
-            FILTER_TIMEOUT,
+        // One budget per candidate, covering both the open and the whole
+        // consumption — the composer writes a short JSON reply, so the
+        // non-stream mode's per-call FILTER_TIMEOUT is the right total here.
+        let deadline = tokio::time::Instant::now() + FILTER_TIMEOUT;
+        let mut stream = match tokio::time::timeout_at(
+            deadline,
             state.openrouter.execute_stream_as(&req, &model_id),
         )
         .await
         {
-            Ok(Ok(ds)) => {
-                opened = Some((model_id, ds));
-                break;
-            }
+            Ok(Ok(ds)) => ds,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
+                continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "compose endpoint: stream open timeout; next");
+                continue;
             }
-        }
-    }
-    let (attempted_model, delta_stream) =
-        opened.ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
-
-    let frames = async_stream::stream! {
-        let _guard = guard;
-        let mut acc = String::new();
+        };
+        let mut first: Option<String> = None;
         let mut served_model: Option<String> = None;
         let mut generation_id: Option<String> = None;
         let mut usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
-        let mut failed = false;
-        futures_util::pin_mut!(delta_stream);
-        while let Some(item) = futures_util::StreamExt::next(&mut delta_stream).await {
-            match item {
-                Ok(chunk) => {
+        while first.is_none() {
+            match tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut stream))
+                .await
+            {
+                Ok(Some(Ok(chunk))) => {
+                    if let Some(m) = chunk.model {
+                        served_model = Some(m);
+                    }
+                    if let Some(g) = chunk.generation_id {
+                        generation_id = Some(g);
+                    }
+                    if let Some(u) = chunk.usage {
+                        usage = Some(u);
+                    }
+                    if let Some(c) = chunk.content {
+                        if !c.is_empty() {
+                            first = Some(c);
+                        }
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream died before first token; next");
+                    break;
+                }
+                Ok(None) => {
+                    tracing::warn!(model = %model_id, "compose endpoint: stream ended with no content; next");
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!(model = %model_id, "compose endpoint: timeout before first token; next");
+                    break;
+                }
+            }
+        }
+        if let Some(first) = first {
+            opened = Some(Opened {
+                attempted_model: model_id,
+                first,
+                served_model,
+                generation_id,
+                usage,
+                stream,
+                deadline,
+            });
+            break;
+        }
+    }
+    let Opened {
+        attempted_model,
+        first,
+        mut served_model,
+        mut generation_id,
+        mut usage,
+        stream: mut delta_stream,
+        deadline,
+    } = opened.ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
+
+    let frames = async_stream::stream! {
+        let _guard = guard;
+        let mut acc = first.clone();
+        // The peeked chunk is real output — emit it before resuming the stream.
+        yield ComposeFrame::Delta { content: first };
+        // `failure` is Some once this attempt can no longer produce a `done`.
+        // There is no chain left to walk mid-stream, so it becomes an in-band
+        // error frame instead of a status code.
+        let mut failure: Option<String> = None;
+        loop {
+            match tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut delta_stream)).await {
+                Ok(Some(Ok(chunk))) => {
                     if let Some(m) = chunk.model {
                         served_model = Some(m);
                     }
@@ -392,45 +482,54 @@ async fn compose_stream(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Some(Err(e))) => {
                     tracing::warn!(error = %e, "compose endpoint: stream died mid-flight");
-                    yield ComposeFrame::Error {
-                        code: StreamErrorCode::UpstreamUnavailable,
-                        retryable: true,
-                        message: format!("composer stream failed: {e}"),
-                        user_message: "服务出现问题，请稍后再试".into(),
-                    };
-                    failed = true;
+                    failure = Some(format!("composer stream failed: {e}"));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // Bounds a provider that opens the response and then goes
+                    // quiet: without this the request — and the per-user slot
+                    // guard held by this stream — would live until the client
+                    // gave up. Mirrors the chat path's STREAM_TOTAL_TIMEOUT.
+                    tracing::warn!("compose endpoint: total timeout while streaming");
+                    failure = Some("composer stream timed out".into());
                     break;
                 }
             }
         }
-        if !failed {
-            // Same usage-log synthesis as the chat path's streaming arms.
-            crate::pipeline::log_openrouter_usage(
-                "chat_image_prompt_compose",
-                None,
-                &eros_engine_llm::openrouter::ChatResponse {
-                    reply: String::new(), // usage log only — never echo content
-                    generation_id: generation_id.clone(),
-                    model: served_model.clone(),
-                    usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
-                    finish_reason: None,
-                },
-            );
-            let raw = acc.trim().to_string();
-            let (subject, caption) = parse_compose_reply(&raw);
-            if subject.is_empty() {
-                // Empty reply, or empty prompt after parse — mid-stream there
-                // is no chain left to walk, so this is the in-band twin of the
-                // chat path's "empty reply; next" failure arms.
-                yield ComposeFrame::Error {
-                    code: StreamErrorCode::UpstreamUnavailable,
-                    retryable: true,
-                    message: "composer returned no usable prompt".into(),
-                    user_message: "服务出现问题，请稍后再试".into(),
-                };
-            } else {
+        // Usage is logged on EVERY terminal path, failures included: a stream
+        // that died mid-flight may still have been billed, and reconciling
+        // that is this endpoint's job. Same synthesis as the chat path's
+        // streaming arms.
+        crate::pipeline::log_openrouter_usage(
+            "chat_image_prompt_compose",
+            None,
+            &eros_engine_llm::openrouter::ChatResponse {
+                reply: String::new(), // usage log only — never echo content
+                generation_id: generation_id.clone(),
+                model: served_model.clone(),
+                usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                finish_reason: None,
+            },
+        );
+        let (subject, caption) = parse_compose_reply(acc.trim());
+        match failure {
+            Some(message) => yield ComposeFrame::Error {
+                code: StreamErrorCode::UpstreamUnavailable,
+                retryable: true,
+                message,
+                user_message: "服务出现问题，请稍后再试".into(),
+            },
+            // A parse that yields no subject cannot be served as a `done`.
+            None if subject.is_empty() => yield ComposeFrame::Error {
+                code: StreamErrorCode::UpstreamUnavailable,
+                retryable: true,
+                message: "composer returned no usable prompt".into(),
+                user_message: "服务出现问题，请稍后再试".into(),
+            },
+            None => {
                 let composed_prompt = compose_image_prompt(style_key, &persona, &subject);
                 yield ComposeFrame::Done {
                     composed_prompt,
@@ -471,7 +570,7 @@ mod tests {
     use sqlx::PgPool;
     use std::sync::Arc;
     use tower::Service;
-    use wiremock::matchers::path as wm_path;
+    use wiremock::matchers::{body_string_contains, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mint_jwt(uid: Uuid) -> String {
@@ -997,6 +1096,77 @@ mod tests {
             .map(|f| f["content"].as_str().unwrap())
             .collect();
         assert_eq!(deltas, "PLAIN STREAM PROMPT");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_advances_chain_when_candidate_yields_no_content(pool: PgPool) {
+        // Codex review (PR #220, P1): a 200 that carries no token is not a
+        // usable candidate. The non-stream mode advances its chain on exactly
+        // that ("empty reply; next"), so the stream mode must too — otherwise
+        // a configured fallback is silently skipped and the caller gets a 200
+        // error frame instead of the fallback's real output.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        // Primary: 200, well-formed SSE, but zero content chunks.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        // Fallback: the real answer.
+        let chunk = json!({
+            "choices": [{"delta": {"content": r#"{"prompt":"FALLBACK SUBJECT"}"#}}],
+            "id": "gen-fallback",
+            "model": "served/fallback-model",
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"backup\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfallback = [\"backup\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = sse_frames(resp).await;
+        let done = frames
+            .iter()
+            .find(|f| f["type"] == "done")
+            .expect("fallback served a done frame");
+        assert_eq!(done["subject"], "FALLBACK SUBJECT");
+        assert_eq!(done["model"], "served/fallback-model");
+        assert!(
+            !frames.iter().any(|f| f["type"] == "error"),
+            "no error frame once the fallback served: {frames:?}"
+        );
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 2, "both chain candidates were tried");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

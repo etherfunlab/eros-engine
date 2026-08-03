@@ -1529,7 +1529,7 @@
               "string",
               "null"
             ],
-            "description": "Lands in the `[最近场景]` slot. Omitted or blank ⇒ `（无）`. A composer\n*input*, not the prompt: the composer reads it and writes its own\nsubject — there is no verbatim injection channel."
+            "description": "Lands in the `[最近场景]` slot. Omitted or blank ⇒ `（无）`. A composer\n*input*, not the prompt: the engine never copies it into\n`composed_prompt` — only the composer's own output is assembled. That\nis a routing property, not sanitization: the composer is a language\nmodel reading caller-supplied text, so it can be steered by this slot\nand can echo it back through the deltas and `subject`. Treat the output\nas model-generated, not as trusted."
           },
           "stream": {
             "type": "boolean",

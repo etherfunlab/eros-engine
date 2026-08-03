@@ -454,7 +454,7 @@ Body fields:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `content` | `String` | yes | Non-empty after trim, max 4096 chars. Lands in the `[对方最新消息]` composer slot. |
-| `scene` | `String` | no | Lands in `[最近场景]`; omitted or blank ⇒ `（无）`. Max 8192 chars (`422` over). A composer *input*, not the prompt — the composer reads it and writes its own subject; there is no verbatim injection channel. |
+| `scene` | `String` | no | Lands in `[最近场景]`; omitted or blank ⇒ `（无）`. Max 8192 chars (`422` over). A composer *input*, not the prompt — the engine never copies it into `composed_prompt`; only the composer's own output is assembled. |
 | `style` | `String` | no | Same three presets as the chat path; default `realistic`. |
 | `aspect_ratio` | `String` | no | Same allow-list as the chat path; `422` on anything else. |
 | `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
@@ -496,6 +496,14 @@ deltas and reads the terminal frame.
 A successful-but-non-JSON composer reply keeps the chat path's behaviour:
 `subject` is the whole raw reply, `caption` is `null`, and `composed_prompt`
 is assembled from it as usual.
+
+**Treat the output as model-generated, not sanitized.** "The engine never
+copies `content` / `scene` into `composed_prompt`" is a routing property, not
+a safety boundary: the composer is a language model reading caller-supplied
+text, so those slots can steer it, and it can echo them back through the
+`delta` frames and `subject`. The length caps bound cost, not influence. A
+caller that forwards `composed_prompt` to an image vendor owns whatever policy
+that vendor requires.
 
 Failure modes:
 
