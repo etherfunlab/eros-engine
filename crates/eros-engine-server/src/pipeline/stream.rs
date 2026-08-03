@@ -3701,8 +3701,7 @@ pub fn run_stream(
                         if let Some(rw) =
                             run_input_filter(&state, &f, &transcript, &user_msg.content).await
                         {
-                            effective_user_msg = rw.rewritten_text.clone();
-                            if let Err(e) = chat_repo
+                            match chat_repo
                                 .set_user_input_rewrite(
                                     user_msg.user_message_id,
                                     &rw.rewritten_text,
@@ -3712,7 +3711,19 @@ pub fn run_stream(
                                 )
                                 .await
                             {
-                                tracing::warn!("stream: input-filter rewrite persist failed: {e}");
+                                // The chat model reads the effective text back
+                                // from the DB row (build_reply_request), so the
+                                // composer may track the rewrite only once it is
+                                // persisted — on a failed write the chat model
+                                // will see the ORIGINAL text, and handing the
+                                // composer the unpersisted rewrite would let the
+                                // picture drift from the reply.
+                                Ok(()) => effective_user_msg = rw.rewritten_text.clone(),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "stream: input-filter rewrite persist failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
