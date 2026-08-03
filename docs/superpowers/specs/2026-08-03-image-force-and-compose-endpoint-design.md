@@ -238,15 +238,22 @@ behaviour so the two paths cannot disagree: `subject` is the raw reply,
 | Over the per-user in-flight cap | `429` |
 | Composer call fails | `502`, or an in-band `error` frame if streaming has begun. **No portrait fallback here** — the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. Returning a generic portrait to a caller that asked for a specific prompt would be worse than an error. |
 
-**`502` is a new status code for this repo** — `AppError` has no
-upstream-failure variant today (`Internal` is reserved and unconstructed, and
-maps to `500`). Implementing this means adding one variant and its mapping.
-The case for `502` over reusing `500`: this endpoint is also a composer test
-surface, and an operator tuning a `filter_prompt` needs to tell "the provider
-rejected or failed my call" apart from "the engine broke". Reusing `500`
-collapses that distinction. If the maintainer would rather not grow the status
-surface, `500` via `AppError::Internal` is the fallback and nothing else in
-this spec depends on the choice.
+**`502` is a new status code for this repo.** `AppError` has no upstream-failure
+variant today (`Internal` is reserved and unconstructed, and maps to `500`), so
+this change adds one — `AppError::Upstream(String)` → `502` — alongside the
+existing variants in `error.rs`, with the same `{error, message}` body shape the
+other non-stream routes return.
+
+The reason to grow the status surface rather than reuse `500`: this endpoint is
+also a composer test surface, and an operator tuning a `filter_prompt` needs to
+tell "the provider rejected or failed my call" apart from "the engine broke".
+Reusing `500` collapses that distinction on exactly the endpoint built to
+expose it.
+
+Scope the new variant to this endpoint. Do not retrofit existing call sites
+onto it — the chat path's provider failures already have their own handling
+(fallback chain, then the pseudo-ghost), and rerouting them is a separate
+concern with its own blast radius.
 
 ### 3.7 Persistence and audit
 
@@ -304,9 +311,19 @@ pre-existing Traditional prose around it.
 - OpenAPI snapshot regenerated and committed — CI diffs it.
 - Full `cargo fmt` / `clippy -D warnings` / `test --workspace --all-features`.
 
-## 7. Breaking
+## 7. Breaking — ships in 1.0.1
 
-Three consumer-visible changes on the chat stream: `force` no longer produces a
-text reply, `content` is required on forced turns, and `mode` no longer does
-anything. Version number is the maintainer's call and is deliberately not
-specified here.
+Three consumer-visible changes on the chat stream:
+
+1. `force = true` no longer produces a text reply — it is always `reply_image`.
+2. `content` is required on forced turns; the `force` + `image_only`
+   empty-content exemption is gone.
+3. `mode` no longer does anything. A leftover key deserializes and is ignored
+   (§1), so a consumer still sending `"mode": "text_image"` silently gets an
+   image-only turn instead of text + image.
+
+**The version number will not signal any of this**, so the release notes carry
+the whole burden. Item 3 is the dangerous one: it fails silently on the
+consumer side rather than erroring, which is the exact trade accepted in §1 in
+exchange for not accumulating tombstone fields this early. Notes must state it
+explicitly rather than leaving it to a table row.
