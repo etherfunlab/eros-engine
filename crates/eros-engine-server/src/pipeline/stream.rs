@@ -2619,9 +2619,20 @@ struct DelegatedImagePrompt {
 struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
 
 impl<T> AbortOnDrop<T> {
-    /// Take the handle to await it. Once taken, the guard no longer aborts.
-    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
-        self.0.take()
+    /// Await the guarded task WITHOUT releasing the guard. `JoinHandle` is
+    /// `Unpin`, so a `&mut` await works — and because the handle never leaves
+    /// the guard, a caller dropped mid-await (client disconnect at exactly the
+    /// join point) still aborts the in-flight task. Taking the handle out
+    /// first would open that window: between `take()` and the await's
+    /// completion, a drop would detach the raw `JoinHandle` and the task would
+    /// run on with no consumer. After a completed await the handle stays put;
+    /// aborting a finished task is a no-op, so the drop-time abort is
+    /// harmless.
+    async fn join(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        match self.0.as_mut() {
+            Some(h) => Some(h.await),
+            None => None,
+        }
     }
 }
 
@@ -3898,24 +3909,24 @@ pub fn run_stream(
                         let img_mid = ulid_string(Ulid::from(msg_uuid));
                         // The composer was spawned before the chat call; by now
                         // it has almost always finished, so this await is ~free.
-                        // A panicked or cancelled task degrades exactly like a
+                        // Awaited THROUGH the guard so a client disconnect at
+                        // this exact point still aborts the in-flight call. A
+                        // panicked or cancelled task degrades exactly like a
                         // failed compose — never a dropped frame.
-                        let img = match compose_handle.take() {
-                            Some(h) => match h.await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("image-compose task failed: {e}");
-                                    build_delegated_image_prompt(
-                                        &state,
-                                        &input.persona,
-                                        &plan,
-                                        req_image,
-                                        &pde_transcript.transcript,
-                                        &effective_user_msg,
-                                    )
-                                    .await
-                                }
-                            },
+                        let img = match compose_handle.join().await {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => {
+                                tracing::warn!("image-compose task failed: {e}");
+                                build_delegated_image_prompt(
+                                    &state,
+                                    &input.persona,
+                                    &plan,
+                                    req_image,
+                                    &pde_transcript.transcript,
+                                    &effective_user_msg,
+                                )
+                                .await
+                            }
                             None => {
                                 build_delegated_image_prompt(
                                     &state,
@@ -6948,7 +6959,7 @@ data: [DONE]\n\n";
     /// at the end of the burst is trivially satisfied and proves nothing about
     /// ordering under a REAL in-flight call. This test configures the composer
     /// AND gives its mocked response a delay that outlasts the (instant, mocked)
-    /// chat burst, so the join at `compose_handle.take().unwrap().await`
+    /// chat burst, so the join at `compose_handle.join().await`
     /// genuinely waits on a still-running task — the actual race the concurrent
     /// spawn in `run_stream` is meant to survive. Asserts the wire frame order
     /// still holds (`meta → delta* → done → image_request → final`) and that
