@@ -79,7 +79,7 @@ gates.
 
 ## Auth
 
-Middleware (`auth::middleware::require_auth`) is layered onto `/comp/*` only. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
+Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer) and `/docs` (merged in `main.rs`) — today that means `/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
 
 The default validator is `SupabaseJwtValidator` (HS256 against `SUPABASE_JWT_SECRET`). Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
 
@@ -98,6 +98,9 @@ eros-engine-server :8080
     │       └─► spawn post_process(state.clone(), …)
     │              │
     │              ▼
+    ├─► routes::persona (/persona/{instance_id}/image/compose)
+    │       └─► image-prompt composer LLM only — nothing persisted
+    │
     └────────────► Postgres (`engine` schema)
                        chat_sessions / chat_messages
                        companion_affinity / companion_affinity_events
@@ -156,7 +159,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
-        ├── routes/           # health / companion / companion_stream / debug / mod
+        ├── routes/           # health / companion / companion_stream / voice / persona / world_town / bff / dto / debug / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata
 ```
 

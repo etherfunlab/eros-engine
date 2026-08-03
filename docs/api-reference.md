@@ -302,7 +302,6 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "client_msg_id": "01J3333333333333333333333A",
         "image": {
           "force": true,
-          "mode": "text_image",
           "style": "realistic",
           "aspect_ratio": "3:4"
         }
@@ -318,8 +317,7 @@ draws on the chat stream).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `force` | `bool` | `false` | Override the PDE decision for this turn — force an image. When `false` the PDE decides. |
-| `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = text reply + image; `image_only` = image only (no text). `image_only` permits an empty `content` field. |
+| `force` | `bool` | `false` | Override the PDE decision for this turn — the turn is always `reply_image` (image only, no text reply). Requires `[tasks.chat_image_prompt_compose]` to be configured (`422` otherwise), and `content` follows the ordinary non-empty rule. When `false` the PDE decides. A leftover `mode` key from the pre-1.0.1 contract deserializes and is silently ignored. |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | One of the three engine-owned style presets; `"realistic"` is the engine's built-in default. |
 | `aspect_ratio` | `String` | none | Allowed: `1:1`, `3:4`, `4:3`, `9:16`, `16:9`; absent when omitted (PDE plan → request → absent). Returns `422` if invalid. |
 | `prompt_variant` | `String` | none | Selects a `[tasks.chat_image_prompt_compose].filter_prompt` variant: an index (`"0"`, `"1"`) or a key (`"a"`, `"b"`), depending on how that task is configured (see [model-config.md](model-config.md)). `"raw"` carries no special meaning: it selects a prompt only if the deployment configures a variant under that literal key, exactly like any other name. An index/key that doesn't match — `"raw"` included — falls back to the engine's built-in composer prompt, never a `422` or other error. Ignored when the task isn't configured, or configures a single plain prompt. |
@@ -341,8 +339,11 @@ successful compose (fail-open degradation, or composer not configured). The
 composed prompt itself is never persisted — storing it is the consumer's job.
 The reference kind is not recorded.
 
-Validation: `force` + `tips_amount_usd` on the same turn → `422`. An
-unsupported `aspect_ratio` returns `422 BadRequest` as a pre-stream error.
+Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
+while `[tasks.chat_image_prompt_compose]` is not configured → `422` (the
+composer is the only prompt source; without it a forced image could only be a
+generic portrait). An unsupported `aspect_ratio` returns `422 BadRequest` as a
+pre-stream error. All are pre-stream: no user row is persisted.
 
 **`image_request` SSE frame** — emitted once per image turn in place of any
 in-engine draw. The engine composes the prompt; the consumer draws it via its
@@ -430,6 +431,87 @@ Body fields:
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
+## Persona
+
+### `POST /persona/{instance_id}/image/compose`
+
+Standalone image-prompt composition for a persona instance — a consumer that
+wants a prompt for arbitrary text, not a chat turn. **Nothing is persisted, no
+affinity runs, no memory is written.** The instance must belong to the JWT
+user (`403` otherwise; `404` when it does not exist). Requires
+`[tasks.chat_image_prompt_compose]` (`501 compose_disabled` without it).
+
+The endpoint doubles as a composer test surface: the response carries `model`
+and `generation_id`, and streaming passes the composer's raw output through
+verbatim — the most common failure when tuning a `filter_prompt` is the model
+not emitting valid JSON, and the operator needs to see what it actually
+returned.
+
+Body fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `content` | `String` | yes | Non-empty after trim, max 4096 chars. Lands in the `[对方最新消息]` composer slot. |
+| `scene` | `String` | no | Lands in `[最近场景]`; omitted or blank ⇒ `（无）`. Max 8192 chars (`422` over). A composer *input*, not the prompt — the composer reads it and writes its own subject; there is no verbatim injection channel. |
+| `style` | `String` | no | Same three presets as the chat path; default `realistic`. |
+| `aspect_ratio` | `String` | no | Same allow-list as the chat path; `422` on anything else. |
+| `prompt_variant` | `String` | no | Same variant selection as the chat path, including the unknown-key-falls-back-to-built-in rule. |
+| `stream` | `bool` | no | Default `true`. |
+
+The composer payload is identical to the chat path's five slots, so one
+`filter_prompt` contract serves both callers (see
+[model-config.md](model-config.md)).
+
+Both modes return the same five fields:
+
+| Field | Meaning |
+|---|---|
+| `composed_prompt` | Style preset + persona appearance + subject — the string to hand an image vendor |
+| `subject` | The composer's own prompt field, before assembly |
+| `caption` | The composer's short caption, `null` when it produced none |
+| `model` | The model that actually answered |
+| `generation_id` | For reconciling against provider logs |
+
+`stream: false` returns them as one JSON body. `stream: true` returns
+`text/event-stream`:
+
+```
+data: {"type":"delta","content":"{\"prompt\":\"…"}
+data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","model":"…","generation_id":"…"}
+```
+
+- `delta` frames carry the composer's raw output as it arrives, verbatim and
+  unparsed.
+- one terminal `done` frame carries the five fields — its payload minus the
+  `type` discriminator is byte-identical to the `stream: false` body.
+- a single `{"type":"error",…}` frame on failure after streaming has begun,
+  matching the chat stream's in-band error shape (`code`, `retryable`,
+  `message`, `user_message`).
+
+There is no `meta` frame. A consumer that only wants the result ignores the
+deltas and reads the terminal frame.
+
+A successful-but-non-JSON composer reply keeps the chat path's behaviour:
+`subject` is the whole raw reply, `caption` is `null`, and `composed_prompt`
+is assembled from it as usual.
+
+Failure modes:
+
+| Condition | Response |
+|---|---|
+| `[tasks.chat_image_prompt_compose]` absent | `501 compose_disabled` |
+| Instance not owned by the JWT user | `403` |
+| Instance not found | `404` |
+| Blank `content`, over-cap `scene`, bad `aspect_ratio` | `422` |
+| Over the per-user in-flight cap (shared with chat/voice, ≤3) | `429` |
+| Composer chain exhausted | `502` — `{"error":"upstream","message":…}` — or an in-band `error` frame if streaming has begun. **No portrait fallback here**: the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. |
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"在海边，黄昏","style":"realistic","aspect_ratio":"3:4","stream":false}' \
+  http://localhost:8080/persona/{instance_id}/image/compose
 ```
 
 ## Profile
@@ -659,11 +741,14 @@ All errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`:
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
+| 502 | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted) |
 
 ## Source
 
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
+- `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
+- `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/debug.rs` — affinity debug routes (vector + event log)

@@ -509,6 +509,15 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 
 该功能是 **fail-open** 的：合成器失败 / 超时 / 输出为空时，引擎回退到空主体——`compose_image_prompt` 会把空主体变成一句纯人格外观的肖像 prompt——所以合成器故障只会降低出图质量，绝不阻塞或失败图片轮次。该任务**仅在图片轮次按需解析**，因此不会在文本/ghost 轮次推进 `model` 的 round-robin 游标。
 
+**两个消费方，一份契约。** 除聊天流的图片轮次外，独立端点
+`POST /persona/{instance_id}/image/compose`（见
+[api-reference.zh.md](api-reference.zh.md)）跑的也是这个任务：同样的五槽位载荷
+（`[人物外观] / [最近场景] / [对方最新消息] / [风格] / [画幅]`）、同样的
+`filter_prompt` 契约——部署自定义的提示词无需任何改动即可同时服务两者。端点侧
+有两处行为差异：`[最近场景]` 槽位由请求的 `scene` 字段填充而非对话历史；并且
+**没有肖像回退**——整条链失败直接 `502`（该端点兼作合成器的调试面，报告失败而
+不是掩盖失败）。
+
 ```toml
 [tasks.chat_image_prompt_compose]
 model        = "x-ai/grok-4"                       # 任意文本模型；选一个能覆盖你内容范围的

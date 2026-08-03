@@ -76,7 +76,7 @@ PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、
 
 ## Auth
 
-中間件（`auth::middleware::require_auth`）只掛在 `/comp/*` 上。它讀 `Authorization: Bearer …` 頭，調 `state.auth.validate(token)`，把 `AuthUser(user_id)` 作為 extension 注入請求。每個受保護的 handler 讀 `Extension(AuthUser(user_id))`；請求體裡的 `user_id` 永不被信任。
+中间件（`auth::middleware::require_auth`）保护除 `/healthz`（在 auth 层之外合并）和 `/docs`（在 `main.rs` 里合并）以外的一切——目前即 `/comp/*`、`/bff/v1/*`、`/world/*`、`/persona/*`。该层挂在 `routes/mod.rs` 的合并子路由上，而不是某个路径前缀上，所以新增命名空间（如 `/persona/*`）不需要任何额外的鉴权接线。它讀 `Authorization: Bearer …` 頭，調 `state.auth.validate(token)`，把 `AuthUser(user_id)` 作為 extension 注入請求。每個受保護的 handler 讀 `Extension(AuthUser(user_id))`；請求體裡的 `user_id` 永不被信任。
 
 默認驗證器是 `SupabaseJwtValidator`（HS256，密鑰用 `SUPABASE_JWT_SECRET`）。自部署用其他 IdP 的話實現 `AuthValidator` trait，把實例注入 `AppState.auth` 即可。
 
@@ -95,6 +95,9 @@ eros-engine-server :8080
     │       └─► spawn post_process(state.clone(), …)
     │              │
     │              ▼
+    ├─► routes::persona（/persona/{instance_id}/image/compose）
+    │       └─► 只调用出图 prompt 合成器 LLM——不落任何表
+    │
     └────────────► Postgres（`engine` schema）
                        chat_sessions / chat_messages
                        companion_affinity / companion_affinity_events
@@ -152,7 +155,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / debug / mod
+        ├── routes/           # health / companion / companion_stream / voice / persona / world_town / bff / dto / debug / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 

@@ -277,7 +277,6 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "client_msg_id": "01J3333333333333333333333A",
         "image": {
           "force": true,
-          "mode": "text_image",
           "style": "realistic",
           "aspect_ratio": "3:4"
         }
@@ -292,15 +291,17 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 | 字段 | 类型 | 默认值 | 备注 |
 |---|---|---|---|
-| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策。`false` 时由 PDE 决定。 |
-| `mode` | `"text_image"` \| `"image_only"` | `"text_image"` | `text_image` = 文字 + 图片；`image_only` = 仅图片（允许空 `content`）。 |
+| `force` | `bool` | `false` | 强制本轮发图，覆盖 PDE 决策——该轮固定为 `reply_image`（仅图片，无文字回复）。要求部署配置了 `[tasks.chat_image_prompt_compose]`（否则 `422`），且 `content` 遵循普通的非空规则。`false` 时由 PDE 决定。1.0.1 之前旧契约遗留的 `mode` 键可以正常反序列化，但会被静默忽略。 |
 | `style` | `"realistic"` \| `"semi_realistic"` \| `"anime"` | `"realistic"` | 引擎内置三种风格预设之一；`"realistic"` 是引擎内置默认值。 |
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
 
 **参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），不记录参考类型。
 
-校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`aspect_ratio` 不在允许集时，作为 pre-stream 错误返回 `422 BadRequest`。
+校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
+`[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
+强制出图只能产出一张无视用户消息的通用肖像）。`aspect_ratio` 不在允许集时，作为
+pre-stream 错误返回 `422 BadRequest`。以上全部是 pre-stream 错误：不会落任何用户行。
 
 **`image_request` SSE 帧** — 每个图片轮次发出一次，取代任何引擎内绘图。引擎负责组装提示词；由消费方通过自己的图像供应商绘制（引擎没有绘图端点）。聊天流本身不绘图、不回传图像字节、不持久化绘图结果。
 
@@ -378,6 +379,79 @@ Body 字段：
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
+## Persona
+
+### `POST /persona/{instance_id}/image/compose`
+
+面向单个角色实例的独立图片提示词合成——给「想为任意文本拿一段提示词、而不是走
+一轮聊天」的消费方用。**不落任何表，不跑好感度，不写记忆。** 实例必须属于
+JWT 用户（否则 `403`；不存在时 `404`）。要求配置
+`[tasks.chat_image_prompt_compose]`（没有则 `501 compose_disabled`）。
+
+这个端点同时是合成器的调试面：响应携带 `model` 和 `generation_id`，流式模式
+把合成器的原始输出逐字透传——调 `filter_prompt` 时最常见的失败是模型没吐出合法
+JSON，运维需要看到它实际返回了什么。
+
+Body 字段：
+
+| 字段 | 类型 | 必填 | 备注 |
+|---|---|---|---|
+| `content` | `String` | 是 | trim 后非空，最长 4096 字符。落入合成器的 `[对方最新消息]` 槽位。 |
+| `scene` | `String` | 否 | 落入 `[最近场景]`；省略或空白 ⇒ `（无）`。最长 8192 字符（超出 `422`）。它是合成器的*输入*，不是提示词——合成器读它并自己撰写主题，不存在逐字注入通道。 |
+| `style` | `String` | 否 | 与聊天路径相同的三种预设；默认 `realistic`。 |
+| `aspect_ratio` | `String` | 否 | 与聊天路径相同的允许集；其他值 `422`。 |
+| `prompt_variant` | `String` | 否 | 与聊天路径相同的变体选择规则，包括「未命中的 key 回退到内置提示词」。 |
+| `stream` | `bool` | 否 | 默认 `true`。 |
+
+合成器载荷与聊天路径的五个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
+调用方（见 [model-config.zh.md](model-config.zh.md)）。
+
+两种模式返回同样的五个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `composed_prompt` | 风格预设 + 角色外观 + 主题——直接交给图像供应商的字符串 |
+| `subject` | 合成器自己写的 prompt 字段，组装之前的原文 |
+| `caption` | 合成器的一句话描述，没有则为 `null` |
+| `model` | 实际应答的模型 |
+| `generation_id` | 用于与供应商日志对账 |
+
+`stream: false` 时以单个 JSON body 返回。`stream: true` 时返回
+`text/event-stream`：
+
+```
+data: {"type":"delta","content":"{\"prompt\":\"…"}
+data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","model":"…","generation_id":"…"}
+```
+
+- `delta` 帧逐字透传合成器的原始输出，不做任何解析。
+- 一个终结的 `done` 帧携带五个字段——其载荷去掉 `type` 判别符后与
+  `stream: false` 的 body 逐字节一致。
+- 开流之后失败时发送单个 `{"type":"error",…}` 帧，形状与聊天流的带内错误一致
+  （`code`、`retryable`、`message`、`user_message`）。
+
+没有 `meta` 帧。只要结果的消费方可以忽略 delta、只读终结帧。
+
+合成器成功返回但不是 JSON 时，保持与聊天路径一致的行为：`subject` 是整段原始
+回复，`caption` 为 `null`，`composed_prompt` 照常由它组装。
+
+失败模式：
+
+| 条件 | 响应 |
+|---|---|
+| 未配置 `[tasks.chat_image_prompt_compose]` | `501 compose_disabled` |
+| 实例不属于 JWT 用户 | `403` |
+| 实例不存在 | `404` |
+| `content` 空白、`scene` 超长、`aspect_ratio` 非法 | `422` |
+| 超出每用户并发上限（与聊天/语音共享，≤3） | `429` |
+| 合成器链条全部失败 | `502`——`{"error":"upstream","message":…}`——开流之后则为带内 `error` 帧。**这里没有肖像回退**：回退的存在是为了让聊天轮次继续走下去，而这个端点没有轮次要保护。 |
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"在海边，黄昏","style":"realistic","aspect_ratio":"3:4","stream":false}' \
+  http://localhost:8080/persona/{instance_id}/image/compose
 ```
 
 ## 用戶畫像
@@ -590,11 +664,14 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
+| 502 | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败） |
 
 ## 源碼
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
+- `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）
+- `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/debug.rs`——好感度 debug 路由（向量 + 事件日志）

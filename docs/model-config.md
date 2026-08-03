@@ -594,6 +594,17 @@ image quality rather than blocking or failing the image turn. The task is
 resolved **lazily, only on image turns**, so it never advances a `model`
 round-robin cursor on text/ghost turns.
 
+**Two consumers, one contract.** Besides the chat stream's image turns, the
+standalone `POST /persona/{instance_id}/image/compose` endpoint (see
+[api-reference.md](api-reference.md)) runs this same task with the same
+five-slot payload (`[人物外观] / [最近场景] / [对方最新消息] / [风格] / [画幅]`)
+and the same `filter_prompt` contract — a deployment's custom prompt needs no
+changes to serve both. Two behavioural differences on the endpoint side: the
+`[最近场景]` slot is filled from the request's `scene` field instead of the
+conversation history, and there is **no portrait fallback** — a fully failed
+chain is a `502` (the endpoint doubles as the composer's test surface, so it
+reports failure instead of masking it).
+
 ```toml
 [tasks.chat_image_prompt_compose]
 model        = "x-ai/grok-4"                       # any text model; pick one comfortable with your content range
