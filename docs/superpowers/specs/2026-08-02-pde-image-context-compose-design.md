@@ -399,7 +399,22 @@ Serial LLM hops on the turn drop from 3 to 2.
   (same chain). This is now the ONLY degraded image path — a turn either gets a
   composed picture or a portrait.
 - A panicked or cancelled composer task surfaces at the join as
-  `Err(JoinError)` and maps to the same degradation — never a dropped frame.
+  `Err(JoinError)`. **Implemented differently from this section's original
+  plan** (amended post-review, 2026-08-02 fix wave): rather than mapping
+  straight to the portrait-fallback degradation above, the join's `Err(e)` arm
+  logs a warn and re-runs `build_delegated_image_prompt` **sequentially**,
+  right there — a second, synchronous attempt at a real composed picture
+  before falling through to the empty-subject/portrait path (only if that
+  second attempt also fails to produce one). This is strictly more robust than
+  "maps to the same degradation": a `JoinError` is usually an orthogonal
+  scheduler event (a panic, or an abort racing a not-yet-observed success), not
+  evidence that the composer itself is broken, so unconditionally discarding
+  its chance at a real picture would degrade turns that a plain retry could
+  have saved — never a dropped frame either way. The cost is a second LLM call
+  and a serial hop on this (rare) path. The reviewer that closed issue #212
+  judged this behavior preferable to the original plan, so this document was
+  amended to describe it rather than changing the code to match the original
+  plan.
 - If the text path returns early before the join (e.g. `build_reply_request`
   fails and the stream yields `Error` and returns), the handle is dropped.
   **Dropping a `JoinHandle` does not cancel the task**: it runs to completion

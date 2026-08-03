@@ -455,7 +455,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 两次，ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
 
-**图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
+**图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
 
@@ -528,7 +528,7 @@ b = """
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_prompt_compose()`。
 
-**审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。用量/费用不落库；请用 generation id 去你的供应商日志里对账。长的 `prompt` 本身不持久化（按设计交给消费方自己留存）。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`。
+**审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。用量/费用不落库；请用 generation id 去你的供应商日志里对账。`metadata.image.prompt`——合成器的 `prompt` 字段，也就是真正的出图主体——**会**持久化在每个图片轮次上；它正是 `build_delegated_image_marker` 写入、与上面审计三元组同行的那个字段。真正不持久化的是完整拼装出的**线上 wire prompt**（style 预设 + 人格外观 + 这个主体，由 `compose_image_prompt` 拼装而成）：这段字符串只出现在 `image_request` 帧的 `composed_prompt` 字段里，base64 编码后发出，从不写入任何数据行。运营方审计数据库时，能在每个图片轮次上找到出图主体本身——只是找不到那个已经套上 style 与外观外壳、供应商真正收到的完整版本。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`。
 
 ### `[tasks.chat_vision]` — 图片输入（视觉预处理阶段，opt-in）
 
