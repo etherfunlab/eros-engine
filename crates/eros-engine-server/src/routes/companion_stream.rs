@@ -274,7 +274,7 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
             }));
         }
         if let Some(ar) = img.aspect_ratio.as_deref() {
-            if !matches!(ar, "1:1" | "3:4" | "4:3" | "9:16" | "16:9") {
+            if !aspect_ratio_supported(ar) {
                 return Err(AppError::StreamPre(StreamPreError {
                     status: StatusCode::UNPROCESSABLE_ENTITY,
                     code: "unprocessable",
@@ -286,6 +286,12 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// The aspect-ratio allow-list shared by the chat stream and the persona
+/// compose endpoint.
+pub(crate) fn aspect_ratio_supported(ar: &str) -> bool {
+    matches!(ar, "1:1" | "3:4" | "4:3" | "9:16" | "16:9")
 }
 
 /// `image.force` demands the composer (spec 2026-08-03 §2.3): with no

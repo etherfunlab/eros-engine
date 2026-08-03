@@ -27,7 +27,6 @@ pub enum AppError {
     /// distinguishable from "the engine broke" (500). Scoped to that endpoint:
     /// the chat path's provider failures keep their own handling (fallback
     /// chain, pseudo-ghost) and must not be rerouted here.
-    #[allow(dead_code)] // constructed by routes/persona.rs (compose endpoint)
     #[error("upstream failure: {0}")]
     Upstream(String),
     // Reserved for handler-level 500s; constructed nowhere right now (its only

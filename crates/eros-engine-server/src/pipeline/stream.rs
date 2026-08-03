@@ -1337,7 +1337,7 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 // ── run_output_filter ────────────────────────────────────────────────────────
 
 /// Per-model timeout for a single filter LLM call.
-const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Max wait for a chat stream to OPEN (connect + queue + response headers).
 /// A provider that accepts the socket but never sends headers must not hold
@@ -2387,7 +2387,7 @@ async fn run_input_filter(
 /// Assemble the composer's user message from the appearance, recent scene,
 /// latest user message, style, and aspect ratio. Pure (kept separate so it is
 /// testable without a network call).
-fn compose_user_payload(
+pub(crate) fn compose_user_payload(
     appearance: &str,
     recent_scene: &str,
     latest_user_msg: &str,
@@ -2417,7 +2417,7 @@ struct ComposeReply {
 /// is now usually empty), just bare markers until the prompt is updated.
 ///
 /// A blank caption is normalised to `None`; callers must not persist `""`.
-fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
+pub(crate) fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
     let parsed = serde_json::from_str::<ComposeReply>(raw).ok().or_else(|| {
         super::find_json_block(raw).and_then(|b| serde_json::from_str::<ComposeReply>(b).ok())
     });
@@ -2436,20 +2436,20 @@ fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
 /// A SUCCESSFUL composer call's result: the picture subject, the short caption
 /// for history-facing renders, plus the audit values persisted to
 /// `metadata.image` (spec 2026-08-02). Mirrors `VisionOutcome`.
-struct ComposeOutcome {
-    prompt: String,
+pub(crate) struct ComposeOutcome {
+    pub(crate) prompt: String,
     /// One short line describing what the picture shows, for the chat history
     /// and the judge transcript. `None` when the model gave none — including
     /// when the reply wasn't JSON at all (the migration fallback in
     /// `parse_compose_reply`, where the whole reply becomes `prompt` instead).
-    caption: Option<String>,
+    pub(crate) caption: Option<String>,
     /// Model that actually answered: `resp.model`, falling back to the
     /// attempted model id (same idiom as the vision audit).
-    model: String,
-    generation_id: Option<String>,
+    pub(crate) model: String,
+    pub(crate) generation_id: Option<String>,
     /// `ResolvedImagePromptCompose::variant_key`, carried so the call site
     /// doesn't need the resolved config in scope.
-    variant: Option<String>,
+    pub(crate) variant: Option<String>,
 }
 
 /// Generate the image prompt (and its caption) via the optional composer LLM.
@@ -2457,7 +2457,11 @@ struct ComposeOutcome {
 /// returns the parsed prompt/caption plus the audit trio on first success, or
 /// `None` (caller falls back to an empty subject — the portrait path). Never
 /// blocks or fails the image turn. Mirrors `run_input_filter`.
-async fn run_image_prompt_compose(
+///
+/// Shared with `routes/persona.rs`: the standalone compose endpoint's
+/// non-stream mode maps a `None` here to a 502 instead of the chat path's
+/// fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
+pub(crate) async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     persona: &eros_engine_core::persona::CompanionPersona,

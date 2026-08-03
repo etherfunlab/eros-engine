@@ -3,7 +3,8 @@
 //!
 //! The HTTP surface is split into two independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
-//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`  — Supabase JWT (see auth::middleware)
+//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*`
+//!                    — Supabase JWT (see auth::middleware)
 //!
 //! The auth layer is applied to the `/comp` + `/bff` merge, NOT the
 //! top-level merge, so the public `/healthz` route stays unauthenticated
@@ -21,6 +22,7 @@ pub mod companion_stream;
 pub mod debug;
 pub mod dto;
 pub mod health;
+pub mod persona;
 pub mod voice;
 pub mod world_town;
 
@@ -39,6 +41,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(debug::router(state.config.expose_affinity_debug))
         .merge(bff::router())
         .merge(world_town::router())
+        .merge(persona::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
@@ -57,4 +60,5 @@ pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState
         .merge(debug::router(expose_affinity_debug))
         .merge(bff::router())
         .merge(world_town::router())
+        .merge(persona::router())
 }
