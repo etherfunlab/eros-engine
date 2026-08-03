@@ -3092,10 +3092,15 @@ pub fn run_stream(
         };
         let product_qa_recent: Option<String> =
             product_qa_available.then(|| render_product_qa_pairs(&product_qa_pairs));
-        // Shared history transcript: built once, reused by the judge here AND the
-        // input filter below (which previously fetched its own). `resolved_pde` is
-        // already None on tip turns, so this only fires for a real judge turn.
-        let pde_transcript: JudgeTranscript = if resolved_pde.is_some() {
+        // Shared history transcript: built once, reused by the judge here, the
+        // input filter below (which previously fetched its own), AND the image
+        // composer's `[最近场景]`. Fetched whenever any of them can need it this
+        // turn: a judge turn (`resolved_pde` — already None on tips), or a
+        // forced image turn. The composer generates from the recent scene now
+        // that no seed exists, so a forced image with the judge disabled must
+        // not lose that context; rule-based `pde::decide` never picks image
+        // actions, so `force_image` is the only judge-less image path.
+        let pde_transcript: JudgeTranscript = if resolved_pde.is_some() || force_image {
             build_input_filter_transcript(&chat_repo, user_msg.session_id, user_msg.user_message_id).await
         } else {
             JudgeTranscript::default()
@@ -6345,6 +6350,123 @@ data: [DONE]\n\n";
 
         let reqs = mock.received_requests().await.expect("recorded requests");
         (reqs, frames)
+    }
+
+    /// Codex-review P1 regression (PR #216): a forced image turn with the PDE
+    /// judge DISABLED must still fetch the history transcript. The composer
+    /// generates from the recent scene now that no seed exists, so leaving the
+    /// transcript fetch keyed on `resolved_pde.is_some()` alone would hand the
+    /// composer `[最近场景]\n（无）` on every judge-less deployment — silently
+    /// stripping its main context. Rule-based `pde::decide` never picks image
+    /// actions, so `force_image` is the only judge-less image path and the one
+    /// this pins.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn forced_image_without_pde_still_feeds_the_scene(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // A prior exchange the composer's scene must carry.
+        for (role, content) in [
+            ("user", "我们明天去天台看日落吧"),
+            ("assistant", "好呀，我先去踩个点"),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Composer configured, judge NOT — `resolve_pde()` is None, so before
+        // the fix the transcript was never fetched on this path.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    mode: crate::routes::companion_stream::ImageMode::ImageOnly,
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("composer request body is json");
+        let payload = body["messages"][1]["content"]
+            .as_str()
+            .expect("composer user payload");
+        assert!(
+            payload.contains("天台看日落"),
+            "the composer's scene must carry the prior exchange: {payload}"
+        );
+        assert!(
+            !payload.contains("[最近场景]\n（无）"),
+            "the scene must not be empty when history exists: {payload}"
+        );
     }
 
     /// `image.prompt_variant = "b"` must send variant b's text as the
