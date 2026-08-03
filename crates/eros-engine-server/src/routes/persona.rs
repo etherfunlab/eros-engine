@@ -540,7 +540,9 @@ mod tests {
     }
 
     async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -890,7 +892,13 @@ mod tests {
         ));
         let jwt = mint_jwt(user_id);
         // `stream` omitted — pins the default-true decision (spec §1).
-        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边，黄昏"})).await;
+        let resp = post_compose(
+            &mut app,
+            instance_id,
+            &jwt,
+            json!({"content": "在海边，黄昏"}),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             resp.headers()
@@ -977,7 +985,10 @@ mod tests {
         let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let frames = sse_frames(resp).await;
-        let done = frames.iter().find(|f| f["type"] == "done").expect("done frame");
+        let done = frames
+            .iter()
+            .find(|f| f["type"] == "done")
+            .expect("done frame");
         assert_eq!(done["subject"], "PLAIN STREAM PROMPT");
         assert_eq!(done["caption"], serde_json::Value::Null);
         let deltas: String = frames

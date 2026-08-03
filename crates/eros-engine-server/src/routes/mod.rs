@@ -3,8 +3,7 @@
 //!
 //! The HTTP surface is split into two independently-authed sub-trees:
 //!   * Public:        `/healthz` — no auth
-//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*`
-//!                    — Supabase JWT (see auth::middleware)
+//!   * Bearer JWT:    `/comp/*`, `/bff/v1/*`, `/world/*`, `/persona/*` — Supabase JWT (see auth::middleware)
 //!
 //! The auth layer is applied to the `/comp` + `/bff` merge, NOT the
 //! top-level merge, so the public `/healthz` route stays unauthenticated
