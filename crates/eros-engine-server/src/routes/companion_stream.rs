@@ -298,6 +298,29 @@ fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+/// `image.force` demands the composer (spec 2026-08-03 §2.3): with no
+/// `[tasks.chat_image_prompt_compose]` nothing can write the prompt, so the
+/// request is refused pre-stream instead of degrading to a generic portrait.
+/// Separate from `validate_payload`, which stays pure/config-free.
+fn validate_image_capability(
+    req: &StreamSendRequest,
+    model_config: &eros_engine_llm::model_config::ModelConfig,
+) -> Result<(), AppError> {
+    if req.image.as_ref().is_some_and(|i| i.force)
+        && !model_config.has_task("chat_image_prompt_compose")
+    {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            message: "image.force requires [tasks.chat_image_prompt_compose] to be configured"
+                .into(),
+            user_message: "该服务未启用图片回复".into(),
+            original_user_message_id: None,
+        }));
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/comp/chat/{session_id}/message/stream",
@@ -331,6 +354,7 @@ pub async fn send_message_stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
     validate_payload(&req)?;
+    validate_image_capability(&req, &state.model_config)?;
     let prompt_traits = validate_prompt_traits(req.prompt_traits.as_deref().unwrap_or(&[]))
         .map_err(|e| {
             AppError::StreamPre(StreamPreError {
@@ -737,6 +761,63 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], "unprocessable");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_422_when_forced_image_without_composer(pool: PgPool) {
+        // spec 2026-08-03 §2.3: image.force with no [tasks.chat_image_prompt_compose]
+        // is refused pre-stream — no user row may be persisted.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Default test_state carries no chat_image_prompt_compose task.
+        let state = crate::routes::companion::test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "draw me",
+            "client_msg_id": "01J5555555555555555555555A",
+            "image": {"force": true}
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "unprocessable");
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "pre-stream rejection must not persist a user row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1171,6 +1252,39 @@ mod validate_payload_tests {
             ..Default::default()
         });
         assert!(validate_payload(&req).is_err());
+    }
+
+    #[test]
+    fn image_capability_rejects_force_without_composer() {
+        let mut req = minimal_req();
+        req.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
+        let cfg = eros_engine_llm::model_config::ModelConfig::default();
+        assert!(validate_image_capability(&req, &cfg).is_err());
+    }
+
+    #[test]
+    fn image_capability_allows_force_with_composer() {
+        let mut req = minimal_req();
+        req.image = Some(ImageReplyParams {
+            force: true,
+            ..Default::default()
+        });
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+        )
+        .unwrap();
+        assert!(validate_image_capability(&req, &cfg).is_ok());
+    }
+
+    #[test]
+    fn image_capability_ignores_unforced_image_block() {
+        let mut req = minimal_req();
+        req.image = Some(ImageReplyParams::default());
+        let cfg = eros_engine_llm::model_config::ModelConfig::default();
+        assert!(validate_image_capability(&req, &cfg).is_ok());
     }
 
     #[test]
