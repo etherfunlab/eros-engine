@@ -409,21 +409,22 @@ All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_
 
 ### `GET /comp/user/{user_id}/profile`
 
-Current `companion_insights` JSONB plus a weighted `training_level`. Same `user_id` equality check as above.
+Current `companion_insights` JSONB plus a weighted `agent_training_level`. Same `user_id` equality check as above.
 
 ```json
 {
-  "insights": {
+  "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "companion_insights": {
     "city": "Hong Kong",
     "occupation": "graphic designer",
     "interests": ["jazz", "long walks"],
     "mbti_guess": "INFP"
   },
-  "training_level": 0.42
+  "agent_training_level": 0.42
 }
 ```
 
-`training_level` is a weighted score across 15 fields summing to 1.0 (city 0.04, occupation 0.04, interests 0.08, mbti_guess 0.10, love_values 0.12, emotional_needs 0.12, life_rhythm 0.06, personality_traits 0.12, matching_preferences 0.08, education 0.04, family 0.04, relationship_history 0.06, social_pattern 0.04, future_plans 0.04, finance_status 0.02). Source of truth: `WEIGHTS` in `crates/eros-engine-store/src/insight.rs`.
+`agent_training_level` is a weighted score across 15 fields summing to 1.0 (city 0.04, occupation 0.04, interests 0.08, mbti_guess 0.10, love_values 0.12, emotional_needs 0.12, life_rhythm 0.06, personality_traits 0.12, matching_preferences 0.08, education 0.04, family 0.04, relationship_history 0.06, social_pattern 0.04, future_plans 0.04, finance_status 0.02). Source of truth: `WEIGHTS` in `crates/eros-engine-store/src/insight.rs`.
 
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)

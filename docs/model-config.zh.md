@@ -401,9 +401,15 @@ Regex 过滤在所有其他处理之前运行：
 
 仅当至少一条规则实际改变了回复时才会设置这些列（与 LLM filter 行为一致——无变更的过滤不会设置这些列）。
 
-#### 空结果 fail-safe
+#### 只剩 artifact 的回复 ⇒ 空气泡
 
-若某次过滤会将非空回复变为空字符串，则该次过滤为**空操作**——原始回复原样交付，审计列不被设置。此机制防止过于宽泛的 pattern 让伴侣陷入沉默。
+当回复**整体**就是一个 artifact 时（例如一个裸的
+`[你给对方发送了一张照片：…]`，别无其它内容），strip 会把它清空。**没有
+fail-safe**：客户端**收不到任何内容气泡**（不发 delta），该行落库时 `content`
+为空字符串（`""`），审计列照样会被设置（`pre_filter_content` = 过滤前的原始
+回复，`filter_model` = `"<regex>"`）。空/NULL 回复怎么渲染由下游客户端自己
+决定——参考 web 客户端直接不显示，效果类似已读不回，反而更容易让用户追问
+（更像跟真人聊天）。
 
 #### `filtered` 标志
 
@@ -428,14 +434,14 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 | 名称 | 使用方 | 状态 |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers::ReplyHandler`（chat completion；tip 轮次使用相同的 reply 路径） | live |
+| `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion；tip 轮次使用相同的 reply 路径） | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights`（事实挖掘 + JSONB 合并） | live |
-| `chat_output_filter` | `pipeline::handlers::ReplyHandler`（交付前对 chat 回复进行可选的二次改写） | live |
+| `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
-| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动，见 issue #210） | live |
+| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动，**任何形态都算设置，显式留空也算**；与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -469,6 +475,20 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
+
+**近期图片上下文行。** 判断器上下文里同样恒定带一行
+`[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`。
+这个数是引擎从落库的行里数出来的，判断器不必自己去对话记录里点图片标记——括号
+里那句就是叫模型信这一行、别信自己数的。窗口是最近 **8 行**，不是 8 轮。写自定义
+`filter_prompt` 的人无论引不引用都会收到这一行；下游若有覆盖层要解析它，请原样
+保留这个 token 串。
+
+**`structured_output` 字段**（bool，默认 `true`）：判断器调用会带
+`response_format` JSON-schema 约束。如果你的供应商或模型不接受这个参数（有些会
+直接返 HTTP 400），把 `structured_output = false` 关掉——引擎会退回到只在 prompt
+里要求 JSON，解析方式不变。`[tasks.world_director]`、
+`[tasks.world_stories_director]`、`[tasks.world_comment]` 也有这个字段，默认值
+相同。
 
 **`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。
 
@@ -762,9 +782,9 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 
 选择 primary 后，解析出的 `fallback` 链中与其 id 完全相同的条目会被删除——重试刚刚失败的模型毫无意义。对于 round-robin/weighted primary，这是动态行为：只删除当前调用所选的 id。
 
-## 稳定性承诺（OSS 0.x）
+## 稳定性承诺
 
-在 `0.x` 期间，OSS 引擎承诺：
+以下承诺立于 `0.x` 期间，并**原样延续到 `1.x`**。在 `1.x` 期间，OSS 引擎承诺：
 
 1. **不删除字段。** `[defaults]` 和 `[tasks.<name>]` 中现有的字段名不会消失。
    （目前的例外，均已在上文记录：`[tasks.embedding].dimensions`——已移除，

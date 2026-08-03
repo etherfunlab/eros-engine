@@ -25,6 +25,8 @@ CREATE TABLE engine.companion_memories (
     instance_id  UUID,                         -- NULL = profile layer
     content      TEXT NOT NULL,
     embedding    VECTOR(512) NOT NULL,
+    category     TEXT,                         -- fact|preference|event|emotion|relation; NULL on raw-turn rows
+    metadata     JSONB,                        -- opaque per-memory extraction payload; NULL on raw-turn rows
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -82,12 +84,14 @@ Relationship-layer search adds `instance_id = $4`. The `1 - distance` lets you s
 
 ## What gets embedded
 
-Post-process inserts memories during the background phase of every turn. Two paths:
+Two independent writers, on different schedules:
 
-1. **Insight extraction** — the LLM identifies factual nuggets ("user mentioned they're a librarian"). These go into the profile layer (`instance_id = NULL`).
-2. **Relationship moments** — anything specific to this session (a callback the persona made, a small confession). Goes into the relationship layer.
+1. **Raw-turn writer** (`write_turn`, post-process) — runs on **every** substantive turn (non-empty user utterance and at least one non-empty assistant message). It embeds **the user's utterance only** into *both* layers — never the assistant's prose, which fed back into the model's own prompt via recall and collapsed replies to a repeated line (issue #113). The relationship-layer copy is prefixed `用户：` so a recalled line stays readable as "what the user said." These rows carry `category = NULL` and `metadata = NULL`.
+2. **Dreaming-lite sweeper** (`[tasks.memory_extraction]`, `pipeline::dreaming`) — a background, idle-session-triggered pass that asks an LLM for durable memory candidates. It writes **profile-layer rows only**, tagged `category ∈ {fact, preference, event, emotion, relation}` (anything else the model invents collapses to `fact`) plus an opaque `metadata` payload.
 
-Embeddings are NOT generated for every message — only the ones the insight extractor surfaces as worth remembering. Volume stays modest.
+`insight_extraction` is a **separate** pipeline and writes nothing to this table — its structured output is merged into `companion_insights` (and mirrored to the flat `human_insights` table), not embedded here.
+
+So embeddings *are* generated once per substantive turn, not only for LLM-surfaced highlights.
 
 ## What doesn't get stored
 
@@ -100,17 +104,26 @@ Memory is read back into the prompt on each chat turn, gated by the per-request
 default `neutral_and_relationship`). The reply handler (`pipeline::handlers`)
 builds a profile/relationship context block from two sources:
 
-- **Profile layer** — the structured `companion_insights` JSONB, rendered as
-  profile bullets. `memory_scope` decides whether intimate fields are included
-  (`full` / `insights_only`) or only the neutral subset (`neutral_*`).
+- **Profile layer** — two merged sources. The 基础画像 bullets come from the
+  flat **`human_insights`** mirror table (kept in sync from `companion_insights`),
+  *not* from the `companion_insights` JSONB directly; `memory_scope` decides
+  whether intimate fields are included (`full` / `insights_only`) or only the
+  neutral subset (`neutral_*`). Alongside them, profile-layer
+  `companion_memories` rows are pulled by similarity search and grouped by
+  `category`. Note the intimate/neutral distinction applies to the
+  `human_insights` bullets only — it does **not** filter which memory
+  categories are injected.
 - **Relationship layer** — `companion_memories` rows pulled by semantic
   (embedding) similarity search against the current turn, included when the
   scope keeps relationship memory (`full` / `neutral_and_relationship` /
   `relationship_only`).
 
-`memory_scope = none` skips memory injection entirely. The frontend's
-`/comp/user/{user_id}/profile` endpoint returns the same `companion_insights`
-JSONB as a human-readable view of what's been collected.
+`memory_scope = none` skips memory injection entirely. **`memory_scope` gates
+prompt injection only — never writes.** Even under `none`, the raw-turn writer
+still embeds and stores this turn, and insight extraction and the affinity
+evaluation still run; there is currently no scope value that suppresses
+writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
+`companion_insights` JSONB as a human-readable view of what's been collected.
 
 ## Source
 

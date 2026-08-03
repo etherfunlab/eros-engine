@@ -80,14 +80,19 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
   对象删掉，而不是只删它内部的字段）。
 - 未设或空 → 维持现状（完整透传）。
 
-后台路径（`pipeline::dreaming`、`pipeline::post_process`）的 usage
-只通过 `tracing::info!` 字段输出：
+后台路径（`pipeline::dreaming`、`pipeline::post_process`、
+`pipeline::world_director`）的 usage 只通过 `tracing::info!` 字段输出：
 
 ```
 openrouter: call completed session=… generation_id=… model=…
 prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 ```
 
+- `world_director` —— World Memories 导演清扫（后台）。每个已加入的 owner 每
+  `interval_hours` 调一次。`user` = `11111111-1111-1111-1111-111111111112`
+  （world 子系统哨兵，与 dreaming 的 `11111111-1111-1111-1111-111111111111`
+  不同）。Usage/cost 通过 tracing 字段输出，走
+  `log_openrouter_usage("world_director", None, …)`；不出现在任何 client 帧上。
 - `world_comment` —— World Town 每小时评论轮（后台）。每个有新动态的 owner
   批量调一次。`user` = `11111111-1111-1111-1111-111111111112`（world 子系统
   共享哨兵）。Usage/cost 通过 tracing 字段输出，走
@@ -137,18 +142,22 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 
 ## 引擎不做的事
 
-- **不持久化。**没有任何 DB 列保存 `audit` / `usage` / attribution。
-  只有 surface 字段。
+- **不持久化 `audit` 对象。**没有任何 DB 列保存 caller 传来的 `audit`
+  （`user` / `session_id` / `metadata`）或 attribution 头——它们只是 surface
+  字段，转发上游之后就丢弃。但 OpenRouter 的 `model` / `usage` /
+  `generation_id` 三元组**是**会落库的：聊天补全落在
+  `chat_messages.model` / `.usage` / `.generation_id`（好感度评估镜像在
+  `companion_affinity_events`，合成器和 vision 调用落在
+  `chat_messages.metadata.image` / `.vision*`）——参见上面 `usage` 过滤那节。
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
 - **不解读。**引擎不会按 audit 字段分组、聚合、报警。Caller 自己接。
 
 ## 可观测性
 
-收到 `audit` 时，引擎会打 info 级别日志，带
-`audit_user_present` / `audit_session_present` / `audit_metadata_keys`
-（只有 key，永远不带 value）。每次成功的 OpenRouter 调用也会日志
+每次成功的 OpenRouter 调用，引擎会打一条 info 级别日志，带
 `generation_id` / `model` 以及 best-effort 解析出来的 token / cost。
+`audit` 对象本身不会被日志——它只转发给上游，从不回写进引擎日志。
 
 ## 为什么不持久化？
 

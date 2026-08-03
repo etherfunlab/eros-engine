@@ -490,14 +490,14 @@ input filter has no triggers, timing, or tiers).
 
 | Name | Consumed by | Status |
 |---|---|---|
-| `chat_companion` | `pipeline::handlers::ReplyHandler` (chat completions; tip turns ride the same reply path) | live |
+| `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions; tip turns ride the same reply path) | live |
 | `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
-| `chat_output_filter` | `pipeline::handlers::ReplyHandler` (optional second-pass rewrite of the chat reply before delivery) | live |
+| `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
-| `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot, see issue #210) | live |
+| `affinity_evaluation` | `pipeline::post_process` (per-turn 6-axis affinity delta; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot **in every shape, an explicit blank included**; unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
@@ -532,6 +532,22 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 - Every judge call is audited to `companion_decision_events`.
 
 **Image-availability context line.** The judge context always carries exactly one line — `[图片能力] 本轮可发图=是` when an image action is available this turn (the request carries an `image` block AND `[tasks.chat_image_prompt_compose]` is configured — both must hold), or `[图片能力] 本轮可发图=否` otherwise. Prompt authors should treat `本轮可发图=否` as a hard constraint (never choose `reply_image` / `reply_text_image` — they would be degraded by `guard_action` anyway, wasting tokens and skewing audits), and `本轮可发图=是` as the gate that *permits* image actions, then decide by persona/context (the engine does not force an image just because one is possible). Keep the token string `[图片能力] 本轮可发图=是/否` verbatim if a downstream overlay references it.
+
+**Recent-image context line.** The judge context also always carries exactly one
+`[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`
+line. The engine counts these from the stored rows so the judge never has to
+tally image markers in the transcript itself — the parenthetical tells the model
+to trust this line over its own counting. The window is the last **8 rows**, not
+8 turns. Prompt authors writing a custom `filter_prompt` receive this line
+whether or not they reference it; keep the token string verbatim if a downstream
+overlay parses it.
+
+**`structured_output` field** (bool, default `true`): sends the judge call with a
+`response_format` JSON-schema constraint. Set `structured_output = false` if your
+provider or model rejects that parameter (some return HTTP 400) — the engine then
+asks for JSON in the prompt alone and parses the reply the same way. Also
+available on `[tasks.world_director]`, `[tasks.world_stories_director]`, and
+`[tasks.world_comment]`, with the same default.
 
 **`ghosting` field** (bool, default `true`): a safety switch for downstream products. Set `ghosting = false` to disable ghosting across the _entire_ PDE path — LLM verdict, rule fallback, and the pure rule engine — so the companion never goes silent. Useful for products where silent turns are undesirable.
 
@@ -938,9 +954,10 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 
 After the primary is selected, any occurrence of that exact id is removed from the resolved `fallback` chain — retrying a model that just failed is wasted. With round-robin/weighted primaries this is dynamic: only the id chosen for that call is dropped.
 
-## Stability commitments (OSS 0.x)
+## Stability commitments
 
-For the duration of `0.x`, the OSS engine commits to:
+These commitments were made during `0.x` and **carry forward unchanged into
+`1.x`**. For the duration of `1.x`, the OSS engine commits to:
 
 1. **No removed fields.** Existing field names in `[defaults]` and `[tasks.<name>]` will not disappear.
    (Exceptions to date, both documented above: `[tasks.embedding].dimensions`

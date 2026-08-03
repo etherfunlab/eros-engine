@@ -67,8 +67,14 @@ system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
 
 ## 可观测性
 
-只要有至少一条 trait 被提交，引擎会输出 `info` 级日志，字段包含
-`traits_count` 和 `trait_tags`。`text` 内容**不**进日志。
+只有当 tier 的 `allow_traits` **确实丢掉了东西**时，引擎才会输出 `info` 级日志
+——消息为 `prompt_traits: dropped tags not allowed for tier`，字段是 `tier`、
+`kept`（留下几条）和 `dropped_tags`（被丢掉的标签）。提交的 trait 全部保留的
+轮次不会有任何日志。`text` 内容**不**进日志。
+
+拿不到服务端日志的 API 调用方可以看 SSE `final` 帧的 `prompt_injected` 字段
+——那是经过 tier 过滤后本轮实际注入的标签。见
+[api-reference.zh.md](api-reference.zh.md)。
 
 ## 威胁模型
 

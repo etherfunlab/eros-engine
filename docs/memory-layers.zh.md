@@ -25,6 +25,8 @@ CREATE TABLE engine.companion_memories (
     instance_id  UUID,                         -- NULL = profile 層
     content      TEXT NOT NULL,
     embedding    VECTOR(512) NOT NULL,
+    category     TEXT,                         -- fact|preference|event|emotion|relation；逐轮写入的行为 NULL
+    metadata     JSONB,                        -- 每条记忆的不透明抽取载荷；逐轮写入的行为 NULL
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -82,12 +84,14 @@ Relationship 層查詢加 `instance_id = $4`。`1 - distance` 讓你直接按相
 
 ## 甚麼會被 embed
 
-post-process 在每輪的後台階段插入記憶。兩條路徑：
+两个互相独立的写入方，跑在不同的节奏上：
 
-1. **Insight 抽取**——LLM 識別出值得記住的事實小塊（「用戶提到自己是圖書管理員」）。這些進 profile 層（`instance_id = NULL`）。
-2. **Relationship 時刻**——任何 session 特有的東西（人格剛說過的回呼、用戶吐露的小心事）。進 relationship 層。
+1. **逐轮写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑（用户话非空，且至少有一条非空的助手消息）。它只把**用户的那句话**embed 进*两个*层——绝不存助手的散文，因为那会通过召回反馈进模型自己的 prompt，把回复塌缩成一句反复出现的话（issue #113）。关系层那份前面加 `用户：`，让召回出来的行仍读得出「这是用户说的」。这些行的 `category` 和 `metadata` 都是 NULL。
+2. **Dreaming-lite 清扫**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
 
-不是每條消息都會被 embed——只有 insight 抽取器標出來值得記住的才會。容量保持節制。
+`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出合并进 `companion_insights`（并镜像到扁平的 `human_insights` 表），不在这里 embed。
+
+所以 embedding 是每个实质轮次生成一次，不是「只有 LLM 挑出来的高光才生成」。
 
 ## 甚麼不被存
 
@@ -99,15 +103,21 @@ post-process 在每輪的後台階段插入記憶。兩條路徑：
 见 [api-reference.md](api-reference.md)；默认 `neutral_and_relationship`）。回复
 handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文块：
 
-- **画像层** —— 结构化的 `companion_insights` JSONB，渲染成画像 bullet。
-  `memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带中性
-  子集（`neutral_*`）。
+- **画像层** —— 由两个来源合并。基础画像 bullet 来自扁平的 **`human_insights`**
+  镜像表（从 `companion_insights` 同步过来），**不是**直接读 `companion_insights`
+  JSONB；`memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带
+  中性子集（`neutral_*`）。与之并列，画像层的 `companion_memories` 行也会按相似度
+  检索出来并按 `category` 分组注入。注意私密/中性这个区分只作用于 `human_insights`
+  bullet——它**不**过滤哪些记忆类别会被注入。
 - **关系层** —— `companion_memories` 行，按对当前轮的语义（embedding）相似度
   检索拉取，在 scope 保留关系记忆时纳入（`full` / `neutral_and_relationship` /
   `relationship_only`）。
 
-`memory_scope = none` 完全跳过记忆注入。前端的 `/comp/user/{user_id}/profile`
-端点返回同一份 `companion_insights` JSONB，作为已收集内容的人类可读视图。
+`memory_scope = none` 完全跳过记忆注入。**`memory_scope` 只管 prompt 注入，
+不管写入。** 即使是 `none`，逐轮写入照样把这一轮 embed 并存下来，insight 抽取和
+好感度评估也照常跑；目前没有任何 scope 取值能抑制写入。前端的
+`/comp/user/{user_id}/profile` 端点返回 `companion_insights` JSONB，作为已收集
+内容的人类可读视图。
 
 ## 源碼
 

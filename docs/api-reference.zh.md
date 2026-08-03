@@ -53,6 +53,10 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 `is_new=false` 表示同一用戶用同一個 `genome_id` 再調 `/start`——引擎恢復已有 session 而不是建重複的。
 
+可选的 `channel` 字段：`"text"`（默认）或 `"voice"`。开新/恢复是按频道隔离的
+——语音频道的 start 永远不会恢复一个文本 session，反之亦然。语音客户端必须先
+在这里用 `"channel": "voice"` 拿到 session，才能去调语音轮次端点。
+
 ### `POST /comp/chat/{session_id}/message/stream`
 
 流式聊天，返回 `text/event-stream`，使用 `meta → delta* → done → final`
@@ -313,6 +317,42 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
 外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。
 
+## 语音
+
+### `POST /comp/voice/{session_id}/turn/stream`
+
+精简的语音频道轮次：进来一条转写好的用户话，出去一条流式文本回复。STT 和 TTS
+完全是调用方的事，引擎从不碰音频（见
+[voice-call parts 设计文档](superpowers/specs/2026-07-07-voice-call-parts-design.md)）。
+
+返回 `text/event-stream`，帧集合更小：`delta`* 之后接一个终结的 `done`，或者
+单独一个 `error`——帧的形状与上面的聊天消息流一致，但**没有** `meta` 帧，也没有
+`action_type`。
+
+session 必须是**语音频道** session（否则 `409 wrong_channel`）——通过
+`POST /comp/chat/start` 带 `"channel": "voice"` 拿到。语音是每个部署自行选择
+开启的：model config 里没有 `[tasks.chat_voice]` 块时，该端点返回
+`501 voice_disabled`。
+
+prompt 刻意做得很薄：人格 + 语音指令 + 一行由该 session 好感度推导出的关系描述
+（bond/chemistry 档位）。不做向量召回，不带记忆，不带 traits/scopes 等重型块。
+
+Body 字段：
+
+- `content` —— 用户说的那句话。最长 4096 字符。
+- `client_msg_id` —— 26..36 个 ASCII 可打印字符（任意 UUID 或 ULID）。同一组
+  `(session_id, client_msg_id)` 重放会返回 `409 duplicate`，而不是再生成一条
+  回复。
+- `relationship_scope`（可选）—— 本轮注入关系描述的哪几半：`"none"`、`"bond"`、
+  `"chemistry"`、`"both"`（默认 `"both"`）。解析后的取值记录在 assistant 行的
+  `metadata.relationship_scope` 上。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
 ## 用戶畫像
 
 ### `GET /comp/chat/{user_id}/sessions`
@@ -321,21 +361,22 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 ### `GET /comp/user/{user_id}/profile`
 
-當前的 `companion_insights` JSONB 加上加權的 `training_level`。同樣的 `user_id` 等值檢查。
+當前的 `companion_insights` JSONB 加上加權的 `agent_training_level`。同樣的 `user_id` 等值檢查。
 
 ```json
 {
-  "insights": {
+  "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "companion_insights": {
     "city": "Hong Kong",
     "occupation": "graphic designer",
     "interests": ["jazz", "long walks"],
     "mbti_guess": "INFP"
   },
-  "training_level": 0.42
+  "agent_training_level": 0.42
 }
 ```
 
-`training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
+`agent_training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
 
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）

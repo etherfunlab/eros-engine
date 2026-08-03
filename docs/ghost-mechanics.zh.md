@@ -2,7 +2,7 @@
 
 [English](ghost-mechanics.md) · [中文](ghost-mechanics.zh.md)
 
-人格決定 **不** 在這一輪回覆。確定性——不調 LLM。讓對話感覺像在跟一個有自己狀態的人說話，這個機制單獨做的工作最多。
+人格決定 **不** 在這一輪回覆。**默认**是确定性的——不调 LLM——除非配置了可选的 LLM PDE 判断器（`[tasks.pde_decision].filter_prompt`），那种情况下由判断器提出本轮动作，下面这套打分退为 fallback，外加一道判断器永远无法推翻的硬安全否决。讓對話感覺像在跟一個有自己狀態的人說話，這個機制單獨做的工作最多。
 
 ## 為甚麼 ghost 重要
 
@@ -114,11 +114,11 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 ## Ghost 不是甚麼
 
 - **不是** 错误响应。HTTP 路由仍返 200。由于引擎采用 SSE 流式传输，ghost 轮会发出三帧后关闭流：`meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`。不会发出 `delta` 帧，也不会调用任何 LLM。
-- **不是** LLM 調用失敗。決策純 Rust，從不問 LLM。
+- **不是** LLM 調用失敗。走默认规则引擎时决策纯 Rust，从不问 LLM。配置了可选的 LLM PDE 判断器之后，由判断器提出动作，但 `ghost_permitted` 仍会否决硬安全规则不允许的 ghost，而 `ghosting` 开关可以把每一个 ghost 判定强行拉回 `reply_text`——见 [model-config.zh.md](model-config.zh.md)。
 - **不是** 永遠沉默。時間衰退會恢復 `patience`、軟化 `tension`；最終人格會回應下一條消息。
 
 ## 源碼
 
-- `crates/eros-engine-core/src/ghost.rs`——score + decide（7 個單元測試）
-- `crates/eros-engine-server/src/pipeline/handlers.rs::GhostHandler`——返回無 chat 請求的 handler
+- `crates/eros-engine-core/src/ghost.rs`——score + ghost_permitted + decide（11 個單元測試）
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`——其中的 `ActionType::Ghost` 分支：标记该行并记录 ghost，不构建 chat 请求
 - `crates/eros-engine-store/src/affinity.rs::record_ghost`——持久化（增加 streak、total_ghosts、last_ghost_at）

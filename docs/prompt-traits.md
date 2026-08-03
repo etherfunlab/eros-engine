@@ -72,9 +72,15 @@ Violations return `400 BadRequest` and **no user message row is persisted**.
 
 ## Observability
 
-When at least one trait is supplied, the engine logs an `info`-level
-event with `traits_count` and `trait_tags`. The `text` body is never
-logged.
+The engine logs an `info`-level event **only when the tier's `allow_traits`
+actually drops something** — message `prompt_traits: dropped tags not allowed
+for tier`, fields `tier`, `kept` (how many survived), and `dropped_tags` (the
+tags that were removed). A turn where every supplied trait is kept logs
+nothing. The `text` body is never logged.
+
+API callers without server-log access can see the result on the SSE `final`
+frame's `prompt_injected` field — the tags actually injected this turn, after
+tier gating. See [api-reference.md](api-reference.md).
 
 ## Threat model
 

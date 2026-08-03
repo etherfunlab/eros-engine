@@ -2,7 +2,7 @@
 
 [English](ghost-mechanics.md) · [中文](ghost-mechanics.zh.md)
 
-The persona deciding **not** to reply this turn. Deterministic — no LLM call. The single mechanic that does the most work to make the chat feel like talking to a person who has their own state.
+The persona deciding **not** to reply this turn. Deterministic **by default** — no LLM call — unless the opt-in LLM PDE judge (`[tasks.pde_decision].filter_prompt`) is configured, in which case the judge proposes the turn's action and the scoring below becomes the fallback plus a hard-safety veto the judge can never override. The single mechanic that does the most work to make the chat feel like talking to a person who has their own state.
 
 ## Why ghosting matters
 
@@ -114,11 +114,11 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 ## What ghosting is not
 
 - It's **not** an error response. The HTTP route still returns 200. Because the engine is SSE-streaming, a ghost turn emits three frames and then closes the stream: `meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`. No `delta` frame is emitted and no LLM is called.
-- It's **not** an LLM call gone wrong. The decision is pure Rust; the LLM never gets asked.
+- It's **not** an LLM call gone wrong. With the default rule engine the decision is pure Rust and the LLM never gets asked. With the opt-in LLM PDE judge configured the judge proposes the action, but `ghost_permitted` still vetoes any ghost the hard-safety rules forbid, and the `ghosting` switch can force every ghost verdict back to `reply_text` — see [model-config.md](model-config.md).
 - It's **not** silent forever. Time-decay restores `patience` and softens `tension`; eventually the persona will reply again to the next message.
 
 ## Source
 
-- `crates/eros-engine-core/src/ghost.rs` — score + decide (7 unit tests)
-- `crates/eros-engine-server/src/pipeline/handlers.rs::GhostHandler` — handler that returns no chat request
+- `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (11 unit tests)
+- `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the `ActionType::Ghost` arm: stamps the row and records the ghost, building no chat request
 - `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at)

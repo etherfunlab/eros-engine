@@ -40,9 +40,10 @@ PDE 決策                eros_engine_core::pde::decide(&input) → ActionPlan
                          companion_decision_events）
        │
        ▼
-handler 分派            Reply  → ReplyHandler  構建 ChatRequest
-                        Ghost  → GhostHandler  返回 None（不調 LLM）
-                        Proact → ProactiveHandler
+action 分派             run_stream 里的 inline `match plan.action_type`：
+                        Ghost     → 标记该行 ghosted + record_ghost（不调 LLM）
+                        ProductQa → 独立的产品问答执行器
+                        其余      → 回复路径构建 ChatRequest
        │
        ▼
 chat 執行               若有 ChatRequest：state.openrouter.execute(req).await?
@@ -59,12 +60,14 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
-其中三个是有条件可用的：`reply_image` 和 `reply_text_image` 都要求请求带
-`image` 块；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM PDE
-已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
+其中三个是有条件可用的：`reply_image` 和 `reply_text_image` **同时**要求请求带
+`image` 块**且** `[tasks.chat_image_prompt_compose]` 已配置——判断器不再写
+image-prompt 种子之后，合成器是唯一能产出图片 prompt 的东西，缺了这个任务
+图片轮次就不可用；`product_qa` 要求 `[tasks.chat_product_qa]` 已配置（且 LLM
+PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、绝不升级。
 `product_qa` 会短路整条伴侣链路（不注入人格 prompt、不跑 post-process）：
-它路由到一个独立的产品问答执行器，而不是 `ReplyHandler`。各动作的启用
-门槛见 [model-config.zh.md](model-config.zh.md)。
+它路由到一个独立的产品问答执行器，而不是回复路径。各动作的启用门槛见
+[model-config.zh.md](model-config.zh.md)。
 
 ## Auth
 

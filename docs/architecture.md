@@ -40,9 +40,10 @@ PDE decide             eros_engine_core::pde::decide(&input) → ActionPlan
                         companion_decision_events)
        │
        ▼
-handler dispatch       Reply  → ReplyHandler  builds ChatRequest
-                       Ghost  → GhostHandler  returns None (no chat call)
-                       Proact → ProactiveHandler
+action dispatch        inline `match plan.action_type` in run_stream:
+                       Ghost     → mark row ghosted + record_ghost (no chat call)
+                       ProductQa → independent product-QA executor
+                       else      → reply path builds ChatRequest
        │
        ▼
 chat exec              if Some(req): state.openrouter.execute(req).await?
@@ -60,12 +61,15 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
 Three of these are conditionally available: `reply_image` and
-`reply_text_image` both require an `image` block on the request;
+`reply_text_image` require **both** an `image` block on the request **and**
+`[tasks.chat_image_prompt_compose]` configured — since the judge stopped
+writing image-prompt seeds the composer is the only thing that can produce an
+image prompt, so a missing composer task leaves image turns unavailable;
 `product_qa` requires `[tasks.chat_product_qa]` configured (with the LLM PDE
 enabled). Each degrades to `reply_text` when unavailable — never upgrades.
 `product_qa` short-circuits the whole companion chain (no persona prompt, no
-post-process): it routes to an independent product-QA executor instead of
-`ReplyHandler`. See [model-config.md](model-config.md) for the per-action
+post-process): it routes to an independent product-QA executor instead of the
+reply path. See [model-config.md](model-config.md) for the per-action
 gates.
 
 ## Auth

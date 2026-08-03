@@ -156,8 +156,14 @@ as shown above.
 
 ## What the engine does NOT do
 
-- **Persist.** No DB column stores `audit`, `usage`, or attribution.
-  Surface fields only.
+- **Persist the `audit` object.** No DB column stores the caller-supplied
+  `audit` (`user` / `session_id` / `metadata`) or the attribution headers —
+  those are surface fields only, forwarded upstream and then dropped. The
+  OpenRouter `model` / `usage` / `generation_id` triple **is** persisted, on
+  `chat_messages.model` / `.usage` / `.generation_id` for the chat completion
+  (mirrored on `companion_affinity_events` for the affinity eval, and under
+  `chat_messages.metadata.image` / `.vision*` for the composer and vision
+  calls) — see the `usage` filtering note above.
 - **Hash.** The engine does not transform `user` — callers are
   responsible for sending a hash.
 - **Sanitise.** `metadata` keys and values are size / shape-checked,
@@ -167,11 +173,10 @@ as shown above.
 
 ## Observability
 
-When `audit` is supplied, the engine logs an `info`-level event with
-`audit_user_present`, `audit_session_present`, and `audit_metadata_keys`
-(keys only — never values). On every successful OpenRouter call the
-engine also logs `generation_id`, `model`, and best-effort parsed
-token/cost fields from `usage`.
+On every successful OpenRouter call the engine logs an `info`-level event
+carrying `generation_id`, `model`, and best-effort parsed token/cost fields
+from `usage`. The `audit` object itself is not logged — it is forwarded
+upstream and never echoed into engine logs.
 
 ## Why not persist?
 
