@@ -441,7 +441,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
-| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动，**任何形态都算设置，显式留空也算**；与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
+| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -478,10 +478,10 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 **近期图片上下文行。** 判断器上下文里同样恒定带一行
 `[近期图片] 最近8条消息内已发图=<n> 张；上一条 AI 消息是图片=<是/否>（以本行计数为准，对话记录里的图片标记仅供参考）`。
-这个数是引擎从落库的行里数出来的，判断器不必自己去对话记录里点图片标记——括号
-里那句就是叫模型信这一行、别信自己数的。窗口是最近 **8 行**，不是 8 轮。写自定义
-`filter_prompt` 的人无论引不引用都会收到这一行；下游若有覆盖层要解析它，请原样
-保留这个 token 串。
+该数量由引擎按已落库的消息行统计，判断器无需自行去对话记录里清点图片标记；括号
+里那句要求模型以本行为准。统计窗口是最近 **8 行**，不是 8 轮。自定义
+`filter_prompt` 无论是否引用该信息都会收到这一行；下游若有覆盖层需要解析它，请
+原样保留这个 token 串。
 
 **`structured_output` 字段**（bool，默认 `true`）：判断器调用会带
 `response_format` JSON-schema 约束。如果你的供应商或模型不接受这个参数（有些会

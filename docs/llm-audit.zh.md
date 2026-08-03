@@ -157,7 +157,7 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 
 每次成功的 OpenRouter 调用，引擎会打一条 info 级别日志，带
 `generation_id` / `model` 以及 best-effort 解析出来的 token / cost。
-`audit` 对象本身不会被日志——它只转发给上游，从不回写进引擎日志。
+`audit` 对象本身不写入日志——它只转发给上游，从不回写进引擎日志。
 
 ## 为什么不持久化？
 

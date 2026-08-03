@@ -335,7 +335,7 @@ session 必须是**语音频道** session（否则 `409 wrong_channel`）——�
 `501 voice_disabled`。
 
 prompt 刻意做得很薄：人格 + 语音指令 + 一行由该 session 好感度推导出的关系描述
-（bond/chemistry 档位）。不做向量召回，不带记忆，不带 traits/scopes 等重型块。
+（bond/chemistry 档位）。不做向量召回，不带记忆，不带 traits/scopes 等较大的上下文块。
 
 Body 字段：
 

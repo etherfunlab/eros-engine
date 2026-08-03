@@ -2,7 +2,7 @@
 
 [English](ghost-mechanics.md) · [中文](ghost-mechanics.zh.md)
 
-The persona deciding **not** to reply this turn. Deterministic **by default** — no LLM call — unless the opt-in LLM PDE judge (`[tasks.pde_decision].filter_prompt`) is configured, in which case the judge proposes the turn's action and the scoring below becomes the fallback plus a hard-safety veto the judge can never override. The single mechanic that does the most work to make the chat feel like talking to a person who has their own state.
+The persona deciding **not** to reply this turn. By default the decision is deterministic and makes no LLM call. With the opt-in LLM PDE judge (`[tasks.pde_decision].filter_prompt`) configured, the judge proposes the turn's action instead; the scoring below stays on as the fallback, plus a hard-safety veto the judge can never override. The single mechanic that does the most work to make the chat feel like talking to a person who has their own state.
 
 ## Why ghosting matters
 
