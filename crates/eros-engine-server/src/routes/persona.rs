@@ -8,9 +8,11 @@
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
@@ -20,9 +22,12 @@ use eros_engine_store::persona::PersonaRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
-use crate::pipeline::stream::run_image_prompt_compose;
+use crate::pipeline::stream::{
+    compose_user_payload, parse_compose_reply, run_image_prompt_compose, StreamErrorCode,
+    FILTER_TIMEOUT,
+};
 use crate::routes::companion_stream::aspect_ratio_supported;
-use crate::state::AppState;
+use crate::state::{AppState, StreamSlotGuard};
 
 /// Same cap as the chat/voice `content`.
 const MAX_CONTENT_CHARS: usize = 4096;
@@ -30,9 +35,36 @@ const MAX_CONTENT_CHARS: usize = 4096;
 /// composer 8 rows) without becoming an unbounded prompt-injection surface.
 const MAX_SCENE_CHARS: usize = 8192;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
+const SSE_KEEPALIVE_SECS: u64 = 15;
 
 fn default_true() -> bool {
     true
+}
+
+/// Wire frames for the compose SSE mode. Names deliberately reuse the chat
+/// stream's `delta` / `done` / `error` vocabulary (spec 2026-08-03 §3.4);
+/// there is no `meta` frame — `model` rides the terminal frame. `Done` minus
+/// the `type` discriminator is byte-identical to the `stream: false` body.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ComposeFrame {
+    /// The composer's raw output as it arrives, verbatim and unparsed — this
+    /// is what makes the endpoint usable for diagnosing a `filter_prompt`
+    /// whose model emits malformed JSON.
+    Delta { content: String },
+    Done {
+        composed_prompt: String,
+        subject: String,
+        caption: Option<String>,
+        model: String,
+        generation_id: Option<String>,
+    },
+    Error {
+        code: StreamErrorCode,
+        retryable: bool,
+        message: String,
+        user_message: String,
+    },
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -221,9 +253,18 @@ pub async fn compose_image(
         .unwrap_or_else(|| "realistic".to_string());
 
     if req.stream {
-        return Err(AppError::BadRequest(
-            "stream mode lands in the next commit".into(),
-        ));
+        return compose_stream(
+            state,
+            persona,
+            resolved,
+            style_key,
+            &style_str,
+            &scene,
+            &content,
+            req.aspect_ratio.as_deref(),
+            _guard,
+        )
+        .await;
     }
 
     // Walks [model] + fallback; usage is logged inside (§3.7). `None` after
@@ -249,6 +290,169 @@ pub async fn compose_image(
         generation_id: outcome.generation_id,
     })
     .into_response())
+}
+
+/// Stream mode. The composer chain (`[model] + fallback`) is walked while
+/// OPENING the upstream stream, BEFORE the SSE response is constructed — so
+/// total failure is a real HTTP 502 and only a death after first byte becomes
+/// the in-band `error` frame (spec §3.6). Mirrors `run_image_prompt_compose`'s
+/// request shape so both modes hit the composer identically.
+#[allow(clippy::too_many_arguments)]
+async fn compose_stream(
+    state: AppState,
+    persona: eros_engine_core::persona::CompanionPersona,
+    resolved: eros_engine_llm::model_config::ResolvedImagePromptCompose,
+    style_key: StyleKey,
+    style_str: &str,
+    scene: &str,
+    content: &str,
+    aspect_ratio: Option<&str>,
+    guard: StreamSlotGuard,
+) -> Result<axum::response::Response, AppError> {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+    let appearance = crate::prompt::meta_str(&persona, "appearance")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（无）");
+    let scene_slot = if scene.is_empty() { "（无）" } else { scene };
+    let ar = aspect_ratio.unwrap_or("（未指定）");
+    let user_payload = compose_user_payload(appearance, scene_slot, content, style_str, ar);
+    // The model on the wire comes from the per-candidate `execute_stream_as`
+    // argument, not this field.
+    let req = ChatRequest {
+        model: resolved.model.clone(),
+        fallback_model: vec![],
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.compose_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: user_payload,
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        reasoning: resolved.reasoning.clone(),
+        task: Some("chat_image_prompt_compose".into()),
+        ..Default::default()
+    };
+
+    let chain: Vec<String> = std::iter::once(resolved.model.clone())
+        .chain(resolved.fallback_model.iter().cloned())
+        .collect();
+    let mut opened: Option<(String, eros_engine_llm::openrouter::DeltaStream)> = None;
+    for model_id in chain {
+        match tokio::time::timeout(
+            FILTER_TIMEOUT,
+            state.openrouter.execute_stream_as(&req, &model_id),
+        )
+        .await
+        {
+            Ok(Ok(ds)) => {
+                opened = Some((model_id, ds));
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
+            }
+            Err(_) => {
+                tracing::warn!(model = %model_id, "compose endpoint: stream open timeout; next");
+            }
+        }
+    }
+    let (attempted_model, delta_stream) =
+        opened.ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
+
+    let frames = async_stream::stream! {
+        let _guard = guard;
+        let mut acc = String::new();
+        let mut served_model: Option<String> = None;
+        let mut generation_id: Option<String> = None;
+        let mut usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+        let mut failed = false;
+        futures_util::pin_mut!(delta_stream);
+        while let Some(item) = futures_util::StreamExt::next(&mut delta_stream).await {
+            match item {
+                Ok(chunk) => {
+                    if let Some(m) = chunk.model {
+                        served_model = Some(m);
+                    }
+                    if let Some(g) = chunk.generation_id {
+                        generation_id = Some(g);
+                    }
+                    if let Some(u) = chunk.usage {
+                        usage = Some(u);
+                    }
+                    if let Some(c) = chunk.content {
+                        if !c.is_empty() {
+                            acc.push_str(&c);
+                            yield ComposeFrame::Delta { content: c };
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "compose endpoint: stream died mid-flight");
+                    yield ComposeFrame::Error {
+                        code: StreamErrorCode::UpstreamUnavailable,
+                        retryable: true,
+                        message: format!("composer stream failed: {e}"),
+                        user_message: "服务出现问题，请稍后再试".into(),
+                    };
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            // Same usage-log synthesis as the chat path's streaming arms.
+            crate::pipeline::log_openrouter_usage(
+                "chat_image_prompt_compose",
+                None,
+                &eros_engine_llm::openrouter::ChatResponse {
+                    reply: String::new(), // usage log only — never echo content
+                    generation_id: generation_id.clone(),
+                    model: served_model.clone(),
+                    usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                    finish_reason: None,
+                },
+            );
+            let raw = acc.trim().to_string();
+            let (subject, caption) = parse_compose_reply(&raw);
+            if subject.is_empty() {
+                // Empty reply, or empty prompt after parse — mid-stream there
+                // is no chain left to walk, so this is the in-band twin of the
+                // chat path's "empty reply; next" failure arms.
+                yield ComposeFrame::Error {
+                    code: StreamErrorCode::UpstreamUnavailable,
+                    retryable: true,
+                    message: "composer returned no usable prompt".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+            } else {
+                let composed_prompt = compose_image_prompt(style_key, &persona, &subject);
+                yield ComposeFrame::Done {
+                    composed_prompt,
+                    subject,
+                    caption,
+                    model: served_model.unwrap_or(attempted_model),
+                    generation_id,
+                };
+            }
+        }
+    };
+    let sse = futures_util::StreamExt::map(frames, |f: ComposeFrame| {
+        let json = serde_json::to_string(&f).expect("ComposeFrame serialization is infallible");
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    });
+    Ok(Sse::new(sse)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
+                .text("ping"),
+        )
+        .into_response())
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -636,6 +840,171 @@ mod tests {
             json!({"content": "在海边", "stream": false}),
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "upstream");
+    }
+
+    /// Collect the `data:` frames out of an SSE body (keep-alive comment lines
+    /// are skipped by the `data: ` prefix filter).
+    async fn sse_frames(resp: axum::http::Response<Body>) -> Vec<serde_json::Value> {
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        text.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_deltas_then_done_matches_nonstream_body(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+
+        // The composer's raw reply, split across two SSE chunks (ASCII cut).
+        let reply = r#"{"prompt":"STREAMED SUBJECT","caption":"一张流式图"}"#;
+        let (a, b) = reply.split_at(14);
+        let chunk1 = json!({"choices": [{"delta": {"content": a}}]});
+        let chunk2 = json!({
+            "choices": [{"delta": {"content": b}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 9, "total_tokens": 11},
+            "id": "gen-stream",
+            "model": "served/composer-model",
+        });
+        let sse_body = format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+        let stream_mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&stream_mock)
+            .await;
+
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &stream_mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        // `stream` omitted — pins the default-true decision (spec §1).
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边，黄昏"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream"),
+            "default mode is SSE"
+        );
+        let frames = sse_frames(resp).await;
+        let deltas: String = frames
+            .iter()
+            .filter(|f| f["type"] == "delta")
+            .map(|f| f["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, reply, "raw composer output passes through verbatim");
+        let done: Vec<_> = frames.iter().filter(|f| f["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "exactly one terminal done: {frames:?}");
+        assert_eq!(
+            frames.last().unwrap()["type"],
+            "done",
+            "done is terminal: {frames:?}"
+        );
+        let mut done_obj = done[0].clone();
+        done_obj.as_object_mut().unwrap().remove("type");
+
+        // Non-stream twin against a JSON mock carrying the same reply/model/id:
+        // the done frame minus the discriminator must equal the stream:false body.
+        let json_mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-stream",
+                "model": "served/composer-model",
+                "choices": [{"message": {"content": reply}}],
+            })))
+            .mount(&json_mock)
+            .await;
+        let mut app2 = build_router(with_composer(
+            crate::routes::companion::test_state(pool),
+            &json_mock.uri(),
+        ));
+        let resp2 = post_compose(
+            &mut app2,
+            instance_id,
+            &jwt,
+            json!({"content": "在海边，黄昏", "stream": false}),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let v2 = body_json(resp2).await;
+        assert_eq!(
+            done_obj, v2,
+            "done minus the type discriminator equals the stream:false body"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_non_json_reply_passes_through_raw(pool: PgPool) {
+        // spec §3.5's stream twin: a successful-but-non-JSON reply streams out
+        // verbatim and becomes the whole subject with a null caption.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let chunk = json!({
+            "choices": [{"delta": {"content": "PLAIN STREAM PROMPT"}}],
+            "id": "gen-raw",
+            "model": "served/composer-model",
+        });
+        let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = sse_frames(resp).await;
+        let done = frames.iter().find(|f| f["type"] == "done").expect("done frame");
+        assert_eq!(done["subject"], "PLAIN STREAM PROMPT");
+        assert_eq!(done["caption"], serde_json::Value::Null);
+        let deltas: String = frames
+            .iter()
+            .filter(|f| f["type"] == "delta")
+            .map(|f| f["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, "PLAIN STREAM PROMPT");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_502_when_chain_exhausted(pool: PgPool) {
+        // The chain is walked while OPENING the stream, before the SSE response
+        // exists — total failure must be a real HTTP 502 even in stream mode.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let v = body_json(resp).await;
         assert_eq!(v["error"], "upstream");
