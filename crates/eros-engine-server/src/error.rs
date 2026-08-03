@@ -22,6 +22,14 @@ pub enum AppError {
     BadRequest(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// Upstream provider failure surfaced as-is (502). Used by the standalone
+    /// compose endpoint, whose caller needs "the provider failed my call"
+    /// distinguishable from "the engine broke" (500). Scoped to that endpoint:
+    /// the chat path's provider failures keep their own handling (fallback
+    /// chain, pseudo-ghost) and must not be rerouted here.
+    #[allow(dead_code)] // constructed by routes/persona.rs (compose endpoint)
+    #[error("upstream failure: {0}")]
+    Upstream(String),
     // Reserved for handler-level 500s; constructed nowhere right now (its only
     // user, the legacy event_gift route, was removed). Still mapped to a 500 via
     // the `_` arm in IntoResponse.
@@ -70,6 +78,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         (
@@ -100,5 +109,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(v["code"], "duplicate_in_progress");
         assert_eq!(v["original_user_message_id"], id.to_string());
+    }
+
+    #[tokio::test]
+    async fn upstream_error_renders_502_with_error_body() {
+        let resp = AppError::Upstream("composer chain exhausted".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "upstream");
+        assert_eq!(v["message"], "upstream failure: composer chain exhausted");
     }
 }
