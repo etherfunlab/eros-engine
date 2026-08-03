@@ -70,18 +70,16 @@ impl AffinityScopeDto {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageMode {
-    #[default]
-    TextImage,
-    ImageOnly,
-}
-
 /// Per-turn image parameters. Presence of this block signals the consumer
 /// handles images this turn (it drives image-action availability). The engine
 /// composes the prompt and emits a single `image_request` frame — it never
 /// draws on the chat stream.
+///
+/// `force = true` overrides the judge and makes the turn `reply_image` —
+/// image only, no text reply. `content` follows the ordinary non-empty rule
+/// on forced turns, and forcing requires `[tasks.chat_image_prompt_compose]`
+/// to be configured (422 otherwise). A leftover `mode` key from the pre-1.0.1
+/// contract deserializes and is silently ignored (spec 2026-08-03 §1).
 ///
 /// Reference-image URLs travel on the `image_request` frame; the engine
 /// never draws, so there is no engine-side draw request carrying them.
@@ -89,8 +87,6 @@ pub enum ImageMode {
 pub struct ImageReplyParams {
     #[serde(default)]
     pub force: bool,
-    #[serde(default)]
-    pub mode: ImageMode,
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub style: Option<StyleKey>,
@@ -175,16 +171,10 @@ fn image_url_is_valid(url: &str) -> bool {
 }
 
 fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
-    // Content may be empty only when a tip, an image_url, or a forced ImageOnly turn is attached.
-    let image_only = req
-        .image
-        .as_ref()
-        .is_some_and(|i| i.force && i.mode == ImageMode::ImageOnly);
-    if req.content.is_empty()
-        && req.tips_amount_usd.is_none()
-        && req.image_url.is_none()
-        && !image_only
-    {
+    // Content may be empty only when a tip or an image_url is attached. A
+    // forced image turn gets no exemption: the composer's strongest input is
+    // the user's message (spec 2026-08-03 §2.3).
+    if req.content.is_empty() && req.tips_amount_usd.is_none() && req.image_url.is_none() {
         return Err(AppError::StreamPre(StreamPreError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "unprocessable",
@@ -1288,15 +1278,25 @@ mod validate_payload_tests {
     }
 
     #[test]
-    fn validate_allows_image_only_empty_content() {
+    fn validate_rejects_forced_image_with_empty_content() {
+        // spec 2026-08-03 §2.3: the force+image_only empty-content exemption is
+        // gone — content follows the ordinary non-empty rule on forced turns.
         let mut req = minimal_req();
         req.content = String::new();
         req.image = Some(ImageReplyParams {
             force: true,
-            mode: ImageMode::ImageOnly,
             ..Default::default()
         });
-        assert!(validate_payload(&req).is_ok());
+        assert!(validate_payload(&req).is_err());
+    }
+
+    #[test]
+    fn leftover_mode_key_deserializes_and_is_ignored() {
+        // Consumers may still send the deleted `mode` field; no
+        // deny_unknown_fields, so it must parse and change nothing (spec §1).
+        let p: ImageReplyParams =
+            serde_json::from_str(r#"{"force":true,"mode":"image_only"}"#).unwrap();
+        assert!(p.force);
     }
 
     #[test]

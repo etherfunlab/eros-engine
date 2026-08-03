@@ -1561,16 +1561,9 @@
           }
         }
       },
-      "ImageMode": {
-        "type": "string",
-        "enum": [
-          "text_image",
-          "image_only"
-        ]
-      },
       "ImageReplyParams": {
         "type": "object",
-        "description": "Per-turn image parameters. Presence of this block signals the consumer\nhandles images this turn (it drives image-action availability). The engine\ncomposes the prompt and emits a single `image_request` frame — it never\ndraws on the chat stream.\n\nReference-image URLs travel on the `image_request` frame; the engine\nnever draws, so there is no engine-side draw request carrying them.",
+        "description": "Per-turn image parameters. Presence of this block signals the consumer\nhandles images this turn (it drives image-action availability). The engine\ncomposes the prompt and emits a single `image_request` frame — it never\ndraws on the chat stream.\n\n`force = true` overrides the judge and makes the turn `reply_image` —\nimage only, no text reply. `content` follows the ordinary non-empty rule\non forced turns, and forcing requires `[tasks.chat_image_prompt_compose]`\nto be configured (422 otherwise). A leftover `mode` key from the pre-1.0.1\ncontract deserializes and is silently ignored (spec 2026-08-03 §1).\n\nReference-image URLs travel on the `image_request` frame; the engine\nnever draws, so there is no engine-side draw request carrying them.",
         "properties": {
           "aspect_ratio": {
             "type": [
@@ -1580,9 +1573,6 @@
           },
           "force": {
             "type": "boolean"
-          },
-          "mode": {
-            "$ref": "#/components/schemas/ImageMode"
           },
           "prompt_variant": {
             "type": [
