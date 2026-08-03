@@ -2435,7 +2435,9 @@ fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
 struct ComposeOutcome {
     prompt: String,
     /// One short line describing what the picture shows, for the chat history
-    /// and the judge transcript. `None` when the model gave none.
+    /// and the judge transcript. `None` when the model gave none — including
+    /// when the reply wasn't JSON at all (the migration fallback in
+    /// `parse_compose_reply`, where the whole reply becomes `prompt` instead).
     caption: Option<String>,
     /// Model that actually answered: `resp.model`, falling back to the
     /// attempted model id (same idiom as the vision audit).
@@ -2653,7 +2655,9 @@ async fn build_delegated_image_prompt(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "realistic".to_string());
     let variant = req_image.and_then(|i| i.prompt_variant.as_deref());
-    let compose = match state.model_config.resolve_image_prompt_compose(variant) {
+    let resolved_compose = state.model_config.resolve_image_prompt_compose(variant);
+    let composer_configured = resolved_compose.is_some();
+    let compose = match resolved_compose {
         Some(c) => {
             run_image_prompt_compose(
                 state,
@@ -2677,7 +2681,30 @@ async fn build_delegated_image_prompt(
                 Some(o.model),
                 o.generation_id,
             ),
-            None => (String::new(), None, None, None, None),
+            None => {
+                // Loud on purpose: this is the ONE path where the capability
+                // gate (`本轮可发图=否` when the composer isn't configured) is
+                // bypassed — a forced image turn (`image.force = true`) always
+                // reaches here regardless of gate state. A deployment that
+                // upgraded past #212 without configuring
+                // `[tasks.chat_image_prompt_compose]` would otherwise silently
+                // get a generic persona-portrait prompt on every forced image,
+                // with zero log lines anywhere else on this path. Still a warn,
+                // not an error: the portrait fallback is the sanctioned
+                // fail-open degradation, not a bug.
+                tracing::warn!(
+                    composer_configured,
+                    "image-compose: no subject produced this turn; falling back to a generic \
+                     persona-portrait prompt ({})",
+                    if composer_configured {
+                        "composer chain failed — see the preceding image-compose warn for the \
+                         model and reason"
+                    } else {
+                        "no [tasks.chat_image_prompt_compose] configured"
+                    }
+                );
+                (String::new(), None, None, None, None)
+            }
         };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
@@ -6780,6 +6807,221 @@ data: [DONE]\n\n";
             "marker must not store a generation id"
         );
         assert!(img.get("url").is_none(), "marker must not store a url");
+    }
+
+    /// Review finding (2026-08-02, issue #212 fix wave): the sibling test above
+    /// configures NO `chat_image_prompt_compose` task, so the concurrently
+    /// spawned compose task resolves `None` and returns instantly — the join
+    /// at the end of the burst is trivially satisfied and proves nothing about
+    /// ordering under a REAL in-flight call. This test configures the composer
+    /// AND gives its mocked response a delay that outlasts the (instant, mocked)
+    /// chat burst, so the join at `compose_handle.take().unwrap().await`
+    /// genuinely waits on a still-running task — the actual race the concurrent
+    /// spawn in `run_stream` is meant to survive. Asserts the wire frame order
+    /// still holds (`meta → delta* → done → image_request → final`) and that
+    /// the `image_request` frame plus the persisted marker carry the racing
+    /// composer's real output, not the empty-subject portrait fallback.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_concurrent_composer_races_chat_burst(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Chat burst: streams back immediately, no delay. The composer mock
+        // below is delayed well past this, so by the time `run_stream` reaches
+        // the join point the compose task is still in flight — the join must
+        // actually wait on it rather than observe an already-resolved handle.
+        let chat_body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        // Route the two calls by the MODEL ID present in the request body so the
+        // two mocks are MUTUALLY EXCLUSIVE (mount order/precedence cannot matter):
+        // chat call body contains "primary"; composer call body contains "composer".
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(150))
+                    .set_body_json(serde_json::json!({
+                        "id": "gen-compose-race",
+                        "model": "served/composer-model",
+                        "choices": [{"message": {"content":
+                            r#"{"prompt":"CONCURRENT COMPOSED SUBJECT","caption":"并发合成的图片"}"#
+                        }}],
+                    })),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9222222222222222222222A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    // default mode = TextImage ⇒ ReplyTextImage
+                    ..Default::default()
+                }),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let reqs = mock.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "reply_text_image makes exactly two provider calls: chat + composer, {reqs:?}"
+        );
+
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        // meta(reply_text_image) → delta* → done → image_request → final,
+        // preserved even though the composer is still running when the chat
+        // burst's `done` frame is emitted.
+        assert_eq!(types.first().map(String::as_str), Some("meta"), "{types:?}");
+        assert_eq!(types.last().map(String::as_str), Some("final"), "{types:?}");
+        assert!(
+            types.iter().any(|t| t == "delta"),
+            "text burst delta present: {types:?}"
+        );
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request present");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done even with a real in-flight composer: {types:?}"
+        );
+        assert_eq!(
+            types[ir_pos + 1],
+            "final",
+            "image_request immediately before final"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| t.as_str() == "image_request")
+                .count(),
+            1,
+            "exactly one image_request"
+        );
+
+        // The image_request frame carries the COMPOSER'S output (the wire
+        // prompt embeds the enriched subject) — not the empty-subject portrait
+        // fallback the no-composer sibling test exercises.
+        let composed_b64 = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::ImageRequest {
+                    composed_prompt, ..
+                } => Some(composed_prompt.clone()),
+                _ => None,
+            })
+            .expect("image_request present");
+        let composed = {
+            use base64::Engine as _;
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&composed_b64)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(
+            composed.contains("CONCURRENT COMPOSED SUBJECT"),
+            "composed wire prompt must carry the racing composer's subject, got {composed}"
+        );
+
+        // The marker MERGED onto the assistant text row carries the composer's
+        // actual subject/caption/audit trio — proof the join actually picked up
+        // the still-in-flight task's result rather than racing past it.
+        let row: (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!row.0.is_empty(), "the text reply row has content");
+        let img = row.1.expect("row has metadata")["image"].clone();
+        assert_eq!(img["prompt"], "CONCURRENT COMPOSED SUBJECT");
+        assert_eq!(img["caption"], "并发合成的图片");
+        assert_eq!(img["compose_model"], "served/composer-model");
+        assert_eq!(img["compose_generation_id"], "gen-compose-race");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
