@@ -2259,8 +2259,12 @@ async fn build_input_filter_transcript(
     session_id: Uuid,
     current_user_message_id: Uuid,
 ) -> JudgeTranscript {
+    // +1: the turn being processed is already persisted, so it always occupies
+    // the newest fetched slot and is then excluded below. Fetching exactly the
+    // window size would leave 7 prior messages while `[近期图片]` tells the
+    // judge it counted 8 — an every-turn off-by-one on the anti-spam facts.
     let rows = chat_repo
-        .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
+        .history(session_id, INPUT_FILTER_CONTEXT_TURNS + 1, 0)
         .await
         .unwrap_or_default();
     let mut acc = JudgeTranscriptAcc::default();
@@ -4686,6 +4690,151 @@ mod tests {
         // metadata present but no image key: content passes through
         let meta4 = serde_json::json!({"tip": 5});
         assert_eq!(assistant_transcript_line("hello", Some(&meta4)), "hello");
+    }
+
+    /// Codex-review P2 regression (PR #216): the current turn is already
+    /// persisted when the transcript is built, so it always occupies the
+    /// newest fetched slot before being excluded — fetching exactly the window
+    /// size left 7 prior messages while `[近期图片]` told the judge it counted
+    /// 8. Seeds exactly 8 prior rows whose OLDEST is an image turn: with the
+    /// off-by-one that image fell out of the window and the count read 0.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn transcript_window_covers_the_full_advertised_eight(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // 8 prior rows, oldest first at now()-8min … now()-1min. Row 0 (the
+        // oldest, exactly 8th-most-recent prior) is the image turn.
+        for i in 0..8i32 {
+            let (role, content, meta) = if i == 0 {
+                (
+                    "assistant",
+                    "",
+                    Some(serde_json::json!({"image":{"prompt":"x","caption":"在沙滩"}})),
+                )
+            } else if i % 2 == 1 {
+                ("user", "文字消息", None)
+            } else {
+                ("assistant", "文字回复", None)
+            };
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5))",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(meta)
+            .bind(8 - i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let chat_repo = ChatRepo { pool: &pool };
+        let current = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let t = build_input_filter_transcript(&chat_repo, session_id, current).await;
+        assert_eq!(
+            t.images_in_window, 1,
+            "the 8th-most-recent prior message is an image and must be counted: {t:?}"
+        );
+        assert!(
+            !t.last_assistant_is_image,
+            "the newest assistant row is text: {t:?}"
+        );
+        assert_eq!(
+            t.transcript.lines().count(),
+            8,
+            "the judge must see the full advertised 8 prior messages: {}",
+            t.transcript
+        );
+        assert!(
+            !t.transcript.contains("hi"),
+            "the current turn must be excluded: {}",
+            t.transcript
+        );
+    }
+
+    /// Channel-marked rows (voice / product_qa) are out of companion context:
+    /// they must neither render in the transcript nor count as images. Pins
+    /// the exclusion the counting facts now silently depend on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn transcript_excludes_channel_rows_from_text_and_counts(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        let user_id = Uuid::new_v4();
+        let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '普通消息', now() - interval '3 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A voice-channel image row: out of companion context entirely.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, channel, sent_at) \
+             VALUES ($1, 'assistant', '语音旁路', '{\"image\":{\"prompt\":\"v\"}}', 'voice', now() - interval '2 minutes')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'assistant', '', '{\"image\":{\"prompt\":\"y\",\"caption\":\"在天台\"}}', now() - interval '1 minute')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let current = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000D",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let t = build_input_filter_transcript(&chat_repo, session_id, current).await;
+        assert_eq!(
+            t.images_in_window, 1,
+            "the voice-channel image row must not count: {t:?}"
+        );
+        assert!(
+            t.last_assistant_is_image,
+            "the newest COMPANION assistant row is the image turn: {t:?}"
+        );
+        assert!(
+            !t.transcript.contains("语音旁路"),
+            "channel rows must not render: {}",
+            t.transcript
+        );
+        assert!(t.transcript.contains("普通消息"), "{}", t.transcript);
     }
 
     /// Build a `JudgeTranscript` from (role, content, metadata) triples,
