@@ -380,5 +380,6 @@ Design documents (decision history and full edge-case tables):
 
 - [`docs/superpowers/specs/2026-07-21-world-memories-design.md`](superpowers/specs/2026-07-21-world-memories-design.md)
 - [`docs/superpowers/specs/2026-07-21-world-town-design.md`](superpowers/specs/2026-07-21-world-town-design.md)
+- [`docs/superpowers/specs/2026-07-21-world-town-reply-window-design.md`](superpowers/specs/2026-07-21-world-town-reply-window-design.md)
 - [`docs/superpowers/specs/2026-07-23-world-stories-design.md`](superpowers/specs/2026-07-23-world-stories-design.md)
 - [`docs/superpowers/specs/2026-07-28-world-worldview-design.md`](superpowers/specs/2026-07-28-world-worldview-design.md)

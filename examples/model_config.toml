@@ -88,9 +88,12 @@
 # ids in preference order. The chain is tried sequentially; first success
 # wins. An explicit empty value (`""` or `[]`) opts out of the defaults
 # block's fallback for this task.
-# Recommendation: keep `fallback` to at most 2 entries. The streaming chat
-# burst caps attempts at MAX_STREAM_FALLBACK_DEPTH (3 = primary + 2 fallbacks);
-# anything past the third entry is never tried on the chat path.
+# Recommendation: keep `fallback` to at most 2 entries. The chain is truncated
+# to `retry_depth` entries before the streaming chat burst — default 2 on this
+# task (primary + 2 fallbacks = 3 attempts), settable here or per tier;
+# anything past the truncation point is never tried. The single-purpose tasks
+# below (output/input filter, vision, PDE, product QA, image compose) default
+# to retry_depth = 1 instead.
 model = "deepseek/deepseek-v4-flash"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8

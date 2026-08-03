@@ -47,6 +47,9 @@ action dispatch        inline `match plan.action_type` in run_stream:
        │
        ▼
 chat exec              if Some(req): state.openrouter.execute(req).await?
+                       (reply_text_image: the image composer is tokio::spawn'ed
+                        before the chat call and joined after the text reply
+                        streams — the compose hop hides under the chat call)
                        persist assistant message via ChatRepo
        │
        ▼
@@ -54,6 +57,8 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        - affinity persist (LLM evaluates 6-dim Δ → DB)
                        - memory   (Voyage embed → pgvector upsert)
                        - insight  (LLM extracts facts → companion_insights merge)
+                       - lead-score refresh (insights → chat_sessions.lead_score)
+                       (the four run concurrently via tokio::join!)
 ```
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
@@ -102,7 +107,7 @@ eros-engine-server :8080
                        companion_decision_events
 ```
 
-The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
+The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight / lead-score writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
 
 **`chat_messages.channel`**: `NULL` = normal text; `'voice'` = voice channel;
 `'product_qa'` = out-of-character product answer — non-NULL rows are
@@ -114,7 +119,7 @@ fully visible on the live stream, replay, and client history.
 
 Two reasons:
 
-1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 25 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
+1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 68 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
 2. **Embeddability.** Anyone wanting to build a different product on top — journaling agent, language tutor, coaching companion — can pull in `core` without inheriting the HTTP shape, the Postgres schema, or the JWT auth. The 6-dim affinity model is the part most worth lifting; we made that easy.
 
 ## File structure
@@ -127,6 +132,7 @@ crates/
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
+│       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/
@@ -134,7 +140,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0028_companion_decision_events
+│   ├── migrations/           # 0000_schema → 0039_world_worldviews
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -148,7 +154,7 @@ crates/
         ├── state.rs          # AppState (pool/auth/openrouter/voyage/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
-        ├── pipeline/         # mod (orchestrator) / handlers / post_process
+        ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …
         ├── prompt.rs         # system-prompt builder (affinity → directives)
         ├── routes/           # health / companion / companion_stream / debug / mod
         └── openapi.rs        # utoipa ApiDoc spec metadata

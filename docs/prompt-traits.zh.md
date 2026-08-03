@@ -46,6 +46,8 @@ system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
   [tasks.chat_companion.tiers.gold]
   allow_traits = ["allow_nsfw", "allow_politics"]
   ```
+  tier 块只能写在 `chat_companion` 和 `chat_output_filter` 下；写在其他任务
+  下会拒绝启动（见 [model-config.zh.md](model-config.zh.md#tier-块只对两个任务生效)）。
 - **三态语义:**
   - `allow_traits` 缺省 —— 不过滤，所有 trait 注入。
   - `allow_traits = []` —— 丢弃所有 trait。

@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.6.x",
+  "version": "1.0.x",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
@@ -59,6 +59,15 @@ Optional `channel` field: `"text"` (default) or `"voice"`. Start/resume is
 channel-scoped — a voice-channel start never resumes a text session (and
 vice versa). Voice clients must obtain their session here with
 `"channel": "voice"` before calling the voice turn endpoint.
+
+Optional `instance_id` field: an explicit `persona_instance` id. When absent,
+the server picks (or auto-creates) the user's instance for the supplied
+`genome_id`; `genome_id` is required only when `instance_id` is absent.
+
+Optional `is_demo` field: marks the new session as a demo. Persisted to the
+session's `metadata.is_demo` and read by the affinity pipeline to apply
+`demo_ema_inertia` instead of the global value, so meters move visibly within
+a demo's turn budget. Ignored when resuming an existing session.
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
@@ -95,7 +104,7 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 Frame fields worth noting:
 
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
-- **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; may be omitted), `generation_id` (optional OpenRouter id).
+- **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`.
 - **`final`** — turn summary: `lead_score`, `should_show_cta`, `agent_training_level`, plus `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served).
 
 Concurrent active streams per user are capped at 3. The keep-alive heartbeat
@@ -190,6 +199,28 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "client_msg_id": "01J3333333333333333333333A",
         "memory_scope": "full",
         "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**Optional: reply anchor (rewind).** The body may include
+`reply_to_message_id` — the UUID of a `chat_messages` row in this session to
+anchor this turn's context on. When it resolves, history rewinds to (and
+includes) that message: rows sent after it are excluded from the prompt, and
+the anchor is recorded on the persisted user row's
+`metadata.reply_to_message_id`. A present-but-unresolvable id (unknown, or
+belonging to another session) does not fail the request — history is dropped
+for this turn (only the current message is in context) and the row's
+`metadata.reply_to_error` is set to `"not_found"`. Omit the field for the
+normal latest-history behavior.
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "wait, about that earlier plan",
+        "client_msg_id": "01J3333333333333333333333A",
+        "reply_to_message_id": "3cc06c53-9d2e-4f8a-b3c1-0a1b2c3d4e5f"
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
@@ -340,9 +371,9 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 The engine never draws and no draw-lifecycle frames exist: the consumer
 receives `image_request` and calls its own image vendor.
 
-### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
+### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
-Paginated message history, newest first.
+Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
 
 ```json
 {
@@ -572,6 +603,16 @@ Latest user-turn affinity delta (post-EMA), for per-turn frontend
 observation. Unlike the canonical `/comp/affinity/{session_id}` debug
 route, this is **not** gated by `EXPOSE_AFFINITY_DEBUG` (the frontend owns
 this surface) — but it is still JWT + ownership checked.
+
+Query parameters (both optional):
+
+- `after` — long-poll baseline: the `event_id` the caller already has. While
+  the session's latest turn event still matches it (or none exists yet), the
+  request is held open until a newer event lands or `wait` elapses — a
+  timed-out response returns the unchanged state, same shape as the immediate
+  path. Absent ⇒ the latest event is returned immediately.
+- `wait` — how long to hold the request open, in milliseconds. Only
+  meaningful with `after`. Default 10000, server-capped at 25000.
 
 ```json
 {

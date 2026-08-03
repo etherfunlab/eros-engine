@@ -80,7 +80,11 @@ docker compose up -d engine
 
 At least one auth source must be wired — `SUPABASE_URL` (or `SUPABASE_JWKS_URL`) for asymmetric JWKS validation, or a non-empty legacy `SUPABASE_JWT_SECRET`. With neither, the engine refuses to boot — by design, so a misconfigured deploy fails loudly instead of silently rejecting every request.
 
-**Model config:** the image bakes the sanitized `examples/model_config.toml` at `/etc/eros-engine/model_config.toml` and presets `MODEL_CONFIG_PATH` to it, so the container boots as-is. Note the baked example includes live `[tasks.world_*]` sections — harmless with zero world enrollments (no LLM calls), but the world sweepers do run; set `WORLD_DISABLED=true` if you want the [World system](world-system.md) fully inert. For a real deployment, mount your own config and point `MODEL_CONFIG_PATH` at it — or set `MODEL_CONFIG_DIR` to a mounted directory of `.toml` fragments merged at boot. The two are mutually exclusive, and the image presets `MODEL_CONFIG_PATH`, so going the directory route means clearing it explicitly (`MODEL_CONFIG_PATH=` — empty counts as unset). See [Model config](model-config.md).
+**Model config:** the image bakes the sanitized `examples/model_config.toml` at `/etc/eros-engine/model_config.toml` and presets `MODEL_CONFIG_PATH` to it, so the container boots as-is. Note the baked example includes live `[tasks.world_*]` sections — harmless with zero world enrollments (no LLM calls), but the world sweepers do run; set `WORLD_DISABLED=true` if you want the [World system](world-system.md) fully inert.
+
+Conversely, `[tasks.chat_image_prompt_compose]` is commented out in the baked example — and the image-prompt composer is required for image capability, so out of the box image turns stay unavailable and image actions silently degrade to text until you configure that block. See [Model config → image-prompt composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns).
+
+For a real deployment, mount your own config and point `MODEL_CONFIG_PATH` at it — or set `MODEL_CONFIG_DIR` to a mounted directory of `.toml` fragments merged at boot. The two are mutually exclusive, and the image presets `MODEL_CONFIG_PATH`, so going the directory route means clearing it explicitly (`MODEL_CONFIG_PATH=` — empty counts as unset). See [Model config](model-config.md).
 
 Place a real Caddy / Traefik / Cloudflare in front for HTTPS termination.
 

@@ -50,7 +50,7 @@ fallback_temperature = 0.5
 fallback_max_tokens  = 200
 
 [tasks.<name>]
-model        = "<provider>/<model-id>"      # required; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
+model        = "<provider>/<model-id>"      # optional — absent falls through to [defaults].fallback_model, then the compiled-in default; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
@@ -83,12 +83,13 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `defaults.fallback_model` | `String` | 否 | 任务配置未提供 model 时使用的最终 fallback。若仍然缺失，代码使用编译时内置默认值 `x-ai/grok-4-mini`。 |
 | `defaults.fallback_temperature` | `f64` | 否 | 优先级相同；编译时内置默认值为 `0.5`。 |
 | `defaults.fallback_max_tokens` | `u32` | 否 | 优先级相同；编译时内置默认值为 `200`。 |
-| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 是 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。参见“主模型选择”。 |
+| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | 否 | 主模型。字符串 = 固定；数组 = round-robin；表 = weighted 随机。缺失（或为空）时依次回退到 `defaults.fallback_model`、编译时内置默认值——`[tasks.<name>]` 块不写 `model` key 也能正常解析并启动。例外：`[tasks.chat_voice]` 块一旦存在，`model` 必须是单一固定且非空的 id，否则拒绝启动。参见“主模型选择”。 |
 | `tasks.<name>.fallback` | `String` | 否 | 主调用失败时由 `OpenRouterClient` 使用的次要模型。 |
+| `tasks.<name>.retry_depth` | `u32` | 否 | 把解析出的 `fallback` 链截断：primary + 最多这么多个 fallback，之后的条目永远不会被尝试。默认值：走通用 `resolve()` 的任务为 `2`（含 `chat_companion`；可按 tier 覆盖），单一用途任务为 `1`——参见“Fallback 截断（`retry_depth`）”。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 每任务的 token 上限。无 per-tier 覆盖。 |
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
-| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback` 和/或 `allow_traits`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
+| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
@@ -781,6 +782,12 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 ### Fallback 去重
 
 选择 primary 后，解析出的 `fallback` 链中与其 id 完全相同的条目会被删除——重试刚刚失败的模型毫无意义。对于 round-robin/weighted primary，这是动态行为：只删除当前调用所选的 id。
+
+### Fallback 截断（`retry_depth`）
+
+去重之后，链会被截断到 `retry_depth` 条——每次调用先试 primary，再最多试 `retry_depth` 个 fallback，截断点之后的条目永远不会被尝试。`retry_depth` 可在任务级设置，在两个 tier 感知任务上还可按 tier 覆盖（tier > 任务默认块）。
+
+默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`chat_product_qa`、`chat_image_prompt_compose`）用 `1`（primary + 第一个 fallback）。
 
 ## 稳定性承诺
 

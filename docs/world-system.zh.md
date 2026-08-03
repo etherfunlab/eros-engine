@@ -335,5 +335,6 @@ WM director 回合、故事回合、小镇扫描之外，直到下游回填
 
 - [`docs/superpowers/specs/2026-07-21-world-memories-design.md`](superpowers/specs/2026-07-21-world-memories-design.md)
 - [`docs/superpowers/specs/2026-07-21-world-town-design.md`](superpowers/specs/2026-07-21-world-town-design.md)
+- [`docs/superpowers/specs/2026-07-21-world-town-reply-window-design.md`](superpowers/specs/2026-07-21-world-town-reply-window-design.md)
 - [`docs/superpowers/specs/2026-07-23-world-stories-design.md`](superpowers/specs/2026-07-23-world-stories-design.md)
 - [`docs/superpowers/specs/2026-07-28-world-worldview-design.md`](superpowers/specs/2026-07-28-world-worldview-design.md)

@@ -80,7 +80,11 @@ docker compose up -d engine
 
 至少要接一个 auth 来源——非对称 JWKS 校验用 `SUPABASE_URL`（或 `SUPABASE_JWKS_URL`），或者一个非空的旧版 `SUPABASE_JWT_SECRET`。两者都没有时引擎会拒绝启动——这是刻意设计，让配错的部署直接报错，而不是默默拒掉每一个请求。
 
-**模型配置：**镜像把脱敏过的 `examples/model_config.toml` 烧在 `/etc/eros-engine/model_config.toml`，并预设了 `MODEL_CONFIG_PATH` 指向它，所以容器开箱即可启动。注意烧进去的示例带有生效的 `[tasks.world_*]` section——零注册时无害（不会有 LLM 调用），但世界 sweeper 会跑起来；想让[世界系统](world-system.zh.md)完全不动就设 `WORLD_DISABLED=true`。真实部署时挂载你自己的配置并把 `MODEL_CONFIG_PATH` 指过去——或者设 `MODEL_CONFIG_DIR` 指向一个挂载目录，里面的 `.toml` 片段会在启动时合并。两者互斥，而镜像预设了 `MODEL_CONFIG_PATH`，所以走目录路线要显式清掉它（`MODEL_CONFIG_PATH=`——空值等同未设置）。见[模型配置](model-config.zh.md)。
+**模型配置：**镜像把脱敏过的 `examples/model_config.toml` 烧在 `/etc/eros-engine/model_config.toml`，并预设了 `MODEL_CONFIG_PATH` 指向它，所以容器开箱即可启动。注意烧进去的示例带有生效的 `[tasks.world_*]` section——零注册时无害（不会有 LLM 调用），但世界 sweeper 会跑起来；想让[世界系统](world-system.zh.md)完全不动就设 `WORLD_DISABLED=true`。
+
+反过来，烧进去的示例里 `[tasks.chat_image_prompt_compose]` 是注释掉的——而出图 prompt 合成器是图片能力的必需项，所以开箱状态下图片轮次不可用，图片动作会静默降级为纯文本，直到你配置好这个块。见[模型配置 → 出图 prompt 合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
+
+真实部署时挂载你自己的配置并把 `MODEL_CONFIG_PATH` 指过去——或者设 `MODEL_CONFIG_DIR` 指向一个挂载目录，里面的 `.toml` 片段会在启动时合并。两者互斥，而镜像预设了 `MODEL_CONFIG_PATH`，所以走目录路线要显式清掉它（`MODEL_CONFIG_PATH=`——空值等同未设置）。见[模型配置](model-config.zh.md)。
 
 前面放個真正的 Caddy / Traefik / Cloudflare 做 HTTPS 終止。
 

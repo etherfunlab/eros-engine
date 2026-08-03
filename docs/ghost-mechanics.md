@@ -47,20 +47,26 @@ Score alone doesn't decide. Four rules run in priority order before the threshol
 
 4. otherwise:
      base threshold     = 0.65
-     if recent ghost:
-       threshold = 0.85          (raise the bar after a ghost)
+     if this session has ever ghosted:
+       threshold = 0.85          (bar stays raised for the rest
+                                  of the session)
      ghost iff score > threshold
 ```
 
 Implementation:
 
 ```rust
+// Rules 1-3 live in their own fn: the LLM PDE path reuses them as a veto,
+// without the score threshold (the judge decides ghost-worthiness itself).
+pub fn ghost_permitted(a: &Affinity, s: GhostSignals) -> bool {
+    if s.message_count < 10 { return false; }
+    if a.ghost_streak >= 2 { return false; }
+    if matches!(s.hours_since_last_ghost, Some(h) if h < 1.0) { return false; }
+    true
+}
+
 pub fn decide(a: &Affinity, s: GhostSignals) -> GhostDecision {
-    if s.message_count < 10 { return GhostDecision::Reply; }
-    if a.ghost_streak >= 2 { return GhostDecision::Reply; }
-    if matches!(s.hours_since_last_ghost, Some(h) if h < 1.0) {
-        return GhostDecision::Reply;
-    }
+    if !ghost_permitted(a, s) { return GhostDecision::Reply; }
     let threshold = if s.hours_since_last_ghost.is_some() { 0.85 } else { 0.65 };
     if score(a) > threshold {
         GhostDecision::Ghost
@@ -69,6 +75,8 @@ pub fn decide(a: &Affinity, s: GhostSignals) -> GhostDecision {
     }
 }
 ```
+
+The raised bar does not decay: the branch checks `hours_since_last_ghost.is_some()`, `last_ghost_at` is only ever set and never cleared, and the affinity row is 1:1 with a chat session — so once a session has ghosted at all, 0.85 is the threshold for the rest of that session (outside the 1-hour cooldown, where rule 3 forces a reply anyway).
 
 ## Worked examples
 
@@ -98,7 +106,7 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
       = 0.76
 ```
 
-Recent ghost → threshold raised to `0.85`. `0.76 ≤ 0.85` → **Reply** (but a short, dry one — the affinity is still bad, the persona is just choosing to engage minimally rather than disappear).
+The session has ghosted before (`last_ghost_at` is set) → threshold is `0.85`. `0.76 ≤ 0.85` → **Reply** (but a short, dry one — the affinity is still bad, the persona is just choosing to engage minimally rather than disappear).
 
 ### Example 4: nascent relationship
 
@@ -115,10 +123,12 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 
 - It's **not** an error response. The HTTP route still returns 200. Because the engine is SSE-streaming, a ghost turn emits three frames and then closes the stream: `meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`. No `delta` frame is emitted and no LLM is called.
 - It's **not** an LLM call gone wrong. With the default rule engine the decision is pure Rust and the LLM never gets asked. With the opt-in LLM PDE judge configured the judge proposes the action, but `ghost_permitted` still vetoes any ghost the hard-safety rules forbid, and the `ghosting` switch can force every ghost verdict back to `reply_text` — see [model-config.md](model-config.md).
+- It's **not** the only way a turn goes silent. A reply whose text resolves empty gets there by a different route: the model returned an empty completion, or `apply_output_regex` stripped an artifact-only reply to nothing (the fail-safe there was deliberately removed). That turn is persisted as an ordinary assistant reply row with empty content, surfaces as `done(ghost_fallback=true)` with `metadata.fallback_reason` of `empty_completion` or `regex_strip`, and does **not** touch `ghost_streak` / `total_ghosts` / `last_ghost_at` — the persona decided nothing; the reply just came back empty.
 - It's **not** silent forever. Time-decay restores `patience` and softens `tension`; eventually the persona will reply again to the next message.
 
 ## Source
 
 - `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (11 unit tests)
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the `ActionType::Ghost` arm: stamps the row and records the ghost, building no chat request
-- `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at)
+- `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at), plus a zero-delta `companion_affinity_events` row with `event_type='ghost'`
+- `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted` — sets `chat_messages.ghost_decision = true` on the user row, so replay can tell a ghost outcome from a still-generating turn

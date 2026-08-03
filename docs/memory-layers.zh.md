@@ -25,8 +25,8 @@ CREATE TABLE engine.companion_memories (
     instance_id  UUID,                         -- NULL = profile 層
     content      TEXT NOT NULL,
     embedding    VECTOR(512) NOT NULL,
-    category     TEXT,                         -- fact|preference|event|emotion|relation；逐轮写入的行为 NULL
-    metadata     JSONB,                        -- 每条记忆的不透明抽取载荷；逐轮写入的行为 NULL
+    category     TEXT,                         -- fact|preference|event|emotion|relation；逐轮原文写入的行为 NULL
+    metadata     JSONB,                        -- 每条记忆的不透明抽取载荷；逐轮原文写入的行为 NULL
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -45,17 +45,19 @@ CREATE INDEX idx_memories_session
 
 ## Embedding
 
-默认 `voyage-4-lite` 走 Voyage API（可在 `[tasks.embedding]` 配置）。512 维、多语言。
+默认 `voyage-4-lite` 走 Voyage 原生 API。512 维、多语言——schema 是 `VECTOR(512)`，非 Voyage 路由也会在请求里强制 `dimensions: 512`。
+
+路由由 `[tasks.embedding]` 决定。`model` 带上 `@provider` 后缀就把调用发去别处：`@openrouter` 走内建的 OpenRouter embeddings 端点（URL 可用 `[providers].openrouter.embeddings` 覆盖），`@<name>` 走任何声明了 `embeddings` URL 的 `[providers]` 条目（密钥读 `<NAME>_API_KEY`）。另一种写法是配一对 `model_read`/`model_write`，把召回和入库模型拆开独立指定——两者必须成对出现、与 `model` 互斥，且只允许 voyage-4 系列及以上的 Voyage 模型：只有这个系列保证不同尺寸模型共享同一向量空间。
 
 ```rust
-// crates/eros-engine-llm/src/voyage.rs
-pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError>;
-pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, LlmError>;
+// crates/eros-engine-llm/src/embedding.rs — EmbeddingRouter
+pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, LlmError>;    // read 后端
+pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError>; // write 后端
 ```
 
-`embed_document` 跟 `embed_query` 給 Voyage 不同的 `input_type` 提示——documents 為入庫檢索優化、queries 為餘弦匹配優化。所以引擎是兩個方法不是一個。
+`embed_query` 服务每轮召回路径，`embed_document` 服务入库路径。在 Voyage 后端上，两者变成不同的 `input_type` 提示（`query` vs `document`）；OpenRouter 兼容协议没有这个提示，所以在那边这个区分只在 `model_read`/`model_write` 确实不同时才有意义。
 
-引擎在 `VOYAGE_API_KEY` 為空時 **大聲拒絕啟動**——缺密鑰直接拒絕 boot。閉源版的 eros-gateway 有個已知回歸：空 key 會悄悄關掉 embeddings；eros-engine 拒絕繼承這個坑。
+密钥缺失时引擎依然**大声拒绝启动**——但 `VOYAGE_API_KEY` 这道 boot 闸只在解析出的路由包含 Voyage 后端时才触发；OpenRouter 和自定义路由改由各自的密钥把关（`OPENROUTER_API_KEY` / `<NAME>_API_KEY`）。閉源版的 eros-gateway 有個已知回歸：空 key 會悄悄關掉 embeddings；eros-engine 拒絕繼承這個坑。
 
 ## 檢索
 
@@ -71,14 +73,14 @@ CREATE INDEX idx_memories_embedding
 Profile 層查詢：
 
 ```sql
-SELECT id, content, 1 - (embedding <=> $2::vector) AS similarity
+SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at
 FROM engine.companion_memories
 WHERE user_id = $1 AND instance_id IS NULL
 ORDER BY embedding <=> $2::vector
 LIMIT $3;
 ```
 
-Relationship 層查詢加 `instance_id = $4`。`1 - distance` 讓你直接按相似度排序或閾值處理，不用記住 pgvector 是「距離」不是「相似度」這個約定。
+Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NOT LIKE '%\nAI：%'`（`$3`）排除旧版逐字转录行（issue #113），embedding 和 LIMIT 随之后移到 `$4`、`$5`。代码里任何地方都不计算相似度分数——结果直接按 `<=>` 余弦距离原值排序，检索就是 `LIMIT` 取 top-K；没有相似度阈值，最近的 K 行不管绝对距离多远都会返回。
 
 `lists = 100` 是中小規模表（≲ 1M 行）的平衡默認值。語料更大就調高（經驗法則：`lists ≈ √rows`）。
 
@@ -86,8 +88,8 @@ Relationship 層查詢加 `instance_id = $4`。`1 - distance` 讓你直接按相
 
 两个互相独立的写入方，跑在不同的节奏上：
 
-1. **逐轮写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑：用户话语非空，且至少有一条非空的助手消息。它只把**用户话语**embed 进两个层，不存助手的回复文本——助手回复经记忆召回重新进入模型自己的 prompt 会形成反馈回路，让后续回复反复出现同一句话（issue #113）。关系层那一份带 `用户：` 前缀，召回出来后仍能认出是用户原话。这些行的 `category` 和 `metadata` 都是 NULL。
-2. **Dreaming-lite 清扫**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
+1. **逐轮原文写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑：用户话语非空，且至少有一条非空的助手消息。它只把**用户话语**embed 进两个层，不存助手的回复文本——助手回复经记忆召回重新进入模型自己的 prompt 会形成反馈回路，让后续回复反复出现同一句话（issue #113）。关系层那一份带 `用户：` 前缀，召回出来后仍能认出是用户原话。这些行的 `category` 和 `metadata` 都是 NULL。
+2. **Dreaming-lite 清扫器**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
 
 `insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出合并进 `companion_insights`（并镜像到扁平的 `human_insights` 表），不在这里 embed。
 
@@ -114,14 +116,20 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   `relationship_only`）。
 
 `memory_scope = none` 完全跳过记忆注入。**`memory_scope` 只管 prompt 注入，
-不管写入。** 即使是 `none`，逐轮写入照样把这一轮 embed 并存下来，insight 抽取和
+不管写入。** 即使是 `none`，逐轮原文写入照样把这一轮 embed 并存下来，insight 抽取和
 好感度评估也照常跑；目前没有任何 scope 取值能抑制写入。前端的
 `/comp/user/{user_id}/profile` 端点返回 `companion_insights` JSONB，作为已收集
 内容的人类可读视图。
 
 ## 源碼
 
-- `crates/eros-engine-store/src/memory.rs`——`MemoryRepo`（upsert + search，3 個 sqlx::test 集成測試）
-- `crates/eros-engine-llm/src/voyage.rs`——embedding 客戶端
-- `crates/eros-engine-server/src/pipeline/post_process.rs`——寫入路徑
+- `crates/eros-engine-store/src/memory.rs`——`MemoryRepo`（upsert + search，7 个 sqlx::test 集成测试）
+- `crates/eros-engine-store/src/human_insight.rs`——注入时读取的扁平 `human_insights` 镜像
+- `crates/eros-engine-llm/src/voyage.rs`——Voyage 原生客户端
+- `crates/eros-engine-llm/src/embedding.rs`——`EmbeddingRouter` + OpenRouter 兼容客户端
+- `crates/eros-engine-server/src/pipeline/post_process.rs`——逐轮原文写入路径
+- `crates/eros-engine-server/src/pipeline/dreaming.rs`——dreaming-lite 清扫器
+- `crates/eros-engine-server/src/pipeline/handlers.rs`——检索 + prompt 注入
 - `crates/eros-engine-store/migrations/0003_memory.sql`——schema + 索引 DDL
+- `crates/eros-engine-store/migrations/0006_memory_category.sql`——`category` 列
+- `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql`——`metadata` 列

@@ -50,7 +50,7 @@ fallback_temperature = 0.5
 fallback_max_tokens  = 200
 
 [tasks.<name>]
-model        = "<provider>/<model-id>"      # required; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
+model        = "<provider>/<model-id>"      # optional — absent falls through to [defaults].fallback_model, then the compiled-in default; also accepts an array (round-robin) or table (weighted) — see "Primary model selection"
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
@@ -85,12 +85,13 @@ Field details:
 | `defaults.fallback_model` | `String` | no | Hard fallback if the task config provides no model. If still missing, code uses the compiled-in default `x-ai/grok-4-mini`. |
 | `defaults.fallback_temperature` | `f64` | no | Same precedence; compiled-in default `0.5`. |
 | `defaults.fallback_max_tokens` | `u32` | no | Same precedence; compiled-in default `200`. |
-| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | yes | Primary model. String = fixed; array = round-robin; table = weighted random. See "Primary model selection". |
+| `tasks.<name>.model` | `String` \| `Array<String>` \| `Table<String,f64>` | no | Primary model. String = fixed; array = round-robin; table = weighted random. Absent (or empty) falls through to `defaults.fallback_model`, then the compiled-in default — a `[tasks.<name>]` block with no `model` key parses and boots. Exception: a present `[tasks.chat_voice]` block requires a single fixed, non-empty id and refuses to boot otherwise. See "Primary model selection". |
 | `tasks.<name>.fallback` | `String` | no | Secondary model used by `OpenRouterClient` if the primary call fails. |
+| `tasks.<name>.retry_depth` | `u32` | no | Truncates the resolved `fallback` chain: primary + at most this many fallbacks are ever tried. Defaults: `2` for tasks resolved by the generic `resolve()` (`chat_companion` included; per-tier override allowed), `1` for the single-purpose tasks — see "Fallback truncation (`retry_depth`)". |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
 | `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
-| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, and/or `allow_traits`. Does not override `temperature` or `max_tokens`. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
+| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature` or `max_tokens`. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
@@ -953,6 +954,12 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 ### Fallback dedup
 
 After the primary is selected, any occurrence of that exact id is removed from the resolved `fallback` chain — retrying a model that just failed is wasted. With round-robin/weighted primaries this is dynamic: only the id chosen for that call is dropped.
+
+### Fallback truncation (`retry_depth`)
+
+After deduplication the chain is truncated to `retry_depth` entries — a call tries the primary, then at most `retry_depth` fallbacks; anything past the truncation point is never tried. `retry_depth` is settable task-level, and per tier on the two tier-aware tasks (tier > task default).
+
+The default differs by task. The generic `resolve()` uses `2` (primary + 2 fallbacks — so `chat_companion` tries at most 3 models per streaming chat burst); the single-purpose tasks (`chat_output_filter`, `chat_input_filter`, `chat_vision`, `pde_decision`, `chat_product_qa`, `chat_image_prompt_compose`) use `1` (primary + first fallback).
 
 ## Stability commitments
 

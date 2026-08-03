@@ -26,7 +26,7 @@ curl http://localhost:8080/healthz
 {
   "status": "ok",
   "service": "eros-engine",
-  "version": "0.6.x",
+  "version": "1.0.x",
   "timestamp": "2026-05-05T19:06:05.309302232+00:00"
 }
 ```
@@ -56,6 +56,14 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 可选的 `channel` 字段：`"text"`（默认）或 `"voice"`。开新/恢复是按频道隔离的
 ——语音频道的 start 永远不会恢复一个文本 session，反之亦然。语音客户端必须先
 在这里用 `"channel": "voice"` 拿到 session，才能去调语音轮次端点。
+
+可选的 `instance_id` 字段：显式指定 `persona_instance` id。缺省时服务器为
+所给 `genome_id` 挑选（或自动创建）该用户的 instance；仅当 `instance_id`
+缺省时 `genome_id` 才是必填。
+
+可选的 `is_demo` 字段：把新建的 session 标记为 demo。持久化到 session 的
+`metadata.is_demo`，好感度管线读它来用 `demo_ema_inertia` 替代全局值，
+让好感度条在 demo 的轮次预算内有可见的移动。恢复已有 session 时忽略。
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
@@ -90,7 +98,7 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
-- **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后，可能省略）、`generation_id`（可选的 OpenRouter id）。
+- **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。
 - **`final`** —— 本轮汇总：`lead_score`、`should_show_cta`、`agent_training_level`，外加 `filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。
 
 每个用户最多 3 条并发活跃流。保活心跳（`: ping`）每 15 秒发一次，
@@ -177,6 +185,25 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
         "client_msg_id": "01J3333333333333333333333A",
         "memory_scope": "full",
         "affinity_scope": "bond_and_chemistry"
+      }' \
+  http://localhost:8080/comp/chat/<session_id>/message/stream
+```
+
+**可选：回复锚点（回卷）。** 请求体可附加 `reply_to_message_id` ——
+本 session 内某条 `chat_messages` 行的 UUID，把本轮上下文锚定到那条消息。
+解析成功时，历史回卷到（且包含）那条消息：晚于它发送的行不进入 prompt，
+锚点记录在落库的用户行的 `metadata.reply_to_message_id` 上。传了但解析
+不到（id 不存在，或属于别的 session）不会让请求失败——本轮丢弃历史
+（上下文里只剩当前这条消息），并在该行的 `metadata.reply_to_error` 写入
+`"not_found"`。省略该字段即为正常的最新历史行为。
+
+```bash
+curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+        "content": "等等，说回之前那个计划",
+        "client_msg_id": "01J3333333333333333333333A",
+        "reply_to_message_id": "3cc06c53-9d2e-4f8a-b3c1-0a1b2c3d4e5f"
       }' \
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
@@ -298,9 +325,9 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
 
-### `GET /comp/chat/{session_id}/history?limit=50&offset=0`
+### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
-分頁讀消息歷史，最新在前。
+分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。
 
 ```json
 {
@@ -512,6 +539,15 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 最近一次用户轮次的好感度 delta（post-EMA），供前端做逐轮观测。与
 canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
 `EXPOSE_AFFINITY_DEBUG` 控制（这块归前端所有）——但仍做 JWT + ownership 检查。
+
+查询参数（均可选）：
+
+- `after` —— 长轮询基线：调用方手上已有的 `event_id`。只要该 session 最新的
+  用户轮事件仍等于它（或还没有任何事件），请求就被挂起，直到有更新的事件落库
+  或 `wait` 超时——超时响应返回未变的状态，形状与立即返回路径相同。缺省 ⇒
+  立即返回最新事件。
+- `wait` —— 请求最长挂起多少毫秒。仅在带 `after` 时有意义。默认 10000，
+  服务端上限 25000。
 
 ```json
 {

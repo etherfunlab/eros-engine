@@ -45,17 +45,19 @@ CREATE INDEX idx_memories_session
 
 ## Embedding
 
-`voyage-4-lite` via Voyage's API by default (configurable in `[tasks.embedding]`). 512 dimensions, multilingual.
+`voyage-4-lite` via Voyage's native API by default. 512 dimensions, multilingual — the schema is `VECTOR(512)`, and non-Voyage routes have `dimensions: 512` forced on the wire.
+
+`[tasks.embedding]` picks the route. A `@provider` suffix on `model` sends the calls elsewhere: `@openrouter` uses the built-in OpenRouter embeddings endpoint (URL overridable via `[providers].openrouter.embeddings`), and `@<name>` uses any `[providers]` entry that declares an `embeddings` URL (key read from `<NAME>_API_KEY`). Alternatively a `model_read`/`model_write` pair splits the recall and storage models independently — the pair must appear together, is mutually exclusive with `model`, and is restricted to Voyage models of the voyage-4 series and above, the only lineup guaranteeing one shared vector space across model sizes.
 
 ```rust
-// crates/eros-engine-llm/src/voyage.rs
-pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError>;
-pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, LlmError>;
+// crates/eros-engine-llm/src/embedding.rs — EmbeddingRouter
+pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, LlmError>;    // read backend
+pub async fn embed_document(&self, text: &str) -> Result<Vec<f32>, LlmError>; // write backend
 ```
 
-`embed_document` and `embed_query` use different `input_type` hints to Voyage — documents get optimised for storage retrieval, queries for cosine match. This is why the engine has both methods and not just one.
+`embed_query` serves the per-turn recall path, `embed_document` the storage paths. On the Voyage backend the two become different `input_type` hints (`query` vs `document`); the OpenRouter-compatible wire has no such hint, so there the split only matters when `model_read`/`model_write` actually differ.
 
-The engine **fails loud** on empty `VOYAGE_API_KEY` — boot refuses if the secret is missing. The closed-source eros-gateway has a known regression where an empty key silently disables embeddings; eros-engine declined to inherit that.
+The engine still **fails loud** on missing secrets — but the `VOYAGE_API_KEY` boot gate fires only when the resolved route includes a Voyage backend; OpenRouter and custom routes are gated on their own keys (`OPENROUTER_API_KEY` / `<NAME>_API_KEY`) instead. The closed-source eros-gateway has a known regression where an empty key silently disables embeddings; eros-engine declined to inherit that.
 
 ## Retrieval
 
@@ -71,14 +73,14 @@ CREATE INDEX idx_memories_embedding
 Profile-layer search:
 
 ```sql
-SELECT id, content, 1 - (embedding <=> $2::vector) AS similarity
+SELECT id, session_id, user_id, instance_id, content, category, metadata, created_at
 FROM engine.companion_memories
 WHERE user_id = $1 AND instance_id IS NULL
 ORDER BY embedding <=> $2::vector
 LIMIT $3;
 ```
 
-Relationship-layer search adds `instance_id = $4`. The `1 - distance` lets you sort or threshold on similarity directly without remembering pgvector's distance-not-similarity convention.
+Relationship-layer search filters on `instance_id = $2` instead and adds `content NOT LIKE '%\nAI：%'` (`$3`) to exclude legacy verbatim-transcript rows (issue #113), shifting the embedding to `$4` and the limit to `$5`. No similarity score is computed anywhere — results are ordered by the raw `<=>` cosine distance and retrieval is pure top-K via `LIMIT`; there is no similarity threshold, so the K nearest rows come back regardless of absolute distance.
 
 `lists = 100` is a balanced default for small-to-medium tables (≲ 1M rows). Tune up for larger corpora (rule of thumb: `lists ≈ √rows`).
 
@@ -127,7 +129,13 @@ writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
 
 ## Source
 
-- `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 3 sqlx::test integration tests)
-- `crates/eros-engine-llm/src/voyage.rs` — embedding client
-- `crates/eros-engine-server/src/pipeline/post_process.rs` — write path
+- `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 7 sqlx::test integration tests)
+- `crates/eros-engine-store/src/human_insight.rs` — flat `human_insights` mirror read at injection
+- `crates/eros-engine-llm/src/voyage.rs` — native Voyage client
+- `crates/eros-engine-llm/src/embedding.rs` — `EmbeddingRouter` + OpenRouter-compatible client
+- `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path
+- `crates/eros-engine-server/src/pipeline/dreaming.rs` — dreaming-lite sweeper
+- `crates/eros-engine-server/src/pipeline/handlers.rs` — retrieval + prompt injection
 - `crates/eros-engine-store/migrations/0003_memory.sql` — schema + index DDL
+- `crates/eros-engine-store/migrations/0006_memory_category.sql` — `category` column
+- `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql` — `metadata` column

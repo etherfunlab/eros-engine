@@ -51,6 +51,9 @@ system prompt. Specifically:
   [tasks.chat_companion.tiers.gold]
   allow_traits = ["allow_nsfw", "allow_politics"]
   ```
+  Tier blocks are only valid under `chat_companion` and `chat_output_filter`;
+  a tier block under any other task refuses to boot (see
+  [model-config.md](model-config.md#tier-blocks-are-limited-to-two-tasks)).
 - **Three-state semantics:**
   - `allow_traits` absent — no gating; all traits are injected.
   - `allow_traits = []` — drop all traits.
