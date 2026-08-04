@@ -1,8 +1,6 @@
 # eros-engine
 
-> **An open-source Rust engine for AI companions that feel real: persistent memory, an evolving relationship model, and a decision engine that keeps a persona in character across thousands of turns.**
->
-> `eros-engine` is the companion-chat core behind [Eros Chat](https://chat.etherfun.xyz), extracted into a standalone service. It turns conversation into durable state — a structured user profile, two-layer long-term memory, and a six-dimensional affinity model — so a persona behaves like the same person each time a user comes back.
+**An open-source Rust engine for AI companions that feel real: persistent memory, an evolving relationship model, and a decision engine that keeps a persona in character across thousands of turns.**
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -13,7 +11,7 @@
 
 **English** · [中文](README.zh.md) · [日本語](README.ja.md)
 
-## Why this exists
+## Highlights
 
 Most AI character apps treat memory as text appended to a prompt and relationship as a paragraph of instructions. That can work in a demo, but behavior drifts over long sessions, breaks character, and becomes hard to debug. `eros-engine` moves those concerns into explicit, inspectable state, so a companion feels like **a real person** — remembering you and responding to the state of the relationship — and **stays in character** turn after turn, because behavior is *decided*, not improvised.
 

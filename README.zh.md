@@ -1,8 +1,6 @@
 # eros-engine
 
-> **一个让 AI 伴侣如真人般鲜活的开源 Rust 引擎：具备持久记忆、持续演变的关系模型，以及让人设历经数千轮对话仍保持一致的决策引擎。**
->
-> `eros-engine` 是 [Eros Chat](https://chat.etherfun.xyz) 背后的伴侣对话核心，现已抽离为独立服务。它将对话转化为持久状态——结构化用户画像、双层长期记忆和六维亲密度模型——让用户每次回来时，角色都像始终如一的同一个人。
+**一个让 AI 伴侣如真人般鲜活的开源 Rust 引擎：具备持久记忆、持续演变的关系模型，以及让人设历经数千轮对话仍保持一致的决策引擎。**
 
 [![CI](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/etherfunlab/eros-engine/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -13,7 +11,7 @@
 
 [English](README.md) · **中文** · [日本語](README.ja.md)
 
-## 为什么做这个
+## 亮点
 
 大多数 AI 角色应用只是将记忆作为文本附加到 prompt 中，并用一段指令描述关系。这种做法或许足以演示，但在长会话中，行为会逐渐漂移、偏离人设，而且难以调试。`eros-engine` 将这些要素转化为明确、可检查的状态，使伴侣**如真人一般**——记得你，也会根据当前的关系状态作出反应——并在一轮又一轮对话中**始终符合人设**，因为行为是经过*决策*的，而非临场发挥。
 
