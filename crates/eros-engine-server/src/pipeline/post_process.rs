@@ -454,9 +454,7 @@ fn parse_affinity_eval(
     String,
 ) {
     use eros_engine_core::affinity::AffinityDeltas;
-    let parsed: Option<LlmAffinityEval> = serde_json::from_str(raw)
-        .ok()
-        .or_else(|| super::find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()));
+    let parsed: Option<LlmAffinityEval> = super::parse_llm_json(raw);
     let Some(e) = parsed else {
         return (AffinityDeltas::default(), None, String::new());
     };
@@ -920,9 +918,7 @@ async fn extract_facts(
     };
 
     // Parse once; distinguish parse_error (no JSON at all) from empty/ok.
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .or_else(|| super::find_json_block(&raw).and_then(|b| serde_json::from_str(b).ok()));
+    let parsed = super::parse_llm_json::<serde_json::Value>(&raw);
     match parsed {
         Some(v) => {
             let facts = extract_facts_array(&v);

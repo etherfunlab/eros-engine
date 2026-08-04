@@ -94,6 +94,15 @@ pub(super) fn find_json_block(raw: &str) -> Option<&str> {
     None
 }
 
+/// Parse an LLM reply expected to contain a JSON object of type `T`: try the
+/// whole text first, then fall back to the balanced `{…}` block (via
+/// `find_json_block`) for replies that fence or prose-wrap their JSON.
+pub(super) fn parse_llm_json<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    serde_json::from_str::<T>(raw)
+        .ok()
+        .or_else(|| find_json_block(raw).and_then(|b| serde_json::from_str::<T>(b).ok()))
+}
+
 pub async fn compute_signals_for_session(
     pool: &sqlx::PgPool,
     session_id: Uuid,
@@ -339,5 +348,48 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(block).unwrap();
         assert_eq!(v["a"], "b}c");
         assert_eq!(v["d"]["e"], 1);
+    }
+
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct ParseProbe {
+        verdict: String,
+        score: i32,
+    }
+
+    #[test]
+    fn parse_llm_json_accepts_pure_json() {
+        let raw = r#"{"verdict":"pass","score":3}"#;
+        let parsed: ParseProbe = super::parse_llm_json(raw).unwrap();
+        assert_eq!(
+            parsed,
+            ParseProbe {
+                verdict: "pass".into(),
+                score: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parse_llm_json_falls_back_to_embedded_block() {
+        let raw = "Sure! Here is the result:\n```json\n{\"verdict\":\"fail\",\"score\":-2}\n```\nHope that helps.";
+        let parsed: ParseProbe = super::parse_llm_json(raw).unwrap();
+        assert_eq!(
+            parsed,
+            ParseProbe {
+                verdict: "fail".into(),
+                score: -2
+            }
+        );
+    }
+
+    #[test]
+    fn parse_llm_json_none_when_no_json() {
+        assert!(super::parse_llm_json::<ParseProbe>("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_llm_json_none_when_shape_mismatch() {
+        // Valid JSON block, wrong shape: the fallback must also fail typed.
+        assert!(super::parse_llm_json::<ParseProbe>(r#"prose {"other": 1} prose"#).is_none());
     }
 }

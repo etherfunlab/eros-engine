@@ -578,6 +578,7 @@ fn drive_chat_burst(
                 };
                 let effective_ghost = is_ghost_fallback || regex_ghost;
 
+                let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     id: msg_uuid,
@@ -586,7 +587,7 @@ fn drive_chat_burst(
                     continues_from_message_id: continues_from.map(Into::into),
                     truncated,
                     model: Some(model_id.clone()),
-                    usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                    usage: usage_full.clone(),
                     generation_id: last_gen_id.clone(),
                     filter_audit,
                     metadata: if is_ghost_fallback {
@@ -612,7 +613,7 @@ fn drive_chat_burst(
                 // Strip OPENROUTER_USAGE_HIDDEN_KEYS from the wire usage. The DB
                 // row above persists the full unfiltered usage; only the frame is
                 // filtered (mirrors the sync send_message path).
-                let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                let mut wire_usage = usage_full;
                 filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
                 yield ProtocolFrame::Done {
                     message_id: ulid_string(msg_ulid),
@@ -873,6 +874,8 @@ fn drive_chat_burst(
                     // "empty_completion" so ops can tell the two apart.
                     let msg_ulid = Ulid::new();
                     let msg_uuid: Uuid = msg_ulid.into();
+                    let usage_full =
+                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
                     let row = eros_engine_store::chat::AssistantInsert {
                         id: msg_uuid,
                         content: String::new(),
@@ -880,7 +883,7 @@ fn drive_chat_burst(
                         continues_from_message_id: None,
                         truncated: false,
                         model: Some(model_id.clone()),
-                        usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        usage: usage_full.clone(),
                         generation_id: last_gen_id.clone(),
                         filter_audit: None,
                         metadata: ghost_fallback_metadata(build_metadata(None), "empty_completion"),
@@ -923,8 +926,7 @@ fn drive_chat_burst(
                     // on an otherwise-empty completion) — same wire contract as the
                     // other served Done frames; the DB row above already persisted
                     // the full unfiltered usage.
-                    let mut wire_usage =
-                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    let mut wire_usage = usage_full;
                     filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
                     yield ProtocolFrame::Done {
                         message_id: ulid_string(msg_ulid),
@@ -1128,6 +1130,7 @@ fn drive_chat_burst(
                 };
             }
 
+            let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             let row = eros_engine_store::chat::AssistantInsert {
                 id: msg_uuid,
                 content: visible.clone(),
@@ -1135,7 +1138,7 @@ fn drive_chat_burst(
                 continues_from_message_id: None,
                 truncated: false,
                 model: Some(model_id.clone()),
-                usage: last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                usage: usage_full.clone(),
                 generation_id: last_gen_id.clone(),
                 filter_audit,
                 metadata: if is_ghost {
@@ -1157,7 +1160,7 @@ fn drive_chat_burst(
                 action: plan_action,
             });
 
-            let mut wire_usage = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            let mut wire_usage = usage_full;
             filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
             if is_ghost {
                 outcome.lock().unwrap().ghost_fallback = true;
@@ -1483,12 +1486,7 @@ struct InputFilterVerdict {
 /// Parse the filter reply into a verdict: direct JSON first, then a balanced
 /// JSON block embedded in prose (mirrors post_process extraction parsing).
 fn parse_input_filter_verdict(text: &str) -> Option<InputFilterVerdict> {
-    serde_json::from_str::<InputFilterVerdict>(text)
-        .ok()
-        .or_else(|| {
-            super::find_json_block(text)
-                .and_then(|b| serde_json::from_str::<InputFilterVerdict>(b).ok())
-        })
+    super::parse_llm_json(text)
 }
 
 // ── PDE judge primitives ──────────────────────────────────────────────────────
@@ -1540,9 +1538,7 @@ pub(crate) struct PdeVerdict {
 /// Parse the judge reply: direct JSON first, then a balanced JSON block in prose
 /// (mirrors `parse_input_filter_verdict`).
 fn parse_pde_verdict(text: &str) -> Option<PdeVerdict> {
-    serde_json::from_str::<PdeVerdict>(text).ok().or_else(|| {
-        super::find_json_block(text).and_then(|b| serde_json::from_str::<PdeVerdict>(b).ok())
-    })
+    super::parse_llm_json(text)
 }
 
 const INNER_STATE_MAX_CHARS: usize = 200;
@@ -2033,9 +2029,7 @@ struct ImageVision {
 /// Parse the describe reply: direct JSON first, then a balanced JSON block
 /// embedded in prose (mirrors `parse_input_filter_verdict`).
 fn parse_image_vision(text: &str) -> Option<ImageVision> {
-    serde_json::from_str::<ImageVision>(text).ok().or_else(|| {
-        super::find_json_block(text).and_then(|b| serde_json::from_str::<ImageVision>(b).ok())
-    })
+    super::parse_llm_json(text)
 }
 
 /// Validity gate for a parsed describe. Reject a `content_filter` finish reason,
@@ -2418,9 +2412,7 @@ struct ComposeReply {
 ///
 /// A blank caption is normalised to `None`; callers must not persist `""`.
 pub(crate) fn parse_compose_reply(raw: &str) -> (String, Option<String>) {
-    let parsed = serde_json::from_str::<ComposeReply>(raw).ok().or_else(|| {
-        super::find_json_block(raw).and_then(|b| serde_json::from_str::<ComposeReply>(b).ok())
-    });
+    let parsed = super::parse_llm_json::<ComposeReply>(raw);
     match parsed {
         Some(r) => {
             let caption = r

@@ -185,9 +185,7 @@ fn story_response_format() -> serde_json::Value {
 /// Warns (once per round) on unknown insight keys — the fixed field list is
 /// the contract; unknown keys are dropped by the typed deserialize.
 fn parse_story_output(raw: &str) -> Option<StoryOutput> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .ok()
-        .or_else(|| super::find_json_block(raw).and_then(|b| serde_json::from_str(b).ok()))?;
+    let value: serde_json::Value = super::parse_llm_json(raw)?;
     if let Some(obj) = value.get("insight").and_then(|v| v.as_object()) {
         let unknown: Vec<&str> = obj
             .keys()
