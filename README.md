@@ -13,7 +13,7 @@
 
 ## Highlights
 
-Most AI character apps eventually forget who you are. Their relationships reset to whatever fits in a prompt, and their personalities drift as the conversation grows. We built `eros-engine` to make those parts durable: a companion remembers you across sessions, the relationship changes through interaction, and each reply is chosen in character rather than improvised by a generic assistant.
+Most AI character apps eventually forget who you are. Their relationships reset to whatever fits in a prompt, and their personalities drift as the conversation grows. `eros-engine` makes those parts durable: a companion remembers you across sessions, the relationship changes through interaction, and each reply is chosen in character rather than improvised by a generic assistant.
 
 The engine has five foundations:
 
