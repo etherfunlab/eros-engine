@@ -13,7 +13,11 @@ The CLA grants etherfunlab the right to relicense your contribution. This is req
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-docker compose -f docker/docker-compose.yml up -d postgres
+docker run -d --name eros-pg -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=eros_engine_test \
+  pgvector/pgvector:pg16
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/eros_engine_test
+cargo run -p eros-engine-server -- migrate
 cargo test --workspace
 ```
 
