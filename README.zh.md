@@ -13,7 +13,7 @@
 
 ## 亮点
 
-大多数 AI 角色应用用不了多久就会忘记你。关系被压缩成 prompt 里的一段文字，聊得越久，人设越容易漂移。我做 `eros-engine`，就是想把这些真正重要的部分保存下来：伴侣能跨会话记住你，关系会随着相处而变化，每次回复也会依照人设作出决定，而不是让一个通用助手临场发挥。
+大多数 AI 角色应用用不了多久就会忘记你。关系被压缩成 prompt 里的一段文字，聊得越久，人设越容易漂移。我们做 `eros-engine`，就是想把这些真正重要的部分保存下来：伴侣能跨会话记住你，关系会随着相处而变化，每次回复也会依照人设作出决定，而不是让一个通用助手临场发挥。
 
 引擎建立在五项基础能力之上：
 
@@ -56,8 +56,8 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 ```toml
 [dependencies]
 eros-engine-core  = "1.0"
-eros-engine-store = "1.0"   # 可选：Postgres + pgvector 持久化
-eros-engine-llm   = "1.0"   # 可选：模型与 embedding 客户端
+eros-engine-store = "1.0"   # optional: Postgres + pgvector persistence
+eros-engine-llm   = "1.0"   # optional: model and embedding clients
 ```
 
 `eros-engine-server` 不发布到 crates.io，请使用 Docker 镜像运行。
@@ -68,7 +68,7 @@ eros-engine-llm   = "1.0"   # 可选：模型与 embedding 客户端
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:1.0.1
-# 或跟随最新的正式版本
+# Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
@@ -99,7 +99,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # 填写 DATABASE_URL、模型路由所需的密钥和一个鉴权来源
+cp .env.example .env   # Set DATABASE_URL, the keys required by your model routes, and one auth source
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas

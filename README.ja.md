@@ -13,15 +13,15 @@
 
 ## ハイライト
 
-多くの AI キャラクターアプリは、やがてあなたを忘れます。関係性はプロンプトに収まる文章へ戻り、会話が長くなるほど人物像もぶれていきます。`eros-engine` は、そこを持続させるために作りました。コンパニオンはセッションをまたいであなたを覚え、交流とともに関係が変わり、汎用アシスタントの即興ではなく、その人物らしい判断から返信します。
+多くの AI キャラクターアプリは、やがてあなたを忘れます。関係性はプロンプトに収まる文章へ戻り、会話が長くなるほど人物像もぶれていきます。私たちは、そこを持続させるために `eros-engine` を作りました。コンパニオンはセッションをまたいであなたを覚え、交流とともに関係が変わり、汎用アシスタントの即興ではなく、その人物らしい判断から返信します。
 
 土台となるのは次の 5 つです。
 
 - 🧠 **2 層の記憶** — 安定したユーザー情報と、共有した出来事、過去への言及、続きのある話題をそれぞれ保持します。→ [Memory layers](docs/memory-layers.md)
 - 💞 **変化する親密度** — 6 つの関係軸が滑らかに変化し、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
-- 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、LLM による判定も任意で使えます。→ [Model config](docs/model-config.md)
+- 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、LLM judge も任意で使えます。→ [Model config](docs/model-config.md)
 - 🧩 **構造化されたユーザー理解** — 検索可能なプロフィールを育て、導入体験、パーソナライズ、分析などに活用できます。→ [API reference](docs/api-reference.md)
-- ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、プロンプト特性、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、`prompt_traits`、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
 汎用エージェントフレームワークではありません。同じ人物が同じユーザーを時間をかけて知っていくプロダクトのための、状態を持つ中核です。AI コンパニオン、日記、コーチ、語学チューター、キャラクターチャットに向いています。
 
@@ -56,8 +56,8 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 ```toml
 [dependencies]
 eros-engine-core  = "1.0"
-eros-engine-store = "1.0"   # 任意：Postgres + pgvector による永続化
-eros-engine-llm   = "1.0"   # 任意：モデルと embedding のクライアント
+eros-engine-store = "1.0"   # optional: Postgres + pgvector persistence
+eros-engine-llm   = "1.0"   # optional: model and embedding clients
 ```
 
 `eros-engine-server` は crates.io では公開していません。Docker イメージで実行してください。
@@ -68,7 +68,7 @@ eros-engine-llm   = "1.0"   # 任意：モデルと embedding のクライアン
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:1.0.1
-# または最新の正式リリースを利用
+# Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
@@ -90,7 +90,7 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 - [Prompt traits](docs/prompt-traits.md) — リクエストごとのプロンプト調整と tier の許可リスト。
 - [LLM / OpenRouter audit](docs/llm-audit.md) — ユーザー・セッション単位の帰属情報。
 - [Deploying](docs/deploying.md) — Docker、Postgres、認証、運用。
-- [API reference](docs/api-reference.md) — ルート、リクエスト形式、SSE フレーム。
+- [API reference](docs/api-reference.md) — ルート、リクエスト schema、SSE frame。
 
 ## クイックスタート
 
@@ -99,7 +99,7 @@ Rust、`pgvector` を導入した Postgres 16+、認証元が 1 つ必要です�
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # DATABASE_URL、モデル経路に必要なキー、認証元を 1 つ設定
+cp .env.example .env   # Set DATABASE_URL, the keys required by your model routes, and one auth source
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
@@ -110,7 +110,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 概要
 
-基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。履歴、セッション、プロフィール、任意の親密度デバッグ用ルートもあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。パス、データ形式、ストリームの各フレームは [API reference](docs/api-reference.md) を参照してください。
+基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。履歴、セッション、プロフィール、任意の親密度デバッグ用ルートもあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。パス、ペイロード、ストリームの各 frame は [API reference](docs/api-reference.md) を参照してください。
 
 ## 設定
 
