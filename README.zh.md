@@ -94,12 +94,12 @@ docker run --rm -p 8080:8080 --env-file .env \
 
 ## 快速开始
 
-你需要 Rust、带 `pgvector` 的 Postgres 16+，以及一个鉴权来源。默认模型配置使用 OpenRouter 和 Voyage；embedding 也可路由到其他提供方，只有在读取和写入均不再使用 Voyage 时，才无需 `VOYAGE_API_KEY`。
+你需要 Rust、带 `pgvector` 的 Postgres 16+、一个 OpenRouter API key，以及一个鉴权来源。默认 embedding 路由使用 Voyage；embedding 也可路由到其他提供方，只有在读取和写入均不再使用 Voyage 时，才无需 `VOYAGE_API_KEY`。
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # Set DATABASE_URL, the keys required by your model routes, and one auth source
+cp .env.example .env   # Set DATABASE_URL, OPENROUTER_API_KEY, VOYAGE_API_KEY, and one auth source
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
@@ -114,14 +114,14 @@ cargo run -p eros-engine-server -- serve
 
 ## 配置
 
-至少需要设置 `DATABASE_URL`、一个身份验证来源，以及所选模型路由需要的 API key。OpenRouter 是内置默认提供方；`[providers]` 可加入兼容 OpenAI 的聊天和 embedding 端点。默认 Voyage embedding 配置需要 `VOYAGE_API_KEY`，除非 `[tasks.embedding]` 将读取和写入都路由到其他提供方。
+至少需要设置 `DATABASE_URL`、一个身份验证来源，以及 `OPENROUTER_API_KEY`——OpenRouter 是内置默认提供方，启动时始终需要它的 key。`[providers]` 可加入兼容 OpenAI 的聊天和 embedding 端点，各用各的 key；默认 Voyage embedding 配置需要 `VOYAGE_API_KEY`，除非 `[tasks.embedding]` 将读取和写入都路由到其他提供方。
 
 完整环境变量见 [`.env.example`](.env.example)，运维说明见[部署](docs/deploying.zh.md)，路由细节见[模型配置](docs/model-config.zh.md)。
 
 ## 路线图
 
 - [ ] **多角色实验场**——多个 AI 人设在同一会话中彼此互动，也与用户互动。
-- [ ] **语音消息**与**实时语音对话**。
+- [ ] **语音消息**与**原生音频 I/O**——低延迟的语音回合 API 已经就位，STT/TTS 目前由调用方负责。
 - [ ] **视频生成**——由伴侣发送短视频片段。
 
 ## 非目标

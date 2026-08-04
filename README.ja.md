@@ -94,12 +94,12 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 
 ## クイックスタート
 
-Rust、`pgvector` を導入した Postgres 16+、認証元が 1 つ必要です。標準のモデル設定は OpenRouter と Voyage を使います。embedding は別の提供元にも振り分けられ、読み取りと書き込みの両方を Voyage から外した場合に限り `VOYAGE_API_KEY` は不要です。
+Rust、`pgvector` を導入した Postgres 16+、OpenRouter API キー、認証元が 1 つ必要です。標準の embedding 経路は Voyage を使います。embedding は別の提供元にも振り分けられ、読み取りと書き込みの両方を Voyage から外した場合に限り `VOYAGE_API_KEY` は不要です。
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # Set DATABASE_URL, the keys required by your model routes, and one auth source
+cp .env.example .env   # Set DATABASE_URL, OPENROUTER_API_KEY, VOYAGE_API_KEY, and one auth source
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
@@ -114,14 +114,14 @@ cargo run -p eros-engine-server -- serve
 
 ## 設定
 
-最低限、`DATABASE_URL`、認証元を 1 つ、選択したモデル経路に必要な API キーを設定します。OpenRouter が組み込みの標準提供元です。`[providers]` では OpenAI 互換のチャット・embedding エンドポイントを追加できます。標準の Voyage embedding 構成には `VOYAGE_API_KEY` が必要ですが、`[tasks.embedding]` で読み取りと書き込みを両方とも別の提供元へ振り分けた場合は不要です。
+最低限、`DATABASE_URL`、認証元を 1 つ、そして `OPENROUTER_API_KEY` を設定します。OpenRouter は組み込みの標準提供元で、その API キーは起動時に必ず必要です。`[providers]` では OpenAI 互換のチャット・embedding エンドポイントをそれぞれのキーで追加できます。標準の Voyage embedding 構成には `VOYAGE_API_KEY` が必要ですが、`[tasks.embedding]` で読み取りと書き込みを両方とも別の提供元へ振り分けた場合は不要です。
 
 環境変数の全一覧は [`.env.example`](.env.example)、運用情報は [Deploying](docs/deploying.md)、ルーティングの詳細は [Model config](docs/model-config.md) にあります。
 
 ## ロードマップ
 
 - [ ] **複数ペルソナの実験環境** — 同じセッションで複数の AI ペルソナが互いに、またユーザーと会話する仕組み。
-- [ ] **音声メッセージ**と**リアルタイム音声会話**。
+- [ ] **音声メッセージ**と**ネイティブ音声 I/O** — 低遅延の音声ターン API は提供済みで、STT/TTS は現在呼び出し側の担当です。
 - [ ] **動画生成** — コンパニオンから短い動画を送信。
 
 ## スコープ外

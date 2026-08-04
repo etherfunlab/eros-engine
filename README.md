@@ -94,12 +94,12 @@ Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed
 
 ## Quickstart
 
-You need Rust, Postgres 16+ with `pgvector`, and one auth source. OpenRouter and Voyage power the default model configuration; embeddings can be routed to other providers instead, and once both embedding reads and writes leave Voyage, `VOYAGE_API_KEY` is no longer needed.
+You need Rust, Postgres 16+ with `pgvector`, an OpenRouter API key, and one auth source. Voyage powers the default embedding route; embeddings can be routed to other providers instead, and once both embedding reads and writes leave Voyage, `VOYAGE_API_KEY` is no longer needed.
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # Set DATABASE_URL, the keys required by your model routes, and one auth source
+cp .env.example .env   # Set DATABASE_URL, OPENROUTER_API_KEY, VOYAGE_API_KEY, and one auth source
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
@@ -114,14 +114,14 @@ The main flow is simple: start a persona session, then send turns to the SSE str
 
 ## Configuration
 
-At minimum, configure `DATABASE_URL`, one authentication source, and the API keys used by your selected model routes. OpenRouter is built in as the default. `[providers]` adds OpenAI-compatible endpoints for chat and embeddings; the default Voyage embedding setup requires `VOYAGE_API_KEY`, unless `[tasks.embedding]` routes both reads and writes elsewhere.
+At minimum, configure `DATABASE_URL`, one authentication source, and `OPENROUTER_API_KEY` — OpenRouter is the built-in default and its key is always required at boot. `[providers]` adds OpenAI-compatible endpoints for chat and embeddings, each with its own key; the default Voyage embedding setup requires `VOYAGE_API_KEY`, unless `[tasks.embedding]` routes both reads and writes elsewhere.
 
 The complete environment list is in [`.env.example`](.env.example), operational guidance in [Deploying](docs/deploying.md), and routing details in [Model config](docs/model-config.md).
 
 ## Roadmap
 
 - [ ] **Agents playground** — multiple personas sharing a session with each other and the user.
-- [ ] **Voice messages** and **real-time voice conversation**.
+- [ ] **Voice messages** and **native audio I/O** — the low-latency voice-turn API already ships; STT/TTS currently stay on the caller's side.
 - [ ] **Video generation** for companion-sent clips.
 
 ## Non-goals
