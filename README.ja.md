@@ -13,17 +13,17 @@
 
 ## ハイライト
 
-多くの AI キャラクターアプリでは、記憶をプロンプトに追加するテキストとして扱い、関係性を一段落の指示で表現しています。デモでは機能しても、長いセッションでは振る舞いが徐々にずれ、キャラクター性が崩れ、デバッグも困難になります。`eros-engine` はこれらを明示的で検査可能な状態へ移すことで、コンパニオンを**本物の人間のように**感じさせます。コンパニオンはあなたを覚え、現在の関係性に応じて反応します。また、振る舞いは即興ではなく*決定*されるため、何ターン重ねても**キャラクター性を維持**します。
+多くの AI キャラクターアプリは、やがてあなたを忘れます。関係性はプロンプトに収まる文章へ戻り、会話が長くなるほど人物像もぶれていきます。`eros-engine` は、そこを持続させるために作りました。コンパニオンはセッションをまたいであなたを覚え、交流とともに関係が変わり、汎用アシスタントの即興ではなく、その人物らしい判断から返信します。
 
-これを支えるのが、次の 5 つの柱です。
+土台となるのは次の 5 つです。
 
-- 🧠 **2 層の記憶** — プロフィール記憶（安定したユーザー情報）と関係記憶（共有した出来事、過去の話題への言及、未完了の話題）を Postgres + pgvector に保存し、セッションやペルソナをまたいでコンパニオンがあなたを記憶できるようにします。→ [Memory layers](docs/memory-layers.md)
-- 💞 **6 軸の親密度 + ghost mechanics** — 数値化された関係ベクトル（warmth、trust、intimacy、intrigue、patience、tension）を EMA による平滑化とリアルタイム減衰で更新します。時間とともに口調、会話の深さ、振る舞いを変化させ、*返信しない*という判断さえ可能にします。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
-- 🎭 **Persona Decision Engine (PDE)** — 各ターンの行動（返信、ghost、写真送信）と内的状態を選択します。デフォルトではルールベースで、任意に LLM judge を有効化できます。汎用アシスタントのような口調ではなく、人間らしくキャラクターに沿った返信を維持する仕組みです。judge の呼び出しは `companion_decision_events` に監査記録されます。→ [Model config](docs/model-config.md)
-- 🧩 **構造化されたユーザーインサイト** — 都市、職業、興味、MBTI signals、感情的ニーズ、生活リズム、マッチング設定を JSONB プロフィールとして保持し、重み付きの `training_level` を付与します。下流プロダクトからクエリし、マッチメイキング、オンボーディング、分析、gating に利用できます。→ [API reference](docs/api-reference.md)
-- ⚡ **流暢なコンパニオンチャットのための設計** — トークン単位の SSE ストリーミング、画像理解（ユーザーからの写真送信）、コンパニオンによる画像生成（`reply_image` / `reply_text_image`）、リクエスト単位の `prompt_traits` と tier、OpenRouter ベースのルーティングを備えています。タスクごとのモデル選択（固定 / ラウンドロビン / 加重とフォールバックチェーン）と、すべての呼び出しに対する監査にも対応します。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- 🧠 **2 層の記憶** — 安定したユーザー情報と、共有した出来事、過去への言及、続きのある話題をそれぞれ保持します。→ [Memory layers](docs/memory-layers.md)
+- 💞 **変化する親密度** — 6 つの関係軸が滑らかに変化し、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、LLM による判定も任意で使えます。→ [Model config](docs/model-config.md)
+- 🧩 **構造化されたユーザー理解** — 検索可能なプロフィールを育て、導入体験、パーソナライズ、分析などに活用できます。→ [API reference](docs/api-reference.md)
+- ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、プロンプト特性、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 
-これは汎用エージェントフレームワークではありません。同じペルソナが同じユーザーと複数のセッションにわたって会話するプロダクトに特化したエンジンです。AI コンパニオン、ジャーナリングコンパニオン、コーチングエージェント、語学チューター、キャラクターチャットなどに適しています。
+汎用エージェントフレームワークではありません。同じ人物が同じユーザーを時間をかけて知っていくプロダクトのための、状態を持つ中核です。AI コンパニオン、日記、コーチ、語学チューター、キャラクターチャットに向いています。
 
 ## アーキテクチャ
 
@@ -43,18 +43,9 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
-ワークスペースは 4 つの crate に分かれています。
+4 つの crate が、ドメインロジック、モデル接続、永続化、HTTP サービスを分担します。`eros-engine-server` を API として動かすことも、`core + llm + store` を独自の Rust サービスへ組み込むこともできます。境界とデータフローは [Architecture](docs/architecture.md) を参照してください。
 
-| Crate | 役割 |
-|---|---|
-| `eros-engine-core` | 純粋なドメインロジック：親密度の計算、ghost の判定、PDE、ペルソナ型。I/O はありません。 |
-| `eros-engine-llm` | OpenRouter チャットクライアント、Voyage embedding クライアント、TOML モデル設定ローダー。 |
-| `eros-engine-store` | Postgres + pgvector による永続化。すべてのテーブルは `engine` schema 配下に置かれます。 |
-| `eros-engine-server` | Axum HTTP サービス、Supabase JWT ミドルウェア、OpenAPI ドキュメント、pipeline の接続処理。 |
-
-`eros-engine-server` を HTTP API として実行することも、`core + llm + store` を独自の Rust サービスへ直接組み込むこともできます。crate の境界、pipeline の各フェーズ、データフローについては、[Architecture](docs/architecture.md) を参照してください。
-
-## ライブラリとして使う
+## ライブラリ利用
 
 3 つのライブラリ crate は crates.io で公開されています（[core](https://crates.io/crates/eros-engine-core) · [store](https://crates.io/crates/eros-engine-store) · [llm](https://crates.io/crates/eros-engine-llm)）。
 
@@ -65,106 +56,88 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 ```toml
 [dependencies]
 eros-engine-core  = "1.0"
-eros-engine-store = "1.0"   # only if you want the Postgres + pgvector layer
-eros-engine-llm   = "1.0"   # only if you want the OpenRouter + Voyage clients
+eros-engine-store = "1.0"   # 任意：Postgres + pgvector による永続化
+eros-engine-llm   = "1.0"   # 任意：モデルと embedding のクライアント
 ```
 
-`eros-engine-server` は意図的に crates.io では公開していません。Docker イメージとして実行してください（下記参照）。
+`eros-engine-server` は crates.io では公開していません。Docker イメージで実行してください。
 
-## Docker イメージとして実行する
+## Docker イメージ
 
-`eros-engine-server` のマルチアーキテクチャイメージ（`linux/amd64` + `linux/arm64`）は、`v*` タグごとに GitHub Container Registry へ公開されます。
+各 `v*` タグについて、複数アーキテクチャ対応のイメージを GitHub Container Registry へ公開しています。
 
 ```bash
 docker pull ghcr.io/etherfunlab/eros-engine:1.0.1
-# or track the latest tagged release
+# または最新の正式リリースを利用
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
-
-最小構成での実行例です（Postgres と独自の `.env` が必要です）。
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
   ghcr.io/etherfunlab/eros-engine:1.0.1 serve
 ```
 
-このイメージのビルドには、同じ `docker/Dockerfile` が使われています。任意のコンテナホストにデプロイできます。詳細は [Deploying](docs/deploying.md) を参照してください。
+Postgres と `.env` は利用者側で用意してください。同じ `docker/Dockerfile` を任意のコンテナ環境へ配備できます。詳細は [Deploying](docs/deploying.md) を参照してください。
 
 ## ドキュメント
 
-- [Architecture](docs/architecture.md) — crate の境界、pipeline の各フェーズ、データフロー。
-- [Affinity model](docs/affinity-model.md) — 6 つの次元、EMA、時間減衰、関係ラベル。
-- [Ghost mechanics](docs/ghost-mechanics.md) — スコア式、保護ルール、例。
-- [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、Voyage、pgvector による検索。
-- [World system](docs/world-system.md) — 実験的なオーナー単位のペルソナワールド：World Memories のシミュレーションとリコール注入、World Town のソーシャルフィード。
-- [Model config](docs/model-config.md) — `model_config.toml` schema、すべてのタスク（chat、vision、image generation、PDE、filters、extraction）、モデル選択、マルチプロバイダールーティング（`[providers]`）、0.x の安定性に関する方針。
-- [Prompt traits](docs/prompt-traits.md) — リクエスト単位の system prompt 注入と tier の許可リスト。
-- [LLM / OpenRouter audit](docs/llm-audit.md) — ユーザー単位 / セッション単位の attribution の受け渡し。
-- [Deploying](docs/deploying.md) — Docker、独自の Postgres / IdP、運用向け環境変数。
-- [API reference](docs/api-reference.md) — すべての `/comp/*` endpoint、リクエストフィールド、SSE frame layout。
+- [Architecture](docs/architecture.md) — crate の境界、処理段階、データフロー。
+- [Affinity model](docs/affinity-model.md) — 関係軸、平滑化、減衰、関係ラベル。
+- [Ghost mechanics](docs/ghost-mechanics.md) — コンパニオンが沈黙する条件と理由。
+- [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、embedding、検索。
+- [World system](docs/world-system.md) — 実験的な World Memories、World Town、World Stories のシミュレーション。
+- [Model config](docs/model-config.md) — タスク、モデル選択、フォールバック、`[providers]` による複数提供元へのルーティング。
+- [Prompt traits](docs/prompt-traits.md) — リクエストごとのプロンプト調整と tier の許可リスト。
+- [LLM / OpenRouter audit](docs/llm-audit.md) — ユーザー・セッション単位の帰属情報。
+- [Deploying](docs/deploying.md) — Docker、Postgres、認証、運用。
+- [API reference](docs/api-reference.md) — ルート、リクエスト形式、SSE フレーム。
 
 ## クイックスタート
 
-前提条件：Rust ツールチェーン（`rust-toolchain.toml`）、`pgvector` を導入した Postgres 16+、OpenRouter API key、Voyage API key、そして認証元を 1 つ（Supabase JWKS（`SUPABASE_URL`）または旧来の `SUPABASE_JWT_SECRET`）、あるいは独自の `AuthValidator`。
+Rust、`pgvector` を導入した Postgres 16+、認証元が 1 つ必要です。標準のモデル設定は OpenRouter と Voyage を使います。embedding は別の提供元にも振り分けられ、読み取りと書き込みの両方を Voyage から外した場合に限り `VOYAGE_API_KEY` は不要です。
 
 ```bash
 git clone https://github.com/etherfunlab/eros-engine
 cd eros-engine
-cp .env.example .env   # fill in DATABASE_URL, OPENROUTER_API_KEY, VOYAGE_API_KEY, and one auth source
+cp .env.example .env   # DATABASE_URL、モデル経路に必要なキー、認証元を 1 つ設定
 
 cargo run -p eros-engine-server -- migrate
 cargo run -p eros-engine-server -- seed-personas examples/personas
 cargo run -p eros-engine-server -- serve
 ```
 
-サーバーはデフォルトで `0.0.0.0:8080` で待ち受けます。Scalar API ドキュメントは `/docs` にあります。生の OpenAPI JSON は `print-openapi` サブコマンドで出力してください。公式の Eros Chat Web クライアントはクローズドソースです。独自の UI を用意するか、crate を別のサービスへ組み込んでください。
+サーバーは標準で `0.0.0.0:8080` を使用し、Scalar API ドキュメントは `/docs` にあります。公式 Eros Chat Web クライアントは非公開です。独自の UI を用意するか、crate を別のサービスへ組み込んでください。
 
 ## API 概要
 
-デフォルトでは、すべての `/comp/*` ルートに `Authorization: Bearer <Supabase JWT>` が必要です（他の identity provider には、差し替え可能な `AuthValidator` trait で対応できます）。主な endpoint は次のとおりです。
-
-- `POST /comp/chat/start` — ペルソナとのチャットセッションを開始します。
-- `POST /comp/chat/{session_id}/message/stream` — **中心となる**チャットターンの endpoint です。トークン単位の Server-Sent Events を返します。ターンごとの任意フィールドには、`tier`、`prompt_traits`、`audit`、`tips_amount_usd`（コンパニオンへの tip）、`image_url`（コンパニオンへ写真を送信）、`image`（コンパニオンによる画像生成を要求。style / aspect ratio を指定）があります。画像ターンではエンジンがプロンプトを組み立てて `image_request` frame を送出し、チャットストリーム自体は描画しません。
-- `GET /comp/chat/{session_id}/history` · `GET /comp/chat/{user_id}/sessions` · `GET /comp/user/{user_id}/profile` — 履歴、セッション一覧、構造化されたインサイトプロフィールを取得します。
-- `GET /comp/affinity/{session_id}` — debug 専用のリアルタイム親密度ベクトル（`EXPOSE_AFFINITY_DEBUG=true`）。
-
-完全なリクエスト schema、SSE frame layout（チャットストリーム上の `delta`、`image_request`、ghost、error frame を含む）、各フィールドの意味については、[API reference](docs/api-reference.md) を参照してください。
+基本の流れは、ペルソナとのセッションを作り、SSE ストリーミングのエンドポイントへ会話を送るだけです。履歴、セッション、プロフィール、任意の親密度デバッグ用ルートもあります。標準認証は Supabase JWT で、`AuthValidator` により差し替えられます。パス、データ形式、ストリームの各フレームは [API reference](docs/api-reference.md) を参照してください。
 
 ## 設定
 
-必須の環境変数は `DATABASE_URL`、`OPENROUTER_API_KEY`、`VOYAGE_API_KEY` と、**いずれか 1 つ**の認証元です。`SUPABASE_URL` / `SUPABASE_JWKS_URL`（JWKS、2025 年以降の Supabase のデフォルト）、**または** `SUPABASE_JWT_SECRET`（旧来の HS256）を設定してください。認証元が未設定の場合、サーバーは起動しません。
+最低限、`DATABASE_URL`、認証元を 1 つ、選択したモデル経路に必要な API キーを設定します。OpenRouter が組み込みの標準提供元です。`[providers]` では OpenAI 互換のチャット・embedding エンドポイントを追加できます。標準の Voyage embedding 構成には `VOYAGE_API_KEY` が必要ですが、`[tasks.embedding]` で読み取りと書き込みを両方とも別の提供元へ振り分けた場合は不要です。
 
-その他の項目には適切なデフォルト値があります。モデルルーティング（`MODEL_CONFIG_PATH` → `model_config.toml`、または `MODEL_CONFIG_DIR` で分割設定ディレクトリ）、OpenRouter attribution headers、dreaming-lite / snapshot sweepers、関係性の難易度を調整する `EMA_INERTIA`、debug toggles などです。全項目の一覧は [`.env.example`](.env.example)、運用ガイドは [Deploying](docs/deploying.md)、モデルルーティングは [Model config](docs/model-config.md) を参照してください。
+環境変数の全一覧は [`.env.example`](.env.example)、運用情報は [Deploying](docs/deploying.md)、ルーティングの詳細は [Model config](docs/model-config.md) にあります。
 
-## Roadmap
+## ロードマップ
 
-現時点ではエンジンに含まれていませんが、今後の候補となっている項目です。
+- [ ] **複数ペルソナの実験環境** — 同じセッションで複数の AI ペルソナが互いに、またユーザーと会話する仕組み。
+- [ ] **音声メッセージ**と**リアルタイム音声会話**。
+- [ ] **動画生成** — コンパニオンから短い動画を送信。
 
-- [ ] **Agents playground** — 複数の AI ペルソナが 1 つのセッションで互いに、そしてユーザーと対話します。
-- [ ] **Voice messages** — コンパニオンとユーザーの双方が送信できる音声ターン。
-- [ ] **Real-time voice conversation** — 低レイテンシーの音声によるリアルタイムなやり取り。
-- [ ] **Video generation** — image executor を拡張し、コンパニオンが短い動画クリップを送信します。
+## スコープ外
 
-## 意図的に対象外としているもの
-
-このリポジトリは、会話、記憶、関係状態の中核です。次の機能は含まれません。
-
-- **Matchmaking** — 多段階 filtering、soft scoring、agent-to-agent matching simulation は、引き続きクローズドソースのプロダクトに含まれます。
-- **完全な social UX** — onboarding、video、voice、billing、photos、moderation UI、mobile clients。
-- **ペルソナの provenance / marketplace logic** — 商用プロダクトのコードであり、このエンジンには含まれません。
-
-別のプロダクトを構築する場合、再利用できるのは親密度 + 記憶 + インサイトの pipeline です。
+このリポジトリが扱うのは、会話、記憶、関係状態の中核です。マッチング、ソーシャルプロダクト全体の体験、ペルソナの流通・来歴管理は対象外です。再利用の中心となるのは、親密度、記憶、ユーザー理解の処理系です。
 
 ## コンテンツに関する注意
 
-`examples/personas/` のサンプルペルソナは、成人向けキャラクターチャットの例として記述されています。関係状態がその段階に達すると、相手を誘惑したり欲求を表現したりする一方で、敬意を欠く行為や境界を越える行為は拒否します。プロダクトで SFW をデフォルトにする必要がある場合は、デプロイ前にこれらのペルソナファイルを置き換えてください。
+`examples/personas/` のサンプルは成人向けキャラクターチャットです。関係が深まれば誘惑や欲求を表すことがありますが、敬意を欠く行為や境界を越える行為は拒否します。SFW を標準にする場合は、配備前にこれらのペルソナを置き換えてください。
 
-リクエストごとの振る舞いは、メッセージ route の [`prompt_traits`](docs/prompt-traits.md) フィールドでさらに調整できます。エンジンは渡されたテキストを不透明なデータとして扱うため、`prompt_traits` がどのようなポリシーを表すかは、frontend / middleware 側で完全に定義します。
+リクエストごとの振る舞いは [`prompt_traits`](docs/prompt-traits.md) でも調整できます。エンジンはその文字列を解釈しないため、方針はフロントエンドまたはミドルウェア側で定義します。
 
 ## コントリビューション
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md) をお読みください。すべての contributor は、最初の PR で cla-assistant.io を通じて [`CLA`](CLA.md) に同意する必要があります。
+[`CONTRIBUTING.md`](CONTRIBUTING.md) をお読みください。初回 PR では cla-assistant.io を通じて [`CLA`](CLA.md) への同意が必要です。
 
 ## ライセンス
 
-`eros-engine` は AGPL-3.0-only でライセンスされています。AGPL が配布モデルに適さない場合は、商用ライセンスをご利用いただけます：`henrylin@etherfun.xyz`。
+`eros-engine` は AGPL-3.0-only です。商用ライセンスについては `henrylin@etherfun.xyz` までお問い合わせください。
