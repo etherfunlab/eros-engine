@@ -320,6 +320,7 @@ fn normalise_category(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::companion::testutil::seed_persona_instance;
 
     #[test]
     fn parse_memory_candidates_handles_clean_json() {
@@ -454,7 +455,7 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )

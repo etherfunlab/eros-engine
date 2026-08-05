@@ -26,6 +26,39 @@ pub struct OpenRouterCallMeta {
     pub usage: Option<serde_json::Value>,
 }
 
+/// Test helpers shared across this crate's `#[cfg(test)]` modules.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Persist a genome + active instance and return the instance id.
+    /// Since 0040 `chat_sessions.instance_id`, `companion_affinity.instance_id`
+    /// and `companion_memories.instance_id` carry real FKs, so a test that just
+    /// needs "some valid instance" has to own one rather than fabricate a bare
+    /// `Uuid::new_v4()`. The genome name is randomised so repeat calls never
+    /// collide on `persona_instances UNIQUE(genome_id, owner_uid)`.
+    pub(crate) async fn seed_persona_instance(pool: &PgPool, owner: Uuid) -> Uuid {
+        let genome_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ($1, 'you are a companion', '{}'::jsonb) RETURNING id",
+        )
+        .bind(format!("seed-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod migration_tests {
     use sqlx::PgPool;
@@ -52,6 +85,36 @@ mod migration_tests {
         .await
         .expect("query relrowsecurity for _sqlx_migrations");
         assert!(enabled, "RLS must be enabled on public._sqlx_migrations");
+    }
+
+    /// 0040 closed the gap where the three original instance-scoped tables
+    /// referenced `persona_instances` by convention only. Pins both the
+    /// existence of each FK and its ON DELETE action — a plain `REFERENCES`
+    /// (confdeltype 'a' = NO ACTION) would silently block instance deletion
+    /// instead of wiping the instance's data, which is not what 0040 chose.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0040_instance_fks_exist_with_cascade(pool: PgPool) {
+        for table in ["chat_sessions", "companion_affinity", "companion_memories"] {
+            let deltype: Option<i8> = sqlx::query_scalar(
+                "SELECT c.confdeltype::text::\"char\" FROM pg_constraint c \
+                 JOIN unnest(c.conkey) k(attnum) ON true \
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+                 WHERE c.contype = 'f' \
+                   AND c.conrelid = ('engine.' || $1)::regclass \
+                   AND c.confrelid = 'engine.persona_instances'::regclass \
+                   AND a.attname = 'instance_id'",
+            )
+            .bind(table)
+            .fetch_optional(&pool)
+            .await
+            .expect("query instance_id foreign key")
+            .flatten();
+            assert_eq!(
+                deltype,
+                Some(b'c' as i8),
+                "engine.{table}.instance_id must carry an ON DELETE CASCADE FK to persona_instances"
+            );
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -597,6 +597,7 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::companion::testutil::seed_persona_instance;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request};
     use axum::Router;
@@ -974,8 +975,9 @@ mod tests {
         let persisted = serde_json::Value::Object(meta_map);
 
         let chat_repo = ChatRepo { pool: &pool };
+        let user_id = uuid::Uuid::new_v4();
         let session = chat_repo
-            .create_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .create_session(user_id, seed_persona_instance(&pool, user_id).await)
             .await
             .unwrap();
         chat_repo
@@ -1086,8 +1088,9 @@ mod tests {
     async fn user_row_omits_scope_raw_keys_when_request_fields_are_none(pool: sqlx::PgPool) {
         use eros_engine_store::chat::ChatRepo;
         let chat_repo = ChatRepo { pool: &pool };
+        let user_id = uuid::Uuid::new_v4();
         let session = chat_repo
-            .create_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+            .create_session(user_id, seed_persona_instance(&pool, user_id).await)
             .await
             .unwrap();
         // None of the three optional fields present, no tip, no tier → meta_map

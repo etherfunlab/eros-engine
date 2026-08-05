@@ -1051,12 +1051,25 @@ impl<'a> ChatRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::seed_persona_instance;
+
+    /// A session on a freshly seeded persona instance, for the many tests that
+    /// just need "some session" and never look at the ids. Since 0040 the FK on
+    /// `chat_sessions.instance_id` rejects a fabricated `Uuid::new_v4()`.
+    async fn throwaway_session(pool: &PgPool) -> ChatSession {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, owner).await;
+        ChatRepo { pool }
+            .create_session(owner, instance_id)
+            .await
+            .unwrap()
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn create_then_retrieve_session(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
         let loaded = repo.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(loaded.user_id, user_id);
@@ -1069,7 +1082,7 @@ mod tests {
     async fn append_message_and_history_roundtrip(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         repo.append_message(s.id, "user", "hello").await.unwrap();
@@ -1093,7 +1106,7 @@ mod tests {
     async fn history_slim_returns_role_content_sent_at_in_order(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         repo.append_message(s.id, "user", "alpha").await.unwrap();
@@ -1117,7 +1130,7 @@ mod tests {
     async fn history_slim_respects_limit_and_offset(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
         for n in 0..5 {
             repo.append_message(s.id, "user", &format!("m{n}"))
@@ -1144,7 +1157,7 @@ mod tests {
     async fn history_slim_exposes_channel(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         repo.append_message(s.id, "user", "normal turn")
@@ -1175,9 +1188,9 @@ mod tests {
         let user_id = Uuid::new_v4();
         let other_user = Uuid::new_v4();
 
-        let i1 = Uuid::new_v4();
-        let i2 = Uuid::new_v4();
-        let i3 = Uuid::new_v4();
+        let i1 = seed_persona_instance(&pool, user_id).await;
+        let i2 = seed_persona_instance(&pool, user_id).await;
+        let i3 = seed_persona_instance(&pool, other_user).await;
 
         repo.create_session(user_id, i1).await.unwrap();
         repo.create_session_with_metadata(user_id, i2, serde_json::json!({}), "voice")
@@ -1204,7 +1217,7 @@ mod tests {
     async fn create_or_resume_returns_existing(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let first = repo.create_session(user_id, instance_id).await.unwrap();
         let resumed = repo.create_or_resume(user_id, instance_id).await.unwrap();
         assert_eq!(first.id, resumed.id);
@@ -1214,7 +1227,7 @@ mod tests {
     async fn upsert_user_message_idempotent_first_insert(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let outcome = repo
@@ -1239,7 +1252,7 @@ mod tests {
     async fn upsert_user_message_idempotent_replay_after_done(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
@@ -1307,7 +1320,7 @@ mod tests {
     async fn upsert_user_message_idempotent_409_when_no_assistant_and_not_ghost(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
@@ -1347,7 +1360,7 @@ mod tests {
     async fn upsert_user_message_idempotent_replay_when_ghost(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let first = match repo
@@ -1393,7 +1406,7 @@ mod tests {
     async fn resume_latest_session_returns_latest_and_bumps(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
 
         // no session yet → None
         assert!(repo
@@ -1444,10 +1457,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn upsert_user_message_writes_role_user_and_no_metadata(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let outcome = repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000000A", "user", None)
             .await
@@ -1472,10 +1482,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn upsert_user_message_writes_gift_user_role_and_tip_metadata(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let meta = serde_json::json!({ "tips_amount_usd": 20.0, "tier": "gold" });
         repo.upsert_user_message_idempotent(
             s.id,
@@ -1500,10 +1507,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn upsert_user_message_replay_finds_gift_user_row(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let meta = serde_json::json!({ "tips_amount_usd": 5.0 });
         repo.upsert_user_message_idempotent(
             s.id,
@@ -1537,10 +1541,7 @@ mod tests {
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn assistant_batch_round_trips_filter_audit(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000001A", "user", None)
             .await
@@ -1604,10 +1605,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_columns_default_null(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000002A", "user", None)
             .await
@@ -1680,10 +1678,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_audit_with_none_generation_id_writes_null(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000003A", "user", None)
             .await
@@ -1732,10 +1727,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_filter_triggers_json_null_persists_as_sql_null(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000004A", "user", None)
             .await
@@ -1788,10 +1780,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_prompt_traits(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000004A", "user", None)
             .await
@@ -1830,10 +1819,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_metadata_default_null(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000005A", "user", None)
             .await
@@ -1871,10 +1857,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn assistant_batch_persists_metadata_with_tier(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000006A", "user", None)
             .await
@@ -1916,10 +1899,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_empty_session_returns_empty(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let cutoff = Utc::now() + chrono::Duration::seconds(60);
         let pairs = repo.recent_turn_pairs(s.id, cutoff, 3).await.unwrap();
         assert!(pairs.is_empty());
@@ -1928,10 +1908,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_single_pair_returned(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000010001A", "user", None)
             .await
@@ -1964,10 +1941,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_skips_truncated_assistant(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
 
         let u1 = match repo
             .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000020001A", "user", None)
@@ -2033,10 +2007,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_returns_latest_three_when_more_exist(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         // Insert 5 complete pairs.
         for n in 0..5u8 {
             // ULIDs must be unique and monotonic. Use n in the suffix:
@@ -2084,10 +2055,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_cutoff_excludes_current_turn(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let u1 = match repo
             .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000040001A", "user", None)
             .await
@@ -2136,10 +2104,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_drops_orphan_user_at_end(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let u1 = match repo
             .upsert_user_message_idempotent(s.id, "u1", "01J0000000000000000050001A", "user", None)
             .await
@@ -2179,10 +2144,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_includes_gift_user_pair(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let meta = serde_json::json!({"tips_amount_usd": 20.0});
         let u1 = match repo
             .upsert_user_message_idempotent(
@@ -2228,10 +2190,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn set_user_input_rewrite_stamps_audit_keeps_content(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let session = throwaway_session(&pool).await;
         let umid = match repo
             .upsert_user_message_idempotent(
                 session.id,
@@ -2285,10 +2244,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn set_user_input_rewrite_blank_reason_leaves_triggers_null(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let session = throwaway_session(&pool).await;
         let umid = match repo
             .upsert_user_message_idempotent(
                 session.id,
@@ -2321,10 +2277,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_before_message_uses_msg_sent_at_not_now(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
 
         // Insert 1 prior complete pair.
         let u1 = match repo
@@ -2398,7 +2351,7 @@ mod tests {
     async fn history_row_exposes_metadata_column(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let meta = serde_json::json!({ "image_url": "https://x/y.png" });
@@ -2424,7 +2377,7 @@ mod tests {
     async fn set_user_image_vision_merges_and_preserves(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
 
         let seed = serde_json::json!({ "image_url": "https://x/y.png" });
@@ -2470,7 +2423,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0027_drops_legacy_non_tip_gift_user_rows(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
         )
@@ -2535,7 +2488,7 @@ mod tests {
         let repo = ChatRepo { pool: &pool };
         // minimal session + user row + assistant row
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let s = repo.create_session(user_id, instance_id).await.unwrap();
         let u = match repo
             .upsert_user_message_idempotent(
@@ -2591,7 +2544,7 @@ mod tests {
         // scope via the test module's `use super::*;`.
         let chat_repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session = chat_repo
             .create_session(user_id, instance_id)
             .await
@@ -2677,14 +2630,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn message_sent_at_in_session_scopes_by_session(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let other = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
+        let other = throwaway_session(&pool).await;
         let base = chrono::Utc::now();
         let m = insert_at(&pool, s.id, "user", "hi", base).await;
         let n = insert_at(&pool, other.id, "user", "yo", base).await;
@@ -2711,10 +2658,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn history_anchored_rewind_drops_between_and_keeps_m_and_u(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let base = chrono::Utc::now();
         // A B M C D E U with strictly increasing sent_at.
         let labels = ["A", "B", "M", "C", "D", "E", "U"];
@@ -2755,10 +2699,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn history_anchored_drop_history_returns_only_current(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let base = chrono::Utc::now();
         insert_at(&pool, s.id, "user", "old1", base).await;
         insert_at(
@@ -2790,10 +2731,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn history_anchored_rewind_counts_current_toward_limit(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let base = chrono::Utc::now();
         // A B M C D E U with strictly increasing sent_at.
         let labels = ["A", "B", "M", "C", "D", "E", "U"];
@@ -2834,10 +2772,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn merge_assistant_metadata_key_writes_under_named_key(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let s = repo
-            .create_session(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
+        let s = throwaway_session(&pool).await;
         let user_msg_id = match repo
             .upsert_user_message_idempotent(s.id, "hi", "01J0000000000000000000002A", "user", None)
             .await
@@ -2900,14 +2835,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn channel_column_accepts_voice_and_null_rejects_other(pool: PgPool) {
         // Minimal session to satisfy FKs.
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
 
         // NULL channel (default) — ok.
         sqlx::query(
@@ -2942,14 +2870,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn voice_inserts_are_marked_and_idempotent(pool: PgPool) {
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         let repo = ChatRepo { pool: &pool };
 
         // User insert: idempotent on client_msg_id.
@@ -3025,14 +2946,7 @@ mod tests {
         // (`gift_user`) row must be classified as Duplicate (→ 409), not error
         // out with RowNotFound (→ 500). The unique index is role-agnostic, so
         // the conflict-recovery SELECT must not filter by role.
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         let cmid = "01J9000000000000000000GIFT1";
         sqlx::query(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
@@ -3059,14 +2973,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn channel_check_accepts_product_qa_and_rejects_unknown(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
 
         // product_qa accepted
         sqlx::query(
@@ -3098,7 +3005,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn sessions_are_channel_scoped(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let (user_id, instance_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
 
         let text = repo.create_session(user_id, instance_id).await.unwrap();
 
@@ -3134,14 +3042,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn mark_user_message_product_qa_stamps_channel_idempotently(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         let user_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content) \
              VALUES ($1, 'user', '介绍下这个产品') RETURNING id",
@@ -3166,14 +3067,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn insert_product_qa_assistant_message_round_trips(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         let user_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content) \
              VALUES ($1, 'user', 'q') RETURNING id",
@@ -3212,14 +3106,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn recent_product_qa_pairs_returns_only_marked_pairs_before_cutoff(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         // normal pair (must NOT appear)
         for (role, content) in [("user", "嗨"), ("assistant", "嗨呀")] {
             sqlx::query(
@@ -3268,14 +3155,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn context_readers_exclude_channel_marked_rows(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
-        let session_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id = throwaway_session(&pool).await.id;
         // one normal pair, one product_qa pair, then cutoff row
         for (role, content, channel) in [
             ("user", "嗨", None::<&str>),

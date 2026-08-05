@@ -188,6 +188,7 @@ impl<'a> MemoryRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::seed_persona_instance;
 
     fn unit_embedding(seed: usize) -> Vec<f32> {
         // Generate a deterministic 512-dim vector with a single hot index.
@@ -212,7 +213,7 @@ mod tests {
     async fn upsert_then_retrieve(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
 
         let emb = unit_embedding(7);
@@ -244,7 +245,7 @@ mod tests {
     async fn cosine_search_picks_nearest_neighbour(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
 
         let target_id = repo
@@ -297,7 +298,7 @@ mod tests {
     async fn relationship_search_excludes_legacy_transcript_rows(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
 
         // Legacy verbatim turn (contains "\nAI："). It is the NEAREST neighbour
@@ -422,7 +423,7 @@ mod tests {
     async fn category_roundtrips_through_search(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
 
         repo.upsert(
@@ -466,7 +467,7 @@ mod tests {
     async fn profile_layer_isolates_from_relationship(pool: PgPool) {
         let repo = MemoryRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
 
         // Profile-layer write has instance_id forced to NULL.

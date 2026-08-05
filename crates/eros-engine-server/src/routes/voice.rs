@@ -239,6 +239,7 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::companion::testutil::seed_persona_instance;
     use axum::body::Body;
     use axum::http::{header, Request};
     use axum::Router;
@@ -448,22 +449,31 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn voice_404_when_persona_instance_missing(pool: PgPool) {
-        // A session whose persona instance is missing/inactive must be rejected
-        // pre-stream (404) WITHOUT persisting a user row. chat_sessions.instance_id
-        // has no FK, so a dangling instance_id is possible; load_companion also
-        // filters status='active', so an archived instance takes the same path.
+    async fn voice_404_when_persona_instance_inactive(pool: PgPool) {
+        // A session whose persona instance is not active must be rejected
+        // pre-stream (404) WITHOUT persisting a user row. Archival is the only
+        // way to reach this state — 0040 gave chat_sessions.instance_id a real
+        // FK, so a dangling id can no longer be written and a deleted instance
+        // takes its sessions with it (ON DELETE CASCADE). That matches
+        // production: the engine only ever flips status to 'archived', it never
+        // DELETEs an instance. load_companion filters status = 'active', so
+        // this lands on the same 404 branch the dangling case used to take.
         let user_id = Uuid::new_v4();
-        let missing_instance = Uuid::new_v4(); // no matching persona_instances row
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
              VALUES ($1, $2, 'voice') RETURNING id",
         )
         .bind(user_id)
-        .bind(missing_instance)
+        .bind(instance_id)
         .fetch_one(&pool)
         .await
         .unwrap();
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(instance_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let mut app = build_router(with_voice(crate::routes::companion::test_state(
             pool.clone(),

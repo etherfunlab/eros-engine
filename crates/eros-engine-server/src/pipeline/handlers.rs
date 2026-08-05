@@ -1009,6 +1009,7 @@ mod tests {
     // either need a live Voyage key or a trait-mock indirection that
     // doesn't justify its weight for a single thin function.
 
+    use crate::routes::companion::testutil::seed_persona_instance;
     use eros_engine_store::human_insight::HumanInsightRepo;
     use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
     use sqlx::PgPool;
@@ -1055,7 +1056,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn recall_memory_with_embedding_isolates_layers(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
         let repo = MemoryRepo { pool: &pool };
 
@@ -1107,7 +1108,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn recall_memory_with_embedding_groups_categorised_rows(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
         let repo = MemoryRepo { pool: &pool };
 
@@ -1180,7 +1181,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn recall_memory_with_embedding_respects_top_k(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
         let repo = MemoryRepo { pool: &pool };
 
@@ -1236,7 +1237,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn recall_memory_with_embedding_picks_nearest_per_layer(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
         let repo = MemoryRepo { pool: &pool };
 
@@ -1332,7 +1333,7 @@ mod tests {
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn recall_gating_skips_layers_per_flags(pool: PgPool) {
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, Some(instance_id)).await;
         let repo = MemoryRepo { pool: &pool };
         repo.upsert(
@@ -2038,7 +2039,7 @@ mod tests {
 
         let chat_repo = ChatRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session = chat_repo
             .create_session(user_id, instance_id)
             .await

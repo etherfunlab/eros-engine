@@ -830,6 +830,16 @@ pub(crate) mod testutil {
         .await
         .unwrap()
     }
+
+    /// Genome + active instance in one step, returning the instance id.
+    /// Since 0040 `chat_sessions.instance_id` carries a real FK, so tests that
+    /// only need "some valid instance" must persist one instead of fabricating
+    /// a bare `Uuid::new_v4()`. The genome name is randomised so repeat calls
+    /// never collide on `persona_instances UNIQUE(genome_id, owner_uid)`.
+    pub(crate) async fn seed_persona_instance(pool: &PgPool, owner: Uuid) -> Uuid {
+        let genome_id = seed_genome(pool, &format!("seed-{}", Uuid::new_v4())).await;
+        seed_instance(pool, genome_id, owner).await
+    }
 }
 
 #[cfg(test)]

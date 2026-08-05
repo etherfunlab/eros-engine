@@ -387,6 +387,7 @@ impl<'a> AffinityRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::seed_persona_instance;
 
     async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
@@ -404,7 +405,7 @@ mod tests {
     async fn load_or_create_idempotent(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
 
         let a1 = repo
@@ -425,7 +426,7 @@ mod tests {
     async fn persist_with_event_updates_vector_and_logs(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
 
         let mut a = repo
@@ -476,7 +477,7 @@ mod tests {
     async fn record_ghost_increments_counters(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
 
         let mut a = repo
@@ -499,7 +500,7 @@ mod tests {
     async fn persist_with_event_records_post_ema_effective(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -546,7 +547,7 @@ mod tests {
     async fn persist_with_event_effective_reflects_clamping(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -585,7 +586,7 @@ mod tests {
     async fn record_ghost_writes_zero_effective_deltas(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -613,7 +614,7 @@ mod tests {
     async fn concurrent_persist_with_event_does_not_lose_updates(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let base = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -686,7 +687,7 @@ mod tests {
     async fn persist_with_event_flips_label_when_axes_cross_thresholds(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -744,7 +745,7 @@ mod tests {
     async fn list_events_newest_first_with_filter(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -776,7 +777,7 @@ mod tests {
     async fn latest_turn_event_includes_ghost_skips_time_decay(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -804,7 +805,7 @@ mod tests {
     async fn latest_turn_event_none_when_only_time_decay(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -819,7 +820,7 @@ mod tests {
     async fn latest_turn_event_none_for_session_without_events(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         repo.load_or_create(session_id, user_id, instance_id)
             .await
@@ -865,7 +866,7 @@ mod tests {
     async fn recent_emotional_reasons_newest_first_skips_empty_and_scoped(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -902,9 +903,11 @@ mod tests {
         .await; // wrong type → skip
 
         // Another session must not leak in.
-        let other_session = make_session(&pool, Uuid::new_v4(), Uuid::new_v4()).await;
+        let other_user = Uuid::new_v4();
+        let other_instance = seed_persona_instance(&pool, other_user).await;
+        let other_session = make_session(&pool, other_user, other_instance).await;
         let b = repo
-            .load_or_create(other_session, Uuid::new_v4(), Uuid::new_v4())
+            .load_or_create(other_session, other_user, other_instance)
             .await
             .unwrap();
         seed_event_ctx(
@@ -934,7 +937,7 @@ mod tests {
     async fn recent_emotional_reasons_excludes_events_after_cutoff(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -978,7 +981,7 @@ mod tests {
     async fn generated_bond_chemistry_match_core(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1017,7 +1020,7 @@ mod tests {
     async fn persist_writes_new_legacy_label(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1051,7 +1054,7 @@ mod tests {
     async fn persist_with_event_patience_target_sets_directly_bypassing_ema(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1107,7 +1110,7 @@ mod tests {
     async fn persist_with_event_patience_none_keeps_ema_path(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1143,7 +1146,7 @@ mod tests {
     async fn label_changes_recorded_on_tier_crossing_and_null_otherwise(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1199,7 +1202,7 @@ mod tests {
     async fn effective_line_deltas_are_floored_exact(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
@@ -1243,7 +1246,7 @@ mod tests {
     async fn persist_with_event_stores_openrouter_audit_trio(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
         let session_id = make_session(&pool, user_id, instance_id).await;
         let mut a = repo
             .load_or_create(session_id, user_id, instance_id)
