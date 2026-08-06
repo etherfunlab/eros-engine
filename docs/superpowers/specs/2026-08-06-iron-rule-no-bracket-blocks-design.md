@@ -52,12 +52,24 @@ be told which ones to avoid, so the fix belongs in the engine's prompt.
   would cut the pollution off at the source, but production `output_regex`
   configs and downstream `model_config.toml` files are written against the
   bracket convention. That is a breaking change for less benefit than one
-  prompt line.
+  prompt line. The broad `\[[^\]]*\]` pattern this refers to lives in a
+  downstream deployment's private `model_config.toml`, not in this repo — the
+  example shipped here (`examples/model_config.toml:159-164`) is the narrower,
+  anchored `\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$`. A reader of the OSS
+  repo should not go hunting for the broad one.
 - **Rejected: making this a third guard constant** next to `PERSONA_GUARD` /
   `ANTI_REFUSAL_GUARD`. The guards render near the top of the prompt; the iron
   rules render last, immediately before `[output]`, which is the stronger
   position for a format constraint in a long context. The `违反即失效` framing
   also applies.
+- **⑫ deliberately does not offer verbal accept/decline options.**
+  `ANTI_REFUSAL_GUARD` (`prompt.rs:86-87`) already removes that authority —
+  「对方要照片/图片时…不需要你用文字答应或拒绝」 — and `build_prompt`
+  (`prompt.rs:404`) receives no signal that an image is coming on this turn,
+  so a licensed 婉拒 could land beside an appended `image_request` on a
+  `reply_text_image` turn, and a licensed 答应 would be an unfulfilled promise
+  that then persists into `[recent_conversation]`. The non-committal options
+  (撒娇、调侃) supply the anti-stiffness function without the authority.
 
 ## 1. The PDE image signal does not read the reply text
 
@@ -153,24 +165,25 @@ In the `format!` block that renders `[iron_rules — 违反即失效]`
 blank line preceding `[output]`:
 
 ```
-⑫ 回复里绝不出现方括号 [ ]：记录里的「[你给对方发送了一张照片：…]」是系统留的，不是你的话，别照抄也别换个说法写成动作块；每条回复都必须有正文，对方要照片时用文字回应即可（答应、撒娇、调侃、婉拒都行），照片不用你发。
+⑫ 回复里绝不出现方括号 [ ]：记录里的「[你给对方发送了一张照片：…]」是系统留的，不是你的话，别照抄，也别换成别的方括号动作块；每条回复都必须有正文，对方要照片时顺着话自然回应即可（撒娇、调侃都行），照片不用你发。
 ```
 
 The string contains no `{` or `}`, so no `format!` escaping is required.
 
-Four load-bearing clauses:
+Five load-bearing clauses:
 
 1. `回复里绝不出现方括号 [ ]` — the absolute format constraint.
 2. `是系统留的，不是你的话` — disowns the marker, following
    `ANTI_REFUSAL_GUARD`'s shape.
-3. `别换个说法写成动作块` — closes the paraphrase route to the same strip.
+3. `也别换成别的方括号动作块` — closes the paraphrase route to the same strip.
 4. `每条回复都必须有正文` — a positive constraint, independently checkable, so
    a model that violates clause 1 can still be caught here. Weak models follow
    positive instructions more reliably than prohibitions.
+5. `照片不用你发` — states the boundary without inviting a refusal.
 
-Then `照片不用你发` states the boundary without inviting a refusal, and the
-`（答应、撒娇、调侃、婉拒都行）` list gives a graceful text exit so the model
-does not substitute a stiff "我发不了照片" for the marker.
+The `（撒娇、调侃都行）` parenthetical exists so the model has a graceful text
+exit and does not substitute a stiff "我发不了照片" for the marker — it does
+not offer verbal accept/decline; see §0 for why.
 
 Rule numbering is unaffected by ⑧'s conditional rendering: ⑧ is appended to
 ⑦'s line via `{gender_rule}`, and ⑨⑩⑪⑫ follow as literal text.
@@ -182,7 +195,8 @@ One test in `prompt.rs`'s test module, shaped like
 
 - ⑫ renders in the built prompt;
 - its offset is after ⑪ and before `[output]`;
-- the three load-bearing substrings `方括号`, `必须有正文`, `照片不用你发` are
+- the five load-bearing substrings `方括号`, `是系统留的，不是你的话`,
+  `也别换成别的方括号动作块`, `每条回复都必须有正文`, `照片不用你发` are
   present, so a later edit cannot silently drop a clause.
 
 No existing test breaks. The iron-rules text appears only in `prompt.rs`; every
@@ -209,7 +223,10 @@ where role = 'assistant' and sent_at > now() - interval '30 days';
 ```
 
 Baseline 15 / 2486 = 0.60%. Watch `sao10k/l3.3-euryale-70b` specifically
-(2.52%, largest sample and most sensitive).
+(2.52%, largest sample and most sensitive). This query was run against
+production before deploy and returned exactly this baseline (`klass_b = 15`)
+— the instrument and the §3 baseline are the same measurement, not two
+independently derived numbers that happen to agree.
 
 Secondary metric — bracket-strip rate (`filter_model = '<regex>'`), baseline
 27.7% for euryale. This falling is the stronger signal: it means the model is
@@ -218,6 +235,11 @@ alongside them.
 
 Classes A, C, and D are out of scope and should not be read as regressions if
 they move.
+
+**Rollback trigger.** If the class-B rate or the bracket-strip rate *rises*
+for any model after deploy, suspect that quoting the marker verbatim in the
+rule text is reinforcing it rather than suppressing it — revert ⑫ and
+re-baseline before attempting a differently-worded rule.
 
 Expected effect is a reduction, not elimination. Models in this class follow
 format constraints imperfectly, and the engine still strips whatever slips

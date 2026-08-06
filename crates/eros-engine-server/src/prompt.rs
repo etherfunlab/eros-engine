@@ -696,7 +696,7 @@ pub fn build_prompt(
          ⑨ 别开口就自述动作或凝视；先接住对方刚说的话，针对那句话回应，而不是自说自话。\n\
          ⑩ 少用省略号（…）；一条回复最多一次。\n\
          ⑪ 不要连续两句都以「我」开头；开头先回应对方，别总是「我+动作」。\n\
-         ⑫ 回复里绝不出现方括号 [ ]：记录里的「[你给对方发送了一张照片：…]」是系统留的，不是你的话，别照抄也别换个说法写成动作块；每条回复都必须有正文，对方要照片时用文字回应即可（答应、撒娇、调侃、婉拒都行），照片不用你发。\n\
+         ⑫ 回复里绝不出现方括号 [ ]：记录里的「[你给对方发送了一张照片：…]」是系统留的，不是你的话，别照抄，也别换成别的方括号动作块；每条回复都必须有正文，对方要照片时顺着话自然回应即可（撒娇、调侃都行），照片不用你发。\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
@@ -1448,10 +1448,17 @@ mod tests {
             "⑫ must sit inside [iron_rules], before [output]"
         );
         // Load-bearing clauses (spec §4): the absolute bracket ban, the
-        // positive body-text constraint, and the photo boundary. Each is an
+        // marker disownment, the paraphrase-route closure, the positive
+        // body-text constraint, and the photo boundary. Each is an
         // independent reason the rule works — a later edit must not silently
         // drop one while leaving the rule looking intact.
-        for clause in ["方括号", "必须有正文", "照片不用你发"] {
+        for clause in [
+            "方括号",
+            "是系统留的，不是你的话",
+            "也别换成别的方括号动作块",
+            "每条回复都必须有正文",
+            "照片不用你发",
+        ] {
             assert!(
                 s.contains(clause),
                 "⑫ must keep the load-bearing clause {clause:?}: {s}"
