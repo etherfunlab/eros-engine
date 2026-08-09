@@ -15,7 +15,7 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use eros_engine_core::scope::RelationshipScope;
+use eros_engine_core::scope::{MemoryScope, RelationshipScope};
 use eros_engine_store::chat::{ChatRepo, VoiceUserInsert};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -40,6 +40,13 @@ pub struct VoiceTurnRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub relationship_scope: Option<RelationshipScope>,
+    /// How much long-term memory this turn may use — same field name, enum,
+    /// wire values, and default (`neutral_and_relationship`) as the chat
+    /// stream. On the session's FIRST turn the resolved insight tier is frozen
+    /// into the bootstrap snapshot and never changes for the rest of the call.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub memory_scope: Option<MemoryScope>,
 }
 
 fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
@@ -208,6 +215,10 @@ pub async fn voice_turn_stream(
         user_id,
         user_message_id,
         relationship_scope: req.relationship_scope.unwrap_or_default(),
+        memory_scope: req.memory_scope.unwrap_or_default(),
+        // Handed over from the row loaded above — the pipeline reads the
+        // `voice_bootstrap` marker from it instead of re-querying the session.
+        session_metadata: session.metadata,
     };
     let proto = run_voice_turn(Arc::new(state.clone()), turn, resolved);
 
@@ -347,6 +358,29 @@ mod tests {
                 "content": "hi",
                 "client_msg_id": "01J2222222222222222222222A",
                 "relationship_scope": "romance"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// `memory_scope` is a typed enum on the wire, exactly like
+    /// `relationship_scope`: an unknown value is a payload error, not a
+    /// silent fallback to the default.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_422_when_memory_scope_invalid(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let jwt = mint_jwt(user_id);
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &jwt,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "memory_scope": "everything"
             }),
         )
         .await;

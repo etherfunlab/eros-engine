@@ -2135,6 +2135,13 @@
           "content": {
             "type": "string"
           },
+          "memory_scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How much long-term memory this turn may use — same field name, enum,\nwire values, and default (`neutral_and_relationship`) as the chat\nstream. On the session's FIRST turn the resolved insight tier is frozen\ninto the bootstrap snapshot and never changes for the rest of the call."
+          },
           "relationship_scope": {
             "type": [
               "string",

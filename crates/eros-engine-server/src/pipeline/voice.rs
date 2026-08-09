@@ -3,31 +3,47 @@
 //!
 //! Spec: docs/superpowers/specs/2026-07-07-voice-call-parts-design.md
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::sync::Arc;
 use ulid::Ulid;
 use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, BondLabel, ChemistryLabel};
 use eros_engine_core::persona::PersonaGenome;
-use eros_engine_core::scope::RelationshipScope;
+use eros_engine_core::scope::{InsightMode, MemoryScope, RelationshipScope};
 use eros_engine_llm::model_config::ResolvedVoice;
 use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
 use eros_engine_store::affinity::AffinityRepo;
-use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::chat::{ChatMessageSlim, ChatRepo};
+use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
 
+use crate::pipeline::handlers::human_insights_to_bullets;
 use crate::pipeline::stream::{
     ulid_string, ProtocolFrame, StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
 use crate::state::AppState;
 
-/// Assemble the thin voice system prompt: persona + voice directive + one
-/// optional relationship line (bond/chemistry-derived, gated by
-/// `relationship_scope`). Deliberately excludes recall, memories, traits,
-/// scopes, and every heavy block the text path's `build_prompt` composes.
+/// `chat_sessions.metadata` key holding a voice session's frozen bootstrap
+/// snapshot (write-once — see `ChatRepo::set_voice_bootstrap`).
+const VOICE_BOOTSTRAP_KEY: &str = "voice_bootstrap";
+
+/// Assemble the thin voice system prompt: persona + voice directive +
+/// the (already rendered) bootstrap block + one optional relationship line
+/// (bond/chemistry-derived, gated by `relationship_scope`). Deliberately
+/// excludes memories, traits, scopes, and every heavy block the text path's
+/// `build_prompt` composes.
+///
+/// Order matters: persona → directive → bootstrap → relationship line. The
+/// bootstrap block is frozen for the whole call, so everything up to (and
+/// including) it is byte-stable across the call's turns — provider-side
+/// prefix caching keeps working.
 pub fn build_voice_prompt(
     genome: &PersonaGenome,
     directive: &str,
+    bootstrap: Option<&str>,
     affinity: Option<&Affinity>,
     relationship_scope: RelationshipScope,
 ) -> String {
@@ -35,11 +51,210 @@ pub fn build_voice_prompt(
     s.push_str(&genome.system_prompt);
     s.push_str("\n\n");
     s.push_str(directive);
+    if let Some(block) = bootstrap {
+        s.push_str("\n\n");
+        s.push_str(block);
+    }
     if let Some(line) = affinity.and_then(|a| relationship_line(a, relationship_scope)) {
         s.push_str("\n\n");
         s.push_str(&line);
     }
     s
+}
+
+/// A voice call's frozen bootstrap context, stored under
+/// `chat_sessions.metadata.voice_bootstrap` on the session's first turn and
+/// re-injected verbatim on every later turn (OpenRouter is stateless — there
+/// is no such thing as "injected once at session start").
+///
+/// Everything here is stored **rendered**: the bullets and the transcript are
+/// the exact strings that go into the prompt, never re-derived from live rows.
+/// That is what makes the prefix byte-stable for the whole call even as the
+/// underlying `human_insights` row changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceBootstrap {
+    /// 基础画像 bullets, rendered at first turn under that turn's `InsightMode`.
+    pub insights: Vec<String>,
+    /// Previous voice call's tail, rendered as a plain transcript.
+    #[serde(default)]
+    pub prev_call: Option<String>,
+    /// The sibling voice session the transcript came from (audit only).
+    #[serde(default)]
+    pub prev_session_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What this turn should do about the bootstrap snapshot, decided purely from
+/// the session `metadata` the route already loaded — no query.
+#[derive(Debug)]
+enum BootstrapPlan {
+    /// Marker present and well-formed: inject it, touch nothing.
+    Frozen(VoiceBootstrap),
+    /// Marker present but unreadable: inject nothing and NEVER rewrite — the
+    /// snapshot is write-once, and clobbering it would be worse than degrading.
+    Malformed,
+    /// Marker absent: assemble a snapshot this turn (the only path that reads).
+    Assemble,
+}
+
+fn plan_bootstrap(session_metadata: &serde_json::Value) -> BootstrapPlan {
+    match session_metadata.get(VOICE_BOOTSTRAP_KEY) {
+        None => BootstrapPlan::Assemble,
+        Some(v) => match serde_json::from_value::<VoiceBootstrap>(v.clone()) {
+            Ok(b) => BootstrapPlan::Frozen(b),
+            Err(_) => BootstrapPlan::Malformed,
+        },
+    }
+}
+
+/// Render the bootstrap block: `[关于他]` bullets then the `[上次通话]`
+/// transcript. Each sub-block is omitted when its part is empty; `None` when
+/// both are — the caller then emits no block at all (no stray blank lines).
+fn render_bootstrap(b: &VoiceBootstrap) -> Option<String> {
+    let bullets: Vec<&str> = b
+        .insights
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let prev = b
+        .prev_call
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if bullets.is_empty() && prev.is_none() {
+        return None;
+    }
+    let mut s = String::new();
+    if !bullets.is_empty() {
+        s.push_str("[关于他]");
+        for b in bullets {
+            s.push_str("\n- ");
+            s.push_str(b);
+        }
+    }
+    if let Some(t) = prev {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("[上次通话]\n");
+        s.push_str(t);
+    }
+    Some(s)
+}
+
+/// Render a sibling voice session's tail as a plain transcript, one line per
+/// message. Empty-content rows are skipped (a caption-less image turn would
+/// otherwise render as a bare speaker prefix) and so is any role outside the
+/// user/assistant pair; `gift_user` speaks as the user.
+fn render_prev_call(rows: &[ChatMessageSlim]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+    for m in rows {
+        let content = m.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let speaker = match m.role.as_str() {
+            "user" | "gift_user" => "用户",
+            "assistant" => "她",
+            _ => continue,
+        };
+        lines.push(format!("{speaker}：{content}"));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// 基础画像 bullets for the snapshot. `Off` short-circuits without a query —
+/// an empty part, and still a SUCCESS (the marker may be written).
+async fn load_bootstrap_insights(
+    pool: &PgPool,
+    user_id: Uuid,
+    mode: InsightMode,
+) -> Result<Vec<String>, sqlx::Error> {
+    if matches!(mode, InsightMode::Off) {
+        return Ok(Vec::new());
+    }
+    // Deliberately NOT `load_human_insight_bullets`: it swallows Err into an
+    // empty vec, erasing the failed-vs-empty distinction this snapshot needs
+    // (an empty read freezes the marker; a failed read must not).
+    match (HumanInsightRepo { pool }).load(user_id).await {
+        Ok(Some(row)) => Ok(human_insights_to_bullets(&row, mode)),
+        Ok(None) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The previous call's tail: the latest sibling voice session for this
+/// user × instance (never this session, never a text session) and its last
+/// `VOICE_HISTORY_WINDOW` messages. No sibling ⇒ an empty part, still a
+/// success (first-ever call).
+async fn load_bootstrap_prev_call(
+    pool: &PgPool,
+    user_id: Uuid,
+    instance_id: Uuid,
+    session_id: Uuid,
+) -> Result<(Option<String>, Option<Uuid>), sqlx::Error> {
+    let repo = ChatRepo { pool };
+    let Some(sibling) = repo
+        .latest_sibling_voice_session(user_id, instance_id, session_id)
+        .await?
+    else {
+        return Ok((None, None));
+    };
+    // Same 8-message unit as the in-session window (spec §3). `history_slim`
+    // is the narrow, channel-blind projection — the sibling is already
+    // channel-scoped by the lookup.
+    let rows = repo
+        .history_slim(sibling.id, VOICE_HISTORY_WINDOW, 0)
+        .await?;
+    Ok((render_prev_call(&rows), Some(sibling.id)))
+}
+
+/// Assemble a first-turn snapshot. The two parts degrade independently; the
+/// returned flag is `true` only when BOTH succeeded — a partial snapshot is
+/// injected in memory for this turn but must not be frozen, so the next turn
+/// retries.
+async fn assemble_bootstrap(
+    pool: &PgPool,
+    user_id: Uuid,
+    instance_id: Uuid,
+    session_id: Uuid,
+    insight_mode: InsightMode,
+) -> (VoiceBootstrap, bool) {
+    let (insights_res, prev_res) = tokio::join!(
+        load_bootstrap_insights(pool, user_id, insight_mode),
+        load_bootstrap_prev_call(pool, user_id, instance_id, session_id),
+    );
+    let mut complete = true;
+    let insights = match insights_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice: bootstrap insights read failed");
+            complete = false;
+            Vec::new()
+        }
+    };
+    let (prev_call, prev_session_id) = match prev_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice: bootstrap prev-call read failed");
+            complete = false;
+            (None, None)
+        }
+    };
+    (
+        VoiceBootstrap {
+            insights,
+            prev_call,
+            prev_session_id,
+            created_at: Utc::now(),
+        },
+        complete,
+    )
 }
 
 /// One relationship-tone line, derived at read time from the affinity row's
@@ -95,17 +310,29 @@ pub struct VoiceTurn {
     pub user_id: Uuid,
     pub user_message_id: Uuid,
     pub relationship_scope: RelationshipScope,
+    /// This turn's memory scope. On the FIRST turn its resolved `InsightMode`
+    /// picks the bootstrap snapshot's insight tier — frozen for the whole call
+    /// from then on.
+    pub memory_scope: MemoryScope,
+    /// `chat_sessions.metadata` as the route already loaded it. Carries the
+    /// `voice_bootstrap` marker, so the common path (marker present) costs no
+    /// extra query at all.
+    pub session_metadata: serde_json::Value,
 }
 
-/// Recent turns fed to the model on a voice turn. Shorter than the text path to
-/// keep latency/tokens down.
-pub const VOICE_HISTORY_WINDOW: i64 = 12;
+/// Recent turns fed to the model on a voice turn — 8 messages (4 exchanges).
+/// Shorter than the text path to keep latency/tokens down; the bootstrap
+/// snapshot and per-turn recall carry the longer memory. Doubles as the tail
+/// length quoted from the previous call into the bootstrap snapshot.
+pub const VOICE_HISTORY_WINDOW: i64 = 8;
 
-/// Drive one voice turn: load persona + (optional) affinity + recent history,
-/// assemble the thin prompt, stream a single-model completion (walking the
-/// outage fallback chain ourselves, since `execute_stream` is single-model),
-/// emit `delta`* then `done`, and persist the assistant turn. `error` only when
-/// no candidate produced anything.
+/// Drive one voice turn: load persona + (optional) affinity + recent history
+/// (+ the bootstrap snapshot on a session's first turn), assemble the thin
+/// prompt, stream a single-model completion (walking the outage fallback chain
+/// ourselves, since `execute_stream` is single-model), emit `delta`* then
+/// `done`, and persist the assistant turn. `error` only when no candidate
+/// produced anything — never for a memory problem, which always degrades to a
+/// warn.
 pub fn run_voice_turn(
     state: Arc<AppState>,
     turn: VoiceTurn,
@@ -116,7 +343,50 @@ pub fn run_voice_turn(
         let persona_repo = PersonaRepo { pool: &state.pool };
         let affinity_repo = AffinityRepo { pool: &state.pool };
 
-        let persona = match persona_repo.load_companion(turn.instance_id).await {
+        // Decided from the session row the route already loaded: after the
+        // first turn this is `Frozen` and the whole bootstrap costs ZERO
+        // queries.
+        let plan = plan_bootstrap(&turn.session_metadata);
+        if matches!(plan, BootstrapPlan::Malformed) {
+            tracing::warn!(
+                session_id = %turn.session_id,
+                "voice: unreadable voice_bootstrap metadata — injecting nothing, never rewriting",
+            );
+        }
+        let assemble_bootstrap_now = matches!(plan, BootstrapPlan::Assemble);
+        // The FIRST turn's scope decides the snapshot's insight tier; later
+        // turns can't change it (the snapshot is frozen).
+        let insight_mode = turn.memory_scope.resolve().0;
+
+        // All independent reads in one round trip's worth of wall clock. The
+        // bootstrap future is inert unless this is the first turn.
+        let (persona_res, affinity_res, history_res, assembled) = tokio::join!(
+            persona_repo.load_companion(turn.instance_id),
+            // Resolve affinity by user × persona-instance, not by session:
+            // `companion_affinity` is populated only by the text pipeline, so a
+            // voice-channel session's own `session_id` never has a row — this
+            // read-only lookup takes the freshest row across every session for
+            // the same pair (e.g. a prior text session) instead. Never creates a
+            // row on the voice path.
+            affinity_repo.load_latest_for_pair(turn.user_id, turn.instance_id),
+            // Chronological history, includes the just-persisted user turn.
+            chat_repo.history(turn.session_id, VOICE_HISTORY_WINDOW, 0),
+            async {
+                if assemble_bootstrap_now {
+                    Some(assemble_bootstrap(
+                        &state.pool,
+                        turn.user_id,
+                        turn.instance_id,
+                        turn.session_id,
+                        insight_mode,
+                    ).await)
+                } else {
+                    None
+                }
+            },
+        );
+
+        let persona = match persona_res {
             Ok(Some(p)) => p,
             _ => {
                 yield ProtocolFrame::Error {
@@ -129,22 +399,9 @@ pub fn run_voice_turn(
             }
         };
 
-        // Resolve affinity by user × persona-instance, not by session:
-        // `companion_affinity` is populated only by the text pipeline, so a
-        // voice-channel session's own `session_id` never has a row — this
-        // read-only lookup takes the freshest row across every session for
-        // the same pair (e.g. a prior text session) instead. Never creates a
-        // row on the voice path.
-        let affinity = affinity_repo
-            .load_latest_for_pair(turn.user_id, turn.instance_id)
-            .await
-            .unwrap_or(None);
+        let affinity = affinity_res.unwrap_or(None);
 
-        // Chronological history, includes the just-persisted user turn.
-        let history = match chat_repo
-            .history(turn.session_id, VOICE_HISTORY_WINDOW, 0)
-            .await
-        {
+        let history = match history_res {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = %e, "voice: history read failed");
@@ -158,9 +415,41 @@ pub fn run_voice_turn(
             }
         };
 
+        // Freeze the snapshot on the first turn, then inject it (this turn from
+        // the in-memory copy, later turns from `metadata`). Every failure here
+        // is a warn: a memory problem never costs the caller a reply.
+        let bootstrap = match plan {
+            BootstrapPlan::Frozen(b) => Some(b),
+            BootstrapPlan::Malformed => None,
+            BootstrapPlan::Assemble => match assembled {
+                Some((snapshot, complete)) => {
+                    if complete {
+                        match serde_json::to_value(&snapshot) {
+                            // rows_affected 0 = the key was already there (a
+                            // concurrent first turn won the race): normal, and
+                            // this turn just uses its own identical copy.
+                            Ok(v) => if let Err(e) = chat_repo.set_voice_bootstrap(turn.session_id, &v).await {
+                                tracing::warn!(error = %e, "voice: bootstrap snapshot write failed; using in-memory copy");
+                            },
+                            Err(e) => tracing::warn!(error = %e, "voice: bootstrap snapshot serialize failed"),
+                        }
+                    } else {
+                        tracing::warn!(
+                            session_id = %turn.session_id,
+                            "voice: bootstrap assembly incomplete — injecting what loaded, marker left unwritten (next turn retries)",
+                        );
+                    }
+                    Some(snapshot)
+                }
+                None => None,
+            },
+        };
+        let bootstrap_block = bootstrap.as_ref().and_then(render_bootstrap);
+
         let system_prompt = build_voice_prompt(
             &persona.genome,
             &resolved.directive,
+            bootstrap_block.as_deref(),
             affinity.as_ref(),
             turn.relationship_scope,
         );
@@ -403,10 +692,202 @@ mod tests {
         }
     }
 
+    /// A frozen snapshot with both parts populated.
+    fn snapshot(insights: &[&str], prev_call: Option<&str>) -> VoiceBootstrap {
+        VoiceBootstrap {
+            insights: insights.iter().map(|s| (*s).to_string()).collect(),
+            prev_call: prev_call.map(str::to_string),
+            prev_session_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn slim(role: &str, content: &str) -> ChatMessageSlim {
+        ChatMessageSlim {
+            id: Uuid::new_v4(),
+            role: role.into(),
+            content: content.into(),
+            sent_at: Utc::now(),
+            client_msg_id: None,
+            tips_amount_usd: None,
+            channel: None,
+        }
+    }
+
     #[test]
     fn includes_persona_and_directive_without_affinity() {
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", None, RelationshipScope::default());
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            None,
+            None,
+            RelationshipScope::default(),
+        );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
+    }
+
+    // ─── bootstrap block rendering ──────────────────────────────────────
+
+    /// The whole block, byte-pinned: label, bullet prefix, sub-block order,
+    /// and the `\n\n` joining discipline the prompt already uses.
+    #[test]
+    fn bootstrap_block_rendering_is_pinned() {
+        let s = snapshot(
+            &["城市：上海", "职业：设计师"],
+            Some("用户：你好\n她：嗨呀"),
+        );
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s).as_deref(),
+            None,
+            RelationshipScope::None,
+        );
+        assert_eq!(
+            p,
+            "You are Mia.\n\nDIRECTIVE\n\n\
+             [关于他]\n- 城市：上海\n- 职业：设计师\n\n\
+             [上次通话]\n用户：你好\n她：嗨呀"
+        );
+    }
+
+    /// Order: persona → directive → bootstrap → relationship line.
+    #[test]
+    fn bootstrap_block_sits_between_directive_and_relationship_line() {
+        let a = affinity_at(0.0, 0.0, 0.0, 0.0, 0.0);
+        let s = snapshot(&["城市：上海"], Some("用户：你好"));
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s).as_deref(),
+            Some(&a),
+            RelationshipScope::default(),
+        );
+        let directive = p.find("DIRECTIVE").expect("directive present");
+        let about = p.find("[关于他]").expect("insights sub-block present");
+        let prev = p.find("[上次通话]").expect("prev-call sub-block present");
+        let line = p
+            .find("still getting to know each other")
+            .expect("relationship line present");
+        assert!(
+            directive < about && about < prev && prev < line,
+            "expected persona → directive → bootstrap → relationship line; got {p}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_empty_insights_omits_the_about_sub_block() {
+        let s = snapshot(&[], Some("用户：你好"));
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s).as_deref(),
+            None,
+            RelationshipScope::None,
+        );
+        assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[上次通话]\n用户：你好");
+        assert!(!p.contains("[关于他]"));
+    }
+
+    #[test]
+    fn bootstrap_missing_prev_call_omits_the_prev_call_sub_block() {
+        let s = snapshot(&["城市：上海"], None);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s).as_deref(),
+            None,
+            RelationshipScope::None,
+        );
+        assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[关于他]\n- 城市：上海");
+        assert!(!p.contains("[上次通话]"));
+    }
+
+    /// Both parts empty ⇒ no block at all, and no stray blank lines: the
+    /// prompt must be byte-identical to the no-bootstrap prompt.
+    #[test]
+    fn bootstrap_both_parts_empty_emits_no_block() {
+        let empty = snapshot(&[], None);
+        assert!(render_bootstrap(&empty).is_none());
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&empty).as_deref(),
+            None,
+            RelationshipScope::None,
+        );
+        assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
+        // A whitespace-only prev_call is empty too.
+        let blank = snapshot(&["  "], Some("   \n "));
+        assert!(render_bootstrap(&blank).is_none());
+    }
+
+    // ─── prev-call transcript rendering ─────────────────────────────────
+
+    #[test]
+    fn prev_call_transcript_maps_roles_and_skips_noise() {
+        let rows = vec![
+            slim("user", "你好"),
+            slim("assistant", "嗨呀"),
+            slim("assistant", "   "), // empty-content row: skipped
+            slim("gift_user", "（打赏 $5）"),
+            slim("system", "ignored"), // unknown role: skipped
+            slim("user", "晚安"),
+        ];
+        assert_eq!(
+            render_prev_call(&rows).unwrap(),
+            "用户：你好\n她：嗨呀\n用户：（打赏 $5）\n用户：晚安"
+        );
+    }
+
+    #[test]
+    fn prev_call_transcript_none_when_nothing_renders() {
+        assert!(render_prev_call(&[]).is_none());
+        assert!(render_prev_call(&[slim("assistant", ""), slim("tool", "x")]).is_none());
+    }
+
+    // ─── bootstrap marker plan ──────────────────────────────────────────
+
+    #[test]
+    fn plan_is_assemble_when_marker_absent() {
+        assert!(matches!(
+            plan_bootstrap(&serde_json::json!({})),
+            BootstrapPlan::Assemble
+        ));
+        assert!(matches!(
+            plan_bootstrap(&serde_json::json!({ "is_demo": true })),
+            BootstrapPlan::Assemble
+        ));
+    }
+
+    #[test]
+    fn plan_is_frozen_when_marker_well_formed() {
+        let s = snapshot(&["城市：上海"], Some("用户：你好"));
+        let meta = serde_json::json!({ "voice_bootstrap": serde_json::to_value(&s).unwrap() });
+        match plan_bootstrap(&meta) {
+            BootstrapPlan::Frozen(b) => {
+                assert_eq!(b.insights, vec!["城市：上海".to_string()]);
+                assert_eq!(b.prev_call.as_deref(), Some("用户：你好"));
+            }
+            other => panic!("expected Frozen, got {other:?}"),
+        }
+    }
+
+    /// Malformed marker ⇒ inject nothing AND never rewrite (a distinct plan
+    /// from `Assemble`, which would write).
+    #[test]
+    fn plan_is_malformed_on_garbage_marker() {
+        for v in [
+            serde_json::json!({ "voice_bootstrap": "not-an-object" }),
+            serde_json::json!({ "voice_bootstrap": null }),
+            serde_json::json!({ "voice_bootstrap": { "insights": "not-a-list" } }),
+            serde_json::json!({ "voice_bootstrap": { "insights": [] } }), // no created_at
+        ] {
+            assert!(
+                matches!(plan_bootstrap(&v), BootstrapPlan::Malformed),
+                "expected Malformed for {v}"
+            );
+        }
     }
 
     #[test]
@@ -416,6 +897,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
+            None,
             Some(&a),
             RelationshipScope::default(),
         );
@@ -431,6 +913,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
+            None,
             Some(&a),
             RelationshipScope::default(),
         );
@@ -449,6 +932,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
+            None,
             Some(&a),
             RelationshipScope::default(),
         );
@@ -460,12 +944,24 @@ mod tests {
     fn chemistry_boundary_switches_clause_at_crush() {
         // (0+0.52+0.50)/3 ≈ 0.34 ⇒ tier 2: still the subtle clause.
         let low = affinity_at(0.0, 0.0, 0.0, 0.52, 0.50);
-        let p_low = build_voice_prompt(&genome(), "D", Some(&low), RelationshipScope::default());
+        let p_low = build_voice_prompt(
+            &genome(),
+            "D",
+            None,
+            Some(&low),
+            RelationshipScope::default(),
+        );
         assert!(p_low.contains("faint, unspoken spark"));
         assert!(!p_low.contains("growing attraction"));
         // (0+0.54+0.54)/3 = 0.36 ⇒ tier 3: switches to the Crush clause.
         let high = affinity_at(0.0, 0.0, 0.0, 0.54, 0.54);
-        let p_high = build_voice_prompt(&genome(), "D", Some(&high), RelationshipScope::default());
+        let p_high = build_voice_prompt(
+            &genome(),
+            "D",
+            None,
+            Some(&high),
+            RelationshipScope::default(),
+        );
         assert!(p_high.contains("growing attraction"));
         assert!(!p_high.contains("faint, unspoken spark"));
     }
@@ -473,14 +969,26 @@ mod tests {
     #[test]
     fn scope_none_suppresses_line() {
         let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a), RelationshipScope::None);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            None,
+            Some(&a),
+            RelationshipScope::None,
+        );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
     }
 
     #[test]
     fn scope_bond_emits_base_only() {
         let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9); // CloseFriend / Beloved
-        let p = build_voice_prompt(&genome(), "DIRECTIVE", Some(&a), RelationshipScope::Bond);
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            None,
+            Some(&a),
+            RelationshipScope::Bond,
+        );
         assert!(p.contains("close friends"));
         assert!(!p.contains("deeply in love"));
     }
@@ -491,6 +999,7 @@ mod tests {
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
+            None,
             Some(&a),
             RelationshipScope::Chemistry,
         );
@@ -576,6 +1085,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -728,6 +1239,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -837,6 +1350,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -969,6 +1484,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -1101,6 +1618,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -1226,6 +1745,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -1342,6 +1863,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -1464,6 +1987,8 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
             },
             resolved,
         )
@@ -1515,5 +2040,616 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(content, "recovered");
+    }
+
+    // ─── bootstrap snapshot, end to end ─────────────────────────────────
+    //
+    // Shared scaffolding for the bootstrap e2e tests: one always-succeeding
+    // mock, and a `run_bootstrap_turn` that mirrors the route (load the
+    // session row → persist the user turn → drive the pipeline with that
+    // row's metadata), so "the marker written by turn 1 is what turn 2 sees"
+    // is exercised the way production reaches it.
+
+    async fn bootstrap_mock() -> wiremock::MockServer {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"id\":\"gen-b\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        mock
+    }
+
+    async fn seed_instance(pool: &sqlx::PgPool, user_id: Uuid) -> Uuid {
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_session(pool: &sqlx::PgPool, user_id: Uuid, instance_id: Uuid, ch: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(ch)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A message `mins_ago` minutes old, so ordering is deterministic.
+    async fn seed_message(
+        pool: &sqlx::PgPool,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+        mins_ago: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, sent_at) \
+             VALUES ($1, $2, $3, 'voice', now() - make_interval(mins => $4))",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(mins_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_insights(pool: &sqlx::PgPool, user_id: Uuid, insights: serde_json::Value) {
+        eros_engine_store::human_insight::HumanInsightRepo { pool }
+            .project_from_insights(user_id, &insights)
+            .await
+            .unwrap();
+    }
+
+    /// `metadata->'voice_bootstrap'`; `None` when the marker is absent.
+    async fn read_marker(pool: &sqlx::PgPool, session_id: Uuid) -> Option<serde_json::Value> {
+        sqlx::query_scalar(
+            "SELECT metadata->'voice_bootstrap' FROM engine.chat_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn last_request_body(mock: &wiremock::MockServer) -> serde_json::Value {
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let last = received.last().expect("at least one upstream request");
+        serde_json::from_slice(&last.body).expect("JSON request body")
+    }
+
+    fn system_prompt_of(body: &serde_json::Value) -> String {
+        let m = &body["messages"][0];
+        assert_eq!(
+            m["role"], "system",
+            "first wire message must be the system prompt"
+        );
+        m["content"].as_str().expect("system content").to_string()
+    }
+
+    /// One turn, exactly as the route drives it.
+    async fn run_bootstrap_turn(
+        pool: &sqlx::PgPool,
+        mock: &wiremock::MockServer,
+        session_id: Uuid,
+        instance_id: Uuid,
+        user_id: Uuid,
+        client_msg_id: &str,
+        memory_scope: MemoryScope,
+    ) -> Vec<ProtocolFrame> {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+
+        let repo = ChatRepo { pool };
+        // The route loads the full session row (metadata included) BEFORE the
+        // user insert and hands `metadata` to the pipeline — mirror that.
+        let session = repo
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", client_msg_id)
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_voice().unwrap();
+        run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                relationship_scope: RelationshipScope::None,
+                memory_scope,
+                session_metadata: session.metadata,
+            },
+            resolved,
+        )
+        .collect()
+        .await
+    }
+
+    fn assert_no_error_frame(frames: &[ProtocolFrame]) {
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "a memory path must never emit an error frame; got {frames:?}"
+        );
+    }
+
+    /// First turn freezes the snapshot into `metadata.voice_bootstrap` and
+    /// injects it: insights at the default (Neutral) tier + the previous
+    /// call's tail.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_first_turn_freezes_and_injects_bootstrap(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+
+        seed_insights(
+            &pool,
+            user_id,
+            serde_json::json!({ "city": "上海", "occupation": "设计师", "love_values": "慢热" }),
+        )
+        .await;
+
+        // A previous call (sibling voice session) with a two-message tail.
+        let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, sibling, "user", "你好", 20).await;
+        seed_message(&pool, sibling, "assistant", "嗨呀", 19).await;
+
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        // Frozen in the session row, RENDERED.
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+        assert_eq!(
+            marker["insights"],
+            serde_json::json!(["城市：上海", "职业：设计师"]),
+            "default scope ⇒ Neutral tier (no 感情观); got {marker}"
+        );
+        assert_eq!(
+            marker["prev_call"],
+            serde_json::json!("用户：你好\n她：嗨呀")
+        );
+        assert_eq!(marker["prev_session_id"], serde_json::json!(sibling));
+        assert!(
+            marker["created_at"].is_string(),
+            "created_at recorded: {marker}"
+        );
+
+        // …and injected into this very turn's system prompt.
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            sys.contains("[关于他]\n- 城市：上海\n- 职业：设计师"),
+            "insights sub-block missing: {sys}"
+        );
+        assert!(
+            sys.contains("[上次通话]\n用户：你好\n她：嗨呀"),
+            "prev-call sub-block missing: {sys}"
+        );
+        assert!(
+            !sys.contains("感情观"),
+            "Neutral tier must not leak intimate fields: {sys}"
+        );
+    }
+
+    /// The snapshot is frozen: a later turn re-injects the stored strings and
+    /// never re-reads (or rewrites) live insight data.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_second_turn_reuses_frozen_snapshot(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let first = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+
+        // Live data moves on mid-call — and must NOT reach the prompt.
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "北京" })).await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000002",
+            MemoryScope::Full,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let second = read_marker(&pool, session_id)
+            .await
+            .expect("marker still there");
+        assert_eq!(second, first, "the snapshot must never be rewritten");
+
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("城市：上海"), "frozen bullet missing: {sys}");
+        assert!(
+            !sys.contains("北京"),
+            "live insight data must not reach a later turn: {sys}"
+        );
+    }
+
+    /// No previous call ⇒ insights-only snapshot, no `[上次通话]` label.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_bootstrap_without_sibling_is_insights_only(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+        assert_eq!(marker["insights"], serde_json::json!(["城市：上海"]));
+        assert_eq!(marker["prev_call"], serde_json::Value::Null);
+        assert_eq!(marker["prev_session_id"], serde_json::Value::Null);
+
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("[关于他]"));
+        assert!(!sys.contains("[上次通话]"), "no sibling ⇒ no tail: {sys}");
+    }
+
+    /// Sibling selection: never this session, never a text session.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_bootstrap_sibling_skips_current_and_text_sessions(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+
+        // The real previous call — oldest of the three, so "most recently
+        // active" alone would NOT pick it.
+        let voice_sibling = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, voice_sibling, "user", "语音上次内容", 30).await;
+
+        // A text session for the same pair, more recently active.
+        let text_session = seed_session(&pool, user_id, instance_id, "text").await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '文字会话内容', now() - interval '5 minutes')",
+        )
+        .bind(text_session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(text_session)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The session being bootstrapped, with prior content of its own.
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, session_id, "user", "当前会话内容", 1).await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+        assert_eq!(marker["prev_session_id"], serde_json::json!(voice_sibling));
+        let prev = marker["prev_call"].as_str().expect("a transcript");
+        assert_eq!(prev, "用户：语音上次内容");
+        assert!(
+            !prev.contains("文字会话内容"),
+            "text session leaked: {prev}"
+        );
+        assert!(!prev.contains("当前会话内容"), "self quoted: {prev}");
+    }
+
+    /// `memory_scope: "none"` on the FIRST turn ⇒ no insight part, frozen for
+    /// the whole call (a later turn asking for `full` still gets none).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_memory_scope_none_freezes_snapshot_without_insights(
+        pool: sqlx::PgPool,
+    ) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, sibling, "user", "你好", 20).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::None,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+        assert_eq!(
+            marker["insights"],
+            serde_json::json!([]),
+            "InsightMode::Off ⇒ empty part, still a written marker; got {marker}"
+        );
+        assert_eq!(marker["prev_call"], serde_json::json!("用户：你好"));
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            !sys.contains("[关于他]"),
+            "scope none injected insights: {sys}"
+        );
+        assert!(
+            sys.contains("[上次通话]"),
+            "prev call still injected: {sys}"
+        );
+
+        // Turn 2 asks for Full — the frozen snapshot still wins.
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000002",
+            MemoryScope::Full,
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            !sys.contains("城市：上海"),
+            "the first turn's scope decides the whole call: {sys}"
+        );
+    }
+
+    /// The in-session window is 8 messages — asserted on the wire request.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_history_window_is_eight(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        // 10 prior messages, oldest first; the turn's own user row makes 11.
+        for i in 0..10i32 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            seed_message(&pool, session_id, role, &format!("m{i}"), 20 - i).await;
+        }
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let body = last_request_body(&mock).await;
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            msgs.len(),
+            9,
+            "system + VOICE_HISTORY_WINDOW(8) messages; got {}",
+            serde_json::to_string(&body["messages"]).unwrap()
+        );
+        assert_eq!(msgs[0]["role"], "system");
+        let wire: Vec<&str> = msgs[1..]
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            wire,
+            vec!["m3", "m4", "m5", "m6", "m7", "m8", "m9", "hello"]
+        );
+    }
+
+    /// A marker that is present but unreadable: inject nothing, degrade with a
+    /// warn, and NEVER overwrite it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_malformed_bootstrap_marker_is_never_rewritten(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, sibling, "user", "你好", 20).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        sqlx::query(
+            "UPDATE engine.chat_sessions \
+             SET metadata = '{\"voice_bootstrap\": \"garbage\"}'::jsonb WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        assert_eq!(
+            read_marker(&pool, session_id).await,
+            Some(serde_json::json!("garbage")),
+            "a write-once snapshot must never be clobbered, not even when unreadable"
+        );
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(!sys.contains("[关于他]"), "{sys}");
+        assert!(!sys.contains("[上次通话]"), "{sys}");
+    }
+
+    /// A failed part leaves the marker unwritten so the NEXT turn retries.
+    /// The insights read is broken by renaming its table out from under the
+    /// query (each `sqlx::test` gets its own database), then restored.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_failed_bootstrap_part_retries_next_turn(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let sibling = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_message(&pool, sibling, "user", "你好", 20).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        sqlx::query("ALTER TABLE engine.human_insights RENAME TO human_insights_broken")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        assert_eq!(
+            read_marker(&pool, session_id).await,
+            None,
+            "a partial assembly must not freeze the snapshot"
+        );
+        // The part that DID load is still injected this turn.
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("[上次通话]\n用户：你好"), "{sys}");
+        assert!(!sys.contains("[关于他]"), "{sys}");
+
+        sqlx::query("ALTER TABLE engine.human_insights_broken RENAME TO human_insights")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000002",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("the retry wrote the marker");
+        assert_eq!(marker["insights"], serde_json::json!(["城市：上海"]));
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(sys.contains("[关于他]\n- 城市：上海"), "{sys}");
     }
 }
