@@ -1065,6 +1065,59 @@ impl<'a> ChatRepo<'a> {
         .await?;
         Ok(())
     }
+
+    /// The user's most-recently-active OTHER voice session for this persona
+    /// instance — used to quote its tail into a new voice session's bootstrap
+    /// snapshot on that session's first turn. Same `(user_id, instance_id)`
+    /// pair, `channel = 'voice'`, and excludes `exclude_session_id` (the
+    /// session being bootstrapped) so a session never becomes its own
+    /// sibling. Read-only — unlike `resume_latest_session`, does NOT bump
+    /// `last_active_at`; this is a side lookup for a different session, not a
+    /// resume. Rides `idx_chat_sessions_user_instance_channel` (migration
+    /// 0031).
+    pub async fn latest_sibling_voice_session(
+        &self,
+        user_id: Uuid,
+        instance_id: Uuid,
+        exclude_session_id: Uuid,
+    ) -> Result<Option<ChatSession>, sqlx::Error> {
+        sqlx::query_as::<_, ChatSession>(
+            "SELECT * FROM engine.chat_sessions \
+             WHERE user_id = $1 AND instance_id = $2 AND channel = 'voice' AND id <> $3 \
+             ORDER BY last_active_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(exclude_session_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    /// Write-once snapshot of a voice session's bootstrap context into
+    /// `metadata.voice_bootstrap`. Guarded by `NOT (metadata ? 'voice_bootstrap')`
+    /// so a retried pipeline step, or two concurrent first-turn requests
+    /// racing each other, can never clobber the original snapshot — the
+    /// loser's write is a no-op, not a silent overwrite. No `COALESCE` needed:
+    /// `chat_sessions.metadata` is `NOT NULL DEFAULT '{}'` (migration 0001).
+    /// Returns `rows_affected`: 1 = this call wrote the snapshot; 0 = the key
+    /// was already present (race lost, or already written on a prior turn) —
+    /// callers treat 0 as a normal no-op, not an error.
+    pub async fn set_voice_bootstrap(
+        &self,
+        session_id: Uuid,
+        snapshot: &serde_json::Value,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE engine.chat_sessions \
+             SET metadata = metadata || jsonb_build_object('voice_bootstrap', $2::jsonb) \
+             WHERE id = $1 AND NOT (metadata ? 'voice_bootstrap')",
+        )
+        .bind(session_id)
+        .bind(snapshot)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -3377,5 +3430,190 @@ mod tests {
             .unwrap();
         assert!(openings.iter().all(|c| c != "这是官方说明……"));
         assert!(openings.contains(&"嗨呀".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_excludes_current_and_text_channel(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // The only session that should ever come back: an older voice
+        // session for the same user × instance.
+        let sibling = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(sibling.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Decoy: a text-channel session, more recently active than `sibling`.
+        // If the channel filter were missing, this would be picked instead.
+        let text_decoy = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "text")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(text_decoy.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Current: the voice session we exclude by id. Left at its default
+        // `now()` last_active_at — the most recent of all three — so a
+        // missing `id <> $3` filter would wrongly return it instead of
+        // `sibling`.
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.map(|s| s.id),
+            Some(sibling.id),
+            "must exclude the current session and any text-channel session"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_orders_by_last_active_at(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let older = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '2 hours' \
+             WHERE id = $1",
+        )
+        .bind(older.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let newer = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(newer.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap()
+            .expect("a sibling voice session exists");
+        assert_eq!(
+            found.id, newer.id,
+            "must return the most-recently-active sibling"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_sibling_voice_session_none_when_no_sibling(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let current = repo
+            .create_session_with_metadata(user_id, instance_id, serde_json::json!({}), "voice")
+            .await
+            .unwrap();
+
+        let found = repo
+            .latest_sibling_voice_session(user_id, instance_id, current.id)
+            .await
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "no other voice session exists for this user × instance"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_voice_bootstrap_writes_once_then_noops(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let s = throwaway_session(&pool).await;
+        let snapshot = serde_json::json!({
+            "tail": "上次聊到这里",
+            "prior_session_id": Uuid::new_v4().to_string(),
+        });
+
+        let rows = repo.set_voice_bootstrap(s.id, &snapshot).await.unwrap();
+        assert_eq!(rows, 1, "first write must succeed");
+
+        let loaded = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
+
+        // Second call with a DIFFERENT snapshot must no-op — the key is
+        // already present.
+        let other_snapshot = serde_json::json!({"tail": "should never be written"});
+        let rows2 = repo
+            .set_voice_bootstrap(s.id, &other_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows2, 0,
+            "second write must be a no-op (key already present)"
+        );
+
+        let loaded2 = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded2.metadata["voice_bootstrap"], snapshot,
+            "original snapshot must be preserved, not overwritten"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_voice_bootstrap_preserves_other_metadata_keys(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let s = repo
+            .create_session_with_metadata(
+                user_id,
+                instance_id,
+                serde_json::json!({"is_demo": true}),
+                "voice",
+            )
+            .await
+            .unwrap();
+
+        let snapshot = serde_json::json!({"tail": "接上次"});
+        let rows = repo.set_voice_bootstrap(s.id, &snapshot).await.unwrap();
+        assert_eq!(rows, 1);
+
+        let loaded = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.metadata["is_demo"],
+            serde_json::json!(true),
+            "pre-existing metadata keys must survive the merge"
+        );
+        assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
     }
 }
