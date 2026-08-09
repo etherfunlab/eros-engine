@@ -896,4 +896,150 @@ mod tests {
                 .unwrap();
         assert!(stamped.is_some(), "session must still be stamped");
     }
+
+    /// 512-dim unit vector — matches the column dimension the migrations set.
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    /// An `EmbeddingRouter` whose backend is a wiremock server, built through
+    /// the production `from_config_with` path (custom provider + its
+    /// `<NAME>_API_KEY`). Mirrors the helper in `pipeline::voice`'s tests.
+    async fn embed_router_mock() -> (
+        wiremock::MockServer,
+        eros_engine_llm::embedding::EmbeddingRouter,
+    ) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": unit_embedding(1) } ] }),
+            ))
+            .mount(&server)
+            .await;
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            server.uri()
+        ))
+        .expect("embedding provider config parses");
+        let router = eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+        })
+        .expect("mock embedding router builds");
+        (server, router)
+    }
+
+    /// Full path: an ended (idle) voice call becomes categorized profile-layer
+    /// memories and is stamped; a call that is still warm is not swept.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_ingests_idle_voice_session_and_skips_active_one(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let llm = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content":
+                    "{\"memories\":[{\"content\":\"用户住在上海\",\"category\":\"fact\"}]}" } }],
+                "id": "gen-e2e", "model": "primary"
+            })))
+            .mount(&llm)
+            .await;
+        let (_embed_server, embed) = embed_router_mock().await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", llm.uri()),
+            ),
+        );
+        state.embed = std::sync::Arc::new(embed);
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // Ended call: last_active_at two hours ago.
+        let ended: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
+             VALUES ($1,$2,'voice', now() - interval '2 hours') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Live call: active right now.
+        let live: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel, last_active_at) \
+             VALUES ($1,$2,'voice', now()) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for sid in [ended, live] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+                 ($1,'user','我住在上海','voice'), ($1,'assistant','[giggles] 上海不错','voice')",
+            )
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let processed = scan_and_classify(
+            &state,
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .expect("sweep ok");
+        assert_eq!(processed, 1, "only the ended call is eligible");
+
+        // Profile layer == `instance_id IS NULL` (there is no `layer` column;
+        // see `MemoryRepo::upsert`, which forces instance_id to NULL for
+        // MemoryLayer::Profile).
+        let rows: Vec<(String, Option<String>, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT content, category, session_id, instance_id \
+             FROM engine.companion_memories WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one extracted candidate ⇒ one memory row");
+        assert_eq!(rows[0].0, "用户住在上海");
+        assert_eq!(rows[0].1.as_deref(), Some("fact"));
+        assert_eq!(rows[0].2, ended, "memory is attributed to the ended call");
+        assert!(rows[0].3.is_none(), "profile layer ⇒ instance_id NULL");
+
+        let ended_stamp: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(ended)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended_stamp.is_some(), "ended call stamped");
+        let live_stamp: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(live)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(live_stamp.is_none(), "live call must not be swept mid-call");
+    }
 }
