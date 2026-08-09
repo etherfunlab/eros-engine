@@ -86,6 +86,12 @@ pub(crate) fn parse_prompt_log_dir(raw: Option<&str>) -> Option<std::path::PathB
     raw.filter(|s| !s.is_empty()).map(std::path::PathBuf::from)
 }
 
+/// Pure boolean-env parser. Accepts exactly `"1"` / `"true"`; everything
+/// else (including unset) is `false` — the `DREAMING_DISABLED` convention.
+pub(crate) fn parse_bool_flag(raw: Option<&str>) -> bool {
+    raw.map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
 /// injection off, town disabled off, stories disabled off, stories-prompt
 /// injection off, 300-second sweep cadence.
@@ -198,6 +204,15 @@ pub struct ServerConfig {
     /// re-claims the row. Should comfortably exceed the worst-case
     /// processing time (one LLM call + N calls to the embedding router).
     pub dreaming_claim_stale_threshold: Duration,
+    /// Opt out of post-call voice memory ingestion (`DREAMING_VOICE_DISABLED`).
+    /// Default `false` ⇒ ended voice sessions ARE swept and distilled into
+    /// profile-layer memories. Set to `1`/`true` to restore the pre-#236
+    /// text-only behavior: voice sessions are still claimed and stamped, but
+    /// their messages are never read. Exists because this is a
+    /// privacy-relevant behavior change — deployments keep a zero-code way
+    /// back. Note that `classified_at` is stamped once: calls swept while
+    /// this flag was on are never re-swept after turning it off.
+    pub dreaming_voice_disabled: bool,
     /// Top-level keys removed from the `usage` object before it leaves the
     /// engine — both `CompanionReplyResponse.usage` (sync) and the SSE
     /// streaming `done` frame. Empty = pass-through. The DB persists the full
@@ -223,9 +238,9 @@ impl ServerConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
-        let dreaming_disabled = std::env::var("DREAMING_DISABLED")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
+        let dreaming_disabled = parse_bool_flag(std::env::var("DREAMING_DISABLED").ok().as_deref());
+        let dreaming_voice_disabled =
+            parse_bool_flag(std::env::var("DREAMING_VOICE_DISABLED").ok().as_deref());
         let dreaming_tick = if dreaming_disabled {
             Duration::ZERO
         } else {
@@ -266,6 +281,7 @@ impl ServerConfig {
             dreaming_tick,
             dreaming_idle_threshold,
             dreaming_claim_stale_threshold,
+            dreaming_voice_disabled,
             openrouter_usage_hidden_keys: parse_usage_hidden_keys(
                 std::env::var("OPENROUTER_USAGE_HIDDEN_KEYS")
                     .ok()
@@ -452,5 +468,26 @@ mod tests {
         let c = parse_world_config(None, None, None, Some("yes"), Some("0"), None);
         assert!(!c.stories_disabled, "only 1/true count");
         assert!(!c.stories_prompt_disabled);
+    }
+
+    #[test]
+    fn bool_flag_accepts_one_and_true() {
+        assert!(parse_bool_flag(Some("1")));
+        assert!(parse_bool_flag(Some("true")));
+    }
+
+    #[test]
+    fn bool_flag_is_false_when_unset_or_other() {
+        assert!(!parse_bool_flag(None), "unset ⇒ off (voice ingestion ON)");
+        assert!(!parse_bool_flag(Some("false")));
+        assert!(!parse_bool_flag(Some("0")));
+        assert!(
+            !parse_bool_flag(Some("yes")),
+            "only 1/true, per DREAMING_DISABLED convention"
+        );
+        assert!(
+            !parse_bool_flag(Some("TRUE")),
+            "case-sensitive, like the existing flags"
+        );
     }
 }

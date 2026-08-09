@@ -164,12 +164,23 @@ async fn classify_session(
     // 1. Pull the conversation log. We use chat_messages (the canonical
     // turn record) rather than the formatted companion_memories rows so
     // the LLM doesn't see the "用户：X\nAI：Y" wrapper twice.
-    let rows: Vec<(String, String)> = sqlx::query_as(
+    //
+    // Channel filter: text rows (`channel IS NULL`) always; voice rows too
+    // unless `DREAMING_VOICE_DISABLED` is set. Eligibility is idle-based, so
+    // a voice session only reaches here after the call ended and went quiet
+    // for `DREAMING_IDLE_SECS` — this never reads a live call. `product_qa`
+    // rows stay excluded: out-of-character product asides are not memories.
+    let channel_filter = if state.config.dreaming_voice_disabled {
+        "AND channel IS NULL"
+    } else {
+        "AND (channel IS NULL OR channel = 'voice')"
+    };
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
         "SELECT role, content FROM engine.chat_messages \
          WHERE session_id = $1 AND role IN ('user', 'assistant') \
-           AND channel IS NULL \
-         ORDER BY sent_at",
-    )
+           {channel_filter} \
+         ORDER BY sent_at"
+    ))
     .bind(session_id)
     .fetch_all(&state.pool)
     .await
@@ -599,8 +610,72 @@ mod tests {
         // configured system prompt sentinel.
     }
 
+    /// Spec 2026-08-09-voice-dreaming-ingestion §1: voice rows now reach the
+    /// extraction transcript. This test REPLACES the old
+    /// `classify_session_excludes_voice_rows` lock — the inversion is
+    /// spec-mandated, not a weakened assertion. The boundary that must not
+    /// move is pinned by `classify_session_excludes_product_qa_rows` below.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn classify_session_excludes_voice_rows(pool: sqlx::PgPool) {
+    async fn classify_session_includes_voice_rows(pool: sqlx::PgPool) {
+        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
+        assert!(
+            joined.contains("VOICELINE"),
+            "voice turn must now be extracted (spec §1 flip)"
+        );
+    }
+
+    /// The boundary that must NOT move: `product_qa` is an out-of-character
+    /// product aside, never companion memory.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_excludes_product_qa_rows(pool: sqlx::PgPool) {
+        let (mock, state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
+        assert!(
+            !joined.contains("QALINE"),
+            "product_qa turn must stay excluded from memory extraction"
+        );
+    }
+
+    /// `DREAMING_VOICE_DISABLED=1` restores the pre-flip filter.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_excludes_voice_rows_when_flag_set(pool: sqlx::PgPool) {
+        let (mock, mut state, session_id, user_id, instance_id) = seed_channel_case(&pool).await;
+        state.config.dreaming_voice_disabled = true;
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(
+            joined.contains("TEXTLINE"),
+            "text turn must still be extracted"
+        );
+        assert!(
+            !joined.contains("VOICELINE"),
+            "flag on ⇒ voice turn excluded again"
+        );
+    }
+
+    /// Seed one session carrying a text turn, a voice turn, and a product_qa
+    /// turn, plus a state whose OpenRouter points at a mock returning an empty
+    /// memory list (so no embedding call is ever made).
+    async fn seed_channel_case(
+        pool: &sqlx::PgPool,
+    ) -> (
+        wiremock::MockServer,
+        crate::state::AppState,
+        Uuid,
+        Uuid,
+        Uuid,
+    ) {
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -613,29 +688,28 @@ mod tests {
             .mount(&mock)
             .await;
 
-        // Seed session with one TEXT assistant turn and one VOICE assistant turn.
         let user_id = Uuid::new_v4();
-        let genome_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) VALUES ('V','p','{}'::jsonb) RETURNING id",
-        ).fetch_one(&pool).await.unwrap();
-        let instance_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1,$2) RETURNING id",
-        ).bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let instance_id = seed_persona_instance(pool, user_id).await;
         let session_id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
         )
         .bind(user_id)
         .bind(instance_id)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
-        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1,'user','TEXTLINE')")
-            .bind(session_id).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES ($1,'assistant','VOICELINE','voice')")
-            .bind(session_id).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'user','TEXTLINE',NULL), \
+             ($1,'assistant','VOICELINE','voice'), \
+             ($1,'assistant','QALINE','product_qa')",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
-        // State with a memory_extraction task + mock OpenRouter.
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
@@ -650,19 +724,17 @@ mod tests {
             ),
         );
 
-        // Drive the private classify_session (same module).
-        let _ = super::classify_session(&state, session_id, user_id, Some(instance_id)).await;
+        (mock, state, session_id, user_id, instance_id)
+    }
 
-        // The request the extractor sent must contain the text turn, not the voice turn.
-        let reqs = mock.received_requests().await.unwrap();
-        let joined: String = reqs
+    /// Every request body the mock saw, concatenated — enough to assert which
+    /// sentinel lines made it into the extraction prompt.
+    async fn joined_request_bodies(mock: &wiremock::MockServer) -> String {
+        mock.received_requests()
+            .await
+            .expect("recording enabled by default")
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
-            .collect();
-        assert!(joined.contains("TEXTLINE"), "text turn must be extracted");
-        assert!(
-            !joined.contains("VOICELINE"),
-            "voice turn must be excluded from memory extraction"
-        );
+            .collect()
     }
 }
