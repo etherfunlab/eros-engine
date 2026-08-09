@@ -33,6 +33,26 @@ const RELATIONSHIP_RECALL_K: i32 = 3;
 /// Five categories × 2 = at most 10 lines of grouped profile context;
 /// kept small so the prompt doesn't bloat once classification fills in.
 const K_PER_CATEGORY: i32 = 2;
+
+/// Recall fan-out sizes for one call site of `recall_memory` /
+/// `recall_memory_with_embedding`. Parameterised so callers other than the
+/// text-chat path (e.g. voice) can reuse the same search + grouping logic
+/// with a smaller tier without touching the constants below.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecallTier {
+    pub grouped_k: i32,
+    pub raw_k: i32,
+    pub relationship_k: i32,
+}
+
+/// Text-chat recall tier — same values as the historical unparameterised
+/// constants, now passed explicitly.
+pub(crate) const TEXT_RECALL_TIER: RecallTier = RecallTier {
+    grouped_k: K_PER_CATEGORY,
+    raw_k: PROFILE_RECALL_K,
+    relationship_k: RELATIONSHIP_RECALL_K,
+};
+
 /// World-memories fragment recall size (spec §3.2).
 const WORLD_RECALL_K: i32 = 3;
 /// World-stories episode recall size (stories spec §5.3).
@@ -309,13 +329,14 @@ pub(crate) fn compose_image_prompt(
 /// element is the computed query embedding (`Some` only on success), reused
 /// by `fetch_world_context` so world-fragment recall doesn't pay a second
 /// Voyage call.
-async fn recall_memory(
+pub(crate) async fn recall_memory(
     state: &AppState,
     user_id: Uuid,
     instance_id: Uuid,
     query_text: &str,
     x_on: bool,
     y_on: bool,
+    tier: RecallTier,
 ) -> (Vec<(String, Vec<String>)>, Vec<String>, Option<Vec<f32>>) {
     if (!x_on && !y_on) || query_text.trim().is_empty() {
         return (vec![], vec![], None);
@@ -335,9 +356,16 @@ async fn recall_memory(
         y_on,
         "recall_memory: embedded query, dispatching pgvector search"
     );
-    let (profile_groups, relationship) =
-        recall_memory_with_embedding(&state.pool, user_id, instance_id, &embedding, x_on, y_on)
-            .await;
+    let (profile_groups, relationship) = recall_memory_with_embedding(
+        &state.pool,
+        user_id,
+        instance_id,
+        &embedding,
+        x_on,
+        y_on,
+        tier,
+    )
+    .await;
     (profile_groups, relationship, Some(embedding))
 }
 
@@ -354,22 +382,23 @@ async fn recall_memory(
 /// Hot path (`x_on` ⇒ `y_on`): the three profile + relationship searches run
 /// in parallel via `tokio::join!`. Relationship-only (`!x_on && y_on`): only
 /// the relationship search runs. Both off: no DB round-trip.
-async fn recall_memory_with_embedding(
+pub(crate) async fn recall_memory_with_embedding(
     pool: &PgPool,
     user_id: Uuid,
     instance_id: Uuid,
     embedding: &[f32],
     x_on: bool,
     y_on: bool,
+    tier: RecallTier,
 ) -> (Vec<(String, Vec<String>)>, Vec<String>) {
     let repo = MemoryRepo { pool };
 
     let (profile_groups, relationship): (Vec<(String, Vec<String>)>, Vec<String>) = if x_on {
         // X on ⇒ Y on: original three-way parallel recall (hot path).
         let (grouped_res, raw_res, rel_res) = tokio::join!(
-            repo.search_profile_grouped(user_id, embedding, K_PER_CATEGORY),
-            repo.search(user_id, None, embedding, PROFILE_RECALL_K),
-            repo.search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K),
+            repo.search_profile_grouped(user_id, embedding, tier.grouped_k),
+            repo.search(user_id, None, embedding, tier.raw_k),
+            repo.search(user_id, Some(instance_id), embedding, tier.relationship_k),
         );
         let grouped_rows = grouped_res.unwrap_or_else(|e| {
             tracing::warn!("profile-layer grouped search failed: {e}");
@@ -390,7 +419,7 @@ async fn recall_memory_with_embedding(
     } else if y_on {
         // relationship_only: skip both profile-layer searches.
         let rel = match repo
-            .search(user_id, Some(instance_id), embedding, RELATIONSHIP_RECALL_K)
+            .search(user_id, Some(instance_id), embedding, tier.relationship_k)
             .await
         {
             Ok(rows) => rows.into_iter().map(|r| r.content).collect(),
@@ -538,7 +567,7 @@ fn insights_to_bullets(insights: &Value) -> Vec<String> {
 /// emotional_needs / family / finance_status).
 /// Matching-only columns (preferred_gender / age / deal_breakers) are never
 /// rendered. `Off` → empty (defensive; loaders gate it before calling).
-fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
+pub(crate) fn human_insights_to_bullets(row: &HumanInsightsRow, mode: InsightMode) -> Vec<String> {
     if matches!(mode, InsightMode::Off) {
         return vec![];
     }
@@ -756,8 +785,16 @@ pub(super) async fn build_reply_request(
         );
     }
 
-    let (mut profile_groups, relationship_facts, query_embedding) =
-        recall_memory(state, user_id, instance_id, &query_text, x_on, y_on).await;
+    let (mut profile_groups, relationship_facts, query_embedding) = recall_memory(
+        state,
+        user_id,
+        instance_id,
+        &query_text,
+        x_on,
+        y_on,
+        TEXT_RECALL_TIER,
+    )
+    .await;
 
     let insight_bullets = load_human_insight_bullets(&state.pool, user_id, mem_mode).await;
     if !insight_bullets.is_empty() {
@@ -1047,6 +1084,7 @@ mod tests {
             &unit_embedding(7),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert!(profile.is_empty());
@@ -1096,6 +1134,7 @@ mod tests {
             &unit_embedding(11),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert_eq!(
@@ -1159,6 +1198,7 @@ mod tests {
             &unit_embedding(7),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
 
@@ -1223,6 +1263,7 @@ mod tests {
             &unit_embedding(100),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
 
@@ -1305,6 +1346,7 @@ mod tests {
             &unit_embedding(42),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert_eq!(profile_groups.len(), 1);
@@ -1322,6 +1364,7 @@ mod tests {
             &unit_embedding(99),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert_eq!(
@@ -1369,6 +1412,7 @@ mod tests {
             &unit_embedding(11),
             false,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert!(prof.is_empty(), "profile groups must be empty when X off");
@@ -1382,6 +1426,7 @@ mod tests {
             &unit_embedding(11),
             false,
             false,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert!(prof2.is_empty() && rel2.is_empty());
@@ -1394,6 +1439,7 @@ mod tests {
             &unit_embedding(11),
             true,
             true,
+            TEXT_RECALL_TIER,
         )
         .await;
         assert!(
@@ -1401,6 +1447,154 @@ mod tests {
             "profile groups should be present when X on"
         );
         assert!(!rel3.is_empty(), "relationship should be present when Y on");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_voice_tier_respects_k(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // Two categorised profile rows in each of two categories — more than
+        // the voice tier's grouped_k=1, so the cap must actually bite.
+        for (i, content) in ["lives in shanghai", "works remote"].iter().enumerate() {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                content,
+                &unit_embedding(500 + i),
+                Some("fact"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for (i, content) in ["loves coffee", "loves tea"].iter().enumerate() {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                content,
+                &unit_embedding(510 + i),
+                Some("preference"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Three relationship rows — more than the voice tier's
+        // relationship_k=2, so the cap must actually bite.
+        for i in 0..3 {
+            repo.upsert(
+                MemoryLayer::Relationship,
+                session_id,
+                user_id,
+                Some(instance_id),
+                &format!("relationship-{i}"),
+                &unit_embedding(600 + i),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let voice_tier = RecallTier {
+            grouped_k: 1,
+            raw_k: 2,
+            relationship_k: 2,
+        };
+
+        let (profile_groups, relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(500),
+            true,
+            true,
+            voice_tier,
+        )
+        .await;
+
+        // grouped_k=1 ⇒ each of the two categories is capped to a single
+        // bullet even though 2 rows exist per category.
+        assert_eq!(profile_groups.len(), 2, "both categories present");
+        for (label, items) in &profile_groups {
+            assert_eq!(
+                items.len(),
+                1,
+                "grouped_k=1 must cap category {label:?} to 1 row"
+            );
+        }
+
+        // relationship_k=2 ⇒ capped below the 3 rows seeded.
+        assert_eq!(relationship.len(), 2);
+    }
+
+    /// `recall_memory_with_embedding_voice_tier_respects_k` above seeds only
+    /// categorised profile rows, so `build_profile_groups` always takes the
+    /// grouped branch and the raw-fallback `raw_res` — though computed with
+    /// `tier.raw_k` — is discarded unread. That test alone never observes
+    /// whether `raw_k` is actually threaded through. Grouped and raw are
+    /// mutually-exclusive fallback paths (`build_profile_groups` returns the
+    /// grouped rows whenever any exist), so a single seeded scenario can't
+    /// exercise both; this sibling test seeds *only* uncategorised rows to
+    /// force the raw-fallback branch and assert its cap directly.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recall_memory_with_embedding_voice_tier_raw_fallback_cap(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, Some(instance_id)).await;
+        let repo = MemoryRepo { pool: &pool };
+
+        // Three uncategorised profile rows, zero categorised — forces the
+        // "近况" raw-fallback branch, more than the voice tier's raw_k=2.
+        for i in 0..3 {
+            repo.upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                &format!("raw-fact-{i}"),
+                &unit_embedding(700 + i),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let voice_tier = RecallTier {
+            grouped_k: 1,
+            raw_k: 2,
+            relationship_k: 2,
+        };
+
+        let (profile_groups, _relationship) = recall_memory_with_embedding(
+            &pool,
+            user_id,
+            instance_id,
+            &unit_embedding(700),
+            true,
+            true,
+            voice_tier,
+        )
+        .await;
+
+        // No categorised rows exist ⇒ raw fallback fires under "近况",
+        // capped to raw_k=2 even though 3 rows were seeded.
+        assert_eq!(profile_groups.len(), 1);
+        assert_eq!(profile_groups[0].0, "近况");
+        assert_eq!(
+            profile_groups[0].1.len(),
+            2,
+            "raw_k=2 must cap the 近况 fallback group to 2 rows"
+        );
     }
 
     // ─── human_insights_to_bullets ──────────────────────────────────────
