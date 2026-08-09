@@ -175,8 +175,8 @@ async fn classify_session(
     } else {
         "AND (channel IS NULL OR channel = 'voice')"
     };
-    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
-        "SELECT role, content FROM engine.chat_messages \
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT role, content, channel FROM engine.chat_messages \
          WHERE session_id = $1 AND role IN ('user', 'assistant') \
            {channel_filter} \
          ORDER BY sent_at"
@@ -193,13 +193,36 @@ async fn classify_session(
         return Ok(0);
     }
 
+    // Voice assistant rows may carry inline TTS cues when the deployment runs
+    // `[tasks.chat_voice] tts_audio_tags = true`. Strip them here — they are
+    // stage directions, not memories. User rows and text rows pass through
+    // verbatim. A turn that strips to nothing is dropped entirely rather than
+    // contributing an empty "AI：" line.
     let turns: Vec<String> = rows
         .into_iter()
-        .map(|(role, content)| {
+        .filter_map(|(role, content, channel)| {
+            let is_voice_assistant = role == "assistant" && channel.as_deref() == Some("voice");
+            let content = if is_voice_assistant {
+                strip_audio_tags(&content)
+            } else {
+                content
+            };
+            if content.trim().is_empty() {
+                return None;
+            }
             let label = if role == "user" { "用户" } else { "AI" };
-            format!("{label}：{content}")
+            Some(format!("{label}：{content}"))
         })
         .collect();
+
+    // Everything stripped away (a call of nothing but audio tags) reduces to
+    // the empty-session case: stamp, no LLM call.
+    if turns.is_empty() {
+        mark_classified(&state.pool, session_id)
+            .await
+            .map_err(|e| format!("mark classified (empty transcript): {e}"))?;
+        return Ok(0);
+    }
 
     // 2. Single LLM call, structured-JSON output. The instruction is the
     // configured system prompt; the conversation is a separate user message.
@@ -343,7 +366,6 @@ fn normalise_category(raw: &str) -> String {
 ///
 /// When nothing is stripped the input is returned byte-identical — the
 /// whitespace collapse only runs on strings a tag was actually removed from.
-#[allow(dead_code)]
 fn strip_audio_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut stripped = false;
@@ -377,7 +399,6 @@ fn strip_audio_tags(s: &str) -> String {
 /// Collapse runs of ASCII spaces into one and trim the ends. Newlines and
 /// other whitespace are preserved — only the gaps a removed tag left behind
 /// are closed up.
-#[allow(dead_code)]
 fn collapse_spaces(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
@@ -736,5 +757,143 @@ mod tests {
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect()
+    }
+
+    /// Spec §4: bracketed TTS cues on voice assistant rows never reach the
+    /// extraction prompt; user rows and non-voice rows are untouched.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_strips_audio_tags_from_voice_assistant_rows(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
+                "id": "gen-x", "model": "primary"
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'user','我 [laughs] 住在上海','voice'), \
+             ($1,'assistant','[giggles] 上海真好 [sighs] 我也想去','voice'), \
+             ($1,'assistant','[chuckles] 文字轮次',NULL)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let _ = classify_session(&state, session_id, user_id, Some(instance_id)).await;
+
+        let joined = joined_request_bodies(&mock).await;
+        assert!(
+            joined.contains("上海真好 我也想去"),
+            "voice assistant row must arrive tag-free and space-collapsed; got {joined}"
+        );
+        assert!(
+            !joined.contains("giggles"),
+            "no audio tag may survive on the voice assistant row"
+        );
+        assert!(
+            joined.contains("我 [laughs] 住在上海"),
+            "user rows are never stripped"
+        );
+        assert!(
+            joined.contains("[chuckles] 文字轮次"),
+            "non-voice assistant rows are never stripped"
+        );
+    }
+
+    /// A call whose every turn is tag-only leaves nothing to extract: stamp,
+    /// no LLM call — the same path a genuinely empty session takes.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn classify_session_stamps_without_llm_when_all_turns_strip_empty(pool: sqlx::PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"memories\":[]}" } }],
+                "id": "gen-x", "model": "primary"
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel) VALUES \
+             ($1,'assistant','[laughs]','voice'), ($1,'assistant','[sighs] [giggles]','voice')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.memory_extraction]\nmodel = \"primary\"\nfilter_prompt = \"extract\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let written = classify_session(&state, session_id, user_id, Some(instance_id))
+            .await
+            .expect("classify ok");
+        assert_eq!(written, 0);
+        assert!(
+            joined_request_bodies(&mock).await.is_empty(),
+            "nothing left to extract ⇒ no LLM call"
+        );
+        let stamped: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT classified_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamped.is_some(), "session must still be stamped");
     }
 }
