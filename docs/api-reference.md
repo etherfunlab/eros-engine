@@ -65,7 +65,9 @@ create a fresh session (`is_new: true`), even if a resumable one exists for
 this user × instance × channel. Default `false`/omitted keeps the normal
 resume-or-create behavior. Recommended for voice calls — start every call
 with `{"channel": "voice", "force_new": true}` so each call gets its own
-session instead of continuing a previous one.
+session instead of continuing a previous one. `POST /comp/chat/start` has no
+built-in rate limit, so deployments that expose `force_new` may want
+request-level rate limiting downstream.
 
 Optional `instance_id` field: an explicit `persona_instance` id. When absent,
 the server picks (or auto-creates) the user's instance for the supplied
@@ -461,10 +463,10 @@ Body fields:
 - `memory_scope` (optional) — same field name, enum, and default
   (`"neutral_and_relationship"`) as the
   [chat message stream](#post-compchatsession_idmessagestream). On the
-  session's **first** turn, the resolved insight tier picks the bootstrap
-  snapshot's `[关于他]` tier and is frozen for the rest of the call; every
-  turn it also gates that turn's recall block. Later turns cannot change
-  the snapshot's tier.
+  session's **first successfully-assembling** turn, the resolved insight
+  tier picks the bootstrap snapshot's `[关于他]` tier and is frozen for the
+  rest of the call; every turn it also gates that turn's recall block.
+  Later turns cannot change the snapshot's tier.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \

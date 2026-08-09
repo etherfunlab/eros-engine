@@ -117,8 +117,8 @@ prefix is byte-stable for the whole call, so provider-side prefix caching
 keeps working. Reading the snapshot costs zero extra queries.
 
 **Frozen semantics**: the snapshot's insight tier is decided by the first
-turn's `memory_scope` and never changes mid-call. Later turns' `memory_scope`
-gates that turn's recall layers only.
+successfully-assembling turn's `memory_scope` and never changes mid-call.
+Later turns' `memory_scope` gates that turn's recall layers only.
 
 **Reused sessions**: per-call sessions are a best practice the engine cannot
 enforce. A downstream that keeps reusing one voice session gets the correct
@@ -132,9 +132,10 @@ policy ever be wanted.
 name, enum, wire values, and default as the chat stream
 (`neutral_and_relationship`). On voice it means:
 
-- **First turn**: the resolved `InsightMode` picks the bootstrap insight tier —
-  Neutral by default; `full` / `insights_only` give Full; `relationship_only` /
-  `none` give Off (no insight part for the whole call).
+- **First successfully-assembling turn**: the resolved `InsightMode` picks the
+  bootstrap insight tier — Neutral by default; `full` / `insights_only` give
+  Full; `relationship_only` / `none` give Off (no insight part for the whole
+  call).
 - **Every turn**: the resolved `(x_on, y_on)` gates that turn's recall layers,
   exactly like chat.
 - `relationship_scope` is unchanged and orthogonal.

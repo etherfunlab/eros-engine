@@ -51,7 +51,7 @@ const VOICE_RECALL_BUDGET: Duration = Duration::from_millis(300);
 /// Voice K tier — deliberately far below the text path's (2 / 4 / 3): a spoken
 /// turn can absorb a couple of recalled lines, not a wall of them, and every
 /// row is prompt latency. Spec §5.
-const VOICE_RECALL_TIER: RecallTier = RecallTier {
+pub(crate) const VOICE_RECALL_TIER: RecallTier = RecallTier {
     grouped_k: 1,
     raw_k: 2,
     relationship_k: 2,

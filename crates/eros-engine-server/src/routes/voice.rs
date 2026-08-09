@@ -42,8 +42,9 @@ pub struct VoiceTurnRequest {
     pub relationship_scope: Option<RelationshipScope>,
     /// How much long-term memory this turn may use — same field name, enum,
     /// wire values, and default (`neutral_and_relationship`) as the chat
-    /// stream. On the session's FIRST turn the resolved insight tier is frozen
-    /// into the bootstrap snapshot and never changes for the rest of the call.
+    /// stream. The first successfully-assembling turn's resolved insight
+    /// tier is frozen into the bootstrap snapshot and never changes for the
+    /// rest of the call.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub memory_scope: Option<MemoryScope>,

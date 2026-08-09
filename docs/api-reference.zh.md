@@ -61,7 +61,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 （`is_new: true`），即使这个用户 × instance × channel 组合本有可以恢复的
 session。默认 `false`/缺省保持原本的恢复优先行为。语音通话推荐使用：每通
 电话都用 `{"channel": "voice", "force_new": true}` 开始，让每通电话都拿到
-自己的 session，而不是接着上一通的。
+自己的 session，而不是接着上一通的。`POST /comp/chat/start` 本身没有内置
+速率限制，暴露 `force_new` 的部署可能需要在下游做请求级别的限流。
 
 可选的 `instance_id` 字段：显式指定 `persona_instance` id。缺省时服务器为
 所给 `genome_id` 挑选（或自动创建）该用户的 instance；仅当 `instance_id`
@@ -400,10 +401,10 @@ Body 字段：
   `metadata.relationship_scope` 上。
 - `memory_scope`（可选）—— 字段名、枚举值、默认值
   （`"neutral_and_relationship"`）都与
-  [聊天消息流](#post-compchatsession_idmessagestream) 相同。session 的
-  **首轮**里，解析出的 insight 档位会决定引导快照 `[关于他]` 部分的档位，
-  并为整通电话冻结；每一轮它还会门控当轮的召回块。之后的轮次改不了快照的
-  档位。
+  [聊天消息流](#post-compchatsession_idmessagestream) 相同。session 里
+  **首个成功组装快照的轮次**中，解析出的 insight 档位会决定引导快照
+  `[关于他]` 部分的档位，并为整通电话冻结；每一轮它还会门控当轮的召回块。
+  之后的轮次改不了快照的档位。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \

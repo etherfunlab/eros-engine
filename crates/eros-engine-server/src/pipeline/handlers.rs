@@ -1504,11 +1504,7 @@ mod tests {
             .unwrap();
         }
 
-        let voice_tier = RecallTier {
-            grouped_k: 1,
-            raw_k: 2,
-            relationship_k: 2,
-        };
+        let voice_tier = crate::pipeline::voice::VOICE_RECALL_TIER;
 
         let (profile_groups, relationship) = recall_memory_with_embedding(
             &pool,
@@ -1569,11 +1565,7 @@ mod tests {
             .unwrap();
         }
 
-        let voice_tier = RecallTier {
-            grouped_k: 1,
-            raw_k: 2,
-            relationship_k: 2,
-        };
+        let voice_tier = crate::pipeline::voice::VOICE_RECALL_TIER;
 
         let (profile_groups, _relationship) = recall_memory_with_embedding(
             &pool,
