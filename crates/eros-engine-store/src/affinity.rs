@@ -109,6 +109,31 @@ impl<'a> AffinityRepo<'a> {
         Ok(row.map(AffinityRow::into_domain))
     }
 
+    /// Load the freshest affinity row for a user × persona-instance pair,
+    /// across all sessions. `companion_affinity` is session-keyed
+    /// (`session_id UNIQUE`) and rows are created only by the text
+    /// pipeline, so a voice-channel session never has one of its own — the
+    /// voice path resolves affinity by pair instead, taking whichever
+    /// session's row was updated most recently (latest state wins). Never
+    /// creates a row. `idx_affinity_user` covers the `user_id` filter;
+    /// per-user row counts are small enough that this scan is cheap.
+    pub async fn load_latest_for_pair(
+        &self,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) -> Result<Option<Affinity>, sqlx::Error> {
+        let row = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity \
+             WHERE user_id = $1 AND instance_id = $2 \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(AffinityRow::into_domain))
+    }
+
     /// Load existing or insert a fresh row with default values.
     pub async fn load_or_create(
         &self,
@@ -420,6 +445,79 @@ mod tests {
         // Lowered seed (stranger start) from migration 0029.
         assert!((a1.warmth - 0.1).abs() < 1e-9);
         assert!((a1.intrigue).abs() < 1e-9);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_latest_for_pair_returns_freshest_row(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // Two sessions for the same user × instance pair (e.g. a text
+        // session and a later voice session) each get their own affinity
+        // row — companion_affinity.session_id is UNIQUE.
+        let older_session = make_session(&pool, user_id, instance_id).await;
+        let newer_session = make_session(&pool, user_id, instance_id).await;
+        let older = repo
+            .load_or_create(older_session, user_id, instance_id)
+            .await
+            .unwrap();
+        let newer = repo
+            .load_or_create(newer_session, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // Force a deterministic updated_at ordering instead of relying on
+        // real-time gaps between the two load_or_create calls above.
+        sqlx::query("UPDATE engine.companion_affinity SET updated_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(older.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE engine.companion_affinity SET updated_at = now() WHERE id = $1")
+            .bind(newer.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let latest = repo
+            .load_latest_for_pair(user_id, instance_id)
+            .await
+            .unwrap()
+            .expect("a row exists for this pair");
+        assert_eq!(
+            latest.id, newer.id,
+            "the most recently updated session's row wins, not the oldest"
+        );
+
+        // A different pair (different user) must not leak in.
+        let other_user = Uuid::new_v4();
+        let other_instance = seed_persona_instance(&pool, other_user).await;
+        let other_session = make_session(&pool, other_user, other_instance).await;
+        repo.load_or_create(other_session, other_user, other_instance)
+            .await
+            .unwrap();
+        let scoped = repo
+            .load_latest_for_pair(user_id, instance_id)
+            .await
+            .unwrap()
+            .expect("still the original pair's row");
+        assert_eq!(scoped.id, newer.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_latest_for_pair_none_when_pair_has_none(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        // A brand-new user × instance pair with zero sessions and zero
+        // affinity rows — the state of every voice-channel session before
+        // any text session for the same pair has ever run.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        assert!(repo
+            .load_latest_for_pair(user_id, instance_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

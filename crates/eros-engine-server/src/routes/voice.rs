@@ -205,6 +205,7 @@ pub async fn voice_turn_stream(
     let turn = VoiceTurn {
         session_id,
         instance_id,
+        user_id,
         user_message_id,
         relationship_scope: req.relationship_scope.unwrap_or_default(),
     };

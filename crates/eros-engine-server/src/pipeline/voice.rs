@@ -92,6 +92,7 @@ fn relationship_line(affinity: &Affinity, scope: RelationshipScope) -> Option<St
 pub struct VoiceTurn {
     pub session_id: Uuid,
     pub instance_id: Uuid,
+    pub user_id: Uuid,
     pub user_message_id: Uuid,
     pub relationship_scope: RelationshipScope,
 }
@@ -128,8 +129,16 @@ pub fn run_voice_turn(
             }
         };
 
-        // Read-only affinity load (never creates a row on the voice path).
-        let affinity = affinity_repo.load(turn.session_id).await.unwrap_or(None);
+        // Resolve affinity by user × persona-instance, not by session:
+        // `companion_affinity` is populated only by the text pipeline, so a
+        // voice-channel session's own `session_id` never has a row — this
+        // read-only lookup takes the freshest row across every session for
+        // the same pair (e.g. a prior text session) instead. Never creates a
+        // row on the voice path.
+        let affinity = affinity_repo
+            .load_latest_for_pair(turn.user_id, turn.instance_id)
+            .await
+            .unwrap_or(None);
 
         // Chronological history, includes the just-persisted user turn.
         let history = match chat_repo
@@ -564,6 +573,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -608,6 +618,144 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(scope_meta.as_deref(), Some("both"));
+    }
+
+    /// Task 0 (affinity dead-row fix): `companion_affinity` is session-keyed
+    /// and populated only by the text pipeline, so a voice-channel session's
+    /// own `session_id` never has a row. The turn here runs on a voice
+    /// session that has none of its own, while an earlier TEXT session for
+    /// the same user × instance pair does — proving the relationship line
+    /// resolves via the pair, not the (affinity-less) voice session_id.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_renders_relationship_line_from_text_session_affinity(
+        pool: sqlx::PgPool,
+    ) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"id\":\"gen-v\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Seed persona + instance.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+
+        // A prior TEXT session for this pair, with its own affinity row —
+        // fresh-seed defaults land on Acquaintance/Spark (bond ≈ chemistry ≈
+        // 0.033, same tiers `fresh_affinity_gets_acquaintance_and_spark_line`
+        // asserts on for those exact phrases).
+        let text_session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'text') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        AffinityRepo { pool: &pool }
+            .load_or_create(text_session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // The voice session this turn actually runs on — no affinity row of
+        // its own.
+        let voice_session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Persist the user turn as the route would.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(voice_session_id, "hello", "01J9000000000000000000VOIC7")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // State with a chat_voice task + mock OpenRouter.
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id: voice_session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                relationship_scope: RelationshipScope::default(),
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Done { .. })));
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, ProtocolFrame::Error { .. })));
+
+        // The outbound system prompt must carry the relationship line
+        // derived from the TEXT session's affinity row — proof the voice
+        // path resolved it by pair, not by its own (nonexistent) row.
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        assert_eq!(received.len(), 1);
+        let req_body = String::from_utf8_lossy(&received[0].body);
+        assert!(
+            req_body.contains("still getting to know each other"),
+            "expected the bond relationship line in the outbound request; body={req_body}"
+        );
+        assert!(
+            req_body.contains("faint, unspoken spark"),
+            "expected the chemistry relationship line in the outbound request; body={req_body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -686,6 +834,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -817,6 +966,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -948,6 +1098,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -1072,6 +1223,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -1187,6 +1339,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
@@ -1308,6 +1461,7 @@ data: [DONE]\n\n";
             VoiceTurn {
                 session_id,
                 instance_id,
+                user_id,
                 user_message_id: umid,
                 relationship_scope: RelationshipScope::default(),
             },
