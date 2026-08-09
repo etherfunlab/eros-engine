@@ -393,6 +393,54 @@ fn is_binary_gender(persona: &CompanionPersona) -> bool {
     matches!(meta_str(persona, "gender"), Some("male") | Some("female"))
 }
 
+/// Render the `[user_profile]` and `[shared_memories]` recall sections shared
+/// by every prompt builder. `None` means the respective input had no content
+/// to render (for `profile_groups`, no group with a non-empty item list);
+/// callers decide what an empty section becomes — `build_prompt` substitutes
+/// the placeholder text, a future voice builder can omit the section
+/// entirely. `Some` content is byte-identical to today's non-empty
+/// rendering: profile groups as `[label]\n- bullet` blocks joined by `\n\n`,
+/// relationship facts as `- fact` lines joined by `\n`.
+pub(crate) fn render_recall_sections(
+    profile_groups: &[(String, Vec<String>)],
+    relationship_facts: &[String],
+) -> (Option<String>, Option<String>) {
+    let non_empty_groups: Vec<&(String, Vec<String>)> = profile_groups
+        .iter()
+        .filter(|(_, items)| !items.is_empty())
+        .collect();
+    let profile_sec = if non_empty_groups.is_empty() {
+        None
+    } else {
+        Some(
+            non_empty_groups
+                .iter()
+                .map(|(label, items)| {
+                    let bullets = items
+                        .iter()
+                        .map(|f| format!("- {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("[{label}]\n{bullets}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    };
+    let rel_sec = if relationship_facts.is_empty() {
+        None
+    } else {
+        Some(
+            relationship_facts
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    (profile_sec, rel_sec)
+}
+
 /// Build the full companion system prompt (plain-text reply schema).
 ///
 /// `profile_groups` is a list of `(label, bullets)` pairs that get rendered
@@ -478,35 +526,9 @@ pub fn build_prompt(
         format!("\n\n[additional_guidance]\n{bullets}")
     };
 
-    let non_empty_groups: Vec<&(String, Vec<String>)> = profile_groups
-        .iter()
-        .filter(|(_, items)| !items.is_empty())
-        .collect();
-    let profile_str = if non_empty_groups.is_empty() {
-        "（刚认识，还不了解他）".to_string()
-    } else {
-        non_empty_groups
-            .iter()
-            .map(|(label, items)| {
-                let bullets = items
-                    .iter()
-                    .map(|f| format!("- {f}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("[{label}]\n{bullets}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    let rel_str = if relationship_facts.is_empty() {
-        "（还没有专属记忆，慢慢来）".to_string()
-    } else {
-        relationship_facts
-            .iter()
-            .map(|f| format!("- {f}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let (profile_sec, rel_sec) = render_recall_sections(profile_groups, relationship_facts);
+    let profile_str = profile_sec.unwrap_or_else(|| "（刚认识，还不了解他）".to_string());
+    let rel_str = rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string());
 
     let attitude = affinity
         .map(|a| affinity_to_attitude_prompt(a, affinity_scope))
@@ -835,6 +857,56 @@ mod tests {
                 status: "active".into(),
             },
         }
+    }
+
+    // render_recall_sections — unit tests for the extracted recall renderer.
+    // `build_prompt`'s [user_profile]/[shared_memories] sections must stay
+    // byte-identical to today's output; these tests pin the helper's exact
+    // formatting independent of that placeholder-substitution wiring.
+
+    #[test]
+    fn render_recall_sections_empty_inputs_returns_none_none() {
+        let (profile_sec, rel_sec) = render_recall_sections(&[], &[]);
+        assert_eq!(profile_sec, None);
+        assert_eq!(rel_sec, None);
+    }
+
+    #[test]
+    fn render_recall_sections_filters_only_empty_item_groups() {
+        let groups = vec![
+            ("空组".to_string(), vec![]),
+            ("基础画像".to_string(), vec!["住在上海".to_string()]),
+        ];
+        let (profile_sec, rel_sec) = render_recall_sections(&groups, &[]);
+        assert_eq!(
+            profile_sec,
+            Some("[基础画像]\n- 住在上海".to_string()),
+            "empty-item group is filtered out, mirroring non_empty_groups"
+        );
+        assert_eq!(rel_sec, None);
+    }
+
+    #[test]
+    fn render_recall_sections_renders_profile_groups_exact_format() {
+        let groups = vec![
+            ("基础画像".to_string(), vec!["住在上海".to_string()]),
+            (
+                "偏好".to_string(),
+                vec!["喜欢猫".to_string(), "怕黑".to_string()],
+            ),
+        ];
+        let (profile_sec, _) = render_recall_sections(&groups, &[]);
+        assert_eq!(
+            profile_sec,
+            Some("[基础画像]\n- 住在上海\n\n[偏好]\n- 喜欢猫\n- 怕黑".to_string())
+        );
+    }
+
+    #[test]
+    fn render_recall_sections_renders_relationship_facts_as_bullet_lines() {
+        let facts = vec!["聊到深夜".to_string(), "一起看过电影".to_string()];
+        let (_, rel_sec) = render_recall_sections(&[], &facts);
+        assert_eq!(rel_sec, Some("- 聊到深夜\n- 一起看过电影".to_string()));
     }
 
     #[test]
