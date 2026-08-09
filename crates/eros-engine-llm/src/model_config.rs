@@ -884,6 +884,11 @@ pub struct TaskConfig {
     /// docs/superpowers/specs/2026-07-11-voice-tts-audio-tags-design.md.
     #[serde(default)]
     pub tts_audio_tags: Option<bool>,
+    /// chat_voice-only: per-turn vector recall on the voice path. Omitted ⇒
+    /// enabled. Set `recall = false` to keep the voice prompt recall-free.
+    /// Read only by `resolve_voice`.
+    #[serde(default)]
+    pub recall: Option<bool>,
     /// world_director-only: hours between per-owner director rounds. Read only
     /// on `[tasks.world_director]` (like `ghosting` on pde_decision). Default 24.
     #[serde(default)]
@@ -1140,6 +1145,7 @@ pub struct ResolvedVoice {
     pub max_tokens: u32,
     pub reasoning: Option<ReasoningConfig>,
     pub directive: String,
+    pub recall: bool,
 }
 
 /// Generic, product-identity-free default prompt for the image-prompt composer.
@@ -1753,6 +1759,7 @@ impl ModelConfig {
         const VOICE_TASK: &str = "chat_voice";
         let task_cfg = self.tasks.get(VOICE_TASK)?;
         let audio_tags = task_cfg.tts_audio_tags.unwrap_or(false);
+        let recall = task_cfg.recall.unwrap_or(true);
         let custom = task_cfg
             .filter_prompt
             .as_ref()
@@ -1773,6 +1780,7 @@ impl ModelConfig {
             max_tokens: m.max_tokens,
             reasoning: m.reasoning,
             directive,
+            recall,
         })
     }
 
@@ -4584,6 +4592,21 @@ retry_depth = 0
         let v = cfg.resolve_voice().expect("voice enabled");
         assert_eq!(v.directive, "Speak like a pirate.");
         assert!(!v.directive.contains("[laughs]"));
+    }
+
+    #[test]
+    fn resolve_voice_recall_defaults_true() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = \"m\"\n").unwrap();
+        let resolved = cfg.resolve_voice().expect("voice enabled");
+        assert!(resolved.recall);
+    }
+
+    #[test]
+    fn resolve_voice_recall_false_when_configured_off() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_voice]\nmodel = \"m\"\nrecall = false\n")
+            .unwrap();
+        let resolved = cfg.resolve_voice().expect("voice enabled");
+        assert!(!resolved.recall);
     }
 
     #[test]
