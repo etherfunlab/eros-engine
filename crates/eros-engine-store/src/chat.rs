@@ -934,7 +934,10 @@ impl<'a> ChatRepo<'a> {
     /// `channel = 'voice'` and skips all replay/ghost machinery. Returns
     /// which case occurred — `Duplicate` when `client_msg_id` was already
     /// seen (existing row's id), `Inserted` (fresh row's id) otherwise — so
-    /// callers can refuse to regenerate a reply for a duplicate.
+    /// callers can refuse to regenerate a reply for a duplicate. Bumps
+    /// `last_active_at` only on the `Inserted` branch — a `Duplicate` replay
+    /// must not bump, or it would reorder sibling-session selection for a
+    /// later feature.
     pub async fn insert_voice_user_message(
         &self,
         session_id: Uuid,
@@ -946,6 +949,7 @@ impl<'a> ChatRepo<'a> {
         // migration 0012) — DO NOTHING and fall through to reading the existing id,
         // so concurrent duplicates are classified reliably (the loser gets
         // Duplicate, never a unique-violation 500).
+        let mut tx = self.pool.begin().await?;
         let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
              VALUES ($1, 'user', $2, $3, 'voice') \
@@ -955,9 +959,16 @@ impl<'a> ChatRepo<'a> {
         .bind(session_id)
         .bind(content)
         .bind(client_msg_id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(id) = inserted {
+            // Bump only on a fresh insert. A `Duplicate` replay must NOT bump —
+            // it would reorder sibling-session selection for a later feature.
+            sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Ok(VoiceUserInsert::Inserted(id));
         }
         // Conflict → a row with this (session_id, client_msg_id) already exists.
@@ -970,14 +981,16 @@ impl<'a> ChatRepo<'a> {
         )
         .bind(session_id)
         .bind(client_msg_id)
-        .fetch_one(self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(VoiceUserInsert::Duplicate(existing))
     }
 
     /// Persist an assistant turn on the voice channel: `role='assistant'`,
     /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
-    /// continues_from — voice replies are single, whole messages.
+    /// continues_from — voice replies are single, whole messages. Bumps
+    /// `last_active_at` in the same transaction as the insert.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_voice_assistant_message(
         &self,
@@ -991,6 +1004,7 @@ impl<'a> ChatRepo<'a> {
         truncated: bool,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO engine.chat_messages \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
@@ -1006,8 +1020,13 @@ impl<'a> ChatRepo<'a> {
         .bind(usage)
         .bind(generation_id)
         .bind(metadata)
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2967,6 +2986,158 @@ mod tests {
         assert!(
             matches!(out, VoiceUserInsert::Duplicate(_)),
             "voice insert colliding with a gift_user row must be Duplicate, got {out:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_user_insert_bumps_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+
+        // Backdate so the bump is unambiguous regardless of clock resolution.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let out = repo
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP1")
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, VoiceUserInsert::Inserted(_)),
+            "expected Inserted, got {out:?}"
+        );
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            after > before,
+            "a fresh voice user insert must bump last_active_at"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_user_insert_duplicate_does_not_bump_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+        let cmid = "01J9000000000000000000BUMP2";
+
+        let first = match repo
+            .insert_voice_user_message(session_id, "hi", cmid)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // Backdate so a stray bump on the duplicate branch would be visible.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let out = repo
+            .insert_voice_user_message(session_id, "hi again", cmid)
+            .await
+            .unwrap();
+        match out {
+            VoiceUserInsert::Duplicate(id) => assert_eq!(id, first),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "a duplicate voice user insert must NOT bump last_active_at (would reorder \
+             sibling-session selection for a replayed client_msg_id)"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_assistant_insert_bumps_last_active_at(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+
+        let user_message_id = match repo
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP3")
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // Backdate so the assistant-insert bump is unambiguous.
+        sqlx::query(
+            "UPDATE engine.chat_sessions SET last_active_at = now() - interval '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let aid: Uuid = ulid::Ulid::new().into();
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_message_id,
+            aid,
+            "hi there",
+            Some("primary"),
+            None,
+            Some("gen-1"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_active_at FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            after > before,
+            "a voice assistant insert must bump last_active_at"
         );
     }
 
