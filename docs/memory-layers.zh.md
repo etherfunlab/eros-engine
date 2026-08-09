@@ -147,8 +147,8 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   session 空闲满 `DREAMING_IDLE_SECS` 之后，dreaming-lite 清扫器会读它的通话
   记录，蒸馏出带 category 的画像层 `companion_memories` 行——和文字 session
   的处理完全一样。这些行就是普通记忆，之后的语音通话和文字聊天都能召回。
-  助手行里的 TTS 音频标签（开了 `tts_audio_tags` 时的 `[laughs]`、`[sighs]`）
-  会先被剥掉，舞台提示不会变成记忆文本。部署方可以用
+  语音助手行里的 TTS 音频标签（开了 `tts_audio_tags` 时的 `[laughs]`、
+  `[sighs]`）会先被剥掉，舞台提示不会变成记忆文本。部署方可以用
   `DREAMING_VOICE_DISABLED=1` 整个关掉，恢复到早先只扫文字的过滤条件；注意
   在开关打开期间已被扫过的通话，关掉开关后不会重扫（`classified_at` 只盖一次）。
   关系层的行仍然从不由语音写入。

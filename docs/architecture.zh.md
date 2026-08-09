@@ -110,9 +110,10 @@ eros-engine-server :8080
 post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight / lead-score 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
 
 **`chat_messages.channel`**：`NULL` = 普通文本；`'voice'` = 语音频道；
-`'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在伴侣上下文与记忆之外
-（短期回忆、对话信号、dreaming、好感度评估、insight 抽取），但在实时流、
-重放和客户端历史记录里完全可见。
+`'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在短期回忆、对话信号、
+好感度评估、insight 抽取之外，但在实时流、重放和客户端历史记录里完全可见。
+dreaming 是例外：它默认也会读 `'voice'` 的行（通话空闲后才读；可用
+`DREAMING_VOICE_DISABLED` 关掉），但仍然排除 `'product_qa'`。
 
 ## 為甚麼 core 必須純領域
 

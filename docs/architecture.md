@@ -114,9 +114,11 @@ The post-process spawn returns `()` and is fire-and-forget by design — the use
 
 **`chat_messages.channel`**: `NULL` = normal text; `'voice'` = voice channel;
 `'product_qa'` = out-of-character product answer — non-NULL rows are
-excluded from companion context and memory (short-term recall, conversation
-signals, dreaming, affinity evaluation, insight extraction) while staying
-fully visible on the live stream, replay, and client history.
+excluded from short-term recall, conversation signals, affinity evaluation,
+and insight extraction while staying fully visible on the live stream,
+replay, and client history. Dreaming is the exception: it also reads
+`'voice'` rows by default (once a call goes idle; opt out with
+`DREAMING_VOICE_DISABLED`), but still excludes `'product_qa'`.
 
 ## Why pure-domain core
 

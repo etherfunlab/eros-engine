@@ -160,8 +160,8 @@ the request shape and [model-config.md](model-config.md) for the
   distills categorized profile-layer `companion_memories` rows, exactly as it
   does for text sessions. Those rows are ordinary memories — later calls and
   text chats both recall them. Inline TTS audio tags (`[laughs]`, `[sighs]`,
-  when `tts_audio_tags` is on) are stripped from assistant rows first, so
-  stage directions never become memory text. Operators can turn the whole
+  when `tts_audio_tags` is on) are stripped from voice assistant rows first,
+  so stage directions never become memory text. Operators can turn the whole
   behavior off with `DREAMING_VOICE_DISABLED=1`, which restores the earlier
   text-only sweeper filter; note that a call swept while the flag was on is
   never re-swept after turning it off (`classified_at` is stamped once).
