@@ -317,6 +317,73 @@ fn normalise_category(raw: &str) -> String {
     }
 }
 
+/// Strip inline TTS audio tags from a voice assistant turn.
+///
+/// Deployments with `[tasks.chat_voice] tts_audio_tags = true` get replies
+/// carrying stage directions — `[laughs]`, `[whispers]`, `[sighs]` — that the
+/// TTS layer consumes. They are performance cues, not things the user said or
+/// the companion learned, so they never belong in extracted memory text.
+///
+/// Deliberately conservative: a tag is `[` + a non-empty run of lowercase
+/// ASCII letters and single spaces + `]` (the shape `AUDIO_TAGS_ADDENDUM`
+/// teaches, including improvised multi-word tags like `[laughs softly]`).
+/// `[Laughs]`, `[标签]`, `[3]`, `[]`, and unclosed `[` are left verbatim so
+/// literal brackets in real content survive.
+///
+/// When nothing is stripped the input is returned byte-identical — the
+/// whitespace collapse only runs on strings a tag was actually removed from.
+#[allow(dead_code)]
+fn strip_audio_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut stripped = false;
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let tag = after
+            .find(']')
+            .map(|close| &after[..close])
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == ' '));
+        match tag {
+            Some(t) => {
+                out.push_str(&rest[..open]);
+                rest = &after[t.len() + 1..];
+                stripped = true;
+            }
+            None => {
+                // Not a tag — keep the '[' and continue scanning past it.
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    if !stripped {
+        return s.to_string();
+    }
+    collapse_spaces(&out)
+}
+
+/// Collapse runs of ASCII spaces into one and trim the ends. Newlines and
+/// other whitespace are preserved — only the gaps a removed tag left behind
+/// are closed up.
+#[allow(dead_code)]
+fn collapse_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c == ' ' {
+            if !prev_space {
+                out.push(c);
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +479,57 @@ mod tests {
         assert_eq!(normalise_category("opinion"), "fact");
         assert_eq!(normalise_category(""), "fact");
         assert_eq!(normalise_category("分类"), "fact");
+    }
+
+    #[test]
+    fn strip_audio_tags_removes_a_single_tag() {
+        assert_eq!(strip_audio_tags("[laughs] 你好啊"), "你好啊");
+        assert_eq!(strip_audio_tags("你好啊 [laughs]"), "你好啊");
+    }
+
+    #[test]
+    fn strip_audio_tags_removes_interspersed_tags() {
+        assert_eq!(
+            strip_audio_tags("今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦"),
+            "今天全搞砸了 不想说了…… 骗你的啦"
+        );
+    }
+
+    #[test]
+    fn strip_audio_tags_accepts_multi_word_tags() {
+        // The addendum explicitly lets the model improvise beyond the listed
+        // vocabulary, so `[laughs softly]` must strip too.
+        assert_eq!(strip_audio_tags("好啦 [laughs softly] 别闹"), "好啦 别闹");
+    }
+
+    #[test]
+    fn strip_audio_tags_yields_empty_for_tag_only_content() {
+        assert_eq!(strip_audio_tags("[laughs]"), "");
+        assert_eq!(strip_audio_tags(" [sighs] [giggles] "), "");
+    }
+
+    #[test]
+    fn strip_audio_tags_leaves_no_doubled_spaces() {
+        assert_eq!(strip_audio_tags("a [sighs] b"), "a b");
+        assert_eq!(strip_audio_tags("a[sighs]b"), "ab");
+    }
+
+    #[test]
+    fn strip_audio_tags_keeps_non_tag_brackets() {
+        // Uppercase, CJK, digits, empty, unclosed — none of these are TTS tags.
+        assert_eq!(strip_audio_tags("[Laughs] 嗨"), "[Laughs] 嗨");
+        assert_eq!(strip_audio_tags("[标签] 嗨"), "[标签] 嗨");
+        assert_eq!(strip_audio_tags("第 [3] 章"), "第 [3] 章");
+        assert_eq!(strip_audio_tags("空 [] 括号"), "空 [] 括号");
+        assert_eq!(strip_audio_tags("[laughs 没关"), "[laughs 没关");
+    }
+
+    #[test]
+    fn strip_audio_tags_is_byte_identical_without_tags() {
+        // No tag ⇒ no whitespace collapsing either: untagged rows must be
+        // passed through untouched, doubled spaces and all.
+        let s = "我  住在   上海\n真的";
+        assert_eq!(strip_audio_tags(s), s);
     }
 
     #[test]
