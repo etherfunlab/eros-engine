@@ -73,6 +73,10 @@ pub struct BffStartRequest {
     /// the canonical start; see `StartChatRequest::channel`.
     #[serde(default)]
     pub channel: Option<String>,
+    /// Skip resume and always create a fresh session. Passed through to the
+    /// canonical start; see `StartChatRequest::force_new`.
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 impl From<&BffStartRequest> for StartChatRequest {
@@ -82,6 +86,7 @@ impl From<&BffStartRequest> for StartChatRequest {
             genome_id: b.genome_id,
             is_demo: b.is_demo,
             channel: b.channel.clone(),
+            force_new: b.force_new,
         }
     }
 }
@@ -758,6 +763,40 @@ mod tests {
         .await;
         assert!(!text2["is_new"].as_bool().unwrap());
         assert_eq!(text2["session_id"], text1["session_id"]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_force_new_creates_fresh_session(pool: PgPool) {
+        // Proves `force_new` survives the wire + the literal
+        // `From<&BffStartRequest> for StartChatRequest` impl — with
+        // `#[serde(default)]` on the field, a forgotten copy in that impl
+        // would silently drop it instead of failing loudly.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, first) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={first}");
+        assert!(first["is_new"].as_bool().unwrap());
+        let first_id = first["session_id"].as_str().unwrap().to_string();
+
+        let (status, second) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id, "force_new": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={second}");
+        assert!(
+            second["is_new"].as_bool().unwrap(),
+            "force_new must produce is_new: true; got {second}"
+        );
+        assert_ne!(second["session_id"].as_str().unwrap(), first_id);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

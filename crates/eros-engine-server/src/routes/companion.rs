@@ -83,6 +83,13 @@ pub struct StartChatRequest {
     /// text session and vice versa, so the two conversations stay isolated.
     #[serde(default)]
     pub channel: Option<String>,
+    /// When `true`, skip resume entirely and always create a fresh session
+    /// (returns `is_new: true`), even if a resumable one exists for this
+    /// user × instance × channel. Default `false`/omitted keeps the normal
+    /// resume-or-create behavior. Intended for callers (e.g. voice calls)
+    /// that want one session per call rather than a continued conversation.
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -471,11 +478,16 @@ pub(crate) async fn resolve_or_create_session(
     };
 
     // Resume the latest session (bumping last_active_at in one statement), or
-    // create a fresh one. Only `id` is consumed downstream.
-    let (session_id, is_new) = match chat_repo
-        .resume_latest_session(user_id, instance_id, channel)
-        .await?
-    {
+    // create a fresh one. Only `id` is consumed downstream. `force_new` skips
+    // the resume lookup entirely so the match below always falls to create.
+    let resumed = if req.force_new.unwrap_or(false) {
+        None
+    } else {
+        chat_repo
+            .resume_latest_session(user_id, instance_id, channel)
+            .await?
+    };
+    let (session_id, is_new) = match resumed {
         Some(s) => (s.id, false),
         None => {
             let metadata = if req.is_demo.unwrap_or(false) {
@@ -923,6 +935,119 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row_user_id, user_id);
+    }
+
+    // ─── Test 3b: force_new bypasses resume; default still resumes ──
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_force_new_creates_fresh_session_when_one_exists(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Echo").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // 1. Plain start creates the first session.
+        let body = serde_json::to_vec(&json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, first) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "body={first}");
+        assert_eq!(first["is_new"], true);
+        let first_id = first["session_id"].as_str().unwrap().to_string();
+
+        // 2. force_new: true must NOT resume — it always creates a fresh session.
+        let body =
+            serde_json::to_vec(&json!({ "genome_id": genome_id, "force_new": true })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, second) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "body={second}");
+        assert_eq!(second["is_new"], true);
+        let second_id = second["session_id"].as_str().unwrap().to_string();
+        assert_ne!(
+            second_id, first_id,
+            "force_new must create a session distinct from the resumable one"
+        );
+
+        // 3. A plain (non-force) start afterward resumes the LATEST session —
+        //    the one force_new just created, bumped ahead by last_active_at —
+        //    not a third fresh one.
+        let body = serde_json::to_vec(&json!({ "genome_id": genome_id })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, third) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "body={third}");
+        assert_eq!(third["is_new"], false);
+        assert_eq!(third["session_id"].as_str().unwrap(), second_id);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn start_force_new_on_voice_channel(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nyx").await;
+        let state = test_state(pool.clone());
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        // 1. Plain voice start creates the first voice session.
+        let body =
+            serde_json::to_vec(&json!({ "genome_id": genome_id, "channel": "voice" })).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, first) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "body={first}");
+        assert_eq!(first["is_new"], true);
+        let first_id = first["session_id"].as_str().unwrap().to_string();
+
+        // 2. force_new on voice must create a fresh voice session, not resume.
+        let body = serde_json::to_vec(
+            &json!({ "genome_id": genome_id, "channel": "voice", "force_new": true }),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/comp/chat/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, second) = send_request(&mut app, req).await;
+        assert_eq!(status, StatusCode::OK, "body={second}");
+        assert_eq!(second["is_new"], true);
+        let second_id_str = second["session_id"].as_str().unwrap();
+        assert_ne!(second_id_str, first_id);
+        let second_id = Uuid::parse_str(second_id_str).unwrap();
+
+        // The fresh session must land on the voice channel, not silently
+        // reset to text.
+        let channel: String =
+            sqlx::query_scalar("SELECT channel FROM engine.chat_sessions WHERE id = $1")
+                .bind(second_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(channel, "voice");
     }
 
     // ─── Test 4: cross-user GET /chat/{user_id}/sessions → 403 ──────
@@ -1417,6 +1542,7 @@ mod tests {
             genome_id: Some(genome_id),
             is_demo: None,
             channel: None,
+            force_new: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1453,6 +1579,7 @@ mod tests {
             genome_id: Some(genome_id),
             is_demo: None,
             channel: None,
+            force_new: None,
         };
         let resolved = resolve_or_create_session(&state, user_id, &req)
             .await
@@ -1484,6 +1611,7 @@ mod tests {
             genome_id: None,
             is_demo: None,
             channel: None,
+            force_new: None,
         };
         let err = resolve_or_create_session(&state, intruder, &req)
             .await
@@ -1513,6 +1641,7 @@ mod tests {
             genome_id: None,
             is_demo: None,
             channel: None,
+            force_new: None,
         };
         let err = resolve_or_create_session(&state, user_id, &req)
             .await
