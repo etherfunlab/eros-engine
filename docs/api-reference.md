@@ -426,10 +426,13 @@ first-turn **bootstrap snapshot** (frozen once per session, then re-injected
 verbatim every turn) + one relationship line derived from the session's
 affinity (bond/chemistry tiers) + this turn's **recall block**. History is
 the last 8 messages (4 exchanges) — shorter than the chat path's window,
-since the bootstrap and recall carry the longer-range memory instead. Voice
-still writes **no** memories of any kind (no insight extraction, no vector
-writes) — a call's content only becomes reachable from a *later* call, via
-the bootstrap snapshot below.
+since the bootstrap and recall carry the longer-range memory instead. A
+voice **turn** writes no memories (no insight extraction, no vector
+writes), but a finished **call** does: once the session goes idle, the
+dreaming-lite sweeper distills its transcript into profile-layer memories,
+so later calls and text chats can recall it. Operators opt out with
+`DREAMING_VOICE_DISABLED=1` — see
+[memory-layers.md](memory-layers.md#voice-turns).
 
 **Bootstrap snapshot** (first turn only, then frozen into
 `chat_sessions.metadata.voice_bootstrap` and replayed on every later turn —

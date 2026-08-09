@@ -153,14 +153,25 @@ the request shape and [model-config.md](model-config.md) for the
   backchannels) skips recall entirely, with no embedding call. Deployment
   kill-switch: `[tasks.chat_voice] recall = false` (default `true`) always
   wins over the request's `memory_scope`.
-- **Read-only** — voice never writes to `companion_memories`: no raw-turn
-  embed, no dreaming-lite extraction (the sweeper still excludes
-  `channel = 'voice'` sessions). A call's own content is not searchable by
-  itself; it only becomes reachable from a *later* sibling voice call, via
-  the bootstrap snapshot above.
+- **Post-call writes only** — a live voice turn never writes: no raw-turn
+  embed, no insight extraction, no affinity eval. What a call *does* leave
+  behind is written after it ends: once the session has been idle for
+  `DREAMING_IDLE_SECS`, the dreaming-lite sweeper reads its transcript and
+  distills categorized profile-layer `companion_memories` rows, exactly as it
+  does for text sessions. Those rows are ordinary memories — later calls and
+  text chats both recall them. Inline TTS audio tags (`[laughs]`, `[sighs]`,
+  when `tts_audio_tags` is on) are stripped from assistant rows first, so
+  stage directions never become memory text. Operators can turn the whole
+  behavior off with `DREAMING_VOICE_DISABLED=1`, which restores the earlier
+  text-only sweeper filter; note that a call swept while the flag was on is
+  never re-swept after turning it off (`classified_at` is stamped once).
+  Relationship-layer rows are still never written from voice.
 
-Design spec:
-[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md).
+Design specs:
+[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)
+(bootstrap + recall) and
+[2026-08-09-voice-dreaming-ingestion-design.md](superpowers/specs/2026-08-09-voice-dreaming-ingestion-design.md)
+(post-call ingestion).
 
 ## Source
 

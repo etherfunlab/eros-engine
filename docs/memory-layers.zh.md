@@ -142,13 +142,22 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   哈哈这类应和词）直接跳过召回，不发起 embedding 调用。部署方可以用
   `[tasks.chat_voice] recall = false`（默认 `true`）强制关闭，优先级高于
   请求里的 `memory_scope`。
-- **只读** —— 语音路径从不往 `companion_memories` 写入：没有逐轮原文写入，
-  也没有 dreaming-lite 抽取（清扫器仍然排除 `channel = 'voice'` 的
-  session）。一通电话自己的内容不能被自己检索到；只有*之后*的同频道语音
-  通话，才能通过上面的引导快照读到它。
+- **只在通话结束后写入** —— 语音轮次进行中从不写入：没有逐轮原文写入，没有
+  insight 抽取，也没有好感度评估。一通电话留下的东西是在它结束之后才写的：
+  session 空闲满 `DREAMING_IDLE_SECS` 之后，dreaming-lite 清扫器会读它的通话
+  记录，蒸馏出带 category 的画像层 `companion_memories` 行——和文字 session
+  的处理完全一样。这些行就是普通记忆，之后的语音通话和文字聊天都能召回。
+  助手行里的 TTS 音频标签（开了 `tts_audio_tags` 时的 `[laughs]`、`[sighs]`）
+  会先被剥掉，舞台提示不会变成记忆文本。部署方可以用
+  `DREAMING_VOICE_DISABLED=1` 整个关掉，恢复到早先只扫文字的过滤条件；注意
+  在开关打开期间已被扫过的通话，关掉开关后不会重扫（`classified_at` 只盖一次）。
+  关系层的行仍然从不由语音写入。
 
 设计文档：
-[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)。
+[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)
+（引导快照 + 召回）与
+[2026-08-09-voice-dreaming-ingestion-design.md](superpowers/specs/2026-08-09-voice-dreaming-ingestion-design.md)
+（通话结束后的记忆写入）。
 
 ## 源碼
 
