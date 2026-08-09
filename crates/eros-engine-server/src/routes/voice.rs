@@ -214,6 +214,10 @@ pub async fn voice_turn_stream(
         instance_id,
         user_id,
         user_message_id,
+        // Verbatim: the per-turn recall embeds it as the query text (voice has
+        // no input-filter rewrite). Already persisted above as the latest
+        // history row — the wire messages still come from there.
+        content: req.content,
         relationship_scope: req.relationship_scope.unwrap_or_default(),
         memory_scope: req.memory_scope.unwrap_or_default(),
         // Handed over from the row loaded above — the pipeline reads the

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -20,32 +21,94 @@ use eros_engine_store::chat::{ChatMessageSlim, ChatRepo};
 use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
 
-use crate::pipeline::handlers::human_insights_to_bullets;
+use crate::memory_hygiene::prune_recalled;
+use crate::pipeline::handlers::{human_insights_to_bullets, recall_memory, RecallTier};
 use crate::pipeline::stream::{
     ulid_string, ProtocolFrame, StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
+use crate::prompt::render_recall_sections;
 use crate::state::AppState;
 
 /// `chat_sessions.metadata` key holding a voice session's frozen bootstrap
 /// snapshot (write-once — see `ChatRepo::set_voice_bootstrap`).
 const VOICE_BOOTSTRAP_KEY: &str = "voice_bootstrap";
 
+/// Backchannel floor for per-turn recall: an utterance carrying fewer than
+/// this many alphanumeric characters (see `recall_query_chars` — whitespace
+/// and punctuation, ASCII *and* CJK, don't count) skips recall entirely, with
+/// no embedding round trip and no query. Calls are full of 嗯 / 好啊 / 哈哈;
+/// embedding them buys nothing but latency and garbage nearest neighbours.
+/// The bootstrap snapshot and the in-session history still carry the turn.
+const VOICE_RECALL_MIN_QUERY_CHARS: usize = 4;
+
+/// Wall-clock budget for the WHOLE per-turn recall leg (embed round trip +
+/// pgvector searches). Blowing it degrades to "no recall block" with a warn —
+/// a memory problem must never delay or fail a voice reply. It wraps only the
+/// recall future; persona / affinity / history / bootstrap keep their own
+/// behaviour.
+const VOICE_RECALL_BUDGET: Duration = Duration::from_millis(300);
+
+/// Voice K tier — deliberately far below the text path's (2 / 4 / 3): a spoken
+/// turn can absorb a couple of recalled lines, not a wall of them, and every
+/// row is prompt latency. Spec §5.
+const VOICE_RECALL_TIER: RecallTier = RecallTier {
+    grouped_k: 1,
+    raw_k: 2,
+    relationship_k: 2,
+};
+
+/// Characters that make an utterance worth embedding: alphanumerics only.
+/// `char::is_alphanumeric` keeps CJK ideographs, kana, letters and digits, and
+/// drops every kind of whitespace plus ASCII (`!?.,;:()"'`) *and* CJK
+/// (`，。！？～…、；：「」『』（）`) punctuation — the CJK half is the point:
+/// counting raw `chars()` would let 嗯嗯，好～ sail past the threshold.
+fn recall_query_chars(content: &str) -> usize {
+    content.chars().filter(|c| c.is_alphanumeric()).count()
+}
+
+/// Turn one turn's recall results into the trailing prompt block: prune →
+/// render → label. A section that rendered empty is OMITTED — the text path's
+/// Chinese placeholders (`（刚认识，还不了解他）` / `（还没有专属记忆，慢慢来）`)
+/// never appear on voice, and a turn that recalled nothing costs the prompt
+/// nothing (`None` ⇒ byte-identical to a no-recall turn).
+fn render_recall_block(
+    profile_groups: Vec<(String, Vec<String>)>,
+    relationship_facts: Vec<String>,
+) -> Option<String> {
+    let (profile_groups, relationship_facts) = prune_recalled(profile_groups, relationship_facts);
+    let (profile_sec, rel_sec) = render_recall_sections(&profile_groups, &relationship_facts);
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    if let Some(p) = profile_sec {
+        parts.push(format!("[user_profile]\n{p}"));
+    }
+    if let Some(r) = rel_sec {
+        parts.push(format!("[shared_memories]\n{r}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 /// Assemble the thin voice system prompt: persona + voice directive +
 /// the (already rendered) bootstrap block + one optional relationship line
-/// (bond/chemistry-derived, gated by `relationship_scope`). Deliberately
-/// excludes memories, traits, scopes, and every heavy block the text path's
-/// `build_prompt` composes.
+/// (bond/chemistry-derived, gated by `relationship_scope`) + this turn's
+/// (already rendered) recall block. Deliberately excludes traits, scopes, and
+/// every heavy block the text path's `build_prompt` composes.
 ///
-/// Order matters: persona → directive → bootstrap → relationship line. The
-/// bootstrap block is frozen for the whole call, so everything up to (and
-/// including) it is byte-stable across the call's turns — provider-side
-/// prefix caching keeps working.
+/// Order matters: persona → directive → bootstrap → relationship line →
+/// recall. The bootstrap block is frozen for the whole call, so everything up
+/// to (and including) it is byte-stable across the call's turns — provider-side
+/// prefix caching keeps working, and the one genuinely per-turn block sits
+/// last where it disturbs the least.
 pub fn build_voice_prompt(
     genome: &PersonaGenome,
     directive: &str,
     bootstrap: Option<&str>,
     affinity: Option<&Affinity>,
     relationship_scope: RelationshipScope,
+    recall: Option<&str>,
 ) -> String {
     let mut s = String::with_capacity(genome.system_prompt.len() + directive.len() + 384);
     s.push_str(&genome.system_prompt);
@@ -58,6 +121,10 @@ pub fn build_voice_prompt(
     if let Some(line) = affinity.and_then(|a| relationship_line(a, relationship_scope)) {
         s.push_str("\n\n");
         s.push_str(&line);
+    }
+    if let Some(block) = recall {
+        s.push_str("\n\n");
+        s.push_str(block);
     }
     s
 }
@@ -302,13 +369,17 @@ fn relationship_line(affinity: &Affinity, scope: RelationshipScope) -> Option<St
 }
 
 /// Inputs for one voice turn. The user utterance is already persisted (by the
-/// route) as the latest history row, so the generator reads it from history —
-/// it is not passed again here.
+/// route) as the latest history row, so the wire messages come from history —
+/// `content` is carried separately only because the per-turn recall needs it
+/// as the embedding query BEFORE the history read has returned.
 pub struct VoiceTurn {
     pub session_id: Uuid,
     pub instance_id: Uuid,
     pub user_id: Uuid,
     pub user_message_id: Uuid,
+    /// This turn's utterance verbatim — the per-turn recall query text (voice
+    /// has no input-filter rewrite).
+    pub content: String,
     pub relationship_scope: RelationshipScope,
     /// This turn's memory scope. On the FIRST turn its resolved `InsightMode`
     /// picks the bootstrap snapshot's insight tier — frozen for the whole call
@@ -355,12 +426,22 @@ pub fn run_voice_turn(
         }
         let assemble_bootstrap_now = matches!(plan, BootstrapPlan::Assemble);
         // The FIRST turn's scope decides the snapshot's insight tier; later
-        // turns can't change it (the snapshot is frozen).
-        let insight_mode = turn.memory_scope.resolve().0;
+        // turns can't change it (the snapshot is frozen). `x_on`/`y_on` are
+        // per-turn and drive the recall gate below.
+        let (insight_mode, x_on, y_on) = turn.memory_scope.resolve();
+
+        // Recall gate — settled BEFORE any embedding work, in this order:
+        //   1. the deployment kill-switch beats any per-request scope;
+        //   2. both memory layers off ⇒ nothing to search;
+        //   3. a backchannel utterance isn't worth a round trip.
+        // A skipped turn constructs no recall future at all.
+        let recall_on = resolved.recall
+            && (x_on || y_on)
+            && recall_query_chars(&turn.content) >= VOICE_RECALL_MIN_QUERY_CHARS;
 
         // All independent reads in one round trip's worth of wall clock. The
-        // bootstrap future is inert unless this is the first turn.
-        let (persona_res, affinity_res, history_res, assembled) = tokio::join!(
+        // bootstrap and recall futures are inert unless their gate opened.
+        let (persona_res, affinity_res, history_res, assembled, recalled) = tokio::join!(
             persona_repo.load_companion(turn.instance_id),
             // Resolve affinity by user × persona-instance, not by session:
             // `companion_affinity` is populated only by the text pipeline, so a
@@ -379,6 +460,26 @@ pub fn run_voice_turn(
                         turn.instance_id,
                         turn.session_id,
                         insight_mode,
+                    ).await)
+                } else {
+                    None
+                }
+            },
+            // Per-turn vector recall: READ-ONLY (no embed_document, no memory
+            // insert, no post-process). The budget wraps this arm alone.
+            async {
+                if recall_on {
+                    Some(tokio::time::timeout(
+                        VOICE_RECALL_BUDGET,
+                        recall_memory(
+                            &state,
+                            turn.user_id,
+                            turn.instance_id,
+                            &turn.content,
+                            x_on,
+                            y_on,
+                            VOICE_RECALL_TIER,
+                        ),
                     ).await)
                 } else {
                     None
@@ -446,12 +547,34 @@ pub fn run_voice_turn(
         };
         let bootstrap_block = bootstrap.as_ref().and_then(render_bootstrap);
 
+        // Recall degrades silently in every direction: the gate closed, the
+        // budget blew, or `recall_memory` swallowed an embed/search failure
+        // into empty results. None of them is worth an `error` frame — the
+        // persona just sounds slightly less "with it" for this turn.
+        let recall_block = match recalled {
+            None => None,
+            Some(Err(_elapsed)) => {
+                tracing::warn!(
+                    session_id = %turn.session_id,
+                    budget_ms = VOICE_RECALL_BUDGET.as_millis(),
+                    "voice: per-turn recall exceeded its budget — no recall block this turn",
+                );
+                None
+            }
+            // The query embedding is deliberately DISCARDED: the voice path has
+            // no world-fragment recall to reuse it for.
+            Some(Ok((profile_groups, relationship_facts, _embedding))) => {
+                render_recall_block(profile_groups, relationship_facts)
+            }
+        };
+
         let system_prompt = build_voice_prompt(
             &persona.genome,
             &resolved.directive,
             bootstrap_block.as_deref(),
             affinity.as_ref(),
             turn.relationship_scope,
+            recall_block.as_deref(),
         );
 
         let mut messages = Vec::with_capacity(history.len() + 1);
@@ -722,6 +845,7 @@ mod tests {
             None,
             None,
             RelationshipScope::default(),
+            None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
     }
@@ -742,6 +866,7 @@ mod tests {
             render_bootstrap(&s).as_deref(),
             None,
             RelationshipScope::None,
+            None,
         );
         assert_eq!(
             p,
@@ -762,6 +887,7 @@ mod tests {
             render_bootstrap(&s).as_deref(),
             Some(&a),
             RelationshipScope::default(),
+            None,
         );
         let directive = p.find("DIRECTIVE").expect("directive present");
         let about = p.find("[关于他]").expect("insights sub-block present");
@@ -784,6 +910,7 @@ mod tests {
             render_bootstrap(&s).as_deref(),
             None,
             RelationshipScope::None,
+            None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[上次通话]\n用户：你好");
         assert!(!p.contains("[关于他]"));
@@ -798,6 +925,7 @@ mod tests {
             render_bootstrap(&s).as_deref(),
             None,
             RelationshipScope::None,
+            None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[关于他]\n- 城市：上海");
         assert!(!p.contains("[上次通话]"));
@@ -815,11 +943,196 @@ mod tests {
             render_bootstrap(&empty).as_deref(),
             None,
             RelationshipScope::None,
+            None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
         // A whitespace-only prev_call is empty too.
         let blank = snapshot(&["  "], Some("   \n "));
         assert!(render_bootstrap(&blank).is_none());
+    }
+
+    // ─── per-turn recall block ──────────────────────────────────────────
+
+    /// The backchannel counter keeps only alphanumerics (CJK ideographs
+    /// included) — ASCII *and* CJK punctuation and every kind of whitespace
+    /// are stripped before the threshold is applied.
+    #[test]
+    fn recall_query_chars_counts_only_alphanumerics() {
+        for (content, expected) in [
+            ("嗯", 1usize),
+            ("好啊", 2),
+            ("哈哈", 2),
+            ("哈哈哈哈", 4),
+            ("ok", 2),
+            ("嗯嗯，好～", 3),
+            ("带我去东京吧", 6),
+            ("想你", 2),
+            ("", 0),
+        ] {
+            assert_eq!(
+                recall_query_chars(content),
+                expected,
+                "recall_query_chars({content:?})"
+            );
+        }
+    }
+
+    /// Only the table's ≥ 4 entries may pass the gate.
+    #[test]
+    fn recall_backchannel_threshold_skips_short_utterances() {
+        for skipped in ["嗯", "好啊", "哈哈", "ok", "嗯嗯，好～", "想你", ""] {
+            assert!(
+                recall_query_chars(skipped) < VOICE_RECALL_MIN_QUERY_CHARS,
+                "{skipped:?} must be treated as a backchannel"
+            );
+        }
+        for kept in ["哈哈哈哈", "带我去东京吧"] {
+            assert!(
+                recall_query_chars(kept) >= VOICE_RECALL_MIN_QUERY_CHARS,
+                "{kept:?} must NOT be treated as a backchannel"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_block_rendering_is_pinned() {
+        let block = render_recall_block(
+            vec![("客观事实".to_string(), vec!["住在上海".to_string()])],
+            vec!["一起看过电影".to_string()],
+        )
+        .expect("both sections present");
+        assert_eq!(
+            block,
+            "[user_profile]\n[客观事实]\n- 住在上海\n\n[shared_memories]\n- 一起看过电影"
+        );
+    }
+
+    /// Dynamic content last: the recall block sits AFTER the relationship
+    /// line, which itself sits after the frozen bootstrap.
+    #[test]
+    fn recall_block_is_the_last_prompt_segment() {
+        let a = affinity_at(0.0, 0.0, 0.0, 0.0, 0.0);
+        let s = snapshot(&["城市：上海"], Some("用户：你好"));
+        let block = render_recall_block(
+            vec![("偏好".to_string(), vec!["喜欢猫".to_string()])],
+            vec!["聊到深夜".to_string()],
+        );
+        let p = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            render_bootstrap(&s).as_deref(),
+            Some(&a),
+            RelationshipScope::default(),
+            block.as_deref(),
+        );
+        assert_eq!(
+            p,
+            "You are Mia.\n\nDIRECTIVE\n\n\
+             [关于他]\n- 城市：上海\n\n[上次通话]\n用户：你好\n\n\
+             You two are still getting to know each other; keep it light and natural. \
+             A faint, unspoken spark exists between you. Keep it subtle — light teasing \
+             is allowed, but do not lean into romance or seduction yet.\n\n\
+             [user_profile]\n[偏好]\n- 喜欢猫\n\n[shared_memories]\n- 聊到深夜"
+        );
+        assert!(
+            p.ends_with("[shared_memories]\n- 聊到深夜"),
+            "the recall block must be the final segment: {p}"
+        );
+    }
+
+    /// One empty section is omitted entirely — never a placeholder, never a
+    /// dangling label.
+    #[test]
+    fn recall_block_omits_the_empty_section() {
+        let only_profile = render_recall_block(
+            vec![("偏好".to_string(), vec!["喜欢猫".to_string()])],
+            vec![],
+        )
+        .expect("profile only");
+        assert_eq!(only_profile, "[user_profile]\n[偏好]\n- 喜欢猫");
+        let only_rel = render_recall_block(vec![], vec!["聊到深夜".to_string()]).expect("rel only");
+        assert_eq!(only_rel, "[shared_memories]\n- 聊到深夜");
+    }
+
+    /// Both sections empty ⇒ no block at all, and the prompt is BYTE-identical
+    /// to the same turn without recall.
+    #[test]
+    fn recall_both_sections_empty_emits_no_block() {
+        assert!(render_recall_block(vec![], vec![]).is_none());
+        // A group whose items all pruned away is empty too.
+        assert!(
+            render_recall_block(vec![("偏好".to_string(), vec!["   ".to_string()])], vec![])
+                .is_none()
+        );
+        let a = affinity_at(0.0, 0.0, 0.0, 0.0, 0.0);
+        let with_none = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            None,
+            Some(&a),
+            RelationshipScope::Bond,
+            None,
+        );
+        let with_empty = build_voice_prompt(
+            &genome(),
+            "DIRECTIVE",
+            None,
+            Some(&a),
+            RelationshipScope::Bond,
+            render_recall_block(vec![], vec![]).as_deref(),
+        );
+        assert_eq!(with_none, with_empty);
+        assert_eq!(
+            with_none,
+            "You are Mia.\n\nDIRECTIVE\n\n\
+             You two are still getting to know each other; keep it light and natural."
+        );
+    }
+
+    /// The text path substitutes Chinese placeholders for empty recall
+    /// sections. The voice prompt must NEVER carry them — a call that recalled
+    /// nothing simply says nothing about it.
+    #[test]
+    fn voice_prompt_never_renders_the_text_path_placeholders() {
+        const PLACEHOLDERS: [&str; 2] = ["（刚认识，还不了解他）", "（还没有专属记忆，慢慢来）"];
+        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
+        let s = snapshot(&["城市：上海"], Some("用户：你好"));
+        for groups in [
+            vec![],
+            vec![("偏好".to_string(), vec!["喜欢猫".to_string()])],
+        ] {
+            for facts in [vec![], vec!["聊到深夜".to_string()]] {
+                let p = build_voice_prompt(
+                    &genome(),
+                    "DIRECTIVE",
+                    render_bootstrap(&s).as_deref(),
+                    Some(&a),
+                    RelationshipScope::default(),
+                    render_recall_block(groups.clone(), facts.clone()).as_deref(),
+                );
+                for ph in PLACEHOLDERS {
+                    assert!(
+                        !p.contains(ph),
+                        "placeholder {ph} leaked into a voice prompt: {p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Deduplication runs before rendering: a fact present in both layers is
+    /// kept in the profile section and dropped from `[shared_memories]`.
+    #[test]
+    fn recall_block_prunes_cross_layer_duplicates() {
+        let block = render_recall_block(
+            vec![("偏好".to_string(), vec!["喜欢猫".to_string()])],
+            vec!["喜欢猫".to_string(), "聊到深夜".to_string()],
+        )
+        .expect("a block");
+        assert_eq!(
+            block,
+            "[user_profile]\n[偏好]\n- 喜欢猫\n\n[shared_memories]\n- 聊到深夜"
+        );
     }
 
     // ─── prev-call transcript rendering ─────────────────────────────────
@@ -900,6 +1213,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::default(),
+            None,
         );
         assert!(p.contains("still getting to know each other"));
         assert!(p.contains("faint, unspoken spark"));
@@ -916,6 +1230,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::default(),
+            None,
         );
         assert!(p.contains("know each other inside out"));
         assert!(p.contains("do not lean into romance or seduction yet"));
@@ -935,6 +1250,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::default(),
+            None,
         );
         assert!(p.contains("close friends"));
         assert!(p.contains("deeply in love"));
@@ -950,6 +1266,7 @@ mod tests {
             None,
             Some(&low),
             RelationshipScope::default(),
+            None,
         );
         assert!(p_low.contains("faint, unspoken spark"));
         assert!(!p_low.contains("growing attraction"));
@@ -961,6 +1278,7 @@ mod tests {
             None,
             Some(&high),
             RelationshipScope::default(),
+            None,
         );
         assert!(p_high.contains("growing attraction"));
         assert!(!p_high.contains("faint, unspoken spark"));
@@ -975,6 +1293,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::None,
+            None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
     }
@@ -988,6 +1307,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::Bond,
+            None,
         );
         assert!(p.contains("close friends"));
         assert!(!p.contains("deeply in love"));
@@ -1002,6 +1322,7 @@ mod tests {
             None,
             Some(&a),
             RelationshipScope::Chemistry,
+            None,
         );
         assert!(!p.contains("close friends"));
         assert!(p.contains("deeply in love"));
@@ -1065,7 +1386,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1084,6 +1405,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1219,7 +1541,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1238,6 +1560,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1330,7 +1653,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1349,6 +1672,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1463,7 +1787,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1483,6 +1807,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1598,7 +1923,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1617,6 +1942,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1723,7 +2049,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1744,6 +2070,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1843,7 +2170,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1862,6 +2189,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -1966,7 +2294,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nfallback = [\"backup\"]\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -1986,6 +2314,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::default(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
@@ -2190,7 +2519,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = Arc::new(
             ModelConfig::from_toml_str(
-                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\n",
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
             )
             .unwrap(),
         );
@@ -2208,6 +2537,7 @@ data: [DONE]\n\n";
                 instance_id,
                 user_id,
                 user_message_id: umid,
+                content: "hello".into(),
                 relationship_scope: RelationshipScope::None,
                 memory_scope,
                 session_metadata: session.metadata,
@@ -2651,5 +2981,447 @@ data: [DONE]\n\n";
         assert_eq!(marker["insights"], serde_json::json!(["城市：上海"]));
         let sys = system_prompt_of(&last_request_body(&mock).await);
         assert!(sys.contains("[关于他]\n- 城市：上海"), "{sys}");
+    }
+
+    // ─── per-turn recall, end to end ────────────────────────────────────
+    //
+    // The embedding leg is mocked by pointing `[tasks.embedding]` at a custom
+    // `[providers.<name>]` OpenAI-compatible endpoint served by a SECOND
+    // wiremock server — exactly how a deployment wires a self-hosted embedding
+    // provider, and the same wire `EmbedHttpClient` speaks in production.
+    // Every test below installs that router, so nothing here can reach the
+    // real Voyage endpoint; a "zero embedding calls" assertion is then a
+    // genuine request count on a live mock, not an absence of configuration.
+    //
+    // The pre-existing voice e2e tests above stay network-free a different
+    // way: their `[tasks.chat_voice]` config carries `recall = false`, so the
+    // gate closes before `state.embed` (a Voyage router) is ever touched.
+
+    /// 512-dim unit vector — a query embedded at the same seed is the exact
+    /// nearest neighbour of a row stored at it.
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    /// A wiremock server standing in for the embeddings provider.
+    async fn embed_mock(status: u16, delay: Option<Duration>) -> wiremock::MockServer {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut tpl = ResponseTemplate::new(status);
+        if status == 200 {
+            tpl = tpl.set_body_json(
+                serde_json::json!({ "data": [ { "embedding": unit_embedding(1) } ] }),
+            );
+        }
+        if let Some(d) = delay {
+            tpl = tpl.set_delay(d);
+        }
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(tpl)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// An `EmbeddingRouter` whose read backend is `embed_mock`, built through
+    /// the production `from_config_with` path (custom provider + its
+    /// `<NAME>_API_KEY`).
+    fn embed_router(uri: &str) -> eros_engine_llm::embedding::EmbeddingRouter {
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{uri}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n"
+        ))
+        .expect("embedding provider config parses");
+        eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+        })
+        .expect("mock embedding router builds")
+    }
+
+    async fn embed_hits(embed: &wiremock::MockServer) -> usize {
+        embed
+            .received_requests()
+            .await
+            .expect("recording enabled by default")
+            .len()
+    }
+
+    /// One categorised profile row + one relationship row, both stored at
+    /// `unit_embedding(1)` — the vector `embed_mock` hands back.
+    async fn seed_recallable_memories(
+        pool: &sqlx::PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        instance_id: Uuid,
+    ) {
+        use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+        let repo = MemoryRepo { pool };
+        repo.upsert(
+            MemoryLayer::Profile,
+            session_id,
+            user_id,
+            None,
+            "喜欢在东京散步",
+            &unit_embedding(1),
+            Some("preference"),
+            None,
+        )
+        .await
+        .unwrap();
+        repo.upsert(
+            MemoryLayer::Relationship,
+            session_id,
+            user_id,
+            Some(instance_id),
+            "上次约好一起去东京",
+            &unit_embedding(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Knobs for one recall e2e turn.
+    struct RecallTurnOpts<'a> {
+        client_msg_id: &'a str,
+        /// The utterance — also the recall query text.
+        content: &'a str,
+        memory_scope: MemoryScope,
+        relationship_scope: RelationshipScope,
+        /// `[tasks.chat_voice] recall = …`
+        recall: bool,
+    }
+
+    impl Default for RecallTurnOpts<'_> {
+        fn default() -> Self {
+            Self {
+                client_msg_id: "01J9RECALL000000000000001",
+                // 6 alphanumeric chars — comfortably past the backchannel floor.
+                content: "带我去东京吧",
+                memory_scope: MemoryScope::default(),
+                relationship_scope: RelationshipScope::None,
+                recall: true,
+            }
+        }
+    }
+
+    /// One voice turn, driven the way the route drives it, with BOTH the chat
+    /// and the embedding provider mocked.
+    async fn run_recall_turn(
+        pool: &sqlx::PgPool,
+        mock: &wiremock::MockServer,
+        embed: &wiremock::MockServer,
+        session_id: Uuid,
+        instance_id: Uuid,
+        user_id: Uuid,
+        opts: RecallTurnOpts<'_>,
+    ) -> Vec<ProtocolFrame> {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+
+        let repo = ChatRepo { pool };
+        let session = repo
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        let umid = match repo
+            .insert_voice_user_message(session_id, opts.content, opts.client_msg_id)
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = {}\n",
+                opts.recall
+            ))
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.embed = Arc::new(embed_router(&embed.uri()));
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                content: opts.content.to_string(),
+                relationship_scope: opts.relationship_scope,
+                memory_scope: opts.memory_scope,
+                session_metadata: session.metadata,
+            },
+            resolved,
+        )
+        .collect()
+        .await
+    }
+
+    fn assert_streamed_hi(frames: &[ProtocolFrame]) {
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi", "the reply must still stream; got {frames:?}");
+        assert!(matches!(frames.last(), Some(ProtocolFrame::Done { .. })));
+        assert_no_error_frame(frames);
+    }
+
+    fn assert_no_recall_block(sys: &str) {
+        assert!(
+            !sys.contains("[user_profile]"),
+            "recall block present: {sys}"
+        );
+        assert!(
+            !sys.contains("[shared_memories]"),
+            "recall block present: {sys}"
+        );
+        // …and never the text path's placeholders in its place.
+        assert!(!sys.contains("（刚认识，还不了解他）"), "{sys}");
+        assert!(!sys.contains("（还没有专属记忆，慢慢来）"), "{sys}");
+    }
+
+    /// The happy path: this turn's utterance is embedded, the pgvector hits are
+    /// rendered under `[user_profile]` / `[shared_memories]`, and the block is
+    /// the LAST thing in the system prompt — after the relationship line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_recall_snippets_appear_in_wire_prompt(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        // An affinity row for the pair, so a relationship line exists for the
+        // recall block to sit after (fresh seed ⇒ Acquaintance / Spark).
+        let text_session = seed_session(&pool, user_id, instance_id, "text").await;
+        AffinityRepo { pool: &pool }
+            .load_or_create(text_session, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts {
+                relationship_scope: RelationshipScope::default(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_streamed_hi(&frames);
+        assert_eq!(embed_hits(&embed).await, 1, "exactly one embedding call");
+
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            sys.contains("[user_profile]\n[偏好]\n- 喜欢在东京散步"),
+            "profile section missing: {sys}"
+        );
+        assert!(
+            sys.contains("[shared_memories]\n- 上次约好一起去东京"),
+            "relationship section missing: {sys}"
+        );
+        // Dynamic content last: after the relationship line, and at the very
+        // end of the prompt.
+        let line = sys
+            .find("still getting to know each other")
+            .expect("relationship line present");
+        let block = sys.find("[user_profile]").expect("recall block present");
+        assert!(
+            line < block,
+            "the recall block must follow the relationship line: {sys}"
+        );
+        assert!(
+            sys.ends_with("[shared_memories]\n- 上次约好一起去东京"),
+            "the recall block must be the final segment: {sys}"
+        );
+    }
+
+    /// The embedding provider fails: the reply still streams, no recall block,
+    /// and no `error` frame — the failure is swallowed inside `recall_memory`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_embed_failure_degrades_to_no_block(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(500, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts::default(),
+        )
+        .await;
+        assert_streamed_hi(&frames);
+        assert_eq!(
+            embed_hits(&embed).await,
+            1,
+            "the embedding WAS attempted — it just failed"
+        );
+        assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
+    }
+
+    /// The embedding provider hangs past `VOICE_RECALL_BUDGET`: the turn stops
+    /// waiting, streams its reply with no recall block, and emits no `error`
+    /// frame. The wall-clock bound is deliberately loose — it only has to prove
+    /// the turn did NOT sit out the provider's full delay.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_embed_timeout_degrades_to_no_block(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, Some(Duration::from_secs(3))).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        let started = std::time::Instant::now();
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts::default(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_streamed_hi(&frames);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the turn must not wait out the provider's 3s delay; took {elapsed:?}"
+        );
+        assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
+    }
+
+    /// `memory_scope: "none"` resolves both layers off ⇒ the gate closes before
+    /// any embedding work: zero calls on the embedding mock.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_memory_scope_none_issues_no_embedding_call(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts {
+                memory_scope: MemoryScope::None,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_streamed_hi(&frames);
+        assert_eq!(
+            embed_hits(&embed).await,
+            0,
+            "both layers off ⇒ no embedding round trip"
+        );
+        assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
+    }
+
+    /// The deployment kill-switch wins over the request: `recall = false` with
+    /// the most permissive `memory_scope` still issues no embedding call.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_config_recall_false_beats_request(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts {
+                recall: false,
+                memory_scope: MemoryScope::Full,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_streamed_hi(&frames);
+        assert_eq!(
+            embed_hits(&embed).await,
+            0,
+            "config recall = false must beat memory_scope: full"
+        );
+        assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
+    }
+
+    /// A backchannel turn (嗯嗯 — 2 alphanumerics after punctuation stripping)
+    /// skips recall entirely: no embedding call, reply unaffected.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_backchannel_turn_skips_embedding_call(pool: sqlx::PgPool) {
+        let mock = bootstrap_mock().await;
+        let embed = embed_mock(200, None).await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+        seed_recallable_memories(&pool, session_id, user_id, instance_id).await;
+
+        let frames = run_recall_turn(
+            &pool,
+            &mock,
+            &embed,
+            session_id,
+            instance_id,
+            user_id,
+            RecallTurnOpts {
+                content: "嗯嗯",
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_streamed_hi(&frames);
+        assert_eq!(
+            embed_hits(&embed).await,
+            0,
+            "a backchannel utterance must not cost an embedding round trip"
+        );
+        assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
     }
 }
