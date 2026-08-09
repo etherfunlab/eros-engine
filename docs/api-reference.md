@@ -60,6 +60,13 @@ channel-scoped — a voice-channel start never resumes a text session (and
 vice versa). Voice clients must obtain their session here with
 `"channel": "voice"` before calling the voice turn endpoint.
 
+Optional `force_new` field: when `true`, skip resume entirely and always
+create a fresh session (`is_new: true`), even if a resumable one exists for
+this user × instance × channel. Default `false`/omitted keeps the normal
+resume-or-create behavior. Recommended for voice calls — start every call
+with `{"channel": "voice", "force_new": true}` so each call gets its own
+session instead of continuing a previous one.
+
 Optional `instance_id` field: an explicit `persona_instance` id. When absent,
 the server picks (or auto-creates) the user's instance for the supplied
 `genome_id`; `genome_id` is required only when `instance_id` is absent.
@@ -412,9 +419,34 @@ otherwise) — obtain one via `POST /comp/chat/start` with
 `[tasks.chat_voice]` block in the model config the endpoint returns
 `501 voice_disabled`.
 
-The prompt is deliberately thin: persona + voice directive + one
-relationship line derived from the session's affinity (bond/chemistry
-tiers). No vector recall, no memories, no traits/scopes/heavy blocks.
+The prompt is lean but not memoryless: persona + voice directive + a
+first-turn **bootstrap snapshot** (frozen once per session, then re-injected
+verbatim every turn) + one relationship line derived from the session's
+affinity (bond/chemistry tiers) + this turn's **recall block**. History is
+the last 8 messages (4 exchanges) — shorter than the chat path's window,
+since the bootstrap and recall carry the longer-range memory instead. Voice
+still writes **no** memories of any kind (no insight extraction, no vector
+writes) — a call's content only becomes reachable from a *later* call, via
+the bootstrap snapshot below.
+
+**Bootstrap snapshot** (first turn only, then frozen into
+`chat_sessions.metadata.voice_bootstrap` and replayed on every later turn —
+the provider is stateless, so there is no "inject once" on the wire): a
+`[关于他]` block of `human_insights` bullets (Neutral tier by default; see
+`memory_scope` below) plus a `[上次通话]` block, the previous voice call's
+last 8 messages rendered as a transcript. The two parts degrade
+independently and silently — a failed assembly leaves the marker unwritten
+so the next turn retries.
+
+**Per-turn recall** (every turn, read-only): a small vector-search pass over
+the same `companion_memories` layers the chat path uses, gated by
+`memory_scope` and budgeted at 300 ms — a timeout or search failure just
+drops the block for that turn, never an error. An utterance under 4
+alphanumeric characters after stripping whitespace/punctuation (嗯 / 好啊 /
+哈哈-style backchannels) skips recall entirely, with no embedding call.
+Deployments can force recall off regardless of the request via
+`[tasks.chat_voice] recall = false` (default `true` — see
+[model-config.md](model-config.md)).
 
 Body fields:
 
@@ -426,10 +458,17 @@ Body fields:
   to inject this turn: `"none"`, `"bond"`, `"chemistry"`, `"both"`
   (default `"both"`). The resolved value is recorded on the assistant
   row's `metadata.relationship_scope`.
+- `memory_scope` (optional) — same field name, enum, and default
+  (`"neutral_and_relationship"`) as the
+  [chat message stream](#post-compchatsession_idmessagestream). On the
+  session's **first** turn, the resolved insight tier picks the bootstrap
+  snapshot's `[关于他]` tier and is frozen for the rest of the call; every
+  turn it also gates that turn's recall block. Later turns cannot change
+  the snapshot's tier.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
 ```
 
@@ -638,6 +677,10 @@ The body is the canonical start body plus one BFF-only field:
 - `genome_id` / `instance_id` — identify the persona (same as canonical).
 - `is_demo` — optional, same as canonical.
 - `history_limit` — optional bundled-history page size; default 50, capped at 50.
+- `force_new` — optional, same as canonical. Passed through to
+  `StartChatRequest::force_new` — skip resume and always create a fresh
+  session (`is_new: true`); recommended for voice calls (see the
+  [voice section](#post-compvoicesession_idturnstream) above).
 
 ```json
 {

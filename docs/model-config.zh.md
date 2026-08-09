@@ -462,6 +462,30 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 `ModelConfig::resolve_embedding()`，在 `main.rs` 启动时调用一次来构建
 `EmbeddingRouter`。见下文“`[tasks.embedding]` — 已激活”。
 
+### `[tasks.chat_voice]` — 语音通道的伴侣回复（opt-in）
+
+支撑 `POST /comp/voice/{session_id}/turn/stream`
+（`pipeline::voice::run_voice_turn`，由 `routes::voice` 经 `resolve_voice()`
+调用）。任务块缺失时功能关闭。
+
+- `model` —— **必须**是单个固定、非空的 id。与这里其它任务不同，round-robin
+  数组、加权表、`tiers` 在 `chat_voice` 上都会拒绝启动（正在进行的通话不支持
+  中途换模型）。`fallback` 仍然可用，作为顺序重试的故障切换链。
+- `filter_prompt` —— 可选的语音指令覆盖。与 `chat_vision`/`chat_product_qa`
+  不同，留空或缺省**不会**关闭该功能——会回退到内置指令（简短、口语化，
+  不带 markdown/emoji/括号舞台提示）。
+- `tts_audio_tags`（bool，默认 `false`）—— 为 `true` 时，生效的指令会邀请
+  模型插入行内音频标签（`[laughs]`、`[whispers]` 等），Gemini 系 TTS 模型
+  会把它们渲染成语气/动作提示。标签原样透传（流式、落库、重放都不处理）；
+  客户端需要把文本喂给能理解这些标签的 TTS 模型。可以和自定义
+  `filter_prompt` 叠加——标签说明会追加在其后。
+- `recall`（bool，默认 `true`）—— 语音路径上的逐轮只读向量召回。设为
+  `false` 会让语音 prompt 永远不带召回块，不管请求里的 `memory_scope` 是
+  什么——配置永远优先于请求里的 scope。见
+  [memory-layers.zh.md](memory-layers.zh.md#语音轮次)。
+
+调用点：`crates/eros-engine-server/src/pipeline/voice.rs::run_voice_turn`。
+
 ### `[tasks.pde_decision]` — opt-in LLM PDE 判断器
 
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：

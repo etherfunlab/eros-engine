@@ -519,6 +519,34 @@ its own resolver, `ModelConfig::resolve_embedding()`, called once at boot
 from `main.rs` to build the `EmbeddingRouter`. See "`[tasks.embedding]` —
 active" below.
 
+### `[tasks.chat_voice]` — voice-channel companion reply (opt-in)
+
+Powers `POST /comp/voice/{session_id}/turn/stream`
+(`pipeline::voice::run_voice_turn`, reached from `routes::voice` via
+`resolve_voice()`). Off unless this task block exists.
+
+- `model` — **must** be a single fixed, non-empty id. Unlike every other
+  task, the round-robin array, the weighted table, and `tiers` all refuse to
+  boot on `chat_voice` (mixing models mid-call isn't supported). `fallback`
+  is still allowed as a sequential outage-retry chain.
+- `filter_prompt` — optional voice directive override. Unlike
+  `chat_vision`/`chat_product_qa`, a blank or absent value does **not**
+  disable the feature — it falls back to the built-in directive (short,
+  spoken, no markdown/emoji/bracketed stage directions).
+- `tts_audio_tags` (bool, default `false`) — when `true`, the effective
+  directive invites inline audio tags (`[laughs]`, `[whispers]`, …) that
+  Gemini-family TTS models render as delivery cues. Tags pass through
+  verbatim (streamed, persisted, replayed); the client must feed the text to
+  a TTS model that understands them. Composes with a custom `filter_prompt`
+  — the tag guidance is appended to it.
+- `recall` (bool, default `true`) — per-turn read-only vector recall on the
+  voice path. `false` keeps the voice prompt recall-free on every turn
+  regardless of the request's `memory_scope` — config always wins over the
+  per-request scope. See
+  [memory-layers.md](memory-layers.md#voice-turns).
+
+Call site: `crates/eros-engine-server/src/pipeline/voice.rs::run_voice_turn`.
+
 ### `[tasks.pde_decision]` — opt-in LLM PDE judge
 
 By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.rs`) to decide the per-turn action (reply / ghost / proactive). Setting `filter_prompt` in this block switches on an LLM judge:

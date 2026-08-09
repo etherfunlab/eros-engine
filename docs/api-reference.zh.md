@@ -57,6 +57,12 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ——语音频道的 start 永远不会恢复一个文本 session，反之亦然。语音客户端必须先
 在这里用 `"channel": "voice"` 拿到 session，才能去调语音轮次端点。
 
+可选的 `force_new` 字段：为 `true` 时跳过恢复，总是创建一个全新 session
+（`is_new: true`），即使这个用户 × instance × channel 组合本有可以恢复的
+session。默认 `false`/缺省保持原本的恢复优先行为。语音通话推荐使用：每通
+电话都用 `{"channel": "voice", "force_new": true}` 开始，让每通电话都拿到
+自己的 session，而不是接着上一通的。
+
 可选的 `instance_id` 字段：显式指定 `persona_instance` id。缺省时服务器为
 所给 `genome_id` 挑选（或自动创建）该用户的 instance；仅当 `instance_id`
 缺省时 `genome_id` 才是必填。
@@ -362,8 +368,26 @@ session 必须是**语音频道** session（否则 `409 wrong_channel`）——�
 开启的：model config 里没有 `[tasks.chat_voice]` 块时，该端点返回
 `501 voice_disabled`。
 
-prompt 刻意做得很薄：人格 + 语音指令 + 一行由该 session 好感度推导出的关系描述
-（bond/chemistry 档位）。不做向量召回，不带记忆，不带 traits/scopes 等较大的上下文块。
+prompt 精简但不再失忆：人格 + 语音指令 + 首轮生成、此后每轮原样重发的
+**引导快照（bootstrap snapshot）** + 一行由该 session 好感度推导出的关系描述
+（bond/chemistry 档位）+ 本轮的**召回块**。历史窗口是最近 8 条消息（4 个来回）
+——比聊天路径的窗口短，因为更长程的记忆改由引导快照和召回承担。语音依旧
+**不写**任何记忆（不做 insight 抽取，不写向量）——一通电话的内容只会通过
+引导快照，被*之后*的通话读到。
+
+**引导快照**（仅首轮组装，随后冻结进 `chat_sessions.metadata.voice_bootstrap`，
+此后每轮原样重新注入——provider 是无状态的，线路上不存在"只注入一次"这回事）：
+一个 `[关于他]` 块（`human_insights` bullets，默认中性档，见下面的
+`memory_scope`）加一个 `[上次通话]` 块（上一通语音通话最后 8 条消息渲染出的
+文字记录）。两部分各自独立、静默降级——组装失败时标记位不落，下一轮重试。
+
+**每轮召回**（每轮都跑，只读）：对聊天路径同样的 `companion_memories` 分层
+做一次更小的向量检索，受 `memory_scope` 门控，300 ms 预算内完成——超时或
+检索失败只是丢掉这一轮的召回块，绝不报错。去掉空白和标点后不足 4 个字母
+数字字符的话语（嗯 / 好啊 / 哈哈这类应和词）直接跳过召回，不发起 embedding
+调用。部署方可以用 `[tasks.chat_voice] recall = false`（默认 `true`）强制
+关闭召回，不管请求里传了什么 `memory_scope`——详见
+[model-config.zh.md](model-config.zh.md)。
 
 Body 字段：
 
@@ -374,10 +398,16 @@ Body 字段：
 - `relationship_scope`（可选）—— 本轮注入关系描述的哪几半：`"none"`、`"bond"`、
   `"chemistry"`、`"both"`（默认 `"both"`）。解析后的取值记录在 assistant 行的
   `metadata.relationship_scope` 上。
+- `memory_scope`（可选）—— 字段名、枚举值、默认值
+  （`"neutral_and_relationship"`）都与
+  [聊天消息流](#post-compchatsession_idmessagestream) 相同。session 的
+  **首轮**里，解析出的 insight 档位会决定引导快照 `[关于他]` 部分的档位，
+  并为整通电话冻结；每一轮它还会门控当轮的召回块。之后的轮次改不了快照的
+  档位。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both"}' \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
 ```
 
@@ -570,6 +600,9 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 - `genome_id` / `instance_id` —— 標識人格（同 canonical）。
 - `is_demo` —— 可選，同 canonical。
 - `history_limit` —— 可選，打包歷史的頁大小；默認 50，上限 50。
+- `force_new` —— 可选，同 canonical。透传给 `StartChatRequest::force_new`
+  ——跳过恢复，总是创建一个全新 session（`is_new: true`）；语音通话推荐
+  使用（见上面的[语音小节](#post-compvoicesession_idturnstream)）。
 
 ```json
 {

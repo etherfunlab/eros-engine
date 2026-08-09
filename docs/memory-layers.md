@@ -127,6 +127,41 @@ evaluation still run; there is currently no scope value that suppresses
 writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
 `companion_insights` JSONB as a human-readable view of what's been collected.
 
+### Voice turns
+
+The voice endpoint (`POST /comp/voice/{session_id}/turn/stream`) reads from
+the same two layers through a leaner, voice-specific path — see
+[api-reference.md](api-reference.md#post-compvoicesession_idturnstream) for
+the request shape and [model-config.md](model-config.md) for the
+`[tasks.chat_voice]` block.
+
+- **Bootstrap snapshot** — assembled once, on a session's first turn, and
+  frozen into `chat_sessions.metadata.voice_bootstrap`; re-injected verbatim
+  on every later turn (OpenRouter is stateless, so there is no "inject once"
+  on the wire — later turns cannot change it). Two parts: `human_insights`
+  bullets at Neutral tier by default (tunable via that first turn's
+  `memory_scope`), and the previous voice call's last 8 messages rendered as
+  a plain transcript. Each part degrades independently; a failed assembly
+  leaves the marker unwritten so the next turn retries.
+- **Per-turn recall** — the same `companion_memories` search as the chat
+  path (`memory_scope`-gated, cross-layer dedup via `memory_hygiene`) but at
+  a much smaller K: grouped profile 1/category + raw fallback 2 +
+  relationship 2 (chat's tier is 2/4/3), wrapped in a 300 ms budget — a
+  timeout or search error just drops that turn's recall block, with a warn
+  log, never an error frame. An utterance under 4 alphanumeric characters
+  after stripping whitespace/punctuation (嗯 / 好啊 / 哈哈-style
+  backchannels) skips recall entirely, with no embedding call. Deployment
+  kill-switch: `[tasks.chat_voice] recall = false` (default `true`) always
+  wins over the request's `memory_scope`.
+- **Read-only** — voice never writes to `companion_memories`: no raw-turn
+  embed, no dreaming-lite extraction (the sweeper still excludes
+  `channel = 'voice'` sessions). A call's own content is not searchable by
+  itself; it only becomes reachable from a *later* sibling voice call, via
+  the bootstrap snapshot above.
+
+Design spec:
+[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md).
+
 ## Source
 
 - `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 7 sqlx::test integration tests)
@@ -136,6 +171,7 @@ writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path
 - `crates/eros-engine-server/src/pipeline/dreaming.rs` — dreaming-lite sweeper
 - `crates/eros-engine-server/src/pipeline/handlers.rs` — retrieval + prompt injection
+- `crates/eros-engine-server/src/pipeline/voice.rs` — voice-turn bootstrap snapshot + per-turn recall
 - `crates/eros-engine-store/migrations/0003_memory.sql` — schema + index DDL
 - `crates/eros-engine-store/migrations/0006_memory_category.sql` — `category` column
 - `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql` — `metadata` column

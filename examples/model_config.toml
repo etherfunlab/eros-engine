@@ -691,3 +691,9 @@ model = "voyage-4-lite"
 # that understands them. Works with a custom filter_prompt too (the tag guidance
 # is appended to it).
 #tts_audio_tags = true
+
+# `recall` (OPTIONAL, default true): per-turn read-only vector recall on the
+# voice path (bootstrap snapshot + this turn's recalled memories). Set to
+# false to keep the voice prompt recall-free, regardless of the request's
+# memory_scope — config always wins over the per-request scope.
+#recall = false

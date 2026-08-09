@@ -121,6 +121,35 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 `/comp/user/{user_id}/profile` 端点返回 `companion_insights` JSONB，作为已收集
 内容的人类可读视图。
 
+### 语音轮次
+
+语音端点（`POST /comp/voice/{session_id}/turn/stream`）读取同样的两层，但走
+一条更精简的语音专属路径——请求体见
+[api-reference.zh.md](api-reference.zh.md#post-compvoicesession_idturnstream)，
+`[tasks.chat_voice]` 块见 [model-config.zh.md](model-config.zh.md)。
+
+- **引导快照** —— 仅在 session 首轮组装一次，冻结进
+  `chat_sessions.metadata.voice_bootstrap`，此后每轮原样重新注入（OpenRouter
+  是无状态的，线路上不存在"只注入一次"这回事——之后的轮次也改不了它）。分两
+  部分：默认中性档的 `human_insights` bullets（档位可由首轮的 `memory_scope`
+  调整），加上上一通语音通话最后 8 条消息渲染出的纯文字记录。两部分各自独立
+  降级；组装失败时标记位不落，下一轮重试。
+- **逐轮召回** —— 与聊天路径相同的 `companion_memories` 检索（受
+  `memory_scope` 门控，经 `memory_hygiene` 做跨层去重），但 K 值小得多：
+  分组画像 1/类别 + 原始兜底 2 + 关系记忆 2（聊天路径是 2/4/3），整体包在
+  300 ms 预算里——超时或检索出错只是丢掉这一轮的召回块，打一条 warn 日志，
+  绝不是 error 帧。去掉空白和标点后不足 4 个字母数字字符的话语（嗯 / 好啊 /
+  哈哈这类应和词）直接跳过召回，不发起 embedding 调用。部署方可以用
+  `[tasks.chat_voice] recall = false`（默认 `true`）强制关闭，优先级高于
+  请求里的 `memory_scope`。
+- **只读** —— 语音路径从不往 `companion_memories` 写入：没有逐轮原文写入，
+  也没有 dreaming-lite 抽取（清扫器仍然排除 `channel = 'voice'` 的
+  session）。一通电话自己的内容不能被自己检索到；只有*之后*的同频道语音
+  通话，才能通过上面的引导快照读到它。
+
+设计文档：
+[2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)。
+
 ## 源碼
 
 - `crates/eros-engine-store/src/memory.rs`——`MemoryRepo`（upsert + search，7 个 sqlx::test 集成测试）
@@ -130,6 +159,7 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 - `crates/eros-engine-server/src/pipeline/post_process.rs`——逐轮原文写入路径
 - `crates/eros-engine-server/src/pipeline/dreaming.rs`——dreaming-lite 清扫器
 - `crates/eros-engine-server/src/pipeline/handlers.rs`——检索 + prompt 注入
+- `crates/eros-engine-server/src/pipeline/voice.rs`——语音轮次的引导快照 + 逐轮召回
 - `crates/eros-engine-store/migrations/0003_memory.sql`——schema + 索引 DDL
 - `crates/eros-engine-store/migrations/0006_memory_category.sql`——`category` 列
 - `crates/eros-engine-store/migrations/0032_companion_memories_metadata.sql`——`metadata` 列
