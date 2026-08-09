@@ -660,12 +660,14 @@ filter_prompt = """
 `assistant_action_type='reply'`），并打上 `channel='product_qa'` 标记。该
 标记让这一行对伴侣大脑不可见：短期回忆（`recent_turn_pairs` /
 `recent_turn_pairs_before_message` / `recent_assistant_contents`）、对话信号
-（`compute_signals_for_session`）、dreaming sweeper 的会话日志拉取、判断器
-自己共用的伴侣 transcript（`build_input_filter_transcript`），以及伴侣的
-实时消息窗口（`assemble_chat_request`），都会过滤掉 `channel IS NOT NULL`
-的行——同时这一行在实时 SSE 流、断线重放和客户端历史记录里完全可见
-（两个历史投影都会带出 `channel`）。完整的 `chat_messages.channel` 语义见
-[architecture.zh.md](architecture.zh.md)。
+（`compute_signals_for_session`）、判断器自己共用的伴侣 transcript
+（`build_input_filter_transcript`），以及伴侣的实时消息窗口
+（`assemble_chat_request`），都会过滤掉 `channel IS NOT NULL` 的行。
+dreaming sweeper 也会排除它，但不是靠一刀切的非 NULL 过滤——它默认也会读
+`'voice'` 的行（见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)），
+所以只有 `product_qa` 会被排除在外——同时这一行在实时 SSE 流、断线重放和
+客户端历史记录里完全可见（两个历史投影都会带出 `channel`）。完整的
+`chat_messages.channel` 语义见 [architecture.zh.md](architecture.zh.md)。
 
 **失败兜底。** 若执行器的整条候选链（`model` + `fallback`）耗尽仍未流出任何
 内容，引擎**不会**降级到人格内的伴侣回复——伴侣并不知道产品事实，临场发挥

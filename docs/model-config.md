@@ -818,13 +818,16 @@ filter_prompt = """
 `channel='product_qa'`. That marker makes the row invisible to the companion
 brain: short-term recall (`recent_turn_pairs` / `recent_turn_pairs_before_message`
 / `recent_assistant_contents`), conversation signals
-(`compute_signals_for_session`), the dreaming sweeper's session-log pull, the
-judge's own shared companion transcript (`build_input_filter_transcript`),
-and the companion's live message window (`assemble_chat_request`) all filter
-`channel IS NOT NULL` rows out — while the row stays fully visible on the
-live SSE stream, disconnect-replay, and client history (`channel` is exposed
-on both history projections). See [architecture.md](architecture.md) for the
-full `chat_messages.channel` semantics.
+(`compute_signals_for_session`), the judge's own shared companion transcript
+(`build_input_filter_transcript`), and the companion's live message window
+(`assemble_chat_request`) all filter `channel IS NOT NULL` rows out. The
+dreaming sweeper excludes it too, but not via a blanket non-NULL filter — by
+default it also reads `'voice'` rows (see
+[memory-layers.md](memory-layers.md#voice-turns)), so only `product_qa`
+stays out — while the row stays fully visible on the live SSE stream,
+disconnect-replay, and client history (`channel` is exposed on both history
+projections). See [architecture.md](architecture.md) for the full
+`chat_messages.channel` semantics.
 
 **Failure fallback.** If the executor's whole candidate chain (`model` +
 `fallback`) is exhausted without streaming any content, the engine does
