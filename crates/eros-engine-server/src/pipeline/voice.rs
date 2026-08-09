@@ -324,6 +324,54 @@ async fn assemble_bootstrap(
     )
 }
 
+/// Reload the winner's stored snapshot after THIS turn lost the
+/// `set_voice_bootstrap` write race (`rows_affected == 0`): re-read the
+/// session row and pull `metadata.voice_bootstrap` back out. `None` on ANY
+/// failure in that chain (query error, key missing — shouldn't happen right
+/// after a lost race, but the row could theoretically have moved again;
+/// malformed) — the caller then falls back to its own locally-assembled
+/// copy, which is always safe to inject, just possibly not what actually got
+/// frozen.
+async fn reload_bootstrap_winner(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+) -> Option<VoiceBootstrap> {
+    let session = match chat_repo.get_session(session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::warn!(
+                session_id = %session_id,
+                "voice: bootstrap race reload — session vanished; falling back to in-memory copy",
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id, error = %e,
+                "voice: bootstrap race reload — session query failed; falling back to in-memory copy",
+            );
+            return None;
+        }
+    };
+    let Some(marker) = session.metadata.get(VOICE_BOOTSTRAP_KEY) else {
+        tracing::warn!(
+            session_id = %session_id,
+            "voice: bootstrap race reload — marker missing after a lost write race; falling back to in-memory copy",
+        );
+        return None;
+    };
+    match serde_json::from_value::<VoiceBootstrap>(marker.clone()) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id, error = %e,
+                "voice: bootstrap race reload — winner's stored snapshot unreadable; falling back to in-memory copy",
+            );
+            None
+        }
+    }
+}
+
 /// One relationship-tone line, derived at read time from the affinity row's
 /// bond/chemistry tiers — never from the cached `relationship_label`, which
 /// the voice path (no per-turn affinity eval) would leave stale forever.
@@ -523,14 +571,35 @@ pub fn run_voice_turn(
             BootstrapPlan::Frozen(b) => Some(b),
             BootstrapPlan::Malformed => None,
             BootstrapPlan::Assemble => match assembled {
-                Some((snapshot, complete)) => {
+                Some((mut snapshot, complete)) => {
                     if complete {
                         match serde_json::to_value(&snapshot) {
-                            // rows_affected 0 = the key was already there (a
-                            // concurrent first turn won the race): normal, and
-                            // this turn just uses its own identical copy.
-                            Ok(v) => if let Err(e) = chat_repo.set_voice_bootstrap(turn.session_id, &v).await {
-                                tracing::warn!(error = %e, "voice: bootstrap snapshot write failed; using in-memory copy");
+                            Ok(v) => match chat_repo.set_voice_bootstrap(turn.session_id, &v).await {
+                                // rows_affected 0 = the key was already there
+                                // — a concurrent first turn won the race.
+                                // That winner's stored snapshot can differ
+                                // from ours (e.g. a different `memory_scope`
+                                // on the two requests ⇒ different insight
+                                // tier), so injecting our own would violate
+                                // the frozen-single-snapshot-per-call
+                                // invariant for THIS turn. Reload and use the
+                                // winner's instead; any failure in that
+                                // reload falls back to our in-memory copy.
+                                Ok(0) => {
+                                    tracing::debug!(
+                                        session_id = %turn.session_id,
+                                        "voice: bootstrap write race lost — reloading winner's stored snapshot",
+                                    );
+                                    if let Some(winner) =
+                                        reload_bootstrap_winner(&chat_repo, turn.session_id).await
+                                    {
+                                        snapshot = winner;
+                                    }
+                                }
+                                // This turn's write won: the in-memory copy
+                                // IS the frozen one.
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(error = %e, "voice: bootstrap snapshot write failed; using in-memory copy"),
                             },
                             Err(e) => tracing::warn!(error = %e, "voice: bootstrap snapshot serialize failed"),
                         }
@@ -2676,6 +2745,111 @@ data: [DONE]\n\n";
         assert!(
             !sys.contains("北京"),
             "live insight data must not reach a later turn: {sys}"
+        );
+    }
+
+    /// The `rows_affected == 0` branch of `set_voice_bootstrap`: this turn
+    /// lost the write race to a concurrent first turn. Simulated
+    /// deterministically — the "winner's" snapshot is written directly
+    /// (distinguishable content) BEFORE the turn runs, and the turn is driven
+    /// with a STALE `session_metadata: {}` (exactly what a race loser
+    /// observed before the winner's write landed), so `plan_bootstrap` still
+    /// decides `Assemble` and this turn builds its OWN (different, from live
+    /// `human_insights`) snapshot before losing the write. The loser must
+    /// reload and inject the WINNER's stored snapshot, not its own.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_race_loser_injects_winners_stored_snapshot(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+
+        // What this turn's OWN live assembly would produce, had it not lost
+        // the race — must NOT reach the wire prompt.
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        // The concurrent winner's already-frozen snapshot, written directly.
+        let winner_snapshot = serde_json::json!({
+            "insights": ["来自DB胜者的画像"],
+            "prev_call": null,
+            "prev_session_id": null,
+            "created_at": Utc::now(),
+        });
+        let repo = ChatRepo { pool: &pool };
+        let rows = repo
+            .set_voice_bootstrap(session_id, &winner_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the winner's own write must succeed");
+
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9BOOTRACE0000000001")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                content: "hello".into(),
+                relationship_scope: RelationshipScope::None,
+                memory_scope: MemoryScope::default(),
+                // The stale read a race loser actually saw: the marker isn't
+                // in it yet, even though the winner already wrote it to the
+                // DB by the time THIS turn's write races and loses.
+                session_metadata: serde_json::json!({}),
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+        assert_no_error_frame(&frames);
+
+        // (a) wire prompt carries the DB winner's content, never the loser's
+        // own locally-assembled live-insights content.
+        let sys = system_prompt_of(&last_request_body(&mock).await);
+        assert!(
+            sys.contains("来自DB胜者的画像"),
+            "winner's stored snapshot missing from wire prompt: {sys}"
+        );
+        assert!(
+            !sys.contains("城市：上海"),
+            "loser's own locally-assembled snapshot leaked into the wire prompt: {sys}"
+        );
+
+        // (b) the DB marker is unchanged after the turn — the loser's write
+        // was a no-op, and the reload path never rewrites it either.
+        let marker = read_marker(&pool, session_id)
+            .await
+            .expect("marker present");
+        assert_eq!(
+            marker, winner_snapshot,
+            "the winner's snapshot must survive the loser's turn untouched"
         );
     }
 

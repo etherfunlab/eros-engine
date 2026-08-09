@@ -103,7 +103,11 @@ a successful-but-empty read writes the marker with that part empty):
 **Persistence**: one conditional jsonb UPDATE that only writes when the key is
 absent — idempotent under concurrent first turns:
 `metadata.voice_bootstrap = { insights, prev_call, prev_session_id, created_at }`.
-UPDATE failure ⇒ use the in-memory copy this turn, warn, retry next turn.
+UPDATE failure (a query `Err`) ⇒ use the in-memory copy this turn, warn, retry
+next turn. `rows_affected == 0` (the key was already there — a concurrent
+first turn won the race) is different: the loser reloads and injects the
+*winner's* stored snapshot instead of its own, falling back to its in-memory
+copy only if that reload itself fails (query `Err`, key missing, malformed).
 
 **Injection** (every turn) — system prompt order:
 
