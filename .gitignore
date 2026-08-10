@@ -15,5 +15,9 @@ Cargo.lock.bak
 # canonical design docs that release notes / READMEs link to.
 docs/superpowers/plans/
 
+# Agent working directory (ledgers, task briefs, review diffs). Pure scratch —
+# the record of what shipped lives in git history and docs/superpowers/specs/.
+.superpowers/
+
 # Supabase CLI scratch state (created by `supabase link`).
 **/supabase/.temp/
