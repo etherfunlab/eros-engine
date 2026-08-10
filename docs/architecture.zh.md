@@ -7,11 +7,14 @@
 ```
 ┌─────────────────────────────┐
 │ eros-engine-server          │   Axum HTTP、auth 中間件、
-│   ↓ 依賴                    │   pipeline 接線
-│ eros-engine-store           │   Postgres + pgvector 倉儲、
-│   ↓                         │   sqlx 遷移
+│   ↓ 依赖全部三者            │   pipeline 接線
+├─────────────────────────────┤
 │ eros-engine-llm             │   OpenRouter + Voyage 客戶端、
-│   ↓                         │   TOML 模型配置
+│                             │   TOML 模型配置
+│ eros-engine-store           │   Postgres + pgvector 倉儲、
+│                             │   sqlx 遷移
+│   ↓ 两者都只依赖 core       │
+├─────────────────────────────┤
 │ eros-engine-core            │   純領域——好感度、ghost、
 │                             │   PDE、人格、類型。零 I/O。
 └─────────────────────────────┘
@@ -20,7 +23,7 @@
 依賴圖嚴格向下——`core` 不知道有 `llm`，`llm` 不知道有 `store`，如此類推。這意味著：
 
 - `core` 是一個普通 Rust crate，可以拉進任何別的項目。沒有 async、沒有 Postgres、沒有 HTTP。毫秒級單元測試。
-- `llm` 跟 `store` 是獨立集成。想換掉 Voyage 用別的 embedder、或者換掉 pgvector 用別的向量庫，替換一個 crate 就好。
+- `llm` 跟 `store` 是獨立集成。换掉 embedder 现在是配置层面的事——`[tasks.embedding]` 可以指向内建的 Voyage 客户端、内建的 OpenRouter 端点，或任何 `[providers].<name>.embeddings` URL——不必换 crate；换掉 pgvector 用别的向量库，还是得换 `store` 这个 crate。
 - `server` 把這些黏起來。如果你不要 HTTP，直接依賴 `core + llm + store` 把引擎當庫嵌進去就行。
 
 ## Pipeline
@@ -78,7 +81,7 @@ PDE 已启用）。各自在不可用时降级为 `reply_text`——只降级、
 
 中间件（`auth::middleware::require_auth`）保护除 `/healthz`（在 auth 层之外合并）和 `/docs`（在 `main.rs` 里合并）以外的一切——目前即 `/comp/*`、`/bff/v1/*`、`/world/*`、`/persona/*`。该层挂在 `routes/mod.rs` 的合并子路由上，而不是某个路径前缀上，所以新增命名空间（如 `/persona/*`）不需要任何额外的鉴权接线。它讀 `Authorization: Bearer …` 頭，調 `state.auth.validate(token)`，把 `AuthUser(user_id)` 作為 extension 注入請求。每個受保護的 handler 讀 `Extension(AuthUser(user_id))`；請求體裡的 `user_id` 永不被信任。
 
-默認驗證器是 `SupabaseJwtValidator`（HS256，密鑰用 `SUPABASE_JWT_SECRET`）。自部署用其他 IdP 的話實現 `AuthValidator` trait，把實例注入 `AppState.auth` 即可。
+默认验证器是 `SupabaseJwtValidator`；它依 token 的 `alg` 头派发，优先用基于 JWKS 的非对称验证（ES256/RS256/EdDSA）——这是 Supabase 自 2025 年 JWT Signing Keys 上线后的默认机制——来源是 `SUPABASE_JWKS_URL` 或由 `SUPABASE_URL` 推导；未迁移的项目则回退到用 `SUPABASE_JWT_SECRET` 的旧版 HS256。自部署用其他 IdP 的話實現 `AuthValidator` trait，把實例注入 `AppState.auth` 即可。
 
 ## 數據流
 
@@ -151,7 +154,7 @@ crates/
 └── eros-engine-server/
     └── src/
         ├── main.rs           # serve | migrate | seed-personas 子命令
-        ├── state.rs          # AppState（pool / auth / openrouter / voyage / config）
+        ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …

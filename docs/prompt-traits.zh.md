@@ -26,7 +26,11 @@ system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
 
 ## 引擎不会做什么
 
-- **不持久化。** trait 不会写进任何数据库表，每轮请求都由调用方重新提交。
+- **不是 persona 状态。** trait 不会写入 persona/genome 表，也不会在
+  后续轮次自动重放——每轮请求都要由调用方重新提交想要生效的 trait。
+  引擎会把审计副本写进普通聊天记录：完整的 `{tag, text}` 数组落在
+  用户消息行的 `chat_messages.metadata.prompt_traits_raw`，过 tier
+  过滤后留下的 tag 落在 assistant 消息行的 `metadata.prompt_traits`。
 - **不解释内容。** 引擎把 `text` 当不透明字符串处理。内容过滤、
   用户同意流程都是调用方的责任。
 - **不带语义类别。** `tag` 仅供日志/指标用，引擎不会因为 tag 是
@@ -84,7 +88,9 @@ system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
 `allow_traits` 做服务端 tag 过滤（见上方"Tier 过滤"），但防护 persona
 内部状态最终是调用方的责任。部署层的 tag 白名单是主要防线；引擎侧过滤是纵深防御。
 
-## 为什么不持久化？
+## 为什么不是 persona 状态？
 
-引擎的 persona 表是长期契约。trait 故意保持瞬态，让调用方的实验、A/B
-测试和按会话的策略不会污染 persona 数据，也不需要 migration。
+引擎的 persona 表是长期契约。trait 故意不写入这张表，让调用方的实验、
+A/B 测试和按会话的策略不会污染 persona 数据，也不需要 migration。
+（`chat_messages.metadata` 里的审计副本属于普通聊天记录，不是 persona
+状态——见上方"引擎不会做什么"。）

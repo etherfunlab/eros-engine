@@ -281,9 +281,10 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 absolute `http(s)` URL with a host, no embedded whitespace, ≤ 2048 chars. When
 present, the engine runs a vision *describe* pre-stage (the `chat_vision` task)
 and feeds the description into the reply. `image_url` and `tips_amount_usd` are
-mutually exclusive on a single turn. A malformed URL returns `400 BadRequest` as
-a pre-stream error. Vision is active only if `[tasks.chat_vision]` is configured
-with a non-blank `filter_prompt` (see [model-config.md](model-config.md)).
+mutually exclusive on a single turn. A malformed URL returns `422 Unprocessable
+Entity` (`code: "unprocessable"`) as a pre-stream error. Vision is active only
+if `[tasks.chat_vision]` is configured with a non-blank `filter_prompt` (see
+[model-config.md](model-config.md)).
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -788,7 +789,13 @@ reports all-zero `effective_deltas`.
 
 ## Error responses
 
-All errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`:
+Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.
+The streaming routes (`POST /comp/chat/{session_id}/message/stream`, `POST
+/comp/voice/{session_id}/turn/stream`, and `POST
+/persona/{instance_id}/image/compose`) are the exception: most of the
+failure modes on all three routes use the `code` / `message` /
+`user_message` shape described under "Pre-stream errors" above, with no
+`"error"` key. The table below covers the plain shape:
 
 | Status | Code | When |
 |--------|------|------|

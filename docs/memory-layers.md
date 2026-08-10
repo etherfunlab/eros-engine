@@ -112,9 +112,10 @@ builds a profile/relationship context block from two sources:
   whether intimate fields are included (`full` / `insights_only`) or only the
   neutral subset (`neutral_*`). Alongside them, profile-layer
   `companion_memories` rows are pulled by similarity search and grouped by
-  `category`. Note the intimate/neutral distinction applies to the
-  `human_insights` bullets only — it does **not** filter which memory
-  categories are injected.
+  `category`, but only when the scope keeps profile memory (`full` /
+  `neutral_and_relationship`) — `relationship_only`, `neutral_only`,
+  `insights_only`, and `none` skip this half entirely, leaving only the
+  `human_insights` bullets (where the scope still produces any).
 - **Relationship layer** — `companion_memories` rows pulled by semantic
   (embedding) similarity search against the current turn, included when the
   scope keeps relationship memory (`full` / `neutral_and_relationship` /

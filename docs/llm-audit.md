@@ -73,8 +73,9 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 
 Behaviour:
 
-- Applies to the SSE streaming `done` frame
-  (`/comp/chat/{id}/message/stream`).
+- Applies to the SSE streaming `done` frame on both
+  `/comp/chat/{id}/message/stream` and
+  `/comp/voice/{session_id}/turn/stream`.
 - The full unfiltered `usage` is still persisted to the DB; only the
   client-facing payload is filtered.
 - Does **not** affect `tracing::info!` output — operator observability
@@ -161,7 +162,9 @@ as shown above.
   those are surface fields only, forwarded upstream and then dropped. The
   OpenRouter `model` / `usage` / `generation_id` triple **is** persisted, on
   `chat_messages.model` / `.usage` / `.generation_id` for the chat completion
-  (mirrored on `companion_affinity_events` for the affinity eval, and under
+  (mirrored on `companion_affinity_events` for the affinity eval, on
+  `companion_insights_events` for each `insight_extraction` call, on
+  `companion_decision_events` for each `pde_decision` judge run, and under
   `chat_messages.metadata.image` / `.vision*` for the composer and vision
   calls) — see the `usage` filtering note above.
 - **Hash.** The engine does not transform `user` — callers are
@@ -173,10 +176,14 @@ as shown above.
 
 ## Observability
 
-On every successful OpenRouter call the engine logs an `info`-level event
-carrying `generation_id`, `model`, and best-effort parsed token/cost fields
-from `usage`. The `audit` object itself is not logged — it is forwarded
-upstream and never echoed into engine logs.
+On every successful OpenRouter call *other than* the primary chat reply
+(`chat_companion`) and the voice turn (`chat_voice`), the engine logs an
+`info`-level event carrying `generation_id`, `model`, and best-effort parsed
+token/cost fields from `usage`. Those two highest-volume tasks never call
+that logging helper — their own per-attempt log is a `stream_metrics` event
+(`model` / `attempt` / `ttft_ms` / `total_ms` / `outcome`) with no
+`generation_id` or cost breakdown. The `audit` object itself is not logged —
+it is forwarded upstream and never echoed into engine logs.
 
 ## Why not persist?
 

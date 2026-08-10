@@ -109,8 +109,10 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   镜像表（从 `companion_insights` 同步过来），**不是**直接读 `companion_insights`
   JSONB；`memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带
   中性子集（`neutral_*`）。与之并列，画像层的 `companion_memories` 行也会按相似度
-  检索出来并按 `category` 分组注入。注意私密/中性这个区分只作用于 `human_insights`
-  bullet——它**不**过滤哪些记忆类别会被注入。
+  检索出来并按 `category` 分组注入，但仅当 scope 保留画像记忆时才会跑（`full` /
+  `neutral_and_relationship`）——`relationship_only`、`neutral_only`、
+  `insights_only`、`none` 都会整段跳过这一半，只剩下 `human_insights` bullet
+  （如果该 scope 下还有 bullet 的话）。
 - **关系层** —— `companion_memories` 行，按对当前轮的语义（embedding）相似度
   检索拉取，在 scope 保留关系记忆时纳入（`full` / `neutral_and_relationship` /
   `relationship_only`）。

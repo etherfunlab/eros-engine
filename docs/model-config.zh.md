@@ -88,6 +88,9 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.retry_depth` | `u32` | 否 | 把解析出的 `fallback` 链截断：primary + 最多这么多个 fallback，之后的条目永远不会被尝试。默认值：走通用 `resolve()` 的任务为 `2`（含 `chat_companion`；可按 tier 覆盖），单一用途任务为 `1`——参见“Fallback 截断（`retry_depth`）”。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 每任务的 token 上限。无 per-tier 覆盖。 |
+| `tasks.chat_companion.top_p` | `f32` | 否 | 核采样（nucleus sampling）概率质量。仅限 `chat_companion` 任务；仅任务级——tier 会继承该值但不能覆盖，也没有 `[defaults]` 回退。在其他任务上设置该字段能正常解析，但不会产生任何效果。缺失时 ⇒ 请求里直接省略 `top_p`，而不是发送某个默认值。 |
+| `tasks.chat_companion.frequency_penalty` | `f32` | 否 | OpenAI 风格的 frequency penalty。作用域规则与 `top_p` 相同；缺失时同样从请求中省略。 |
+| `tasks.chat_companion.presence_penalty` | `f32` | 否 | OpenAI 风格的 presence penalty。作用域规则与 `top_p` 相同；缺失时同样从请求中省略。 |
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |

@@ -2,10 +2,12 @@
 
 [English](affinity-model.md) · [中文](affinity-model.zh.md)
 
-Affinity is a six-dimensional vector that changes on every chat turn and folds
-into two derived lines — **Bond** (friendship axis) and **Chemistry** (romance
-axis). Each line has tiers and labels. The engine is the single source of truth
-for scores, labels, and per-turn label transitions.
+Affinity is a six-dimensional vector that changes on every text-channel,
+non-`product_qa` chat turn and folds into two derived lines — **Bond**
+(friendship axis) and **Chemistry** (romance axis). Voice-channel and
+`product_qa` turns never write an affinity event. Each line has tiers and
+labels. The engine is the single source of truth for scores, labels, and
+per-turn label transitions.
 
 ## The six base axes
 
@@ -34,7 +36,10 @@ new_value = clamp(old_value + (1 − ema_inertia) × delta)
 ```
 
 Default `ema_inertia = 0.5` (configurable via `EMA_INERTIA`). At that default,
-a delta of `+0.5` moves the axis by `+0.25` for the turn.
+a delta of `+0.5` moves the axis by `+0.25` for the turn. Sessions opened
+with `metadata.is_demo` use `DEMO_EMA_INERTIA` instead (default `0.3`) so
+demo meters move faster within a short demo — at that inertia the same
+`+0.5` delta moves the axis by `+0.35`.
 
 ### Time decay
 

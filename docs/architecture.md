@@ -7,11 +7,14 @@
 ```
 ┌─────────────────────────────┐
 │ eros-engine-server          │   Axum HTTP, auth middleware,
-│   ↓ depends on              │   pipeline wiring
-│ eros-engine-store           │   Postgres + pgvector repos,
-│   ↓                         │   sqlx migrations
+│   ↓ depends on all three    │   pipeline wiring
+├─────────────────────────────┤
 │ eros-engine-llm             │   OpenRouter + Voyage clients,
-│   ↓                         │   TOML model config
+│                             │   TOML model config
+│ eros-engine-store           │   Postgres + pgvector repos,
+│                             │   sqlx migrations
+│   ↓ both depend only on     │
+├─────────────────────────────┤
 │ eros-engine-core            │   Pure domain — affinity, ghost,
 │                             │   PDE, persona, types. Zero I/O.
 └─────────────────────────────┘
@@ -20,7 +23,7 @@
 The dependency graph is strictly downward — `core` doesn't know about `llm`, `llm` doesn't know about `store`, etc. This means:
 
 - `core` is a regular Rust crate you can pull into any other project. No async, no Postgres, no HTTP. Test in milliseconds.
-- `llm` and `store` are independent integrations. Swap Voyage for another embedder, or pgvector for another vector DB, by replacing one crate.
+- `llm` and `store` are independent integrations. Swapping the embedder is a config change now — `[tasks.embedding]` can route to the built-in Voyage client, the built-in OpenRouter endpoint, or any `[providers].<name>.embeddings` URL — not a crate swap; swapping pgvector for another vector DB is still a `store` crate swap.
 - `server` glues them together. If you don't want HTTP, depend on `core + llm + store` directly and embed the engine as a library.
 
 ## Pipeline
@@ -81,7 +84,7 @@ gates.
 
 Middleware (`auth::middleware::require_auth`) protects everything except `/healthz` (merged outside the layer) and `/docs` (merged in `main.rs`) — today that means `/comp/*`, `/bff/v1/*`, `/world/*`, and `/persona/*`. The layer attaches to the merged sub-router in `routes/mod.rs`, not to a path prefix, which is why a new namespace (e.g. `/persona/*`) needs no extra auth wiring. It pulls the `Authorization: Bearer …` header, calls `state.auth.validate(token)`, and inserts an `AuthUser(user_id)` extension into the request. Every protected handler reads `Extension(AuthUser(user_id))`; `user_id` from request bodies is never trusted.
 
-The default validator is `SupabaseJwtValidator` (HS256 against `SUPABASE_JWT_SECRET`). Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
+The default validator is `SupabaseJwtValidator`; it dispatches per-token on the JWT `alg` header, preferring JWKS-based asymmetric verification (ES256/RS256/EdDSA) — the default since Supabase's 2025 JWT Signing Keys rollout — sourced from `SUPABASE_JWKS_URL` or derived from `SUPABASE_URL`, and falling back to legacy HS256 against `SUPABASE_JWT_SECRET` for projects that haven't migrated. Self-hosters with a different IdP implement the `AuthValidator` trait and inject their impl into `AppState.auth`.
 
 ## Data flow
 
@@ -156,7 +159,7 @@ crates/
 └── eros-engine-server/
     └── src/
         ├── main.rs           # serve | migrate | seed-personas subcommands
-        ├── state.rs          # AppState (pool/auth/openrouter/voyage/config)
+        ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware
         ├── pipeline/         # stream (run_stream) / handlers / post_process / dreaming / …

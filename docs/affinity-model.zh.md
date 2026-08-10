@@ -2,8 +2,8 @@
 
 [English](affinity-model.md) · [中文](affinity-model.zh.md)
 
-好感度是一个六维向量，会在每轮对话后变化，并折叠成两条衍生线——**Bond**（友情轴）和
-**Chemistry**（爱情轴）。每条线都有分层和标签。引擎是分数、标签、以及每轮标签变化的单一权威来源。
+好感度是一个六维向量，会在每个文本频道、非 `product_qa` 的对话轮次后变化，并折叠成两条衍生线——**Bond**（友情轴）和
+**Chemistry**（爱情轴）。语音频道和 `product_qa` 轮次从不写入好感度事件。每条线都有分层和标签。引擎是分数、标签、以及每轮标签变化的单一权威来源。
 
 ## 六个基础轴
 
@@ -28,7 +28,7 @@ LLM 评估出的 deltas 会通过指数移动平均应用，避免大幅跳变�
 new_value = clamp(old_value + (1 − ema_inertia) × delta)
 ```
 
-默认 `ema_inertia = 0.5`（环境变量 `EMA_INERTIA` 可调）。在该默认值下，delta `+0.5` 在这一轮会移动 `+0.25`。
+默认 `ema_inertia = 0.5`（环境变量 `EMA_INERTIA` 可调）。在该默认值下，delta `+0.5` 在这一轮会移动 `+0.25`。以 `metadata.is_demo` 开启的会话改用 `DEMO_EMA_INERTIA`（默认 `0.3`），让 demo 场次的好感度表能更快看到变化——同样 `+0.5` 的 delta 在该惯性下会移动 `+0.35`。
 
 ### 时间衰退
 

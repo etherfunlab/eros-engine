@@ -71,7 +71,8 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 
 行为：
 
-- 对 SSE 流式 `done` 帧（`/comp/chat/{id}/message/stream`）生效。
+- 对 SSE 流式 `done` 帧生效，覆盖 `/comp/chat/{id}/message/stream`
+  和 `/comp/voice/{session_id}/turn/stream` 两个路由。
 - 完整未过滤的 `usage` 仍会落库；只过滤面向 client 的负载。
 - **不**影响 `tracing::info!` 输出 —— 运维可见性照旧。
 - 后台路径（dreaming / post_process）本来就不把 `usage` 返回给
@@ -147,7 +148,9 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   字段，转发上游之后就丢弃。但 OpenRouter 的 `model` / `usage` /
   `generation_id` 三元组**是**会落库的：聊天补全落在
   `chat_messages.model` / `.usage` / `.generation_id`（好感度评估镜像在
-  `companion_affinity_events`，合成器和 vision 调用落在
+  `companion_affinity_events`，每次 `insight_extraction` 调用落在
+  `companion_insights_events`，每次 `pde_decision` judge 运行落在
+  `companion_decision_events`，合成器和 vision 调用落在
   `chat_messages.metadata.image` / `.vision*`）——参见上面 `usage` 过滤那节。
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
@@ -155,9 +158,13 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 
 ## 可观测性
 
-每次成功的 OpenRouter 调用，引擎会打一条 info 级别日志，带
-`generation_id` / `model` 以及 best-effort 解析出来的 token / cost。
-`audit` 对象本身不写入日志——它只转发给上游，从不回写进引擎日志。
+除了主聊天回复（`chat_companion`）和语音回合（`chat_voice`）之外，每次
+成功的 OpenRouter 调用，引擎都会打一条 info 级别日志，带
+`generation_id` / `model` 以及 best-effort 解析出来的 token / cost。这
+两个调用量最大的任务不走这条日志——它们各自的 per-attempt 日志是一条
+`stream_metrics` 事件（`model` / `attempt` / `ttft_ms` / `total_ms` /
+`outcome`），没有 `generation_id` 也没有 cost 明细。`audit` 对象本身
+不写入日志——它只转发给上游，从不回写进引擎日志。
 
 ## 为什么不持久化？
 

@@ -27,8 +27,13 @@ the legacy output.
 
 ## What the engine does NOT do
 
-- **No persistence.** Traits are not written to any DB table.
-  Each request re-supplies them.
+- **Not persona state.** Traits are never written to the persona/genome
+  tables and are never auto-replayed on a later turn — each request must
+  re-supply the traits it wants applied. The engine does write an audit
+  copy into ordinary chat history: the verbatim `{tag, text}` array lands
+  in the user row's `chat_messages.metadata.prompt_traits_raw`, and the
+  kept (post-tier-gated) tags land in the assistant row's
+  `metadata.prompt_traits`.
 - **No content interpretation.** The engine treats `text` as opaque.
   Sanitisation and user-consent gating are the caller's responsibility.
 - **No semantic categories.** `tag` is a logging key — the engine does
@@ -93,8 +98,10 @@ engine now performs server-side tag filtering via `allow_traits` (see
 caller's responsibility. Use deployer-side allow-listing of `tag`
 values as the primary guard; the engine-side filtering is defense-in-depth.
 
-## Why not persist?
+## Why not persona state?
 
 By design, the engine's persona table is the long-lived contract. Traits
-are intentionally ephemeral so caller-side experimentation, A/B testing,
-and per-session policy don't pollute persona rows or require migrations.
+are intentionally kept out of it so caller-side experimentation, A/B
+testing, and per-session policy don't pollute persona rows or require
+migrations. (The `chat_messages.metadata` audit copy is ordinary chat
+history, not persona state — see "What the engine does NOT do" above.)

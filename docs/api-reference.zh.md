@@ -260,8 +260,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 URL，需带 host、不含空白、≤ 2048 字符。带图时引擎先跑一段 vision *describe*
 预处理（`chat_vision` 任务），把图片描述喂给回复。`image_url` 与
 `tips_amount_usd` 同一轮互斥。URL 非法时作为 pre-stream 错误返回
-`400 BadRequest`。仅当 `[tasks.chat_vision]` 配了非空 `filter_prompt` 时
-vision 才生效（见 [model-config.md](model-config.md)）。
+`422 Unprocessable Entity`（`code: "unprocessable"`）。仅当
+`[tasks.chat_vision]` 配了非空 `filter_prompt` 时 vision 才生效（见
+[model-config.md](model-config.md)）。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -303,7 +304,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
 
-**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），不记录参考类型。
+**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。合成后的提示词本身从不持久化——存储它是消费方的责任。不记录参考类型。
 
 校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
 `[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
@@ -698,7 +699,12 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 
 ## 錯誤響應
 
-所有錯誤都是 JSON 形狀 `{"error": "<code>", "message": "<人類可讀>"}`：
+大多数错误是 JSON 形状 `{"error": "<code>", "message": "<人类可读>"}`。
+流式路由（`POST /comp/chat/{session_id}/message/stream`、`POST
+/comp/voice/{session_id}/turn/stream`、`POST
+/persona/{instance_id}/image/compose`）是例外：这三个路由的大多数失败情形
+用的是上文"流前错误"段落描述的 `code` / `message` /
+`user_message` 形状，没有 `"error"` 字段。下表覆盖的是普通形状：
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|
