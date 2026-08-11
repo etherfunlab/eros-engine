@@ -1210,6 +1210,80 @@ impl<'a> ChatRepo<'a> {
             Some((id, true)) => LatestTurnLookup::Latest(id),
         })
     }
+
+    /// Record a deliberate barge-in: mark the user row, and make the assistant
+    /// reply say what TTS actually played.
+    ///
+    /// `spoken_text` empty ⇒ NO assistant content is ever written (neither
+    /// inserted nor overwritten); the user-row marker alone records the
+    /// interrupt. That keeps the "never persist empty assistant content"
+    /// invariant `run_voice_turn` holds.
+    ///
+    /// The insert carries its own `ON CONFLICT` (rather than branching on a
+    /// prior SELECT) so a generator that is still alive cannot slip between the
+    /// check and the write. Combined with `insert_voice_assistant_message`'s
+    /// audit-only conflict path, the pair is order-independent.
+    pub async fn upsert_voice_interrupt(
+        &self,
+        session_id: Uuid,
+        user_message_id: Uuid,
+        candidate_assistant_id: Uuid,
+        spoken_text: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        const MARKER: &str = r#"{"voice_interrupt": true}"#;
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
+              WHERE id = $1",
+        )
+        .bind(user_message_id)
+        .bind(MARKER)
+        .execute(&mut *tx)
+        .await?;
+
+        let assistant_id: Option<Uuid> = if spoken_text.is_empty() {
+            sqlx::query_scalar(
+                "UPDATE engine.chat_messages \
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
+                  WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice' \
+                  RETURNING id",
+            )
+            .bind(user_message_id)
+            .bind(MARKER)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            Some(
+                sqlx::query_scalar(
+                    "INSERT INTO engine.chat_messages AS m \
+                     (id, session_id, role, content, user_message_id, truncated, \
+                      assistant_action_type, channel, metadata) \
+                     VALUES ($1, $2, 'assistant', $3, $4, true, 'reply', 'voice', $5::jsonb) \
+                     ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
+                     DO UPDATE SET content = EXCLUDED.content, \
+                                   truncated = true, \
+                                   metadata = COALESCE(m.metadata, '{}'::jsonb) || EXCLUDED.metadata \
+                     RETURNING m.id",
+                )
+                .bind(candidate_assistant_id)
+                .bind(session_id)
+                .bind(spoken_text)
+                .bind(user_message_id)
+                .bind(MARKER)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        };
+
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(assistant_id)
+    }
 }
 
 #[cfg(test)]
@@ -3908,5 +3982,226 @@ mod tests {
             "pre-existing metadata keys must survive the merge"
         );
         assert_eq!(loaded.metadata["voice_bootstrap"], snapshot);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_inserts_spoken_text_and_marks_user_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let aid = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "你今天过得")
+            .await
+            .unwrap()
+            .expect("a row is written when text was played");
+
+        let (content, truncated): (String, bool) =
+            sqlx::query_as("SELECT content, truncated FROM engine.chat_messages WHERE id = $1")
+                .bind(aid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "你今天过得");
+        assert!(truncated);
+
+        let marked: bool = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->>'voice_interrupt','false')::bool \
+               FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked, "the user row carries the marker");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_with_empty_text_marks_but_writes_no_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let out = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "empty spoken_text must never write assistant content"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+
+        let marked: bool = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->>'voice_interrupt','false')::bool \
+               FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked, "still distinguishable from a disconnect");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_after_completion_overwrites_content_keeps_audit(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        let usage = serde_json::json!({"total_tokens": 42});
+        let scope = serde_json::json!({"relationship_scope": "both"});
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "the whole sentence",
+            Some("m/1"),
+            Some(&usage),
+            Some("gen-9"),
+            false,
+            Some(&scope),
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "the whole")
+            .await
+            .unwrap()
+            .expect("returns the existing row's id");
+
+        let (content, model, gen, truncated, meta): (
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT content, model, generation_id, truncated, metadata \
+               FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "the whole", "content is what was actually heard");
+        assert_eq!(model.as_deref(), Some("m/1"), "billing audit survives");
+        assert_eq!(gen.as_deref(), Some("gen-9"));
+        assert!(truncated);
+        assert_eq!(
+            meta["relationship_scope"], "both",
+            "generator metadata preserved"
+        );
+        assert_eq!(
+            meta["voice_interrupt"], true,
+            "marker merged in, not replacing"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn interrupt_with_empty_text_leaves_completed_reply_alone(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "already said this",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            content, "already said this",
+            "degenerate case is non-destructive"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn double_write_race_is_order_independent(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+
+        // Order A: interrupt first, generator second.
+        let (s1, u1) = seed_voice_turn(&pool, "hello").await;
+        repo.upsert_voice_interrupt(s1, u1, Uuid::new_v4(), "heard this much")
+            .await
+            .unwrap();
+        repo.insert_voice_assistant_message(
+            s1,
+            u1,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-a"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Order B: generator first, interrupt second.
+        let (s2, u2) = seed_voice_turn(&pool, "hello").await;
+        repo.insert_voice_assistant_message(
+            s2,
+            u2,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-b"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.upsert_voice_interrupt(s2, u2, Uuid::new_v4(), "heard this much")
+            .await
+            .unwrap();
+
+        for (uid, gen) in [(u1, "gen-a"), (u2, "gen-b")] {
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT content, generation_id FROM engine.chat_messages \
+                  WHERE user_message_id = $1 AND role = 'assistant'",
+            )
+            .bind(uid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "one row regardless of arrival order");
+            assert_eq!(
+                rows[0].0, "heard this much",
+                "content is always the interrupt's"
+            );
+            assert_eq!(
+                rows[0].1.as_deref(),
+                Some(gen),
+                "audit is always the generator's"
+            );
+        }
     }
 }
