@@ -46,6 +46,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```json
 {
   "session_id": "5f7e…",
+  "instance_id": "…",
   "persona_name": "Aria",
   "is_new": true
 }
@@ -262,7 +263,7 @@ URL，需带 host、不含空白、≤ 2048 字符。带图时引擎先跑一段
 `tips_amount_usd` 同一轮互斥。URL 非法时作为 pre-stream 错误返回
 `422 Unprocessable Entity`（`code: "unprocessable"`）。仅当
 `[tasks.chat_vision]` 配了非空 `filter_prompt` 时 vision 才生效（见
-[model-config.md](model-config.md)）。
+[model-config.zh.md](model-config.zh.md)）。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -309,7 +310,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
 `[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
 强制出图只能产出一张无视用户消息的通用肖像）。`aspect_ratio` 不在允许集时，作为
-pre-stream 错误返回 `422 BadRequest`。以上全部是 pre-stream 错误：不会落任何用户行。
+pre-stream 错误返回 `422 Unprocessable Entity`（`code: "unprocessable"`）。以上
+全部是 pre-stream 错误：不会落任何用户行。
 
 **`image_request` SSE 帧** — 每个图片轮次发出一次，取代任何引擎内绘图。引擎负责组装提示词；由消费方通过自己的图像供应商绘制（引擎没有绘图端点）。聊天流本身不绘图、不回传图像字节、不持久化绘图结果。
 
@@ -715,7 +717,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
 | 502 | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败） |
 
-## 源碼
+## 源码
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
@@ -725,4 +727,4 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
 - `crates/eros-engine-server/src/routes/debug.rs`——好感度 debug 路由（向量 + 事件日志）
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
-- `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元數據
+- `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

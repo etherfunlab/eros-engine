@@ -332,7 +332,7 @@ Per-tier 子表（`[tasks.chat_output_filter.tiers.<tier>]`）可以覆盖 `mode
 
 | 谓词 | 类型 | 语义 |
 |---|---|---|
-| `random` | `(0.0, 1.0]` 范围内的 `f64` | 当前轮次通过的概率。`random = 0.3` → 约 30% 的轮次会被过滤。 |
+| `random` | `(0.0, 1.0]` 范围内的 `f64` | 当前轮次通过的概率。`random = 0.3` → 约 30% 的轮次会被过滤。与 `input_filter` 不同，该范围**不会在启动时校验**：由于每轮抽样均匀分布于 `[0.0, 1.0)`，`random ≥ 1.0` 会一直触发，`random ≤ 0.0` 则永不触发——加载和运行时都不会报错。 |
 | `models` | `Array<String>` | 仅当生成回复的 model id 在列表中时，当前轮次才通过。 |
 | `traits` | `{ any = [...], when = "present" \| "absent" }` | 仅当 `any` 中至少一个 tag 在**实际注入** prompt 的 tag 中存在（`when = "present"`）或不存在（`when = "absent"`）时，当前轮次才通过；这里指经过 tier `allow_traits` 门控后、与 `final` frame 的 `prompt_injected` 所报告内容相同的集合。被 tier 丢弃的 trait 不算存在。 |
 

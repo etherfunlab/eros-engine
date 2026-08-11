@@ -13,7 +13,7 @@
 | `trust` | 0.0 ↔ 1.0 | `0.0` | 话题深度，是否愿意暴露自己。Bond 轴。 |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | 好奇心、追问动力，抗 ghost 的主力。Bond 轴。 |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | 内部梗、昵称、回头呼应之前的细节。Chemistry 轴。 |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。LLM 每轮给绝对值（0~1，每 0.1 档）+ 规则 delta，直接写入（不走 EMA，仍夹钳到 `[0, 1]`）。不计入两条线。 |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。当该轮 LLM 给出绝对值读数时（0~1，每 0.1 档），与规则 delta 合并后直接写入（不走 EMA）；没有读数时规则 delta 单独走常规 EMA 路径（见下文）。始终夹钳到 `[0, 1]`。不计入两条线。 |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | 推拉、玩闹式的小摩擦、傲娇空间。Chemistry 轴。 |
 
 只有 `warmth` 可以为负值。其余五个都限制在 `[0, 1]`。每次更新都会对六个轴做夹钳（clamp）。
@@ -50,7 +50,7 @@ tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 
 PDE 仍照常计算这一轮回复/主动消息的规则 delta `R`（`predict_reply_deltas`：长消息 +0.02 / 极短消息 −0.02 / 超过 24 小时未活动 −0.05）——这部分不变。
 
-本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。±0.4/−0.6 非对称上限在更早的 `parse_affinity_eval` 中就已作用于五个 LLM delta 轴——patience 从不受这两项上限约束。持久化时，`apply_deltas` 照常先跑一遍（六轴统一走 EMA 平滑 + `[0, 1]` 夹钳），随后 patience 被 `patience_target` **直接覆盖**——绕过 EMA 平滑（仍会夹钳到 `[0, 1]`）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
+本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。±0.4/−0.6 非对称上限在更早的 `parse_affinity_eval` 中就已作用于五个 LLM delta 轴——patience 从不受这两项上限约束。持久化时，`apply_deltas` 照常先跑一遍（六轴统一走 EMA 平滑，再各自夹钳到自己的区间——`warmth` 为 `[-1, 1]`，其余为 `[0, 1]`），随后 patience 被 `patience_target` **直接覆盖**——绕过 EMA 平滑（仍会夹钳到 `[0, 1]`）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
 
 **兜底：** 当本轮没有 LLM patience 读数时——Proactive、用户消息过短、助手回复为空、`no_persona_or_affinity`（persona 加载失败或不存在好感度行）、或评估调用报错/超时/模型省略了 `patience` 字段——`patience_target` 为 `None`，patience 走**旧路径**：把 `R` 通过 EMA 叠加并夹钳。
 

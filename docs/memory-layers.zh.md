@@ -102,7 +102,7 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 ## 检索与注入
 
 每轮对话都会把记忆读回 prompt，由每次请求的 `memory_scope` 控制（取值与默认值
-见 [api-reference.md](api-reference.md)；默认 `neutral_and_relationship`）。回复
+见 [api-reference.zh.md](api-reference.zh.md)；默认 `neutral_and_relationship`）。回复
 handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文块：
 
 - **画像层** —— 由两个来源合并。基础画像 bullet 来自扁平的 **`human_insights`**

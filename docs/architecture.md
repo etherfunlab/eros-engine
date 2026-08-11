@@ -148,7 +148,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0039_world_worldviews
+│   ├── migrations/           # 0000_schema → 0040_persona_instance_fks
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -158,7 +158,7 @@ crates/
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas subcommands
+        ├── main.rs           # serve | migrate | seed-personas | backfill-human-insights | print-openapi subcommands
         ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware

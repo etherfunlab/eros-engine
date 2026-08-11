@@ -143,7 +143,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0039_world_worldviews
+│   ├── migrations/           # 0000_schema → 0040_persona_instance_fks
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -153,7 +153,7 @@ crates/
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas 子命令
+        ├── main.rs           # serve | migrate | seed-personas | backfill-human-insights | print-openapi 子命令
         ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件

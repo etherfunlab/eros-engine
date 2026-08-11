@@ -359,7 +359,7 @@ override them — the same rule as every other task).
 
 | Predicate | Type | Semantics |
 |---|---|---|
-| `random` | `f64` in `(0.0, 1.0]` | Probability that this turn passes. `random = 0.3` → ~30 % of turns are filtered. |
+| `random` | `f64` in `(0.0, 1.0]` | Probability that this turn passes. `random = 0.3` → ~30 % of turns are filtered. Unlike `input_filter`, this range is **not validated at boot**: the per-turn draw is uniform in `[0.0, 1.0)`, so `random ≥ 1.0` always fires and `random ≤ 0.0` never fires — no load-time or runtime error either way. |
 | `models` | `Array<String>` | Turn passes only if the producing model id is in the list. |
 | `traits` | `{ any = [...], when = "present" \| "absent" }` | Turn passes only if at least one tag in `any` is present (`when = "present"`) or absent (`when = "absent"`) among the tags **actually injected** into the prompt — i.e. after tier `allow_traits` gating, the same set reported in the `final` frame's `prompt_injected`. A trait the tier dropped does not count as present. |
 

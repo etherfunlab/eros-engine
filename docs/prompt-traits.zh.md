@@ -57,7 +57,7 @@ system prompt 的 `[additional_guidance]` 段落下，位置在 `[topics]` 与
   - `allow_traits = []` —— 丢弃所有 trait。
   - `allow_traits = ["a", "b"]` —— 白名单，只注入列表中的 tag。
 - 请求的 `tier` 字段选择 tier 块（见
-  [api-reference.zh.md](api-reference.zh.md)）。
+  [api-reference.zh.md](api-reference.zh.md#post-compchatsession_idmessagestream)）。
   tier 未知或缺省时使用任务默认块的 `allow_traits`。
 
 ## 限制

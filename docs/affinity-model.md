@@ -17,7 +17,7 @@ per-turn label transitions.
 | `trust` | 0.0 ↔ 1.0 | `0.0` | Topic depth, willingness to disclose self. Bond axis. |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | Curiosity, follow-up questions, anti-ghost driver. Bond axis. |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | Inside jokes, nicknames, callbacks to earlier details. Chemistry axis. |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. The LLM gives an absolute read each turn (0–1, 0.1 steps) + a rule delta, written directly (bypasses EMA; still `[0,1]`-clamped). Excluded from both lines. |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. When the LLM has an absolute read for the turn (0–1, 0.1 steps), it is combined with a rule delta and written directly (bypasses EMA); otherwise the rule delta alone goes through the ordinary EMA path (see below). Always `[0,1]`-clamped. Excluded from both lines. |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | Push-pull, playful friction, tsundere affordance. Chemistry axis. |
 
 `warmth` is the only axis that can go negative. The other five are bounded to
@@ -73,7 +73,8 @@ re-rounded to the `0.1` grid (the grid constrains the LLM read only, so `R` can 
 the result off-grid). The ±0.4/−0.6 asymmetric caps are applied earlier, in
 `parse_affinity_eval`, to the five LLM delta axes only — patience is never subject to
 them. On persist, `apply_deltas` still runs first as usual (all six axes go through
-EMA smoothing + the `[0,1]` clamp), and patience is then **overwritten directly** with
+EMA smoothing + clamping to their own range — `[-1,1]` for `warmth`, `[0,1]` for the
+rest), and patience is then **overwritten directly** with
 `patience_target` — bypassing EMA smoothing (still `[0,1]`-clamped). Because both `L`
 and `R` are independent of the currently stored value, this write is race-safe with no
 read-modify-write needed.

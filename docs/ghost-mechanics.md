@@ -128,7 +128,7 @@ If the persona never ghosts → check that LLM affinity-evaluation is actually m
 
 ## Source
 
-- `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (11 unit tests)
+- `crates/eros-engine-core/src/ghost.rs` — score + ghost_permitted + decide (12 unit tests)
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream` — the `ActionType::Ghost` arm: stamps the row and records the ghost, building no chat request
 - `crates/eros-engine-store/src/affinity.rs::record_ghost` — persistence (increments streak, total_ghosts, last_ghost_at), plus a zero-delta `companion_affinity_events` row with `event_type='ghost'`
 - `crates/eros-engine-store/src/chat.rs::mark_user_message_ghosted` — sets `chat_messages.ghost_decision = true` on the user row, so replay can tell a ghost outcome from a still-generating turn

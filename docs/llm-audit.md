@@ -88,7 +88,8 @@ Behaviour:
 - Unset or empty → today's pass-through behaviour.
 
 Background paths (`pipeline::dreaming`, `pipeline::post_process`,
-`pipeline::world_director`) emit usage only as `tracing::info!` fields:
+`pipeline::world`, `pipeline::story`) emit usage only as `tracing::info!`
+fields:
 
 ```
 openrouter: call completed session=… generation_id=… model=…
@@ -112,6 +113,14 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
   usage/cost emitted as tracing fields via
   `log_openrouter_usage("world_reply", None, …)`; nothing on any client
   frame.
+- `world_stories_director` — World Stories director (background), module
+  `pipeline::story`. Runs as the second phase of the same sweeper tick as
+  `world_director`; one call per claimed persona instance per its own
+  `interval_hours`. `user` = `11111111-1111-1111-1111-111111111113` (story
+  subsystem sentinel, continuing the dreaming/world sequence). Usage/cost
+  emitted as tracing fields via
+  `log_openrouter_usage("world_stories_director", None, …)`; nothing on any
+  client frame.
 
 ## App-attribution headers
 

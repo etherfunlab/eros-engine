@@ -48,6 +48,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```json
 {
   "session_id": "5f7e…",
+  "instance_id": "…",
   "persona_name": "Aria",
   "is_new": true
 }
@@ -352,8 +353,9 @@ The reference kind is not recorded.
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
 while `[tasks.chat_image_prompt_compose]` is not configured → `422` (the
 composer is the only prompt source; without it a forced image could only be a
-generic portrait). An unsupported `aspect_ratio` returns `422 BadRequest` as a
-pre-stream error. All are pre-stream: no user row is persisted.
+generic portrait). An unsupported `aspect_ratio` returns `422 Unprocessable
+Entity` (`code: "unprocessable"`) as a pre-stream error. All are pre-stream:
+no user row is persisted.
 
 **`image_request` SSE frame** — emitted once per image turn in place of any
 in-engine draw. The engine composes the prompt; the consumer draws it via its

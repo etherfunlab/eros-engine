@@ -82,7 +82,7 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 - 未设或空 → 维持现状（完整透传）。
 
 后台路径（`pipeline::dreaming`、`pipeline::post_process`、
-`pipeline::world_director`）的 usage 只通过 `tracing::info!` 字段输出：
+`pipeline::world`、`pipeline::story`）的 usage 只通过 `tracing::info!` 字段输出：
 
 ```
 openrouter: call completed session=… generation_id=… model=…
@@ -101,6 +101,13 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 - `world_reply` —— World Town 回复响应器（后台）。每条经防抖的用户留言调一
   次，按 owner 每 UTC 自然日封顶。同一个哨兵 user；usage/cost 通过 tracing
   字段输出，走 `log_openrouter_usage("world_reply", None, …)`；不出现在任何
+  client 帧上。
+- `world_stories_director` —— World Stories 导演（后台），模块
+  `pipeline::story`。作为 `world_director` 同一个 sweeper tick 的第二阶段
+  运行；每个被认领的 persona instance 按自己的 `interval_hours` 调一次。
+  `user` = `11111111-1111-1111-1111-111111111113`（story 子系统哨兵，延续
+  dreaming/world 的序列）。Usage/cost 通过 tracing 字段输出，走
+  `log_openrouter_usage("world_stories_director", None, …)`；不出现在任何
   client 帧上。
 
 ## App-attribution headers
