@@ -116,6 +116,11 @@ pub struct VisionRequest {
     pub reasoning: Option<ReasoningConfig>,
 }
 
+/// Task name the vision pre-stage matches body rules under. `VisionRequest`
+/// carries no `task` field because the stage is single-purpose — there is
+/// exactly one task that posts this body shape.
+const VISION_TASK: &str = "chat_vision";
+
 /// Build the OpenRouter wire body for one vision attempt against `model`. Pure
 /// (no I/O) so the block shape is unit-testable. A non-blank `caption` becomes
 /// the text block; otherwise a default describe instruction is used.
@@ -793,6 +798,23 @@ impl OpenRouterClient {
                 // that `build_vision_body` bakes in unconditionally, so strip
                 // it back out here, mirroring `WireRequest::for_endpoint`.
                 strip_openrouter_vision_fields(&mut body);
+            }
+            // Body rules reach the vision pre-stage too (issue #225). Applied
+            // AFTER the subset strip, mirroring `call_once`'s strip-then-merge
+            // order: that is what lets a rule on a custom endpoint put back an
+            // extension the strip removed. `messages` (a block array here, not
+            // the chat shape) can't be clobbered — it is refused at boot along
+            // with `model`/`stream`.
+            let rules: &[crate::model_config::BodyRule] = match ep.name {
+                None => &self.openrouter_body_rules,
+                Some(p) => self
+                    .providers
+                    .get(p)
+                    .map(|e| e.body_rules.as_slice())
+                    .unwrap_or(&[]),
+            };
+            if let Some(map) = body.as_object_mut() {
+                apply_body_rules(map, rules, Some(VISION_TASK));
             }
             let mut builder = ep.http.post(ep.url).bearer_auth(ep.api_key);
             if let Some(h) = ep.headers {
@@ -3972,6 +3994,215 @@ data: [DONE]\n\n";
             keys,
             ["max_tokens", "messages", "model", "temperature"],
             "task must never serialize; no rules ⇒ no extra keys"
+        );
+    }
+
+    // ---- body rules on the vision pre-stage (issue #225) ----
+
+    fn vision_req() -> VisionRequest {
+        VisionRequest {
+            model: "vis/m".into(),
+            fallback_model: vec![],
+            system_prompt: "describe".into(),
+            image_url: "https://x/y.png".into(),
+            caption: Some("a caption".into()),
+            temperature: 0.0,
+            max_tokens: 64,
+            reasoning: Some(ReasoningConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn vision_ok() -> serde_json::Value {
+        serde_json::json!({
+            "id": "v-gen",
+            "model": "vis/m",
+            "choices": [{ "message": { "content": "{\"desc\":\"a cat\"}" } }]
+        })
+    }
+
+    #[tokio::test]
+    async fn vision_body_rule_reaches_the_wire_and_beats_task_reasoning() {
+        // The gap issue #225 closes: a deployer knob such as `reasoning_effort`
+        // (a top-level field, NOT part of the `reasoning` object) had no way to
+        // reach the vision pre-stage. It now merges, and — as on the chat path
+        // — a rule's params beat the engine-built fields.
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            Some(&["chat_vision"]),
+            serde_json::json!({"reasoning_effort": "none", "reasoning": {"enabled": true}}),
+        )]);
+        client.execute_vision(vision_req()).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(
+            body["reasoning"]["enabled"], true,
+            "rule params beat [tasks.chat_vision].reasoning"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_body_rule_cannot_flatten_the_block_array_messages() {
+        // Vision's `messages` is structurally unlike chat's — the user turn's
+        // `content` is a block array. `messages` is engine-owned and refused at
+        // boot (`validate_providers`), so no rule can reach it; this pins that
+        // the merge leaves the block array intact even when the rule is
+        // otherwise the widest possible (untargeted, top-level keys).
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            None,
+            serde_json::json!({"provider": {"sort": "price"}}),
+        )]);
+        client.execute_vision(vision_req()).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["provider"]["sort"], "price", "untargeted rule applies");
+        assert_eq!(body["messages"][0]["role"], "system");
+        let blocks = body["messages"][1]["content"]
+            .as_array()
+            .expect("user content stays a block array");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "a caption");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[1]["image_url"]["url"], "https://x/y.png");
+    }
+
+    #[tokio::test]
+    async fn vision_body_rule_skipped_for_unlisted_task() {
+        // A rule scoped to a chat task must not bleed into the vision stage.
+        let mock = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        )
+        .with_openrouter_body_rules(vec![rule(
+            Some(&["chat_companion"]),
+            serde_json::json!({"reasoning_effort": "none"}),
+        )]);
+        client.execute_vision(vision_req()).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "unlisted task must not merge"
+        );
+        assert_eq!(
+            body["reasoning"]["enabled"], false,
+            "request's own reasoning survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_custom_provider_strips_then_merges() {
+        // Custom endpoints strip OpenRouter-only fields first, then merge —
+        // so a rule on that provider can deliberately put `reasoning` back,
+        // exactly as `custom_provider_strips_then_merges` pins for chat.
+        let mock = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", mock.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                        body_rules: vec![rule(
+                            Some(&["chat_vision"]),
+                            serde_json::json!({
+                                "venice_parameters": {"x": 1},
+                                "reasoning": {"strip_thinking_response": true},
+                            }),
+                        )],
+                    },
+                )]));
+        client
+            .execute_vision(VisionRequest {
+                model: "vis@venice".into(),
+                ..vision_req()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["model"], "vis", "bare model on a custom endpoint");
+        assert_eq!(body["venice_parameters"]["x"], 1);
+        assert_eq!(
+            body["reasoning"]["strip_thinking_response"], true,
+            "a rule may put back what the subset strip removed"
+        );
+        assert!(
+            body["reasoning"].get("enabled").is_none(),
+            "the stripped [tasks.chat_vision].reasoning must not resurface"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_openrouter_rules_do_not_leak_to_a_custom_provider() {
+        // Mirrors `each_endpoint_gets_only_its_own_rules` for the vision path.
+        let mock = MockServer::start().await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vision_ok()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let client =
+            OpenRouterClient::with_base_url("or-key".into(), "https://unused.test/v1".into())
+                .with_providers(std::collections::HashMap::from([(
+                    "venice".to_string(),
+                    crate::provider::ProviderEndpoint {
+                        base_url: format!("{}/v1/chat/completions", mock.uri()),
+                        api_key: "v-key".into(),
+                        headers: reqwest::header::HeaderMap::new(),
+                        body_rules: Vec::new(),
+                    },
+                )]))
+                .with_openrouter_body_rules(vec![rule(
+                    None,
+                    serde_json::json!({"reasoning_effort": "none"}),
+                )]);
+        client
+            .execute_vision(VisionRequest {
+                model: "vis@venice".into(),
+                ..vision_req()
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "openrouter-entry rules must not reach a custom provider's vision call"
         );
     }
 }

@@ -54,13 +54,21 @@
 #   [[providers.<name>.body]] rules, see below) you declare for that entry.
 # - Under MODEL_CONFIG_DIR, [providers] merges as ONE top-level key.
 #
-# Per-provider custom body parameters (chat/completions only). `params` is
-# merged into the request body verbatim; `tasks` scopes the rule (omit = all
-# chat tasks on this provider). Later rules win; params win over engine
-# fields. model/messages/stream are engine-owned (boot refusal).
+# Per-provider custom body parameters. `params` is merged into the request
+# body verbatim; `tasks` scopes the rule (omit = every task on this
+# provider). Later rules win; params win over engine fields.
+# model/messages/stream are engine-owned (boot refusal).
 #[[providers.venice.body]]
 #tasks  = ["chat_companion"]
 #params = { venice_parameters = { include_venice_system_prompt = false } }
+#
+# Covers chat_vision too, even though that stage builds its own body — the
+# lever for models that ignore `reasoning = { enabled = false }`, reason
+# anyway, and bill for it (`reasoning_effort` is a separate top-level field,
+# not part of the `reasoning` object). Only `embedding` is uncovered.
+#[[providers.openrouter.body]]
+#tasks  = ["chat_vision"]
+#params = { reasoning_effort = "none" }
 #
 # OpenRouter routing prefs (the former [defaults].ignore_providers /
 # provider_sort) are now body params on the reserved openrouter entry —

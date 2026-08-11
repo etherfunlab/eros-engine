@@ -2439,8 +2439,15 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
 ];
 
 /// Tasks that make outbound calls but build their own bodies — body rules
-/// never reach them (spec: chat/completions `WireRequest` paths only).
-const BODY_UNSUPPORTED_TASKS: &[&str] = &["chat_vision", "embedding"];
+/// never reach them. `embedding` takes no chat-shaped parameters at all, so
+/// there is nothing for a rule to carry there.
+const BODY_UNSUPPORTED_TASKS: &[&str] = &["embedding"];
+
+/// Tasks that build their own wire body yet still run it through the body-rule
+/// merge (issue #225). `chat_vision` posts a `VisionRequest` block-array body
+/// rather than a `ChatRequest`, so it is deliberately absent from
+/// [`KNOWN_CHAT_TASKS`] — but a rule naming it does apply, so it must not warn.
+const BODY_SUPPORTED_NON_CHAT_TASKS: &[&str] = &["chat_vision"];
 
 /// Pure warn-decision for one `[[providers.*.body]].tasks` entry —
 /// unit-testable without a tracing subscriber.
@@ -2455,7 +2462,7 @@ enum BodyTaskWarning {
 fn body_rule_task_warning(task: &str) -> Option<BodyTaskWarning> {
     if BODY_UNSUPPORTED_TASKS.contains(&task) {
         Some(BodyTaskWarning::Unsupported)
-    } else if !KNOWN_CHAT_TASKS.contains(&task) {
+    } else if !KNOWN_CHAT_TASKS.contains(&task) && !BODY_SUPPORTED_NON_CHAT_TASKS.contains(&task) {
         Some(BodyTaskWarning::Unknown)
     } else {
         None
@@ -5069,10 +5076,10 @@ filter_prompt = "只根据产品资料作答。"
     #[test]
     fn body_rule_task_warning_semantics() {
         assert_eq!(body_rule_task_warning("chat_companion"), None);
-        assert_eq!(
-            body_rule_task_warning("chat_vision"),
-            Some(BodyTaskWarning::Unsupported)
-        );
+        // issue #225: vision bodies now run through the merge, so naming
+        // `chat_vision` is legitimate and must NOT warn — even though it is
+        // absent from KNOWN_CHAT_TASKS (it is not a ChatRequest task).
+        assert_eq!(body_rule_task_warning("chat_vision"), None);
         assert_eq!(
             body_rule_task_warning("embedding"),
             Some(BodyTaskWarning::Unsupported)

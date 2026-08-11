@@ -209,13 +209,14 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
 部署方自定义的 JSON，按任务合并进 chat/completions 请求体。`params` 原样
 透传（TOML → JSON）——引擎从不解读它的内容。`tasks` 把规则限定到指定的
 引擎任务名（精确匹配，区分大小写；任务名表见下文）；省略则应用于该
-provider 服务的所有 chat 任务。规则按声明顺序生效，后面的规则在 key 冲突
+provider 服务的所有任务。规则按声明顺序生效，后面的规则在 key 冲突
 时获胜，且合并进的 params 会覆盖引擎自己构建的字段——例如在 `openrouter`
 条目上声明 `reasoning`，就会覆盖被该规则限定的任务上的
 `[tasks.*].reasoning`。`model`、`messages`、`stream` 是引擎自有字段，声明
-它们会拒绝启动。规则若指名 `chat_vision` 或 `embedding` 会记录警告且永不
-生效（这两类调用自己构建请求体）。自定义 provider 必须声明 `chat` 才能使用
-body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖端点。
+它们会拒绝启动。规则若指名 `embedding` 会记录警告且永不生效（该调用自己
+构建请求体，也不接受任何 chat 形态的参数）。自定义 provider 必须声明
+`chat` 才能使用 body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖
+端点。
 
 ```toml
 [providers.venice]
@@ -233,8 +234,25 @@ params = { provider = { ignore = ["some-bad-provider"], sort = "price" } }
 `[defaults].provider_sort` 的替代写法：OpenRouter 路由偏好现在是普通的
 body 参数（裸 OpenRouter provider slug，不带 `@openrouter` 后缀），可以像
 任何其他规则一样按任务限定范围。旧的两个 key 会拒绝启动，并给出这条迁移
-提示。注意被移除的两个 key 以前也会喂给 `chat_vision` 的请求体；body 规则
-不覆盖 vision，所以 vision 调用现在完全不再发送 `provider` 偏好。
+提示。注意被移除的两个 key 以前也会喂给 `chat_vision` 的请求体；由于 body
+规则现在同样覆盖 vision，上面这条未限定 `tasks` 的规则也会作用到 vision
+调用——若只想让路由偏好作用于 chat，请用 `tasks` 限定范围。
+
+`chat_vision` 虽然不是 chat/completions 任务，但同样被覆盖：它的 describe
+调用自己构建请求体，而该请求体也会走同一套合并，因此 `reasoning` 对象表达
+不了的参数照样能到达 vision 前置阶段。
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["chat_vision"]
+params = { reasoning_effort = "none" }
+```
+
+这一点很重要：有些模型会无视 `reasoning = { enabled = false }`，照样推理并
+照样计费——而 `reasoning_effort` 是独立的顶层字段，不属于 `reasoning` 对象，
+`[tasks.*].reasoning` 表达不了它。vision 的 `messages` 是块数组（text +
+`image_url`）而不是 chat 的形态，但 `messages` 属于引擎自有字段、启动时就会
+被拒绝，所以任何规则都不可能把它压平。
 
 ### `model_name_display_override`（仅限 chat 任务）
 
@@ -606,6 +624,8 @@ b = """
 
 此功能**默认关闭**，仅当此任务块存在且 `filter_prompt` 非空白时激活。`retry_depth` 默认为 `1`（primary + 第一个 fallback）。请选择支持视觉的模型；示例使用 `google/gemini-3.1-flash-lite`。
 
+除本块自身的 key 外，其他 wire 参数通过限定 `tasks = ["chat_vision"]` 的 `[[providers.<name>.body]]` 规则送达 describe 调用——凡是 `reasoning` 对象表达不了的（包括 `reasoning_effort`）都走这条路。参见上文“`[[providers.<name>.body]]` — 自定义 body 参数”。
+
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_vision()`。
 
 ### `[tasks.chat_product_qa]` — 出戏产品问答（opt-in）
@@ -870,7 +890,8 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
   路由偏好现在是 `openrouter` 条目上的 `[[providers.<name>.body]]` 规则——
   参见上文“`[[providers.<name>.body]]` — 自定义 body 参数”。残留 key 会
   拒绝启动并给出迁移提示。被移除的两个 key 以前也会喂给 `chat_vision` 的
-  请求体；body 规则只覆盖 chat，所以 vision 调用不再发送 `provider` 偏好。
+  请求体；body 规则同样覆盖 vision，所以一条未限定 `tasks` 的规则可以让
+  vision 调用重新带上 `provider` 偏好。
 
 ## 此配置不控制的内容
 

@@ -224,14 +224,14 @@ Deployer-defined JSON merged into the chat/completions request body, per
 task. `params` is passed through verbatim (TOML → JSON) — the engine never
 interprets it. `tasks` scopes the rule to specific engine task names
 (exact, case-sensitive; see the task table below); omit it to apply to
-every chat task this provider serves. Rules apply in declaration order,
+every task this provider serves. Rules apply in declaration order,
 later rules win on key conflicts, and merged params win over engine-built
 fields — declaring `reasoning` on the `openrouter` entry therefore
 overrides `[tasks.*].reasoning` for the scoped tasks. `model`, `messages`,
-and `stream` are engine-owned and refuse to boot. A rule naming
-`chat_vision` or `embedding` warns and never applies (those calls build
-their own bodies). Custom providers must declare `chat` to use body rules;
-the reserved `openrouter` entry may declare rules alone.
+and `stream` are engine-owned and refuse to boot. A rule naming `embedding`
+warns and never applies (that call builds its own body and takes no
+chat-shaped parameters). Custom providers must declare `chat` to use body
+rules; the reserved `openrouter` entry may declare rules alone.
 
 ```toml
 [providers.venice]
@@ -249,9 +249,28 @@ The second example is the replacement for the removed
 `[defaults].ignore_providers` / `[defaults].provider_sort` keys: OpenRouter
 routing prefs are now ordinary body params (bare OpenRouter provider slugs,
 no `@openrouter` suffix), scopable per task like any other rule. The old
-keys refuse to boot with this migration message. Note the removed keys also
-fed the `chat_vision` body; body rules do not cover vision, so vision calls
-no longer send `provider` prefs at all.
+keys refuse to boot with this migration message. The removed keys also fed
+the `chat_vision` body; since body rules now cover vision too, an
+untargeted rule like the one above reaches the vision call as well — scope
+it with `tasks` if you want routing prefs on chat only.
+
+`chat_vision` is covered even though it is not a chat/completions task: its
+describe call builds its own body, but that body runs through the same
+merge, so a knob the `reasoning` object cannot express still reaches the
+vision pre-stage.
+
+```toml
+[[providers.openrouter.body]]
+tasks  = ["chat_vision"]
+params = { reasoning_effort = "none" }
+```
+
+This matters because some models ignore `reasoning = { enabled = false }`,
+reason anyway, and bill for it — and `reasoning_effort` is a separate
+top-level field, not part of the `reasoning` object, so `[tasks.*].reasoning`
+cannot express it. Vision's `messages` is a block array (text +
+`image_url`) rather than the chat shape, but `messages` is engine-owned and
+refused at boot, so no rule can flatten it.
 
 ### `model_name_display_override` (chat task only)
 
@@ -758,6 +777,11 @@ with a non-blank `filter_prompt`. `retry_depth` defaults to `1` (primary +
 first fallback). Pick a vision-capable model; the example uses
 `google/gemini-3.1-flash-lite`.
 
+Wire parameters beyond this block's own keys reach the describe call through
+`[[providers.<name>.body]]` rules scoped to `tasks = ["chat_vision"]` — the
+route for anything the `reasoning` object cannot express, `reasoning_effort`
+included. See "`[[providers.<name>.body]]` — custom body parameters" above.
+
 Call site: `crates/eros-engine-server/src/pipeline/stream.rs` via
 `resolve_vision()` in `model_config.rs`.
 
@@ -1065,8 +1089,8 @@ What may still change without notice:
   `[[providers.<name>.body]]` rules on the `openrouter` entry — see
   "`[[providers.<name>.body]]` — custom body parameters" above. A leftover
   key refuses to boot with a migration message. The removed keys also fed
-  the `chat_vision` request body; body rules are chat-only, so vision calls
-  no longer send `provider` prefs.
+  the `chat_vision` request body; body rules reach vision as well, so an
+  untargeted rule restores `provider` prefs on the vision call.
 
 ## What this config does NOT control
 
