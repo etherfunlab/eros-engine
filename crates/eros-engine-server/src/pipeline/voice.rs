@@ -3598,4 +3598,254 @@ data: [DONE]\n\n";
         );
         assert_no_recall_block(&system_prompt_of(&last_request_body(&mock).await));
     }
+
+    // ─── duplicate-gate repair: content authority + bootstrap reuse ────
+    //
+    // The route's repair path (Task 5) reads `voice_turn_repair_state` and
+    // hands the PERSISTED content — never the retry body's — to `VoiceTurn`.
+    // These two tests drive `run_voice_turn` the way that repair does: persist
+    // the (orphaned) user row on its own, THEN construct `VoiceTurn` from the
+    // repair state, mirroring the route instead of the single-shot
+    // `run_bootstrap_turn` / `run_recall_turn` helpers above.
+
+    /// The per-turn recall embeds `turn.content` as its query text, so a
+    /// repair that used the retry body's copy would search on the wrong
+    /// query. Proven end to end: the embed mock answers ONLY the PERSISTED
+    /// utterance's exact text (any other query 404s, degrading recall to
+    /// nothing), and the one memory row it can find carries a marker no other
+    /// part of the prompt does — so a populated recall block IS the proof the
+    /// persisted text, not the retry's, drove the search.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn repair_uses_persisted_content_not_the_retry_body(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        let persisted_text = "persisted words";
+        let retry_text = "different words";
+
+        // Abnormal disconnect: the FIRST attempt's utterance landed, nothing
+        // else — no reply, no marker.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, persisted_text, "01J9CONTENT00000000000001")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        // The embed mock answers ONLY a query built from the persisted text.
+        // A query built from `retry_text` (or anything else) gets no match —
+        // wiremock 404s it, `embed_query` fails, and recall degrades to no
+        // block at all.
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "input": [persisted_text] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": unit_embedding(7) } ] }),
+            ))
+            .mount(&embed)
+            .await;
+
+        // One memory row, findable only by the persisted-text query's vector.
+        MemoryRepo { pool: &pool }
+            .upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                "TOKYO_MARKER_SNIPPET",
+                &unit_embedding(7),
+                Some("preference"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The repair leg: reload the session row and the persisted repair
+        // state — exactly what the fixed route reads on the retry — and use
+        // ITS content, never `retry_text`.
+        let session = repo
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        let repair = repo.voice_turn_repair_state(umid).await.unwrap();
+        assert_eq!(
+            repair.content, persisted_text,
+            "sanity: repair state reads the persisted row, not a retry"
+        );
+        assert!(
+            !repair.has_reply && !repair.interrupted,
+            "must be the repairable shape"
+        );
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = true\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.embed = Arc::new(embed_router(&embed.uri()));
+        let resolved = state.model_config.resolve_voice().unwrap();
+
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                // The load-bearing line: the repair state's content, not
+                // `retry_text`.
+                content: repair.content,
+                relationship_scope: RelationshipScope::None,
+                memory_scope: MemoryScope::default(),
+                session_metadata: session.metadata,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+        assert_no_error_frame(&frames);
+
+        // The recall block (system message) proves the QUERY was the
+        // persisted text; the full wire body (system + history messages)
+        // proves the TRANSCRIPT is too, and that the retry's copy never
+        // leaks in anywhere.
+        let body = last_request_body(&mock).await;
+        let sys = system_prompt_of(&body);
+        assert!(
+            sys.contains("TOKYO_MARKER_SNIPPET"),
+            "recall must have used the PERSISTED text as its query — a wrong \
+             query would 404 the embed mock and leave no recall block: {sys}"
+        );
+        let wire = body.to_string();
+        assert!(
+            wire.contains(persisted_text),
+            "the persisted utterance must reach the wire prompt: {wire}"
+        );
+        assert!(
+            !wire.contains(retry_text),
+            "the retry body's text must never reach the wire prompt: {wire}"
+        );
+    }
+
+    /// `set_voice_bootstrap` is write-once: the marker a completed first turn
+    /// freezes is what a LATER repair injects, even though the repaired
+    /// turn's own user row was persisted (orphaned, no reply) before this
+    /// repair drove it — the two-step shape a duplicate-gate repair takes.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn repair_of_first_turn_reuses_frozen_bootstrap(pool: sqlx::PgPool) {
+        use futures_util::StreamExt;
+
+        let mock = bootstrap_mock().await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        seed_insights(&pool, user_id, serde_json::json!({ "city": "上海" })).await;
+        let session_id = seed_session(&pool, user_id, instance_id, "voice").await;
+
+        // Turn 1 completes normally and freezes the bootstrap snapshot.
+        let frames = run_bootstrap_turn(
+            &pool,
+            &mock,
+            session_id,
+            instance_id,
+            user_id,
+            "01J9BOOT0000000000000001",
+            MemoryScope::default(),
+        )
+        .await;
+        assert_no_error_frame(&frames);
+        let first = read_marker(&pool, session_id)
+            .await
+            .expect("marker written");
+
+        // Turn 2: an abnormal disconnect — the user row lands, nothing else —
+        // then gets repaired. The persist step happens on its own, exactly
+        // the shape the (fixed) route's duplicate-gate repair takes.
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "still there?", "01J9BOOT0000000000000002")
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let repair = repo.voice_turn_repair_state(umid).await.unwrap();
+        assert!(
+            !repair.has_reply && !repair.interrupted,
+            "must be the repairable shape"
+        );
+
+        // Reload the session row the way the route re-loads it on the retry
+        // — metadata now carries turn 1's frozen marker.
+        let session = repo
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"primary\"\nmax_tokens = 100\nrecall = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                content: repair.content,
+                relationship_scope: RelationshipScope::None,
+                // Deliberately different from turn 1's scope — the frozen
+                // snapshot must not budge even if a retry's scope would have
+                // picked a different insight tier on a first turn.
+                memory_scope: MemoryScope::Full,
+                session_metadata: session.metadata,
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+        assert_no_error_frame(&frames);
+
+        let second = read_marker(&pool, session_id)
+            .await
+            .expect("marker still there");
+        assert_eq!(
+            second, first,
+            "a repair must never reassemble the frozen bootstrap"
+        );
+    }
 }

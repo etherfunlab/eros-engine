@@ -238,21 +238,37 @@ pub async fn voice_turn_stream(
             )
         })?;
 
-    // Persist the user turn (idempotent on (session_id, client_msg_id)). A
-    // duplicate client_msg_id must NOT trigger a second assistant reply /
-    // second upstream LLM call — return 409 instead of regenerating.
-    let user_message_id = match chat_repo
+    // Persist the user turn (idempotent on (session_id, client_msg_id)).
+    // A duplicate is only a conflict when the turn actually PRODUCED something:
+    // an existing reply (retrying would double-bill) or a deliberate barge-in
+    // (nothing to repair). A duplicate with neither is an abnormal disconnect —
+    // or an upstream failure, which already told the client `retryable: true` —
+    // so it regenerates against the persisted user row.
+    let (user_message_id, persisted_content) = match chat_repo
         .insert_voice_user_message(session_id, &req.content, &req.client_msg_id)
         .await?
     {
-        VoiceUserInsert::Inserted(id) => id,
-        VoiceUserInsert::Duplicate(_) => {
-            return Err(pre(
-                StatusCode::CONFLICT,
-                "duplicate",
-                "duplicate client_msg_id for this session",
-                "这条消息已在处理",
-            ));
+        VoiceUserInsert::Inserted(id) => (id, req.content),
+        VoiceUserInsert::Duplicate(id) => {
+            let st = chat_repo.voice_turn_repair_state(id).await?;
+            if st.has_reply || st.interrupted {
+                return Err(pre(
+                    StatusCode::CONFLICT,
+                    "duplicate",
+                    "duplicate client_msg_id for this session",
+                    "这条消息已在处理",
+                ));
+            }
+            if st.content != req.content {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "voice: repair retry carried different content; using the persisted turn",
+                );
+            }
+            // The persisted utterance is authoritative — the engine never
+            // rewrites history, and the per-turn recall embeds this text as its
+            // query, so a repair must not let the same turn's recall drift.
+            (id, st.content)
         }
     };
 
@@ -264,7 +280,7 @@ pub async fn voice_turn_stream(
         // Verbatim: the per-turn recall embeds it as the query text (voice has
         // no input-filter rewrite). Already persisted above as the latest
         // history row — the wire messages still come from there.
-        content: req.content,
+        content: persisted_content,
         relationship_scope: req.relationship_scope.unwrap_or_default(),
         memory_scope: req.memory_scope.unwrap_or_default(),
         // Handed over from the row loaded above — the pipeline reads the
@@ -581,14 +597,31 @@ mod tests {
         // Pre-seed a user voice row with this client_msg_id, as if a first
         // request already landed it.
         let chat_repo = ChatRepo { pool: &pool };
-        match chat_repo
+        let user_message_id = match chat_repo
             .insert_voice_user_message(session_id, "hi", client_msg_id)
             .await
             .unwrap()
         {
-            VoiceUserInsert::Inserted(_) => {}
+            VoiceUserInsert::Inserted(id) => id,
             other => panic!("expected Inserted, got {other:?}"),
-        }
+        };
+        // A duplicate is only a conflict when the turn PRODUCED something.
+        // Seed the reply so this test still pins the double-billing guard
+        // rather than the (now relaxed) unconditional rule.
+        chat_repo
+            .insert_voice_assistant_message(
+                session_id,
+                user_message_id,
+                Uuid::new_v4(),
+                "hello back",
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
 
         let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
         let jwt = mint_jwt(user_id);
@@ -602,6 +635,72 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn duplicate_regenerates_when_turn_has_no_reply(pool: PgPool) {
+        // Abnormal disconnect: user row persisted, no reply, no marker.
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        seed_user_turn(&pool, session_id, "01J9REPAIR0000000000000001").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "content": "hello", "client_msg_id": "01J9REPAIR0000000000000001"
+            }),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a turn with no reply and no interrupt marker must be repairable"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role='user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 1,
+            "repair reuses the persisted user row, never adds a second"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn duplicate_still_409_after_interrupt(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let uid = seed_user_turn(&pool, session_id, "01J9REPAIR0000000000000002").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+                SET metadata = COALESCE(metadata,'{}'::jsonb) || '{\"voice_interrupt\": true}'::jsonb \
+              WHERE id = $1",
+        ).bind(uid).execute(&pool).await.unwrap();
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "content": "hello", "client_msg_id": "01J9REPAIR0000000000000002"
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a deliberate barge-in has nothing to repair"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
