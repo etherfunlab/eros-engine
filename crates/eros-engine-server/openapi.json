@@ -603,7 +603,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "Companion insights + computed training level for the JWT user. The\npath `user_id` MUST match the JWT's user_id; mismatch returns 403.",
+        "summary": "Typed human_insights profile for the JWT user. The path `user_id` MUST\nmatch the JWT's user_id; mismatch returns 403.",
         "operationId": "get_profile",
         "parameters": [
           {
@@ -1945,16 +1945,146 @@
         "type": "object",
         "required": [
           "user_id",
-          "companion_insights",
-          "agent_training_level"
+          "interests",
+          "personality_traits",
+          "deal_breakers"
         ],
         "properties": {
-          "agent_training_level": {
-            "type": "number",
-            "format": "double"
+          "age_max": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
           },
-          "companion_insights": {
-            "type": "object"
+          "age_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deal_breakers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "education": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "emotional_needs": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finance_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "future_plans": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hometown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "interests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "life_rhythm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "love_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mbti_guess": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nationality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personality_traits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preferred_gender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationship_history": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "social_pattern": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "None when the user has no insights row yet."
           },
           "user_id": {
             "type": "string",
@@ -1984,7 +2114,6 @@
         "type": "object",
         "required": [
           "session_id",
-          "lead_score",
           "is_converted",
           "last_active_at",
           "channel"
@@ -2007,10 +2136,6 @@
           "last_active_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "lead_score": {
-            "type": "number",
-            "format": "double"
           },
           "session_id": {
             "type": "string",

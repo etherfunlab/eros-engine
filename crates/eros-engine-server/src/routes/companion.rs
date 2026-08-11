@@ -17,13 +17,13 @@
 //! - Routes that operate on a `session_id` verify that the session belongs
 //!   to the JWT user; otherwise 403 Forbidden.
 //! - All DB I/O routes through the `eros-engine-store` repos
-//!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `InsightRepo`).
+//!   (`ChatRepo` / `AffinityRepo` / `PersonaRepo` / `HumanInsightRepo`).
 //! - The credit ledger is gone in OSS — tipping is handled inline on the
 //!   streaming `/message/stream` path via `tips_amount_usd`, not through a
 //!   separate credit-spending endpoint.
-//! - `lead_score` / CTA-gating fields are computed from the same store
-//!   primitives used by post-process; no inline `companion_insights`
-//!   table read.
+//! - `/comp/user/{user_id}/profile` returns the flat, typed `human_insights`
+//!   row (city/occupation/interests/... — see `ProfileResponse`), not the
+//!   legacy freeform `companion_insights` JSON blob.
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -38,7 +38,7 @@ use eros_engine_core::affinity::AffinityDeltas;
 use eros_engine_core::types::LlmAudit;
 use eros_engine_core::types::PromptTrait;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
-use eros_engine_store::insight::{compute_training_level, InsightRepo};
+use eros_engine_store::human_insight::HumanInsightRepo;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
@@ -130,7 +130,6 @@ pub struct HistoryResponse {
 pub struct SessionListEntry {
     pub session_id: Uuid,
     pub instance_id: Option<Uuid>,
-    pub lead_score: f64,
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     /// Conversation channel ('text' or 'voice'); start/resume is channel-scoped.
@@ -146,9 +145,89 @@ pub struct ListSessionsResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
-    #[schema(value_type = Object)]
-    pub companion_insights: Option<serde_json::Value>,
-    pub agent_training_level: f64,
+    pub city: Option<String>,
+    pub location: Option<String>,
+    pub hometown: Option<String>,
+    pub nationality: Option<String>,
+    pub occupation: Option<String>,
+    pub mbti_guess: Option<String>,
+    pub love_values: Option<String>,
+    pub emotional_needs: Option<String>,
+    pub life_rhythm: Option<String>,
+    pub interests: Vec<String>,
+    pub personality_traits: Vec<String>,
+    pub preferred_gender: Option<String>,
+    pub age_min: Option<i32>,
+    pub age_max: Option<i32>,
+    pub deal_breakers: Vec<String>,
+    pub education: Option<String>,
+    pub family: Option<String>,
+    pub relationship_history: Option<String>,
+    pub social_pattern: Option<String>,
+    pub future_plans: Option<String>,
+    pub finance_status: Option<String>,
+    /// None when the user has no insights row yet.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl ProfileResponse {
+    fn from_row(
+        user_id: Uuid,
+        row: Option<eros_engine_store::human_insight::HumanInsightsRow>,
+    ) -> Self {
+        match row {
+            Some(r) => Self {
+                user_id,
+                city: r.city,
+                location: r.location,
+                hometown: r.hometown,
+                nationality: r.nationality,
+                occupation: r.occupation,
+                mbti_guess: r.mbti_guess,
+                love_values: r.love_values,
+                emotional_needs: r.emotional_needs,
+                life_rhythm: r.life_rhythm,
+                interests: r.interests,
+                personality_traits: r.personality_traits,
+                preferred_gender: r.preferred_gender,
+                age_min: r.age_min,
+                age_max: r.age_max,
+                deal_breakers: r.deal_breakers,
+                education: r.education,
+                family: r.family,
+                relationship_history: r.relationship_history,
+                social_pattern: r.social_pattern,
+                future_plans: r.future_plans,
+                finance_status: r.finance_status,
+                updated_at: Some(r.updated_at),
+            },
+            None => Self {
+                user_id,
+                city: None,
+                location: None,
+                hometown: None,
+                nationality: None,
+                occupation: None,
+                mbti_guess: None,
+                love_values: None,
+                emotional_needs: None,
+                life_rhythm: None,
+                interests: vec![],
+                personality_traits: vec![],
+                preferred_gender: None,
+                age_min: None,
+                age_max: None,
+                deal_breakers: vec![],
+                education: None,
+                family: None,
+                relationship_history: None,
+                social_pattern: None,
+                future_plans: None,
+                finance_status: None,
+                updated_at: None,
+            },
+        }
+    }
 }
 
 /// Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`
@@ -628,7 +707,6 @@ async fn list_sessions(
         .map(|s| SessionListEntry {
             session_id: s.id,
             instance_id: s.instance_id,
-            lead_score: s.lead_score,
             is_converted: s.is_converted,
             last_active_at: s.last_active_at,
             channel: s.channel,
@@ -640,8 +718,8 @@ async fn list_sessions(
     }))
 }
 
-/// Companion insights + computed training level for the JWT user. The
-/// path `user_id` MUST match the JWT's user_id; mismatch returns 403.
+/// Typed human_insights profile for the JWT user. The path `user_id` MUST
+/// match the JWT's user_id; mismatch returns 403.
 #[utoipa::path(
     get,
     path = "/comp/user/{user_id}/profile",
@@ -662,22 +740,9 @@ async fn get_profile(
     if user_id != jwt_user {
         return Err(AppError::Forbidden("not your data".into()));
     }
-
-    let repo = InsightRepo { pool: &state.pool };
+    let repo = HumanInsightRepo { pool: &state.pool };
     let row = repo.load(user_id).await?;
-    let (insights, training_level) = match row {
-        Some(r) => {
-            let lvl = compute_training_level(&r.insights);
-            (Some(r.insights), lvl)
-        }
-        None => (None, 0.0),
-    };
-
-    Ok(Json(ProfileResponse {
-        user_id,
-        companion_insights: insights,
-        agent_training_level: training_level,
-    }))
+    Ok(Json(ProfileResponse::from_row(user_id, row)))
 }
 
 // ─── Router ─────────────────────────────────────────────────────────

@@ -11,7 +11,6 @@ pub struct ChatSession {
     pub id: Uuid,
     pub user_id: Uuid,
     pub instance_id: Option<Uuid>,
-    pub lead_score: f64,
     pub is_converted: bool,
     pub last_active_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
@@ -1410,7 +1409,6 @@ mod tests {
         let loaded = repo.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(loaded.user_id, user_id);
         assert_eq!(loaded.instance_id, Some(instance_id));
-        assert_eq!(loaded.lead_score, 0.0);
         assert!(!loaded.is_converted);
     }
 

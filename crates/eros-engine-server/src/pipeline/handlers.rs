@@ -9,9 +9,6 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[cfg(test)]
-use serde_json::Value;
-
 use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_core::types::{ActionPlan, DecisionInput, Event, LlmAudit, PromptTrait};
 use eros_engine_llm::model_config::{style_preset, ResolvedModel, StyleKey};
@@ -501,69 +498,9 @@ fn build_profile_groups(
     vec![]
 }
 
-/// Render the `companion_insights` JSONB blob as bullet strings. Skips
-/// empty / missing fields. `matching_preferences` is intentionally omitted
-/// — it's a structured sub-object that doesn't fit a single-line bullet
-/// and isn't useful in chat tone anyway.
-///
-/// Test-only parity reference: the live path renders the flat human_insights
-/// mirror via human_insights_to_bullets; this renders companion_insights JSONB
-/// directly and the parity tests pin the two together. No production caller
-/// remains (the gift path that used it was removed).
-#[cfg(test)]
-fn insights_to_bullets(insights: &Value) -> Vec<String> {
-    let Some(obj) = insights.as_object() else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-
-    let push_str = |out: &mut Vec<String>, key: &str, label: &str| {
-        if let Some(s) = obj.get(key).and_then(Value::as_str) {
-            let s = s.trim();
-            if !s.is_empty() {
-                out.push(format!("{label}：{s}"));
-            }
-        }
-    };
-    let push_arr = |out: &mut Vec<String>, key: &str, label: &str| {
-        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
-            let parts: Vec<&str> = arr
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                out.push(format!("{label}：{}", parts.join("、")));
-            }
-        }
-    };
-
-    push_str(&mut out, "city", "城市");
-    push_str(&mut out, "location", "所在地");
-    push_str(&mut out, "hometown", "老家");
-    push_str(&mut out, "nationality", "国籍");
-    push_str(&mut out, "occupation", "职业");
-    push_str(&mut out, "education", "教育");
-    push_str(&mut out, "mbti_guess", "MBTI");
-    push_str(&mut out, "love_values", "感情观");
-    push_str(&mut out, "relationship_history", "感情经历");
-    push_arr(&mut out, "interests", "兴趣");
-    push_str(&mut out, "emotional_needs", "情感需求");
-    push_str(&mut out, "family", "家庭");
-    push_str(&mut out, "finance_status", "经济状况");
-    push_str(&mut out, "life_rhythm", "作息");
-    push_str(&mut out, "social_pattern", "社交模式");
-    push_arr(&mut out, "personality_traits", "性格特质");
-    push_str(&mut out, "future_plans", "未来计划");
-
-    out
-}
-
-/// Render a `human_insights` row as 基础画像 bullets. Mirrors
-/// `insights_to_bullets`' labels / order / trim / empty-skip exactly so that
-/// `InsightMode::Full` reproduces the legacy output byte-for-byte. `Neutral`
-/// drops the intimate fields (love_values / relationship_history / interests /
+/// Render a `human_insights` row as 基础画像 bullets. `InsightMode::Full`
+/// renders every field in canonical label order; `Neutral` drops the
+/// intimate fields (love_values / relationship_history / interests /
 /// emotional_needs / family / finance_status).
 /// Matching-only columns (preferred_gender / age / deal_breakers) are never
 /// rendered. `Off` → empty (defensive; loaders gate it before calling).
@@ -937,106 +874,6 @@ async fn fetch_recent_turn_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn insights_to_bullets_empty_object() {
-        assert!(insights_to_bullets(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn insights_to_bullets_non_object_returns_empty() {
-        assert!(insights_to_bullets(&json!("just a string")).is_empty());
-        assert!(insights_to_bullets(&json!(["array", "not", "object"])).is_empty());
-        assert!(insights_to_bullets(&json!(null)).is_empty());
-    }
-
-    #[test]
-    fn insights_to_bullets_skips_empty_strings() {
-        let v = json!({
-            "city": "",
-            "occupation": "   ",
-            "mbti_guess": "INFP",
-        });
-        let bullets = insights_to_bullets(&v);
-        assert_eq!(bullets, vec!["MBTI：INFP".to_string()]);
-    }
-
-    #[test]
-    fn insights_to_bullets_renders_string_fields() {
-        let v = json!({
-            "city": "上海",
-            "occupation": "产品经理",
-            "mbti_guess": "ENFJ",
-            "love_values": "重视沟通",
-            "emotional_needs": "需要被认可",
-            "life_rhythm": "夜猫子",
-        });
-        let bullets = insights_to_bullets(&v);
-        assert_eq!(
-            bullets,
-            vec![
-                "城市：上海".to_string(),
-                "职业：产品经理".to_string(),
-                "MBTI：ENFJ".to_string(),
-                "感情观：重视沟通".to_string(),
-                "情感需求：需要被认可".to_string(),
-                "作息：夜猫子".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn insights_to_bullets_joins_arrays_and_skips_blanks() {
-        let v = json!({
-            "interests": ["登山", "  ", "精酿"],
-            "personality_traits": ["真诚", "敏感"],
-        });
-        let bullets = insights_to_bullets(&v);
-        assert_eq!(
-            bullets,
-            vec![
-                "兴趣：登山、精酿".to_string(),
-                "性格特质：真诚、敏感".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn insights_to_bullets_omits_matching_preferences() {
-        let v = json!({
-            "city": "北京",
-            "matching_preferences": {
-                "preferred_gender": "female",
-                "age_range": [25, 35],
-                "deal_breakers": ["smoking"],
-            },
-        });
-        let bullets = insights_to_bullets(&v);
-        assert_eq!(bullets, vec!["城市：北京".to_string()]);
-    }
-
-    #[test]
-    fn insights_to_bullets_preserves_canonical_field_order() {
-        // Field order matters for prompt readability — city before MBTI,
-        // emotional_needs before life_rhythm, etc.
-        let v = json!({
-            "personality_traits": ["真诚"],
-            "city": "上海",
-            "interests": ["登山"],
-            "occupation": "工程师",
-        });
-        let bullets = insights_to_bullets(&v);
-        assert_eq!(
-            bullets,
-            vec![
-                "城市：上海".to_string(),
-                "职业：工程师".to_string(),
-                "兴趣：登山".to_string(),
-                "性格特质：真诚".to_string(),
-            ]
-        );
-    }
 
     // ─── Integration tests: recall_memory_with_embedding ──────────────────
     //
@@ -1664,35 +1501,6 @@ mod tests {
         // never rendered in any mode — proven by the exact vec above.
     }
 
-    #[test]
-    fn human_insights_full_matches_companion_insights_renderer() {
-        // The byte-identical parity contract: Full mode over a human_insights row
-        // must equal insights_to_bullets over the equivalent companion_insights JSON.
-        let row = sample_human_row();
-        let equivalent = serde_json::json!({
-            "city": "上海",
-            "occupation": "设计师",
-            "education": "美院本科",
-            "mbti_guess": "INFP",
-            "love_values": "慢热",
-            "relationship_history": "单身两年",
-            "interests": ["登山", "摄影"],
-            "emotional_needs": "被理解",
-            "family": "独生女，父母在杭州",
-            "finance_status": "攒钱中",
-            "life_rhythm": "夜猫子",
-            "social_pattern": "小圈子聚会",
-            "personality_traits": ["温柔"],
-            "future_plans": "想开工作室",
-            // matching-only fields exist in JSON too but neither renderer emits them
-            "matching_preferences": { "preferred_gender": "female", "age_range": [25, 35] }
-        });
-        assert_eq!(
-            human_insights_to_bullets(&row, InsightMode::Full),
-            insights_to_bullets(&equivalent)
-        );
-    }
-
     fn sample_geo_row() -> HumanInsightsRow {
         HumanInsightsRow {
             user_id: Uuid::new_v4(),
@@ -1732,35 +1540,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn insights_to_bullets_renders_geo_after_city() {
-        let v = serde_json::json!({
-            "city": "深圳", "location": "台北", "hometown": "新界",
-            "nationality": "中国香港", "occupation": "工程师"
-        });
-        assert_eq!(
-            insights_to_bullets(&v),
-            vec![
-                "城市：深圳",
-                "所在地：台北",
-                "老家：新界",
-                "国籍：中国香港",
-                "职业：工程师"
-            ]
-        );
-    }
-
-    #[test]
-    fn human_insights_geo_matches_companion_insights_renderer() {
-        let equivalent = serde_json::json!({
-            "city": "深圳", "location": "台北", "hometown": "新界", "nationality": "中国香港"
-        });
-        assert_eq!(
-            human_insights_to_bullets(&sample_geo_row(), InsightMode::Full),
-            insights_to_bullets(&equivalent)
-        );
-    }
-
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn load_human_insight_bullets_returns_empty_for_unknown_user(pool: PgPool) {
         let bullets = load_human_insight_bullets(&pool, Uuid::new_v4(), InsightMode::Full).await;
@@ -1775,7 +1554,7 @@ mod tests {
             "love_values": "认真", "interests": ["爬山"], "emotional_needs": "陪伴"
         });
         HumanInsightRepo { pool: &pool }
-            .project_from_insights(user_id, &insights)
+            .apply_extraction(user_id, &insights)
             .await
             .unwrap();
 

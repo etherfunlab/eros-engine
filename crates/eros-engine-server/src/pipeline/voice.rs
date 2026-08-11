@@ -2530,7 +2530,7 @@ data: [DONE]\n\n";
 
     async fn seed_insights(pool: &sqlx::PgPool, user_id: Uuid, insights: serde_json::Value) {
         eros_engine_store::human_insight::HumanInsightRepo { pool }
-            .project_from_insights(user_id, &insights)
+            .apply_extraction(user_id, &insights)
             .await
             .unwrap();
     }

@@ -81,9 +81,6 @@ pub enum ProtocolFrame {
         ghost_fallback: bool,
     },
     Final {
-        lead_score: f64,
-        should_show_cta: bool,
-        agent_training_level: f64,
         filtered: bool,
         // null when no trait injected; always present (no skip_serializing_if).
         prompt_injected: Option<Vec<String>>,
@@ -3259,7 +3256,7 @@ pub fn run_stream(
                     generation_id: None,
                     ghost_fallback: false,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
             ActionType::ProductQa => {
@@ -3485,7 +3482,7 @@ pub fn run_stream(
                     generation_id: last_gen_id,
                     ghost_fallback: false,
                 };
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
@@ -3591,17 +3588,8 @@ pub fn run_stream(
                     {
                         tracing::warn!("stream: ghost streak reset failed: {e}");
                     }
-                    let final_frame = compute_final_frame(
-                        &state,
-                        user_msg.session_id,
-                        user_msg.user_id,
-                        false,
-                        None,
-                        user_msg.tier.clone(),
-                        0,
-                        0,
-                    )
-                    .await;
+                    let final_frame =
+                        build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                     yield final_frame;
 
                     let state_bg = (*state).clone();
@@ -3966,17 +3954,13 @@ pub fn run_stream(
                     }
                 }
 
-                let final_frame = compute_final_frame(
-                    &state,
-                    user_msg.session_id,
-                    user_msg.user_id,
+                let final_frame = build_final_frame(
                     did_filter,
                     prompt_injected.clone(),
                     user_msg.tier.clone(),
                     retries_chat,
                     retries_filter,
-                )
-                .await;
+                );
                 yield final_frame;
 
                 // Spawn post-process; do not await.
@@ -4019,50 +4003,23 @@ pub fn run_stream(
             }
             _ => {
                 // Proactive and any future variants: Final-only.
-                let final_frame = compute_final_frame(&state, user_msg.session_id, user_msg.user_id, false, None, user_msg.tier.clone(), 0, 0).await;
+                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
                 yield final_frame;
             }
         }
     }
 }
 
-/// Compute the spec's `final` frame from current session/user state.
-#[allow(clippy::too_many_arguments)]
-async fn compute_final_frame(
-    state: &AppState,
-    session_id: Uuid,
-    user_id: Uuid,
+/// Build the spec's `final` frame. Assembled purely from turn-local values
+/// since the lead/CTA teardown (spec 2026-08-11) — no DB reads.
+fn build_final_frame(
     filtered: bool,
     prompt_injected: Option<Vec<String>>,
     tier: Option<String>,
     retries_chat: u32,
     retries_filter: u32,
 ) -> ProtocolFrame {
-    let lead_score: f64 =
-        sqlx::query_scalar("SELECT lead_score FROM engine.chat_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
-
-    let training_level: f64 = match (eros_engine_store::insight::InsightRepo { pool: &state.pool })
-        .load(user_id)
-        .await
-    {
-        Ok(Some(row)) => eros_engine_store::insight::compute_training_level(&row.insights),
-        _ => 0.0,
-    };
-    let should_show_cta = lead_score >= 7.0 && training_level >= 0.4;
-    // Normalise lead_score from 0..10 to 0..1 to match the spec's declared
-    // [0.0, 1.0] range. Operator dashboards still see the 0..10 raw value
-    // via the sync /message handler.
-    let normalised_lead = (lead_score / 10.0).clamp(0.0, 1.0);
     ProtocolFrame::Final {
-        lead_score: normalised_lead,
-        should_show_cta,
-        agent_training_level: training_level,
         filtered,
         prompt_injected,
         tier,
@@ -4078,8 +4035,11 @@ async fn compute_final_frame(
 /// synthetic Meta+Done(no usage, not truncated) followed by Final.
 pub fn replay_stream(
     state: Arc<AppState>,
-    session_id: Uuid,
-    user_id: Uuid,
+    // Unused since the lead/CTA teardown (spec 2026-08-11): `build_final_frame`
+    // no longer needs session/user state. Kept in the signature — every call
+    // site already has both values in scope — rather than churning every caller.
+    _session_id: Uuid,
+    _user_id: Uuid,
     ghost: bool,
     rows: Vec<eros_engine_store::chat::ChatMessage>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
@@ -4179,7 +4139,7 @@ pub fn replay_stream(
                 return;
             }
         }
-        let final_frame = compute_final_frame(&state, session_id, user_id, false, None, None, 0, 0).await;
+        let final_frame = build_final_frame(false, None, None, 0, 0);
         yield final_frame;
     }
 }
@@ -4468,9 +4428,6 @@ mod tests {
     #[test]
     fn final_frame_carries_filter_and_status_fields() {
         let f = ProtocolFrame::Final {
-            lead_score: 0.71,
-            should_show_cta: false,
-            agent_training_level: 0.42,
             filtered: true,
             prompt_injected: Some(vec!["nsfw_boost".into()]),
             tier: Some("gold".into()),
@@ -4486,9 +4443,6 @@ mod tests {
         assert_eq!(v["retries_filter"], 0);
 
         let f2 = ProtocolFrame::Final {
-            lead_score: 0.0,
-            should_show_cta: false,
-            agent_training_level: 0.0,
             filtered: false,
             prompt_injected: None,
             tier: None,
