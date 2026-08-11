@@ -991,6 +991,12 @@ impl<'a> ChatRepo<'a> {
     /// `assistant_action_type='reply'`, `channel='voice'`. No filter audit, no
     /// continues_from — voice replies are single, whole messages. Bumps
     /// `last_active_at` in the same transaction as the insert.
+    ///
+    /// Idempotent on `user_message_id` (migration 0041): a second writer for the
+    /// same turn refills only `model`/`usage`/`generation_id` and never touches
+    /// `content`, `truncated` or `metadata`. That is what lets the interrupt
+    /// endpoint and a still-live generator race safely in either order —
+    /// content belongs to the interrupt, billing audit to the generator.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_voice_assistant_message(
         &self,
@@ -1006,10 +1012,14 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO engine.chat_messages \
+            "INSERT INTO engine.chat_messages AS m \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
               generation_id, assistant_action_type, channel, metadata) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9)",
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9) \
+             ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
+             DO UPDATE SET model = EXCLUDED.model, \
+                           usage = EXCLUDED.usage, \
+                           generation_id = EXCLUDED.generation_id",
         )
         .bind(id)
         .bind(session_id)
@@ -3191,6 +3201,87 @@ mod tests {
         assert!(
             after > before,
             "a voice assistant insert must bump last_active_at"
+        );
+    }
+
+    /// Seeds a fresh voice session plus its one user turn via the real store
+    /// methods (`throwaway_session` + `insert_voice_user_message`) rather than
+    /// duplicating their genome/instance/session SQL inline.
+    async fn seed_voice_turn(pool: &PgPool, content: &str) -> (Uuid, Uuid) {
+        let session_id = throwaway_session(pool).await.id;
+        let repo = ChatRepo { pool };
+        let user_mid = match repo
+            .insert_voice_user_message(session_id, content, &format!("cmid-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        (session_id, user_mid)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        // First writer wins the content.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "first",
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Second writer must NOT create a second row, must NOT touch content,
+        // and must refill the audit columns it carries.
+        let usage = serde_json::json!({"total_tokens": 7});
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "second",
+            Some("m/1"),
+            Some(&usage),
+            Some("gen-1"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT content, model, generation_id, truncated FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice'",
+        )
+        .bind(user_mid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one assistant reply per voice user turn"
+        );
+        assert_eq!(rows[0].0, "first", "content belongs to the first writer");
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("m/1"),
+            "audit columns get refilled"
+        );
+        assert_eq!(rows[0].2.as_deref(), Some("gen-1"));
+        assert!(
+            rows[0].3,
+            "truncated must not be downgraded by the audit refill"
         );
     }
 
