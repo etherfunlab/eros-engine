@@ -1130,6 +1130,88 @@ impl<'a> ChatRepo<'a> {
     }
 }
 
+/// What the repair gate needs to know about one voice turn, in a single query.
+#[derive(Debug, Clone)]
+pub struct VoiceTurnRepair {
+    /// An assistant reply already exists — retrying would double-bill.
+    pub has_reply: bool,
+    /// The turn was deliberately interrupted — there is nothing to repair.
+    pub interrupted: bool,
+    /// The PERSISTED utterance. The repair path regenerates from this, never
+    /// from the retry body, so the turn's vector recall cannot drift between
+    /// attempts.
+    pub content: String,
+}
+
+/// Outcome of resolving a `client_msg_id` for the interrupt endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestTurnLookup {
+    /// No user row with this `client_msg_id` in this session.
+    NotFound,
+    /// Found, but a newer user turn exists — you can only barge in on what is
+    /// currently being spoken.
+    Stale,
+    Latest(Uuid),
+}
+
+impl<'a> ChatRepo<'a> {
+    /// Read the two facts the `turn/stream` duplicate gate needs, plus the
+    /// persisted utterance, in one round trip.
+    pub async fn voice_turn_repair_state(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<VoiceTurnRepair, sqlx::Error> {
+        let (content, interrupted, has_reply): (String, bool, bool) = sqlx::query_as(
+            "SELECT u.content, \
+                    COALESCE(u.metadata->>'voice_interrupt', 'false')::bool, \
+                    EXISTS ( \
+                        SELECT 1 FROM engine.chat_messages a \
+                         WHERE a.user_message_id = u.id \
+                           AND a.role = 'assistant' AND a.channel = 'voice' \
+                    ) \
+               FROM engine.chat_messages u \
+              WHERE u.id = $1",
+        )
+        .bind(user_message_id)
+        .fetch_one(self.pool)
+        .await?;
+        Ok(VoiceTurnRepair {
+            has_reply,
+            interrupted,
+            content,
+        })
+    }
+
+    /// Resolve a `client_msg_id` to its user row and report whether it is the
+    /// session's most recent user turn. Separating `NotFound` from `Stale` lets
+    /// the route return 404 vs. 409 without a second round trip.
+    pub async fn resolve_latest_voice_user_turn(
+        &self,
+        session_id: Uuid,
+        client_msg_id: &str,
+    ) -> Result<LatestTurnLookup, sqlx::Error> {
+        let row: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT m.id, \
+                    m.id = ( \
+                        SELECT l.id FROM engine.chat_messages l \
+                         WHERE l.session_id = $1 AND l.role = 'user' \
+                         ORDER BY l.sent_at DESC, l.id DESC LIMIT 1 \
+                    ) \
+               FROM engine.chat_messages m \
+              WHERE m.session_id = $1 AND m.client_msg_id = $2 AND m.role = 'user'",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(match row {
+            None => LatestTurnLookup::NotFound,
+            Some((_, false)) => LatestTurnLookup::Stale,
+            Some((id, true)) => LatestTurnLookup::Latest(id),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3294,6 +3376,114 @@ mod tests {
             rows[0].4,
             Some(serde_json::json!({"total_tokens": 7})),
             "usage must be refilled by the audit refill"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_reports_reply_marker_and_content(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello there").await;
+
+        // Fresh turn: nothing yet.
+        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        assert!(!st.has_reply);
+        assert!(!st.interrupted);
+        assert_eq!(
+            st.content, "hello there",
+            "the persisted utterance comes back"
+        );
+
+        // A reply flips has_reply.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "hi",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        assert!(st.has_reply);
+        assert!(!st.interrupted);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_reports_interrupt_marker(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (_session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET metadata = COALESCE(metadata,'{}'::jsonb) || '{\"voice_interrupt\": true}'::jsonb \
+             WHERE id = $1",
+        )
+        .bind(user_mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        assert!(
+            st.interrupted,
+            "the marker must be visible to the repair gate"
+        );
+        assert!(!st.has_reply);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_turn_lookup_classifies_missing_stale_and_latest(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, _first) = seed_voice_turn(&pool, "one").await;
+
+        // Give the first turn a client_msg_id, then add a newer one.
+        sqlx::query(
+            "UPDATE engine.chat_messages SET client_msg_id = 'CID-ONE' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.resolve_latest_voice_user_turn(session_id, "NOPE")
+                .await
+                .unwrap(),
+            LatestTurnLookup::NotFound
+        ));
+        assert!(matches!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-ONE")
+                .await
+                .unwrap(),
+            LatestTurnLookup::Latest(_)
+        ));
+
+        let second: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, client_msg_id) \
+             VALUES ($1,'user','two','voice','CID-TWO') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                repo.resolve_latest_voice_user_turn(session_id, "CID-ONE")
+                    .await
+                    .unwrap(),
+                LatestTurnLookup::Stale
+            ),
+            "an older turn must not be interruptible"
+        );
+        assert_eq!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-TWO")
+                .await
+                .unwrap(),
+            LatestTurnLookup::Latest(second)
         );
     }
 
