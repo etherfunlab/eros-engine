@@ -131,6 +131,25 @@ the next turn.** That is the natural order anyway (you interrupt, then speak). A
 late interrupt is rejected and the turn degrades to the abnormal-disconnect
 state — recoverable, and strictly better than allowing history rewrites.
 
+#### The check-to-write window is deliberately left open
+
+The guard resolves the latest turn and then writes in a separate transaction,
+so a turn that was latest at check time can stop being latest before the write
+lands. Reviewers have flagged this twice as a TOCTOU hole; it is not one, and
+the reasoning is recorded here so it need not be re-derived.
+
+The reachable set is exactly "the turn that was latest **at check time**" —
+which is the caller's own just-interrupted turn. Nothing a client can do makes
+an arbitrary historical turn become latest again, so the property the guard
+actually protects — that a client cannot rewrite arbitrary historical assistant
+content — holds regardless of the window. What the window admits is only the
+benign case the ordering requirement above already describes: an interrupt that
+crosses paths with the next turn still lands on the turn it was about.
+
+Closing it would cost more than it buys. Revalidating latestness inside the
+write transaction would convert that crossing case from "works" into a 409 —
+and a client on a real network is exactly where the crossing happens.
+
 ### Semantics — upsert on the assistant reply
 
 Keyed by the user row's id:

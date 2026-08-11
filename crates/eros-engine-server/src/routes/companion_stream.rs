@@ -390,6 +390,23 @@ pub async fn send_message_stream(
             original_user_message_id: None,
         }));
     }
+    // Channel-scoped, mirroring the voice endpoint's own gate: this handler
+    // writes text-channel rows, so it must not operate on a voice session.
+    // Without this, a text turn lands in a voice conversation's history and
+    // the two channels interleave in a single transcript — and it is what let
+    // a text `client_msg_id` collide with the voice barge-in lookups
+    // (2026-08-11-voice-barge-in-interrupt-design.md). Those lookups now filter
+    // `channel = 'voice'` themselves, so this is defence in depth on the
+    // writing side rather than the only guard.
+    if session.channel == "voice" {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::CONFLICT,
+            code: "wrong_channel",
+            message: "session is a voice-channel session".into(),
+            user_message: "该会话是语音会话".into(),
+            original_user_message_id: None,
+        }));
+    }
     let instance_id = session.instance_id.ok_or_else(|| {
         AppError::StreamPre(StreamPreError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -758,6 +775,62 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], "unprocessable");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_409_when_session_is_voice_channel(pool: PgPool) {
+        // The text stream writes text-channel rows, so it must refuse a voice
+        // session — otherwise a text turn lands in a voice conversation's
+        // history and the two channels interleave in one transcript. Rejected
+        // BEFORE any row is persisted.
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, channel) \
+             VALUES ($1, $2, 'voice') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(
+            &json!({"content":"typed","client_msg_id":"01J2222222222222222222222V"}),
+        )
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "wrong_channel");
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_messages WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a rejected text turn must not persist any row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

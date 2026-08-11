@@ -1005,12 +1005,19 @@ impl<'a> ChatRepo<'a> {
     ///   audit to the generator.
     /// - **unmarked** (both writers are ordinary generators — e.g. an orphaned
     ///   generator from a dead connection racing a client's retry of the same
-    ///   turn): last-writer-wins on EVERY column, `content` and `truncated`
-    ///   included. This keeps `content` and `generation_id` consistent with
-    ///   each other — the previous unconditional "refill audit columns only"
-    ///   rule could leave one generation's `content` paired with a DIFFERENT
-    ///   generation's `generation_id`, which OpenRouter reconciliation would
-    ///   silently mis-attribute.
+    ///   turn): last-writer-wins on every column this clause SETs — `content`
+    ///   and `truncated` included, alongside the audit trio. This keeps
+    ///   `content` and `generation_id` consistent with each other — the
+    ///   previous unconditional "refill audit columns only" rule could leave
+    ///   one generation's `content` paired with a DIFFERENT generation's
+    ///   `generation_id`, which OpenRouter reconciliation would silently
+    ///   mis-attribute.
+    ///
+    /// `metadata` is in NEITHER branch's SET list, so it is never refreshed on
+    /// conflict in either case: the first writer's metadata stands. That is
+    /// deliberate — it is what preserves an interrupt's `voice_interrupt`
+    /// marker (and the generator's `relationship_scope`) against a later
+    /// conflicting write, and the marker is the very key this CASE reads.
     ///
     /// `usage` additionally falls back to the existing row's value when the
     /// conflicting write's own `usage` is NULL (e.g. upstream never sent a
