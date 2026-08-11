@@ -995,8 +995,21 @@ impl<'a> ChatRepo<'a> {
     /// Idempotent on `user_message_id` (migration 0041): a second writer for the
     /// same turn refills only `model`/`usage`/`generation_id` and never touches
     /// `content`, `truncated` or `metadata`. That is what lets the interrupt
-    /// endpoint and a still-live generator race safely in either order —
-    /// content belongs to the interrupt, billing audit to the generator.
+    /// endpoint and a still-live generator race safely when a reply already
+    /// exists — content belongs to the interrupt, billing audit to the
+    /// generator.
+    ///
+    /// The insert is additionally **skipped entirely** when the user row is
+    /// already marked `voice_interrupt` and no assistant reply exists yet —
+    /// that combination means the client reported nothing was heard, and the
+    /// "absent + empty" contract cell requires no assistant row at all. Without
+    /// this guard a still-live generator could win a race against an
+    /// empty-text interrupt and leave a full, untruncated reply with no
+    /// interrupt marker: indistinguishable from a normal completion. The first
+    /// statement below takes `FOR UPDATE` on the user row — the SAME row
+    /// `upsert_voice_interrupt` locks first — so the two writers cannot
+    /// interleave their check and their write; whichever commits first is the
+    /// one the other observes. This lock is load-bearing, not incidental.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_voice_assistant_message(
         &self,
@@ -1011,11 +1024,26 @@ impl<'a> ChatRepo<'a> {
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        // Same row `upsert_voice_interrupt` locks first (via its user-row
+        // UPDATE) — serializes the two writers so the marker check below can't
+        // race a concurrent empty-text interrupt.
+        sqlx::query("SELECT 1 FROM engine.chat_messages WHERE id = $1 FOR UPDATE")
+            .bind(user_message_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO engine.chat_messages AS m \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
               generation_id, assistant_action_type, channel, metadata) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9) \
+             SELECT $1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9 \
+             WHERE NOT ( \
+                 COALESCE((SELECT u.metadata->>'voice_interrupt' \
+                             FROM engine.chat_messages u WHERE u.id = $4), 'false')::bool \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM engine.chat_messages a \
+                      WHERE a.user_message_id = $4 AND a.role = 'assistant' AND a.channel = 'voice' \
+                 ) \
+             ) \
              ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
              DO UPDATE SET model = EXCLUDED.model, \
                            usage = EXCLUDED.usage, \
@@ -1219,10 +1247,22 @@ impl<'a> ChatRepo<'a> {
     /// interrupt. That keeps the "never persist empty assistant content"
     /// invariant `run_voice_turn` holds.
     ///
-    /// The insert carries its own `ON CONFLICT` (rather than branching on a
-    /// prior SELECT) so a generator that is still alive cannot slip between the
-    /// check and the write. Combined with `insert_voice_assistant_message`'s
-    /// audit-only conflict path, the pair is order-independent.
+    /// Two different mechanisms protect the two branches against a still-live
+    /// generator, because a plain "check then write" is unsafe in general:
+    /// - **non-empty `spoken_text`**: the insert carries its own `ON CONFLICT`
+    ///   (rather than branching on a prior `SELECT`), so a concurrent
+    ///   `insert_voice_assistant_message` cannot slip between the check and
+    ///   the write — whichever arrives second just refills its own half
+    ///   (content here, audit columns there).
+    /// - **empty `spoken_text`**: there is no row to `ON CONFLICT` against
+    ///   when none exists yet, so the race is closed differently — this
+    ///   function's first statement (the marker `UPDATE ... WHERE id =
+    ///   user_message_id`) takes a row lock on the user row, and
+    ///   `insert_voice_assistant_message` takes the SAME lock as ITS first
+    ///   statement before checking the marker. The two transactions therefore
+    ///   serialize on that lock: whichever commits first is what the other
+    ///   observes, so the generator's marker check can never read a stale
+    ///   "not yet interrupted" state.
     pub async fn upsert_voice_interrupt(
         &self,
         session_id: Uuid,
@@ -1233,6 +1273,12 @@ impl<'a> ChatRepo<'a> {
         const MARKER: &str = r#"{"voice_interrupt": true}"#;
         let mut tx = self.pool.begin().await?;
 
+        // This UPDATE is also the lock acquisition: it takes a row lock on
+        // the user row that `insert_voice_assistant_message` takes too
+        // (there, via an explicit `FOR UPDATE`) before consulting this same
+        // marker. That serializes the two writers on the empty-text branch,
+        // where there is no row to `ON CONFLICT` against yet. Load-bearing,
+        // not incidental — do not reorder this below the branch that follows.
         sqlx::query(
             "UPDATE engine.chat_messages \
                 SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
@@ -4048,6 +4094,52 @@ mod tests {
         .await
         .unwrap();
         assert!(marked, "still distinguishable from a disconnect");
+    }
+
+    /// The race the empty-text branch cannot close with `ON CONFLICT` alone:
+    /// the client hears nothing and interrupts BEFORE the generator commits.
+    /// `insert_voice_assistant_message` must see the marker (via the shared
+    /// user-row lock) and decline to insert — the "absent + empty" contract
+    /// cell requires no assistant row at all, not a full untruncated reply
+    /// masquerading as a normal completion.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn empty_interrupt_then_generator_leaves_no_assistant_row(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
+
+        let out = repo
+            .upsert_voice_interrupt(session_id, user_mid, Uuid::new_v4(), "")
+            .await
+            .unwrap();
+        assert!(out.is_none());
+
+        // The generator was still alive and only now reaches its own insert.
+        repo.insert_voice_assistant_message(
+            session_id,
+            user_mid,
+            Uuid::new_v4(),
+            "generated much more",
+            Some("m/1"),
+            None,
+            Some("gen-late"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+              WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "the generator must decline to insert once the turn is marked interrupted with nothing played"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
