@@ -9,6 +9,9 @@
 --      in place with its history,
 --   4. drop chat_sessions.lead_score (sole writer refresh_lead_score is
 --      gone; the lead/CTA chain's only input was training_level).
+--      Dropping the column breaks OLD binaries' `SELECT *` ChatSession
+--      decodes (ColumnNotFound) — run this migration at deploy time with
+--      old instances stopping, not hours ahead.
 
 -- 1. Gap-fill. Array/typeof guards mirror 0018.
 INSERT INTO engine.human_insights (

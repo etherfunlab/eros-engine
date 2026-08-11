@@ -98,9 +98,10 @@ Changes are at the ends of the pipeline:
     it.
   - One round-trip; the old load→merge→upsert whole-blob last-write-wins race
     narrows to column-level last-write-wins — strictly better.
-- **Deleted:** `project_from_insights` / `project_columns` and the mirror call
-  in `post_process`; the `backfill-human-insights` CLI subcommand (with direct
-  writes there is no mirror left to repair).
+- **Deleted:** `project_from_insights` and the mirror call in `post_process`;
+  the `backfill-human-insights` CLI subcommand (with direct writes there is no
+  mirror left to repair). `project_columns` is NOT deleted — `apply_extraction`
+  still uses it.
 
 ## §2 Teardown inventory
 
@@ -136,10 +137,14 @@ Changes are at the ends of the pipeline:
 4. `ALTER TABLE engine.chat_sessions DROP COLUMN lead_score;` (gated on the §2
    verification step).
 
-**Rollout note:** migration first, then the new binary. In the window where
-the old binary runs against the new schema, insight merges error and are
-logged at warn — `post_process` is fire-and-forget and fail-open, so chat is
-unaffected; a few extraction runs in the window are lost. Acceptable.
+**Rollout note:** in the window between `migrate` running and the new binary
+taking over, the OLD binary fails on every session-touching endpoint — its
+`ChatSession` derives `FromRow` including `lead_score` and decodes
+`SELECT *`/`RETURNING *` rows, so after step 4 drops the column every decode
+hits `ColumnNotFound` (start_chat, stream ownership check, history, voice,
+list_sessions → 5xx). Only post_process extraction and the final-frame lead
+read were fail-open. Stop old instances before/at migrate, or accept a
+seconds-level 5xx window — a normal deploy restart already implies a brief one.
 
 ## §4 Testing
 

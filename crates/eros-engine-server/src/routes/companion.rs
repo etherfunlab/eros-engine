@@ -1715,4 +1715,100 @@ mod tests {
             .expect_err("archived instance must 404");
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
+
+    // ─── Test 5: ProfileResponse::from_row pins the column mapping ──
+    //
+    // Pure unit test (no DB): every Option<String> field gets a distinct
+    // value (its own field name), so any accidental transposition between
+    // `HumanInsightsRow` and `ProfileResponse` fails an assertion here.
+
+    #[test]
+    fn profile_response_from_row_maps_fields_by_name() {
+        use eros_engine_store::human_insight::HumanInsightsRow;
+
+        let user_id = Uuid::new_v4();
+        let updated_at = Utc::now();
+        let row = HumanInsightsRow {
+            user_id,
+            city: Some("city".into()),
+            location: Some("location".into()),
+            hometown: Some("hometown".into()),
+            nationality: Some("nationality".into()),
+            occupation: Some("occupation".into()),
+            mbti_guess: Some("mbti_guess".into()),
+            love_values: Some("love_values".into()),
+            emotional_needs: Some("emotional_needs".into()),
+            life_rhythm: Some("life_rhythm".into()),
+            interests: vec!["interests_0".into(), "interests_1".into()],
+            personality_traits: vec!["personality_traits_0".into()],
+            preferred_gender: Some("preferred_gender".into()),
+            age_min: Some(21),
+            age_max: Some(35),
+            deal_breakers: vec!["deal_breakers_0".into(), "deal_breakers_1".into()],
+            education: Some("education".into()),
+            family: Some("family".into()),
+            relationship_history: Some("relationship_history".into()),
+            social_pattern: Some("social_pattern".into()),
+            future_plans: Some("future_plans".into()),
+            finance_status: Some("finance_status".into()),
+            updated_at,
+        };
+
+        let resp = ProfileResponse::from_row(user_id, Some(row.clone()));
+        assert_eq!(resp.user_id, user_id);
+        assert_eq!(resp.city.as_deref(), Some("city"));
+        assert_eq!(resp.location.as_deref(), Some("location"));
+        assert_eq!(resp.hometown.as_deref(), Some("hometown"));
+        assert_eq!(resp.nationality.as_deref(), Some("nationality"));
+        assert_eq!(resp.occupation.as_deref(), Some("occupation"));
+        assert_eq!(resp.mbti_guess.as_deref(), Some("mbti_guess"));
+        assert_eq!(resp.love_values.as_deref(), Some("love_values"));
+        assert_eq!(resp.emotional_needs.as_deref(), Some("emotional_needs"));
+        assert_eq!(resp.life_rhythm.as_deref(), Some("life_rhythm"));
+        assert_eq!(resp.interests, vec!["interests_0", "interests_1"]);
+        assert_eq!(resp.personality_traits, vec!["personality_traits_0"]);
+        assert_eq!(resp.preferred_gender.as_deref(), Some("preferred_gender"));
+        assert_eq!(resp.age_min, Some(21));
+        assert_eq!(resp.age_max, Some(35));
+        assert_eq!(
+            resp.deal_breakers,
+            vec!["deal_breakers_0", "deal_breakers_1"]
+        );
+        assert_eq!(resp.education.as_deref(), Some("education"));
+        assert_eq!(resp.family.as_deref(), Some("family"));
+        assert_eq!(
+            resp.relationship_history.as_deref(),
+            Some("relationship_history")
+        );
+        assert_eq!(resp.social_pattern.as_deref(), Some("social_pattern"));
+        assert_eq!(resp.future_plans.as_deref(), Some("future_plans"));
+        assert_eq!(resp.finance_status.as_deref(), Some("finance_status"));
+        assert_eq!(resp.updated_at, Some(row.updated_at));
+
+        // None row: every field falls back to its empty/None default.
+        let empty = ProfileResponse::from_row(user_id, None);
+        assert_eq!(empty.user_id, user_id);
+        assert_eq!(empty.city, None);
+        assert_eq!(empty.location, None);
+        assert_eq!(empty.hometown, None);
+        assert_eq!(empty.nationality, None);
+        assert_eq!(empty.occupation, None);
+        assert_eq!(empty.mbti_guess, None);
+        assert_eq!(empty.love_values, None);
+        assert_eq!(empty.emotional_needs, None);
+        assert_eq!(empty.life_rhythm, None);
+        assert_eq!(empty.interests, Vec::<String>::new());
+        assert_eq!(empty.personality_traits, Vec::<String>::new());
+        assert_eq!(empty.preferred_gender, None);
+        assert_eq!(empty.age_min, None);
+        assert_eq!(empty.age_max, None);
+        assert_eq!(empty.deal_breakers, Vec::<String>::new());
+        assert_eq!(empty.education, None);
+        assert_eq!(empty.family, None);
+        assert_eq!(empty.relationship_history, None);
+        assert_eq!(empty.social_pattern, None);
+        assert_eq!(empty.future_plans, None);
+        assert_eq!(empty.finance_status, None);
+        assert_eq!(empty.updated_at, None);
+    }
 }
