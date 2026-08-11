@@ -15,13 +15,15 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use ulid::Ulid;
+
 use eros_engine_core::scope::{MemoryScope, RelationshipScope};
-use eros_engine_store::chat::{ChatRepo, VoiceUserInsert};
+use eros_engine_store::chat::{ChatRepo, LatestTurnLookup, VoiceUserInsert};
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
-use crate::pipeline::stream::ProtocolFrame;
+use crate::pipeline::stream::{ulid_string, ProtocolFrame};
 use crate::pipeline::voice::{run_voice_turn, VoiceTurn};
 use crate::state::AppState;
 
@@ -50,6 +52,25 @@ pub struct VoiceTurnRequest {
     pub memory_scope: Option<MemoryScope>,
 }
 
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct VoiceInterruptRequest {
+    /// The `client_msg_id` of the turn being interrupted. MUST be the
+    /// session's latest user turn — you can only barge in on what is
+    /// currently being spoken.
+    pub client_msg_id: String,
+    /// What TTS actually played, verbatim. MAY be empty (the user cut in
+    /// before the first audible word), in which case no assistant content is
+    /// written and only the interrupt marker records the turn.
+    pub spoken_text: String,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct VoiceInterruptResponse {
+    /// The assistant row that now holds the spoken text, or `null` when
+    /// nothing was played and no reply row exists.
+    pub message_id: Option<String>,
+}
+
 fn pre(status: StatusCode, code: &'static str, message: &str, user_message: &str) -> AppError {
     AppError::StreamPre(StreamPreError {
         status,
@@ -75,6 +96,31 @@ fn validate(req: &VoiceTurnRequest) -> Result<(), AppError> {
             "unprocessable",
             "content too long",
             "消息过长，请缩短后重试",
+        ));
+    }
+    let n = req.client_msg_id.len();
+    let bad_chars = req
+        .client_msg_id
+        .chars()
+        .any(|c| c.is_whitespace() || !c.is_ascii() || !c.is_ascii_graphic());
+    if !(MIN_CLIENT_MSG_ID_LEN..=MAX_CLIENT_MSG_ID_LEN).contains(&n) || bad_chars {
+        return Err(pre(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "client_msg_id invalid",
+            "请求无效",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_interrupt(req: &VoiceInterruptRequest) -> Result<(), AppError> {
+    if req.spoken_text.chars().count() > MAX_CONTENT_CHARS {
+        return Err(pre(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            "spoken_text too long",
+            "请求无效",
         ));
     }
     let n = req.client_msg_id.len();
@@ -249,8 +295,109 @@ pub async fn voice_turn_stream(
     ))
 }
 
+/// Report a deliberate barge-in on the turn currently being spoken.
+///
+/// Stopping generation is NOT this endpoint's job — aborting the SSE already
+/// does that (the stream generator is dropped, which closes the upstream
+/// connection). This endpoint records what the user actually HEARD, which the
+/// aborted generator can no longer do: its persist step sits after the
+/// streaming loop and never runs.
+///
+/// Deliberately has no `501 voice_disabled` gate — it makes no LLM call, and
+/// gating it on `[tasks.chat_voice]` would make an in-flight call's interrupt
+/// fail if the deployment's config changed mid-call.
+#[utoipa::path(
+    post,
+    path = "/comp/voice/{session_id}/turn/interrupt",
+    tag = "voice",
+    params(("session_id" = Uuid, Path, description = "Voice-channel session id")),
+    request_body = VoiceInterruptRequest,
+    responses(
+        (status = 200, body = VoiceInterruptResponse),
+        (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 403, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 404, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 409, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 422, body = crate::routes::companion_stream::StreamPreErrorBody),
+    ),
+    security(("bearer" = []))
+)]
+pub async fn voice_turn_interrupt(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+    Json(req): Json<VoiceInterruptRequest>,
+) -> Result<Json<VoiceInterruptResponse>, AppError> {
+    validate_interrupt(&req)?;
+
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
+        pre(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+            "会话不存在",
+        )
+    })?;
+    if session.user_id != user_id {
+        return Err(pre(
+            StatusCode::FORBIDDEN,
+            "session_forbidden",
+            "session not owned by JWT user",
+            "无权访问该会话",
+        ));
+    }
+    if session.channel != "voice" {
+        return Err(pre(
+            StatusCode::CONFLICT,
+            "wrong_channel",
+            "session is not a voice-channel session",
+            "该会话不是语音会话",
+        ));
+    }
+
+    let user_message_id = match chat_repo
+        .resolve_latest_voice_user_turn(session_id, &req.client_msg_id)
+        .await?
+    {
+        LatestTurnLookup::Latest(id) => id,
+        LatestTurnLookup::NotFound => {
+            return Err(pre(
+                StatusCode::NOT_FOUND,
+                "turn_not_found",
+                "no such client_msg_id in this session",
+                "该消息不存在",
+            ));
+        }
+        // Guarding this is what stops a client rewriting the content of ANY
+        // past assistant reply through the upsert below.
+        LatestTurnLookup::Stale => {
+            return Err(pre(
+                StatusCode::CONFLICT,
+                "not_latest_turn",
+                "only the session's latest turn can be interrupted",
+                "该回合已结束",
+            ));
+        }
+    };
+
+    let message_id = chat_repo
+        .upsert_voice_interrupt(
+            session_id,
+            user_message_id,
+            Ulid::new().into(),
+            &req.spoken_text,
+        )
+        .await?
+        .map(|id| ulid_string(Ulid::from(id)));
+
+    Ok(Json(VoiceInterruptResponse { message_id }))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(voice_turn_stream))
+    OpenApiRouter::new()
+        .routes(routes!(voice_turn_stream))
+        .routes(routes!(voice_turn_interrupt))
 }
 
 #[cfg(test)]
@@ -486,6 +633,225 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0, "wrong-channel rejection must not persist a turn");
+    }
+
+    async fn post_interrupt(
+        app: &mut Router,
+        session_id: Uuid,
+        jwt: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/voice/{session_id}/turn/interrupt"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.call(req).await.unwrap()
+    }
+
+    /// Persist a voice user turn directly, returning its id.
+    async fn seed_user_turn(pool: &PgPool, session_id: Uuid, cid: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, channel, client_msg_id) \
+             VALUES ($1,'user','hello','voice',$2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(cid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_persists_spoken_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000001").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000001",
+                "spoken_text": "你今天过得"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+              WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "你今天过得");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_with_empty_text_writes_marker_only(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let uid = seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000002").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000002",
+                "spoken_text": ""
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role='assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        let marked: bool = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->>'voice_interrupt','false')::bool \
+               FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_is_idempotent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000003").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+        let jwt = mint_jwt(user_id);
+        let body = json!({"client_msg_id":"01J9INTERRUPT0000000000003","spoken_text":"半句"});
+
+        assert_eq!(
+            post_interrupt(&mut app, session_id, &jwt, body.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_interrupt(&mut app, session_id, &jwt, body)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role='assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "repeat interrupts must not multiply rows");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_409_when_not_latest_turn(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000004").await;
+        seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000005").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(
+            pool.clone(),
+        )));
+
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000004",
+                "spoken_text": "rewrite attempt"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role='assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "a stale interrupt must not touch history");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_404_when_client_msg_id_unknown(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000009", "spoken_text": "x"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_403_when_not_owner(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let session_id = seed(&pool, owner).await;
+        seed_user_turn(&pool, session_id, "01J9INTERRUPT0000000000006").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(Uuid::new_v4()),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000006", "spoken_text": "x"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn interrupt_409_when_session_not_voice_channel(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed_channel(&pool, user_id, "text").await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_interrupt(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "client_msg_id": "01J9INTERRUPT0000000000007", "spoken_text": "x"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
