@@ -48,7 +48,7 @@ pub(crate) fn parse_usage_hidden_keys(raw: Option<&str>) -> HashSet<String> {
         .collect()
 }
 
-/// Knobs for the companion_insights_snapshot sweeper. Defaults: daily
+/// Knobs for the human_insights_snapshot sweeper. Defaults: daily
 /// 23:00 SGT, enabled. The cron string is stored raw and validated by
 /// the sweeper at task start (so an invalid expression fails the sweeper
 /// task only, not the whole server boot).
@@ -220,7 +220,7 @@ pub struct ServerConfig {
     /// stays intact. Populated from `OPENROUTER_USAGE_HIDDEN_KEYS`
     /// (comma-separated).
     pub openrouter_usage_hidden_keys: HashSet<String>,
-    /// Cron-scheduled companion_insights_snapshot sweeper config. See
+    /// Cron-scheduled human_insights_snapshot sweeper config. See
     /// `pipeline::snapshot` for the sweep loop.
     pub snapshot: SnapshotConfig,
     /// Destination directory for raw assembled main-reply prompts. `None`
