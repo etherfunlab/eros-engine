@@ -1243,9 +1243,19 @@ impl<'a> ChatRepo<'a> {
         )
     }
 
-    /// Resolve a `client_msg_id` to its user row and report whether it is the
-    /// session's most recent user turn. Separating `NotFound` from `Stale` lets
-    /// the route return 404 vs. 409 without a second round trip.
+    /// Resolve a `client_msg_id` to its **voice** user row and report whether it
+    /// is the session's most recent voice user turn. Separating `NotFound` from
+    /// `Stale` lets the route return 404 vs. 409 without a second round trip.
+    ///
+    /// Both the target row and the "latest" subquery filter `channel = 'voice'`,
+    /// and that is load-bearing on both sides. A voice session can contain
+    /// non-voice user rows — `routes/companion_stream.rs` has no session-channel
+    /// gate, so a text turn can land in one — and without the filter on `m` such
+    /// a row is interruptible, letting a caller mark it and hang a
+    /// `channel='voice'` assistant reply off a text turn. Without the filter on
+    /// `l`, a newer text row would make a genuine voice turn look `Stale` and
+    /// block a legitimate barge-in. The comparison belongs entirely within the
+    /// voice channel.
     pub async fn resolve_latest_voice_user_turn(
         &self,
         session_id: Uuid,
@@ -1256,10 +1266,12 @@ impl<'a> ChatRepo<'a> {
                     m.id = ( \
                         SELECT l.id FROM engine.chat_messages l \
                          WHERE l.session_id = $1 AND l.role = 'user' \
+                           AND l.channel = 'voice' \
                          ORDER BY l.sent_at DESC, l.id DESC LIMIT 1 \
                     ) \
                FROM engine.chat_messages m \
-              WHERE m.session_id = $1 AND m.client_msg_id = $2 AND m.role = 'user'",
+              WHERE m.session_id = $1 AND m.client_msg_id = $2 AND m.role = 'user' \
+                AND m.channel = 'voice'",
         )
         .bind(session_id)
         .bind(client_msg_id)
@@ -3711,6 +3723,54 @@ mod tests {
                 .await
                 .unwrap(),
             LatestTurnLookup::Latest(second)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_turn_lookup_ignores_non_voice_rows_on_both_sides(pool: PgPool) {
+        // A voice session can hold non-voice user rows: `routes/companion_stream.rs`
+        // has no session-channel gate, so a text turn can land in one. Both sides
+        // of the lookup must stay inside the voice channel.
+        let repo = ChatRepo { pool: &pool };
+        let (session_id, _voice) = seed_voice_turn(&pool, "spoken").await;
+        sqlx::query(
+            "UPDATE engine.chat_messages SET client_msg_id = 'CID-VOICE' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A NEWER text-channel user row lands in the same session.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1,'user','typed','CID-TEXT')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The text row must not be interruptible — otherwise a caller could mark
+        // it and hang a channel='voice' assistant reply off a text turn.
+        assert_eq!(
+            repo.resolve_latest_voice_user_turn(session_id, "CID-TEXT")
+                .await
+                .unwrap(),
+            LatestTurnLookup::NotFound,
+            "a text-channel row must never resolve as an interruptible voice turn"
+        );
+
+        // And it must not shadow the genuine voice turn into Stale, which would
+        // block a legitimate barge-in.
+        assert!(
+            matches!(
+                repo.resolve_latest_voice_user_turn(session_id, "CID-VOICE")
+                    .await
+                    .unwrap(),
+                LatestTurnLookup::Latest(_)
+            ),
+            "a newer text row must not make the latest voice turn look stale"
         );
     }
 
