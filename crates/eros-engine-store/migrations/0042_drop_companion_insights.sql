@@ -40,12 +40,18 @@ SELECT
         '{}'
     ),
     ci.insights->'matching_preferences'->>'preferred_gender',
+    -- Digits-only guard on top of the typeof check: a fractional (22.5) or
+    -- out-of-int-range JSON number passes `jsonb_typeof = 'number'` but makes
+    -- `::int` raise, aborting the whole migration. Degrade such values to
+    -- NULL instead, matching parse_age_range's tolerance in Rust.
     CASE
         WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->0) = 'number'
+         AND (ci.insights->'matching_preferences'->'age_range'->>0) ~ '^\d{1,9}$'
         THEN (ci.insights->'matching_preferences'->'age_range'->>0)::int
     END,
     CASE
         WHEN jsonb_typeof(ci.insights->'matching_preferences'->'age_range'->1) = 'number'
+         AND (ci.insights->'matching_preferences'->'age_range'->>1) ~ '^\d{1,9}$'
         THEN (ci.insights->'matching_preferences'->'age_range'->>1)::int
     END,
     COALESCE(
