@@ -109,6 +109,61 @@ pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
     }
 }
 
+fn put_str(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, v: &Option<String>) {
+    if let Some(s) = v {
+        obj.insert(key.into(), serde_json::Value::String(s.clone()));
+    }
+}
+
+/// Reverse projection: rebuild the extraction-schema JSON shape from the
+/// typed row, for the stage-2 prompt's "existing insights" context. Emits
+/// only populated fields (NULL scalars and empty arrays are omitted), and
+/// re-nests the matching trio into `matching_preferences`; `age_range` is
+/// emitted only when both bounds are set. Inverse of `project_columns` for
+/// every value that survives a store round-trip.
+pub fn existing_as_extraction_json(row: &HumanInsightsRow) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    put_str(&mut obj, "city", &row.city);
+    put_str(&mut obj, "location", &row.location);
+    put_str(&mut obj, "hometown", &row.hometown);
+    put_str(&mut obj, "nationality", &row.nationality);
+    put_str(&mut obj, "occupation", &row.occupation);
+    put_str(&mut obj, "mbti_guess", &row.mbti_guess);
+    put_str(&mut obj, "love_values", &row.love_values);
+    put_str(&mut obj, "emotional_needs", &row.emotional_needs);
+    put_str(&mut obj, "life_rhythm", &row.life_rhythm);
+    if !row.interests.is_empty() {
+        obj.insert("interests".into(), serde_json::json!(row.interests));
+    }
+    if !row.personality_traits.is_empty() {
+        obj.insert(
+            "personality_traits".into(),
+            serde_json::json!(row.personality_traits),
+        );
+    }
+    let mut prefs = serde_json::Map::new();
+    put_str(&mut prefs, "preferred_gender", &row.preferred_gender);
+    if let (Some(lo), Some(hi)) = (row.age_min, row.age_max) {
+        prefs.insert("age_range".into(), serde_json::json!([lo, hi]));
+    }
+    if !row.deal_breakers.is_empty() {
+        prefs.insert("deal_breakers".into(), serde_json::json!(row.deal_breakers));
+    }
+    if !prefs.is_empty() {
+        obj.insert(
+            "matching_preferences".into(),
+            serde_json::Value::Object(prefs),
+        );
+    }
+    put_str(&mut obj, "education", &row.education);
+    put_str(&mut obj, "family", &row.family);
+    put_str(&mut obj, "relationship_history", &row.relationship_history);
+    put_str(&mut obj, "social_pattern", &row.social_pattern);
+    put_str(&mut obj, "future_plans", &row.future_plans);
+    put_str(&mut obj, "finance_status", &row.finance_status);
+    serde_json::Value::Object(obj)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct HumanInsightsRow {
     pub user_id: Uuid,
@@ -181,6 +236,80 @@ impl<'a> HumanInsightRepo<'a> {
                  social_pattern       = EXCLUDED.social_pattern, \
                  future_plans         = EXCLUDED.future_plans, \
                  finance_status       = EXCLUDED.finance_status, \
+                 updated_at           = now()",
+        )
+        .bind(user_id)
+        .bind(c.city)
+        .bind(c.occupation)
+        .bind(c.mbti_guess)
+        .bind(c.love_values)
+        .bind(c.emotional_needs)
+        .bind(c.life_rhythm)
+        .bind(c.interests)
+        .bind(c.personality_traits)
+        .bind(c.preferred_gender)
+        .bind(c.age_min)
+        .bind(c.age_max)
+        .bind(c.deal_breakers)
+        .bind(c.location)
+        .bind(c.hometown)
+        .bind(c.nationality)
+        .bind(c.education)
+        .bind(c.family)
+        .bind(c.relationship_history)
+        .bind(c.social_pattern)
+        .bind(c.future_plans)
+        .bind(c.finance_status)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Apply one extraction result incrementally: extracted scalars overwrite,
+    /// absent/null scalars keep the stored value; arrays overwrite only when
+    /// the extraction produced a non-empty array. Single statement — no
+    /// read-modify-write, so concurrent extractions degrade to column-level
+    /// (not whole-row) last-write-wins. There is deliberately no erase path.
+    pub async fn apply_extraction(
+        &self,
+        user_id: Uuid,
+        insights: &serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        let c = project_columns(insights);
+        sqlx::query(
+            "INSERT INTO engine.human_insights \
+                (user_id, city, occupation, mbti_guess, love_values, emotional_needs, \
+                 life_rhythm, interests, personality_traits, preferred_gender, \
+                 age_min, age_max, deal_breakers, location, hometown, nationality, \
+                 education, family, relationship_history, social_pattern, \
+                 future_plans, finance_status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                     $17, $18, $19, $20, $21, $22) \
+             ON CONFLICT (user_id) DO UPDATE SET \
+                 city                 = COALESCE(EXCLUDED.city, human_insights.city), \
+                 occupation           = COALESCE(EXCLUDED.occupation, human_insights.occupation), \
+                 mbti_guess           = COALESCE(EXCLUDED.mbti_guess, human_insights.mbti_guess), \
+                 love_values          = COALESCE(EXCLUDED.love_values, human_insights.love_values), \
+                 emotional_needs      = COALESCE(EXCLUDED.emotional_needs, human_insights.emotional_needs), \
+                 life_rhythm          = COALESCE(EXCLUDED.life_rhythm, human_insights.life_rhythm), \
+                 interests            = CASE WHEN EXCLUDED.interests = '{}' \
+                                             THEN human_insights.interests ELSE EXCLUDED.interests END, \
+                 personality_traits   = CASE WHEN EXCLUDED.personality_traits = '{}' \
+                                             THEN human_insights.personality_traits ELSE EXCLUDED.personality_traits END, \
+                 preferred_gender     = COALESCE(EXCLUDED.preferred_gender, human_insights.preferred_gender), \
+                 age_min              = COALESCE(EXCLUDED.age_min, human_insights.age_min), \
+                 age_max              = COALESCE(EXCLUDED.age_max, human_insights.age_max), \
+                 deal_breakers        = CASE WHEN EXCLUDED.deal_breakers = '{}' \
+                                             THEN human_insights.deal_breakers ELSE EXCLUDED.deal_breakers END, \
+                 location             = COALESCE(EXCLUDED.location, human_insights.location), \
+                 hometown             = COALESCE(EXCLUDED.hometown, human_insights.hometown), \
+                 nationality          = COALESCE(EXCLUDED.nationality, human_insights.nationality), \
+                 education            = COALESCE(EXCLUDED.education, human_insights.education), \
+                 family               = COALESCE(EXCLUDED.family, human_insights.family), \
+                 relationship_history = COALESCE(EXCLUDED.relationship_history, human_insights.relationship_history), \
+                 social_pattern       = COALESCE(EXCLUDED.social_pattern, human_insights.social_pattern), \
+                 future_plans         = COALESCE(EXCLUDED.future_plans, human_insights.future_plans), \
+                 finance_status       = COALESCE(EXCLUDED.finance_status, human_insights.finance_status), \
                  updated_at           = now()",
         )
         .bind(user_id)
@@ -540,5 +669,203 @@ mod tests {
         assert!(row.interests.is_empty());
         assert!(row.personality_traits.is_empty());
         assert!(row.deal_breakers.is_empty());
+    }
+
+    #[test]
+    fn existing_as_extraction_json_emits_only_populated() {
+        let row = HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: Some("深圳".into()),
+            location: None,
+            hometown: None,
+            nationality: None,
+            occupation: Some("后端工程师".into()),
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec!["手冲咖啡".into()],
+            personality_traits: vec![],
+            preferred_gender: Some("female".into()),
+            age_min: Some(22),
+            age_max: Some(30),
+            deal_breakers: vec![],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let v = existing_as_extraction_json(&row);
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["city"], "深圳");
+        assert_eq!(obj["occupation"], "后端工程师");
+        assert_eq!(obj["interests"], serde_json::json!(["手冲咖啡"]));
+        // Empty arrays and NULL scalars are omitted entirely.
+        assert!(!obj.contains_key("personality_traits"));
+        assert!(!obj.contains_key("mbti_guess"));
+        assert!(!obj.contains_key("location"));
+        // user_id / updated_at are row bookkeeping, not insight fields.
+        assert!(!obj.contains_key("user_id"));
+        assert!(!obj.contains_key("updated_at"));
+        // Matching trio re-nests into matching_preferences.
+        let prefs = obj["matching_preferences"].as_object().unwrap();
+        assert_eq!(prefs["preferred_gender"], "female");
+        assert_eq!(prefs["age_range"], serde_json::json!([22, 30]));
+        assert!(!prefs.contains_key("deal_breakers"));
+    }
+
+    #[test]
+    fn existing_as_extraction_json_empty_row_is_empty_object() {
+        let row = HumanInsightsRow {
+            user_id: Uuid::new_v4(),
+            city: None,
+            location: None,
+            hometown: None,
+            nationality: None,
+            occupation: None,
+            mbti_guess: None,
+            love_values: None,
+            emotional_needs: None,
+            life_rhythm: None,
+            interests: vec![],
+            personality_traits: vec![],
+            preferred_gender: None,
+            age_min: None,
+            age_max: None,
+            deal_breakers: vec![],
+            education: None,
+            family: None,
+            relationship_history: None,
+            social_pattern: None,
+            future_plans: None,
+            finance_status: None,
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(existing_as_extraction_json(&row), serde_json::json!({}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_creates_then_merges_incrementally(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": "深圳", "interests": ["手冲咖啡"] }),
+        )
+        .await
+        .unwrap();
+        let first = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(first.city.as_deref(), Some("深圳"));
+        assert_eq!(first.interests, vec!["手冲咖啡"]);
+
+        // Second extraction touches OTHER fields: previous values survive.
+        repo.apply_extraction(user_id, &serde_json::json!({ "occupation": "后端工程师" }))
+            .await
+            .unwrap();
+        let second = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(
+            second.city.as_deref(),
+            Some("深圳"),
+            "absent scalar keeps old value"
+        );
+        assert_eq!(
+            second.interests,
+            vec!["手冲咖啡"],
+            "absent array keeps old value"
+        );
+        assert_eq!(second.occupation.as_deref(), Some("后端工程师"));
+        assert!(second.updated_at >= first.updated_at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_present_overwrites_absent_keeps(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({
+                "city": "深圳",
+                "interests": ["a"],
+                "matching_preferences": { "preferred_gender": "any", "age_range": [20, 28] }
+            }),
+        )
+        .await
+        .unwrap();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({
+                "city": "上海",
+                "interests": ["b", "c"],
+                "city_null_probe": null
+            }),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.city.as_deref(),
+            Some("上海"),
+            "present scalar overwrites"
+        );
+        assert_eq!(row.interests, vec!["b", "c"], "non-empty array overwrites");
+        assert_eq!(
+            row.preferred_gender.as_deref(),
+            Some("any"),
+            "untouched nested field kept"
+        );
+        assert_eq!(row.age_min, Some(20));
+        assert_eq!(row.age_max, Some(28));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_null_and_empty_array_cannot_erase(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": "深圳", "interests": ["a"] }),
+        )
+        .await
+        .unwrap();
+        // Explicit null / empty array behave like absent: no erase path.
+        repo.apply_extraction(
+            user_id,
+            &serde_json::json!({ "city": null, "interests": [] }),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        assert_eq!(row.city.as_deref(), Some("深圳"), "null does not erase");
+        assert_eq!(row.interests, vec!["a"], "empty array does not erase");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_roundtrips_through_reverse_projection(pool: PgPool) {
+        let repo = HumanInsightRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let input = serde_json::json!({
+            "city": "深圳",
+            "hometown": "长沙",
+            "interests": ["爬山", "手冲咖啡"],
+            "education": "985 本科计算机",
+            "matching_preferences": {
+                "preferred_gender": "female",
+                "age_range": [22, 30],
+                "deal_breakers": ["抽烟"]
+            }
+        });
+        repo.apply_extraction(user_id, &input).await.unwrap();
+        let row = repo.load(user_id).await.unwrap().unwrap();
+        // The reverse projection reproduces exactly what was stored.
+        assert_eq!(existing_as_extraction_json(&row), input);
     }
 }
