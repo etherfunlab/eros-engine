@@ -118,6 +118,22 @@ post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的�
 dreaming 是例外：它默认也会读 `'voice'` 的行（通话空闲后才读；可用
 `DREAMING_VOICE_DISABLED` 关掉），但仍然排除 `'product_qa'`。
 
+**频道归属在写入侧双向强制。** `companion_stream` 拒绝语音 session，`voice`
+拒绝非语音 session，两者都在落库任何一行之前返回 `409 wrong_channel`。少了
+这层对称性，文本轮次会落进语音会话，它的 `client_msg_id` 还会和语音轮次的
+查找撞车。
+
+**一个语音轮次最多挂一条 assistant 回复**，由
+`(user_message_id) WHERE role='assistant' AND channel='voice'` 上的 partial
+unique index 保证（migration 0041）。文本路径没有这条约束——它本来就会通过
+`continues_from_message_id` 为同一个用户轮次写多条 assistant 行。这条索引存在
+是因为一个语音轮次有两个可能的写入方：流式生成器，以及上报客户端实际播出内容
+的 barge-in interrupt 端点。两者靠 user 行上共享的 `FOR UPDATE` 锁排序：
+`content` 归 interrupt，审计列（`model` / `usage` / `generation_id`）归生成器。
+user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断的——这也正是
+区分「重试」与「可修复的掉线」的依据。详见
+[voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-design.md)。
+
 ## 為甚麼 core 必須純領域
 
 兩個原因：

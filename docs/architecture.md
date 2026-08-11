@@ -123,6 +123,25 @@ replay, and client history. Dreaming is the exception: it also reads
 `'voice'` rows by default (once a call goes idle; opt out with
 `DREAMING_VOICE_DISABLED`), but still excludes `'product_qa'`.
 
+**Channel ownership is enforced on writes, both ways.** `companion_stream`
+refuses a voice session and `voice` refuses a non-voice one, each with
+`409 wrong_channel` before persisting anything. Without that symmetry a text
+turn could land in a voice conversation, and its `client_msg_id` could then
+collide with the voice-turn lookups.
+
+**A voice turn holds at most one assistant reply**, enforced by a partial
+unique index on `(user_message_id) WHERE role='assistant' AND channel='voice'`
+(migration 0041). The text path has no such constraint — it legitimately
+writes several assistant rows per user turn via `continues_from_message_id`.
+The index exists because a voice turn has two possible writers: the streaming
+generator, and the barge-in interrupt endpoint reporting what the client
+actually played. They are ordered by a shared `FOR UPDATE` lock on the user
+row, and `content` belongs to the interrupt while the audit columns
+(`model` / `usage` / `generation_id`) belong to the generator. A user row
+carrying `metadata.voice_interrupt` marks a turn the user deliberately cut
+off — which is also what tells a retry apart from a repairable disconnect.
+See [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-design.md).
+
 ## Why pure-domain core
 
 Two reasons:

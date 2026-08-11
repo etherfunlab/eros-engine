@@ -127,6 +127,14 @@ body with `code`, `message`, `user_message` and — for
 [spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)
 for the full code table.
 
+**This endpoint is text-channel only.** A `session_id` belonging to a
+voice-channel session is rejected with `409 wrong_channel` before any row is
+persisted — it writes text-channel messages, and letting them land in a voice
+conversation would interleave both channels in one transcript. Voice turns go
+to [`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)
+instead. The gate mirrors the voice endpoint's, so the two channels are
+symmetric: neither endpoint will write into the other's sessions.
+
 Once the first SSE byte has been written, terminal failures arrive as an
 in-band `error` frame and the stream closes; the HTTP response has already
 committed `200 OK`.

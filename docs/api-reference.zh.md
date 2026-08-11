@@ -117,6 +117,12 @@ data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_
 时还会带 `original_user_message_id`。完整错误码表见
 [设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md#13-pre-stream-errors-http-status-json-body)。
 
+**该端点仅限文本频道。** 传入语音频道 session 的 `session_id` 会在落库任何
+一行之前被拒绝，返回 `409 wrong_channel` —— 它写的是文本频道消息，让这些行
+落进语音会话会使两个频道在同一份 transcript 里交错。语音轮次请改用
+[`POST /comp/voice/{session_id}/turn/stream`](#post-compvoicesession_idturnstream)。
+这道闸与语音端点自己的闸对称：两个端点都不会写进对方的 session。
+
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
 此时 HTTP 响应已提交 `200 OK`。
 

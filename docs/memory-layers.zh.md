@@ -154,6 +154,10 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
   `DREAMING_VOICE_DISABLED=1` 整个关掉，恢复到早先只扫文字的过滤条件；注意
   在开关打开期间已被扫过的通话，关掉开关后不会重扫（`classified_at` 只盖一次）。
   关系层的行仍然从不由语音写入。
+- **被打断的那轮留下什么** —— 被打断的轮次贡献的是客户端上报的「实际播出」
+  文本，而不是完整生成内容，所以清扫器蒸馏的是用户**听到**的东西。在首个可听
+  词之前就被切断的轮次只贡献用户那一行，因为根本没有写入 assistant 行。两种
+  情况下通话记录都与这通电话本身一致——这正是记录 interrupt 的意义所在。
 
 设计文档：
 [2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)

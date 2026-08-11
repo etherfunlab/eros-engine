@@ -15,13 +15,14 @@
 
 Most AI character apps eventually forget who you are. Their relationships reset to whatever fits in a prompt, and their personalities drift as the conversation grows. `eros-engine` makes those parts durable: a companion remembers you across sessions, the relationship changes through interaction, and each reply is chosen in character rather than improvised by a generic assistant.
 
-The engine has five foundations:
+The engine has six foundations:
 
 - 🧠 **Two-layer memory** — stable facts about the user live alongside shared moments, callbacks, and unfinished threads. → [Memory layers](docs/memory-layers.md)
 - 💞 **Evolving affinity** — six relationship dimensions change smoothly and decay with time, shaping tone, depth, and even whether the companion replies. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine (PDE)** — before generation, the engine chooses an action and inner state. Rules work out of the box; an LLM judge is optional. → [Model config](docs/model-config.md)
 - 🧩 **Structured user insight** — the engine builds a queryable profile that downstream products can use for onboarding, personalization, and analysis. → [API reference](docs/api-reference.md)
 - ⚡ **A complete chat path** — SSE streaming, image understanding and generation requests, prompt traits, per-task model selection, fallbacks, and call auditing. OpenRouter is the default; additional OpenAI-compatible chat and embedding providers can be configured through `[providers]`. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- 🎙️ **A voice turn path built for interruption** — a lean, low-latency turn endpoint on its own channel, with barge-in: the client stops playback and reports what was actually spoken, so history records what the user *heard* rather than what the model produced. A turn lost to a dropped connection can be regenerated instead of stranded. → [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
 
 This is not a generic agent framework. It is the stateful core for products where one persona gets to know the same person over time: companions, journals, coaches, tutors, and character chat.
 
@@ -110,7 +111,7 @@ The server listens on `0.0.0.0:8080` by default, with Scalar API docs at `/docs`
 
 ## API surface
 
-The main flow is simple: start a persona session, then send turns to the SSE streaming endpoint. The engine also exposes history, session, profile, and optional affinity-debug routes. Authentication uses Supabase JWTs by default and can be replaced through `AuthValidator`. See the [API reference](docs/api-reference.md) for paths, payloads, and stream frames.
+The main flow is simple: start a persona session, then send turns to the SSE streaming endpoint. Voice runs on its own channel — start the session with `channel: "voice"` and use the voice turn endpoint, which carries a leaner prompt and a barge-in call; the two channels never write into each other's sessions. The engine also exposes history, session, profile, and optional affinity-debug routes. Authentication uses Supabase JWTs by default and can be replaced through `AuthValidator`. See the [API reference](docs/api-reference.md) for paths, payloads, and stream frames.
 
 ## Configuration
 
@@ -121,7 +122,7 @@ The complete environment list is in [`.env.example`](.env.example), operational 
 ## Roadmap
 
 - [ ] **Agents playground** — multiple personas sharing a session with each other and the user.
-- [ ] **Voice messages** and **native audio I/O** — the low-latency voice-turn API already ships; STT/TTS currently stay on the caller's side.
+- [ ] **Native audio I/O** — the low-latency voice-turn API and barge-in already ship; STT/TTS currently stay on the caller's side.
 - [ ] **Video generation** for companion-sent clips.
 
 ## Non-goals

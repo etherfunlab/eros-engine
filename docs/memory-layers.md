@@ -167,6 +167,12 @@ the request shape and [model-config.md](model-config.md) for the
   text-only sweeper filter; note that a call swept while the flag was on is
   never re-swept after turning it off (`classified_at` is stamped once).
   Relationship-layer rows are still never written from voice.
+- **What a barge-in leaves behind** — an interrupted turn contributes the text
+  the client reported as actually spoken, not the full generation, so the
+  sweeper distills what the user *heard*. A turn cut off before the first
+  audible word contributes only the user's line, because no assistant row is
+  written at all. Either way the transcript matches the call, which is the
+  whole point of recording the interrupt.
 
 Design specs:
 [2026-08-09-voice-memory-bootstrap-recall-design.md](superpowers/specs/2026-08-09-voice-memory-bootstrap-recall-design.md)
