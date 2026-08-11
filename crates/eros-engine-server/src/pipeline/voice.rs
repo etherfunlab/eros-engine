@@ -818,7 +818,16 @@ pub fn run_voice_turn(
                 )
                 .await
             {
-                tracing::warn!(error = %e, "voice: assistant persist failed");
+                // `error!`, not `warn!`: this is not a benign retry-later
+                // condition. Migration 0041's `ON CONFLICT ... WHERE ...`
+                // clause requires the partial unique index it creates; on a
+                // database where that migration has not run, EVERY voice
+                // reply's persist raises Postgres 42P10 here and is silently
+                // dropped while the SSE stream still looks healthy to the
+                // client (the text already streamed as `delta` frames before
+                // this point). A `warn!` would bury that under normal log
+                // noise instead of paging someone.
+                tracing::error!(error = %e, "voice: assistant persist failed — reply not saved");
             }
         }
 
@@ -3681,7 +3690,11 @@ data: [DONE]\n\n";
             .await
             .unwrap()
             .expect("session exists");
-        let repair = repo.voice_turn_repair_state(umid).await.unwrap();
+        let repair = repo
+            .voice_turn_repair_state(umid)
+            .await
+            .unwrap()
+            .expect("insert_voice_user_message produces an actual voice user turn");
         assert_eq!(
             repair.content, persisted_text,
             "sanity: repair state reads the persisted row, not a retry"
@@ -3791,7 +3804,11 @@ data: [DONE]\n\n";
             eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
             other => panic!("expected Inserted, got {other:?}"),
         };
-        let repair = repo.voice_turn_repair_state(umid).await.unwrap();
+        let repair = repo
+            .voice_turn_repair_state(umid)
+            .await
+            .unwrap()
+            .expect("insert_voice_user_message produces an actual voice user turn");
         assert!(
             !repair.has_reply && !repair.interrupted,
             "must be the repairable shape"

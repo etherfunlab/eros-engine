@@ -693,6 +693,9 @@
               }
             }
           },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
           "403": {
             "description": "",
             "content": {

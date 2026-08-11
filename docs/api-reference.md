@@ -560,12 +560,22 @@ and its `content` always ends up as the interrupt's report:
 Repeated interrupt calls for the same turn are idempotent — the marker and
 the upsert both key off the user row's id, so a retry cannot multiply rows.
 
+**A race outside this table: two `turn/stream` generators for the same
+turn**, e.g. an orphaned generator from a dead connection still alive
+(TCP retransmission) when the client's retry starts its own. No interrupt is
+involved, so none of the four rows above apply — there is no marker to make
+one writer authoritative. That case is last-writer-wins on `content`,
+`truncated`, and the audit columns together (never a mix of one generation's
+text with a different generation's `generation_id`); see
+`insert_voice_assistant_message` in `crates/eros-engine-store/src/chat.rs`.
+
 Status ladder:
 
 | Status | Code | When |
 |---|---|---|
 | 200 | — | interrupt recorded (see body above) |
 | 400 | `invalid_payload` | `client_msg_id` outside 26..36 ASCII-printable chars |
+| 401 | `unauthorized` | missing / malformed / expired / wrong-secret JWT |
 | 403 | `session_forbidden` | session not owned by the JWT user |
 | 404 | `session_not_found` | unknown `session_id` |
 | 404 | `turn_not_found` | `client_msg_id` names no user row in this session |

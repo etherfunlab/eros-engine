@@ -486,12 +486,22 @@ Response `200`：
 同一轮次重复调用打断接口是幂等的——标记和 upsert 都以 user 行的 id 为键，重试
 不会让行数翻倍。
 
+**这张表之外还有一种竞态：同一轮次的两个 `turn/stream` 生成器。** 比如一个
+因断连而孤儿化、但还存活的生成器（TCP 重传会让它再活几十秒），撞上了客户端
+重试发起的另一个生成器——这里没有打断参与，上面四行都不适用，因为没有标记
+能让某一方权威。这种情况是 `content`、`truncated` 和审计列**一起**由后落地
+的那一次调用说了算（last-writer-wins），绝不会出现某一次生成的正文配上另一
+次生成的 `generation_id`；实现见
+`crates/eros-engine-store/src/chat.rs` 里 `insert_voice_assistant_message`
+的 `ON CONFLICT` 子句。
+
 状态码梯度：
 
 | 状态码 | code | 何时 |
 |---|---|---|
 | 200 | — | 打断已记录（见上面的 body） |
 | 400 | `invalid_payload` | `client_msg_id` 不在 26..36 个 ASCII 可打印字符范围内 |
+| 401 | `unauthorized` | JWT 缺失 / 格式错 / 过期 / 密钥不符 |
 | 403 | `session_forbidden` | session 不属于该 JWT 用户 |
 | 404 | `session_not_found` | `session_id` 不存在 |
 | 404 | `turn_not_found` | `client_msg_id` 在该 session 里找不到对应的 user 行 |

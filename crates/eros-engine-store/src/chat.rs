@@ -993,11 +993,28 @@ impl<'a> ChatRepo<'a> {
     /// `last_active_at` in the same transaction as the insert.
     ///
     /// Idempotent on `user_message_id` (migration 0041): a second writer for the
-    /// same turn refills only `model`/`usage`/`generation_id` and never touches
-    /// `content`, `truncated` or `metadata`. That is what lets the interrupt
-    /// endpoint and a still-live generator race safely when a reply already
-    /// exists — content belongs to the interrupt, billing audit to the
-    /// generator.
+    /// same turn hits `ON CONFLICT`, whose behaviour depends on whether the
+    /// EXISTING row already carries the interrupt marker
+    /// (`metadata ? 'voice_interrupt'`):
+    /// - **marked** (an interrupt inserted or touched this row first): `content`
+    ///   and `truncated` are left as they are — the interrupt's report is
+    ///   authoritative — while `model`/`usage`/`generation_id` still refill from
+    ///   the conflicting write, so a still-live generator's billing audit is
+    ///   not lost. This is what lets the interrupt endpoint and a still-live
+    ///   generator race safely — content belongs to the interrupt, billing
+    ///   audit to the generator.
+    /// - **unmarked** (both writers are ordinary generators — e.g. an orphaned
+    ///   generator from a dead connection racing a client's retry of the same
+    ///   turn): last-writer-wins on EVERY column, `content` and `truncated`
+    ///   included. This keeps `content` and `generation_id` consistent with
+    ///   each other — the previous unconditional "refill audit columns only"
+    ///   rule could leave one generation's `content` paired with a DIFFERENT
+    ///   generation's `generation_id`, which OpenRouter reconciliation would
+    ///   silently mis-attribute.
+    ///
+    /// `usage` additionally falls back to the existing row's value when the
+    /// conflicting write's own `usage` is NULL (e.g. upstream never sent a
+    /// usage payload), so a race never downgrades known usage to unknown.
     ///
     /// The insert is additionally **skipped entirely** when the user row is
     /// already marked `voice_interrupt` and no assistant reply exists yet —
@@ -1045,8 +1062,12 @@ impl<'a> ChatRepo<'a> {
                  ) \
              ) \
              ON CONFLICT (user_message_id) WHERE role = 'assistant' AND channel = 'voice' \
-             DO UPDATE SET model = EXCLUDED.model, \
-                           usage = EXCLUDED.usage, \
+             DO UPDATE SET content   = CASE WHEN m.metadata ? 'voice_interrupt' \
+                                             THEN m.content ELSE EXCLUDED.content END, \
+                           truncated = CASE WHEN m.metadata ? 'voice_interrupt' \
+                                             THEN m.truncated ELSE EXCLUDED.truncated END, \
+                           model = EXCLUDED.model, \
+                           usage = COALESCE(EXCLUDED.usage, m.usage), \
                            generation_id = EXCLUDED.generation_id",
         )
         .bind(id)
@@ -1184,12 +1205,22 @@ pub enum LatestTurnLookup {
 
 impl<'a> ChatRepo<'a> {
     /// Read the two facts the `turn/stream` duplicate gate needs, plus the
-    /// persisted utterance, in one round trip.
+    /// persisted utterance, in one round trip. Scoped to `role = 'user' AND
+    /// channel = 'voice'` — `insert_voice_user_message`'s conflict lookup
+    /// that supplies `user_message_id` is deliberately role-agnostic (the
+    /// colliding row can be a `gift_user` tip row, or even a text-channel
+    /// `user` row reached via `message/stream` against the same session id,
+    /// since that route has no channel guard). Returns `None` when the row
+    /// is not an actual voice user turn, so the caller can fall back to the
+    /// ordinary unconditional 409 instead of treating a tip or text row as a
+    /// repairable voice turn — regenerating against it would embed the
+    /// wrong text as the recall query and write a `channel='voice'`
+    /// assistant row pointing at a non-voice user row.
     pub async fn voice_turn_repair_state(
         &self,
         user_message_id: Uuid,
-    ) -> Result<VoiceTurnRepair, sqlx::Error> {
-        let (content, interrupted, has_reply): (String, bool, bool) = sqlx::query_as(
+    ) -> Result<Option<VoiceTurnRepair>, sqlx::Error> {
+        let row: Option<(String, bool, bool)> = sqlx::query_as(
             "SELECT u.content, \
                     COALESCE(u.metadata->>'voice_interrupt', 'false')::bool, \
                     EXISTS ( \
@@ -1198,16 +1229,18 @@ impl<'a> ChatRepo<'a> {
                            AND a.role = 'assistant' AND a.channel = 'voice' \
                     ) \
                FROM engine.chat_messages u \
-              WHERE u.id = $1",
+              WHERE u.id = $1 AND u.role = 'user' AND u.channel = 'voice'",
         )
         .bind(user_message_id)
-        .fetch_one(self.pool)
+        .fetch_optional(self.pool)
         .await?;
-        Ok(VoiceTurnRepair {
-            has_reply,
-            interrupted,
-            content,
-        })
+        Ok(
+            row.map(|(content, interrupted, has_reply)| VoiceTurnRepair {
+                has_reply,
+                interrupted,
+                content,
+            }),
+        )
     }
 
     /// Resolve a `client_msg_id` to its user row and report whether it is the
@@ -3423,29 +3456,39 @@ mod tests {
         (session_id, user_mid)
     }
 
+    /// Generator-vs-generator race, no interrupt marker involved: e.g. an
+    /// orphaned generator from a dead connection is still alive (TCP
+    /// retransmission keeps it going for tens of seconds) when the client's
+    /// retry lands its OWN generator for the same turn. Migration 0041 keeps
+    /// this to one row, but the surviving row must be entirely the SAME
+    /// call's data — `content`, `truncated`, AND the audit columns —  never a
+    /// mix of one generation's `content` with a DIFFERENT generation's
+    /// `generation_id` (which would corrupt OpenRouter reconciliation).
     #[sqlx::test(migrations = "./migrations")]
     #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
 
-        // First writer wins the content.
+        // Generator A writes first — no interrupt marker on the user row.
         repo.insert_voice_assistant_message(
             session_id,
             user_mid,
             Uuid::new_v4(),
             "first",
+            Some("m/0"),
             None,
-            None,
-            None,
+            Some("gen-0"),
             true,
             None,
         )
         .await
         .unwrap();
 
-        // Second writer must NOT create a second row, must NOT touch content,
-        // and must refill the audit columns it carries.
+        // Generator B conflicts on the same row with DIFFERENT content AND a
+        // DIFFERENT generation_id. Must NOT create a second row; must be
+        // last-writer-wins on every column (content included), so the
+        // surviving row never pairs A's content with B's generation_id.
         let usage = serde_json::json!({"total_tokens": 7});
         repo.insert_voice_assistant_message(
             session_id,
@@ -3481,21 +3524,28 @@ mod tests {
             1,
             "exactly one assistant reply per voice user turn"
         );
-        assert_eq!(rows[0].0, "first", "content belongs to the first writer");
+        assert_eq!(
+            rows[0].0, "second",
+            "no interrupt marker ⇒ last-writer-wins on content, not first-writer-wins"
+        );
         assert_eq!(
             rows[0].1.as_deref(),
             Some("m/1"),
-            "audit columns get refilled"
+            "audit columns come from the SAME (surviving) writer as content"
         );
-        assert_eq!(rows[0].2.as_deref(), Some("gen-1"));
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some("gen-1"),
+            "generation_id must match the surviving content's call, never a stale earlier generation"
+        );
         assert!(
-            rows[0].3,
-            "truncated must not be downgraded by the audit refill"
+            !rows[0].3,
+            "truncated must come from the same writer as content"
         );
         assert_eq!(
             rows[0].4,
             Some(serde_json::json!({"total_tokens": 7})),
-            "usage must be refilled by the audit refill"
+            "usage must come from the same writer as content"
         );
     }
 
@@ -3505,7 +3555,11 @@ mod tests {
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello there").await;
 
         // Fresh turn: nothing yet.
-        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("seed_voice_turn produces an actual voice user turn");
         assert!(!st.has_reply);
         assert!(!st.interrupted);
         assert_eq!(
@@ -3527,7 +3581,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("still an actual voice user turn");
         assert!(st.has_reply);
         assert!(!st.interrupted);
     }
@@ -3546,12 +3604,61 @@ mod tests {
         .await
         .unwrap();
 
-        let st = repo.voice_turn_repair_state(user_mid).await.unwrap();
+        let st = repo
+            .voice_turn_repair_state(user_mid)
+            .await
+            .unwrap()
+            .expect("still an actual voice user turn");
         assert!(
             st.interrupted,
             "the marker must be visible to the repair gate"
         );
         assert!(!st.has_reply);
+    }
+
+    /// `insert_voice_user_message`'s conflict lookup that supplies
+    /// `user_message_id` is deliberately role-agnostic (the colliding row can
+    /// be a `gift_user` tip row, or a text-channel `user` row reached via
+    /// `message/stream` against the same session id, since that route has no
+    /// channel guard). The repair gate must independently refuse to treat
+    /// either as a repairable voice turn.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_state_is_none_for_non_voice_user_rows(pool: PgPool) {
+        let repo = ChatRepo { pool: &pool };
+        let session_id = throwaway_session(&pool).await.id;
+
+        let gift_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, 'gift_user', '(打赏 $20)', 'cid-gift', '{\"tips_amount_usd\": 20.0}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.voice_turn_repair_state(gift_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a gift_user row must never be reported as a repairable voice turn"
+        );
+
+        let text_user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'user', 'hi', 'cid-text') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            repo.voice_turn_repair_state(text_user_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a channel-less (text) user row must never be reported as a repairable voice turn"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -250,7 +250,24 @@ pub async fn voice_turn_stream(
     {
         VoiceUserInsert::Inserted(id) => (id, req.content),
         VoiceUserInsert::Duplicate(id) => {
+            // `insert_voice_user_message`'s conflict lookup is deliberately
+            // role-agnostic (see its doc comment) — the colliding row can be a
+            // `gift_user` tip row, or even a text-channel `user` row reached
+            // via `message/stream` against this same session id, since that
+            // route has no channel guard. `voice_turn_repair_state` is scoped
+            // to `role = 'user' AND channel = 'voice'` and returns `None` for
+            // anything else, so such a collision falls back to the ordinary
+            // unconditional 409 instead of being treated as a repairable
+            // voice turn (which would regenerate against the wrong row).
             let st = chat_repo.voice_turn_repair_state(id).await?;
+            let Some(st) = st else {
+                return Err(pre(
+                    StatusCode::CONFLICT,
+                    "duplicate",
+                    "duplicate client_msg_id for this session",
+                    "这条消息已在处理",
+                ));
+            };
             if st.has_reply || st.interrupted {
                 return Err(pre(
                     StatusCode::CONFLICT,
@@ -260,6 +277,10 @@ pub async fn voice_turn_stream(
                 ));
             }
             if st.content != req.content {
+                // Deliberately omits the differing text — this repo forbids
+                // logging chat content. Do not "improve" this by adding the
+                // diff between `st.content` and `req.content`; that would leak
+                // user utterances into the logs.
                 tracing::warn!(
                     session_id = %session_id,
                     "voice: repair retry carried different content; using the persisted turn",
@@ -331,6 +352,7 @@ pub async fn voice_turn_stream(
     responses(
         (status = 200, body = VoiceInterruptResponse),
         (status = 400, body = crate::routes::companion_stream::StreamPreErrorBody),
+        (status = 401, description = "missing or invalid bearer"),
         (status = 403, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 404, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 409, body = crate::routes::companion_stream::StreamPreErrorBody),
@@ -397,6 +419,13 @@ pub async fn voice_turn_interrupt(
         }
     };
 
+    // TOCTOU: the turn resolved as "latest" above can stop being latest
+    // before the upsert below runs (a new turn lands in between). This is
+    // safe to leave as-is — it only WIDENS the legitimate window in which a
+    // barge-in on the just-resolved turn is accepted, it can never let a
+    // client reach an OLDER turn than the one it named (the `Stale` check
+    // above already rejected that). Do not "fix" this by re-checking
+    // latest-ness right before the upsert.
     let message_id = chat_repo
         .upsert_voice_interrupt(
             session_id,
@@ -673,6 +702,65 @@ mod tests {
             n, 1,
             "repair reuses the persisted user row, never adds a second"
         );
+    }
+
+    /// `insert_voice_user_message`'s conflict lookup is deliberately
+    /// role-agnostic (see its doc comment: "the conflicting row may be a
+    /// `user` OR a `gift_user` (tip) row"). Before the repair relaxation that
+    /// only ever produced a 409, so the role-agnosticism was harmless. Now
+    /// that a duplicate with no reply and no interrupt marker regenerates,
+    /// a `client_msg_id` collision against a NON-voice-user row (a
+    /// `gift_user` tip row, seeded here — the realistic case per the plan;
+    /// also possible via a text-channel `user` row, since `message/stream`
+    /// has no channel guard against being pointed at this session id) must
+    /// still fall back to the ordinary unconditional 409, never regenerate.
+    /// Regenerating would embed the tip marker text as the recall query and
+    /// write a `channel='voice'` assistant row whose `user_message_id`
+    /// points at a tip row.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_409_and_no_regen_on_non_voice_user_row_collision(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let client_msg_id = "01J9GIFTCOLLIDE00000000001";
+
+        // Seed a gift_user (tip) row directly, colliding on
+        // (session_id, client_msg_id) — the same collision surface
+        // `insert_voice_user_message`'s ON CONFLICT resolves against.
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                (session_id, role, content, client_msg_id, metadata) \
+             VALUES ($1, 'gift_user', '(打赏 $20)', $2, \
+                     '{\"tips_amount_usd\": 20.0}'::jsonb)",
+        )
+        .bind(session_id)
+        .bind(client_msg_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let resp = post_voice(
+            &mut build_router(with_voice(crate::routes::companion::test_state(
+                pool.clone(),
+            ))),
+            session_id,
+            &mint_jwt(user_id),
+            json!({"content": "hello", "client_msg_id": client_msg_id}),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a client_msg_id collision with a non-voice-user row must not be treated as repairable"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "must not have regenerated an assistant reply");
     }
 
     /// A 512-dim one-hot vector — a query embedded at the same seed is the

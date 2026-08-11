@@ -142,6 +142,23 @@ Keyed by the user row's id:
 | exists (completion race) | non-empty | overwrite `content`, set `truncated = true`; **keep** `model`, `usage`, `generation_id` |
 | exists (completion race) | empty | leave `content` untouched |
 
+**A fifth cell, outside this table: generator vs. generator, no interrupt
+involved at all.** Two orphaned/live `insert_voice_assistant_message` writers
+can race for the same turn — the branch's own premise (TCP retransmission
+keeps a disconnected generator alive for tens of seconds) applies just as
+well to a still-live generator racing the client's retry as it does to the
+interrupt racing a generator. Migration 0041 still keeps this to one row, but
+neither writer is the interrupt, so none of the four rows above apply — there
+is no marker to make one side authoritative. The rule there is last-writer-
+wins on **every** column (`content`, `truncated`, and the audit columns
+together), never the audit-only refill the table above implies: refilling
+only `model`/`usage`/`generation_id` while leaving a stale `content` in place
+would pair one generation's text with a DIFFERENT generation's
+`generation_id`, corrupting OpenRouter reconciliation. See
+`insert_voice_assistant_message`'s `ON CONFLICT` clause in
+`crates/eros-engine-store/src/chat.rs`, keyed off whether the existing row
+carries the interrupt marker.
+
 **An empty `spoken_text` never writes assistant content** — neither inserting
 nor overwriting. The codebase holds a "never persist empty assistant content"
 invariant (`voice.rs:791` refuses an empty `done`, `voice.rs:806` guards the
@@ -174,17 +191,24 @@ an interrupt-inserted row simply has none.
 
 ### New store methods
 
-- `voice_turn_repair_state(user_message_id) -> VoiceTurnRepair { has_reply: bool, interrupted: bool }`
-  — one query returning both facts.
+- `voice_turn_repair_state(user_message_id) -> Option<VoiceTurnRepair> { has_reply: bool, interrupted: bool }`
+  — one query returning both facts. `None` when `user_message_id` does not
+  name an actual voice user turn (`role = 'user' AND channel = 'voice'`) —
+  the id handed to this function comes from `insert_voice_user_message`'s
+  conflict lookup, which is deliberately role-agnostic (a colliding row can
+  be a `gift_user` tip row, or a text-channel `user` row), so the repair gate
+  must independently confirm the row before treating it as repairable; the
+  route falls back to the ordinary unconditional 409 on `None`.
 - `resolve_latest_voice_user_turn(session_id, client_msg_id) -> LatestTurnLookup`
   — resolves the `client_msg_id` to a user row id and reports whether it is the
   session's most recent user row, so the route can separate 404 (no such turn)
   from `409 not_latest_turn` in one round trip.
 - `upsert_voice_interrupt(session_id, user_message_id, candidate_assistant_id, spoken_text) -> Option<Uuid>`
   — marker write plus the assistant upsert in one transaction. Returns the
-  assistant row's id when a row exists afterwards (inserted or updated), `None`
-  for the empty-text case. `candidate_assistant_id` is used only on insert; on
-  the race path the existing row's id is returned.
+  assistant row's id when a row exists afterwards (inserted or updated),
+  `None` only when nothing was played and no reply row exists (spoken_text
+  empty and no completion race). `candidate_assistant_id` is used only on
+  insert; on the race path the existing row's id is returned.
 
 ## 3. Regeneration repair path
 
