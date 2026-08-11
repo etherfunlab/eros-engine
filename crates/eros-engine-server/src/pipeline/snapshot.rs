@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! companion_insights_snapshot sweeper.
+//! human_insights_snapshot sweeper.
 //!
-//! On a cron schedule (default 23:00 SGT daily), inserts one row per
-//! user with a companion_insights record into
-//! engine.companion_insights_snapshot, preserving the JSONB and
-//! training_level at that instant for downstream time-series consumers.
+//! On a cron schedule (default 23:00 SGT daily), inserts one
+//! to_jsonb(human_insights) row per user into
+//! engine.human_insights_snapshot for downstream time-series consumers.
 //! No LLM, no dedupe, no transformation.
 
 use std::str::FromStr;
@@ -12,7 +11,7 @@ use std::str::FromStr;
 use chrono::Utc;
 use cron::Schedule;
 
-use eros_engine_store::insight::InsightRepo;
+use eros_engine_store::human_insight::HumanInsightRepo;
 
 use crate::state::AppState;
 
@@ -49,7 +48,7 @@ pub async fn sweeper(state: AppState) {
         tokio::time::sleep(delay).await;
 
         let fire_at = Utc::now();
-        let repo = InsightRepo { pool: &state.pool };
+        let repo = HumanInsightRepo { pool: &state.pool };
         match repo.snapshot_all_users(fire_at).await {
             Ok(n) => tracing::info!(written = n, %fire_at, "snapshot: fire complete"),
             Err(e) => {

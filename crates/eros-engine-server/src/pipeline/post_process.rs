@@ -6,7 +6,8 @@
 //! memory,insight}.rs` with these OSS-specific changes:
 //!
 //! - All DB writes go through `eros-engine-store` repos (`AffinityRepo`,
-//!   `MemoryRepo`, `InsightRepo`, `ChatRepo`) instead of inline `sqlx::query`.
+//!   `MemoryRepo`, `HumanInsightRepo`, `InsightEventRepo`, `ChatRepo`) instead
+//!   of inline `sqlx::query`.
 //! - Insight extraction (`extract_insights`) writes `human_insights` directly
 //!   via `HumanInsightRepo::apply_extraction`; the audit trail still lands in
 //!   `companion_insights_events`.
@@ -35,8 +36,8 @@ use crate::state::AppState;
 /// One assistant message persisted during a burst (sync or streaming path).
 /// `action` mirrors the spec's `meta.action_type` discriminator. `message_id`
 /// and `action` are unused by today's per-message side-effects but are kept
-/// on the struct for the audit / lead-score hooks that a future task will
-/// thread per-message.
+/// on the struct for the audit hooks that a future task will thread
+/// per-message.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ProducedMessage {

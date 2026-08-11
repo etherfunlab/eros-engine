@@ -247,6 +247,75 @@ mod migration_tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn human_insights_snapshot_schema(pool: PgPool) {
+        let cols: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'engine' \
+               AND table_name   = 'human_insights_snapshot' \
+             ORDER BY ordinal_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query columns for human_insights_snapshot");
+        let names: Vec<&str> = cols.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "user_id", "snapshot", "captured_at"],
+            "column order/identity must match migration 0042"
+        );
+        let captured_at_null = cols
+            .iter()
+            .find(|(n, _, _)| n == "captured_at")
+            .map(|(_, _, nullable)| nullable.as_str())
+            .unwrap();
+        assert_eq!(captured_at_null, "NO", "captured_at must be NOT NULL");
+
+        let idx_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_indexes \
+                 WHERE schemaname = 'engine' \
+                   AND tablename  = 'human_insights_snapshot' \
+                   AND indexname  = 'idx_human_insights_snapshot_user_time')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query pg_indexes");
+        assert!(idx_exists);
+
+        let rls_enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+              WHERE oid = 'engine.human_insights_snapshot'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity");
+        assert!(rls_enabled);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0042_dropped_companion_insights_and_lead_score(pool: PgPool) {
+        let ci_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+              WHERE table_schema = 'engine' AND table_name = 'companion_insights')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!ci_exists, "companion_insights must be dropped");
+
+        let lead_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'engine' AND table_name = 'chat_sessions' \
+                AND column_name = 'lead_score')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!lead_exists, "chat_sessions.lead_score must be dropped");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn migration_0023_drops_nft_ownership_stack(pool: PgPool) {
         // The three tables are gone.
         for tbl in ["wallet_links", "persona_ownership", "sync_cursors"] {
