@@ -175,7 +175,14 @@ as shown above.
   `companion_insights_events` for each `insight_extraction` call, on
   `companion_decision_events` for each `pde_decision` judge run, and under
   `chat_messages.metadata.image` / `.vision*` for the composer and vision
-  calls) — see the `usage` filtering note above.
+  calls) — see the `usage` filtering note above. Since the companion_insights
+  teardown (spec 2026-08-11), `companion_insights_events` rows can contain
+  keys the typed `human_insights` store never persists: the extractor's
+  `existing_insights` context is now reverse-projected from `human_insights`
+  (not the retired JSONB blob), and any off-schema key the LLM emits still
+  lands in the event payload but nowhere else — a future events↔store
+  reconciliation has to compare on payload keys ∩ `human_insights` column
+  set, not full equality.
 - **Hash.** The engine does not transform `user` — callers are
   responsible for sending a hash.
 - **Sanitise.** `metadata` keys and values are size / shape-checked,

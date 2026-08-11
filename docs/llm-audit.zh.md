@@ -159,6 +159,12 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `companion_insights_events`，每次 `pde_decision` judge 运行落在
   `companion_decision_events`，合成器和 vision 调用落在
   `chat_messages.metadata.image` / `.vision*`）——参见上面 `usage` 过滤那节。
+  companion_insights 拆除（spec 2026-08-11）之后，`companion_insights_events`
+  的行里可能出现类型化 `human_insights` 表从不落库的 key：抽取器的
+  `existing_insights` 上下文现在是从 `human_insights` 反向投影出来的（不再是
+  已废弃的 JSONB blob），LLM 吐出的任何 schema 之外的 key 仍然会进事件
+  payload，但不会落在其它任何地方——以后做 events↔store 对账时，要按
+  payload key 与 `human_insights` 列集合的交集比较，不能直接判等。
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
 - **不解读。**引擎不会按 audit 字段分组、聚合、报警。Caller 自己接。

@@ -91,7 +91,7 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 1. **逐轮原文写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑：用户话语非空，且至少有一条非空的助手消息。它只把**用户话语**embed 进两个层，不存助手的回复文本——助手回复经记忆召回重新进入模型自己的 prompt 会形成反馈回路，让后续回复反复出现同一句话（issue #113）。关系层那一份带 `用户：` 前缀，召回出来后仍能认出是用户原话。这些行的 `category` 和 `metadata` 都是 NULL。
 2. **Dreaming-lite 清扫器**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
 
-`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出合并进 `companion_insights`（并镜像到扁平的 `human_insights` 表），不在这里 embed。
+`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出直接 UPSERT 进扁平的 `human_insights` 表（按列增量合并；见 [api-reference.zh.md](api-reference.zh.md#get-compuseruser_idprofile)），不在这里 embed。
 
 所以 embedding 是每个实质轮次生成一次，不是「只有 LLM 挑出来的高光才生成」。
 
@@ -105,9 +105,10 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 见 [api-reference.zh.md](api-reference.zh.md)；默认 `neutral_and_relationship`）。回复
 handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文块：
 
-- **画像层** —— 由两个来源合并。基础画像 bullet 来自扁平的 **`human_insights`**
-  镜像表（从 `companion_insights` 同步过来），**不是**直接读 `companion_insights`
-  JSONB；`memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带
+- **画像层** —— 由两个来源合并。基础画像 bullet 直接来自扁平的
+  **`human_insights`** 表——companion_insights 拆除（spec 2026-08-11）之后，
+  这是 insight 抽取器唯一的写入目标，不再有 JSONB blob 或镜像这一步；
+  `memory_scope` 决定是否带上私密字段（`full` / `insights_only`）还是只带
   中性子集（`neutral_*`）。与之并列，画像层的 `companion_memories` 行也会按相似度
   检索出来并按 `category` 分组注入，但仅当 scope 保留画像记忆时才会跑（`full` /
   `neutral_and_relationship`）——`relationship_only`、`neutral_only`、
@@ -120,7 +121,7 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 `memory_scope = none` 完全跳过记忆注入。**`memory_scope` 只管 prompt 注入，
 不管写入。** 即使是 `none`，逐轮原文写入照样把这一轮 embed 并存下来，insight 抽取和
 好感度评估也照常跑；目前没有任何 scope 取值能抑制写入。前端的
-`/comp/user/{user_id}/profile` 端点返回 `companion_insights` JSONB，作为已收集
+`/comp/user/{user_id}/profile` 端点返回类型化的 `human_insights` 行，作为已收集
 内容的人类可读视图。
 
 ### 语音轮次
@@ -168,7 +169,7 @@ handler（`pipeline::handlers`）从两个来源拼出画像 / 关系上下文�
 ## 源碼
 
 - `crates/eros-engine-store/src/memory.rs`——`MemoryRepo`（upsert + search，7 个 sqlx::test 集成测试）
-- `crates/eros-engine-store/src/human_insight.rs`——注入时读取的扁平 `human_insights` 镜像
+- `crates/eros-engine-store/src/human_insight.rs`——扁平类型化的 `human_insights` 存储；insight 抽取器的 `apply_extraction` 增量写入，回复 handler 在注入时读取
 - `crates/eros-engine-llm/src/voyage.rs`——Voyage 原生客户端
 - `crates/eros-engine-llm/src/embedding.rs`——`EmbeddingRouter` + OpenRouter 兼容客户端
 - `crates/eros-engine-server/src/pipeline/post_process.rs`——逐轮原文写入路径

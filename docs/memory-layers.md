@@ -91,7 +91,7 @@ Two independent writers, on different schedules:
 1. **Raw-turn writer** (`write_turn`, post-process) — runs on **every** substantive turn (non-empty user utterance and at least one non-empty assistant message). It embeds **the user's utterance only** into *both* layers — never the assistant's prose, which fed back into the model's own prompt via recall and collapsed replies to a repeated line (issue #113). The relationship-layer copy is prefixed `用户：` so a recalled line stays readable as "what the user said." These rows carry `category = NULL` and `metadata = NULL`.
 2. **Dreaming-lite sweeper** (`[tasks.memory_extraction]`, `pipeline::dreaming`) — a background, idle-session-triggered pass that asks an LLM for durable memory candidates. It writes **profile-layer rows only**, tagged `category ∈ {fact, preference, event, emotion, relation}` (anything else the model invents collapses to `fact`) plus an opaque `metadata` payload.
 
-`insight_extraction` is a **separate** pipeline and writes nothing to this table — its structured output is merged into `companion_insights` (and mirrored to the flat `human_insights` table), not embedded here.
+`insight_extraction` is a **separate** pipeline and writes nothing to this table — its structured output is UPSERTed directly into the flat `human_insights` table (per-column incremental merge; see [api-reference.md](api-reference.md#get-compuseruser_idprofile)), not embedded here.
 
 So embeddings *are* generated once per substantive turn, not only for LLM-surfaced highlights.
 
@@ -106,9 +106,10 @@ Memory is read back into the prompt on each chat turn, gated by the per-request
 default `neutral_and_relationship`). The reply handler (`pipeline::handlers`)
 builds a profile/relationship context block from two sources:
 
-- **Profile layer** — two merged sources. The 基础画像 bullets come from the
-  flat **`human_insights`** mirror table (kept in sync from `companion_insights`),
-  *not* from the `companion_insights` JSONB directly; `memory_scope` decides
+- **Profile layer** — two merged sources. The 基础画像 bullets come directly
+  from the flat **`human_insights`** table — the insight extractor's only
+  write target since the companion_insights teardown (spec 2026-08-11); there
+  is no JSONB blob or mirror step anymore. `memory_scope` decides
   whether intimate fields are included (`full` / `insights_only`) or only the
   neutral subset (`neutral_*`). Alongside them, profile-layer
   `companion_memories` rows are pulled by similarity search and grouped by
@@ -126,7 +127,7 @@ prompt injection only — never writes.** Even under `none`, the raw-turn writer
 still embeds and stores this turn, and insight extraction and the affinity
 evaluation still run; there is currently no scope value that suppresses
 writing. The frontend's `/comp/user/{user_id}/profile` endpoint returns the
-`companion_insights` JSONB as a human-readable view of what's been collected.
+typed `human_insights` row as a human-readable view of what's been collected.
 
 ### Voice turns
 
@@ -183,7 +184,7 @@ Design specs:
 ## Source
 
 - `crates/eros-engine-store/src/memory.rs` — `MemoryRepo` (upsert + search, 7 sqlx::test integration tests)
-- `crates/eros-engine-store/src/human_insight.rs` — flat `human_insights` mirror read at injection
+- `crates/eros-engine-store/src/human_insight.rs` — flat, typed `human_insights` store; the insight extractor's `apply_extraction` writes it incrementally, the reply handler reads it at injection
 - `crates/eros-engine-llm/src/voyage.rs` — native Voyage client
 - `crates/eros-engine-llm/src/embedding.rs` — `EmbeddingRouter` + OpenRouter-compatible client
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — raw-turn write path

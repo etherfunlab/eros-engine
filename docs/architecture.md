@@ -59,9 +59,9 @@ chat exec              if Some(req): state.openrouter.execute(req).await?
 spawn post_process     tokio::spawn — runs concurrent with response return:
                        - affinity persist (LLM evaluates 6-dim Δ → DB)
                        - memory   (Voyage embed → pgvector upsert)
-                       - insight  (LLM extracts facts → companion_insights merge)
-                       - lead-score refresh (insights → chat_sessions.lead_score)
-                       (the four run concurrently via tokio::join!)
+                       - insight  (LLM extracts facts → human_insights UPSERT,
+                         per-column incremental)
+                       (the three run concurrently via tokio::join!)
 ```
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
@@ -109,11 +109,11 @@ eros-engine-server :8080
                        companion_affinity / companion_affinity_events
                        companion_memories (vector(512))
                        persona_genomes / persona_instances
-                       companion_insights
+                       human_insights
                        companion_decision_events
 ```
 
-The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight / lead-score writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
+The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
 
 **`chat_messages.channel`**: `NULL` = normal text; `'voice'` = voice channel;
 `'product_qa'` = out-of-character product answer — non-NULL rows are
@@ -173,11 +173,12 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
-│       ├── insight.rs        # InsightRepo (weighted training_level)
+│       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
+│       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, per-field UPSERT)
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas | backfill-human-insights | print-openapi subcommands
+        ├── main.rs           # serve | migrate | seed-personas | print-openapi subcommands
         ├── state.rs          # AppState (pool/auth/openrouter/embed/config)
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase impl + middleware

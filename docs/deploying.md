@@ -23,7 +23,6 @@ The binary has five modes (dispatched by `argv[1]`):
 | `serve` (default) | Run the HTTP server on `BIND_ADDR` |
 | `migrate` | Apply pending sqlx migrations and exit |
 | `seed-personas [dir]` | Read every `*.toml` in `[dir]` (default `/etc/eros-engine/personas` — the examples baked into the Docker image) and upsert as a persona genome |
-| `backfill-human-insights` | One-off projection of every `companion_insights` row into `engine.human_insights` (idempotent; manual only) |
 | `print-openapi` | Dump the OpenAPI spec to stdout and exit (no DB, no env; used by the CI drift check) |
 
 `seed-personas` is idempotent — re-runs update existing rows in place (matched by `name`), preserving UUIDs and FK references in `persona_instances`.

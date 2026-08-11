@@ -16,7 +16,7 @@
 //!
 //! 2. **Insight extraction prompts** (`facts_user_message`,
 //!    `extract_structured_insights_prompt`) — drive the post-process
-//!    `companion_insights` pipeline. The schema description constant
+//!    insight-extraction pipeline. The schema description constant
 //!    `COMPANION_INSIGHTS_SCHEMA` is shared by the second of these.
 //!
 //! Memory-layer "prompts" are not LLM-driven (the embedding router only) and

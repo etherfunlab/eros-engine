@@ -23,7 +23,6 @@
 | `serve`（默認） | 在 `BIND_ADDR` 上跑 HTTP 服務器 |
 | `migrate` | 應用待處理的 sqlx migrations 然後退出 |
 | `seed-personas [dir]` | 读 `[dir]` 里每个 `*.toml` 文件（默认 `/etc/eros-engine/personas`——Docker 镜像里烧的示例），upsert 为人格基因 |
-| `backfill-human-insights` | 一次性把每行 `companion_insights` 投影进 `engine.human_insights`（幂等；仅手动执行） |
 | `print-openapi` | 把 OpenAPI 规范打到 stdout 后退出（不连 DB、不读 env；CI 漂移检查用） |
 
 `seed-personas` 是冪等的——再跑會 update 原有行（按 `name` 匹配），保持 UUID 跟 `persona_instances` 裡的 FK 引用穩定。

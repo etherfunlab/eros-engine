@@ -227,10 +227,12 @@ the moment chat activity resumes — no catch-up rounds.
 | Digest (1-2 sentences) | `persona_story_insights.digest`, resident injection |
 | Events (category + content, capped 6/round) | `persona_story_events`, and embedded verbatim into `persona_story_memories` (1:1, same round/transaction) |
 
-The insight field list is a **fixed flat superset of `companion_insights`**
-(the `human_insights` lesson applied in advance — flat typed columns from day
-one, no opaque-JSONB stage): every existing companion field, reworded to
-describe the persona, plus four story-exclusive columns — `work_history`
+The insight field list is a **fixed flat superset of `human_insights`' typed
+columns** (the `human_insights` lesson applied in advance — flat typed columns
+from day one, no opaque-JSONB stage; the companion side caught up to this
+shape with the companion_insights teardown, spec 2026-08-11): every existing
+companion field, reworded to describe the persona, plus four story-exclusive
+columns — `work_history`
 (工作经历), `romance_history` (感情史), `family_of_origin` (与原生家庭的关系),
 `user_relationship` (与用户的关系状态). The list ships as an engine constant;
 the operator `filter_prompt` controls each field's *richness*, never the

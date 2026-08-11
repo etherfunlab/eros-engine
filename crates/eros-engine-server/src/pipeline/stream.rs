@@ -4031,8 +4031,9 @@ fn build_final_frame(
 /// Build a frame stream from previously persisted assistant rows for a
 /// given user_message_id. The chain is given in original chronological
 /// order; emits one (meta, single-delta, done) trio per row, then one
-/// `final` computed from current session state. Ghost replay emits a
-/// synthetic Meta+Done(no usage, not truncated) followed by Final.
+/// `final` assembled from turn-local constants (no DB reads — see
+/// `build_final_frame`). Ghost replay emits a synthetic Meta+Done(no usage,
+/// not truncated) followed by Final.
 pub fn replay_stream(
     state: Arc<AppState>,
     // Unused since the lead/CTA teardown (spec 2026-08-11): `build_final_frame`

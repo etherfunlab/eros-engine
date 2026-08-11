@@ -59,9 +59,9 @@ chat 執行               若有 ChatRequest：state.openrouter.execute(req).awa
 spawn post_process     tokio::spawn——跟返回響應並行：
                         - affinity 寫入（LLM 評估 6 維 Δ → DB）
                         - memory   （Voyage embed → pgvector upsert）
-                        - insight  （LLM 抽事實 → companion_insights 合併）
-                        - lead-score 刷新（insights → chat_sessions.lead_score）
-                        （四个 future 经 tokio::join! 并发执行）
+                        - insight  （LLM 抽事实 → human_insights UPSERT，
+                          按列增量更新）
+                        （三个 future 经 tokio::join! 并发执行）
 ```
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
@@ -106,11 +106,11 @@ eros-engine-server :8080
                        companion_affinity / companion_affinity_events
                        companion_memories（vector(512)）
                        persona_genomes / persona_instances
-                       companion_insights
+                       human_insights
                        companion_decision_events
 ```
 
-post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight / lead-score 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
+post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
 
 **`chat_messages.channel`**：`NULL` = 普通文本；`'voice'` = 语音频道；
 `'product_qa'` = 出戏产品问答——非 NULL 的行会被排除在短期回忆、对话信号、
@@ -165,11 +165,12 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
-│       ├── insight.rs        # InsightRepo（加權 training_level）
+│       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
+│       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，按字段 UPSERT）
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）
 └── eros-engine-server/
     └── src/
-        ├── main.rs           # serve | migrate | seed-personas | backfill-human-insights | print-openapi 子命令
+        ├── main.rs           # serve | migrate | seed-personas | print-openapi 子命令
         ├── state.rs          # AppState（pool / auth / openrouter / embed / config）
         ├── error.rs          # AppError → axum IntoResponse
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件

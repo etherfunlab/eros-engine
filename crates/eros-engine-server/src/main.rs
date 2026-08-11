@@ -258,8 +258,8 @@ async fn run_server() -> Result<()> {
     // missing [tasks.*_extraction] section means that extraction is off — the
     // engine boots and runs without it. A present section with a blank/absent
     // filter_prompt is a misconfiguration we refuse to boot on. Placed in the
-    // serve path only (the print-openapi / backfill subcommands return before
-    // reaching here).
+    // serve path only (the print-openapi subcommand returns before reaching
+    // here).
     if let Err(msg) = model_config.validate_extraction_prompts() {
         anyhow::bail!(msg);
     }

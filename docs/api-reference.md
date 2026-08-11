@@ -108,14 +108,14 @@ data: {"type":"delta","message_id":"01J...","content":"你好"}
 
 data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
 
-data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18,"filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
 Frame fields worth noting:
 
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`.
-- **`final`** — turn summary: `lead_score`, `should_show_cta`, `agent_training_level`, plus `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served).
+- **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
 
 Concurrent active streams per user are capped at 3. The keep-alive heartbeat
 (`: ping`) is emitted every 15 s so reverse-proxies don't time out the
@@ -694,22 +694,37 @@ All chat sessions for `user_id`. The path's `user_id` MUST match the JWT's user_
 
 ### `GET /comp/user/{user_id}/profile`
 
-Current `companion_insights` JSONB plus a weighted `agent_training_level`. Same `user_id` equality check as above.
+The flat, typed `human_insights` row for this user — the same columns the insight extractor UPSERTs incrementally after each turn. Same `user_id` equality check as above.
 
 ```json
 {
   "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
-  "companion_insights": {
-    "city": "Hong Kong",
-    "occupation": "graphic designer",
-    "interests": ["jazz", "long walks"],
-    "mbti_guess": "INFP"
-  },
-  "agent_training_level": 0.42
+  "city": "Hong Kong",
+  "location": null,
+  "hometown": null,
+  "nationality": null,
+  "occupation": "graphic designer",
+  "mbti_guess": "INFP",
+  "love_values": null,
+  "emotional_needs": null,
+  "life_rhythm": null,
+  "interests": ["jazz", "long walks"],
+  "personality_traits": [],
+  "preferred_gender": null,
+  "age_min": null,
+  "age_max": null,
+  "deal_breakers": [],
+  "education": null,
+  "family": null,
+  "relationship_history": null,
+  "social_pattern": null,
+  "future_plans": null,
+  "finance_status": null,
+  "updated_at": "2026-08-11T12:00:00Z"
 }
 ```
 
-`agent_training_level` is a weighted score across 15 fields summing to 1.0 (city 0.04, occupation 0.04, interests 0.08, mbti_guess 0.10, love_values 0.12, emotional_needs 0.12, life_rhythm 0.06, personality_traits 0.12, matching_preferences 0.08, education 0.04, family 0.04, relationship_history 0.06, social_pattern 0.04, future_plans 0.04, finance_status 0.02). Source of truth: `WEIGHTS` in `crates/eros-engine-store/src/insight.rs`.
+`updated_at: null` means the user has no `human_insights` row yet — no extraction has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed columns above are the whole surface now.
 
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)

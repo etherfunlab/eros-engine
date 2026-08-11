@@ -100,14 +100,14 @@ data: {"type":"delta","message_id":"01J...","content":"你好"}
 
 data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16},"generation_id":"gen-abc"}
 
-data: {"type":"final","lead_score":0.42,"should_show_cta":false,"agent_training_level":0.18,"filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。
-- **`final`** —— 本轮汇总：`lead_score`、`should_show_cta`、`agent_training_level`，外加 `filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。
+- **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
 
 每个用户最多 3 条并发活跃流。保活心跳（`: ping`）每 15 秒发一次，
 防止反向代理因空闲超时断开连接。
@@ -608,22 +608,37 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/user/{user_id}/profile`
 
-當前的 `companion_insights` JSONB 加上加權的 `agent_training_level`。同樣的 `user_id` 等值檢查。
+这个用户扁平化、类型化的 `human_insights` 行——insight 抽取器每轮增量 UPSERT 的那些列。`user_id` 等值检查同上。
 
 ```json
 {
   "user_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
-  "companion_insights": {
-    "city": "Hong Kong",
-    "occupation": "graphic designer",
-    "interests": ["jazz", "long walks"],
-    "mbti_guess": "INFP"
-  },
-  "agent_training_level": 0.42
+  "city": "Hong Kong",
+  "location": null,
+  "hometown": null,
+  "nationality": null,
+  "occupation": "graphic designer",
+  "mbti_guess": "INFP",
+  "love_values": null,
+  "emotional_needs": null,
+  "life_rhythm": null,
+  "interests": ["jazz", "long walks"],
+  "personality_traits": [],
+  "preferred_gender": null,
+  "age_min": null,
+  "age_max": null,
+  "deal_breakers": [],
+  "education": null,
+  "family": null,
+  "relationship_history": null,
+  "social_pattern": null,
+  "future_plans": null,
+  "finance_status": null,
+  "updated_at": "2026-08-11T12:00:00Z"
 }
 ```
 
-`agent_training_level` 是 15 个字段加权后的分数，总和为 1.0（city 0.04、occupation 0.04、interests 0.08、mbti_guess 0.10、love_values 0.12、emotional_needs 0.12、life_rhythm 0.06、personality_traits 0.12、matching_preferences 0.08、education 0.04、family 0.04、relationship_history 0.06、social_pattern 0.04、future_plans 0.04、finance_status 0.02）。以 `crates/eros-engine-store/src/insight.rs` 中的 `WEIGHTS` 为准。
+`updated_at` 为 `null` 表示这个用户还没有 `human_insights` 行——还没跑过任何抽取——这时其余字段也都是 `null`/`[]`。现在没有汇总的"训练程度"分数了：`agent_training_level` 和原始的 `companion_insights` JSONB 都随 companion_insights 拆除（spec 2026-08-11）一起移除，上面这些类型化字段就是现在的全部返回内容。
 
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）

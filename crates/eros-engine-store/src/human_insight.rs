@@ -76,8 +76,9 @@ fn parse_age_range(prefs: Option<&serde_json::Value>) -> (Option<i32>, Option<i3
         .unwrap_or((None, None))
 }
 
-/// The single definition of the companion_insights JSONB -> human_insights
-/// columns mapping. Pure; unit-tested without a database.
+/// The single definition of the extraction JSONB (the `companion_insights`
+/// schema the extractor emits) -> human_insights columns mapping. Pure;
+/// unit-tested without a database.
 pub fn project_columns(insights: &serde_json::Value) -> ProjectedColumns {
     let prefs = insights.get("matching_preferences");
     let (age_min, age_max) = parse_age_range(prefs);
