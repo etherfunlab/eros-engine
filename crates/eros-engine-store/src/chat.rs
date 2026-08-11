@@ -3222,6 +3222,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
     async fn voice_assistant_insert_is_idempotent_on_user_message(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
@@ -3258,8 +3259,14 @@ mod tests {
         .await
         .unwrap();
 
-        let rows: Vec<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
-            "SELECT content, model, generation_id, truncated FROM engine.chat_messages \
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT content, model, generation_id, truncated, usage FROM engine.chat_messages \
              WHERE user_message_id = $1 AND role = 'assistant' AND channel = 'voice'",
         )
         .bind(user_mid)
@@ -3282,6 +3289,11 @@ mod tests {
         assert!(
             rows[0].3,
             "truncated must not be downgraded by the audit refill"
+        );
+        assert_eq!(
+            rows[0].4,
+            Some(serde_json::json!({"total_tokens": 7})),
+            "usage must be refilled by the audit refill"
         );
     }
 
