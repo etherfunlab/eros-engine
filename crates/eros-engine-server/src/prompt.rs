@@ -9,7 +9,7 @@
 //!    deliberate changes for the open-source engine:
 //!    - Output is plain-text reply (no JSON evaluation segment)
 //!    - Affinity deltas are NOT requested from the LLM (PDE predicts them)
-//!    - lead_score / training_progress moved to post_process/insight
+//!    - Insight extraction lives in post_process
 //!    - Reply style directive injected based on PDE's decision
 //!    - Persona fields (age/mbti/backstory/...) read from `genome.art_metadata`
 //!      JSONB instead of a flat `CompanionPersona` DTO
@@ -734,8 +734,8 @@ pub fn build_prompt(
 // prompts.rs` have a clear destination.
 
 /// Schema description used in `extract_structured_insights_prompt`. Mirrors
-/// the JSONB shape that `InsightRepo::merge` accepts, with each field's
-/// `compute_training_level` weight implicitly determined by presence.
+/// the JSON shape that `HumanInsightRepo::apply_extraction` accepts
+/// (projected by `project_columns`).
 pub const COMPANION_INSIGHTS_SCHEMA: &str = r#"
 companion_insights schema（真人用户画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
@@ -788,9 +788,9 @@ pub fn memories_user_message(turns: &[String]) -> String {
 }
 
 /// Stage-2 insight extraction prompt: take the bullet list of facts mined
-/// in stage 1 plus the user's existing `companion_insights` JSONB, and
-/// fill in whatever fields the LLM is confident about. Output expected
-/// as a JSON object matching `COMPANION_INSIGHTS_SCHEMA`.
+/// in stage 1 plus the user's existing insights (reverse-projected from
+/// `human_insights`), and fill in whatever fields the LLM is confident
+/// about. Output expected as a JSON object matching `COMPANION_INSIGHTS_SCHEMA`.
 pub fn extract_structured_insights_prompt(
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
