@@ -39,8 +39,12 @@ downstream scoring belongs downstream.
   input (`training_level` → `lead_score = level×10` on `chat_sessions` →
   `should_show_cta` → SSE final frame). Remove `refresh_lead_score`,
   `fut_lead`, `should_show_cta`, and the `agent_training_level` field from
-  both the SSE final frame and the profile route. Drop
-  `chat_sessions.lead_score` after verifying no other reader (see §3).
+  both the SSE final frame and the profile route. The reader verification
+  (done at planning) found the remaining `lead_score` readers are all
+  exporters of the same dead chain — the SSE final frame's normalised
+  `lead_score` field and `SessionListEntry.lead_score` on
+  `GET /comp/chat/{user_id}/sessions` — so they are removed with it and
+  `chat_sessions.lead_score` is dropped.
 - **D3 — Snapshots re-pointed.** Freeze `companion_insights_snapshot` (keep
   table and history, including historical `training_level`; stop writing).
   Create `human_insights_snapshot`; `snapshot_all_users` snapshots
@@ -106,8 +110,9 @@ Changes are at the ends of the pipeline:
 | `InsightRepo` (`load`/`merge`), `merge_objects`, `compute_training_level`, `WEIGHTS` | deleted; `insight.rs` keeps `InsightEventRepo` and the snapshot repo |
 | `insights_to_bullets` (`#[cfg(test)]`) | deleted |
 | `refresh_lead_score`, `fut_lead`, `should_show_cta` | deleted |
-| `chat_sessions.lead_score` | dropped in §3 migration, gated on a plan-step grep verifying no other reader; if one exists, stop and escalate |
-| SSE final frame fields `agent_training_level`, `should_show_cta` | removed (wire break; docs updated) |
+| `chat_sessions.lead_score` | dropped in §3 migration (reader grep done: only same-chain exporters remained, removed below) |
+| SSE final frame fields `lead_score`, `agent_training_level`, `should_show_cta` | removed (wire break; docs updated) |
+| `SessionListEntry.lead_score` on `GET /comp/chat/{user_id}/sessions` | removed (wire break; docs updated) |
 | `GET /comp/user/{user_id}/profile` | `ProfileResponse` rewritten as flat typed DTO: `user_id`, all 21 `human_insights` data columns (matching four included), `updated_at`; openapi regenerated |
 | `companion_insights_snapshot` + `snapshot_all_users` | table frozen in place (history kept); writer re-pointed to new `human_insights_snapshot` |
 | `backfill-human-insights` CLI | removed (`main.rs` dispatch + `docs/deploying.md`) |
@@ -167,10 +172,12 @@ lead score, CTA, mirror/projection. Known touchpoints:
 
 ## Breaking changes (release notes)
 
-1. SSE `final` frame: `agent_training_level` and `should_show_cta` removed.
+1. SSE `final` frame: `lead_score`, `agent_training_level`, and
+   `should_show_cta` removed.
 2. `GET /comp/user/{user_id}/profile`: response is now a flat typed
    `human_insights` DTO; `companion_insights` (raw JSONB) and
    `agent_training_level` fields are gone.
+   `GET /comp/chat/{user_id}/sessions`: `lead_score` removed from entries.
 3. CLI subcommand `backfill-human-insights` removed.
 4. Tables: `engine.companion_insights` dropped; `chat_sessions.lead_score`
    dropped; `companion_insights_snapshot` frozen (no longer written);
