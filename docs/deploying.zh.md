@@ -16,7 +16,7 @@
 
 ## 子命令
 
-二進制文件有五種模式（按 `argv[1]` 分派）：
+二進制文件有四種模式（按 `argv[1]` 分派）：
 
 | 子命令 | 用途 |
 |---|---|
@@ -267,5 +267,5 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 ## 源碼
 
 - `docker/Dockerfile`——多阶段构建（Rust 1.88 构建器 → debian:bookworm-slim 运行时）；`ghcr.io/etherfunlab/eros-engine` 就是用它构建的同一份产物
-- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那五种模式）
+- `crates/eros-engine-server/src/main.rs`——子命令分派（上面那四种模式）
 - [`.env.example`](../.env.example)——运维环境变量清单（细节见本指南）

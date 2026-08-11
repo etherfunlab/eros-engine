@@ -16,7 +16,7 @@ Two supported paths, in order of effort:
 
 ## Subcommands
 
-The binary has five modes (dispatched by `argv[1]`):
+The binary has four modes (dispatched by `argv[1]`):
 
 | Subcommand | Purpose |
 |------------|---------|
@@ -274,5 +274,5 @@ call. Details, data model, and the boot-validation rules are in
 ## Source
 
 - `docker/Dockerfile` — multi-stage build (Rust 1.88 builder → debian:bookworm-slim runtime); the same artifact behind `ghcr.io/etherfunlab/eros-engine`
-- `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the five modes above)
+- `crates/eros-engine-server/src/main.rs` — subcommand dispatch (the four modes above)
 - [`.env.example`](../.env.example) — operational env-var list (details in this guide)

@@ -514,7 +514,7 @@ input filter has no triggers, timing, or tiers).
 | Name | Consumed by | Status |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions; tip turns ride the same reply path) | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + JSONB merge) | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + typed `human_insights` upsert) | live |
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
