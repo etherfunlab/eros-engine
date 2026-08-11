@@ -325,7 +325,7 @@ pub async fn voice_turn_stream(
 #[utoipa::path(
     post,
     path = "/comp/voice/{session_id}/turn/interrupt",
-    tag = "voice",
+    tag = "companion",
     params(("session_id" = Uuid, Path, description = "Voice-channel session id")),
     request_body = VoiceInterruptRequest,
     responses(

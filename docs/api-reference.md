@@ -460,8 +460,20 @@ Body fields:
 
 - `content` — the user utterance. Max 4096 chars.
 - `client_msg_id` — 26..36 ASCII-printable chars (any UUID or ULID).
-  Replaying the same `(session_id, client_msg_id)` returns `409 duplicate`
-  rather than generating a second reply.
+  Replaying the same `(session_id, client_msg_id)` is a conflict **only when
+  the turn already produced something**: an assistant reply already exists
+  (retrying would double-bill), or the turn was deliberately interrupted (see
+  [`turn/interrupt`](#post-compvoicesession_idturninterrupt) below) — either
+  way returns `409 duplicate`. With neither — an abnormal disconnect, or an
+  upstream failure that exhausted every candidate model — the replay
+  **regenerates**: it reuses the persisted user row and issues a fresh call
+  rather than erroring. On that repair path the request body's `content` is
+  **ignored**; the previously persisted utterance is authoritative (a
+  mismatch is only logged as a warning, never rejected), because the
+  per-turn recall embeds that text as its query and must not drift between
+  attempts. This also means a retry after an `Error { retryable: true }`
+  frame now actually succeeds, instead of being turned away by the very
+  duplicate check the client was told it could pass.
 - `relationship_scope` (optional) — which halves of the relationship line
   to inject this turn: `"none"`, `"bond"`, `"chemistry"`, `"both"`
   (default `"both"`). The resolved value is recorded on the assistant
@@ -478,6 +490,93 @@ Body fields:
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
+### `POST /comp/voice/{session_id}/turn/interrupt`
+
+Reports a deliberate barge-in: the user started talking while the client was
+still playing the companion's reply.
+
+**This endpoint does not stop generation.** Aborting the client's SSE
+connection to `turn/stream` already does that — the stream generator is
+dropped at its current await point, which drops the upstream connection with
+it. This endpoint's only job is to record **what was actually heard**, which
+the aborted generator can no longer do itself: its persist step sits after
+the streaming loop and never runs on a drop. Plain JSON in, plain JSON out —
+this is not an SSE route.
+
+**No `501 voice_disabled` gate**, unlike `turn/stream`. This endpoint makes
+no LLM call, so gating it on `[tasks.chat_voice]` would make an in-flight
+call's interrupt fail if the deployment's config changed mid-call.
+
+Body:
+
+```json
+{ "client_msg_id": "01JABCDEFGHJKMNPQRSTVWXYZ0", "spoken_text": "你今天过得" }
+```
+
+- `client_msg_id` — the turn being interrupted, same 26..36 ASCII-printable
+  format as `turn/stream`. It **must be the session's latest user turn** —
+  see the guard below.
+- `spoken_text` — what TTS actually played, verbatim. MAY be empty (the user
+  cut in before any audible word); an empty string writes no assistant
+  content at all — only the marker on the user row records that an interrupt
+  happened. Max 4096 chars.
+
+Response `200`:
+
+```json
+{ "message_id": "01JABCDEFGHJKMNPQRSTVWXYZ0" }
+```
+
+`message_id` is the assistant row that now holds the spoken text, or `null`
+when nothing was played and no reply row exists to point at.
+
+**Latest-turn guard.** A `client_msg_id` naming anything other than the
+session's most recent user row is rejected with `409 not_latest_turn`.
+Without this guard, the upsert below would let a client overwrite the
+`content` of **any** past assistant reply — you can only barge in on what is
+currently being spoken. This puts an ordering requirement on the client:
+**send the interrupt before starting the next turn.** A late interrupt is
+rejected and the turn simply degrades to the abnormal-disconnect state
+(recoverable via `turn/stream`'s regeneration, described above) rather than
+rewriting history.
+
+**Upsert semantics (completion race).** The abort and the interrupt POST are
+two separate round trips, so the server may not have processed the SSE
+disconnect yet — `turn/stream`'s own post-stream persist can still land
+concurrently. Both writers target the same assistant row (keyed on the user
+row's id, `ON CONFLICT (user_message_id) WHERE role='assistant' AND
+channel='voice'`), so exactly one row survives regardless of arrival order,
+and its `content` always ends up as the interrupt's report:
+
+| Assistant row | `spoken_text` | Result |
+|---|---|---|
+| absent | non-empty | inserted, `truncated = true` |
+| absent | empty | no assistant row written |
+| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `relationship_scope` metadata preserved |
+| already exists (race) | empty | `content` left untouched |
+
+Repeated interrupt calls for the same turn are idempotent — the marker and
+the upsert both key off the user row's id, so a retry cannot multiply rows.
+
+Status ladder:
+
+| Status | Code | When |
+|---|---|---|
+| 200 | — | interrupt recorded (see body above) |
+| 400 | `invalid_payload` | `client_msg_id` outside 26..36 ASCII-printable chars |
+| 403 | `session_forbidden` | session not owned by the JWT user |
+| 404 | `session_not_found` | unknown `session_id` |
+| 404 | `turn_not_found` | `client_msg_id` names no user row in this session |
+| 409 | `wrong_channel` | session is not a voice-channel session |
+| 409 | `not_latest_turn` | the named turn is not the session's latest user row |
+| 422 | `unprocessable` | `spoken_text` longer than 4096 chars |
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","spoken_text":"你今天过得"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
 ## Persona
@@ -797,7 +896,10 @@ The streaming routes (`POST /comp/chat/{session_id}/message/stream`, `POST
 /persona/{instance_id}/image/compose`) are the exception: most of the
 failure modes on all three routes use the `code` / `message` /
 `user_message` shape described under "Pre-stream errors" above, with no
-`"error"` key. The table below covers the plain shape:
+`"error"` key. `POST /comp/voice/{session_id}/turn/interrupt` shares that
+same error body shape even though it is not itself a stream (its success
+response is plain JSON) — it reuses the voice turn's precondition checks and
+error type. The table below covers the plain shape:
 
 | Status | Code | When |
 |--------|------|------|

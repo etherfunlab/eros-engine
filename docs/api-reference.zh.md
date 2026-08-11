@@ -400,8 +400,17 @@ Body 字段：
 
 - `content` —— 用户说的那句话。最长 4096 字符。
 - `client_msg_id` —— 26..36 个 ASCII 可打印字符（任意 UUID 或 ULID）。同一组
-  `(session_id, client_msg_id)` 重放会返回 `409 duplicate`，而不是再生成一条
-  回复。
+  `(session_id, client_msg_id)` 重放，**只有在该轮次已经产生了结果时**才算
+  冲突：已经存在一条 assistant 回复（重试会重复计费），或者该轮次被主动
+  打断过（见下面的
+  [`turn/interrupt`](#post-compvoicesession_idturninterrupt)）——这两种情况
+  都返回 `409 duplicate`。两者都不成立时——异常断连，或者候选模型全部失败、
+  上游调用耗尽——重放会**重新生成**：复用已落库的 user 行，发起一次新的调用，
+  而不是报错。走这条修复路径时，请求体里的 `content` 会被**忽略**；已落库
+  的那句话才是权威版本（内容不一致只会记一条 warn 日志，绝不会拒绝请求），
+  因为每轮召回会把这段文字当作查询向量，同一轮次的多次尝试之间不能漂移。
+  这也意味着：客户端在收到 `Error { retryable: true }` 帧之后再重试，现在
+  真的能成功了，不会再被本该放行的重复检查挡回去。
 - `relationship_scope`（可选）—— 本轮注入关系描述的哪几半：`"none"`、`"bond"`、
   `"chemistry"`、`"both"`（默认 `"both"`）。解析后的取值记录在 assistant 行的
   `metadata.relationship_scope` 上。
@@ -416,6 +425,84 @@ Body 字段：
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
+```
+
+### `POST /comp/voice/{session_id}/turn/interrupt`
+
+上报一次主动打断（barge-in）：companion 的回复还在播放的时候，用户开始说话了。
+
+**这个端点不负责停止生成。** 客户端断开 `turn/stream` 的 SSE 连接就已经做到
+这件事——stream 生成器在当前的 await 点被 drop，连带把上游连接也关掉了。这个
+端点唯一的任务是记录**用户实际听到了什么**，这正是被 drop 掉的生成器再也做不
+到的事：它的落库步骤在流式循环之后才跑，drop 时根本不会执行到。这里是纯 JSON
+的请求/响应——不是 SSE 路由。
+
+**没有 `501 voice_disabled` 门槛**，跟 `turn/stream` 不一样。这个端点不发起
+任何 LLM 调用，只是写几行数据库记录；把它也挂在 `[tasks.chat_voice]` 上，会
+导致部署方运行中途改配置时，一通正在进行的电话的打断请求跟着失败。
+
+Body：
+
+```json
+{ "client_msg_id": "01JABCDEFGHJKMNPQRSTVWXYZ0", "spoken_text": "你今天过得" }
+```
+
+- `client_msg_id` —— 被打断的那个轮次，格式跟 `turn/stream` 一样：26..36 个
+  ASCII 可打印字符。**必须是该 session 最新的一个 user 轮次**——见下面的守卫。
+- `spoken_text` —— TTS 实际播放出来的内容，原样传。可以是空字符串（用户在
+  任何声音播出之前就打断了）；空字符串不会写入任何 assistant 内容——只有
+  user 行上的标记会记录下发生过一次打断。最长 4096 字符。
+
+Response `200`：
+
+```json
+{ "message_id": "01JABCDEFGHJKMNPQRSTVWXYZ0" }
+```
+
+`message_id` 是现在持有这段话的 assistant 行 id；如果什么都没播出、也没有
+回复行可指，就是 `null`。
+
+**最新轮次守卫。** 如果 `client_msg_id` 指向的不是该 session 最新的 user 行，
+会被 `409 not_latest_turn` 拒绝。没有这层守卫，下面的 upsert 就能让客户端改写
+**任意一条历史** assistant 回复的 `content`——你只能打断正在说的那句话。这给
+客户端加了一条顺序要求：**打断请求要在下一轮开始之前发出。** 迟到的打断会被
+拒绝，该轮次就退化成异常断连状态（可以走上面 `turn/stream` 的重新生成路径
+恢复），而不会去改写历史。
+
+**Upsert 语义（完成竞态）。** 断连和打断 POST 是两次独立的往返请求，服务器
+可能还没处理完 SSE 的断开信号，`turn/stream` 自己在流式结束后的落库就有可能
+同时落地。两个写入者落的是同一条 assistant 行（以 user 行的 id 为键，
+`ON CONFLICT (user_message_id) WHERE role='assistant' AND channel='voice'`），
+所以不管到达顺序如何，最终都只会剩一行，而它的 `content` 永远以打断上报的为
+准：
+
+| assistant 行 | `spoken_text` | 结果 |
+|---|---|---|
+| 不存在 | 非空 | 插入一行，`truncated = true` |
+| 不存在 | 空 | 不写 assistant 行 |
+| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `relationship_scope` 元数据 |
+| 已存在（竞态） | 空 | `content` 保持不动 |
+
+同一轮次重复调用打断接口是幂等的——标记和 upsert 都以 user 行的 id 为键，重试
+不会让行数翻倍。
+
+状态码梯度：
+
+| 状态码 | code | 何时 |
+|---|---|---|
+| 200 | — | 打断已记录（见上面的 body） |
+| 400 | `invalid_payload` | `client_msg_id` 不在 26..36 个 ASCII 可打印字符范围内 |
+| 403 | `session_forbidden` | session 不属于该 JWT 用户 |
+| 404 | `session_not_found` | `session_id` 不存在 |
+| 404 | `turn_not_found` | `client_msg_id` 在该 session 里找不到对应的 user 行 |
+| 409 | `wrong_channel` | session 不是语音频道 session |
+| 409 | `not_latest_turn` | 指定的轮次不是该 session 最新的 user 行 |
+| 422 | `unprocessable` | `spoken_text` 超过 4096 字符 |
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","spoken_text":"你今天过得"}' \
+  http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
 ## Persona
@@ -706,7 +793,10 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 /comp/voice/{session_id}/turn/stream`、`POST
 /persona/{instance_id}/image/compose`）是例外：这三个路由的大多数失败情形
 用的是上文"流前错误"段落描述的 `code` / `message` /
-`user_message` 形状，没有 `"error"` 字段。下表覆盖的是普通形状：
+`user_message` 形状，没有 `"error"` 字段。`POST
+/comp/voice/{session_id}/turn/interrupt` 本身不是流式接口（成功时返回的是
+普通 JSON），但复用了语音轮次的前置检查和错误类型，错误响应用的也是这同一套
+形状。下表覆盖的是普通形状：
 
 | 狀態碼 | code | 何時 |
 |--------|------|------|

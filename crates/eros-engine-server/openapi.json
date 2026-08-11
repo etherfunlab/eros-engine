@@ -642,6 +642,105 @@
         ]
       }
     },
+    "/comp/voice/{session_id}/turn/interrupt": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Report a deliberate barge-in on the turn currently being spoken.",
+        "description": "Stopping generation is NOT this endpoint's job — aborting the SSE already\ndoes that (the stream generator is dropped, which closes the upstream\nconnection). This endpoint records what the user actually HEARD, which the\naborted generator can no longer do: its persist step sits after the\nstreaming loop and never runs.\n\nDeliberately has no `501 voice_disabled` gate — it makes no LLM call, and\ngating it on `[tasks.chat_voice]` would make an in-flight call's interrupt\nfail if the deployment's config changed mid-call.",
+        "operationId": "voice_turn_interrupt",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Voice-channel session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceInterruptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceInterruptResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/voice/{session_id}/turn/stream": {
       "post": {
         "tags": [
@@ -2119,6 +2218,35 @@
                 "$ref": "#/components/schemas/LabelTransitionDto"
               }
             ]
+          }
+        }
+      },
+      "VoiceInterruptRequest": {
+        "type": "object",
+        "required": [
+          "client_msg_id",
+          "spoken_text"
+        ],
+        "properties": {
+          "client_msg_id": {
+            "type": "string",
+            "description": "The `client_msg_id` of the turn being interrupted. MUST be the\nsession's latest user turn — you can only barge in on what is\ncurrently being spoken."
+          },
+          "spoken_text": {
+            "type": "string",
+            "description": "What TTS actually played, verbatim. MAY be empty (the user cut in\nbefore the first audible word), in which case no assistant content is\nwritten and only the interrupt marker records the turn."
+          }
+        }
+      },
+      "VoiceInterruptResponse": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The assistant row that now holds the spoken text, or `null` when\nnothing was played and no reply row exists."
           }
         }
       },
