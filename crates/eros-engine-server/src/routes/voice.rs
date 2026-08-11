@@ -675,6 +675,169 @@ mod tests {
         );
     }
 
+    /// A 512-dim one-hot vector — a query embedded at the same seed is the
+    /// exact nearest neighbour of a row stored at it. Mirrors
+    /// `pipeline::voice::tests::unit_embedding`.
+    fn unit_embedding(seed: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[seed % 512] = 1.0;
+        v
+    }
+
+    /// An `EmbeddingRouter` whose read backend is a wiremock server. Mirrors
+    /// `pipeline::voice::tests::embed_router`.
+    fn embed_router(uri: &str) -> eros_engine_llm::embedding::EmbeddingRouter {
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{uri}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n"
+        ))
+        .expect("embedding provider config parses");
+        eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&cfg, |k| {
+            (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+        })
+        .expect("mock embedding router builds")
+    }
+
+    /// The route-level counterpart to
+    /// `pipeline::voice::tests::repair_uses_persisted_content_not_the_retry_body`:
+    /// that test proves `run_voice_turn` respects whatever `VoiceTurn.content`
+    /// it is handed, but never reaches the `Duplicate` arm where the ACTUAL
+    /// choice between `st.content` (persisted) and `req.content` (retry body)
+    /// is made. This drives the real HTTP route end to end — orphaned turn,
+    /// then a retry whose body carries DIFFERENT content — and inspects the
+    /// upstream request the route's regeneration actually issued.
+    ///
+    /// Same discrimination technique as the pipeline test: the embed mock
+    /// answers ONLY a query built from the persisted text (any other query,
+    /// e.g. the retry body's, 404s and recall degrades to nothing), and the
+    /// one memory row it can find carries a marker that appears nowhere else
+    /// in the prompt — so a populated recall block in the CAPTURED upstream
+    /// request is proof the persisted text, not the retry's, drove the
+    /// search. Reverting `content: persisted_content` back to
+    /// `content: req.content` at the route's `Duplicate` arm makes this test
+    /// fail (verified — see the task report's sabotage transcript).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn duplicate_regenerates_using_persisted_content_not_retry_body(pool: PgPool) {
+        use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
+        use wiremock::matchers::{body_partial_json, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+
+        let persisted_text = "persisted words";
+        let retry_text = "different words";
+        let client_msg_id = "01J9CONTENT0000000000000003";
+
+        // Abnormal disconnect: the FIRST attempt's utterance landed, nothing
+        // else — no reply, no marker.
+        let chat_repo = ChatRepo { pool: &pool };
+        match chat_repo
+            .insert_voice_user_message(session_id, persisted_text, client_msg_id)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(_) => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+
+        // The embed mock answers ONLY a query built from the persisted text.
+        let embed = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "input": [persisted_text] }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "data": [ { "embedding": unit_embedding(7) } ] }),
+            ))
+            .mount(&embed)
+            .await;
+
+        // One memory row, findable only by the persisted-text query's vector.
+        MemoryRepo { pool: &pool }
+            .upsert(
+                MemoryLayer::Profile,
+                session_id,
+                user_id,
+                None,
+                "TOKYO_MARKER_SNIPPET",
+                &unit_embedding(7),
+                Some("preference"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\
+                         \"id\":\"gen-route-repair\",\"model\":\"primary\"}\n\n\
+                         data: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = with_voice(crate::routes::companion::test_state(pool.clone()));
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        state.embed = Arc::new(embed_router(&embed.uri()));
+        let mut app = build_router(state);
+
+        // The RETRY: same client_msg_id, but DIFFERENT content — must be
+        // discarded in favour of the persisted row.
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({ "content": retry_text, "client_msg_id": client_msg_id }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drive the SSE body to completion so the mocked upstream is actually
+        // hit (the pipeline's async_stream! only runs as the body is polled).
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let sse_text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !sse_text.contains("\"type\":\"error\""),
+            "no error frame expected: {sse_text}"
+        );
+
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let last = received.last().expect("at least one upstream request");
+        let wire: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+        let wire_str = wire.to_string();
+
+        assert!(
+            wire_str.contains("TOKYO_MARKER_SNIPPET"),
+            "recall must have used the PERSISTED text as its query — a wrong \
+             query would 404 the embed mock and leave no recall block: {wire_str}"
+        );
+        assert!(
+            wire_str.contains(persisted_text),
+            "the persisted utterance must reach the upstream request: {wire_str}"
+        );
+        assert!(
+            !wire_str.contains(retry_text),
+            "the retry body's text must never reach the upstream request: {wire_str}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn duplicate_still_409_after_interrupt(pool: PgPool) {
         let user_id = Uuid::new_v4();
