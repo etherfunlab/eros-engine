@@ -3366,6 +3366,10 @@ max_tokens   = 600
 description  = "AI companion chat"
 allow_traits = ["allow_politics"]
 input_filter = true
+top_p              = 0.9
+frequency_penalty  = 0.4
+presence_penalty   = 0.2
+repetition_penalty = 1.15
 
 [tasks.chat_companion.tiers.gold]
 model        = "x-ai/grok-4.20"
@@ -3445,6 +3449,11 @@ filter_prompt = "Answer product questions from the docs."
         );
         assert_eq!(chat.temperature, Some(0.85));
         assert_eq!(chat.max_tokens, Some(600));
+        // Sampling knobs round-trip (schema lock, issue #246).
+        assert_eq!(chat.top_p, Some(0.9));
+        assert_eq!(chat.frequency_penalty, Some(0.4));
+        assert_eq!(chat.presence_penalty, Some(0.2));
+        assert_eq!(chat.repetition_penalty, Some(1.15));
         assert_eq!(chat.description, "AI companion chat");
         // New optional fields round-trip (schema lock for `allow_traits` + `tiers`).
         assert_eq!(chat.allow_traits, Some(vec!["allow_politics".to_string()]));

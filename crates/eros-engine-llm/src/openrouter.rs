@@ -1311,6 +1311,35 @@ mod tests {
         assert!(body.get("never").is_none(), "non-matching rule skipped");
     }
 
+    #[test]
+    fn body_rules_override_max_tokens_and_sampling() {
+        // Companion lock to the test above, which only covers `temperature`.
+        // `[[providers.<name>.body]]` params beat every engine-built wire
+        // field; only the three engine-owned structural keys
+        // (model/messages/stream) are exempt, and those are refused at boot.
+        // Issue #246 leans on this being true for max_tokens and the four
+        // sampling knobs, so it is locked rather than assumed.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "temperature": 0.5,
+            "max_tokens": 200,
+            "top_p": 0.9,
+            "repetition_penalty": 1.0
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let rules = [rule(
+            Some(&["chat_image_prompt_compose"]),
+            serde_json::json!({"max_tokens": 900, "top_p": 0.5, "repetition_penalty": 1.25}),
+        )];
+        apply_body_rules(&mut body, &rules, Some("chat_image_prompt_compose"));
+        assert_eq!(body["max_tokens"], 900, "body params win on max_tokens");
+        assert_eq!(body["top_p"], 0.5, "body params win on top_p");
+        assert_eq!(body["repetition_penalty"], 1.25);
+        assert_eq!(body["temperature"], 0.5, "untouched keys survive");
+    }
+
     #[tokio::test]
     async fn client_sends_configured_openrouter_headers() {
         let server = MockServer::start().await;
