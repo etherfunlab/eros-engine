@@ -245,7 +245,7 @@ pub async fn voice_turn_stream(
     // or an upstream failure, which already told the client `retryable: true` —
     // so it regenerates against the persisted user row.
     let (user_message_id, persisted_content) = match chat_repo
-        .insert_voice_user_message(session_id, &req.content, &req.client_msg_id)
+        .insert_voice_user_message(session_id, &req.content, &req.client_msg_id, None)
         .await?
     {
         VoiceUserInsert::Inserted(id) => (id, req.content),
@@ -627,7 +627,7 @@ mod tests {
         // request already landed it.
         let chat_repo = ChatRepo { pool: &pool };
         let user_message_id = match chat_repo
-            .insert_voice_user_message(session_id, "hi", client_msg_id)
+            .insert_voice_user_message(session_id, "hi", client_msg_id, None)
             .await
             .unwrap()
         {
@@ -821,7 +821,7 @@ mod tests {
         // else — no reply, no marker.
         let chat_repo = ChatRepo { pool: &pool };
         match chat_repo
-            .insert_voice_user_message(session_id, persisted_text, client_msg_id)
+            .insert_voice_user_message(session_id, persisted_text, client_msg_id, None)
             .await
             .unwrap()
         {

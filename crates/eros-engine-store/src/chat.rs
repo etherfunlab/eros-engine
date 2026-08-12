@@ -942,6 +942,7 @@ impl<'a> ChatRepo<'a> {
         session_id: Uuid,
         content: &str,
         client_msg_id: &str,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<VoiceUserInsert, sqlx::Error> {
         // Atomic: on a (session_id, client_msg_id) conflict — the partial unique
         // index chat_messages_client_msg_id_uidx (WHERE client_msg_id IS NOT NULL,
@@ -950,14 +951,15 @@ impl<'a> ChatRepo<'a> {
         // Duplicate, never a unique-violation 500).
         let mut tx = self.pool.begin().await?;
         let inserted: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel) \
-             VALUES ($1, 'user', $2, $3, 'voice') \
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id, channel, metadata) \
+             VALUES ($1, 'user', $2, $3, 'voice', $4) \
              ON CONFLICT (session_id, client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING \
              RETURNING id",
         )
         .bind(session_id)
         .bind(content)
         .bind(client_msg_id)
+        .bind(metadata)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(id) = inserted {
@@ -3210,7 +3212,7 @@ mod tests {
         // User insert: idempotent on client_msg_id.
         let cmid = "01J9000000000000000000VOICE";
         let u1 = match repo
-            .insert_voice_user_message(session_id, "hello", cmid)
+            .insert_voice_user_message(session_id, "hello", cmid, None)
             .await
             .unwrap()
         {
@@ -3218,7 +3220,7 @@ mod tests {
             other => panic!("expected Inserted, got {other:?}"),
         };
         match repo
-            .insert_voice_user_message(session_id, "hello again", cmid)
+            .insert_voice_user_message(session_id, "hello again", cmid, None)
             .await
             .unwrap()
         {
@@ -3275,6 +3277,50 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn voice_user_insert_writes_metadata_verbatim(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+
+        let raw = serde_json::json!({
+            "affinity_scope_raw": "full",
+            "memory_scope_raw": "none",
+        });
+        let id = match repo
+            .insert_voice_user_message(session_id, "hi", "01J9RAWMETA000000000000001", Some(&raw))
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta, raw, "metadata must be written verbatim");
+
+        // None ⇒ SQL NULL, same shape as every pre-existing voice user row.
+        let id2 = match repo
+            .insert_voice_user_message(session_id, "hi", "01J9RAWMETA000000000000002", None)
+            .await
+            .unwrap()
+        {
+            VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let is_null: bool = sqlx::query_scalar(
+            "SELECT metadata IS NULL FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(id2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_null, "no raw fields ⇒ metadata stays NULL");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn voice_insert_duplicate_against_gift_user_row_is_not_500(pool: PgPool) {
         // A voice request reusing a client_msg_id that already exists on a tip
         // (`gift_user`) row must be classified as Duplicate (→ 409), not error
@@ -3295,7 +3341,7 @@ mod tests {
         let repo = ChatRepo { pool: &pool };
         // Must NOT panic (no RowNotFound → no 500); must be Duplicate.
         let out = repo
-            .insert_voice_user_message(session_id, "hi", cmid)
+            .insert_voice_user_message(session_id, "hi", cmid, None)
             .await
             .unwrap();
         assert!(
@@ -3326,7 +3372,7 @@ mod tests {
                 .unwrap();
 
         let out = repo
-            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP1")
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP1", None)
             .await
             .unwrap();
         assert!(
@@ -3353,7 +3399,7 @@ mod tests {
         let cmid = "01J9000000000000000000BUMP2";
 
         let first = match repo
-            .insert_voice_user_message(session_id, "hi", cmid)
+            .insert_voice_user_message(session_id, "hi", cmid, None)
             .await
             .unwrap()
         {
@@ -3378,7 +3424,7 @@ mod tests {
                 .unwrap();
 
         let out = repo
-            .insert_voice_user_message(session_id, "hi again", cmid)
+            .insert_voice_user_message(session_id, "hi again", cmid, None)
             .await
             .unwrap();
         match out {
@@ -3405,7 +3451,7 @@ mod tests {
         let repo = ChatRepo { pool: &pool };
 
         let user_message_id = match repo
-            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP3")
+            .insert_voice_user_message(session_id, "hi", "01J9000000000000000000BUMP3", None)
             .await
             .unwrap()
         {
@@ -3463,7 +3509,7 @@ mod tests {
         let session_id = throwaway_session(pool).await.id;
         let repo = ChatRepo { pool };
         let user_mid = match repo
-            .insert_voice_user_message(session_id, content, &format!("cmid-{}", Uuid::new_v4()))
+            .insert_voice_user_message(session_id, content, &format!("cmid-{}", Uuid::new_v4()), None)
             .await
             .unwrap()
         {

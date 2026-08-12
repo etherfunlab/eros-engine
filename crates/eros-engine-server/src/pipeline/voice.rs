@@ -1453,7 +1453,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOICE")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOICE", None)
             .await
             .unwrap()
         {
@@ -1608,7 +1608,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(voice_session_id, "hello", "01J9000000000000000000VOIC7")
+            .insert_voice_user_message(voice_session_id, "hello", "01J9000000000000000000VOIC7", None)
             .await
             .unwrap()
         {
@@ -1720,7 +1720,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC3")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC3", None)
             .await
             .unwrap()
         {
@@ -1853,7 +1853,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC4")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC4", None)
             .await
             .unwrap()
         {
@@ -1990,7 +1990,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC2")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC2", None)
             .await
             .unwrap()
         {
@@ -2115,7 +2115,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC5")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC5", None)
             .await
             .unwrap()
         {
@@ -2238,7 +2238,7 @@ data: [DONE]\n\n";
 
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC8")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC8", None)
             .await
             .unwrap()
         {
@@ -2360,7 +2360,7 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC6")
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC6", None)
             .await
             .unwrap()
         {
@@ -2587,7 +2587,7 @@ data: [DONE]\n\n";
             .unwrap()
             .expect("session exists");
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", client_msg_id)
+            .insert_voice_user_message(session_id, "hello", client_msg_id, None)
             .await
             .unwrap()
         {
@@ -2797,7 +2797,7 @@ data: [DONE]\n\n";
         assert_eq!(rows, 1, "the winner's own write must succeed");
 
         let umid = match repo
-            .insert_voice_user_message(session_id, "hello", "01J9BOOTRACE0000000001")
+            .insert_voice_user_message(session_id, "hello", "01J9BOOTRACE0000000001", None)
             .await
             .unwrap()
         {
@@ -3315,7 +3315,7 @@ data: [DONE]\n\n";
             .unwrap()
             .expect("session exists");
         let umid = match repo
-            .insert_voice_user_message(session_id, opts.content, opts.client_msg_id)
+            .insert_voice_user_message(session_id, opts.content, opts.client_msg_id, None)
             .await
             .unwrap()
         {
@@ -3645,7 +3645,7 @@ data: [DONE]\n\n";
         // else — no reply, no marker.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, persisted_text, "01J9CONTENT00000000000001")
+            .insert_voice_user_message(session_id, persisted_text, "01J9CONTENT00000000000001", None)
             .await
             .unwrap()
         {
@@ -3798,7 +3798,7 @@ data: [DONE]\n\n";
         // the shape the (fixed) route's duplicate-gate repair takes.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, "still there?", "01J9BOOT0000000000000002")
+            .insert_voice_user_message(session_id, "still there?", "01J9BOOT0000000000000002", None)
             .await
             .unwrap()
         {
