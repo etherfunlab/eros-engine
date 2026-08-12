@@ -121,14 +121,34 @@ Changes are at the ends of the pipeline:
 
 ## §3 Migration `0042_drop_companion_insights.sql`
 
-1. **Final reconciliation backfill** (belt-and-braces — the live mirror should
-   already be in sync): per-column projection `FROM engine.companion_insights` with
-   `ON CONFLICT (user_id) DO UPDATE` — existing `human_insights` values win;
-   only gaps are filled. Scalars: `COALESCE(hi.col, projected)`. Arrays are
+1. **Final reconciliation backfill:** per-column projection
+   `FROM engine.companion_insights` with `ON CONFLICT (user_id) DO UPDATE` —
+   **the projected JSONB wins; the typed row survives only where the source has
+   nothing to say.** Scalars: `COALESCE(projected, hi.col)`. Arrays are
    `NOT NULL DEFAULT '{}'` so COALESCE never fires; use
-   `CASE WHEN hi.col = '{}' THEN projected ELSE hi.col END`. Off-schema keys
-   the JSONB may have accumulated are not projected and are discarded with the
-   table.
+   `CASE WHEN projected = '{}' THEN hi.col ELSE projected END`. `updated_at`
+   moves to `now()`, since a conflicting row can now actually be rewritten.
+
+   ⚠️ **This precedence was reversed during the pre-promotion review, and the
+   reversal is the point.** The original draft had the typed row win, on the
+   reasoning that the live mirror should already be in sync. It is not
+   guaranteed to be: the old write path (`post_process.rs`) committed the
+   `companion_insights` merge and then treated a failed `project_from_insights`
+   as `warn!` and moved on. Any user whose projection ever failed therefore has
+   a **stale typed row and an authoritative blob** — exactly the case the
+   backfill exists for — and letting the typed row win would pin them to the
+   stale value and then destroy the good one at step 2, silently and with no
+   recovery path but a database backup. Read "mirror" throughout this document
+   as *projection of the source*, never as *equal to the source*.
+
+   Array elements are filtered `WHERE v IS NOT NULL`: `jsonb_array_elements_text`
+   maps a JSON `null` element to SQL NULL, `ARRAY(...)` keeps it, and the Rust
+   rows type these columns `Vec<String>` — one `["coffee", null]` would make
+   every later read of that user's row fail to decode, with the source already
+   dropped.
+
+   Off-schema keys the JSONB may have accumulated are not projected and are
+   discarded with the table.
 2. `DROP TABLE engine.companion_insights;`
 3. `CREATE TABLE engine.human_insights_snapshot (id UUID PK DEFAULT
    gen_random_uuid(), user_id UUID NOT NULL, snapshot JSONB NOT NULL,
