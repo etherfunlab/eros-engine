@@ -3310,13 +3310,12 @@ mod tests {
             VoiceUserInsert::Inserted(id) => id,
             other => panic!("expected Inserted, got {other:?}"),
         };
-        let is_null: bool = sqlx::query_scalar(
-            "SELECT metadata IS NULL FROM engine.chat_messages WHERE id = $1",
-        )
-        .bind(id2)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let is_null: bool =
+            sqlx::query_scalar("SELECT metadata IS NULL FROM engine.chat_messages WHERE id = $1")
+                .bind(id2)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(is_null, "no raw fields ⇒ metadata stays NULL");
     }
 
@@ -3509,7 +3508,12 @@ mod tests {
         let session_id = throwaway_session(pool).await.id;
         let repo = ChatRepo { pool };
         let user_mid = match repo
-            .insert_voice_user_message(session_id, content, &format!("cmid-{}", Uuid::new_v4()), None)
+            .insert_voice_user_message(
+                session_id,
+                content,
+                &format!("cmid-{}", Uuid::new_v4()),
+                None,
+            )
             .await
             .unwrap()
         {
