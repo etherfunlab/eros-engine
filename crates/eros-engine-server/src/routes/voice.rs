@@ -633,14 +633,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// Drive one mocked voice turn to completion and return nothing — the
-    /// caller asserts on the DB rows it left behind.
+    /// Byte-anchors for the two relationship-line halves at a fresh
+    /// (all-default) affinity row — Acquaintance bond text / Spark chemistry
+    /// text. Distinctive substrings that appear nowhere else in the prompt.
+    const BOND_LINE_MARK: &str = "still getting to know each other";
+    const CHEM_LINE_MARK: &str = "unspoken spark";
+
+    /// Seed a default-tier affinity row for the session's (user, instance)
+    /// pair so the relationship line renders at all — the voice pipeline
+    /// resolves affinity by user × instance, not by session.
+    async fn seed_affinity(pool: &PgPool, session_id: Uuid, user_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity (session_id, user_id, instance_id) \
+             SELECT $1, $2, instance_id FROM engine.chat_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Drive one mocked voice turn to completion and return the upstream
+    /// chat-completions request as its wire JSON string — the caller asserts
+    /// on the DB rows it left behind AND on the prompt actually served, so
+    /// the audit metadata can never drift from the prompt unnoticed.
     async fn run_mocked_turn(
         pool: &PgPool,
         session_id: Uuid,
         user_id: Uuid,
         body: serde_json::Value,
-    ) {
+    ) -> String {
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let mock = MockServer::start().await;
@@ -675,6 +698,14 @@ mod tests {
             !sse_text.contains("\"type\":\"error\""),
             "no error frame expected: {sse_text}"
         );
+        let received = mock
+            .received_requests()
+            .await
+            .expect("recording enabled by default");
+        let last = received.last().expect("at least one upstream request");
+        serde_json::from_slice::<serde_json::Value>(&last.body)
+            .unwrap()
+            .to_string()
     }
 
     /// Requirement: the two vocabularies must not cross. The legacy value
@@ -748,7 +779,8 @@ mod tests {
     async fn affinity_scope_wins_over_relationship_scope(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let session_id = seed(&pool, user_id).await;
-        run_mocked_turn(
+        seed_affinity(&pool, session_id, user_id).await;
+        let wire = run_mocked_turn(
             &pool,
             session_id,
             user_id,
@@ -760,6 +792,12 @@ mod tests {
             }),
         )
         .await;
+        // The winner is `none`: with an affinity row seeded (the line WOULD
+        // render), neither half may reach the model.
+        assert!(
+            !wire.contains(BOND_LINE_MARK) && !wire.contains(CHEM_LINE_MARK),
+            "affinity_scope none must suppress the relationship line: {wire}"
+        );
         let (legacy, memory): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT metadata->>'relationship_scope', metadata->>'memory_scope' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
@@ -787,13 +825,18 @@ mod tests {
     async fn omitted_scopes_default_to_bond_with_no_raw_audit(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let session_id = seed(&pool, user_id).await;
-        run_mocked_turn(
+        seed_affinity(&pool, session_id, user_id).await;
+        let wire = run_mocked_turn(
             &pool,
             session_id,
             user_id,
             json!({"content": "hi", "client_msg_id": "01J9SCOPEDFLT0000000000001"}),
         )
         .await;
+        assert!(
+            wire.contains(BOND_LINE_MARK) && !wire.contains(CHEM_LINE_MARK),
+            "default bond must serve the bond half only: {wire}"
+        );
         let legacy: Option<String> = sqlx::query_scalar(
             "SELECT metadata->>'relationship_scope' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
@@ -824,7 +867,8 @@ mod tests {
     async fn affinity_scope_axes_array_resolves_and_echoes_raw(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let session_id = seed(&pool, user_id).await;
-        run_mocked_turn(
+        seed_affinity(&pool, session_id, user_id).await;
+        let wire = run_mocked_turn(
             &pool,
             session_id,
             user_id,
@@ -836,6 +880,11 @@ mod tests {
             }),
         )
         .await;
+        // trust ∈ chemistry half ⇒ the chemistry text alone reaches the model.
+        assert!(
+            wire.contains(CHEM_LINE_MARK) && !wire.contains(BOND_LINE_MARK),
+            "[\"trust\"] must serve the chemistry half only: {wire}"
+        );
         let legacy: Option<String> = sqlx::query_scalar(
             "SELECT metadata->>'relationship_scope' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
