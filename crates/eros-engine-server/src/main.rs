@@ -290,6 +290,14 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Sampling knobs (issue #246): an out-of-range value and any knob on
+    // [tasks.embedding] are dead config the provider would clamp, ignore, or
+    // 400 on inconsistently. Sits next to the tier gate because it refuses the
+    // same class — config that parses, boots, and does nothing.
+    if let Err(msg) = model_config.validate_sampling() {
+        anyhow::bail!(msg);
+    }
+
     // Embedding routing (spec 2026-08-01): read/write backends resolved from
     // [tasks.embedding] + [providers]. validate_providers has already gated
     // every failure mode; from_config re-checks keys defensively.
@@ -488,6 +496,17 @@ mod tests {
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_tier_blocks()
             .expect("shipped example must not carry a tier block on a non-tiering task");
+    }
+
+    /// The shipped example sets sampling knobs on [tasks.chat_companion] only,
+    /// all in range, and none on [tasks.embedding] — it MUST pass the sampling
+    /// boot gate, or `main` bails (#246).
+    #[test]
+    fn shipped_model_config_satisfies_sampling_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_sampling()
+            .expect("shipped example must pass the sampling boot gate");
     }
 
     #[test]

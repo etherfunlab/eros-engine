@@ -2471,7 +2471,76 @@ impl ModelConfig {
         }
         Ok(())
     }
+
+    /// Boot gate for the four sampling knobs (issue #246).
+    ///
+    /// Two refusals, both aimed at the same failure mode — config that parses,
+    /// boots, and does nothing:
+    ///
+    /// 1. Out-of-range or non-finite values. Providers handle these
+    ///    inconsistently (some 400, some clamp, some ignore), so an operator
+    ///    who typo'd `top_p = 9` would otherwise never learn.
+    /// 2. Any of the four on `[tasks.embedding]`. Embeddings take no
+    ///    chat-shaped sampling parameters at all, so the key could never do
+    ///    anything — leaving it silent would reproduce the very bug #246 fixed
+    ///    everywhere else.
+    ///
+    /// Task names are visited in sorted order so the message an operator sees
+    /// is stable across restarts.
+    pub fn validate_sampling(&self) -> Result<(), String> {
+        // (field, low, high, low_inclusive) — `high` is always inclusive.
+        const RANGES: [(&str, f32, f32, bool); 4] = [
+            ("top_p", 0.0, 1.0, false),
+            ("frequency_penalty", -2.0, 2.0, true),
+            ("presence_penalty", -2.0, 2.0, true),
+            ("repetition_penalty", 0.0, 2.0, false),
+        ];
+
+        let mut names: Vec<&String> = self.tasks.keys().collect();
+        names.sort();
+        for name in names {
+            let t = &self.tasks[name];
+            let values = [
+                t.top_p,
+                t.frequency_penalty,
+                t.presence_penalty,
+                t.repetition_penalty,
+            ];
+
+            for ((field, low, high, low_inclusive), value) in RANGES.iter().zip(values) {
+                let Some(v) = value else { continue };
+
+                if name == EMBEDDING_TASK {
+                    return Err(format!(
+                        "[tasks].{EMBEDDING_TASK}.{field}: embedding takes no chat-shaped \
+                         sampling parameters — the key could never do anything, so eros-engine \
+                         refuses to boot rather than let it silently no-op. Delete it. \
+                         Rationale: https://github.com/etherfunlab/eros-engine/issues/246"
+                    ));
+                }
+
+                if !v.is_finite() {
+                    return Err(format!(
+                        "[tasks].{name}.{field}: must be a finite number, got {v}"
+                    ));
+                }
+
+                let low_ok = if *low_inclusive { v >= *low } else { v > *low };
+                if !low_ok || v > *high {
+                    let open = if *low_inclusive { '[' } else { '(' };
+                    return Err(format!(
+                        "[tasks].{name}.{field}: must be in {open}{low:.1}, {high:.1}], got {v}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+/// The one task that takes no chat-shaped sampling parameters — see
+/// [`ModelConfig::validate_sampling`].
+const EMBEDDING_TASK: &str = "embedding";
 
 /// Tasks whose config the engine ever resolves with a tier. Everything else
 /// resolves tier-free, so a `[tasks.<other>.tiers.*]` block is dead config —
@@ -5228,6 +5297,75 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn validate_sampling_accepts_in_range_and_absent() {
+        for toml in [
+            "[tasks.chat_companion]\nmodel = \"m\"\n",
+            "[tasks.chat_companion]\nmodel = \"m\"\ntop_p = 1.0\nfrequency_penalty = -2.0\npresence_penalty = 2.0\nrepetition_penalty = 2.0\n",
+            "[tasks.pde_decision]\nmodel = \"m\"\ntop_p = 0.0001\nrepetition_penalty = 0.0001\n",
+            // embedding without sampling knobs is untouched
+            "[tasks.embedding]\nmodel = \"voyage-4-lite\"\n",
+        ] {
+            ModelConfig::from_toml_str(toml)
+                .unwrap()
+                .validate_sampling()
+                .unwrap_or_else(|e| panic!("must accept:\n{toml}\ngot: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_out_of_range() {
+        for (field, value) in [
+            ("top_p", "1.5"),
+            ("top_p", "0.0"),
+            ("top_p", "-0.1"),
+            ("frequency_penalty", "2.1"),
+            ("frequency_penalty", "-2.1"),
+            ("presence_penalty", "3.0"),
+            ("presence_penalty", "-3.0"),
+            ("repetition_penalty", "0.0"),
+            ("repetition_penalty", "2.5"),
+        ] {
+            let toml = format!("[tasks.pde_decision]\nmodel = \"m\"\n{field} = {value}\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .expect_err(&format!("{field} = {value} must refuse"));
+            assert!(err.contains(field), "{field}={value}: {err}");
+            assert!(err.contains("pde_decision"), "{field}={value}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_non_finite() {
+        for value in ["nan", "inf", "-inf"] {
+            let toml = format!("[tasks.pde_decision]\nmodel = \"m\"\ntop_p = {value}\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .unwrap_err();
+            assert!(err.contains("top_p"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_sampling_refuses_knobs_on_embedding() {
+        for field in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            let toml = format!("[tasks.embedding]\nmodel = \"voyage-4-lite\"\n{field} = 0.5\n");
+            let err = ModelConfig::from_toml_str(&toml)
+                .unwrap()
+                .validate_sampling()
+                .expect_err(&format!("embedding.{field} must refuse"));
+            assert!(err.contains("embedding"), "{field}: {err}");
+            assert!(err.contains(field), "{field}: {err}");
+        }
     }
 
     #[test]
