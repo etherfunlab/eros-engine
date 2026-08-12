@@ -11516,6 +11516,7 @@ data: [DONE]\n\n";
             retry_depth: 2,
             reasoning: None,
             structured_output: true,
+            sampling: Default::default(),
         }
     }
 
@@ -12633,6 +12634,7 @@ data: [DONE]\n\n"
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
             reasoning: None,
+            sampling: Default::default(),
         };
 
         let req = eros_engine_llm::openrouter::ChatRequest {
@@ -12877,6 +12879,7 @@ data: [DONE]\n\n"
             timing: eros_engine_llm::model_config::FilterTiming::AfterExtract,
             retry_depth: 0,
             reasoning: None,
+            sampling: Default::default(),
         };
 
         let req = eros_engine_llm::openrouter::ChatRequest {

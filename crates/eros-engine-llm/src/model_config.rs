@@ -1061,6 +1061,8 @@ pub struct ResolvedOutputFilter {
     /// only (no per-tier override), consistent with `chat_companion`'s own
     /// `reasoning` field shape.
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Per-turn trigger for the user-input rewrite filter (`input_filter` on
@@ -1133,6 +1135,8 @@ pub struct ResolvedInputFilter {
     /// trigger resolves to `None`). The stream wiring draws one coin flip per
     /// turn and runs the filter LLM only when `draw < probability`.
     pub probability: f64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved image-describe task (`chat_vision`). Mirrors `ResolvedInputFilter`
@@ -1181,6 +1185,8 @@ pub struct ResolvedVoice {
     pub reasoning: Option<ReasoningConfig>,
     pub directive: String,
     pub recall: bool,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Generic, product-identity-free default prompt for the image-prompt composer.
@@ -1225,6 +1231,8 @@ pub struct ResolvedImagePromptCompose {
     /// variant selection to speak of: `Plain`, no `filter_prompt`, or a miss
     /// (built-in prompt fallback).
     pub variant_key: Option<String>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved PDE decision task (`pde_decision`). Mirrors `ResolvedVision`: the
@@ -1241,6 +1249,8 @@ pub struct ResolvedPde {
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved product-QA executor task (`chat_product_qa`). Mirrors
@@ -1257,6 +1267,8 @@ pub struct ResolvedProductQa {
     pub answer_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved extraction task (`insight_extraction` facts stage / `memory_extraction`).
@@ -1273,6 +1285,8 @@ pub struct ResolvedExtract {
     pub extract_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-director task (`world_director`). The configured `filter_prompt`
@@ -1290,6 +1304,8 @@ pub struct ResolvedWorldDirector {
     pub structured_output: bool,
     pub interval_hours: u32,
     pub retention_days: u32,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-town comment-round task (`world_comment`). The configured
@@ -1306,6 +1322,8 @@ pub struct ResolvedWorldComment {
     pub reasoning: Option<ReasoningConfig>,
     pub structured_output: bool,
     pub round_secs: u64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-town reply-responder task (`world_reply`). Plain-text
@@ -1323,6 +1341,8 @@ pub struct ResolvedWorldReply {
     pub thread_cooldown_secs: u64,
     pub daily_cap: u32,
     pub reply_window_secs: u64,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Resolved world-stories task (`world_stories_director`). The configured
@@ -1342,6 +1362,8 @@ pub struct ResolvedWorldStories {
     pub retention_days: u32,
     pub active_window_hours: u32,
     pub context_days: u32,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Where the model config comes from, resolved from the two env vars.
@@ -1704,6 +1726,7 @@ impl ModelConfig {
             timing,
             retry_depth,
             reasoning,
+            sampling: m.sampling,
         })
     }
 
@@ -1751,6 +1774,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             probability,
+            sampling: m.sampling,
         })
     }
 
@@ -1818,6 +1842,7 @@ impl ModelConfig {
             reasoning: m.reasoning,
             directive,
             recall,
+            sampling: m.sampling,
         })
     }
 
@@ -1864,6 +1889,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             structured_output: task_cfg.structured_output.unwrap_or(true),
+            sampling: m.sampling,
         })
     }
 
@@ -1891,6 +1917,7 @@ impl ModelConfig {
             answer_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            sampling: m.sampling,
         })
     }
 
@@ -2020,6 +2047,7 @@ impl ModelConfig {
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
             variant_key,
+            sampling: m.sampling,
         })
     }
 }
@@ -2168,6 +2196,7 @@ impl ModelConfig {
             extract_prompt,
             retry_depth: m.retry_depth,
             reasoning: m.reasoning,
+            sampling: m.sampling,
         })
     }
 
@@ -2194,6 +2223,7 @@ impl ModelConfig {
             // not a meaningful "run continuously" setting.
             interval_hours: task_cfg.interval_hours.unwrap_or(24).max(1),
             retention_days: task_cfg.retention_days.unwrap_or(30),
+            sampling: m.sampling,
         })
     }
 
@@ -2217,6 +2247,7 @@ impl ModelConfig {
             reasoning: m.reasoning,
             structured_output: task_cfg.structured_output.unwrap_or(true),
             round_secs: task_cfg.round_secs.unwrap_or(3600).max(60),
+            sampling: m.sampling,
         })
     }
 
@@ -2263,6 +2294,7 @@ impl ModelConfig {
             thread_cooldown_secs: task_cfg.thread_cooldown_secs.unwrap_or(600),
             daily_cap: task_cfg.daily_cap.unwrap_or(20),
             reply_window_secs,
+            sampling: m.sampling,
         })
     }
 
@@ -2291,6 +2323,7 @@ impl ModelConfig {
             retention_days: task_cfg.retention_days.unwrap_or(30),
             active_window_hours: task_cfg.active_window_hours.unwrap_or(72).max(1),
             context_days: task_cfg.context_days.unwrap_or(7).max(1),
+            sampling: m.sampling,
         })
     }
 
@@ -5195,6 +5228,128 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn every_non_embedding_resolver_carries_sampling() {
+        // Issue #246 regression lock: a resolver that forgets `sampling: m.sampling`
+        // makes its task's config silently no-op. One distinct knob value per
+        // resolver, so a copy-paste that reads the wrong task also fails.
+        let cfg = ModelConfig::from_toml_str(
+            r#"
+[tasks.chat_companion]
+model = "m"
+output_filter = true
+input_filter = true
+top_p = 0.61
+
+[tasks.chat_output_filter]
+model = "m"
+filter_prompt = "rewrite"
+top_p = 0.62
+
+[tasks.chat_input_filter]
+model = "m"
+filter_prompt = "rewrite"
+top_p = 0.63
+
+[tasks.chat_voice]
+model = "m"
+top_p = 0.64
+
+[tasks.chat_image_prompt_compose]
+model = "m"
+top_p = 0.65
+
+[tasks.pde_decision]
+model = "m"
+filter_prompt = "judge"
+top_p = 0.66
+
+[tasks.chat_product_qa]
+model = "m"
+filter_prompt = "answer"
+top_p = 0.67
+
+[tasks.insight_extraction]
+model = "m"
+filter_prompt = "extract"
+top_p = 0.68
+
+[tasks.memory_extraction]
+model = "m"
+filter_prompt = "extract"
+top_p = 0.69
+
+[tasks.world_director]
+model = "m"
+filter_prompt = "direct"
+top_p = 0.70
+
+[tasks.world_comment]
+model = "m"
+filter_prompt = "comment"
+top_p = 0.71
+
+[tasks.world_reply]
+model = "m"
+filter_prompt = "reply"
+top_p = 0.72
+
+[tasks.world_stories_director]
+model = "m"
+filter_prompt = "stories"
+top_p = 0.73
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.resolve("chat_companion", None).sampling.top_p,
+            Some(0.61)
+        );
+        assert_eq!(
+            cfg.resolve_output_filter(None).unwrap().sampling.top_p,
+            Some(0.62)
+        );
+        assert_eq!(
+            cfg.resolve_input_filter().unwrap().sampling.top_p,
+            Some(0.63)
+        );
+        assert_eq!(cfg.resolve_voice().unwrap().sampling.top_p, Some(0.64));
+        assert_eq!(
+            cfg.resolve_image_prompt_compose(None)
+                .unwrap()
+                .sampling
+                .top_p,
+            Some(0.65)
+        );
+        assert_eq!(cfg.resolve_pde().unwrap().sampling.top_p, Some(0.66));
+        assert_eq!(cfg.resolve_product_qa().unwrap().sampling.top_p, Some(0.67));
+        assert_eq!(
+            cfg.resolve_insight_extract().unwrap().sampling.top_p,
+            Some(0.68)
+        );
+        assert_eq!(
+            cfg.resolve_memory_extract().unwrap().sampling.top_p,
+            Some(0.69)
+        );
+        assert_eq!(
+            cfg.resolve_world_director().unwrap().sampling.top_p,
+            Some(0.70)
+        );
+        assert_eq!(
+            cfg.resolve_world_comment().unwrap().sampling.top_p,
+            Some(0.71)
+        );
+        assert_eq!(
+            cfg.resolve_world_reply().unwrap().sampling.top_p,
+            Some(0.72)
+        );
+        assert_eq!(
+            cfg.resolve_world_stories_director().unwrap().sampling.top_p,
+            Some(0.73)
+        );
     }
 
     #[test]
