@@ -802,16 +802,27 @@ pub struct TaskConfig {
     pub model_write: Option<String>,
     #[serde(default)]
     pub temperature: Option<f64>,
-    /// Nucleus-sampling probability mass. Chat task only; task-level (tiers
-    /// inherit, like `temperature`); no `[defaults]` fallback. `None` ⇒ omit.
+    /// Nucleus-sampling probability mass. Valid on every task except
+    /// `embedding`; task-level (tiers inherit, like `temperature`); no
+    /// `[defaults]` fallback. `None` ⇒ omit. Legal range `(0.0, 1.0]`,
+    /// enforced by `validate_sampling`.
     #[serde(default)]
     pub top_p: Option<f32>,
     /// OpenAI-style frequency penalty. Same scoping rules as `top_p`.
+    /// Legal range `[-2.0, 2.0]`.
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     /// OpenAI-style presence penalty. Same scoping rules as `top_p`.
+    /// Legal range `[-2.0, 2.0]`.
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Repetition penalty — the knob aimed at degenerate tail repetition,
+    /// which `temperature` cannot address (issue #246): looping is
+    /// characteristic of near-greedy decoding, so lowering temperature pushes
+    /// the wrong way. Same scoping rules as `top_p`. Legal range `(0.0, 2.0]`;
+    /// `1.0` is the no-op identity.
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -978,6 +989,30 @@ pub struct ResolvedEmbedding {
 
 const DEFAULT_EMBED_MODEL: &str = "voyage-4-lite";
 
+/// The optional sampling knobs a task may set, grouped so every resolver and
+/// call site carries them as one value.
+///
+/// Grouped deliberately: issue #246 was caused by three loose fields that
+/// twelve `Resolved*` structs each had to remember to copy, and none did. One
+/// field is hard to forget; three are easy. The wire shape is NOT nested —
+/// `WireRequest` keeps flat siblings and is populated from here, so adding a
+/// fifth knob touches this struct, `TaskConfig`, and `WireRequest`, and
+/// nothing else.
+///
+/// All four are standard OpenAI chat/completions parameters accepted by every
+/// OpenAI-compatible endpoint, so none is subject to the strict-subset strip
+/// that `WireRequest::for_endpoint` applies to custom `[providers]` endpoints.
+///
+/// `None` on any field ⇒ that wire param is omitted entirely, never sent with
+/// an engine-chosen default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sampling {
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+}
+
 /// Resolved model parameters for an LLM call.
 ///
 /// `fallback_model` is intentionally singular-named even though it's a
@@ -989,11 +1024,9 @@ pub struct ResolvedModel {
     pub model: String,
     pub fallback_model: Vec<String>,
     pub temperature: f64,
-    /// Optional sampling knobs resolved from the task block (chat task only).
-    /// `None` ⇒ the corresponding wire param is omitted.
-    pub top_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
+    /// Optional sampling knobs resolved from the task block. Task-level; every
+    /// non-embedding task may set them (issue #246).
+    pub sampling: Sampling,
     pub max_tokens: u32,
     /// Resolved trait allow-list. `None` → no gating; `Some(set)` → the chat
     /// handler keeps only `prompt_traits` whose tag is in `set`.
@@ -1552,9 +1585,12 @@ impl ModelConfig {
             .unwrap_or(FALLBACK_MAX_TOKENS);
 
         // Task-level only (tiers inherit; no `[defaults]` fallback). None ⇒ omit.
-        let top_p = task_cfg.and_then(|t| t.top_p);
-        let frequency_penalty = task_cfg.and_then(|t| t.frequency_penalty);
-        let presence_penalty = task_cfg.and_then(|t| t.presence_penalty);
+        let sampling = Sampling {
+            top_p: task_cfg.and_then(|t| t.top_p),
+            frequency_penalty: task_cfg.and_then(|t| t.frequency_penalty),
+            presence_penalty: task_cfg.and_then(|t| t.presence_penalty),
+            repetition_penalty: task_cfg.and_then(|t| t.repetition_penalty),
+        };
 
         // Task-level only (tiers inherit), mirroring temperature/max_tokens.
         let reasoning = task_cfg.and_then(|t| t.reasoning.clone());
@@ -1571,9 +1607,7 @@ impl ModelConfig {
             model,
             fallback_model,
             temperature,
-            top_p,
-            frequency_penalty,
-            presence_penalty,
+            sampling,
             max_tokens,
             allow_traits,
             reasoning,
@@ -3666,14 +3700,14 @@ reasoning = { exclude = true }
         let text = include_str!("../../../examples/model_config.toml");
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, Some(0.9));
-        assert_eq!(r.frequency_penalty, Some(0.4));
-        assert_eq!(r.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.top_p, Some(0.9));
+        assert_eq!(r.sampling.frequency_penalty, Some(0.4));
+        assert_eq!(r.sampling.presence_penalty, Some(0.2));
+        // The shipped example deliberately leaves repetition_penalty unset.
+        assert_eq!(r.sampling.repetition_penalty, None);
         // Extraction stays deterministic — no sampling knobs.
         let e = cfg.resolve("insight_extraction", None);
-        assert_eq!(e.top_p, None);
-        assert_eq!(e.frequency_penalty, None);
-        assert_eq!(e.presence_penalty, None);
+        assert_eq!(e.sampling, Sampling::default());
     }
 
     #[test]
@@ -5138,12 +5172,14 @@ temperature = 0.8
 top_p = 0.9
 frequency_penalty = 0.4
 presence_penalty = 0.2
+repetition_penalty = 1.15
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, Some(0.9));
-        assert_eq!(r.frequency_penalty, Some(0.4));
-        assert_eq!(r.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.top_p, Some(0.9));
+        assert_eq!(r.sampling.frequency_penalty, Some(0.4));
+        assert_eq!(r.sampling.presence_penalty, Some(0.2));
+        assert_eq!(r.sampling.repetition_penalty, Some(1.15));
     }
 
     #[test]
@@ -5155,9 +5191,39 @@ temperature = 0.8
 "#;
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
-        assert_eq!(r.top_p, None);
-        assert_eq!(r.frequency_penalty, None);
-        assert_eq!(r.presence_penalty, None);
+        assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn sampling_params_resolve_on_non_chat_tasks() {
+        // Issue #246: the four knobs are generic TaskConfig fields, so they
+        // must resolve for ANY task, not just chat_companion.
+        let toml = r#"
+[tasks.pde_decision]
+model = "m"
+top_p = 0.5
+repetition_penalty = 1.2
+
+[tasks.world_reply]
+model = "m"
+frequency_penalty = 0.3
+
+[tasks.chat_vision]
+model = "m"
+presence_penalty = -0.5
+"#;
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+        let pde = cfg.resolve("pde_decision", None);
+        assert_eq!(pde.sampling.top_p, Some(0.5));
+        assert_eq!(pde.sampling.repetition_penalty, Some(1.2));
+        assert_eq!(
+            cfg.resolve("world_reply", None).sampling.frequency_penalty,
+            Some(0.3)
+        );
+        assert_eq!(
+            cfg.resolve("chat_vision", None).sampling.presence_penalty,
+            Some(-0.5)
+        );
     }
 
     #[test]
