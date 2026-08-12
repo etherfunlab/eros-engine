@@ -68,14 +68,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 Multi-architecture images are published to GitHub Container Registry for every `v*` tag:
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.0.4
+docker pull ghcr.io/etherfunlab/eros-engine:1.1.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.0.4 serve
+  ghcr.io/etherfunlab/eros-engine:1.1.0 serve
 ```
 
 Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed to any container host. See [Deploying](docs/deploying.md).
