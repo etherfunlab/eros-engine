@@ -1319,11 +1319,15 @@ mod tests {
         // (model/messages/stream) are exempt, and those are refused at boot.
         // Issue #246 leans on this being true for max_tokens and the four
         // sampling knobs, so it is locked rather than assumed.
+        // Every key the rule touches is already present, so this proves
+        // OVERRIDE rather than mere insertion.
         let mut body = serde_json::json!({
             "model": "m",
             "temperature": 0.5,
             "max_tokens": 200,
             "top_p": 0.9,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
             "repetition_penalty": 1.0
         })
         .as_object()
@@ -1331,13 +1335,24 @@ mod tests {
         .clone();
         let rules = [rule(
             Some(&["chat_image_prompt_compose"]),
-            serde_json::json!({"max_tokens": 900, "top_p": 0.5, "repetition_penalty": 1.25}),
+            serde_json::json!({
+                "temperature": 0.11,
+                "max_tokens": 900,
+                "top_p": 0.5,
+                "frequency_penalty": 0.75,
+                "presence_penalty": -0.25,
+                "repetition_penalty": 1.25
+            }),
         )];
         apply_body_rules(&mut body, &rules, Some("chat_image_prompt_compose"));
-        assert_eq!(body["max_tokens"], 900, "body params win on max_tokens");
-        assert_eq!(body["top_p"], 0.5, "body params win on top_p");
+        // All six overridable keys the docs name, not a sample of them.
+        assert_eq!(body["temperature"], 0.11);
+        assert_eq!(body["max_tokens"], 900);
+        assert_eq!(body["top_p"], 0.5);
+        assert_eq!(body["frequency_penalty"], 0.75);
+        assert_eq!(body["presence_penalty"], -0.25);
         assert_eq!(body["repetition_penalty"], 1.25);
-        assert_eq!(body["temperature"], 0.5, "untouched keys survive");
+        assert_eq!(body["model"], "m", "engine-owned key untouched");
     }
 
     #[tokio::test]
@@ -3304,6 +3319,38 @@ data: [DONE]\n\n";
         assert!(s.contains("\"frequency_penalty\":0.4"), "{s}");
         assert!(s.contains("\"presence_penalty\":0.2"), "{s}");
         assert!(s.contains("\"repetition_penalty\":1.15"), "{s}");
+    }
+
+    #[test]
+    fn unset_sampling_serializes_byte_identically_to_the_pre_246_body() {
+        // Stronger than the key-absence checks below: #246 promises a
+        // deployment that sets no sampling knob keeps producing the EXACT
+        // body it produced before. Key absence alone would still pass if
+        // field order or numeric formatting drifted, so compare bytes.
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let wire = WireRequest {
+            model: "m",
+            messages: &messages,
+            temperature: 0.8,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            max_tokens: 16,
+            stream: false,
+            user: None,
+            session_id: None,
+            metadata: None,
+            reasoning: None,
+            response_format: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.8,"max_tokens":16}"#
+        );
     }
 
     #[test]
