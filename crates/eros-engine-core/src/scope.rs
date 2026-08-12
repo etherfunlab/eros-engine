@@ -140,6 +140,16 @@ impl AffinityScope {
         }
         s
     }
+    /// Any axis of the `bond()` half (warmth / intimacy / tension) active.
+    /// The voice relationship line injects at half granularity — these two
+    /// helpers are its flattening rule.
+    pub fn any_bond_axis(&self) -> bool {
+        self.warmth || self.intimacy || self.tension
+    }
+    /// Any axis of the `chemistry()` half (trust / intrigue / patience) active.
+    pub fn any_chemistry_axis(&self) -> bool {
+        self.trust || self.intrigue || self.patience
+    }
     pub fn contains(self, axis: AffinityAxis) -> bool {
         match axis {
             AffinityAxis::Warmth => self.warmth,
@@ -355,5 +365,22 @@ mod tests {
         // warmth ∈ bond, trust ∈ chemistry → both active → avg
         let s = AffinityScope::from_axes(&[AffinityAxis::Warmth, AffinityAxis::Trust]);
         assert!((s.length_score(&a).unwrap() - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn affinity_scope_half_detection() {
+        assert!(AffinityScope::bond().any_bond_axis());
+        assert!(!AffinityScope::bond().any_chemistry_axis());
+        assert!(AffinityScope::chemistry().any_chemistry_axis());
+        assert!(!AffinityScope::chemistry().any_bond_axis());
+        assert!(AffinityScope::full().any_bond_axis());
+        assert!(AffinityScope::full().any_chemistry_axis());
+        assert!(!AffinityScope::none().any_bond_axis());
+        assert!(!AffinityScope::none().any_chemistry_axis());
+        // A single axis activates exactly its half.
+        let w = AffinityScope::from_axes(&[AffinityAxis::Warmth]);
+        assert!(w.any_bond_axis() && !w.any_chemistry_axis());
+        let t = AffinityScope::from_axes(&[AffinityAxis::Trust]);
+        assert!(t.any_chemistry_axis() && !t.any_bond_axis());
     }
 }
