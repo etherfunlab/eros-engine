@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use ulid::Ulid;
 
-use eros_engine_core::scope::{MemoryScope, RelationshipScope};
+use eros_engine_core::scope::{AffinityScope, MemoryScope, RelationshipScope};
 use eros_engine_store::chat::{ChatRepo, LatestTurnLookup, VoiceUserInsert};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -302,7 +302,12 @@ pub async fn voice_turn_stream(
         // no input-filter rewrite). Already persisted above as the latest
         // history row — the wire messages still come from there.
         content: persisted_content,
-        relationship_scope: req.relationship_scope.unwrap_or_default(),
+        affinity_scope: match req.relationship_scope.unwrap_or_default() {
+            RelationshipScope::None => AffinityScope::none(),
+            RelationshipScope::Bond => AffinityScope::bond(),
+            RelationshipScope::Chemistry => AffinityScope::chemistry(),
+            RelationshipScope::Both => AffinityScope::full(),
+        },
         memory_scope: req.memory_scope.unwrap_or_default(),
         // Handed over from the row loaded above — the pipeline reads the
         // `voice_bootstrap` marker from it instead of re-querying the session.

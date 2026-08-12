@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use eros_engine_core::affinity::{Affinity, BondLabel, ChemistryLabel};
 use eros_engine_core::persona::PersonaGenome;
-use eros_engine_core::scope::{InsightMode, MemoryScope, RelationshipScope};
+use eros_engine_core::scope::{AffinityScope, InsightMode, MemoryScope};
 use eros_engine_llm::model_config::ResolvedVoice;
 use eros_engine_llm::openrouter::{ChatMessage as WireMessage, ChatRequest, UsageBlock};
 use eros_engine_store::affinity::AffinityRepo;
@@ -93,7 +93,7 @@ fn render_recall_block(
 
 /// Assemble the thin voice system prompt: persona + voice directive +
 /// the (already rendered) bootstrap block + one optional relationship line
-/// (bond/chemistry-derived, gated by `relationship_scope`) + this turn's
+/// (bond/chemistry-derived, gated by `affinity_scope`) + this turn's
 /// (already rendered) recall block. Deliberately excludes traits, scopes, and
 /// every heavy block the text path's `build_prompt` composes.
 ///
@@ -107,7 +107,7 @@ pub fn build_voice_prompt(
     directive: &str,
     bootstrap: Option<&str>,
     affinity: Option<&Affinity>,
-    relationship_scope: RelationshipScope,
+    affinity_scope: AffinityScope,
     recall: Option<&str>,
 ) -> String {
     let mut s = String::with_capacity(genome.system_prompt.len() + directive.len() + 384);
@@ -118,7 +118,7 @@ pub fn build_voice_prompt(
         s.push_str("\n\n");
         s.push_str(block);
     }
-    if let Some(line) = affinity.and_then(|a| relationship_line(a, relationship_scope)) {
+    if let Some(line) = affinity.and_then(|a| relationship_line(a, affinity_scope)) {
         s.push_str("\n\n");
         s.push_str(&line);
     }
@@ -375,8 +375,10 @@ async fn reload_bootstrap_winner(
 /// One relationship-tone line, derived at read time from the affinity row's
 /// bond/chemistry tiers — never from the cached `relationship_label`, which
 /// the voice path (no per-turn affinity eval) would leave stale forever.
-/// `scope` gates which halves are injected.
-fn relationship_line(affinity: &Affinity, scope: RelationshipScope) -> Option<String> {
+/// The resolved `AffinityScope` flattens to the two halves this line can
+/// inject: any bond axis ⇒ the bond half, any chemistry axis ⇒ the
+/// chemistry half.
+fn relationship_line(affinity: &Affinity, scope: AffinityScope) -> Option<String> {
     let base = || {
         match affinity.bond_label() {
         BondLabel::Acquaintance => {
@@ -408,11 +410,24 @@ fn relationship_line(affinity: &Affinity, scope: RelationshipScope) -> Option<St
         }
     }
     };
-    match scope {
-        RelationshipScope::None => None,
-        RelationshipScope::Bond => Some(base().to_string()),
-        RelationshipScope::Chemistry => Some(clause().to_string()),
-        RelationshipScope::Both => Some(format!("{} {}", base(), clause())),
+    match (scope.any_bond_axis(), scope.any_chemistry_axis()) {
+        (false, false) => None,
+        (true, false) => Some(base().to_string()),
+        (false, true) => Some(clause().to_string()),
+        (true, true) => Some(format!("{} {}", base(), clause())),
+    }
+}
+
+/// Back-projection of the resolved scope into the legacy audit vocabulary.
+/// The assistant row's `relationship_scope` key keeps this shape for one
+/// release (spec 2026-08-12) so deployers reading the old key see identical
+/// values; next release the key becomes the resolved `affinity_scope`.
+fn legacy_scope_label(scope: &AffinityScope) -> &'static str {
+    match (scope.any_bond_axis(), scope.any_chemistry_axis()) {
+        (false, false) => "none",
+        (true, false) => "bond",
+        (false, true) => "chemistry",
+        (true, true) => "both",
     }
 }
 
@@ -428,7 +443,7 @@ pub struct VoiceTurn {
     /// This turn's utterance verbatim — the per-turn recall query text (voice
     /// has no input-filter rewrite).
     pub content: String,
-    pub relationship_scope: RelationshipScope,
+    pub affinity_scope: AffinityScope,
     /// This turn's memory scope. On the FIRST turn its resolved `InsightMode`
     /// picks the bootstrap snapshot's insight tier — frozen for the whole call
     /// from then on.
@@ -642,7 +657,7 @@ pub fn run_voice_turn(
             &resolved.directive,
             bootstrap_block.as_deref(),
             affinity.as_ref(),
-            turn.relationship_scope,
+            turn.affinity_scope,
             recall_block.as_deref(),
         );
 
@@ -803,7 +818,10 @@ pub fn run_voice_turn(
         // gets the FULL unfiltered usage; the wire `Done` frame below gets a
         // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-        let scope_metadata = serde_json::json!({ "relationship_scope": turn.relationship_scope });
+        let scope_metadata = serde_json::json!({
+            "relationship_scope": legacy_scope_label(&turn.affinity_scope),
+            "memory_scope": turn.memory_scope,
+        });
         if !acc.is_empty() {
             if let Err(e) = chat_repo
                 .insert_voice_assistant_message(
@@ -923,7 +941,7 @@ mod tests {
             "DIRECTIVE",
             None,
             None,
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
@@ -944,7 +962,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&s).as_deref(),
             None,
-            RelationshipScope::None,
+            AffinityScope::none(),
             None,
         );
         assert_eq!(
@@ -965,7 +983,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&s).as_deref(),
             Some(&a),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         let directive = p.find("DIRECTIVE").expect("directive present");
@@ -988,7 +1006,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&s).as_deref(),
             None,
-            RelationshipScope::None,
+            AffinityScope::none(),
             None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[上次通话]\n用户：你好");
@@ -1003,7 +1021,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&s).as_deref(),
             None,
-            RelationshipScope::None,
+            AffinityScope::none(),
             None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE\n\n[关于他]\n- 城市：上海");
@@ -1021,7 +1039,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&empty).as_deref(),
             None,
-            RelationshipScope::None,
+            AffinityScope::none(),
             None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
@@ -1101,7 +1119,7 @@ mod tests {
             "DIRECTIVE",
             render_bootstrap(&s).as_deref(),
             Some(&a),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             block.as_deref(),
         );
         assert_eq!(
@@ -1149,7 +1167,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::Bond,
+            AffinityScope::bond(),
             None,
         );
         let with_empty = build_voice_prompt(
@@ -1157,7 +1175,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::Bond,
+            AffinityScope::bond(),
             render_recall_block(vec![], vec![]).as_deref(),
         );
         assert_eq!(with_none, with_empty);
@@ -1186,7 +1204,7 @@ mod tests {
                     "DIRECTIVE",
                     render_bootstrap(&s).as_deref(),
                     Some(&a),
-                    RelationshipScope::default(),
+                    AffinityScope::full(),
                     render_recall_block(groups.clone(), facts.clone()).as_deref(),
                 );
                 for ph in PLACEHOLDERS {
@@ -1291,7 +1309,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert!(p.contains("still getting to know each other"));
@@ -1308,7 +1326,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert!(p.contains("know each other inside out"));
@@ -1328,7 +1346,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert!(p.contains("close friends"));
@@ -1344,7 +1362,7 @@ mod tests {
             "D",
             None,
             Some(&low),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert!(p_low.contains("faint, unspoken spark"));
@@ -1356,7 +1374,7 @@ mod tests {
             "D",
             None,
             Some(&high),
-            RelationshipScope::default(),
+            AffinityScope::full(),
             None,
         );
         assert!(p_high.contains("growing attraction"));
@@ -1371,7 +1389,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::None,
+            AffinityScope::none(),
             None,
         );
         assert_eq!(p, "You are Mia.\n\nDIRECTIVE");
@@ -1385,7 +1403,7 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::Bond,
+            AffinityScope::bond(),
             None,
         );
         assert!(p.contains("close friends"));
@@ -1400,11 +1418,43 @@ mod tests {
             "DIRECTIVE",
             None,
             Some(&a),
-            RelationshipScope::Chemistry,
+            AffinityScope::chemistry(),
             None,
         );
         assert!(!p.contains("close friends"));
         assert!(p.contains("deeply in love"));
+    }
+
+    #[test]
+    fn relationship_line_flattens_axis_subsets_to_halves() {
+        let a = affinity_at(0.0, 0.0, 0.0, 0.0, 0.0); // the file's existing fixture; any tiers work — the two half-lines always differ
+        let warmth_only =
+            AffinityScope::from_axes(&[eros_engine_core::scope::AffinityAxis::Warmth]);
+        let trust_only = AffinityScope::from_axes(&[eros_engine_core::scope::AffinityAxis::Trust]);
+        let bond_line = relationship_line(&a, AffinityScope::bond()).unwrap();
+        let chem_line = relationship_line(&a, AffinityScope::chemistry()).unwrap();
+        // One active axis injects exactly its half's full line.
+        assert_eq!(relationship_line(&a, warmth_only).unwrap(), bond_line);
+        assert_eq!(relationship_line(&a, trust_only).unwrap(), chem_line);
+        // Mixed halves ⇒ the full two-half line.
+        let mixed = AffinityScope::from_axes(&[
+            eros_engine_core::scope::AffinityAxis::Warmth,
+            eros_engine_core::scope::AffinityAxis::Trust,
+        ]);
+        assert_eq!(
+            relationship_line(&a, mixed).unwrap(),
+            relationship_line(&a, AffinityScope::full()).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_scope_label_projects_halves() {
+        assert_eq!(legacy_scope_label(&AffinityScope::full()), "both");
+        assert_eq!(legacy_scope_label(&AffinityScope::bond()), "bond");
+        assert_eq!(legacy_scope_label(&AffinityScope::chemistry()), "chemistry");
+        assert_eq!(legacy_scope_label(&AffinityScope::none()), "none");
+        let w = AffinityScope::from_axes(&[eros_engine_core::scope::AffinityAxis::Warmth]);
+        assert_eq!(legacy_scope_label(&w), "bond");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -1485,7 +1535,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -1530,6 +1580,20 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(scope_meta.as_deref(), Some("both"));
+
+        let ms: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'memory_scope' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ms.as_deref(),
+            Some("neutral_and_relationship"),
+            "voice assistant rows now audit the resolved memory_scope"
+        );
     }
 
     /// Task 0 (affinity dead-row fix): `companion_affinity` is session-keyed
@@ -1608,7 +1672,12 @@ data: [DONE]\n\n";
         // Persist the user turn as the route would.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(voice_session_id, "hello", "01J9000000000000000000VOIC7", None)
+            .insert_voice_user_message(
+                voice_session_id,
+                "hello",
+                "01J9000000000000000000VOIC7",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -1640,7 +1709,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -1752,7 +1821,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -1887,7 +1956,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -2022,7 +2091,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -2150,7 +2219,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -2269,7 +2338,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -2394,7 +2463,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: serde_json::json!({}),
             },
@@ -2617,7 +2686,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::None,
+                affinity_scope: AffinityScope::none(),
                 memory_scope,
                 session_metadata: session.metadata,
             },
@@ -2827,7 +2896,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: "hello".into(),
-                relationship_scope: RelationshipScope::None,
+                affinity_scope: AffinityScope::none(),
                 memory_scope: MemoryScope::default(),
                 // The stale read a race loser actually saw: the marker isn't
                 // in it yet, even though the winner already wrote it to the
@@ -3276,7 +3345,7 @@ data: [DONE]\n\n";
         /// The utterance — also the recall query text.
         content: &'a str,
         memory_scope: MemoryScope,
-        relationship_scope: RelationshipScope,
+        affinity_scope: AffinityScope,
         /// `[tasks.chat_voice] recall = …`
         recall: bool,
     }
@@ -3288,7 +3357,7 @@ data: [DONE]\n\n";
                 // 6 alphanumeric chars — comfortably past the backchannel floor.
                 content: "带我去东京吧",
                 memory_scope: MemoryScope::default(),
-                relationship_scope: RelationshipScope::None,
+                affinity_scope: AffinityScope::none(),
                 recall: true,
             }
         }
@@ -3348,7 +3417,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: opts.content.to_string(),
-                relationship_scope: opts.relationship_scope,
+                affinity_scope: opts.affinity_scope,
                 memory_scope: opts.memory_scope,
                 session_metadata: session.metadata,
             },
@@ -3413,7 +3482,7 @@ data: [DONE]\n\n";
             instance_id,
             user_id,
             RecallTurnOpts {
-                relationship_scope: RelationshipScope::default(),
+                affinity_scope: AffinityScope::full(),
                 ..Default::default()
             },
         )
@@ -3645,7 +3714,12 @@ data: [DONE]\n\n";
         // else — no reply, no marker.
         let repo = ChatRepo { pool: &pool };
         let umid = match repo
-            .insert_voice_user_message(session_id, persisted_text, "01J9CONTENT00000000000001", None)
+            .insert_voice_user_message(
+                session_id,
+                persisted_text,
+                "01J9CONTENT00000000000001",
+                None,
+            )
             .await
             .unwrap()
         {
@@ -3731,7 +3805,7 @@ data: [DONE]\n\n";
                 // The load-bearing line: the repair state's content, not
                 // `retry_text`.
                 content: repair.content,
-                relationship_scope: RelationshipScope::None,
+                affinity_scope: AffinityScope::none(),
                 memory_scope: MemoryScope::default(),
                 session_metadata: session.metadata,
             },
@@ -3845,7 +3919,7 @@ data: [DONE]\n\n";
                 user_id,
                 user_message_id: umid,
                 content: repair.content,
-                relationship_scope: RelationshipScope::None,
+                affinity_scope: AffinityScope::none(),
                 // Deliberately different from turn 1's scope — the frozen
                 // snapshot must not budge even if a retry's scope would have
                 // picked a different insight tier on a first turn.
