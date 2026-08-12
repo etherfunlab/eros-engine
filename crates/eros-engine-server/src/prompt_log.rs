@@ -19,7 +19,7 @@ struct PromptLogSnapshot {
     model: String,
     fallback_model: Vec<String>,
     temperature: f32,
-    top_p: Option<f32>,
+    sampling: eros_engine_llm::model_config::Sampling,
     max_tokens: u32,
     /// (role, content) pairs cloned from `req.messages`, in order.
     messages: Vec<(String, String)>,
@@ -41,7 +41,7 @@ fn snapshot(
         model: req.model.clone(),
         fallback_model: req.fallback_model.clone(),
         temperature: req.temperature,
-        top_p: req.top_p,
+        sampling: req.sampling,
         max_tokens: req.max_tokens,
         messages: req
             .messages
@@ -68,13 +68,18 @@ fn render(snap: &PromptLogSnapshot) -> String {
         format!("   fallbacks: {}", snap.fallback_model.join(", "))
     };
     out.push_str(&format!("# model:    {}{}\n", snap.model, fallbacks));
-    let top_p = snap
-        .top_p
-        .map(|v| format!("{v:.2}"))
-        .unwrap_or_else(|| "none".to_string());
+    let opt = |v: Option<f32>| {
+        v.map(|x| format!("{x:.2}"))
+            .unwrap_or_else(|| "none".to_string())
+    };
     out.push_str(&format!(
-        "# params:   temperature={:.2} top_p={} max_tokens={}\n",
-        snap.temperature, top_p, snap.max_tokens
+        "# params:   temperature={:.2} top_p={} frequency_penalty={} presence_penalty={} repetition_penalty={} max_tokens={}\n",
+        snap.temperature,
+        opt(snap.sampling.top_p),
+        opt(snap.sampling.frequency_penalty),
+        opt(snap.sampling.presence_penalty),
+        opt(snap.sampling.repetition_penalty),
+        snap.max_tokens
     ));
     out.push_str(&format!("# messages: {}\n\n", snap.messages.len()));
     for (i, (role, content)) in snap.messages.iter().enumerate() {
@@ -135,7 +140,11 @@ mod tests {
             model: "vendor/model-a".into(),
             fallback_model: vec!["vendor/model-b".into()],
             temperature: 0.9,
-            top_p: Some(0.95),
+            sampling: eros_engine_llm::model_config::Sampling {
+                top_p: Some(0.95),
+                repetition_penalty: Some(1.15),
+                ..Default::default()
+            },
             max_tokens: 1024,
             messages: vec![
                 ("system".into(), "You are Aria.\nBe warm.".into()),
@@ -149,6 +158,14 @@ mod tests {
         let out = render(&fixture());
         assert!(out.contains("# task:     reply"));
         assert!(out.contains("# model:    vendor/model-a   fallbacks: vendor/model-b"));
+        // All four sampling knobs are logged; unset ones read `none` (#246).
+        assert!(
+            out.contains(
+                "# params:   temperature=0.90 top_p=0.95 frequency_penalty=none \
+                 presence_penalty=none repetition_penalty=1.15 max_tokens=1024"
+            ),
+            "{out}"
+        );
         assert!(out.contains("# messages: 2"));
         assert!(out.contains("================= [00] system ================="));
         assert!(out.contains("You are Aria.\nBe warm.")); // verbatim newline preserved

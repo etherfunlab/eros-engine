@@ -71,11 +71,10 @@ pub struct ChatRequest {
     pub fallback_model: Vec<String>,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
-    /// Optional sampling knobs. `None` ⇒ the wire param is omitted, so a
-    /// deployment that sets none produces a byte-identical body to today.
-    pub top_p: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
+    /// Optional sampling knobs, resolved from the task block. `None` on a
+    /// field ⇒ that wire param is omitted, so a deployment that sets none
+    /// produces a byte-identical body to today.
+    pub sampling: crate::model_config::Sampling,
     pub max_tokens: u32,
     /// Opaque OpenRouter wire passthrough — `user` field. Engine never
     /// inspects this; callers are responsible for hashing PII out.
@@ -291,6 +290,8 @@ struct WireRequest<'a> {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repetition_penalty: Option<f32>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
@@ -683,9 +684,7 @@ impl OpenRouterClient {
                     &req.messages,
                     req.temperature,
                     req.max_tokens,
-                    req.top_p,
-                    req.frequency_penalty,
-                    req.presence_penalty,
+                    req.sampling,
                     req.user.as_deref(),
                     req.session_id.as_deref(),
                     req.metadata.as_ref(),
@@ -923,9 +922,7 @@ impl OpenRouterClient {
         messages: &[ChatMessage],
         temperature: f32,
         max_tokens: u32,
-        top_p: Option<f32>,
-        frequency_penalty: Option<f32>,
-        presence_penalty: Option<f32>,
+        sampling: crate::model_config::Sampling,
         req_user: Option<&str>,
         req_session_id: Option<&str>,
         req_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -938,9 +935,10 @@ impl OpenRouterClient {
             model: &bare_model,
             messages,
             temperature,
-            top_p,
-            frequency_penalty,
-            presence_penalty,
+            top_p: sampling.top_p,
+            frequency_penalty: sampling.frequency_penalty,
+            presence_penalty: sampling.presence_penalty,
+            repetition_penalty: sampling.repetition_penalty,
             max_tokens,
             stream: false,
             user: req_user,
@@ -1075,9 +1073,10 @@ impl OpenRouterClient {
             model: &bare_model,
             messages: &req.messages,
             temperature: req.temperature,
-            top_p: req.top_p,
-            frequency_penalty: req.frequency_penalty,
-            presence_penalty: req.presence_penalty,
+            top_p: req.sampling.top_p,
+            frequency_penalty: req.sampling.frequency_penalty,
+            presence_penalty: req.sampling.presence_penalty,
+            repetition_penalty: req.sampling.repetition_penalty,
             max_tokens: req.max_tokens,
             stream: true,
             user: req.user.as_deref(),
@@ -1470,6 +1469,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -1514,6 +1514,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: req.max_tokens,
             stream: false,
             user: req.user.as_deref(),
@@ -2257,6 +2258,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2279,6 +2281,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2664,6 +2667,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -2685,6 +2689,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3239,6 +3244,7 @@ data: [DONE]\n\n";
             top_p: Some(0.9),
             frequency_penalty: Some(0.4),
             presence_penalty: Some(0.2),
+            repetition_penalty: Some(1.15),
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3251,6 +3257,7 @@ data: [DONE]\n\n";
         assert!(s.contains("\"top_p\":0.9"), "{s}");
         assert!(s.contains("\"frequency_penalty\":0.4"), "{s}");
         assert!(s.contains("\"presence_penalty\":0.2"), "{s}");
+        assert!(s.contains("\"repetition_penalty\":1.15"), "{s}");
     }
 
     #[test]
@@ -3266,6 +3273,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 16,
             stream: false,
             user: None,
@@ -3283,6 +3291,37 @@ data: [DONE]\n\n";
         assert!(
             !s.contains("presence_penalty"),
             "unset presence_penalty must be omitted: {s}"
+        );
+        assert!(
+            !s.contains("repetition_penalty"),
+            "unset repetition_penalty must be omitted: {s}"
+        );
+    }
+
+    #[test]
+    fn chat_request_default_still_works_with_sampling() {
+        // The new grouped field must not break `..Default::default()`, which
+        // every ChatRequest literal in the server crate relies on.
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.5,
+            max_tokens: 10,
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                repetition_penalty: Some(1.15),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(req.sampling.repetition_penalty, Some(1.15));
+        assert_eq!(req.sampling.frequency_penalty, None);
+        assert_eq!(
+            ChatRequest::default().sampling,
+            crate::model_config::Sampling::default()
         );
     }
 
@@ -3334,6 +3373,7 @@ data: [DONE]\n\n";
             top_p: Some(0.9),
             frequency_penalty: Some(0.1),
             presence_penalty: Some(0.1),
+            repetition_penalty: Some(1.15),
             max_tokens: 10,
             stream: true,
             user: Some("u"),
@@ -3344,13 +3384,16 @@ data: [DONE]\n\n";
         }
         .for_endpoint(&ep);
         let v = serde_json::to_value(&wire).unwrap();
-        const ALLOW: [&str; 10] = [
+        const ALLOW: [&str; 11] = [
             "model",
             "messages",
             "temperature",
             "top_p",
             "frequency_penalty",
             "presence_penalty",
+            // Standard OpenAI-format field, not an OpenRouter extension — it
+            // belongs in the allow list, not for_endpoint's drop list (#246).
+            "repetition_penalty",
             "max_tokens",
             "stream",
             "user",
@@ -3390,13 +3433,16 @@ data: [DONE]\n\n";
         };
         let mut body = build_vision_body(&req, "m");
         strip_openrouter_vision_fields(&mut body);
-        const ALLOW: [&str; 10] = [
+        const ALLOW: [&str; 11] = [
             "model",
             "messages",
             "temperature",
             "top_p",
             "frequency_penalty",
             "presence_penalty",
+            // Standard OpenAI-format field, not an OpenRouter extension — it
+            // belongs in the allow list, not for_endpoint's drop list (#246).
+            "repetition_penalty",
             "max_tokens",
             "stream",
             "user",
@@ -3429,6 +3475,7 @@ data: [DONE]\n\n";
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             max_tokens: 10,
             stream: false,
             user: None,
