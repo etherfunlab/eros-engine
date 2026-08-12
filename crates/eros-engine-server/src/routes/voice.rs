@@ -861,6 +861,59 @@ mod tests {
         assert!(user_meta_null, "no fields sent ⇒ no raw audit keys");
     }
 
+    /// Invariant 7 (spec 2026-08-12): a caller still sending ONLY the legacy
+    /// field sees identical behavior — `both` keeps serving both halves of
+    /// the relationship line — and identical audit: the assistant row's
+    /// legacy key echoes `both`, while the legacy field produces NO raw echo
+    /// on the user row (its audit home stays the assistant row this release).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn legacy_relationship_scope_alone_is_byte_compatible(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        seed_affinity(&pool, session_id, user_id).await;
+        let wire = run_mocked_turn(
+            &pool,
+            session_id,
+            user_id,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J9SCOPELEGACY00000000001",
+                "relationship_scope": "both"
+            }),
+        )
+        .await;
+        assert!(
+            wire.contains(BOND_LINE_MARK) && wire.contains(CHEM_LINE_MARK),
+            "legacy both must keep serving BOTH halves: {wire}"
+        );
+        let (legacy, memory): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT metadata->>'relationship_scope', metadata->>'memory_scope' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy.as_deref(),
+            Some("both"),
+            "audit value unchanged for legacy callers"
+        );
+        assert_eq!(memory.as_deref(), Some("neutral_and_relationship"));
+        let user_meta_null: bool = sqlx::query_scalar(
+            "SELECT metadata IS NULL FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            user_meta_null,
+            "the legacy field is never echoed as a raw key"
+        );
+    }
+
     /// The axes-array shape resolves (chemistry half from a chemistry axis)
     /// and is echoed verbatim as the raw audit value.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
