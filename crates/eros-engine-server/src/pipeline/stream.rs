@@ -1924,6 +1924,19 @@ fn build_pde_ctx(
     } else {
         format!("{brief}\n\n")
     };
+    // Precomputed relationship buckets. The judge acts on stated facts but is
+    // unreliable at deriving them: told to fold the six axes itself it mis-ranks
+    // deep relationships as shallow, so both buckets arrive as engine-owned
+    // lines. Unconditional, like 图片能力 — the low end of either scale is
+    // itself a signal, so a missing line must never read as "rung 1".
+    let rung = a.intimacy_rung();
+    let bond = a.bond_score();
+    let chemistry = a.chemistry_score();
+    let patience_band = match a.patience_band() {
+        eros_engine_core::affinity::PatienceBand::High => "高",
+        eros_engine_core::affinity::PatienceBand::Mid => "中",
+        eros_engine_core::affinity::PatienceBand::Low => "低",
+    };
     // Always emit the image-capability line — the negative is a signal too, so
     // the judge gets a clear "no images this turn" rather than a missing line.
     let image_flag = if image_available { "是" } else { "否" };
@@ -1949,6 +1962,8 @@ fn build_pde_ctx(
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
          [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
+         [亲密度] 当前档位=第 {rung} 档（bond={bond:.2} chemistry={chemistry:.2}）\n\
+         [耐心] 当前档位={patience_band}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
@@ -11381,6 +11396,88 @@ data: [DONE]\n\n";
         assert!(
             signal_at < image_at && image_at < latest_at,
             "image-capability line sits between [信号] and [用户最新消息]: {ctx}"
+        );
+    }
+
+    /// Both engine-owned bucket lines render between [关系状态] and [信号],
+    /// with the composites at the same {:.2} as the axes above them.
+    #[test]
+    fn pde_ctx_renders_intimacy_and_patience_buckets() {
+        let mut input = fixture_decision_input();
+        input.affinity.warmth = 0.9;
+        input.affinity.trust = 0.9;
+        input.affinity.intrigue = 0.9;
+        input.affinity.intimacy = 0.0;
+        input.affinity.tension = 0.0; // bond 0.90, chemistry 0.30
+        input.affinity.patience = 0.8;
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+        assert!(
+            ctx.contains("[亲密度] 当前档位=第 3 档（bond=0.90 chemistry=0.30）"),
+            "intimacy line carries the rung and both composites: {ctx}"
+        );
+        assert!(
+            ctx.contains("[耐心] 当前档位=高"),
+            "patience band line present: {ctx}"
+        );
+        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        let rung_at = ctx.find("[亲密度]").expect("intimacy line present");
+        let patience_at = ctx.find("[耐心]").expect("patience line present");
+        let signal_at = ctx.find("[信号]").expect("signal block present");
+        assert!(
+            rel_at < rung_at && rung_at < patience_at && patience_at < signal_at,
+            "buckets sit between [关系状态] and [信号]: {ctx}"
+        );
+    }
+
+    /// The rendered buckets follow the affinity, rather than being pinned to one
+    /// value. The rung's own cuts belong to the core crate — the composites are
+    /// a `/3` fold, so exact edge values are not reachable from here — but the
+    /// patience band reads a raw axis, so its edges render exactly.
+    #[test]
+    fn pde_ctx_bucket_lines_track_the_thresholds() {
+        let mut input = fixture_decision_input();
+        for (score, want) in [(0.05, 1), (0.5, 2), (0.95, 3)] {
+            input.affinity.warmth = score;
+            input.affinity.trust = score;
+            input.affinity.intrigue = score;
+            input.affinity.intimacy = 0.0;
+            input.affinity.tension = 0.0;
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            assert!(
+                ctx.contains(&format!("当前档位=第 {want} 档")),
+                "S={score} renders rung {want}: {ctx}"
+            );
+        }
+        for (patience, want) in [(0.349, "低"), (0.35, "中"), (0.649, "中"), (0.65, "高")] {
+            input.affinity.patience = patience;
+            let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
+            assert!(
+                ctx.contains(&format!("[耐心] 当前档位={want}")),
+                "patience={patience} renders {want}: {ctx}"
+            );
+        }
+    }
+
+    /// Unconditional: a brand-new session renders 第 1 档 rather than omitting
+    /// the line, so an absent line can never be read as the bottom rung.
+    #[test]
+    fn pde_ctx_renders_bucket_lines_for_a_fresh_session() {
+        let mut input = fixture_decision_input();
+        // migration-0029 seed: every axis at 0.033.
+        input.affinity.warmth = 0.033;
+        input.affinity.trust = 0.033;
+        input.affinity.intrigue = 0.033;
+        input.affinity.intimacy = 0.033;
+        input.affinity.tension = 0.033;
+        input.affinity.patience = 0.5;
+        let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, false, None);
+        assert!(
+            ctx.contains("[亲密度] 当前档位=第 1 档"),
+            "fresh session renders the bottom rung: {ctx}"
+        );
+        assert!(
+            ctx.contains("[耐心] 当前档位=中"),
+            "patience line renders too: {ctx}"
         );
     }
 

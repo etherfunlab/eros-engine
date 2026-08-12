@@ -116,6 +116,29 @@ const TIER2_HI: f64 = 0.35;
 const TIER3_HI: f64 = 0.62;
 const TIER4_HI: f64 = 0.9;
 
+/// Floor of the top intimacy rung, on `max(bond_score, chemistry_score)`. Sits
+/// *inside* tier 4 rather than on the tier-5 edge, deliberately loose: the rung
+/// ladder exists to stop a stranger talking their way into a nude, not to make
+/// intimacy expensive, and gating the top rung at the apex (`TIER4_HI`) is a
+/// wall rather than a gate. The bottom rung still folds `TIER1_HI`, so only this
+/// cut is independent — keep it in `(TIER3_HI, TIER4_HI)` so the rungs stay
+/// coarser than the tier ladder they sit on. Tunable.
+const INTIMACY_RUNG3_LO: f64 = 0.76;
+
+const _: () = assert!(
+    TIER3_HI < INTIMACY_RUNG3_LO && INTIMACY_RUNG3_LO < TIER4_HI,
+    "the top intimacy rung must open inside tier 4, not at the apex"
+);
+
+/// Patience band cut-points: low = [0, LO), mid = [LO, HI), high = [HI, 1].
+/// Separate from the tier ladder above on purpose — `patience` is rule-owned
+/// and never folded into either composite, so it carries its own cuts. These
+/// mirror the three bands the PDE judge prompt already prescribes; the engine
+/// owns them so the judge classifies against a stated band instead of
+/// comparing floats itself. Tunable.
+const PATIENCE_LO: f64 = 0.35;
+const PATIENCE_HI: f64 = 0.65;
+
 /// 1..=5 tier index for a 0..1 line score.
 fn tier_index(score: f64) -> u8 {
     if score < TIER1_HI {
@@ -196,6 +219,16 @@ impl ChemistryLabel {
     }
 }
 
+/// Patience band for the PDE judge. Three bands, not five: the judge prompt
+/// prescribes one interaction register per band (how curt the tone runs,
+/// whether irritation shows), and the engine states which band applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatienceBand {
+    Low,
+    Mid,
+    High,
+}
+
 /// One line's tier transition this turn, as serialised keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelTransition {
@@ -269,6 +302,39 @@ impl Affinity {
             3 => ChemistryLabel::Crush,
             4 => ChemistryLabel::Lover,
             _ => ChemistryLabel::Beloved,
+        }
+    }
+
+    /// Coarse 1..=3 intimacy rung for the PDE image gate, taken over whichever
+    /// line is further along. Rung 1 = both lines still tier 1; rung 3 = at or
+    /// above `INTIMACY_RUNG3_LO`; rung 2 = everything between. `max` rather than
+    /// a sum so a purely romantic track and a purely companionable one can each
+    /// unlock on their own.
+    ///
+    /// The bottom cut folds `TIER1_HI` and so cannot drift away from the
+    /// `Acquaintance` / `Spark` labels the rest of the system shows. The top cut
+    /// is deliberately its own constant, set below the tier-5 apex — see
+    /// `INTIMACY_RUNG3_LO`.
+    pub fn intimacy_rung(&self) -> u8 {
+        let s = self.bond_score().max(self.chemistry_score());
+        if tier_index(s) == 1 {
+            1
+        } else if s < INTIMACY_RUNG3_LO {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// Patience band. Reads the raw axis, not a composite — `patience` is
+    /// rule-owned and stays outside both folds.
+    pub fn patience_band(&self) -> PatienceBand {
+        if self.patience < PATIENCE_LO {
+            PatienceBand::Low
+        } else if self.patience < PATIENCE_HI {
+            PatienceBand::Mid
+        } else {
+            PatienceBand::High
         }
     }
 }
@@ -440,6 +506,104 @@ mod tests {
         assert_eq!(tier_index(0.899), 4);
         assert_eq!(tier_index(0.9), 5);
         assert_eq!(tier_index(1.0), 5);
+    }
+
+    /// Rung 1 stays welded to the bottom tier labels, so it cannot drift away
+    /// from what the rest of the system displays. The top rung has a floor of
+    /// its own, deliberately inside tier 4 — a tier-4 relationship already
+    /// clears it, well short of the apex. (That the two ladders cannot cross is
+    /// a compile-time assertion beside the constant. Exact cut values are not
+    /// reachable through the `/3` composites in f64, hence values either side
+    /// rather than on them.)
+    #[test]
+    fn intimacy_rung_cuts_against_the_tier_ladder() {
+        let mut a = fresh();
+
+        // Both lines at the bottom label → rung 1.
+        a.warmth = 0.1;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        assert_eq!(a.bond_label(), BondLabel::Acquaintance);
+        assert_eq!(a.chemistry_label(), ChemistryLabel::Spark);
+        assert_eq!(a.intimacy_rung(), 1);
+
+        // Clear of tier 1, short of the top floor → rung 2.
+        a.warmth = 0.7;
+        a.trust = 0.7;
+        a.intrigue = 0.7;
+        assert_eq!(a.intimacy_rung(), 2);
+
+        // Past the floor while still tier 4 → rung 3 without reaching the apex.
+        a.warmth = 0.8;
+        a.trust = 0.8;
+        a.intrigue = 0.8;
+        assert_eq!(a.bond_label(), BondLabel::Confidant);
+        assert_eq!(a.intimacy_rung(), 3);
+    }
+
+    /// `max` over the two lines: either track alone can unlock.
+    #[test]
+    fn intimacy_rung_takes_the_further_line() {
+        let mut a = fresh();
+        // chemistry = (warmth + intimacy + tension)/3 = 0.95, bond = 0.1
+        a.warmth = 0.95;
+        a.trust = 0.0;
+        a.intrigue = 0.3;
+        a.intimacy = 0.95;
+        a.tension = 0.95;
+        assert!(a.bond_score() < a.chemistry_score());
+        assert_eq!(a.intimacy_rung(), 3);
+        // Mirror image: bond ahead, chemistry flat.
+        a.trust = 0.95;
+        a.intrigue = 0.95;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        assert!(a.chemistry_score() < a.bond_score());
+        assert_eq!(a.intimacy_rung(), 3);
+    }
+
+    /// A brand-new session (migration-0029 seed) is rung 1, not an absent value.
+    #[test]
+    fn intimacy_rung_of_a_seeded_session_is_one() {
+        let mut a = fresh();
+        a.warmth = 0.1;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        assert!(a.bond_score().max(a.chemistry_score()) < TIER1_HI);
+        assert_eq!(a.intimacy_rung(), 1);
+    }
+
+    #[test]
+    fn patience_band_boundaries() {
+        let mut a = fresh();
+        let mut at = |p: f64| {
+            a.patience = p;
+            a.patience_band()
+        };
+        assert_eq!(at(0.0), PatienceBand::Low);
+        assert_eq!(at(0.349), PatienceBand::Low);
+        assert_eq!(at(0.35), PatienceBand::Mid); // low → mid, inclusive
+        assert_eq!(at(0.649), PatienceBand::Mid);
+        assert_eq!(at(0.65), PatienceBand::High); // mid → high, inclusive
+        assert_eq!(at(1.0), PatienceBand::High);
+    }
+
+    /// The band reads the raw axis: moving the composites must not move it.
+    #[test]
+    fn patience_band_is_independent_of_the_composites() {
+        let mut a = fresh();
+        a.patience = 0.2;
+        a.warmth = 1.0;
+        a.trust = 1.0;
+        a.intrigue = 1.0;
+        a.intimacy = 1.0;
+        a.tension = 1.0;
+        assert_eq!(a.intimacy_rung(), 3);
+        assert_eq!(a.patience_band(), PatienceBand::Low);
     }
 
     #[test]
