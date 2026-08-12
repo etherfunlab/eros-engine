@@ -718,6 +718,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Precedence never bypasses type validation: even when `affinity_scope`
+    /// is present (and would win), a garbage legacy value is still a 422 —
+    /// the whole body deserializes before precedence runs.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_422_when_overridden_relationship_scope_is_garbage(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "affinity_scope": "bond",
+                "relationship_scope": "romance"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     /// Both fields sent ⇒ affinity_scope wins. Observable in the audit trail:
     /// the assistant row's legacy key carries the WINNER's projection, and the
     /// user row echoes only the new field's raw value.
