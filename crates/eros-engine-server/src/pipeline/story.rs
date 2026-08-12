@@ -320,6 +320,7 @@ async fn direct_story(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: Some(STORY_AUDIT_USER.into()),
         reasoning: resolved.reasoning.clone(),
         response_format: resolved.structured_output.then(story_response_format),

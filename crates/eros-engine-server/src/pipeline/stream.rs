@@ -1400,6 +1400,7 @@ async fn run_output_filter(
             ],
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
+            sampling: f.sampling,
             reasoning: f.reasoning.clone(),
             task: Some("chat_output_filter".into()),
             ..Default::default()
@@ -1676,6 +1677,7 @@ async fn run_pde_decision(
             ],
             temperature: p.temperature as f32,
             max_tokens: p.max_tokens,
+            sampling: p.sampling,
             reasoning: p.reasoning.clone(),
             response_format: response_format.clone(),
             task: Some("pde_decision".into()),
@@ -2321,6 +2323,7 @@ async fn run_input_filter(
             ],
             temperature: f.temperature as f32,
             max_tokens: f.max_tokens,
+            sampling: f.sampling,
             reasoning: f.reasoning.clone(),
             task: Some("chat_input_filter".into()),
             ..Default::default()
@@ -2496,6 +2499,7 @@ pub(crate) async fn run_image_prompt_compose(
             ],
             temperature: c.temperature as f32,
             max_tokens: c.max_tokens,
+            sampling: c.sampling,
             reasoning: c.reasoning.clone(),
             task: Some("chat_image_prompt_compose".into()),
             ..Default::default()
@@ -3323,6 +3327,7 @@ pub fn run_stream(
                     messages,
                     temperature: p.temperature as f32,
                     max_tokens: p.max_tokens,
+                    sampling: p.sampling,
                     reasoning: p.reasoning.clone(),
                     task: Some("chat_product_qa".into()),
                     ..Default::default()
@@ -11553,6 +11558,99 @@ data: [DONE]\n\n";
         assert_eq!(run.status, PdeStatus::Ok);
         assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
         assert_eq!(run.model.as_deref(), Some("model-b"));
+    }
+
+    #[tokio::test]
+    async fn pde_request_puts_configured_sampling_on_the_wire() {
+        // Issue #246 end-to-end lock. ChatRequest derives Default and every
+        // call-site literal ends in `..Default::default()`, so a site that
+        // forgets `sampling` still COMPILES and silently sends nothing — the
+        // compiler cannot catch this class. Assert the outbound body instead.
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
+                "id": "g", "model": "m"
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let mut p = test_resolved_pde(vec!["model-a".into()]);
+        p.sampling = eros_engine_llm::model_config::Sampling {
+            top_p: Some(0.55),
+            frequency_penalty: Some(0.35),
+            presence_penalty: Some(0.15),
+            repetition_penalty: Some(1.25),
+        };
+        let run = run_pde_decision(&client, &p, "ctx").await;
+        assert_eq!(run.status, PdeStatus::Ok);
+
+        let sent: serde_json::Value = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .first()
+            .expect("one request")
+            .body_json()
+            .expect("body is json");
+        assert_eq!(sent["top_p"], 0.55);
+        assert_eq!(sent["frequency_penalty"], 0.35);
+        assert_eq!(sent["presence_penalty"], 0.15);
+        assert_eq!(sent["repetition_penalty"], 1.25);
+    }
+
+    #[tokio::test]
+    async fn pde_unset_sampling_stays_off_the_wire() {
+        // The other half of the contract: an untuned task must produce a
+        // byte-identical body to before #246 — no key, not a default value.
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"action\":\"reply_text\",\"inner_state\":\"x\"}"}}],
+                "id": "g", "model": "m"
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", mock.uri()),
+        );
+        let p = test_resolved_pde(vec!["model-a".into()]);
+        assert_eq!(
+            run_pde_decision(&client, &p, "ctx").await.status,
+            PdeStatus::Ok
+        );
+
+        let sent: serde_json::Value = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .first()
+            .expect("one request")
+            .body_json()
+            .expect("body is json");
+        for k in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            assert!(
+                sent.get(k).is_none(),
+                "unset {k} must not reach the wire: {sent}"
+            );
+        }
     }
 
     #[tokio::test]

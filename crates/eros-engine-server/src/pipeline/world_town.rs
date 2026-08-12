@@ -204,6 +204,7 @@ async fn run_comment_round(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
         reasoning: resolved.reasoning.clone(),
         response_format: resolved
@@ -318,6 +319,7 @@ async fn run_reply(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
         reasoning: resolved.reasoning.clone(),
         task: Some("world_reply".into()),

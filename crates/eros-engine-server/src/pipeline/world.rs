@@ -302,6 +302,7 @@ async fn direct_world(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         user: Some(WORLD_AUDIT_USER.into()),
         reasoning: resolved.reasoning.clone(),
         response_format: resolved

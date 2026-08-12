@@ -356,6 +356,7 @@ async fn compose_stream(
         ],
         temperature: resolved.temperature as f32,
         max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
         reasoning: resolved.reasoning.clone(),
         task: Some("chat_image_prompt_compose".into()),
         ..Default::default()
