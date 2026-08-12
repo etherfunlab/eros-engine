@@ -2385,6 +2385,17 @@
           "client_msg_id"
         ],
         "properties": {
+          "affinity_scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinityScopeDto",
+                "description": "Which affinity halves feed this turn's relationship line — same field\nname, value space, and default (`bond`) as the chat message stream:\n`\"full\" | \"bond_and_chemistry\" | \"bond\" | \"chemistry\" | \"none\"`, or an\narray of axis names such as `[\"warmth\", \"trust\"]`. Axes flatten to the\ntwo injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒\nchemistry half). When both this and the deprecated `relationship_scope`\nare sent, this field wins."
+              }
+            ]
+          },
           "client_msg_id": {
             "type": "string"
           },
@@ -2403,7 +2414,7 @@
               "string",
               "null"
             ],
-            "description": "Which halves of the relationship line to inject this turn:\n`none | bond | chemistry | both`. Omitted ⇒ `both`."
+            "description": "**Deprecated** — superseded by `affinity_scope`; removed in the next\nminor release. Which halves of the relationship line to inject:\n`none | bond | chemistry | both`. Ignored when `affinity_scope` is\npresent. Note the two value spaces do not mix: `\"full\"` here (or\n`\"both\"` under `affinity_scope`) is a 422."
           }
         }
       }

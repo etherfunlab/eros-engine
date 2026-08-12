@@ -56,7 +56,7 @@ pub enum AffinityScopeDto {
 }
 
 impl AffinityScopeDto {
-    fn resolve(&self) -> AffinityScope {
+    pub(crate) fn resolve(&self) -> AffinityScope {
         match self {
             // bond (warmth+intimacy+tension) ∪ chemistry (trust+intrigue+patience)
             // covers all six axes — identical to Full.

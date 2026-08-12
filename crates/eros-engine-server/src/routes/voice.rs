@@ -37,8 +37,20 @@ const SSE_KEEPALIVE_SECS: u64 = 15;
 pub struct VoiceTurnRequest {
     pub content: String,
     pub client_msg_id: String,
-    /// Which halves of the relationship line to inject this turn:
-    /// `none | bond | chemistry | both`. Omitted ⇒ `both`.
+    /// Which affinity halves feed this turn's relationship line — same field
+    /// name, value space, and default (`bond`) as the chat message stream:
+    /// `"full" | "bond_and_chemistry" | "bond" | "chemistry" | "none"`, or an
+    /// array of axis names such as `["warmth", "trust"]`. Axes flatten to the
+    /// two injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒
+    /// chemistry half). When both this and the deprecated `relationship_scope`
+    /// are sent, this field wins.
+    #[serde(default)]
+    pub affinity_scope: Option<crate::routes::companion_stream::AffinityScopeDto>,
+    /// **Deprecated** — superseded by `affinity_scope`; removed in the next
+    /// minor release. Which halves of the relationship line to inject:
+    /// `none | bond | chemistry | both`. Ignored when `affinity_scope` is
+    /// present. Note the two value spaces do not mix: `"full"` here (or
+    /// `"both"` under `affinity_scope`) is a 422.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub relationship_scope: Option<RelationshipScope>,
@@ -238,6 +250,38 @@ pub async fn voice_turn_stream(
             )
         })?;
 
+    // Resolution precedence: new field ⇒ legacy field ⇒ chat-parity default.
+    // The legacy enum still type-checks even when overridden (a garbage value
+    // 422s regardless), and maps onto the constructors that reproduce its old
+    // behavior exactly.
+    let affinity_scope = match (req.affinity_scope.as_ref(), req.relationship_scope) {
+        (Some(dto), _) => dto.resolve(),
+        (None, Some(rs)) => match rs {
+            RelationshipScope::None => AffinityScope::none(),
+            RelationshipScope::Bond => AffinityScope::bond(),
+            RelationshipScope::Chemistry => AffinityScope::chemistry(),
+            RelationshipScope::Both => AffinityScope::full(),
+        },
+        (None, None) => AffinityScope::default(), // bond — chat parity
+    };
+    // Pre-resolve raw snapshot on the user row, mirroring the chat stream's
+    // sparse `_raw` keys. The legacy field is NOT echoed here — its audit
+    // stays on the assistant row's legacy key for this release.
+    let mut raw = serde_json::Map::new();
+    if let Some(ms) = req.memory_scope.as_ref() {
+        raw.insert(
+            "memory_scope_raw".into(),
+            serde_json::to_value(ms).expect("MemoryScope serializes"),
+        );
+    }
+    if let Some(asd) = req.affinity_scope.as_ref() {
+        raw.insert(
+            "affinity_scope_raw".into(),
+            serde_json::to_value(asd).expect("AffinityScopeDto serializes"),
+        );
+    }
+    let raw_metadata = (!raw.is_empty()).then_some(serde_json::Value::Object(raw));
+
     // Persist the user turn (idempotent on (session_id, client_msg_id)).
     // A duplicate is only a conflict when the turn actually PRODUCED something:
     // an existing reply (retrying would double-bill) or a deliberate barge-in
@@ -245,7 +289,12 @@ pub async fn voice_turn_stream(
     // or an upstream failure, which already told the client `retryable: true` —
     // so it regenerates against the persisted user row.
     let (user_message_id, persisted_content) = match chat_repo
-        .insert_voice_user_message(session_id, &req.content, &req.client_msg_id, None)
+        .insert_voice_user_message(
+            session_id,
+            &req.content,
+            &req.client_msg_id,
+            raw_metadata.as_ref(),
+        )
         .await?
     {
         VoiceUserInsert::Inserted(id) => (id, req.content),
@@ -302,12 +351,7 @@ pub async fn voice_turn_stream(
         // no input-filter rewrite). Already persisted above as the latest
         // history row — the wire messages still come from there.
         content: persisted_content,
-        affinity_scope: match req.relationship_scope.unwrap_or_default() {
-            RelationshipScope::None => AffinityScope::none(),
-            RelationshipScope::Bond => AffinityScope::bond(),
-            RelationshipScope::Chemistry => AffinityScope::chemistry(),
-            RelationshipScope::Both => AffinityScope::full(),
-        },
+        affinity_scope,
         memory_scope: req.memory_scope.unwrap_or_default(),
         // Handed over from the row loaded above — the pipeline reads the
         // `voice_bootstrap` marker from it instead of re-querying the session.
@@ -587,6 +631,207 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Drive one mocked voice turn to completion and return nothing — the
+    /// caller asserts on the DB rows it left behind.
+    async fn run_mocked_turn(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        body: serde_json::Value,
+    ) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\
+                         \"id\":\"gen-scope-test\",\"model\":\"primary\"}\n\n\
+                         data: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&mock)
+            .await;
+        let mut state = with_voice(crate::routes::companion::test_state(pool.clone()));
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let resp = post_voice(&mut app, session_id, &mint_jwt(user_id), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let sse_text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !sse_text.contains("\"type\":\"error\""),
+            "no error frame expected: {sse_text}"
+        );
+    }
+
+    /// Requirement: the two vocabularies must not cross. The legacy value
+    /// `"both"` under the NEW field name is a payload error.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_422_when_affinity_scope_uses_legacy_value(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "affinity_scope": "both"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// And the mirror: the new vocabulary's `"full"` under the LEGACY field.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn voice_422_when_relationship_scope_uses_new_value(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
+        let resp = post_voice(
+            &mut app,
+            session_id,
+            &mint_jwt(user_id),
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "relationship_scope": "full"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Both fields sent ⇒ affinity_scope wins. Observable in the audit trail:
+    /// the assistant row's legacy key carries the WINNER's projection, and the
+    /// user row echoes only the new field's raw value.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn affinity_scope_wins_over_relationship_scope(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        run_mocked_turn(
+            &pool,
+            session_id,
+            user_id,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J9SCOPEPREC0000000000001",
+                "relationship_scope": "both",
+                "affinity_scope": "none"
+            }),
+        )
+        .await;
+        let (legacy, memory): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT metadata->>'relationship_scope', metadata->>'memory_scope' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy.as_deref(), Some("none"), "affinity_scope must win");
+        assert_eq!(memory.as_deref(), Some("neutral_and_relationship"));
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'affinity_scope_raw' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(raw.as_deref(), Some("none"), "user row echoes the raw DTO");
+    }
+
+    /// Neither field ⇒ chat-parity default `bond` (deliberate change from the
+    /// old `both`), and NO raw keys on the user row (sparse audit).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn omitted_scopes_default_to_bond_with_no_raw_audit(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        run_mocked_turn(
+            &pool,
+            session_id,
+            user_id,
+            json!({"content": "hi", "client_msg_id": "01J9SCOPEDFLT0000000000001"}),
+        )
+        .await;
+        let legacy: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'relationship_scope' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy.as_deref(),
+            Some("bond"),
+            "omitted ⇒ chat default bond"
+        );
+        let user_meta_null: bool = sqlx::query_scalar(
+            "SELECT metadata IS NULL FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(user_meta_null, "no fields sent ⇒ no raw audit keys");
+    }
+
+    /// The axes-array shape resolves (chemistry half from a chemistry axis)
+    /// and is echoed verbatim as the raw audit value.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn affinity_scope_axes_array_resolves_and_echoes_raw(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        run_mocked_turn(
+            &pool,
+            session_id,
+            user_id,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J9SCOPEAXES0000000000001",
+                "affinity_scope": ["trust"],
+                "memory_scope": "none"
+            }),
+        )
+        .await;
+        let legacy: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'relationship_scope' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy.as_deref(), Some("chemistry"));
+        let (raw_scope, raw_memory): (Option<serde_json::Value>, Option<String>) = sqlx::query_as(
+            "SELECT metadata->'affinity_scope_raw', metadata->>'memory_scope_raw' \
+             FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(raw_scope, Some(serde_json::json!(["trust"])));
+        assert_eq!(raw_memory.as_deref(), Some("none"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
