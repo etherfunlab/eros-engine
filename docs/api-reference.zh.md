@@ -417,9 +417,22 @@ Body 字段：
   因为每轮召回会把这段文字当作查询向量，同一轮次的多次尝试之间不能漂移。
   这也意味着：客户端在收到 `Error { retryable: true }` 帧之后再重试，现在
   真的能成功了，不会再被本该放行的重复检查挡回去。
-- `relationship_scope`（可选）—— 本轮注入关系描述的哪几半：`"none"`、`"bond"`、
-  `"chemistry"`、`"both"`（默认 `"both"`）。解析后的取值记录在 assistant 行的
-  `metadata.relationship_scope` 上。
+- `affinity_scope`（可选）—— 字段名、取值空间、默认值（`"bond"`）都与
+  [聊天消息流](#post-compchatsession_idmessagestream) 相同：命名值
+  `"full" | "bond_and_chemistry" | "bond" | "chemistry" | "none"`，或轴名
+  数组（如 `["warmth", "trust"]`）。语音按「半句」粒度注入，解析出的轴会
+  压平成关系描述的两半：bond 半（warmth / intimacy / tension 任一激活）与
+  chemistry 半（trust / intrigue / patience 任一激活）。审计：**user** 行在
+  `metadata.affinity_scope_raw`（及 `metadata.memory_scope_raw`）记录原样
+  取值，均为请求带了该字段才写；**assistant** 行的旧键
+  `metadata.relationship_scope` 保留一个版本（`"none" | "bond" |
+  "chemistry" | "both"`，由解析结果反投影而来），并新增解析后的
+  `metadata.memory_scope`。
+- `relationship_scope`（可选，**已废弃** —— 下个 minor 版本移除）——
+  `affinity_scope` 的旧名：`"none"`、`"bond"`、`"chemistry"`、`"both"`。
+  与 `affinity_scope` 同时出现时被忽略。两套取值空间不互通：在这里发
+  `"full"`，或在 `affinity_scope` 下发 `"both"`，都是 422。只发这个字段的
+  调用方行为不变——但**两个字段都不发**时的默认值已从 `both` 改为 `bond`。
 - `memory_scope`（可选）—— 字段名、枚举值、默认值
   （`"neutral_and_relationship"`）都与
   [聊天消息流](#post-compchatsession_idmessagestream) 相同。session 里
@@ -429,7 +442,7 @@ Body 字段：
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","affinity_scope":"bond","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
 ```
 
@@ -486,7 +499,7 @@ Response `200`：
 |---|---|---|
 | 不存在 | 非空 | 插入一行，`truncated = true` |
 | 不存在 | 空 | 不写 assistant 行 |
-| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `relationship_scope` 元数据 |
+| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `relationship_scope` / `memory_scope` 元数据 |
 | 已存在（竞态） | 空 | `content` 保持不动 |
 
 同一轮次重复调用打断接口是幂等的——标记和 upsert 都以 user 行的 id 为键，重试

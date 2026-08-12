@@ -482,10 +482,27 @@ Body fields:
   attempts. This also means a retry after an `Error { retryable: true }`
   frame now actually succeeds, instead of being turned away by the very
   duplicate check the client was told it could pass.
-- `relationship_scope` (optional) — which halves of the relationship line
-  to inject this turn: `"none"`, `"bond"`, `"chemistry"`, `"both"`
-  (default `"both"`). The resolved value is recorded on the assistant
-  row's `metadata.relationship_scope`.
+- `affinity_scope` (optional) — same field name, value space, and default
+  (`"bond"`) as the
+  [chat message stream](#post-compchatsession_idmessagestream): a named
+  value `"full" | "bond_and_chemistry" | "bond" | "chemistry" | "none"`,
+  or an array of axis names such as `["warmth", "trust"]`. Voice injects
+  at half granularity, so the resolved axes flatten to the two halves of
+  the relationship line: any bond axis (warmth / intimacy / tension) ⇒
+  the bond half, any chemistry axis (trust / intrigue / patience) ⇒ the
+  chemistry half. The audit trail: the **user** row records the raw value
+  under `metadata.affinity_scope_raw` (and `metadata.memory_scope_raw`),
+  each only when the request carried the field; the **assistant** row
+  keeps the legacy `metadata.relationship_scope` key for one release
+  (`"none" | "bond" | "chemistry" | "both"`, projected from the resolved
+  halves) plus the resolved `metadata.memory_scope`.
+- `relationship_scope` (optional, **deprecated** — removed in the next
+  minor release) — the pre-`affinity_scope` name of the same switch:
+  `"none"`, `"bond"`, `"chemistry"`, `"both"`. Ignored when
+  `affinity_scope` is present. The two value spaces do not mix: `"full"`
+  here, or `"both"` under `affinity_scope`, is a 422. Callers still
+  sending only this field see unchanged behavior — but note the default
+  when **neither** field is sent is now `bond` (previously `both`).
 - `memory_scope` (optional) — same field name, enum, and default
   (`"neutral_and_relationship"`) as the
   [chat message stream](#post-compchatsession_idmessagestream). On the
@@ -496,7 +513,7 @@ Body fields:
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","relationship_scope":"both","memory_scope":"neutral_and_relationship"}' \
+  -d '{"content":"你今天在干嘛？","client_msg_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","affinity_scope":"bond","memory_scope":"neutral_and_relationship"}' \
   http://localhost:8080/comp/voice/{session_id}/turn/stream
 ```
 
@@ -562,7 +579,7 @@ and its `content` always ends up as the interrupt's report:
 |---|---|---|
 | absent | non-empty | inserted, `truncated = true` |
 | absent | empty | no assistant row written |
-| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `relationship_scope` metadata preserved |
+| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `relationship_scope` / `memory_scope` metadata preserved |
 | already exists (race) | empty | `content` left untouched |
 
 Repeated interrupt calls for the same turn are idempotent — the marker and
