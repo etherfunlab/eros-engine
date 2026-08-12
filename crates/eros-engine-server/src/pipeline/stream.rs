@@ -2082,6 +2082,7 @@ async fn run_vision(
             temperature: v.temperature as f32,
             max_tokens: v.max_tokens,
             reasoning: v.reasoning.clone(),
+            sampling: v.sampling,
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute_vision(req))
             .await

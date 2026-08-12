@@ -1147,6 +1147,8 @@ pub struct ResolvedVision {
     pub describe_prompt: String,
     pub retry_depth: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs from the task block (issue #246).
+    pub sampling: Sampling,
 }
 
 /// Built-in, product-identity-free voice directive. Deployments override it via
@@ -1776,6 +1778,7 @@ impl ModelConfig {
             describe_prompt,
             retry_depth,
             reasoning: task_cfg.reasoning.clone(),
+            sampling: m.sampling,
         })
     }
 
@@ -5192,6 +5195,17 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(toml).unwrap();
         let r = cfg.resolve("chat_companion", None);
         assert_eq!(r.sampling, Sampling::default());
+    }
+
+    #[test]
+    fn resolve_vision_carries_sampling() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_vision]\nmodel = \"m\"\nfilter_prompt = \"describe\"\ntop_p = 0.7\nrepetition_penalty = 1.1\n",
+        )
+        .unwrap();
+        let v = cfg.resolve_vision().expect("vision enabled");
+        assert_eq!(v.sampling.top_p, Some(0.7));
+        assert_eq!(v.sampling.repetition_penalty, Some(1.1));
     }
 
     #[test]

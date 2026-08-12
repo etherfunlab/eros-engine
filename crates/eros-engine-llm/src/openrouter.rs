@@ -113,6 +113,9 @@ pub struct VisionRequest {
     pub temperature: f32,
     pub max_tokens: u32,
     pub reasoning: Option<ReasoningConfig>,
+    /// Optional sampling knobs (issue #246). The describe call is an ordinary
+    /// chat/completions request in every respect but its `messages` shape.
+    pub sampling: crate::model_config::Sampling,
 }
 
 /// Task name the vision pre-stage matches body rules under. `VisionRequest`
@@ -146,6 +149,18 @@ fn build_vision_body(req: &VisionRequest, model: &str) -> serde_json::Value {
             body["reasoning"] = v;
         }
     }
+    // Sampling knobs are omitted entirely when unset, mirroring WireRequest's
+    // `skip_serializing_if` — an untuned deployment must keep producing a
+    // byte-identical body (issue #246).
+    let mut put = |k: &str, v: Option<f32>| {
+        if let Some(x) = v {
+            body[k] = serde_json::json!(x);
+        }
+    };
+    put("top_p", req.sampling.top_p);
+    put("frequency_penalty", req.sampling.frequency_penalty);
+    put("presence_penalty", req.sampling.presence_penalty);
+    put("repetition_penalty", req.sampling.repetition_penalty);
     body
 }
 
@@ -3158,6 +3173,7 @@ data: [DONE]\n\n";
                 temperature: 0.0,
                 max_tokens: 64,
                 reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
             })
             .await
             .expect("garbled vision is repaired into Ok, not dropped");
@@ -3209,6 +3225,7 @@ data: [DONE]\n\n";
                     enabled: Some(false),
                     ..Default::default()
                 }),
+                sampling: crate::model_config::Sampling::default(),
             })
             .await
             .expect("vision call succeeds");
@@ -3296,6 +3313,53 @@ data: [DONE]\n\n";
             !s.contains("repetition_penalty"),
             "unset repetition_penalty must be omitted: {s}"
         );
+    }
+
+    #[test]
+    fn vision_body_carries_sampling_when_set_and_omits_when_unset() {
+        let base = VisionRequest {
+            model: "m".into(),
+            fallback_model: vec![],
+            system_prompt: "sys".into(),
+            image_url: "https://x/y.png".into(),
+            caption: None,
+            temperature: 0.5,
+            max_tokens: 10,
+            reasoning: None,
+            sampling: crate::model_config::Sampling::default(),
+        };
+
+        let bare = build_vision_body(&base, "m");
+        let o = bare.as_object().unwrap();
+        for k in [
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+        ] {
+            assert!(!o.contains_key(k), "unset {k} must be omitted: {bare}");
+        }
+
+        let tuned = VisionRequest {
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                frequency_penalty: Some(0.4),
+                presence_penalty: Some(0.2),
+                repetition_penalty: Some(1.15),
+            },
+            ..base
+        };
+        let body = build_vision_body(&tuned, "m");
+        // Compared through the f32→f64 widening `serde_json::json!` applies.
+        // The vision body is a hand-built `Value`, so every float in it takes
+        // that widening — `temperature` already did before this change. The
+        // typed chat path formats f32 with ryu instead and emits `0.9`; the
+        // difference is representational only, both parse to the same float.
+        let f = |v: f32| serde_json::json!(v);
+        assert_eq!(body["top_p"], f(0.9));
+        assert_eq!(body["frequency_penalty"], f(0.4));
+        assert_eq!(body["presence_penalty"], f(0.2));
+        assert_eq!(body["repetition_penalty"], f(1.15));
     }
 
     #[test]
@@ -3430,6 +3494,14 @@ data: [DONE]\n\n";
                 enabled: Some(false),
                 ..Default::default()
             }),
+            // Set, so the ALLOW lock below actually exercises them — all four
+            // are standard OpenAI fields and must survive the strip (#246).
+            sampling: crate::model_config::Sampling {
+                top_p: Some(0.9),
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.1),
+                repetition_penalty: Some(1.15),
+            },
         };
         let mut body = build_vision_body(&req, "m");
         strip_openrouter_vision_fields(&mut body);
@@ -4059,6 +4131,7 @@ data: [DONE]\n\n";
                 enabled: Some(false),
                 ..Default::default()
             }),
+            sampling: crate::model_config::Sampling::default(),
         }
     }
 
