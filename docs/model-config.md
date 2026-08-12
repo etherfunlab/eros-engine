@@ -54,6 +54,10 @@ model        = "<provider>/<model-id>"      # optional — absent falls through 
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
+top_p              = 0.9                    # optional, (0.0, 1.0]  — omitted from the request when unset
+frequency_penalty  = 0.4                    # optional, [-2.0, 2.0] — omitted when unset
+presence_penalty   = 0.2                    # optional, [-2.0, 2.0] — omitted when unset
+repetition_penalty = 1.15                   # optional, (0.0, 2.0]  — omitted when unset; 1.0 is the no-op identity
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
 
@@ -90,11 +94,12 @@ Field details:
 | `tasks.<name>.retry_depth` | `u32` | no | Truncates the resolved `fallback` chain: primary + at most this many fallbacks are ever tried. Defaults: `2` for tasks resolved by the generic `resolve()` (`chat_companion` included; per-tier override allowed), `1` for the single-purpose tasks — see "Fallback truncation (`retry_depth`)". |
 | `tasks.<name>.temperature` | `f64` | no | Per-task sampling temperature. No per-tier override. |
 | `tasks.<name>.max_tokens` | `u32` | no | Per-task token cap. No per-tier override. |
-| `tasks.chat_companion.top_p` | `f32` | no | Nucleus-sampling probability mass. Chat task only (`chat_companion`); task-level only — tiers inherit it, no per-tier override, no `[defaults]` fallback. Setting it on other tasks parses but has no effect. Absent ⇒ the `top_p` wire param is omitted, not sent with a default. |
-| `tasks.chat_companion.frequency_penalty` | `f32` | no | OpenAI-style frequency penalty. Same scoping as `top_p`; absent ⇒ omitted from the wire request. |
-| `tasks.chat_companion.presence_penalty` | `f32` | no | OpenAI-style presence penalty. Same scoping as `top_p`; absent ⇒ omitted from the wire request. |
+| `tasks.<name>.top_p` | `f32` | no | Nucleus-sampling probability mass. Valid on **every task except `embedding`**; task-level only — tiers inherit it, no per-tier override, no `[defaults]` fallback. Legal range `(0.0, 1.0]`; out of range or non-finite refuses to boot. Absent ⇒ the `top_p` wire param is omitted, not sent with a default. |
+| `tasks.<name>.frequency_penalty` | `f32` | no | OpenAI-style frequency penalty. Same scoping as `top_p`. Legal range `[-2.0, 2.0]`; absent ⇒ omitted from the wire request. |
+| `tasks.<name>.presence_penalty` | `f32` | no | OpenAI-style presence penalty. Same scoping as `top_p`. Legal range `[-2.0, 2.0]`; absent ⇒ omitted from the wire request. |
+| `tasks.<name>.repetition_penalty` | `f32` | no | Repetition penalty — the knob for degenerate tail repetition, which `temperature` cannot address (looping is characteristic of near-greedy decoding, so lowering temperature pushes the wrong way). Same scoping as `top_p`. Legal range `(0.0, 2.0]`, `1.0` being the no-op identity; absent ⇒ omitted from the wire request. |
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
-| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature` or `max_tokens`. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
+| `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, or `repetition_penalty` — all six are task-level only. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
@@ -227,11 +232,24 @@ interprets it. `tasks` scopes the rule to specific engine task names
 every task this provider serves. Rules apply in declaration order,
 later rules win on key conflicts, and merged params win over engine-built
 fields — declaring `reasoning` on the `openrouter` entry therefore
-overrides `[tasks.*].reasoning` for the scoped tasks. `model`, `messages`,
+overrides `[tasks.*].reasoning` for the scoped tasks. This is not special to
+`reasoning`: **every** engine-built wire field loses to a body param —
+`temperature`, `max_tokens`, and the four sampling knobs (`top_p`,
+`frequency_penalty`, `presence_penalty`, `repetition_penalty`) included.
+`model`, `messages`,
 and `stream` are engine-owned and refuse to boot. A rule naming `embedding`
 warns and never applies (that call builds its own body and takes no
 chat-shaped parameters). Custom providers must declare `chat` to use body
 rules; the reserved `openrouter` entry may declare rules alone.
+
+Weigh the trade-off before reaching for a body rule instead of the task
+block: rules are **provider-scoped** while a `fallback` chain crosses
+providers, so a task whose primary and fallback live on different
+`[providers]` entries needs the same param declared twice and the two can
+silently diverge; and `params` is unschema'd passthrough, so a misspelled key
+is never caught. Prefer `[tasks.<name>]` for anything it can express, and keep
+body rules for what it cannot (vendor-specific fields, OpenRouter routing
+prefs).
 
 ```toml
 [providers.venice]
@@ -362,6 +380,10 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 | `retry_depth` | `u32` | `1` | Number of `fallback` entries the filter may try before giving up. `0` = primary only; `1` = primary + first fallback (default). |
 | `temperature` | `f64` | `defaults.fallback_temperature` | Sampling temperature for the filter model. **Task-level only — no per-tier override** (same as every other task). |
 | `max_tokens` | `u32` | `defaults.fallback_max_tokens` | Token cap for the filter response. **Task-level only — no per-tier override.** |
+| `top_p` | `f32` | absent | Nucleus sampling, `(0.0, 1.0]`. Omitted from the request when unset. |
+| `frequency_penalty` | `f32` | absent | OpenAI-style frequency penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `presence_penalty` | `f32` | absent | OpenAI-style presence penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `repetition_penalty` | `f32` | absent | Repetition penalty, `(0.0, 2.0]` (`1.0` = no-op). Omitted when unset. |
 | `filter_prompt` | `String` | — | **Required for the filter to be active.** System/instruction prompt sent to the filter model. Blank or absent → filter is inert. |
 | `trigger` | inline table | absent (every turn) | AND-gate on when to apply the filter. Omit the whole key to filter every qualifying turn. |
 | `timing` | `"after_extract"` \| `"before_extract"` | `"after_extract"` | Controls whether extract (memory/insight/affinity) reads the original or the filtered text (see below). |
@@ -369,8 +391,8 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 Per-tier sub-tables (`[tasks.chat_output_filter.tiers.<tier>]`) may override
 `model`, `fallback`, `retry_depth`, `filter_prompt`, `trigger`, and `timing`; a
 tier that omits one falls back to the default `[tasks.chat_output_filter]` block.
-**`temperature` and `max_tokens` are task-level only** (per-tier sub-tables do not
-override them — the same rule as every other task).
+**`temperature`, `max_tokens`, and the four sampling knobs are task-level only**
+(per-tier sub-tables do not override them — the same rule as every other task).
 
 #### `trigger` predicates
 
@@ -674,6 +696,10 @@ max_tokens   = 700
 | `retry_depth` | `u32` | `1` | Primary + this many fallbacks. |
 | `temperature` | `f64` | task default | Sampling temperature for the composer call. |
 | `max_tokens` | `u32` | task default | Token cap for the composer call. |
+| `top_p` | `f32` | absent | Nucleus sampling, `(0.0, 1.0]`. Omitted from the request when unset. |
+| `frequency_penalty` | `f32` | absent | OpenAI-style frequency penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `presence_penalty` | `f32` | absent | OpenAI-style presence penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `repetition_penalty` | `f32` | absent | Repetition penalty, `(0.0, 2.0]` (`1.0` = no-op). Omitted when unset. |
 | `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **built-in default** | **Optional** (unlike other tasks). Blank/absent ⇒ the engine's built-in `DEFAULT_COMPOSE_PROMPT`. See **variants** below for the array/table shapes. |
 
@@ -825,6 +851,10 @@ filter_prompt = """
 | `retry_depth` | `u32` | `1` | Primary + this many fallbacks. |
 | `temperature` | `f64` | task default | Sampling temperature for the executor call. |
 | `max_tokens` | `u32` | task default | Token cap for the executor call. |
+| `top_p` | `f32` | absent | Nucleus sampling, `(0.0, 1.0]`. Omitted from the request when unset. |
+| `frequency_penalty` | `f32` | absent | OpenAI-style frequency penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `presence_penalty` | `f32` | absent | OpenAI-style presence penalty, `[-2.0, 2.0]`. Omitted when unset. |
+| `repetition_penalty` | `f32` | absent | Repetition penalty, `(0.0, 2.0]` (`1.0` = no-op). Omitted when unset. |
 | `reasoning` | table | absent | Optional reasoning control forwarded to OpenRouter. |
 | `filter_prompt` | `String` | — | **Required.** Product docs + answering rules; blank or absent refuses to boot (see the gates table above). |
 
@@ -901,6 +931,7 @@ every response is length-checked. There used to be a `dimensions` field on
 | `model` | single fixed string | bare ⇒ `@voyage`; `@openrouter` / `@<custom>` route to the OpenRouter-compatible wire; mutually exclusive with the pair |
 | `model_read` | `Option<String>` | pair-only, voyage-only, N ≥ 4 (see the gate below); serves `embed_query` |
 | `model_write` | `Option<String>` | pair-only, voyage-only, N ≥ 4; serves `embed_document` / `embed_documents` |
+| `top_p` / `frequency_penalty` / `presence_penalty` / `repetition_penalty` | `f32` | **Refuses to boot.** Embeddings take no chat-shaped sampling parameters, so the key could never do anything — delete it. See issue #246. |
 
 Routing per suffix, resolved by `ModelConfig::resolve_embedding()`:
 
@@ -992,6 +1023,12 @@ For `temperature` and `max_tokens`:
 task default block > [defaults] > compiled-in fallback
 ```
 
+For `top_p`, `frequency_penalty`, `presence_penalty`, and `repetition_penalty`:
+
+```
+task default block only (absent ⇒ the wire param is omitted)
+```
+
 Where each step contributes:
 
 - **Matched tier block** — `[tasks.<name>.tiers.<tier>]`, where `<tier>` comes from the `tier` field of the chat request (regex `^[a-z0-9_]{1,32}$`). If the requested tier is absent or unknown (no matching sub-table), the task default block is used and a `tracing::warn!` is emitted. This step exists for `chat_companion` and `chat_output_filter` only — every other task skips straight to its default block, and carrying a tier block refuses to boot.
@@ -999,7 +1036,11 @@ Where each step contributes:
 - **`[defaults]`** — top-level defaults block.
 - **Compiled-in fallback** — `x-ai/grok-4-mini`, temperature `0.5`, max_tokens `200`. Hard-coded in `model_config.rs`.
 
-`temperature` and `max_tokens` are task-level only — per-tier sub-tables do not override them.
+`temperature`, `max_tokens`, and the four sampling knobs (`top_p`,
+`frequency_penalty`, `presence_penalty`, `repetition_penalty`) are task-level
+only — per-tier sub-tables do not override them. The four sampling knobs have
+no `[defaults]` fallback and no compiled-in default either: unset means the
+wire param is omitted entirely, never sent with an engine-chosen value.
 
 If `resolve()` is called with an unknown task name, it falls back through `defaults → compiled-in` and emits a `tracing::warn!` ("model_config: unknown task, using defaults").
 
@@ -1043,7 +1084,7 @@ These commitments were made during `0.x` and **carry forward unchanged into
 2. **No renamed fields.** `fallback` will not become `fallback_model`. `model` will not become `primary_model`. Etc.
 3. **No newly required fields.** Anything added is optional with a sensible default.
 4. **No removed task names from this list:** `chat_companion`, `insight_extraction`, `pde_decision`, `embedding`.
-5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only.
+5. **Resolution precedence is fixed.** `matched tier > task default block > [defaults] > compiled-in fallback` for `model`/`fallback`/`allow_traits`. `temperature`/`max_tokens` are task-level only, as are `top_p`/`frequency_penalty`/`presence_penalty`/`repetition_penalty` (which additionally have no `[defaults]` and no compiled-in fallback).
 6. **`model` accepts a string, array (round-robin), or table (weighted).** A plain string remains valid forever; the array/table forms are an additive widening.
 
 What may still change without notice:
@@ -1091,6 +1132,16 @@ What may still change without notice:
   key refuses to boot with a migration message. The removed keys also fed
   the `chat_vision` request body; body rules reach vision as well, so an
   untargeted rule restores `provider` prefs on the vision call.
+- **`top_p` / `frequency_penalty` / `presence_penalty` now apply to every task
+  except `embedding`**, and **`repetition_penalty` is new** with the same
+  scoping. Previously the three were resolved but carried only by
+  `chat_companion`: setting them on any other task parsed, booted, and
+  silently did nothing (issue #246). Two boot gates ship with this, and both
+  are **behavior changes** for a config that already carries such a value:
+  out-of-range or non-finite values now refuse to boot (`top_p` `(0.0, 1.0]`,
+  the two OpenAI penalties `[-2.0, 2.0]`, `repetition_penalty` `(0.0, 2.0]`),
+  and any of the four on `[tasks.embedding]` refuses to boot. A config that
+  sets none of the four produces byte-identical request bodies.
 
 ## What this config does NOT control
 

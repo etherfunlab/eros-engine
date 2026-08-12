@@ -54,6 +54,10 @@ model        = "<provider>/<model-id>"      # optional — absent falls through 
 fallback     = "<provider>/<model-id>"      # optional secondary model
 temperature  = 0.85                         # optional, falls back to defaults.fallback_temperature
 max_tokens   = 600                          # optional, falls back to defaults.fallback_max_tokens
+top_p              = 0.9                    # optional, (0.0, 1.0]  — omitted from the request when unset
+frequency_penalty  = 0.4                    # optional, [-2.0, 2.0] — omitted when unset
+presence_penalty   = 0.2                    # optional, [-2.0, 2.0] — omitted when unset
+repetition_penalty = 1.15                   # optional, (0.0, 2.0]  — omitted when unset; 1.0 is the no-op identity
 allow_traits = ["tag_a", "tag_b"]           # optional, prompt-trait allow-list (three-state)
 description  = "free-form note"             # optional, documentation only — not consumed by code
 
@@ -88,11 +92,12 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.retry_depth` | `u32` | 否 | 把解析出的 `fallback` 链截断：primary + 最多这么多个 fallback，之后的条目永远不会被尝试。默认值：走通用 `resolve()` 的任务为 `2`（含 `chat_companion`；可按 tier 覆盖），单一用途任务为 `1`——参见“Fallback 截断（`retry_depth`）”。 |
 | `tasks.<name>.temperature` | `f64` | 否 | 每任务的采样 temperature。无 per-tier 覆盖。 |
 | `tasks.<name>.max_tokens` | `u32` | 否 | 每任务的 token 上限。无 per-tier 覆盖。 |
-| `tasks.chat_companion.top_p` | `f32` | 否 | 核采样（nucleus sampling）概率质量。仅限 `chat_companion` 任务；仅任务级——tier 会继承该值但不能覆盖，也没有 `[defaults]` 回退。在其他任务上设置该字段能正常解析，但不会产生任何效果。缺失时 ⇒ 请求里直接省略 `top_p`，而不是发送某个默认值。 |
-| `tasks.chat_companion.frequency_penalty` | `f32` | 否 | OpenAI 风格的 frequency penalty。作用域规则与 `top_p` 相同；缺失时同样从请求中省略。 |
-| `tasks.chat_companion.presence_penalty` | `f32` | 否 | OpenAI 风格的 presence penalty。作用域规则与 `top_p` 相同；缺失时同样从请求中省略。 |
+| `tasks.<name>.top_p` | `f32` | 否 | 核采样（nucleus sampling）概率质量。**除 `embedding` 外的每个任务都可以设置**；仅任务级——tier 会继承该值但不能覆盖，也没有 `[defaults]` 回退。合法区间 `(0.0, 1.0]`；越界或非有限值会拒绝启动。缺失时 ⇒ 请求里直接省略 `top_p`，而不是发送某个默认值。 |
+| `tasks.<name>.frequency_penalty` | `f32` | 否 | OpenAI 风格的 frequency penalty。作用域规则与 `top_p` 相同。合法区间 `[-2.0, 2.0]`；缺失时同样从请求中省略。 |
+| `tasks.<name>.presence_penalty` | `f32` | 否 | OpenAI 风格的 presence penalty。作用域规则与 `top_p` 相同。合法区间 `[-2.0, 2.0]`；缺失时同样从请求中省略。 |
+| `tasks.<name>.repetition_penalty` | `f32` | 否 | 重复惩罚——针对退化式尾部复读的旋钮，`temperature` 处理不了这种情况（复读本就是接近贪心解码的特征，调低 temperature 反而推向错误方向）。作用域规则与 `top_p` 相同。合法区间 `(0.0, 2.0]`，其中 `1.0` 是不产生任何效果的恒等值；缺失时同样从请求中省略。 |
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
-| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature` 或 `max_tokens`。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
+| `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature`、`max_tokens`、`top_p`、`frequency_penalty`、`presence_penalty` 或 `repetition_penalty`——这六个都只在任务级生效。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
@@ -212,11 +217,21 @@ headers    = { "HTTP-Referer" = "https://eros.example", "X-OpenRouter-Title" = "
 provider 服务的所有任务。规则按声明顺序生效，后面的规则在 key 冲突
 时获胜，且合并进的 params 会覆盖引擎自己构建的字段——例如在 `openrouter`
 条目上声明 `reasoning`，就会覆盖被该规则限定的任务上的
-`[tasks.*].reasoning`。`model`、`messages`、`stream` 是引擎自有字段，声明
+`[tasks.*].reasoning`。这一点并非 `reasoning` 独有：**任何**引擎自建的 wire
+字段都会输给 body 参数，包括 `temperature`、`max_tokens` 以及四个采样旋钮
+（`top_p`、`frequency_penalty`、`presence_penalty`、`repetition_penalty`）。
+`model`、`messages`、`stream` 是引擎自有字段，声明
 它们会拒绝启动。规则若指名 `embedding` 会记录警告且永不生效（该调用自己
 构建请求体，也不接受任何 chat 形态的参数）。自定义 provider 必须声明
 `chat` 才能使用 body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖
 端点。
+
+在用 body 规则代替任务块之前先掂量一下取舍：规则是**按 provider 限定**的，
+而 `fallback` 链会跨 provider——一个 primary 和 fallback 分别落在不同
+`[providers]` 条目上的任务，同一个参数得声明两遍，两边还可能悄悄不一致；
+而且 `params` 是没有 schema 的透传，key 拼错永远不会被发现。凡是
+`[tasks.<name>]` 表达得了的就用它，body 规则留给它表达不了的（厂商专有字
+段、OpenRouter 路由偏好）。
 
 ```toml
 [providers.venice]
@@ -338,11 +353,15 @@ filter_prompt = "..."            # any field is optional; falls back to the defa
 | `retry_depth` | `u32` | `1` | filter 放弃前可尝试的 `fallback` 条目数。`0` = 仅 primary；`1` = primary + 第一个 fallback（默认）。 |
 | `temperature` | `f64` | `defaults.fallback_temperature` | filter 模型的采样 temperature。**仅限任务级——无 per-tier 覆盖**（与其他所有任务相同）。 |
 | `max_tokens` | `u32` | `defaults.fallback_max_tokens` | filter 响应的 token 上限。**仅限任务级——无 per-tier 覆盖。** |
+| `top_p` | `f32` | 缺失 | 核采样，`(0.0, 1.0]`。未设置时从请求中省略。 |
+| `frequency_penalty` | `f32` | 缺失 | OpenAI 风格的 frequency penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `presence_penalty` | `f32` | 缺失 | OpenAI 风格的 presence penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `filter_prompt` | `String` | — | **filter 生效的必要条件。** 发送给 filter 模型的 system/instruction prompt。空白或缺失 → filter 不生效。 |
 | `trigger` | inline table | 缺失（每轮） | 决定何时应用 filter 的 AND 门控。省略整个 key 即过滤每个符合条件的轮次。 |
 | `timing` | `"after_extract"` \| `"before_extract"` | `"after_extract"` | 控制 extract（memory/insight/affinity）读取原始文本还是过滤后文本（见下文）。 |
 
-Per-tier 子表（`[tasks.chat_output_filter.tiers.<tier>]`）可以覆盖 `model`、`fallback`、`retry_depth`、`filter_prompt`、`trigger` 和 `timing`；tier 中省略的字段会回退到默认的 `[tasks.chat_output_filter]` 块。**`temperature` 和 `max_tokens` 仅限任务级**（per-tier 子表不覆盖它们——与其他所有任务相同）。
+Per-tier 子表（`[tasks.chat_output_filter.tiers.<tier>]`）可以覆盖 `model`、`fallback`、`retry_depth`、`filter_prompt`、`trigger` 和 `timing`；tier 中省略的字段会回退到默认的 `[tasks.chat_output_filter]` 块。**`temperature`、`max_tokens` 以及四个采样旋钮仅限任务级**（per-tier 子表不覆盖它们——与其他所有任务相同）。
 
 #### `trigger` 谓词
 
@@ -582,6 +601,10 @@ max_tokens   = 700
 | `retry_depth` | `u32` | `1` | primary + 这么多个 fallback。 |
 | `temperature` | `f64` | 任务默认 | 合成器调用的采样温度。 |
 | `max_tokens` | `u32` | 任务默认 | 合成器调用的 token 上限。 |
+| `top_p` | `f32` | 缺失 | 核采样，`(0.0, 1.0]`。未设置时从请求中省略。 |
+| `frequency_penalty` | `f32` | 缺失 | OpenAI 风格的 frequency penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `presence_penalty` | `f32` | 缺失 | OpenAI 风格的 presence penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
@@ -666,6 +689,10 @@ filter_prompt = """
 | `retry_depth` | `u32` | `1` | primary + 这么多个 fallback。 |
 | `temperature` | `f64` | 任务默认 | 执行器调用的采样温度。 |
 | `max_tokens` | `u32` | 任务默认 | 执行器调用的 token 上限。 |
+| `top_p` | `f32` | 缺失 | 核采样，`(0.0, 1.0]`。未设置时从请求中省略。 |
+| `frequency_penalty` | `f32` | 缺失 | OpenAI 风格的 frequency penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `presence_penalty` | `f32` | 缺失 | OpenAI 风格的 presence penalty，`[-2.0, 2.0]`。未设置时省略。 |
+| `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `reasoning` | 表 | 缺失 | 可选 reasoning 控制，转发给 OpenRouter。 |
 | `filter_prompt` | `String` | — | **必填。** 产品资料 + 作答规则；空白或缺失会拒绝启动（见上方门槛表）。 |
 
@@ -732,6 +759,7 @@ model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
 | `model` | 单个固定字符串 | 裸 id ⇒ `@voyage`；`@openrouter` / `@<custom>` 路由到 OpenRouter 兼容 wire；与 read/write 对互斥 |
 | `model_read` | `Option<String>` | 仅限 read/write 对使用，仅限 Voyage，N ≥ 4（见下方的 gate）；服务 `embed_query` |
 | `model_write` | `Option<String>` | 仅限 read/write 对使用，仅限 Voyage，N ≥ 4；服务 `embed_document` / `embed_documents` |
+| `top_p` / `frequency_penalty` / `presence_penalty` / `repetition_penalty` | `f32` | **拒绝启动。** embedding 不接受任何 chat 形态的采样参数，这个 key 不可能产生任何效果——删掉它。参见 issue #246。 |
 
 按后缀路由，由 `ModelConfig::resolve_embedding()` 解析：
 
@@ -809,6 +837,12 @@ matched tier block > task default block
 task default block > [defaults] > compiled-in fallback
 ```
 
+对于 `top_p`、`frequency_penalty`、`presence_penalty` 和 `repetition_penalty`：
+
+```
+仅任务默认块（缺失 ⇒ 该 wire 参数直接省略）
+```
+
 各层级的含义如下：
 
 - **匹配的 tier 块**——`[tasks.<name>.tiers.<tier>]`，其中 `<tier>` 来自 chat 请求的 `tier` 字段（正则 `^[a-z0-9_]{1,32}$`）。如果请求的 tier 缺失或未知（没有匹配的子表），则使用任务默认块，并发出 `tracing::warn!`。这一层只对 `chat_companion` 和 `chat_output_filter` 存在——其余任务直接走各自的默认块，写了 tier 块会拒绝启动。
@@ -816,7 +850,10 @@ task default block > [defaults] > compiled-in fallback
 - **`[defaults]`**——顶层 defaults 块。
 - **编译时内置 fallback**——`x-ai/grok-4-mini`、temperature `0.5`、max_tokens `200`。在 `model_config.rs` 中 hard-code。
 
-`temperature` 和 `max_tokens` 仅限任务级——per-tier 子表不会覆盖它们。
+`temperature`、`max_tokens` 以及四个采样旋钮（`top_p`、`frequency_penalty`、
+`presence_penalty`、`repetition_penalty`）仅限任务级——per-tier 子表不会覆盖
+它们。四个采样旋钮既没有 `[defaults]` 回退，也没有编译时内置默认值：未设置
+就意味着该 wire 参数被完全省略，而不是发送某个引擎选定的值。
 
 如果以未知任务名调用 `resolve()`，它会按 `defaults → 编译时内置` 回退，并发出 `tracing::warn!`（`"model_config: unknown task, using defaults"`）。
 
@@ -858,7 +895,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 2. **不重命名字段。** `fallback` 不会变为 `fallback_model`，`model` 不会变为 `primary_model`，以此类推。
 3. **不新增必填字段。** 任何新增字段都是可选的，并具有合理默认值。
 4. **不从此列表中删除任务名：**`chat_companion`、`insight_extraction`、`pde_decision`、`embedding`。
-5. **解析优先级固定。** 对于 `model`/`fallback`/`allow_traits`，优先级为 `matched tier > task default block > [defaults] > compiled-in fallback`。`temperature`/`max_tokens` 仅限任务级。
+5. **解析优先级固定。** 对于 `model`/`fallback`/`allow_traits`，优先级为 `matched tier > task default block > [defaults] > compiled-in fallback`。`temperature`/`max_tokens` 仅限任务级，`top_p`/`frequency_penalty`/`presence_penalty`/`repetition_penalty` 同样如此（且它们既没有 `[defaults]` 回退，也没有编译时内置默认值）。
 6. **`model` 接受字符串、数组（round-robin）或表（weighted）。** 普通字符串将始终有效；数组/表形式属于扩展能力。
 
 以下内容仍可能在不另行通知的情况下改变：
@@ -892,6 +929,15 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
   拒绝启动并给出迁移提示。被移除的两个 key 以前也会喂给 `chat_vision` 的
   请求体；body 规则同样覆盖 vision，所以一条未限定 `tasks` 的规则可以让
   vision 调用重新带上 `provider` 偏好。
+- **`top_p` / `frequency_penalty` / `presence_penalty` 现在对除 `embedding`
+  外的每个任务都生效**，并且**新增 `repetition_penalty`**，作用域规则相同。
+  此前这三个字段虽然会被解析出来，却只有 `chat_companion` 会带上它们：在
+  其他任何任务上设置都能正常解析、正常启动，然后什么也不做（issue #246）。
+  随之而来的两道开机闸，对已经写了这类值的配置来说都是**行为变更**：越界
+  或非有限值现在会拒绝启动（`top_p` `(0.0, 1.0]`、两个 OpenAI penalty
+  `[-2.0, 2.0]`、`repetition_penalty` `(0.0, 2.0]`），在
+  `[tasks.embedding]` 上写这四个中的任意一个也会拒绝启动。一份四个都没设
+  的配置产生的请求体与之前逐字节一致。
 
 ## 此配置不控制的内容
 

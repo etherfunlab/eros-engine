@@ -105,11 +105,15 @@
 model = "deepseek/deepseek-v4-flash"
 fallback = ["thedrummer/cydonia-24b-v4.1", "z-ai/glm-4.7-flash"]
 temperature = 0.8
-# Sampling knobs (chat task only — extraction/vision/affinity want determinism
-# and leave these unset). These ship as the OSS default; a deployment opts out
-# by removing them. top_p trims the long tail; the two penalties are the
-# portable repetition levers (we deliberately do NOT use repetition_penalty —
-# it is provider-inconsistent and distorts CJK at the useful range).
+# Sampling knobs. Every task except `embedding` may set these; extraction /
+# vision / affinity want determinism and deliberately leave them unset. They
+# ship as the OSS default on the chat task only; a deployment opts out by
+# removing them. top_p trims the long tail; the two penalties are the
+# repetition levers. repetition_penalty is available here too — it is a
+# standard OpenAI-format field every chat/completions endpoint accepts — and is
+# deliberately left unset in this example because it distorts CJK at the useful
+# range. Ranges are enforced at boot: top_p (0.0, 1.0], the two penalties
+# [-2.0, 2.0], repetition_penalty (0.0, 2.0] with 1.0 the no-op identity.
 top_p = 0.9
 frequency_penalty = 0.4
 presence_penalty = 0.2
@@ -218,7 +222,8 @@ model_name_display_override = true
 #timing       = "after_extract"   # or "before_extract"
 #[tasks.chat_output_filter.tiers.gold]
 # per-tier may override model/fallback/retry_depth/filter_prompt/trigger/timing
-# (NOT temperature/max_tokens — those are task-level only, like every other task)
+# (NOT temperature/max_tokens/top_p/frequency_penalty/presence_penalty/
+#  repetition_penalty — those are task-level only, like every other task)
 #filter_prompt = "..."
 
 # ── Optional user-input rewrite filter (OFF by default) ──────────────────────
