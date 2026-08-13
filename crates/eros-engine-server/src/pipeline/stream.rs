@@ -530,13 +530,20 @@ fn drive_chat_burst(
                 // empty completion advances to the next model below; only the
                 // LAST chain attempt returning empty is a ghost fallback,
                 // distinct from length/transport truncation (pseudo-ghost).
-                let is_ghost_fallback = empty_completion && idx + 1 == chain.len();
+                // Image-promising turns are exempt: their text side may be
+                // legitimately empty — the trailing image_request is the
+                // payload, and tagging them ghost would mislabel a served
+                // photo as silence (and lets clients render it as one).
+                let is_ghost_fallback =
+                    empty_completion && idx + 1 == chain.len() && !plan_action.promises_image();
                 // A non-last empty completion is a superseded attempt, not a
                 // successful turn: mark it `truncated` so the persisted row and
                 // its Done frame carry the "replace me" signal (as before this
                 // feature) and the client / replay never see a spurious empty
-                // reply bubble. Only the LAST empty attempt is the ghost.
-                if empty_completion && !is_ghost_fallback {
+                // reply bubble. The LAST empty attempt is the ghost (non-image
+                // turns) or an accepted empty text half (image turns) — never
+                // truncated.
+                if empty_completion && idx + 1 < chain.len() {
                     truncated = true;
                 }
 
@@ -569,8 +576,13 @@ fn drive_chat_burst(
                     };
                     // Artifact-only reply: the strip emptied a non-empty completion.
                     // Terminal ghost (does NOT advance the chain), matching the
-                    // filtered burst's regex-strip-to-empty semantics.
-                    let ghost = !strip.matched_rules.is_empty() && strip.cleaned.is_empty();
+                    // filtered burst's regex-strip-to-empty semantics. Image-
+                    // promising turns are exempt (see is_ghost_fallback above):
+                    // stripping the whole text of a text+image turn leaves an
+                    // image-only reply, not a silent one.
+                    let ghost = !strip.matched_rules.is_empty()
+                        && strip.cleaned.is_empty()
+                        && !plan_action.promises_image();
                     (strip.cleaned, audit, ghost)
                 };
                 let effective_ghost = is_ghost_fallback || regex_ghost;
@@ -869,6 +881,10 @@ fn drive_chat_burst(
                     // truncation. Mirrors the regex-strip-to-empty case (a)
                     // above (`ghost_fallback_metadata`), tagged distinctly as
                     // "empty_completion" so ops can tell the two apart.
+                    // Image-promising turns are exempt from the tag: their
+                    // empty text half is an accepted image-only reply, and the
+                    // row/frames still flow so the trailing image_request fires.
+                    let is_ghost = !plan_action.promises_image();
                     let msg_ulid = Ulid::new();
                     let msg_uuid: Uuid = msg_ulid.into();
                     let usage_full =
@@ -883,7 +899,11 @@ fn drive_chat_burst(
                         usage: usage_full.clone(),
                         generation_id: last_gen_id.clone(),
                         filter_audit: None,
-                        metadata: ghost_fallback_metadata(build_metadata(None), "empty_completion"),
+                        metadata: if is_ghost {
+                            ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                        } else {
+                            build_metadata(None)
+                        },
                     };
                     if let Err(e) = chat_repo
                         .insert_assistant_batch(session_id, user_message_id, &[row])
@@ -897,7 +917,9 @@ fn drive_chat_burst(
                         // retries_chat isn't under-reported when only the LAST
                         // chain model returns an empty completion.
                         let mut o = outcome.lock().unwrap();
-                        o.ghost_fallback = true;
+                        if is_ghost {
+                            o.ghost_fallback = true;
+                        }
                         o.retries_chat = (chain.len() as u32).saturating_sub(1);
                         // Keep an (empty) produced row so a ReplyTextImage turn's
                         // trailing image_request still fires — the caller gates it
@@ -930,7 +952,7 @@ fn drive_chat_burst(
                         truncated: false,
                         usage: wire_usage,
                         generation_id: last_gen_id,
-                        ghost_fallback: true,
+                        ghost_fallback: is_ghost,
                     };
                     return;
                 }
@@ -1117,8 +1139,10 @@ fn drive_chat_burst(
             // `"regex_strip"` is always correct here: `visible` can only be
             // empty via the regex-strip-to-empty branch above, since the LLM
             // output filter fails open to the (non-empty) `cleaned` text and
-            // never emptifies an otherwise non-empty reply.
-            let is_ghost = visible.is_empty();
+            // never emptifies an otherwise non-empty reply. Image-promising
+            // turns are exempt (see the live path): an emptied text half of a
+            // text+image turn is an image-only reply, not a silent one.
+            let is_ghost = visible.is_empty() && !plan_action.promises_image();
 
             if !visible.is_empty() {
                 yield ProtocolFrame::Delta {
@@ -7117,6 +7141,158 @@ data: [DONE]\n\n";
         assert!(img.get("url").is_none(), "marker must not store a url");
     }
 
+    /// An image-promising turn whose TEXT half comes back empty is an
+    /// image-only reply, not a silent one: the Done frame must NOT carry
+    /// `ghost_fallback`, the persisted row must NOT be tagged with a
+    /// `fallback_reason`, and the trailing `image_request` must still fire.
+    /// Without the `promises_image` exemption, every reply_text_image whose
+    /// text was empty (or regex-stripped to empty) was mislabeled a ghost —
+    /// and a consumer that renders ghosts as silence hides the served photo.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_empty_completion_is_not_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Chat completion: 200 stream with no content at all → empty completion
+        // on the LAST (only) chain attempt.
+        let body =
+            "data: {\"choices\":[{\"delta\":{}}],\"id\":\"gen-ei\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"pde/judge\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9111111111111111111111B",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // Not a ghost: no Done frame may carry ghost_fallback.
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "image-promising turn must not be tagged ghost_fallback: {frames:?}"
+        );
+        // The image half still fires, in order: done before image_request.
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request still present on empty text");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done: {types:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Error { .. })),
+            "empty text half must not error"
+        );
+        // Persisted row: no fallback_reason tag.
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(reason, None, "row must not be tagged as a ghost fallback");
+    }
+
     /// Review finding (2026-08-02, issue #212 fix wave): the sibling test above
     /// gives the composer a failing (500) mock, so the concurrently spawned
     /// compose task returns almost instantly — the join at the end of the
@@ -11074,10 +11250,15 @@ data: [DONE]\n\n";
         );
     }
 
-    /// Codex P2 (PR #141, round 3): the FILTERED empty-completion ghost fallback
+    /// Codex P2 (PR #141, round 3): the FILTERED empty-completion path
     /// must retain an (empty) produced row like the live/regex-strip paths —
     /// otherwise a ReplyTextImage turn's trailing image_request (gated on
     /// `produced.last()`) silently drops the image half in filtered mode only.
+    /// Since the `promises_image()` exemption, an image-promising turn on this
+    /// path is additionally NOT tagged ghost_fallback (the empty text half is
+    /// an accepted image-only reply) — retention and the exemption are asserted
+    /// together here; the plain-ReplyText ghost tagging keeps its own coverage
+    /// in `empty_completion_last_attempt_becomes_ghost_fallback`.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn filtered_empty_completion_ghost_retains_produced_row(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -11169,20 +11350,25 @@ data: [DONE]\n\n";
         let frames: Vec<ProtocolFrame> = Box::pin(burst).collect().await;
 
         assert!(
-            frames.iter().any(|f| matches!(
+            frames.iter().all(|f| !matches!(
                 f,
                 ProtocolFrame::Done {
                     ghost_fallback: true,
                     ..
                 }
             )),
-            "filtered empty completion must ghost: {frames:?}"
+            "an image-promising turn's empty text half must not be tagged ghost_fallback: {frames:?}"
         );
-        let produced = &outcome.lock().unwrap().produced;
+        let o = outcome.lock().unwrap();
+        assert!(
+            !o.ghost_fallback,
+            "outcome must not count an image-promising turn as a ghost"
+        );
+        let produced = &o.produced;
         assert_eq!(
             produced.len(),
             1,
-            "filtered empty-completion ghost must retain a produced row so ReplyTextImage's \
+            "filtered empty completion must retain a produced row so ReplyTextImage's \
              image_request still fires; got {produced:?}"
         );
         assert_eq!(

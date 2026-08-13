@@ -132,6 +132,14 @@ impl ActionType {
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage
         )
     }
+
+    /// True for actions that promise a photo this turn. An empty text
+    /// completion on these is the expected shape of an image-only reply, not a
+    /// silent turn — the stream's ghost-fallback tagging must not fire for
+    /// them (the trailing `image_request` is the turn's real payload).
+    pub fn promises_image(self) -> bool {
+        matches!(self, ActionType::ReplyImage | ActionType::ReplyTextImage)
+    }
 }
 
 /// Tone directive for the reply generation.
