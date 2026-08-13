@@ -300,7 +300,12 @@ pub async fn compose_image(
     let Some(outcome) = run.outcome else {
         // 502 here, unlike the chat path's portrait fallback (spec
         // 2026-08-03 §3.6) — nothing was assembled, so composed_prompt stays
-        // NULL. The only place in the design where that's true.
+        // NULL. The only place in the design where that's true. `model` /
+        // `generation_id` / `usage` still record the last attempted model's
+        // response on a CONTENT-level failure (`empty` / `empty_prompt`) —
+        // that call answered and was billed even though its result was
+        // unusable. They stay NULL on a pure transport failure
+        // (`model_error` / `timeout`), where nothing ever answered.
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
@@ -314,9 +319,9 @@ pub async fn compose_image(
                 caption: None,
                 composed_prompt: None,
                 variant: resolved.variant_key.as_deref(),
-                model: None,
-                usage: None,
-                generation_id: None,
+                model: run.last_model.as_deref(),
+                usage: run.last_usage.clone(),
+                generation_id: run.last_generation_id.as_deref(),
                 attempts: run.attempts,
                 last_failure: run.last_failure,
             },

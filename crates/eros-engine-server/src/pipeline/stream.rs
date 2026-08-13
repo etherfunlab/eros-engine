@@ -2128,6 +2128,15 @@ struct VisionRun {
     outcome: Option<VisionOutcome>,
     attempts: i16,
     last_failure: Option<&'static str>,
+    /// Same-shape carry-forward as `ComposeRun::last_model` et al.: the last
+    /// CONTENT-level failure's response identity (`empty` / `unparseable` /
+    /// any `image_vision_invalidity` reason) — the provider answered and was
+    /// billed, but the describe itself was unusable. `None` on a pure
+    /// transport failure (`model_error` / `timeout`), where nothing ever
+    /// answered.
+    last_model: Option<String>,
+    last_generation_id: Option<String>,
+    last_usage: Option<serde_json::Value>,
 }
 
 /// Run the `chat_vision` describe over the image. Returns a `VisionRun` carrying
@@ -2154,6 +2163,9 @@ async fn run_vision(
         .collect();
     let mut attempts: i16 = 0;
     let mut last_failure: Option<&'static str> = None;
+    let mut last_model: Option<String> = None;
+    let mut last_generation_id: Option<String> = None;
+    let mut last_usage: Option<serde_json::Value> = None;
     for model_id in &chain {
         attempts += 1;
         let req = VisionRequest {
@@ -2187,6 +2199,12 @@ async fn run_vision(
         if text.is_empty() {
             tracing::warn!(model = %model_id, "chat_vision: empty reply; next");
             last_failure = Some("empty");
+            // Content-level failure: the provider answered and was billed
+            // above by `log_openrouter_usage`, even though the reply was
+            // blank. Record who answered in case the whole chain exhausts.
+            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
+            last_generation_id = resp.generation_id.clone();
+            last_usage = resp.usage.clone();
             continue;
         }
         let vision = match parse_image_vision(&text) {
@@ -2194,12 +2212,18 @@ async fn run_vision(
             None => {
                 tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
                 last_failure = Some("unparseable");
+                last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
+                last_generation_id = resp.generation_id.clone();
+                last_usage = resp.usage.clone();
                 continue;
             }
         };
         if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
             tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
             last_failure = Some(reason);
+            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
+            last_generation_id = resp.generation_id.clone();
+            last_usage = resp.usage.clone();
             continue;
         }
         let vision_model = resp.model.unwrap_or_else(|| model_id.clone());
@@ -2212,12 +2236,18 @@ async fn run_vision(
             }),
             attempts,
             last_failure: None,
+            last_model: None,
+            last_generation_id: None,
+            last_usage: None,
         };
     }
     VisionRun {
         outcome: None,
         attempts,
         last_failure,
+        last_model,
+        last_generation_id,
+        last_usage,
     }
 }
 
@@ -2589,6 +2619,16 @@ pub(crate) struct ComposeRun {
     pub(crate) outcome: Option<ComposeOutcome>,
     pub(crate) attempts: i16,
     pub(crate) last_failure: Option<&'static str>,
+    /// The most recent post-response identifiers, captured on a CONTENT-level
+    /// failure (`empty` / `empty_prompt`) — the provider answered and
+    /// `log_openrouter_usage` already logged the call, but the reply itself
+    /// was unusable. `None` when every attempt failed at the transport level
+    /// (`model_error` / `timeout`), where no response — and nothing to
+    /// attribute usage to — ever came back. `outcome: Some(_)` never needs
+    /// these; they exist to fill the audit row on the `None` arm.
+    pub(crate) last_model: Option<String>,
+    pub(crate) last_generation_id: Option<String>,
+    pub(crate) last_usage: Option<serde_json::Value>,
 }
 
 /// Generate the image prompt (and its caption) via the optional composer LLM.
@@ -2633,6 +2673,9 @@ pub(crate) async fn run_image_prompt_compose(
         .collect();
     let mut attempts: i16 = 0;
     let mut last_failure: Option<&'static str> = None;
+    let mut last_model: Option<String> = None;
+    let mut last_generation_id: Option<String> = None;
+    let mut last_usage: Option<serde_json::Value> = None;
     for model_id in &chain {
         attempts += 1;
         let req = ChatRequest {
@@ -2673,12 +2716,21 @@ pub(crate) async fn run_image_prompt_compose(
         if text.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
             last_failure = Some("empty");
+            // Content-level failure: the provider answered (and was billed
+            // above by `log_openrouter_usage`) even though the reply was
+            // blank. Record who answered in case the whole chain exhausts.
+            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
+            last_generation_id = resp.generation_id.clone();
+            last_usage = resp.usage.clone();
             continue;
         }
         let (prompt, caption) = parse_compose_reply(&text);
         if prompt.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
             last_failure = Some("empty_prompt");
+            last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
+            last_generation_id = resp.generation_id.clone();
+            last_usage = resp.usage.clone();
             continue;
         }
         return ComposeRun {
@@ -2692,12 +2744,18 @@ pub(crate) async fn run_image_prompt_compose(
             }),
             attempts,
             last_failure: None,
+            last_model: None,
+            last_generation_id: None,
+            last_usage: None,
         };
     }
     ComposeRun {
         outcome: None,
         attempts,
         last_failure,
+        last_model,
+        last_generation_id,
+        last_usage,
     }
 }
 
@@ -2857,6 +2915,9 @@ async fn build_delegated_image_prompt(
             outcome: None,
             attempts: 0,
             last_failure: None,
+            last_model: None,
+            last_generation_id: None,
+            last_usage: None,
         },
     };
     let (final_subject, caption, compose_variant, compose_model, compose_generation_id, usage) =
@@ -2908,6 +2969,20 @@ async fn build_delegated_image_prompt(
     } else {
         "not_configured"
     };
+    // A content-level failure (`empty` / `empty_prompt`) still means the last
+    // attempted model answered and was billed — `run.last_*` carries that
+    // response's identity so the audit row isn't wrongly blank on an
+    // `exhausted` status. `compose_model` / `compose_generation_id` / `usage`
+    // stay untouched: they gate `status` above and feed the returned
+    // `DelegatedImagePrompt`, both of which must only reflect an ACCEPTED
+    // outcome. Transport failures (`model_error` / `timeout`) never populate
+    // `run.last_*`, so this stays NULL exactly when no response ever came
+    // back — same distinction `compose_stream` already draws.
+    let audit_model = compose_model.clone().or_else(|| run.last_model.clone());
+    let audit_generation_id = compose_generation_id
+        .clone()
+        .or_else(|| run.last_generation_id.clone());
+    let audit_usage = usage.clone().or_else(|| run.last_usage.clone());
     let source = match plan.action_type {
         ActionType::ReplyImage => "chat_reply_image",
         ActionType::ReplyTextImage => "chat_reply_text_image",
@@ -2939,9 +3014,9 @@ async fn build_delegated_image_prompt(
             caption: caption.as_deref(),
             composed_prompt: Some(composed_prompt.as_str()),
             variant: compose_variant.as_deref(),
-            model: compose_model.as_deref(),
-            usage,
-            generation_id: compose_generation_id.as_deref(),
+            model: audit_model.as_deref(),
+            usage: audit_usage,
+            generation_id: audit_generation_id.as_deref(),
             attempts: run.attempts,
             last_failure: run.last_failure,
         },
@@ -3877,10 +3952,18 @@ pub fn run_stream(
                 // Skip tipped turns (same as the input filter): a tip persists as
                 // role='gift_user' and carries no image (tip+image is rejected at
                 // validation), so describing it would waste the call.
-                // Every image-carrying, non-tipped turn writes exactly one
-                // chat_vision_events row, including the not-configured case —
-                // that's the only way to tell "no [tasks.chat_vision]" apart
-                // from "the describe ran and failed" in the audit trail.
+                // Every image-carrying, non-tipped turn that reaches THIS arm
+                // writes exactly one chat_vision_events row, including the
+                // not-configured case — that's the only way to tell "no
+                // [tasks.chat_vision]" apart from "the describe ran and
+                // failed" in the audit trail. A turn that never reaches this
+                // arm at all — ghosted, routed to product_qa, or an
+                // image-only reply (the early `return` above) — writes NO
+                // row: the describe never runs on those paths either
+                // (running one on a ghost turn would waste a paid call), so
+                // there is nothing to audit. The table's denominator is
+                // "image-carrying, non-tipped turns that reach the text-reply
+                // path", not every image-carrying turn.
                 if user_msg.tips_amount_usd.is_none() {
                     if let Some(image_url) = user_msg.image_url.as_deref() {
                         let (run, status) = match state.model_config.resolve_vision() {
@@ -3897,6 +3980,9 @@ pub fn run_stream(
                                     outcome: None,
                                     attempts: 0,
                                     last_failure: None,
+                                    last_model: None,
+                                    last_generation_id: None,
+                                    last_usage: None,
                                 },
                                 "not_configured",
                             ),
@@ -3925,12 +4011,27 @@ pub fn run_stream(
                                 status,
                                 image_url,
                                 vision: run.outcome.as_ref().map(|o| o.vision.clone()),
-                                model: run.outcome.as_ref().map(|o| o.vision_model.as_str()),
-                                usage: run.outcome.as_ref().and_then(|o| o.usage.clone()),
+                                // A content-level failure (empty / unparseable /
+                                // any invalidity reason) still means the last
+                                // attempted model answered and was billed —
+                                // `run.last_*` carries that identity so an
+                                // `exhausted` row isn't wrongly blank. Transport
+                                // failures never populate `run.last_*`.
+                                model: run
+                                    .outcome
+                                    .as_ref()
+                                    .map(|o| o.vision_model.as_str())
+                                    .or(run.last_model.as_deref()),
+                                usage: run
+                                    .outcome
+                                    .as_ref()
+                                    .and_then(|o| o.usage.clone())
+                                    .or_else(|| run.last_usage.clone()),
                                 generation_id: run
                                     .outcome
                                     .as_ref()
-                                    .and_then(|o| o.v_generation_id.as_deref()),
+                                    .and_then(|o| o.v_generation_id.as_deref())
+                                    .or(run.last_generation_id.as_deref()),
                                 attempts: run.attempts,
                                 last_failure: run.last_failure,
                             })
@@ -7176,23 +7277,52 @@ data: [DONE]\n\n";
             Some(id.to_string().as_str()),
             "the assistant row points at the audit row"
         );
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "no duplicate row from a retried or double-counted write"
+        );
     }
 
     /// A composer chain that never yields usable output still leaves a row —
-    /// today this case is invisible in the database.
+    /// today this case is invisible in the database. The mock reply is BLANK
+    /// (a content-level failure, not a transport error): the model still
+    /// answered and OpenRouter still billed the call, so `model` /
+    /// `generation_id` / `usage` must survive onto the `exhausted` row
+    /// instead of going NULL (final-review fix, 2026-08-14 — this used to be
+    /// indistinguishable from a `model_error` chain exhaustion, which
+    /// correctly stays NULL because no response ever came back).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn exhausted_compose_writes_an_event_with_the_portrait_prompt(pool: PgPool) {
-        let (_reqs, _frames) =
-            run_variant_turn(&pool, Some("a"), wiremock::ResponseTemplate::new(500)).await;
+        let (_reqs, _frames) = run_variant_turn(
+            &pool,
+            Some("a"),
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_compose_empty",
+                "model": "composer",
+                "choices": [{"message": {"content": ""}}],
+                "usage": {"total_tokens": 5}
+            })),
+        )
+        .await;
 
-        let (status, subject, composed, attempts, last_failure): (
+        #[allow(clippy::type_complexity)]
+        let (status, subject, composed, attempts, last_failure, model, generation_id, usage): (
             String,
             Option<String>,
             Option<String>,
             i16,
             Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, subject, composed_prompt, attempts, last_failure \
+            "SELECT status, subject, composed_prompt, attempts, last_failure, model, \
+                    generation_id, usage \
              FROM engine.chat_images_events",
         )
         .fetch_one(&pool)
@@ -7206,7 +7336,34 @@ data: [DONE]\n\n";
             "the portrait fallback still ships a wire prompt — it must be recorded"
         );
         assert!(attempts >= 1);
-        assert_eq!(last_failure.as_deref(), Some("model_error"));
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("empty"),
+            "a blank reply is a content-level failure, not a transport one"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("composer"),
+            "the model answered and was billed even though its reply was blank"
+        );
+        assert_eq!(generation_id.as_deref(), Some("gen_compose_empty"));
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(|v| v.as_i64()),
+            Some(5),
+            "the billed call's usage must not be dropped on a content-level failure"
+        );
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "no duplicate row from a retried or double-counted write"
+        );
     }
 
     /// A turn carrying an image on a deployment with no `[tasks.chat_vision]`
@@ -7741,6 +7898,15 @@ data: [DONE]\n\n";
             stamped.as_deref(),
             Some(event_id.to_string().as_str()),
             "merge_assistant_image_meta stamps the SAME audit row id the compose write produced"
+        );
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "no duplicate row from a retried or double-counted write"
         );
     }
 
@@ -10370,6 +10536,15 @@ data: [DONE]\n\n";
     /// that loop, or `attempts` being off by one. Mirrors
     /// `vision_turn_folds_description_and_persists`'s harness with a failing
     /// describe reply instead of a valid one.
+    ///
+    /// `unparseable` is a CONTENT-level failure — the mock reply is prose,
+    /// not JSON, but the provider did answer and OpenRouter billed the call
+    /// (the mock carries `model` / `id` / `usage`, just like a real response
+    /// would). So this is also the test that pins `model` / `generation_id` /
+    /// `usage` surviving onto an `exhausted` row instead of going NULL
+    /// (final-review fix, 2026-08-14): only a pure transport failure
+    /// (`model_error` / `timeout`), where no response ever came back, should
+    /// leave those three NULL.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn exhausted_vision_chain_writes_an_event_with_last_failure(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -10493,9 +10668,17 @@ data: [DONE]\n\n";
             "the mock reply never parses as ImageVision JSON"
         );
         assert_eq!(vision, None, "no valid describe to record");
-        assert_eq!(model, None, "no successful call to attribute a model to");
-        assert_eq!(generation_id, None);
-        assert_eq!(usage, None, "no successful call to carry a usage block");
+        assert_eq!(
+            model.as_deref(),
+            Some("vis/bad"),
+            "the model answered and was billed even though the describe was unparseable"
+        );
+        assert_eq!(generation_id.as_deref(), Some("gv_bad"));
+        assert_eq!(
+            usage.as_ref().and_then(|u| u.get("total_tokens")),
+            Some(&serde_json::json!(2)),
+            "the billed call's usage must not be dropped on a content-level failure"
+        );
     }
 
     // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
