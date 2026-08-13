@@ -1121,6 +1121,33 @@ mod tests {
         assert!(pending.is_zero());
     }
 
+    /// Signed accumulation: opposite-sign real scores cancel inside the gate,
+    /// and a cancelled balance neither commits nor lingers.
+    #[test]
+    fn threshold_gate_cancels_opposite_signs() {
+        let a = zeroed();
+        let t = AffinityTuning {
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+        let o = turn(
+            &a,
+            AxisGrades::default(),
+            AffinityDeltas {
+                trust: -0.1,
+                ..Default::default()
+            },
+            PendingDeltas {
+                trust: 0.1,
+                ..Default::default()
+            },
+            1.0,
+            &t,
+        );
+        assert_eq!(o.committed.trust, 0.0);
+        assert_eq!(o.pending.trust, 0.0, "+0.1 pending − 0.1 real cancels out");
+    }
+
     /// Demo boost multiplies positive raw only; losses stay full price.
     #[test]
     fn demo_boost_is_positive_only() {

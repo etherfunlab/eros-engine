@@ -93,41 +93,68 @@ pub(crate) fn parse_bool_flag(raw: Option<&str>) -> bool {
 }
 
 /// Affinity 3.0 tuning from `AFFINITY_*` env vars, falling back per-knob to
-/// the core defaults (which reproduce the 2.0 effective envelope). The decay
-/// table is comma-separated and must supply exactly 5 finite values or the
-/// default table stays.
+/// the core defaults (which reproduce the 2.0 effective envelope).
 pub(crate) fn affinity_tuning_from_env() -> eros_engine_core::affinity::AffinityTuning {
+    affinity_tuning_from(|name| std::env::var(name).ok())
+}
+
+/// Testable core of `affinity_tuning_from_env`. Every knob is domain-checked;
+/// an out-of-domain or non-finite value keeps the default and warns — an env
+/// typo must degrade to defaults, never reach the pipeline (a penalty start of
+/// 1 divides by zero, and NaN survives the axis clamp into stored state).
+pub(crate) fn affinity_tuning_from(
+    get: impl Fn(&str) -> Option<String>,
+) -> eros_engine_core::affinity::AffinityTuning {
     let mut t = eros_engine_core::affinity::AffinityTuning::default();
-    let f = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
-    if let Some(v) = f("AFFINITY_GRADE_UNIT") {
-        t.grade_unit = v;
+    {
+        let knob = |name: &str, slot: &mut f64, ok: fn(f64) -> bool| {
+            let Some(raw) = get(name) else { return };
+            match raw.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() && ok(v) => *slot = v,
+                _ => tracing::warn!("invalid {name}={raw:?}; keeping default {}", *slot),
+            }
+        };
+        knob("AFFINITY_GRADE_UNIT", &mut t.grade_unit, |v| v > 0.0);
+        knob("AFFINITY_NEG_FACTOR", &mut t.neg_factor, |v| v >= 0.0);
+        knob("AFFINITY_CROSS_PENALTY", &mut t.cross_penalty, |v| v >= 0.0);
+        knob(
+            "AFFINITY_CROSS_PENALTY_START",
+            &mut t.cross_penalty_start,
+            |v| (0.0..1.0).contains(&v),
+        );
+        knob("AFFINITY_DELTA_THRESHOLD", &mut t.delta_threshold, |v| {
+            v >= 0.0
+        });
+        knob("AFFINITY_DEMO_BOOST", &mut t.demo_boost, |v| v >= 0.0);
     }
-    if let Some(v) = f("AFFINITY_NEG_FACTOR") {
-        t.neg_factor = v;
-    }
-    if let Some(v) = f("AFFINITY_CROSS_PENALTY") {
-        t.cross_penalty = v;
-    }
-    if let Some(v) = f("AFFINITY_CROSS_PENALTY_START") {
-        t.cross_penalty_start = v;
-    }
-    if let Some(v) = f("AFFINITY_DELTA_THRESHOLD") {
-        t.delta_threshold = v;
-    }
-    if let Some(v) = f("AFFINITY_DEMO_BOOST") {
-        t.demo_boost = v;
-    }
-    if let Ok(raw) = std::env::var("AFFINITY_TIER_DECAY") {
-        let vals: Vec<f64> = raw
-            .split(',')
-            .filter_map(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .collect();
-        if let Ok(table) = <[f64; 5]>::try_from(vals) {
-            t.tier_decay = table;
+    if let Some(raw) = get("AFFINITY_TIER_DECAY") {
+        match parse_tier_decay(&raw) {
+            Some(table) => t.tier_decay = table,
+            None => {
+                tracing::warn!("invalid AFFINITY_TIER_DECAY={raw:?}; keeping default table")
+            }
         }
     }
     t
+}
+
+/// Exactly five comma-separated finite values in [0, 1] — anything else
+/// rejects the whole table. Positional by design: silently dropping a bad
+/// entry would shift every later tier's factor.
+pub(crate) fn parse_tier_decay(raw: &str) -> Option<[f64; 5]> {
+    let fields: Vec<&str> = raw.split(',').collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let mut out = [0.0f64; 5];
+    for (slot, field) in out.iter_mut().zip(&fields) {
+        let v = field.trim().parse::<f64>().ok()?;
+        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        *slot = v;
+    }
+    Some(out)
 }
 
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
@@ -335,6 +362,82 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tuning_with(pairs: &[(&str, &str)]) -> eros_engine_core::affinity::AffinityTuning {
+        affinity_tuning_from(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn affinity_tuning_valid_values_apply() {
+        let t = tuning_with(&[
+            ("AFFINITY_GRADE_UNIT", "0.04"),
+            ("AFFINITY_NEG_FACTOR", "2.0"),
+            ("AFFINITY_CROSS_PENALTY", "0.03"),
+            ("AFFINITY_CROSS_PENALTY_START", "0.5"),
+            ("AFFINITY_DELTA_THRESHOLD", "0.05"),
+            ("AFFINITY_DEMO_BOOST", "1.2"),
+            ("AFFINITY_TIER_DECAY", "1.0, 0.8, 0.6, 0.4, 0.2"),
+        ]);
+        assert_eq!(t.grade_unit, 0.04);
+        assert_eq!(t.neg_factor, 2.0);
+        assert_eq!(t.cross_penalty, 0.03);
+        assert_eq!(t.cross_penalty_start, 0.5);
+        assert_eq!(t.delta_threshold, 0.05);
+        assert_eq!(t.demo_boost, 1.2);
+        assert_eq!(t.tier_decay, [1.0, 0.8, 0.6, 0.4, 0.2]);
+    }
+
+    /// The one-typo NaN factory: κ start = 1 makes the penalty ramp divide by
+    /// zero, and NaN survives the axis clamp into stored state. Out-of-domain
+    /// or non-finite values must keep the default, never apply.
+    #[test]
+    fn affinity_tuning_rejects_out_of_domain_scalars() {
+        let d = eros_engine_core::affinity::AffinityTuning::default();
+        for (name, bad) in [
+            ("AFFINITY_CROSS_PENALTY_START", "1"),
+            ("AFFINITY_CROSS_PENALTY_START", "1.5"),
+            ("AFFINITY_CROSS_PENALTY_START", "NaN"),
+            ("AFFINITY_CROSS_PENALTY_START", "-0.1"),
+            ("AFFINITY_GRADE_UNIT", "0"),
+            ("AFFINITY_GRADE_UNIT", "-0.05"),
+            ("AFFINITY_GRADE_UNIT", "inf"),
+            ("AFFINITY_GRADE_UNIT", "abc"),
+            ("AFFINITY_NEG_FACTOR", "-1"),
+            ("AFFINITY_CROSS_PENALTY", "-0.05"),
+            ("AFFINITY_DELTA_THRESHOLD", "-0.5"),
+            ("AFFINITY_DELTA_THRESHOLD", "NaN"),
+            ("AFFINITY_DEMO_BOOST", "-2"),
+        ] {
+            let t = tuning_with(&[(name, bad)]);
+            assert_eq!(t, d, "{name}={bad} must keep every default");
+        }
+    }
+
+    /// Positional table: a dropped bad entry must not shift later tiers, and a
+    /// wrong field count must not half-apply.
+    #[test]
+    fn tier_decay_rejects_malformed_tables_wholesale() {
+        for bad in [
+            "1,bad,0.70,0.45,0.25,0.10",    // 6 fields, one bad — NOT five-after-drop
+            "1.0,0.70,0.45,0.25",           // 4 fields
+            "1.0,0.70,0.45,0.25,0.10,0.05", // 6 valid fields
+            "1.0,0.70,NaN,0.25,0.10",
+            "1.0,0.70,1.5,0.25,0.10", // > 1
+            "1.0,0.70,-0.1,0.25,0.10",
+            "",
+        ] {
+            assert_eq!(parse_tier_decay(bad), None, "must reject: {bad:?}");
+        }
+        assert_eq!(
+            parse_tier_decay("1.0, 0.70, 0.45, 0.25, 0.10"),
+            Some([1.0, 0.70, 0.45, 0.25, 0.10])
+        );
+    }
 
     #[test]
     fn usage_hidden_keys_from_env_parses_comma_separated() {

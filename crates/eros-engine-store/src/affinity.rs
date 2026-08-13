@@ -780,6 +780,126 @@ mod tests {
         );
     }
 
+    /// Two CONCURRENT sub-threshold turns: the pending balance is re-read
+    /// under the same `FOR UPDATE` lock as the axes, so both buffered amounts
+    /// must survive — a lost pending update would silently eat earned score.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_subthreshold_turns_accumulate_pending(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let base = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let p = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let repo = AffinityRepo { pool: &p };
+                let mut a = repo.load(session_id).await.unwrap().unwrap();
+                repo.persist_with_event(
+                    &mut a,
+                    &AxisGrades::default(),
+                    &AffinityDeltas {
+                        trust: 0.1,
+                        ..Default::default()
+                    },
+                    1.0,
+                    &AffinityTuning {
+                        delta_threshold: 0.5,
+                        ..Default::default()
+                    },
+                    "message",
+                    serde_json::json!({}),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let reloaded = repo.load(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.trust, 0.0, "both turns gated — axis untouched");
+        let pending: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT pending_deltas FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(base.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (pending.unwrap()["trust"].as_f64().unwrap() - 0.2).abs() < 1e-9,
+            "both buffered amounts must land — no lost pending update"
+        );
+    }
+
+    /// A flush that overshoots the axis ceiling: the committed amount is the
+    /// full accumulator, the axis clamps, `effective_deltas` reports the
+    /// APPLIED change (after − before), and the balance still resets.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn gate_flush_clamps_and_reports_applied_change(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let tuning = AffinityTuning {
+            delta_threshold: 1.5,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            repo.persist_with_event(
+                &mut a,
+                &AxisGrades::default(),
+                &AffinityDeltas {
+                    trust: 0.9,
+                    ..Default::default()
+                },
+                1.0,
+                &tuning,
+                "message",
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Turn 1 buffers 0.9; turn 2 accumulates 1.8 ≥ 1.5 → commits 1.8,
+        // trust clamps 0.0 → 1.0.
+        assert_eq!(a.trust, 1.0, "clamped at the ceiling");
+        let (pending, eff): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT a.pending_deltas, e.effective_deltas \
+                 FROM engine.companion_affinity a \
+                 JOIN engine.companion_affinity_events e ON e.affinity_id = a.id \
+                 WHERE a.id = $1 ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            )
+            .bind(a.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.unwrap()["trust"].as_f64().unwrap(),
+            0.0,
+            "flush resets the balance even when the axis clamped"
+        );
+        assert!(
+            (eff.unwrap()["trust"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+            "effective_deltas reports the applied 1.0, not the flushed 1.8"
+        );
+    }
+
     /// The event context carries the judge's verdict and the gate balance next
     /// to whatever the caller supplied.
     #[sqlx::test(migrations = "./migrations")]
