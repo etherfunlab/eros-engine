@@ -283,6 +283,7 @@ pub async fn compose_image(
         &style_str,
     )
     .await
+    .outcome
     .ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
 
     let composed_prompt = compose_image_prompt(style_key, &persona, &outcome.prompt);

@@ -161,9 +161,11 @@ fn build_image_request_frame(
 /// one; when the composer LLM call SUCCEEDED it also stores the audit trio
 /// `compose_variant` / `compose_model` / `compose_generation_id` (spec
 /// 2026-08-02; absence = no successful compose this turn — raw skip,
-/// fail-open, or task not configured). Deliberately NOT stored: the composed
-/// wire prompt (the consumer's job), url, or success/failure of the draw.
-/// Pure.
+/// fail-open, or task not configured). Also stores `compose_event_id`, the
+/// `chat_images_events` row id — the pointer that makes the audit table
+/// reachable from a message (spec 2026-08-14). Deliberately NOT stored: the
+/// composed wire prompt (the consumer's job), url, or success/failure of the
+/// draw. Pure.
 fn build_delegated_image_marker(
     subject: &str,
     caption: Option<&str>,
@@ -171,6 +173,7 @@ fn build_delegated_image_marker(
     compose_variant: Option<&str>,
     compose_model: Option<&str>,
     compose_generation_id: Option<&str>,
+    compose_event_id: Option<Uuid>,
 ) -> serde_json::Value {
     let mut m = serde_json::json!({ "prompt": subject });
     if let Some(c) = caption.filter(|s| !s.trim().is_empty()) {
@@ -187,6 +190,9 @@ fn build_delegated_image_marker(
     }
     if let Some(v) = compose_generation_id.filter(|s| !s.is_empty()) {
         m["compose_generation_id"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(id) = compose_event_id {
+        m["compose_event_id"] = serde_json::Value::String(id.to_string());
     }
     m
 }
@@ -2455,6 +2461,45 @@ pub(crate) fn compose_user_payload(
     )
 }
 
+/// The five composer slots as an audit snapshot. Deliberately built from the
+/// RAW values: `run_image_prompt_compose` substitutes `（无）` for empty slots
+/// when it renders the prompt, and that placeholder is a rendering detail — the
+/// audit records an absent slot as the empty string. Pure.
+pub(crate) fn compose_inputs_json(
+    persona: &eros_engine_core::persona::CompanionPersona,
+    recent_scene: &str,
+    latest_user_msg: &str,
+    style: &str,
+    aspect_ratio: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "appearance": crate::prompt::meta_str(persona, "appearance")
+            .map(str::trim)
+            .unwrap_or(""),
+        "recent_scene": recent_scene.trim(),
+        "latest_user_msg": latest_user_msg.trim(),
+        "style": style,
+        "aspect_ratio": aspect_ratio.unwrap_or(""),
+    })
+}
+
+/// Fail-open audit write. Returns the new row id, or `None` when the INSERT
+/// failed — warned and dropped, never propagated: a missing audit row costs the
+/// linkage, never the turn.
+pub(crate) async fn record_compose_event(
+    pool: &sqlx::PgPool,
+    ev: eros_engine_store::image_events::ImageComposeEventInsert<'_>,
+) -> Option<uuid::Uuid> {
+    let repo = eros_engine_store::image_events::ImageComposeEventRepo { pool };
+    match repo.record(ev).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "chat_images_events: audit write failed");
+            None
+        }
+    }
+}
+
 /// The composer's JSON contract.
 #[derive(serde::Deserialize)]
 struct ComposeReply {
@@ -2501,9 +2546,21 @@ pub(crate) struct ComposeOutcome {
     /// attempted model id (same idiom as the vision audit).
     pub(crate) model: String,
     pub(crate) generation_id: Option<String>,
+    /// Full unfiltered OpenRouter usage block for the audit row.
+    /// `openrouter_usage_hidden_keys` filters the WIRE copy only — never this.
+    pub(crate) usage: Option<serde_json::Value>,
     /// `ResolvedImagePromptCompose::variant_key`, carried so the call site
     /// doesn't need the resolved config in scope.
     pub(crate) variant: Option<String>,
+}
+
+/// What one composer chain walk produced, plus the facts the audit row needs
+/// that a bare `Option<ComposeOutcome>` throws away: how many models were
+/// actually called, and why the last one failed.
+pub(crate) struct ComposeRun {
+    pub(crate) outcome: Option<ComposeOutcome>,
+    pub(crate) attempts: i16,
+    pub(crate) last_failure: Option<&'static str>,
 }
 
 /// Generate the image prompt (and its caption) via the optional composer LLM.
@@ -2523,7 +2580,7 @@ pub(crate) async fn run_image_prompt_compose(
     latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
-) -> Option<ComposeOutcome> {
+) -> ComposeRun {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
@@ -2544,7 +2601,10 @@ pub(crate) async fn run_image_prompt_compose(
     let chain: Vec<String> = std::iter::once(c.model.clone())
         .chain(c.fallback_model.iter().cloned())
         .collect();
+    let mut attempts: i16 = 0;
+    let mut last_failure: Option<&'static str> = None;
     for model_id in &chain {
+        attempts += 1;
         let req = ChatRequest {
             model: model_id.clone(),
             fallback_model: vec![],
@@ -2569,10 +2629,12 @@ pub(crate) async fn run_image_prompt_compose(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
+                last_failure = Some("model_error");
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "image-compose: timeout; next");
+                last_failure = Some("timeout");
                 continue;
             }
         };
@@ -2580,22 +2642,33 @@ pub(crate) async fn run_image_prompt_compose(
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
+            last_failure = Some("empty");
             continue;
         }
         let (prompt, caption) = parse_compose_reply(&text);
         if prompt.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
+            last_failure = Some("empty_prompt");
             continue;
         }
-        return Some(ComposeOutcome {
-            prompt,
-            caption,
-            model: resp.model.unwrap_or_else(|| model_id.clone()),
-            generation_id: resp.generation_id,
-            variant: c.variant_key.clone(),
-        });
+        return ComposeRun {
+            outcome: Some(ComposeOutcome {
+                prompt,
+                caption,
+                model: resp.model.unwrap_or_else(|| model_id.clone()),
+                generation_id: resp.generation_id,
+                usage: resp.usage,
+                variant: c.variant_key.clone(),
+            }),
+            attempts,
+            last_failure: None,
+        };
     }
-    None
+    ComposeRun {
+        outcome: None,
+        attempts,
+        last_failure,
+    }
 }
 
 /// The two per-turn image inputs, resolved from plan → request. There is no
@@ -2664,6 +2737,9 @@ struct DelegatedImagePrompt {
     compose_variant: Option<String>,
     compose_model: Option<String>,
     compose_generation_id: Option<String>,
+    /// The `chat_images_events` row this compose produced; `None` when the
+    /// audit write failed.
+    compose_event_id: Option<Uuid>,
 }
 
 /// Guards a speculatively-spawned `tokio::task::JoinHandle` so it is aborted
@@ -2715,6 +2791,7 @@ impl<T> Drop for AbortOnDrop<T> {
 /// subject — there is nothing left to fall back to — and never blocks the
 /// image turn. `compose_image_prompt` turns that empty subject into a plain
 /// persona-appearance portrait prompt (#212).
+#[allow(clippy::too_many_arguments)]
 async fn build_delegated_image_prompt(
     state: &AppState,
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -2722,6 +2799,8 @@ async fn build_delegated_image_prompt(
     req_image: Option<&crate::routes::companion_stream::ImageReplyParams>,
     pde_transcript: &str,
     latest_user_msg: &str,
+    user_id: Uuid,
+    session_id: Uuid,
 ) -> DelegatedImagePrompt {
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
@@ -2731,7 +2810,7 @@ async fn build_delegated_image_prompt(
     let variant = req_image.and_then(|i| i.prompt_variant.as_deref());
     let resolved_compose = state.model_config.resolve_image_prompt_compose(variant);
     let composer_configured = resolved_compose.is_some();
-    let compose = match resolved_compose {
+    let run = match resolved_compose {
         Some(c) => {
             run_image_prompt_compose(
                 state,
@@ -2744,16 +2823,21 @@ async fn build_delegated_image_prompt(
             )
             .await
         }
-        None => None,
+        None => ComposeRun {
+            outcome: None,
+            attempts: 0,
+            last_failure: None,
+        },
     };
-    let (final_subject, caption, compose_variant, compose_model, compose_generation_id) =
-        match compose {
+    let (final_subject, caption, compose_variant, compose_model, compose_generation_id, usage) =
+        match run.outcome {
             Some(o) => (
                 o.prompt,
                 o.caption,
                 o.variant,
                 Some(o.model),
                 o.generation_id,
+                o.usage,
             ),
             None => {
                 // Loud on purpose: this is the ONE path where the capability
@@ -2777,11 +2861,55 @@ async fn build_delegated_image_prompt(
                         "no [tasks.chat_image_prompt_compose] configured"
                     }
                 );
-                (String::new(), None, None, None, None)
+                (String::new(), None, None, None, None, None)
             }
         };
     let composed_prompt =
         crate::pipeline::handlers::compose_image_prompt(inputs.style, persona, &final_subject);
+
+    // Audit BEFORE returning: the composer is the auditable unit, and the
+    // assistant row it will be stamped onto does not exist yet. Writing here
+    // also means a turn that never ships its image (client disconnect, ghost
+    // fallback) still leaves the paid-for call behind.
+    let status = if compose_model.is_some() {
+        "ok"
+    } else if composer_configured {
+        "exhausted"
+    } else {
+        "not_configured"
+    };
+    let source = match plan.action_type {
+        ActionType::ReplyImage => "chat_reply_image",
+        _ => "chat_reply_text_image",
+    };
+    let compose_event_id = record_compose_event(
+        &state.pool,
+        eros_engine_store::image_events::ImageComposeEventInsert {
+            source,
+            user_id,
+            instance_id: Some(persona.instance.id),
+            session_id: Some(session_id),
+            status,
+            inputs: compose_inputs_json(
+                persona,
+                pde_transcript,
+                latest_user_msg,
+                &style_str,
+                inputs.aspect_ratio.as_deref(),
+            ),
+            subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
+            caption: caption.as_deref(),
+            composed_prompt: Some(composed_prompt.as_str()),
+            variant: compose_variant.as_deref(),
+            model: compose_model.as_deref(),
+            usage,
+            generation_id: compose_generation_id.as_deref(),
+            attempts: run.attempts,
+            last_failure: run.last_failure,
+        },
+    )
+    .await;
+
     DelegatedImagePrompt {
         subject: final_subject,
         caption,
@@ -2790,6 +2918,7 @@ async fn build_delegated_image_prompt(
         compose_variant,
         compose_model,
         compose_generation_id,
+        compose_event_id,
     }
 }
 
@@ -3586,6 +3715,8 @@ pub fn run_stream(
                         req_image,
                         &pde_transcript.transcript,
                         &user_msg.content,
+                        user_msg.user_id,
+                        user_msg.session_id,
                     )
                     .await;
                     let subject = img.subject;
@@ -3602,6 +3733,7 @@ pub fn run_stream(
                         img.compose_variant.as_deref(),
                         img.compose_model.as_deref(),
                         img.compose_generation_id.as_deref(),
+                        img.compose_event_id,
                     );
                     image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
@@ -3818,6 +3950,8 @@ pub fn run_stream(
                         let req_image_c = req_image.cloned();
                         let scene_c = pde_transcript.transcript.clone();
                         let latest_c = effective_user_msg.clone();
+                        let user_id_c = user_msg.user_id;
+                        let session_id_c = user_msg.session_id;
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -3826,6 +3960,8 @@ pub fn run_stream(
                                 req_image_c.as_ref(),
                                 &scene_c,
                                 &latest_c,
+                                user_id_c,
+                                session_id_c,
                             )
                             .await
                         })))
@@ -3980,6 +4116,8 @@ pub fn run_stream(
                                     req_image,
                                     &pde_transcript.transcript,
                                     &effective_user_msg,
+                                    user_msg.user_id,
+                                    user_msg.session_id,
                                 )
                                 .await
                             }
@@ -3991,6 +4129,8 @@ pub fn run_stream(
                                     req_image,
                                     &pde_transcript.transcript,
                                     &effective_user_msg,
+                                    user_msg.user_id,
+                                    user_msg.session_id,
                                 )
                                 .await
                             }
@@ -4010,6 +4150,7 @@ pub fn run_stream(
                             img.compose_variant.as_deref(),
                             img.compose_model.as_deref(),
                             img.compose_generation_id.as_deref(),
+                            img.compose_event_id,
                         );
                         if let Err(e) = chat_repo
                             .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
@@ -4387,6 +4528,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m["prompt"], "on a rooftop");
         assert_eq!(m["caption"], "在天台");
@@ -4395,7 +4537,7 @@ mod tests {
 
     #[test]
     fn delegated_image_marker_omits_absent_caption() {
-        let m = build_delegated_image_marker("on a rooftop", None, None, None, None, None);
+        let m = build_delegated_image_marker("on a rooftop", None, None, None, None, None, None);
         assert_eq!(m["prompt"], "on a rooftop");
         assert!(
             m.get("caption").is_none(),
@@ -6858,6 +7000,106 @@ data: [DONE]\n\n";
             !model_text.contains("rooftop"),
             "the prompt must never reach the chat model's history: {model_text}"
         );
+    }
+
+    /// The success path writes exactly one `ok` row and stamps its id onto the
+    /// assistant row's `metadata.image` — the linkage direction the whole
+    /// design rests on (spec 2026-08-14).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_writes_an_ok_event_and_stamps_its_id(pool: PgPool) {
+        let (_reqs, _frames) = run_variant_turn(
+            &pool,
+            Some("a"),
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_compose_ok",
+                "model": "composer",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she leans on the counter\",\"caption\":\"厨房里的她\"}"}}],
+                "usage": {"total_tokens": 88}
+            })),
+        )
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let (id, status, subject, caption, composed, variant, model, gen, attempts, inputs): (
+            Uuid,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i16,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT id, status, subject, caption, composed_prompt, variant, model, \
+                    generation_id, attempts, inputs \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+
+        assert_eq!(status, "ok");
+        assert_eq!(subject.as_deref(), Some("she leans on the counter"));
+        assert_eq!(caption.as_deref(), Some("厨房里的她"));
+        assert!(
+            composed
+                .as_deref()
+                .is_some_and(|c| c.contains("she leans on the counter")),
+            "the assembled wire prompt is stored, not just the subject"
+        );
+        assert_eq!(variant.as_deref(), Some("a"));
+        assert_eq!(model.as_deref(), Some("composer"));
+        assert_eq!(gen.as_deref(), Some("gen_compose_ok"));
+        assert_eq!(attempts, 1);
+        assert_eq!(inputs["latest_user_msg"].as_str(), Some("hi"));
+        assert_eq!(inputs["style"].as_str(), Some("realistic"));
+
+        let stamped: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'image'->>'compose_event_id' FROM engine.chat_messages \
+             WHERE role = 'assistant' AND metadata->'image' IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stamped.as_deref(),
+            Some(id.to_string().as_str()),
+            "the assistant row points at the audit row"
+        );
+    }
+
+    /// A composer chain that never yields usable output still leaves a row —
+    /// today this case is invisible in the database.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn exhausted_compose_writes_an_event_with_the_portrait_prompt(pool: PgPool) {
+        let (_reqs, _frames) =
+            run_variant_turn(&pool, Some("a"), wiremock::ResponseTemplate::new(500)).await;
+
+        let (status, subject, composed, attempts, last_failure): (
+            String,
+            Option<String>,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, subject, composed_prompt, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+
+        assert_eq!(status, "exhausted");
+        assert_eq!(subject, None, "no composer output to record");
+        assert!(
+            composed.is_some(),
+            "the portrait fallback still ships a wire prompt — it must be recorded"
+        );
+        assert!(attempts >= 1);
+        assert_eq!(last_failure.as_deref(), Some("model_error"));
     }
 
     /// Spec 2026-08-02-provider-body-params: an [[providers.openrouter.body]]
@@ -13593,8 +13835,15 @@ data: [DONE]\n\n"
         // Subject under `prompt` (persisted, but NOT what
         // `assistant_transcript_line` reads — see below), plus aspect — and
         // NOTHING else (no caption / composed prompt / model / gen id).
-        let marker =
-            build_delegated_image_marker("beach at sunset", None, Some("3:4"), None, None, None);
+        let marker = build_delegated_image_marker(
+            "beach at sunset",
+            None,
+            Some("3:4"),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
         assert_eq!(
@@ -13615,7 +13864,7 @@ data: [DONE]\n\n"
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
         // No aspect => still a valid one-key marker that annotates (bare, same reason).
-        let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None);
+        let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None, None);
         assert_eq!(m2.as_object().unwrap().len(), 1);
         let w2 = serde_json::json!({ "image": m2 });
         assert_eq!(
@@ -13635,6 +13884,7 @@ data: [DONE]\n\n"
             Some("b"),
             Some("served/model"),
             Some("gen-xyz"),
+            None,
         );
         assert_eq!(m["prompt"], "beach at sunset");
         assert_eq!(m["aspect_ratio"], "3:4");
@@ -13650,6 +13900,7 @@ data: [DONE]\n\n"
             None,
             None,
             Some("served/model"),
+            None,
             None,
         );
         assert_eq!(m2["compose_model"], "served/model");
