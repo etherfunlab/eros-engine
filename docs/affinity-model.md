@@ -223,6 +223,12 @@ effective per-turn caps the old ±0.4/−0.6 clamps yielded through EMA 0.5. The
 asymmetry (a bad turn costs more than a good turn gains) survives as
 `AFFINITY_NEG_FACTOR`; only the interior shape is new.
 
+**Banded input.** The per-turn payload shows the evaluator its six current
+axis reads as coarse bands (冷/低/中/高, cut at 0.35 / 0.65 like the patience
+bands; 冷 = negative warmth), never raw floats — the judge that reports
+buckets is not shown the numbers, which would re-anchor it on the arithmetic
+the graded protocol removed.
+
 **Register and `reason` hygiene.** The evaluator prompt is written in the
 character's own first-person voice ("you are this character; how did this turn
 change how you feel about him?"), not as a third-person analytical judge, and

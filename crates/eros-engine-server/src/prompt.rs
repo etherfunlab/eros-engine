@@ -244,7 +244,7 @@ pub fn affinity_eval_system_prompt() -> &'static str {
     "你就是对话里的这个角色。刚跟对方聊完一轮，凭本能回味：这一轮之后，你对他的感觉变了多少。\n\
      你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格和当前关系去感受。\n\
      \n\
-     输入会给出：角色名、六个维度的当前值、这一轮的对方消息和你的回复。\n\
+     输入会给出：角色名、六个维度的当前档位（冷/低/中/高）、这一轮的对方消息和你的回复。\n\
      \n\
      六个维度：\n\
      - warmth 温暖（-1~1）：他让你觉得亲近还是心冷。\n\
@@ -272,8 +272,26 @@ pub fn affinity_eval_system_prompt() -> &'static str {
      {\"warmth\": {\"grade\": 0, \"direction\": \"up\"}, \"trust\": {\"grade\": 0, \"direction\": \"up\"}, \"intrigue\": {\"grade\": 0, \"direction\": \"up\"}, \"intimacy\": {\"grade\": 0, \"direction\": \"up\"}, \"tension\": {\"grade\": 0, \"direction\": \"up\"}, \"patience\": 0.5, \"reason\": \"...\"}"
 }
 
+/// Coarse band label for one axis value, for the evaluator's own read of the
+/// current state. Cuts mirror the patience bands (0.35 / 0.65,
+/// lower-inclusive); only `warmth` can sit below zero and reads 冷 there.
+/// The judge that reports buckets is never shown raw floats — the numbers
+/// would re-anchor it on the arithmetic the graded protocol removed
+/// (follow-up to the affinity 3.0 spec, 2026-08-13).
+fn axis_band_label(v: f64) -> &'static str {
+    if v < 0.0 {
+        "冷"
+    } else if v < 0.35 {
+        "低"
+    } else if v < 0.65 {
+        "中"
+    } else {
+        "高"
+    }
+}
+
 /// Per-turn data block for the affinity evaluator: the persona's name, all six
-/// current axis values, and this turn's exchange.
+/// current axis reads as coarse bands, and this turn's exchange.
 ///
 /// The human's line is labeled 「对方」, never 「用户」 — the system prompt
 /// lists 「用户」 among the system vocabulary that must never appear in
@@ -286,18 +304,18 @@ pub fn affinity_eval_user_payload(
 ) -> String {
     format!(
         "角色名：{persona_name}\n\
-         当前值：warmth={warmth:.2} trust={trust:.2} intrigue={intrigue:.2} \
-         intimacy={intimacy:.2} patience={patience:.2} tension={tension:.2}\n\
+         当前档位：warmth={warmth} trust={trust} intrigue={intrigue} \
+         intimacy={intimacy} patience={patience} tension={tension}\n\
          \n\
          本轮对话：\n\
          对方：{user_msg}\n\
          {persona_name}：{assistant_msg}",
-        warmth = affinity.warmth,
-        trust = affinity.trust,
-        intrigue = affinity.intrigue,
-        intimacy = affinity.intimacy,
-        patience = affinity.patience,
-        tension = affinity.tension,
+        warmth = axis_band_label(affinity.warmth),
+        trust = axis_band_label(affinity.trust),
+        intrigue = axis_band_label(affinity.intrigue),
+        intimacy = axis_band_label(affinity.intimacy),
+        patience = axis_band_label(affinity.patience),
+        tension = axis_band_label(affinity.tension),
     )
 }
 
@@ -2065,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn affinity_eval_user_payload_renders_name_values_and_exchange() {
+    fn affinity_eval_user_payload_renders_name_bands_and_exchange() {
         let a = fixture_affinity();
         let p = affinity_eval_user_payload("Mia", &a, "我今天好累", "抱抱你");
         assert!(p.contains("角色名：Mia"));
@@ -2073,12 +2091,38 @@ mod tests {
         assert!(p.contains("抱抱你"));
         // The persona's own line is labeled with its name.
         assert!(p.contains("Mia：抱抱你"));
-        // All six current values render, in the documented order.
+        // All six axes render as BANDS, in the documented order — the judge
+        // that reports buckets is never shown raw floats (fixture: 0.42 /
+        // 0.31 / 0.55 / 0.22 / 0.66 / 0.13).
         assert!(
             p.contains(
-                "当前值：warmth=0.42 trust=0.31 intrigue=0.55 intimacy=0.22 patience=0.66 tension=0.13"
+                "当前档位：warmth=中 trust=低 intrigue=中 intimacy=低 patience=高 tension=低"
             ),
-            "six current values must render in axis order: {p}"
+            "six banded axis reads must render in axis order: {p}"
+        );
+        assert!(
+            !p.contains("0."),
+            "no raw axis number may reach the evaluator: {p}"
+        );
+    }
+
+    /// Band cuts mirror the patience bands (0.35 / 0.65, lower-inclusive);
+    /// warmth alone can sit below zero and reads 冷 there.
+    #[test]
+    fn affinity_eval_user_payload_band_boundaries() {
+        let mut a = fixture_affinity();
+        a.warmth = -0.2;
+        a.trust = 0.35; // lower edge of 中
+        a.intrigue = 0.65; // lower edge of 高
+        a.intimacy = 0.0;
+        a.patience = 0.349;
+        a.tension = 1.0;
+        let p = affinity_eval_user_payload("Mia", &a, "嗯", "嗯嗯");
+        assert!(
+            p.contains(
+                "当前档位：warmth=冷 trust=中 intrigue=高 intimacy=低 patience=低 tension=高"
+            ),
+            "band edges must cut at 0.35/0.65 with warmth<0 as 冷: {p}"
         );
     }
 
