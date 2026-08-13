@@ -85,11 +85,11 @@ pub struct AffinityEventEntry {
     /// Stable unique id of this event (FE freshness/dedup key).
     pub event_id: Uuid,
     pub event_type: String,
-    /// Pre-EMA raw delta the pipeline decided.
+    /// Raw delta the pipeline decided, before decay and gating.
     pub deltas: AffinityDeltasDto,
-    /// Post-EMA effective change (after − before). None for pre-0014 rows.
+    /// Effective change actually committed (after − before). None for pre-0014 rows.
     pub effective_deltas: Option<AffinityDeltasDto>,
-    /// Post-EMA delta folded into the two lines (raw-composite units). None for
+    /// Committed delta folded into the two lines (raw-composite units). None for
     /// pre-0014 rows with no `effective_deltas`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_deltas_computed: Option<BondChemistryDeltas>,
@@ -109,7 +109,7 @@ pub struct AffinityEventsResponse {
 
 const VALID_EVENT_TYPES: [&str; 5] = ["message", "ghost", "gift", "proactive", "time_decay"];
 
-/// Paginated affinity-event log for a session — pre-EMA + post-EMA deltas.
+/// Paginated affinity-event log for a session — raw + committed deltas.
 /// Debug-gated (same router as get_affinity).
 #[utoipa::path(
     get,
@@ -238,8 +238,8 @@ mod tests {
         )
         .bind(affinity_id)
         .bind(event_type)
-        .bind(json!({ "warmth": eff_warmth * 2.0 })) // pre-EMA (arbitrary)
-        .bind(json!({ "warmth": eff_warmth })) // post-EMA
+        .bind(json!({ "warmth": eff_warmth * 2.0 })) // raw (arbitrary)
+        .bind(json!({ "warmth": eff_warmth })) // committed
         .execute(pool)
         .await
         .unwrap();

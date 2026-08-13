@@ -27,7 +27,7 @@ pub struct BffAffinityDelta {
     /// Stable unique id of this event — the FE freshness/dedup key.
     pub event_id: Uuid,
     pub event_type: String, // "message" | "gift" | "proactive" | "ghost"
-    /// Post-EMA effective change of the latest user-turn event. All-zero for
+    /// Effective committed change of the latest user-turn event. All-zero for
     /// a ghost turn (AI didn't reply; no axis moved).
     pub effective_deltas: AffinityDeltasDto,
     /// Exact per-turn bond/chemistry delta (floored), read from the stored event
@@ -74,7 +74,7 @@ const LONG_POLL_MAX_WAIT_MS: u64 = 25_000;
 /// resolves on the first tick or two.
 const LONG_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Latest user-turn affinity delta (post-EMA). For per-turn FE observation.
+/// Latest user-turn affinity delta as committed. For per-turn FE observation.
 /// NOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +
 /// ownership checked. With `?after=<event_id>` the request long-polls (see
 /// [`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(ev["event_type"], "gift");
         assert!(ev["event_id"].is_string());
         assert!((ev["effective_deltas"]["warmth"].as_f64().unwrap() - 0.12).abs() < 1e-9);
-        // No raw pre-EMA field on the BFF shape.
+        // No raw pre-decay field on the BFF shape.
         assert!(ev.get("deltas").is_none());
     }
 

@@ -778,7 +778,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         config: crate::state::ServerConfig {
             expose_affinity_debug: true,
             // Default tuning: at a fresh seed (tier 1, no counterpart penalty)
-            // rule deltas land 1:1, matching the old no-smoothing test setup.
+            // rule deltas land 1:1.
             affinity_tuning: eros_engine_core::affinity::AffinityTuning::default(),
             bind_addr: "127.0.0.1:0".into(),
             // Sweeper disabled in tests — unit tests don't spawn it

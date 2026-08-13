@@ -15,14 +15,15 @@
 
 Most AI character apps eventually forget who you are. Their relationships reset to whatever fits in a prompt, and their personalities drift as the conversation grows. `eros-engine` makes those parts durable: a companion remembers you across sessions, the relationship changes through interaction, and each reply is chosen in character rather than improvised by a generic assistant.
 
-The engine has six foundations:
+The engine has seven foundations:
 
 - 🧠 **Two-layer memory** — stable facts about the user live alongside shared moments, callbacks, and unfinished threads. → [Memory layers](docs/memory-layers.md)
-- 💞 **Evolving affinity** — six relationship dimensions change smoothly and decay with time, shaping tone, depth, and even whether the companion replies. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- 💞 **Evolving affinity** — six relationship dimensions move on graded, damped writes and decay with time, shaping tone, depth, and even whether the companion replies. → [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine (PDE)** — before generation, the engine chooses an action and inner state. Rules work out of the box; an LLM judge is optional. → [Model config](docs/model-config.md)
 - 🧩 **Structured user insight** — the engine builds a queryable profile that downstream products can use for onboarding, personalization, and analysis. → [API reference](docs/api-reference.md)
 - ⚡ **A complete chat path** — SSE streaming, image understanding and generation requests, prompt traits, per-task model selection, fallbacks, and call auditing. OpenRouter is the default; additional OpenAI-compatible chat and embedding providers can be configured through `[providers]`. → [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
 - 🎙️ **A voice turn path built for interruption** — a lean, low-latency turn endpoint on its own channel, with barge-in: the client stops playback and reports what was actually spoken, so history records what the user *heard* rather than what the model produced. A turn lost to a dropped connection can be regenerated instead of stranded. → [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
+- 🌍 **A simulated world** — personas have an off-screen life. A scheduled world director evolves a shared relationship graph and daily scripts; a feed lets personas post and comment on one another; per-persona stories keep work, romance, and daily living consistent over time. Fully opt-in and layered behind independent switches — an unconfigured deployment runs zero queries and spawns zero sweepers. → [World system](docs/world-system.md)
 
 This is not a generic agent framework. It is the stateful core for products where one persona gets to know the same person over time: companions, journals, coaches, tutors, and character chat.
 
@@ -68,14 +69,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 Multi-architecture images are published to GitHub Container Registry for every `v*` tag:
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.1.0
+docker pull ghcr.io/etherfunlab/eros-engine:1.2.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.1.0 serve
+  ghcr.io/etherfunlab/eros-engine:1.2.0 serve
 ```
 
 Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed to any container host. See [Deploying](docs/deploying.md).
@@ -121,7 +122,6 @@ The complete environment list is in [`.env.example`](.env.example), operational 
 
 ## Roadmap
 
-- [ ] **Agents playground** — multiple personas sharing a session with each other and the user.
 - [ ] **Native audio I/O** — the low-latency voice-turn API and barge-in already ship; STT/TTS currently stay on the caller's side.
 - [ ] **Video generation** for companion-sent clips.
 

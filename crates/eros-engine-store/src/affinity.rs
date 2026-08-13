@@ -91,9 +91,9 @@ fn label_to_str(label: RelationshipLabel) -> &'static str {
 pub struct AffinityEventRow {
     pub id: Uuid,
     pub event_type: String,
-    pub deltas: serde_json::Value,                        // pre-EMA
-    pub effective_deltas: Option<serde_json::Value>,      // post-EMA (NULL pre-0014)
-    pub label_changes: Option<serde_json::Value>,         // per-turn tier transition (NULL = none)
+    pub deltas: serde_json::Value,                   // raw, pre-decay
+    pub effective_deltas: Option<serde_json::Value>, // committed (NULL pre-0014)
+    pub label_changes: Option<serde_json::Value>,    // per-turn tier transition (NULL = none)
     pub effective_line_deltas: Option<serde_json::Value>, // exact {bond,chemistry} per-turn delta (NULL pre-migration)
     pub created_at: DateTime<Utc>,
 }
@@ -661,7 +661,7 @@ mod tests {
             .unwrap();
 
         // Grade +4 warmth at a fresh seed: raw = 4 × 0.05 = 0.20, and with
-        // tier-1 decay ×1.0 and no gate it applies verbatim — no EMA anywhere.
+        // tier-1 decay ×1.0 and no gate it applies verbatim.
         repo.persist_with_event(
             &mut a,
             &AxisGrades {
@@ -690,7 +690,7 @@ mod tests {
 
         // deltas column = the turn's raw score.
         assert!((row.0["warmth"].as_f64().unwrap() - 0.2).abs() < 1e-9);
-        // effective = applied change: same 0.2, proving the EMA halving is gone.
+        // effective = applied change: same 0.2, i.e. committed 1:1.
         let eff = row.1.expect("effective_deltas present");
         assert!(
             (eff["warmth"].as_f64().unwrap() - 0.2).abs() < 1e-9,

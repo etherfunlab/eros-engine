@@ -9,7 +9,7 @@ Pure-domain types and rules for the [`eros-engine`](https://github.com/etherfunl
 ## What's in here
 
 - `persona` — persona definitions and instance state.
-- `affinity` — the six-dimensional relationship vector with EMA smoothing and decay rules.
+- `affinity` — the six-dimensional relationship vector with its graded write pipeline and decay rules.
 - `pde` — the Persona Decision Engine: rules that decide *how* a persona responds before the LLM call.
 - `ghost` — proactive (unsolicited) message scheduling logic.
 - `types` — shared IDs, timestamps, and enums.

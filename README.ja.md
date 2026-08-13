@@ -15,13 +15,15 @@
 
 多くの AI キャラクターアプリは、やがてあなたを忘れます。関係性はプロンプトに収まる文章へ戻り、会話が長くなるほど人物像もぶれていきます。`eros-engine` は、そこを持続する状態にします。コンパニオンはセッションをまたいであなたを覚え、交流とともに関係が変わり、汎用アシスタントの即興ではなく、その人物らしい判断から返信します。
 
-土台となるのは次の 5 つです。
+土台となるのは次の 7 つです。
 
 - 🧠 **2 層の記憶** — 安定したユーザー情報と、共有した出来事、過去への言及、続きのある話題をそれぞれ保持します。→ [Memory layers](docs/memory-layers.md)
-- 💞 **変化する親密度** — 6 つの関係軸が滑らかに変化し、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
+- 💞 **変化する親密度** — 6 つの関係軸が段階評価にもとづく減衰付きの書き込みで動き、時間とともに減衰します。口調や会話の深さ、返信するかどうかにも影響します。→ [Affinity model](docs/affinity-model.md) · [Ghost mechanics](docs/ghost-mechanics.md)
 - 🎭 **Persona Decision Engine（PDE）** — 生成前に、そのターンの行動と内面状態を選びます。標準はルールベースで、LLM judge も任意で使えます。→ [Model config](docs/model-config.md)
 - 🧩 **構造化されたユーザー理解** — 検索可能なプロフィールを育て、導入体験、パーソナライズ、分析などに活用できます。→ [API reference](docs/api-reference.md)
 - ⚡ **一通りそろったチャット経路** — SSE ストリーミング、画像理解と生成要求、`prompt_traits`、タスク別モデル選択、フォールバック、呼び出し監査を備えます。OpenRouter が標準ですが、`[providers]` から OpenAI 互換のチャット・embedding 提供元を追加できます。→ [API reference](docs/api-reference.md) · [Model config](docs/model-config.md)
+- 🎙️ **割り込み前提の音声ターン** — 独立したチャネル上の軽量・低遅延なターンエンドポイントで、barge-in に対応します。クライアントが再生を止めて実際に読み上げられた内容を報告するため、履歴にはモデルが生成した内容ではなくユーザーが**聞いた**内容が残ります。接続断で失われたターンは、宙に浮かせず再生成できます。→ [API reference](docs/api-reference.md#post-compvoicesession_idturnstream)
+- 🌍 **シミュレートされた世界** — ペルソナには画面の外の生活があります。定期実行の「世界ディレクター」が共有の関係グラフと日々の脚本を更新し、フィード上でペルソナ同士が投稿・コメントし合い、ペルソナごとのストーリーが仕事・恋愛・日常の一貫性を保ちます。完全にオプトインで、独立したスイッチで段階的に有効化します。未設定のデプロイではクエリも定期処理も一切走りません。→ [World system](docs/world-system.md)
 
 汎用エージェントフレームワークではありません。同じ人物が同じユーザーを時間をかけて知っていくプロダクトのための、状態を持つ中核です。AI コンパニオン、日記、コーチ、語学チューター、キャラクターチャットに向いています。
 
@@ -36,7 +38,7 @@
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
 │  │ post-process, spawned after reply              │     │
-│  │   • affinity: persist 6D delta + EMA           │     │
+│  │   • affinity: persist 6D graded turn           │     │
 │  │   • memory:   Voyage embed → pgvector upsert   │     │
 │  │   • insight:  extract facts → JSONB merge      │     │
 │  └────────────────────────────────────────────────┘     │
@@ -67,14 +69,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 各 `v*` タグについて、複数アーキテクチャ対応のイメージを GitHub Container Registry へ公開しています。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.1.0
+docker pull ghcr.io/etherfunlab/eros-engine:1.2.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.1.0 serve
+  ghcr.io/etherfunlab/eros-engine:1.2.0 serve
 ```
 
 Postgres と `.env` は利用者側で用意してください。同じ `docker/Dockerfile` を任意のコンテナ環境へ配備できます。詳細は [Deploying](docs/deploying.md) を参照してください。
@@ -82,7 +84,7 @@ Postgres と `.env` は利用者側で用意してください。同じ `docker/
 ## ドキュメント
 
 - [Architecture](docs/architecture.md) — crate の境界、処理段階、データフロー。
-- [Affinity model](docs/affinity-model.md) — 関係軸、平滑化、減衰、関係ラベル。
+- [Affinity model](docs/affinity-model.md) — 関係軸、段階評価によるスコアリング、減衰、関係ラベル。
 - [Ghost mechanics](docs/ghost-mechanics.md) — コンパニオンが沈黙する条件と理由。
 - [Memory layers](docs/memory-layers.md) — プロフィール記憶と関係記憶、embedding、検索。
 - [World system](docs/world-system.md) — 実験的な World Memories、World Town、World Stories のシミュレーション。
@@ -120,7 +122,6 @@ cargo run -p eros-engine-server -- serve
 
 ## ロードマップ
 
-- [ ] **複数ペルソナの実験環境** — 同じセッションで複数の AI ペルソナが互いに、またユーザーと会話する仕組み。
 - [ ] **音声メッセージ**と**ネイティブ音声 I/O** — 低遅延の音声ターン API は提供済みで、STT/TTS は現在呼び出し側の担当です。
 - [ ] **動画生成** — コンパニオンから短い動画を送信。
 

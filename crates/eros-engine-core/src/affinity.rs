@@ -45,8 +45,8 @@ pub struct AffinityDeltas {
 
 impl Affinity {
     /// Apply committed deltas directly, clamping each axis to its range.
-    /// No EMA here since 3.0: damping lives in `grade_turn`'s tier decay, so a
-    /// committed delta means exactly what it says.
+    /// Damping lives in `grade_turn`'s tier decay, so a committed delta means
+    /// exactly what it says.
     pub fn apply_deltas(&mut self, d: &AffinityDeltas) {
         self.warmth = clamp(self.warmth + d.warmth, -1.0, 1.0);
         self.trust = clamp(self.trust + d.trust, 0.0, 1.0);
@@ -331,9 +331,7 @@ impl Affinity {
 // Design spec: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
 
 /// Tuning knobs for the 3.0 pipeline, env-driven server-side. Defaults
-/// reproduce the 2.0 effective single-turn envelope exactly: grade ±4 lands
-/// +0.20 / −0.30 per axis, the same caps the old ±0.4/−0.6 clamp yielded after
-/// EMA 0.5 — the ceiling is unchanged, only the interior shape is new.
+/// set the single-turn envelope: grade ±4 lands +0.20 / −0.30 per axis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AffinityTuning {
     /// Raw score per grade step (`AFFINITY_GRADE_UNIT`).
@@ -350,8 +348,7 @@ pub struct AffinityTuning {
     /// Commit threshold θ (`AFFINITY_DELTA_THRESHOLD`); 0 commits every turn.
     pub delta_threshold: f64,
     /// Multiplier on the judge's positive raw component for demo sessions
-    /// (`AFFINITY_DEMO_BOOST`); rule nudges are unaffected. Replaces the
-    /// retired demo EMA inertia.
+    /// (`AFFINITY_DEMO_BOOST`); rule nudges are unaffected.
     pub demo_boost: f64,
 }
 

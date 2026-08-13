@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "1.1.1-dev"
+    "version": "1.2.0"
   },
   "servers": [
     {
@@ -21,7 +21,7 @@
         "tags": [
           "bff-companion"
         ],
-        "summary": "Latest user-turn affinity delta (post-EMA). For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
+        "summary": "Latest user-turn affinity delta as committed. For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
         "operationId": "bff_get_affinity_delta",
         "parameters": [
           {
@@ -258,7 +258,7 @@
         "tags": [
           "debug"
         ],
-        "summary": "Paginated affinity-event log for a session — pre-EMA + post-EMA deltas.\nDebug-gated (same router as get_affinity).",
+        "summary": "Paginated affinity-event log for a session — raw + committed deltas.\nDebug-gated (same router as get_affinity).",
         "operationId": "get_affinity_events",
         "parameters": [
           {
@@ -1161,7 +1161,7 @@
           },
           "deltas": {
             "$ref": "#/components/schemas/AffinityDeltasDto",
-            "description": "Pre-EMA raw delta the pipeline decided."
+            "description": "Raw delta the pipeline decided, before decay and gating."
           },
           "effective_deltas": {
             "oneOf": [
@@ -1170,7 +1170,7 @@
               },
               {
                 "$ref": "#/components/schemas/AffinityDeltasDto",
-                "description": "Post-EMA effective change (after − before). None for pre-0014 rows."
+                "description": "Effective change actually committed (after − before). None for pre-0014 rows."
               }
             ]
           },
@@ -1181,7 +1181,7 @@
               },
               {
                 "$ref": "#/components/schemas/BondChemistryDeltas",
-                "description": "Post-EMA delta folded into the two lines (raw-composite units). None for\npre-0014 rows with no `effective_deltas`."
+                "description": "Committed delta folded into the two lines (raw-composite units). None for\npre-0014 rows with no `effective_deltas`."
               }
             ]
           },
@@ -1349,7 +1349,7 @@
           },
           "effective_deltas": {
             "$ref": "#/components/schemas/AffinityDeltasDto",
-            "description": "Post-EMA effective change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
+            "description": "Effective committed change of the latest user-turn event. All-zero for\na ghost turn (AI didn't reply; no axis moved)."
           },
           "effective_deltas_computed": {
             "oneOf": [

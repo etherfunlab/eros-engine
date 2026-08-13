@@ -26,11 +26,10 @@ per-turn label transitions.
 The **default seed** values above apply only to new rows (sessions that start
 after migration `0029`). Existing rows are unaffected.
 
-### No smoothing — graded writes
+### Graded writes
 
-Since affinity 3.0 there is no EMA on the write path. The evaluator reports
-per-axis *grades* instead of numeric deltas; the engine converts them to
-scores, damps and gates them (see
+The evaluator reports per-axis *grades* rather than numeric deltas; the engine
+converts them to scores, damps and gates them (see
 [Write pipeline](#write-pipeline-affinity-30)), and applies the committed
 delta 1:1:
 
@@ -38,8 +37,8 @@ delta 1:1:
 new_value = clamp(old_value + committed_delta)
 ```
 
-A committed delta means exactly what it says — the damping that EMA used to
-provide lives in the pipeline's tier decay instead. Sessions opened with
+A committed delta means exactly what it says — damping is the pipeline's tier
+decay, applied before the write rather than to it. Sessions opened with
 `metadata.is_demo` multiply positive judge scores by `AFFINITY_DEMO_BOOST`
 (default `1.4`) so demo meters move visibly within a short demo.
 
@@ -217,11 +216,9 @@ failure never loses the affinity event. (An omitted axis or `null` grade is
 not malformed — it reads as grade 0; a quoted integer like `"grade": "2"` is
 salvaged.)
 
-**Single-turn envelope (unchanged from 2.0).** With default tuning, grade
-`+4` converts to `+0.20` and grade `−4` to `−0.30` per axis — exactly the
-effective per-turn caps the old ±0.4/−0.6 clamps yielded through EMA 0.5. The
-asymmetry (a bad turn costs more than a good turn gains) survives as
-`AFFINITY_NEG_FACTOR`; only the interior shape is new.
+**Single-turn envelope.** With default tuning, grade `+4` converts to `+0.20`
+and grade `−4` to `−0.30` per axis. The asymmetry — a bad turn costs more than
+a good turn gains — is `AFFINITY_NEG_FACTOR`.
 
 **Banded input.** The per-turn payload shows the evaluator its six current
 axis reads as coarse bands (冷/低/中/高, cut at 0.35 / 0.65 like the patience
@@ -310,7 +307,7 @@ reproduce the 2.0 effective single-turn envelope:
 | `AFFINITY_CROSS_PENALTY` | `0.05` | Cross-line penalty ceiling κ |
 | `AFFINITY_CROSS_PENALTY_START` | `0.35` | Counterpart score where the penalty ramp starts (y₀) |
 | `AFFINITY_DELTA_THRESHOLD` | `0.0` | Commit threshold θ; `0` commits every turn |
-| `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw (rule nudges unaffected) for `metadata.is_demo` sessions (replaces the retired demo EMA inertia) |
+| `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw (rule nudges unaffected) for `metadata.is_demo` sessions |
 
 Every scalar is domain-checked at boot — non-finite or out-of-domain values
 (negative unit/factor/penalty/threshold/boost, a penalty start outside

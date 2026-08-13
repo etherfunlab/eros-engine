@@ -15,13 +15,15 @@
 
 大多数 AI 角色应用用不了多久就会忘记你。关系被压缩成 prompt 里的一段文字，聊得越久，人设越容易漂移。`eros-engine` 把这些真正重要的部分变成持久状态：伴侣能跨会话记住你，关系会随着相处而变化，每次回复也会依照人设作出决定，而不是让一个通用助手临场发挥。
 
-引擎建立在五项基础能力之上：
+引擎建立在七项基础能力之上：
 
 - 🧠 **双层记忆**——稳定的用户事实与共同经历、前情呼应、未完话题各有其位。→ [记忆分层](docs/memory-layers.zh.md)
-- 💞 **演变的亲密度**——六个关系维度平滑变化，也会随时间衰减，逐渐影响语气、深度，甚至是否回复。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
+- 💞 **演变的亲密度**——六个关系维度按档位写入、经衰减落库，也会随时间回落，逐渐影响语气、深度，甚至是否回复。→ [亲密度模型](docs/affinity-model.zh.md) · [ghost 机制](docs/ghost-mechanics.zh.md)
 - 🎭 **人设决策引擎（PDE）**——生成回复前，先选择行为与内在状态。默认规则即可运行，也可启用 LLM 评判。→ [模型配置](docs/model-config.zh.md)
 - 🧩 **结构化用户洞察**——持续形成可查询的用户画像，供下游产品用于引导、个性化和分析。→ [API 参考](docs/api-reference.zh.md)
 - ⚡ **完整的聊天链路**——SSE 流式输出、图像理解与生成请求、prompt traits、按任务选模型、故障回退及调用审计。OpenRouter 是默认提供方，也可通过 `[providers]` 接入其他兼容 OpenAI 的聊天和 embedding 服务。→ [API 参考](docs/api-reference.zh.md) · [模型配置](docs/model-config.zh.md)
+- 🎙️ **为打断而设计的语音回合**——独立通道上的低延迟回合端点，支持 barge-in：客户端停止播放并回报用户实际听到的内容，因此历史记录的是用户**听到**的，而不是模型生成的。因掉线而丢失的回合可以重新生成，不会卡死。→ [API 参考](docs/api-reference.zh.md#post-compvoicesession_idturnstream)
+- 🌍 **模拟世界**——人设拥有台面下的生活。定时的「世界导演」演进共享关系图谱与每日剧本；信息流让人设彼此发帖、互相评论；每个人设的故事线让工作、感情与日常保持长期一致。完全可选，且由多个独立开关分层控制——没有配置的部署不会跑任何查询，也不会启动任何扫描任务。→ [世界系统](docs/world-system.zh.md)
 
 它不是通用 agent 框架，而是为同一人设与同一用户长期相处而做的有状态核心，适合 AI 伴侣、日记伙伴、教练、语言导师和角色聊天。
 
@@ -67,14 +69,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 每个 `v*` tag 都会向 GitHub Container Registry 发布多架构镜像：
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.1.0
+docker pull ghcr.io/etherfunlab/eros-engine:1.2.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.1.0 serve
+  ghcr.io/etherfunlab/eros-engine:1.2.0 serve
 ```
 
 你需要自行提供 Postgres 和 `.env`；同一个 `docker/Dockerfile` 可部署到任意容器托管平台。详见[部署](docs/deploying.zh.md)。
@@ -120,7 +122,6 @@ cargo run -p eros-engine-server -- serve
 
 ## 路线图
 
-- [ ] **多角色实验场**——多个 AI 人设在同一会话中彼此互动，也与用户互动。
 - [ ] **语音消息**与**原生音频 I/O**——低延迟的语音回合 API 已经就位，STT/TTS 目前由调用方负责。
 - [ ] **视频生成**——由伴侣发送短视频片段。
 
