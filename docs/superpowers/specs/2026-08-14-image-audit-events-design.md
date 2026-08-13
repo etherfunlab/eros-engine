@@ -137,7 +137,11 @@ Column notes:
 - **`composed_prompt`** — the assembled wire string from
   `compose_image_prompt(style, persona, subject)`: style preset + persona
   appearance + subject, i.e. exactly what the downstream consumer is handed.
-  NULL unless `status = 'ok'`.
+  **Stored on every row that produced one, including `exhausted` and
+  `not_configured`** — those chat turns still ship a picture, drawn from the
+  portrait fallback, and this column is then the only record anywhere of what
+  was drawn. NULL only on the standalone endpoint's `exhausted` row, which
+  502s without assembling anything.
 - **`variant`** — the resolved `prompt_variant` key. `"raw"` is an ordinary key,
   not a skip.
 - **`usage`** — the **full unfiltered** usage block, `serde_json::to_value`'d,
