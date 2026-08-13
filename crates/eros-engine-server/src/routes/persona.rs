@@ -17,14 +17,15 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use eros_engine_llm::model_config::StyleKey;
+use eros_engine_store::image_events::ImageComposeEventInsert;
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
-    compose_user_payload, parse_compose_reply, run_image_prompt_compose, StreamErrorCode,
-    FILTER_TIMEOUT,
+    compose_inputs_json, compose_user_payload, parse_compose_reply, record_compose_event,
+    run_image_prompt_compose, StreamErrorCode, FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -267,13 +268,15 @@ pub async fn compose_image(
             &content,
             req.aspect_ratio.as_deref(),
             _guard,
+            user_id,
+            instance_id,
         )
         .await;
     }
 
     // Walks [model] + fallback; usage is logged inside (§3.7). `None` after
     // the whole chain ⇒ 502 — no portrait fallback on this endpoint (§3.6).
-    let outcome = run_image_prompt_compose(
+    let run = run_image_prompt_compose(
         &state,
         &resolved,
         &persona,
@@ -282,11 +285,69 @@ pub async fn compose_image(
         req.aspect_ratio.as_deref(),
         &style_str,
     )
-    .await
-    .outcome
-    .ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
+    .await;
+
+    // Audit snapshot of the five composer slots — same shape whichever arm
+    // below fires.
+    let inputs = compose_inputs_json(
+        &persona,
+        &scene,
+        &content,
+        &style_str,
+        req.aspect_ratio.as_deref(),
+    );
+
+    let Some(outcome) = run.outcome else {
+        // 502 here, unlike the chat path's portrait fallback (spec
+        // 2026-08-03 §3.6) — nothing was assembled, so composed_prompt stays
+        // NULL. The only place in the design where that's true.
+        record_compose_event(
+            &state.pool,
+            ImageComposeEventInsert {
+                source: "compose_endpoint",
+                user_id,
+                instance_id: Some(instance_id),
+                session_id: None,
+                status: "exhausted",
+                inputs,
+                subject: None,
+                caption: None,
+                composed_prompt: None,
+                variant: resolved.variant_key.as_deref(),
+                model: None,
+                usage: None,
+                generation_id: None,
+                attempts: run.attempts,
+                last_failure: run.last_failure,
+            },
+        )
+        .await;
+        return Err(AppError::Upstream("image composer chain exhausted".into()));
+    };
 
     let composed_prompt = compose_image_prompt(style_key, &persona, &outcome.prompt);
+    record_compose_event(
+        &state.pool,
+        ImageComposeEventInsert {
+            source: "compose_endpoint",
+            user_id,
+            instance_id: Some(instance_id),
+            session_id: None,
+            status: "ok",
+            inputs,
+            subject: Some(outcome.prompt.as_str()),
+            caption: outcome.caption.as_deref(),
+            composed_prompt: Some(composed_prompt.as_str()),
+            variant: outcome.variant.as_deref(),
+            model: Some(outcome.model.as_str()),
+            usage: outcome.usage.clone(),
+            generation_id: outcome.generation_id.as_deref(),
+            attempts: run.attempts,
+            last_failure: None,
+        },
+    )
+    .await;
+
     Ok(Json(ComposeResponse {
         composed_prompt,
         subject: outcome.prompt,
@@ -331,6 +392,8 @@ async fn compose_stream(
     content: &str,
     aspect_ratio: Option<&str>,
     guard: StreamSlotGuard,
+    user_id: Uuid,
+    instance_id: Uuid,
 ) -> Result<axum::response::Response, AppError> {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let appearance = crate::prompt::meta_str(&persona, "appearance")
@@ -340,6 +403,11 @@ async fn compose_stream(
     let scene_slot = if scene.is_empty() { "（无）" } else { scene };
     let ar = aspect_ratio.unwrap_or("（未指定）");
     let user_payload = compose_user_payload(appearance, scene_slot, content, style_str, ar);
+    // Audit snapshot of the five composer slots, captured before `persona` is
+    // moved into the stream generator below; `variant_key` is likewise cloned
+    // out now so the generator doesn't need to borrow `resolved`.
+    let inputs = compose_inputs_json(&persona, scene, content, style_str, aspect_ratio);
+    let variant_key = resolved.variant_key.clone();
     // The model on the wire comes from the per-candidate `execute_stream_as`
     // argument, not this field.
     let req = ChatRequest {
@@ -374,7 +442,12 @@ async fn compose_stream(
     // fallback behaviour identical and keeps a fully-failed chain a real
     // pre-stream 502 rather than a 200 carrying an error frame.
     let mut opened: Option<Opened> = None;
+    // Models actually called before either a candidate opens or the chain is
+    // exhausted — the audit row's `attempts`, mirroring the counter
+    // `run_image_prompt_compose` keeps for the non-stream chain walk.
+    let mut attempts: i16 = 0;
     for model_id in chain {
+        attempts += 1;
         // One budget per candidate, covering both the open and the whole
         // consumption — the composer writes a short JSON reply, so the
         // non-stream mode's per-call FILTER_TIMEOUT is the right total here.
@@ -446,7 +519,7 @@ async fn compose_stream(
             break;
         }
     }
-    let Opened {
+    let Some(Opened {
         attempted_model,
         first,
         mut served_model,
@@ -454,7 +527,33 @@ async fn compose_stream(
         mut usage,
         stream: mut delta_stream,
         deadline,
-    } = opened.ok_or_else(|| AppError::Upstream("image composer chain exhausted".into()))?;
+    }) = opened
+    else {
+        // No candidate ever produced a first token — nothing was assembled,
+        // so composed_prompt stays NULL, same as the non-stream exhausted arm.
+        record_compose_event(
+            &state.pool,
+            ImageComposeEventInsert {
+                source: "compose_endpoint_stream",
+                user_id,
+                instance_id: Some(instance_id),
+                session_id: None,
+                status: "exhausted",
+                inputs,
+                subject: None,
+                caption: None,
+                composed_prompt: None,
+                variant: variant_key.as_deref(),
+                model: None,
+                usage: None,
+                generation_id: None,
+                attempts,
+                last_failure: Some("stream_open_failed"),
+            },
+        )
+        .await;
+        return Err(AppError::Upstream("image composer chain exhausted".into()));
+    };
 
     let frames = async_stream::stream! {
         let _guard = guard;
@@ -518,12 +617,38 @@ async fn compose_stream(
         );
         let (subject, caption) = parse_compose_reply(acc.trim());
         match failure {
-            Some(message) => yield ComposeFrame::Error {
-                code: StreamErrorCode::UpstreamUnavailable,
-                retryable: true,
-                message,
-                user_message: "服务出现问题，请稍后再试".into(),
-            },
+            Some(message) => {
+                // Died after opening — a chunk carrying `usage` may already
+                // have landed before the failure, so the accumulated block
+                // (not None) is what a caller was actually billed for.
+                record_compose_event(
+                    &state.pool,
+                    ImageComposeEventInsert {
+                        source: "compose_endpoint_stream",
+                        user_id,
+                        instance_id: Some(instance_id),
+                        session_id: None,
+                        status: "exhausted",
+                        inputs,
+                        subject: None,
+                        caption: None,
+                        composed_prompt: None,
+                        variant: variant_key.as_deref(),
+                        model: None,
+                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: None,
+                        attempts,
+                        last_failure: Some("stream_died_midway"),
+                    },
+                )
+                .await;
+                yield ComposeFrame::Error {
+                    code: StreamErrorCode::UpstreamUnavailable,
+                    retryable: true,
+                    message,
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+            }
             // A parse that yields no subject cannot be served as a `done`.
             None if subject.is_empty() => yield ComposeFrame::Error {
                 code: StreamErrorCode::UpstreamUnavailable,
@@ -533,11 +658,33 @@ async fn compose_stream(
             },
             None => {
                 let composed_prompt = compose_image_prompt(style_key, &persona, &subject);
+                let model = served_model.unwrap_or(attempted_model);
+                record_compose_event(
+                    &state.pool,
+                    ImageComposeEventInsert {
+                        source: "compose_endpoint_stream",
+                        user_id,
+                        instance_id: Some(instance_id),
+                        session_id: None,
+                        status: "ok",
+                        inputs,
+                        subject: Some(subject.as_str()),
+                        caption: caption.as_deref(),
+                        composed_prompt: Some(composed_prompt.as_str()),
+                        variant: variant_key.as_deref(),
+                        model: Some(model.as_str()),
+                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: generation_id.as_deref(),
+                        attempts,
+                        last_failure: None,
+                    },
+                )
+                .await;
                 yield ComposeFrame::Done {
                     composed_prompt,
                     subject,
                     caption,
-                    model: served_model.unwrap_or(attempted_model),
+                    model,
                     generation_id,
                 };
             }
@@ -932,7 +1079,7 @@ mod tests {
             .mount(&mock)
             .await;
         let mut app = build_router(with_composer(
-            crate::routes::companion::test_state(pool),
+            crate::routes::companion::test_state(pool.clone()),
             &mock.uri(),
         ));
         let jwt = mint_jwt(user_id);
@@ -946,6 +1093,117 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let v = body_json(resp).await;
         assert_eq!(v["error"], "upstream");
+
+        // The 502 is written before it's returned: the exhausted row exists
+        // even though the caller never got a subject.
+        #[allow(clippy::type_complexity)]
+        let (source, status, subject, composed, model, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(source, "compose_endpoint");
+        assert_eq!(status, "exhausted");
+        assert_eq!(subject, None);
+        assert_eq!(
+            composed, None,
+            "nothing was assembled — the only NULL composed_prompt case in the design"
+        );
+        assert_eq!(model, None);
+        assert_eq!(attempts, 1, "the sole configured model, no fallback");
+        assert_eq!(last_failure.as_deref(), Some("model_error"));
+    }
+
+    /// The standalone endpoint is a first-class composer caller: its calls are
+    /// audited exactly like a chat turn's, minus the session/message linkage
+    /// it does not have.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn non_stream_compose_writes_a_compose_endpoint_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-audit-ok",
+                "model": "served/composer-model",
+                "choices": [{"message": {"content":
+                    r#"{"prompt":"she reads by the window","caption":"窗边"}"#}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 10, "total_tokens": 14},
+            })))
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(
+            &mut app,
+            instance_id,
+            &jwt,
+            json!({"content": "拍一张", "stream": false}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        #[allow(clippy::type_complexity)]
+        let (
+            source,
+            status,
+            subject,
+            composed,
+            session_id,
+            inputs,
+            model,
+            generation_id,
+            usage,
+            attempts,
+            last_failure,
+        ): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+            serde_json::Value,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, session_id, inputs, model, \
+             generation_id, usage, attempts, last_failure FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+
+        assert_eq!(source, "compose_endpoint");
+        assert_eq!(status, "ok");
+        assert_eq!(subject.as_deref(), Some("she reads by the window"));
+        assert!(composed.is_some(), "the assembled wire prompt is recorded");
+        assert_eq!(session_id, None, "the endpoint has no session");
+        assert_eq!(inputs["latest_user_msg"].as_str(), Some("拍一张"));
+        assert_eq!(model.as_deref(), Some("served/composer-model"));
+        assert_eq!(generation_id.as_deref(), Some("gen-audit-ok"));
+        assert_eq!(
+            usage.expect("full usage block recorded")["total_tokens"].as_u64(),
+            Some(14),
+            "the FULL unfiltered usage block is stored, not the wire-filtered copy"
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(last_failure, None);
     }
 
     /// Collect the `data:` frames out of an SSE body (keep-alive comment lines
@@ -1183,7 +1441,7 @@ mod tests {
             .mount(&mock)
             .await;
         let mut app = build_router(with_composer(
-            crate::routes::companion::test_state(pool),
+            crate::routes::companion::test_state(pool.clone()),
             &mock.uri(),
         ));
         let jwt = mint_jwt(user_id);
@@ -1191,5 +1449,174 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let v = body_json(resp).await;
         assert_eq!(v["error"], "upstream");
+
+        // Written before the 502 returns, same as the non-stream twin — but
+        // labelled for the arm that never even opened a candidate.
+        let (source, status, composed, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, composed_prompt, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "exhausted");
+        assert_eq!(composed, None);
+        assert_eq!(attempts, 1, "the sole configured model, no fallback");
+        assert_eq!(last_failure.as_deref(), Some("stream_open_failed"));
+    }
+
+    /// The stream mode's audit twin of `non_stream_compose_writes_a_compose_endpoint_event`:
+    /// the row must carry exactly what the terminal `done` frame carried.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_compose_writes_a_compose_endpoint_stream_event(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let reply = r#"{"prompt":"STREAMED AUDIT SUBJECT","caption":"审计"}"#;
+        let chunk = json!({
+            "choices": [{"delta": {"content": reply}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 12, "total_tokens": 15},
+            "id": "gen-audit-stream",
+            "model": "served/composer-model",
+        });
+        let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "拍一张"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = sse_frames(resp).await;
+        let done = frames
+            .iter()
+            .find(|f| f["type"] == "done")
+            .expect("done frame");
+
+        #[allow(clippy::type_complexity)]
+        let (
+            source,
+            status,
+            subject,
+            composed,
+            model,
+            generation_id,
+            session_id,
+            usage,
+            attempts,
+            last_failure,
+        ): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+            Option<serde_json::Value>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, model, generation_id, \
+             session_id, usage, attempts, last_failure FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "ok");
+        assert_eq!(subject.as_deref(), done["subject"].as_str());
+        assert_eq!(composed.as_deref(), done["composed_prompt"].as_str());
+        assert_eq!(model.as_deref(), done["model"].as_str());
+        assert_eq!(generation_id.as_deref(), done["generation_id"].as_str());
+        assert_eq!(session_id, None, "the endpoint has no session");
+        assert_eq!(
+            usage.expect("full usage block recorded")["total_tokens"].as_u64(),
+            Some(15),
+            "the FULL unfiltered usage block is stored, not the wire-filtered copy"
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(last_failure, None);
+    }
+
+    /// A candidate that opens (yields a first token) and then dies via an
+    /// in-band OpenRouter mid-stream error frame — there is no chain left to
+    /// walk once opened, so it becomes both the SSE `error` frame and an
+    /// audited `exhausted` row, distinct from the open-failure arm above.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_records_exhausted_event_when_stream_dies_midway(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let chunk1 = json!({"choices": [{"delta": {"content": "STREAMED PART"}}]});
+        let chunk_err = json!({"error": {"code": 500, "message": "boom mid-stream"}});
+        let sse_body = format!("data: {chunk1}\n\ndata: {chunk_err}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "in-band error, not an HTTP failure — the candidate did open"
+        );
+        let frames = sse_frames(resp).await;
+        assert!(
+            frames.iter().any(|f| f["type"] == "error"),
+            "mid-stream death becomes an in-band error frame: {frames:?}"
+        );
+
+        #[allow(clippy::type_complexity)]
+        let (source, status, subject, composed, model, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "exhausted");
+        assert_eq!(subject, None);
+        assert_eq!(composed, None);
+        assert_eq!(model, None);
+        assert_eq!(
+            attempts, 1,
+            "the candidate that opened counts as one attempt"
+        );
+        assert_eq!(last_failure.as_deref(), Some("stream_died_midway"));
     }
 }
