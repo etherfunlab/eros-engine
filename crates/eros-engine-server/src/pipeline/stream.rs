@@ -7288,14 +7288,18 @@ data: [DONE]\n\n";
         .collect()
         .await;
 
-        let (status, image_url, attempts, vision): (
+        #[allow(clippy::type_complexity)]
+        let (status, image_url, attempts, vision, model, generation_id, usage): (
             String,
             String,
             i16,
             Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
         ) = sqlx::query_as(
-            "SELECT status, image_url, attempts, vision FROM engine.chat_vision_events \
-                 WHERE message_id = $1",
+            "SELECT status, image_url, attempts, vision, model, generation_id, usage \
+             FROM engine.chat_vision_events WHERE message_id = $1",
         )
         .bind(user_message_id)
         .fetch_one(&pool)
@@ -7306,6 +7310,9 @@ data: [DONE]\n\n";
         assert_eq!(image_url, "https://example.invalid/u.jpg");
         assert_eq!(attempts, 0, "no model was called");
         assert_eq!(vision, None);
+        assert_eq!(model, None, "no model was called");
+        assert_eq!(generation_id, None, "no model was called");
+        assert_eq!(usage, None, "no model was called");
     }
 
     /// `run_variant_turn` forces an image-*generation* turn (`image: Some(...)`)
@@ -10353,6 +10360,142 @@ data: [DONE]\n\n";
             Some(&serde_json::json!(2)),
             "usage stores the FULL unfiltered OpenRouter usage block: {usage:?}"
         );
+    }
+
+    /// The `exhausted` arm: `[tasks.chat_vision]` IS configured but the sole
+    /// chain model's reply never parses as `ImageVision`. `attempts`/
+    /// `last_failure` are written deep inside `run_vision`'s chain-walk loop —
+    /// nothing else in the suite reads them back from the DB, so this is the
+    /// only test that would catch `last_failure` failing to propagate out of
+    /// that loop, or `attempts` being off by one. Mirrors
+    /// `vision_turn_folds_description_and_persists`'s harness with a failing
+    /// describe reply instead of a valid one.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn exhausted_vision_chain_writes_an_event_with_last_failure(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Vision model ("vis/bad"): replies with prose that never parses as the
+        // ImageVision JSON schema — the chain walk records this as "unparseable"
+        // and (with no fallback configured) the chain is exhausted after 1 attempt.
+        let vis_body = serde_json::json!({
+            "id": "gv_bad", "model": "vis/bad",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": "抱歉，我暂时无法处理这张图片"}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("vis/bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vis_body))
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        // Chat model ("deepseek/y"): SSE, matched by model id only — the failed
+        // describe never folds a description into the prompt, so there is no
+        // shared marker to match on (unlike the `ok`-arm harness).
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/y\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/y"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/y\"\n\
+                 [tasks.chat_vision]\nmodel=\"vis/bad\"\nfilter_prompt=\"DESCRIBE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let seed_meta = serde_json::json!({ "image_url": "https://x/bad.png" });
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01J9999999999999999999999F",
+                "user",
+                Some(&seed_meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: Some("https://x/bad.png".into()),
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let (status, attempts, last_failure, vision, model, generation_id, usage): (
+            String,
+            i16,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, attempts, last_failure, vision, model, generation_id, usage \
+             FROM engine.chat_vision_events WHERE message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .expect("one vision event row for the exhausted describe");
+
+        assert_eq!(status, "exhausted");
+        assert!(attempts >= 1, "at least the sole chain model was attempted");
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("unparseable"),
+            "the mock reply never parses as ImageVision JSON"
+        );
+        assert_eq!(vision, None, "no valid describe to record");
+        assert_eq!(model, None, "no successful call to attribute a model to");
+        assert_eq!(generation_id, None);
+        assert_eq!(usage, None, "no successful call to carry a usage block");
     }
 
     // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
