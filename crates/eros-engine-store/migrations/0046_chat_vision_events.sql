@@ -1,9 +1,12 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- engine.chat_vision_events — append-only, best-effort telemetry: one row per
--- image-carrying, non-tipped chat turn, recording the `chat_vision` describe
--- call. Written even when the describe never ran ('not_configured') or failed
--- on every chain model ('exhausted') — those two cases leave no trace anywhere
--- else, which is the gap this table closes.
+-- image-carrying, non-tipped chat turn THAT REACHES THE TEXT-REPLY PATH,
+-- recording the `chat_vision` describe call. A turn that never reaches that
+-- path — ghosted, routed to product_qa, or answered with an image-only reply
+-- — writes no row: the describe never runs on those paths either. Written
+-- even when the describe never ran ('not_configured') or failed on every
+-- chain model ('exhausted') — those two cases leave no trace anywhere else,
+-- which is the gap this table closes.
 --
 -- Keeps message_id (unlike chat_images_events): vision runs AFTER the
 -- role='user' row exists, so the id is already in hand, and there is exactly

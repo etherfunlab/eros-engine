@@ -85,6 +85,14 @@ impl ImageComposeEventRepo<'_> {
 ///
 /// The user's accompanying text is NOT stored — `message_id` points at
 /// `chat_messages.content`, and real user text is not duplicated across tables.
+///
+/// One row per image-carrying, non-tipped turn THAT REACHES THE TEXT-REPLY
+/// PATH. A turn that never reaches that path — ghosted, routed to
+/// product_qa, or answered with an image-only reply — writes no row: the
+/// describe never runs on those paths either (running one on a ghost turn
+/// would waste a paid call). Callers computing a describe success rate off
+/// this table should treat "image-carrying turns that reached the text-reply
+/// path" as the denominator, not every image-carrying turn.
 pub struct ChatVisionEventInsert<'a> {
     pub user_id: Uuid,
     pub session_id: Uuid,

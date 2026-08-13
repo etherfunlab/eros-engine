@@ -621,8 +621,9 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 Standalone image-prompt composition for a persona instance — a consumer that
 wants a prompt for arbitrary text, not a chat turn. **No chat state is
 touched — no session, no messages, no affinity runs, no memory is written.**
-Every call is audited, though (see below). The instance must belong to the
-JWT user (`403` otherwise; `404` when it does not exist). Requires
+Every call is audited, though, with one caveat for streaming mode on client
+disconnect (see below). The instance must belong to the JWT user (`403`
+otherwise; `404` when it does not exist). Requires
 `[tasks.chat_image_prompt_compose]` (`501 compose_disabled` without it).
 
 The endpoint doubles as a composer test surface: the response carries `model`
@@ -646,9 +647,12 @@ The composer payload is identical to the chat path's five slots, so one
 `filter_prompt` contract serves both callers (see
 [model-config.md](model-config.md)).
 
-Every call — success or failure, either streaming mode — is recorded in
-`engine.chat_images_events` (`source = "compose_endpoint"` or
-`"compose_endpoint_stream"`); see [LLM audit → Image-path event
+Every call — success or failure — is recorded in `engine.chat_images_events`
+(`source = "compose_endpoint"` or `"compose_endpoint_stream"`): the non-stream
+mode writes synchronously before its HTTP response returns, with no gap. The
+streaming mode's writes live inside the SSE generator itself, so a client
+that disconnects before the generator reaches one loses that row too, even
+though the call was billed. See [LLM audit → Image-path event
 tables](llm-audit.md#image-path-event-tables).
 
 Both modes return the same five fields:

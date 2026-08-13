@@ -292,13 +292,25 @@ The user's accompanying text is **not** stored: `message_id` points at
 ### Write point
 
 `pipeline/stream.rs`, in the existing `if user_msg.tips_amount_usd.is_none()`
-image-describe block. **One row whenever the turn carries an image and is not a
-tip** — including the `resolve_vision() == None` case, written as
+image-describe block, which sits inside the `ActionType::ReplyText |
+ReplyImage | ReplyTextImage` match arm, after the image-only reply's early
+`return`. **One row per image-carrying, non-tipped turn that reaches this
+arm** — including the `resolve_vision() == None` case, written as
 `not_configured` with `attempts = 0`. That case is one of the three reasons
 `metadata.vision` can be missing, so it has to be recordable.
 
 Turns with no image write nothing: "carries an image" is the denominator, and a
-text turn is not a missed describe.
+text turn is not a missed describe. So do turns that never reach this arm at
+all — `ActionType::Ghost`, `ActionType::ProductQa`, or an image-only reply
+(`ReplyImage`, which returns before this block). The describe never ran on
+those paths before this table existed either, and running one on a ghost turn
+would waste a paid call, so this is not a behaviour change — it means an
+operator computing "how often does the describe succeed" from this table must
+read its denominator as **image-carrying turns that reached the text-reply
+path**, not every image-carrying turn. (Deviation from the original plan: an
+earlier draft of this section said "whenever the turn carries an image and is
+not a tip" with no further qualification; the write site was never moved to
+cover the other three paths, so this section now describes what shipped.)
 
 `run_vision` returns a wrapper carrying `attempts` / `last_failure` alongside
 the optional `VisionOutcome`; `VisionOutcome` gains `usage`. Fail-open exactly

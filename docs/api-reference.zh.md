@@ -537,8 +537,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 面向单个角色实例的独立图片提示词合成——给「想为任意文本拿一段提示词、而不是走
 一轮聊天」的消费方用。**不碰任何聊天状态——不落 session，不落 message，不跑
-好感度，不写记忆。** 但每次调用都会被审计（见下文）。实例必须属于
-JWT 用户（否则 `403`；不存在时 `404`）。要求配置
+好感度，不写记忆。** 但每次调用都会被审计——流式模式在客户端断连时有一个
+例外（见下文）。实例必须属于 JWT 用户（否则 `403`；不存在时 `404`）。要求配置
 `[tasks.chat_image_prompt_compose]`（没有则 `501 compose_disabled`）。
 
 这个端点同时是合成器的调试面：响应携带 `model` 和 `generation_id`，流式模式
@@ -559,9 +559,11 @@ Body 字段：
 合成器载荷与聊天路径的五个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
 
-每一次调用——不管成功失败、不管哪种流式模式——都会记录进
-`engine.chat_images_events`（`source = "compose_endpoint"` 或
-`"compose_endpoint_stream"`）；见
+每一次调用——不管成功失败——都会记录进 `engine.chat_images_events`
+（`source = "compose_endpoint"` 或 `"compose_endpoint_stream"`）：非流式模式在
+HTTP 响应返回之前就同步写完，没有缺口。流式模式的写入是写在 SSE generator
+内部的，客户端如果在 generator 走到某次写入之前就断连，那一行照样会丢——
+即使那次调用已经计费了。见
 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。
 
 两种模式返回同样的五个字段：

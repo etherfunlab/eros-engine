@@ -203,6 +203,17 @@ write costs the event row, never the turn (same discipline as
 `companion_decision_events`). Neither table carries a foreign key: a row may
 outlive or precede anything it refers to.
 
+Unlike `chat_messages`, which cascades from `chat_sessions`, deleting a
+session does not reach either table — both persist verbatim user text
+(`chat_images_events.inputs.latest_user_msg` / `.recent_scene`;
+`chat_vision_events.image_url`, often a signed, token-bearing URL). **Deployers
+must include both tables in their own user-data erasure routine** — the
+engine does not do this for you; erasure policy is the deployer's
+responsibility, not the engine's. Neither table ships with a pruning policy
+either: both grow without bound for as long as the deployment runs, so plan a
+partition scheme or a pruning cron yourselves if that matters for your
+deployment.
+
 ### `engine.chat_images_events`
 
 One row per image-composer LLM call, from **any** caller — a chat turn's
@@ -217,21 +228,34 @@ delegated image prompt, or the standalone `POST
 | `instance_id` | `UUID?` | Persona instance; NULL when the caller has none in scope. |
 | `session_id` | `UUID?` | Chat session; NULL on the standalone endpoint (no session). |
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
-| `inputs` | `JSONB` | The five composer slots, structured: `{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`. Empty slots are `""`, not the `（无）` placeholder the prompt renders — that substitution is a rendering detail, not an input. |
+| `inputs` | `JSONB` | The five composer slots, structured: `{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`. Empty slots are `""`, not the `（无）` placeholder the prompt renders — that substitution is a rendering detail, not an input. `latest_user_msg` differs by `source`: `chat_reply_image` passes the raw `user_msg.content`, while `chat_reply_text_image` passes `effective_user_msg` — the post-input-filter rewrite. Both faithfully record what the composer actually saw on that turn; an operator diffing rows across the two sources should expect the difference, not read it as an inconsistency. |
 | `subject` | `TEXT?` | The composer's own `prompt` field. NULL unless `status = "ok"`. |
 | `caption` | `TEXT?` | NULL when the composer produced none, including the non-JSON fallback reply, where the whole reply becomes `subject` instead. |
 | `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows, which fail without assembling anything. |
 | `variant` | `TEXT?` | The resolved `prompt_variant` key; `"raw"` is an ordinary key, not a skip. |
-| `model` | `TEXT?` | The model that answered, on success. Also populated on the standalone endpoint's **streaming** mode when a candidate had already opened and started streaming before failing (`stream_died_midway`, or a post-open `empty`/`empty_prompt`) — that call may already be billed. NULL on every other failure: the chat path, the non-stream endpoint, and the streaming endpoint's own pre-open exhaustion (`stream_open_failed`) never produced a response to attribute usage to. |
+| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` whenever the LAST attempt answered but its content was unusable: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and `empty`/`empty_prompt`/`stream_died_midway` on the standalone endpoint's streaming mode, which can also fail after a candidate has already opened. NULL only when no response ever came back: a transport failure (`model_error`/`timeout`) on any path, the streaming endpoint's own pre-open exhaustion (`stream_open_failed`), or `not_configured` (no call was made at all). |
 | `usage` | `JSONB?` | Full unfiltered OpenRouter usage block, `serde_json::to_value`'d — `OPENROUTER_USAGE_HIDDEN_KEYS` filters the wire copy only, never this. Travels with `model`: populated exactly where `model` is. |
 | `generation_id` | `TEXT?` | Travels with `model`. |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` for `not_configured`. |
-| `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"`. Values: `model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. `stream_open_failed` / `stream_died_midway` are specific to the standalone endpoint's streaming mode; the chat path and the endpoint's non-stream mode share one chain-walk and only ever report the other four. |
+| `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"` or `"not_configured"` (no attempt was made, so there is nothing to have failed). Values: `model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. `stream_open_failed` / `stream_died_midway` are specific to the standalone endpoint's streaming mode; the chat path and the endpoint's non-stream mode share one chain-walk and only ever report the other four. |
 | `created_at` | `TIMESTAMPTZ` | |
 
 `status` is deliberately three values: `exhausted` means "no usable compose
 result from this call" for every reason including a mid-stream death on the
 streaming endpoint, and `last_failure` carries the distinction.
+
+**`not_configured` is unreachable on this table under current gating.**
+`build_delegated_image_prompt` only runs for `ReplyImage`/`ReplyTextImage`,
+which the action-plan guard only produces when
+`[tasks.chat_image_prompt_compose]` is configured (`model_config` is a
+boot-fixed `Arc`, no hot reload); a forced image without the task 422s at the
+route before any composer call. The non-stream endpoint likewise 501s on a
+missing task before doing any work. The value stays in the CHECK — narrowing
+it later costs a migration, and this repo's standing bias is to keep
+capability rather than remove it — and exists for a future caller that could
+reach the composer without this gate, not as a state you will observe on a
+live deployment today. Contrast `chat_vision_events` below, where
+`not_configured` is both reachable and the single most valuable status.
 
 **No `message_id` column.** The composer runs *before* the assistant row
 exists — on the chat path the composition is `tokio::spawn`ed ahead of the
@@ -245,16 +269,33 @@ direction; `chat_messages.metadata.image` otherwise keeps its existing
 `compose_variant` / `compose_model` / `compose_generation_id` keys unchanged.
 This direction also keeps the table reachable from callers with no message to
 attach to at all (the standalone endpoint's `session_id` is NULL for exactly
-that reason), and it widens coverage: a compose call that completes but whose
-image is never shipped (client disconnect, a ghost fallback firing after the
-call returned) still leaves its row behind — "model call paid for, no picture
-shipped" becomes visible.
+that reason), and it widens coverage **on the chat path**: because
+`build_delegated_image_prompt` writes its row before returning to its caller —
+independent of the chat SSE stream — a chat turn whose image is never shipped
+(client disconnect, a ghost fallback firing after the compose call returned)
+still leaves its row behind — "model call paid for, no picture shipped"
+becomes visible. **This guarantee does not extend to the standalone
+endpoint's own streaming mode** (`compose_endpoint_stream`): its
+`record_compose_event` calls live inside the SSE generator itself
+(`routes/persona.rs::compose_stream`), so a client that disconnects before the
+generator reaches one of those calls loses that row too, even though the call
+was billed. The endpoint's non-stream mode (`compose_endpoint`) writes
+synchronously before its HTTP response returns and is not exposed to this
+gap.
 
 ### `engine.chat_vision_events`
 
-One row per image-carrying, non-tipped chat turn, recording the
-`chat_vision` describe call. A turn with no image writes nothing — "carries
-an image" is the denominator, and a text turn is not a missed describe.
+One row per image-carrying, non-tipped chat turn **that reaches the
+text-reply path**, recording the `chat_vision` describe call. A turn with no
+image writes nothing — "carries an image" is the denominator, and a text turn
+is not a missed describe. Neither does a turn that never reaches the
+text-reply path at all: a ghosted turn, one routed to `product_qa`, or an
+image-only reply all skip this write, because the describe never runs on
+those paths either (running one on a ghost turn would waste a paid call).
+Computing a describe success rate off this table means treating
+"image-carrying turns that reached the text-reply path" as the denominator,
+not every image-carrying turn — a query that doesn't exclude ghosted /
+product_qa / image-only turns will overstate coverage.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -265,11 +306,11 @@ an image" is the denominator, and a text turn is not a missed describe.
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | The parsed describe (`description` / `ocr_text` / `people` / `scene`). Duplicates `chat_messages.metadata.vision` on success — the accepted price of this table answering "how many describes ran, on what, at what success rate" without joining `chat_messages` to establish a denominator. |
-| `model` | `TEXT?` | NULL unless `status = "ok"`. |
+| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` when the last attempt answered but its content was unusable (`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`). NULL only on a pure transport failure (`model_error` / `timeout`, where nothing ever answered) or `not_configured` (no call was made at all). |
 | `usage` | `JSONB?` | Full unfiltered usage block, same rule as `chat_images_events.usage`. |
 | `generation_id` | `TEXT?` | |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` when `[tasks.chat_vision]` is not configured. |
-| `last_failure` | `TEXT?` | NULL when `status = "ok"`. Values: `model_error` \| `timeout` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern` — the last three are `image_vision_invalidity`'s existing reason strings, reused verbatim. |
+| `last_failure` | `TEXT?` | NULL when `status = "ok"` or `"not_configured"`. Values: `model_error` \| `timeout` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern` — the last three are `image_vision_invalidity`'s existing reason strings, reused verbatim. |
 | `created_at` | `TIMESTAMPTZ` | |
 
 **Keeps `message_id`, deliberately breaking symmetry with
