@@ -649,13 +649,46 @@ async fn compose_stream(
                     user_message: "服务出现问题，请稍后再试".into(),
                 };
             }
-            // A parse that yields no subject cannot be served as a `done`.
-            None if subject.is_empty() => yield ComposeFrame::Error {
-                code: StreamErrorCode::UpstreamUnavailable,
-                retryable: true,
-                message: "composer returned no usable prompt".into(),
-                user_message: "服务出现问题，请稍后再试".into(),
-            },
+            // A parse that yields no subject cannot be served as a `done` —
+            // the composer's own contract produced nothing usable, with no
+            // transport failure to blame. Same two reasons
+            // `run_image_prompt_compose` distinguishes for the non-stream
+            // chain walk: the accumulated reply was blank before parsing
+            // even started, or it was valid JSON with a blank `prompt` field.
+            None if subject.is_empty() => {
+                let last_failure = if acc.trim().is_empty() {
+                    "empty"
+                } else {
+                    "empty_prompt"
+                };
+                record_compose_event(
+                    &state.pool,
+                    ImageComposeEventInsert {
+                        source: "compose_endpoint_stream",
+                        user_id,
+                        instance_id: Some(instance_id),
+                        session_id: None,
+                        status: "exhausted",
+                        inputs,
+                        subject: None,
+                        caption: None,
+                        composed_prompt: None,
+                        variant: variant_key.as_deref(),
+                        model: None,
+                        usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
+                        generation_id: None,
+                        attempts,
+                        last_failure: Some(last_failure),
+                    },
+                )
+                .await;
+                yield ComposeFrame::Error {
+                    code: StreamErrorCode::UpstreamUnavailable,
+                    retryable: true,
+                    message: "composer returned no usable prompt".into(),
+                    user_message: "服务出现问题，请稍后再试".into(),
+                };
+            }
             None => {
                 let composed_prompt = compose_image_prompt(style_key, &persona, &subject);
                 let model = served_model.unwrap_or(attempted_model);
@@ -1618,5 +1651,131 @@ mod tests {
             "the candidate that opened counts as one attempt"
         );
         assert_eq!(last_failure.as_deref(), Some("stream_died_midway"));
+    }
+
+    /// The candidate opens on a whitespace-only first chunk (it passes the
+    /// `!c.is_empty()` open gate) and the stream then ends with nothing more
+    /// — no transport failure, but the accumulated reply trims to empty
+    /// before parsing even runs. Distinct from `stream_died_midway`: the
+    /// chain walk itself succeeded, the composer's own output just carried
+    /// nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_records_exhausted_event_when_reply_is_blank(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let chunk = json!({"choices": [{"delta": {"content": " "}}]});
+        let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "in-band error, not an HTTP failure — the candidate did open"
+        );
+        let frames = sse_frames(resp).await;
+        assert!(
+            frames.iter().any(|f| f["type"] == "error"),
+            "blank reply becomes an in-band error frame: {frames:?}"
+        );
+
+        #[allow(clippy::type_complexity)]
+        let (source, status, subject, composed, model, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "exhausted");
+        assert_eq!(subject, None);
+        assert_eq!(composed, None);
+        assert_eq!(model, None);
+        assert_eq!(attempts, 1);
+        assert_eq!(last_failure.as_deref(), Some("empty"));
+    }
+
+    /// The accumulated reply is non-blank AND valid JSON, but its `prompt`
+    /// field is itself blank — distinct from the blank-reply arm above, and
+    /// from the "unparseable reply becomes the whole prompt" migration
+    /// fallback (spec §3.5, `parse_compose_reply`'s `None` branch), which by
+    /// construction can never produce an empty subject here.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_records_exhausted_event_when_parsed_prompt_is_blank(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let reply = r#"{"prompt":"","caption":"审计"}"#;
+        let chunk = json!({"choices": [{"delta": {"content": reply}}]});
+        let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "in-band error, not an HTTP failure — the candidate did open"
+        );
+        let frames = sse_frames(resp).await;
+        assert!(
+            frames.iter().any(|f| f["type"] == "error"),
+            "blank parsed prompt becomes an in-band error frame: {frames:?}"
+        );
+
+        #[allow(clippy::type_complexity)]
+        let (source, status, subject, composed, model, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one compose event row");
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "exhausted");
+        assert_eq!(subject, None);
+        assert_eq!(composed, None);
+        assert_eq!(model, None);
+        assert_eq!(attempts, 1);
+        assert_eq!(last_failure.as_deref(), Some("empty_prompt"));
     }
 }
