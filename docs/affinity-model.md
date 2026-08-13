@@ -300,11 +300,16 @@ reproduce the 2.0 effective single-turn envelope:
 |---------|---------|---------|
 | `AFFINITY_GRADE_UNIT` | `0.05` | Raw score per grade step |
 | `AFFINITY_NEG_FACTOR` | `1.5` | Extra multiplier on negative raw — keeps "slow up, fast down" |
-| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | Positive-delta damping per tier 1–5 (comma-separated; anything but exactly 5 finite values keeps the default) |
+| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | Positive-delta damping per tier 1–5 (comma-separated; anything but exactly 5 finite non-negative values keeps the whole default table — factors above 1 amplify and are allowed) |
 | `AFFINITY_CROSS_PENALTY` | `0.05` | Cross-line penalty ceiling κ |
 | `AFFINITY_CROSS_PENALTY_START` | `0.35` | Counterpart score where the penalty ramp starts (y₀) |
 | `AFFINITY_DELTA_THRESHOLD` | `0.0` | Commit threshold θ; `0` commits every turn |
-| `AFFINITY_DEMO_BOOST` | `1.4` | Positive-raw multiplier for `metadata.is_demo` sessions (replaces the retired demo EMA inertia) |
+| `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw (rule nudges unaffected) for `metadata.is_demo` sessions (replaces the retired demo EMA inertia) |
+
+Every scalar is domain-checked at boot — non-finite or out-of-domain values
+(negative unit/factor/penalty/threshold/boost, a penalty start outside
+`[0, 1)`) keep the default and log a warning, so an env typo degrades to
+defaults instead of reaching the pipeline.
 
 ## Persistence
 

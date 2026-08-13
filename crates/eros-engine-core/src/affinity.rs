@@ -349,8 +349,9 @@ pub struct AffinityTuning {
     pub cross_penalty_start: f64,
     /// Commit threshold θ (`AFFINITY_DELTA_THRESHOLD`); 0 commits every turn.
     pub delta_threshold: f64,
-    /// Positive-raw multiplier for demo sessions (`AFFINITY_DEMO_BOOST`);
-    /// replaces the retired demo EMA inertia.
+    /// Multiplier on the judge's positive raw component for demo sessions
+    /// (`AFFINITY_DEMO_BOOST`); rule nudges are unaffected. Replaces the
+    /// retired demo EMA inertia.
     pub demo_boost: f64,
 }
 

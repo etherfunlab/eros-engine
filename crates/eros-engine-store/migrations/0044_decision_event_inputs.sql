@@ -2,7 +2,7 @@
 -- shown, as of the moment the decision ran. Deliberately a separate column from
 -- payload — payload means "what the model returned", inputs means "what the
 -- engine supplied". Nullable: historical rows stay NULL (the values are not
--- recoverable), and the fail-open audit write leaves it NULL when
--- serialisation fails rather than dropping the row.
+-- recoverable), and the audit write stays fail-open — it is fire-and-forget
+-- best-effort, so a failed write costs the row, never the turn.
 ALTER TABLE engine.companion_decision_events
     ADD COLUMN inputs JSONB;

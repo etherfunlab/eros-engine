@@ -114,7 +114,7 @@ pub(crate) fn affinity_tuning_from(
                 _ => tracing::warn!("invalid {name}={raw:?}; keeping default {}", *slot),
             }
         };
-        knob("AFFINITY_GRADE_UNIT", &mut t.grade_unit, |v| v > 0.0);
+        knob("AFFINITY_GRADE_UNIT", &mut t.grade_unit, |v| v >= 0.0);
         knob("AFFINITY_NEG_FACTOR", &mut t.neg_factor, |v| v >= 0.0);
         knob("AFFINITY_CROSS_PENALTY", &mut t.cross_penalty, |v| v >= 0.0);
         knob(
@@ -138,9 +138,10 @@ pub(crate) fn affinity_tuning_from(
     t
 }
 
-/// Exactly five comma-separated finite values in [0, 1] — anything else
+/// Exactly five comma-separated finite non-negative values — anything else
 /// rejects the whole table. Positional by design: silently dropping a bad
-/// entry would shift every later tier's factor.
+/// entry would shift every later tier's factor. No upper bound: factors above
+/// 1 amplify a tier and are a legitimate tuning direction, not poison.
 pub(crate) fn parse_tier_decay(raw: &str) -> Option<[f64; 5]> {
     let fields: Vec<&str> = raw.split(',').collect();
     if fields.len() != 5 {
@@ -149,7 +150,7 @@ pub(crate) fn parse_tier_decay(raw: &str) -> Option<[f64; 5]> {
     let mut out = [0.0f64; 5];
     for (slot, field) in out.iter_mut().zip(&fields) {
         let v = field.trim().parse::<f64>().ok()?;
-        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        if !v.is_finite() || v < 0.0 {
             return None;
         }
         *slot = v;
@@ -403,7 +404,6 @@ mod tests {
             ("AFFINITY_CROSS_PENALTY_START", "1.5"),
             ("AFFINITY_CROSS_PENALTY_START", "NaN"),
             ("AFFINITY_CROSS_PENALTY_START", "-0.1"),
-            ("AFFINITY_GRADE_UNIT", "0"),
             ("AFFINITY_GRADE_UNIT", "-0.05"),
             ("AFFINITY_GRADE_UNIT", "inf"),
             ("AFFINITY_GRADE_UNIT", "abc"),
@@ -418,6 +418,24 @@ mod tests {
         }
     }
 
+    /// The validator guards against poison (NaN, negatives, a start of 1),
+    /// never against tuning direction: amplifying decay factors (> 1), a zero
+    /// unit (judge channel off) and a zero decay entry (frozen tier) are all
+    /// legitimate operator choices, not errors.
+    #[test]
+    fn affinity_tuning_permits_unusual_but_sound_values() {
+        let t = tuning_with(&[
+            ("AFFINITY_GRADE_UNIT", "0"),
+            ("AFFINITY_TIER_DECAY", "1.5,1.0,0.45,0.0,0.10"),
+        ]);
+        assert_eq!(t.grade_unit, 0.0, "unit 0 = judge channel disabled");
+        assert_eq!(
+            t.tier_decay,
+            [1.5, 1.0, 0.45, 0.0, 0.10],
+            "amplification and frozen tiers are policy, not poison"
+        );
+    }
+
     /// Positional table: a dropped bad entry must not shift later tiers, and a
     /// wrong field count must not half-apply.
     #[test]
@@ -427,7 +445,6 @@ mod tests {
             "1.0,0.70,0.45,0.25",           // 4 fields
             "1.0,0.70,0.45,0.25,0.10,0.05", // 6 valid fields
             "1.0,0.70,NaN,0.25,0.10",
-            "1.0,0.70,1.5,0.25,0.10", // > 1
             "1.0,0.70,-0.1,0.25,0.10",
             "",
         ] {

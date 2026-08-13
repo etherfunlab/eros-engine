@@ -74,9 +74,12 @@ judge grade g ∈ {0..4} + direction        (patience: absolute 0~1, 0.1 steps)
   touched the axis (`g ≠ 0`) — a tax on events, not rent — and only on
   line-exclusive axes (warmth exempt, else a double-high pair would lock
   itself). A positive push can net negative; a negative push loses more. This
-  is the friend-zone given a coordinate: with the counterpart at 0.90, a
-  standard good turn (g2) on the lagging line nets ≈ −0.005 above tier 3, so
-  crossing out of a maxed line's shadow requires g ≥ 3 moments.
+  is the friend-zone given a coordinate: a g2 push on an exclusive axis nets
+  zero where `κ·φ(y) = D_k·2u`, i.e. counterpart break-evens y* ≈ 0.97 (own
+  tier 3), 0.81 (tier 4), 0.64 (tier 5). Against a counterpart at 0.90 a g2
+  exclusive push nets +0.009 at own tier 3 but −0.011 at tier 4, so a lagging
+  line stalls at the tier-3/4 boundary (0.62) on ordinary clear moments —
+  crossing it requires g ≥ 3.
 - **Threshold gate.** Signed per-axis accumulator persisted in
   `companion_affinity.pending_deltas` (JSONB, migration 0043; NULL = zero).
   `θ = AFFINITY_DELTA_THRESHOLD`, default 0 = commit every turn. Conservation:
@@ -86,16 +89,20 @@ judge grade g ∈ {0..4} + direction        (patience: absolute 0~1, 0.1 steps)
 - **Patience** rides through untouched: the rule delta passes 1:1 (no decay,
   penalty, or gating) so the eval-failure fallback still lands, and the
   absolute target overrides as before.
-- **Demo boost.** `AFFINITY_DEMO_BOOST` (1.4) multiplies positive raw on
-  `is_demo` sessions — the replacement for the retired `DEMO_EMA_INERTIA`
-  (blend 0.7 vs 0.5 ≈ ×1.4).
+- **Demo boost.** `AFFINITY_DEMO_BOOST` (1.4) multiplies the judge's positive
+  raw component on `is_demo` sessions (rule nudges unaffected) — the
+  replacement for the retired `DEMO_EMA_INERTIA` (blend 0.7 vs 0.5 ≈ ×1.4).
 
 **EMA removal.** `EMA_INERTIA` / `DEMO_EMA_INERTIA` are gone. EMA's damping
 job is now the decay table's; its noise-smoothing job is done by grade
 quantisation + the gate. Keeping it would make "grade × unit" a lie (a g4
 nominally worth 0.2 would land 0.1).
 
-### Difficulty economics (defaults, standard good turn = +0.05 raw on a line)
+### Difficulty economics
+
+Defaults; "standard good turn" = warmth g1 + one exclusive axis g2 = +0.05
+raw on a line; single line advancing alone with the counterpart below y₀, so
+the cross penalty is zero and the table isolates the decay term.
 
 | tier | span | D | net/turn | turns in tier | cumulative |
 |---|---|---|---|---|---|
@@ -108,8 +115,13 @@ nominally worth 0.2 would land 0.1).
 vs. 2.0's ≈ 20 turns to cap at the same judge generosity. Early game is
 unchanged (D₁ = 1, penalty dormant below y₀); judge inflation is now damped
 multiplicatively instead of clamp-truncated. No tier can be skipped in one
-turn; the cap is reachable in finite turns (D₅ > 0). Balanced dual-line growth
-walls at ≈ 0.80/0.80 for standard turns; dual 1.00 is asymptotic by design.
+turn; the cap is reachable in finite turns (D₅ > 0). Balanced dual-line
+growth: the standard-turn line delta `(0.15·D_k − κ·φ(S))/3` stays positive
+through tier 4 (its zero, φ = 3·D₄, sits at S ≈ 0.91, outside the tier), so
+both lines can reach 0.90/0.90 together — but inside dual tier 5 every
+exclusive-axis push nets negative at ANY grade (even g4: 0.2·0.10 − κ·φ(0.9)
+< 0) and only penalty-exempt warmth still lifts both lines, which caps at
+1.0 while the exclusive axes cannot climb: dual 1.00 is asymptotic by design.
 
 ## 3. Judge protocol
 
@@ -122,9 +134,10 @@ one-line in-character sentence (all 2026-08-02 hygiene rules retained).
 Parsing is strict where it must be and lenient where it can be: quoted
 integer grades, missing direction (up) and missing grade (0) are salvaged;
 a fractional / out-of-range grade or unknown direction rejects the whole
-verdict (all-zero — the engine refuses to guess). Rule deltas persist either
-way. Grades are folded to a signed integer −4..+4 at the parse boundary
-(`AxisGrades`); every number downstream is engine-computed.
+verdict — grades, the patience read and `reason` alike go down with it (the
+engine refuses to trust any part of a malformed reply). Rule deltas persist
+either way. Grades are folded to a signed integer −4..+4 at the parse
+boundary (`AxisGrades`); every number downstream is engine-computed.
 
 ## 4. Read side
 
@@ -154,7 +167,7 @@ the audit row.
 Three read-outs ship with the change, enough for the first tuning round with
 no extra instrumentation:
 
-- `companion_affinity_events.context.grades` — the judge's verbatim signed
+- `companion_affinity_events.context.grades` — the judge's folded signed
   grades (distribution drift watch when swapping evaluator models);
 - `companion_affinity_events.context.pending_after` + `deltas` (raw) vs
   `effective_deltas` (applied) — gate behaviour;
