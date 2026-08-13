@@ -777,18 +777,27 @@ anymore, so it is not a distinct case here). The composer's `caption` is
 persisted separately as `metadata.image.caption`: set whenever the reply
 parsed as JSON with a non-blank `caption` field, and `None` otherwise —
 including on a successful-but-non-JSON reply, where the whole reply becomes
-`prompt` with no caption. Usage/cost is not persisted; reconcile via the
-generation id against your provider's logs. `metadata.image.prompt` — the
-composer's `prompt` field, the actual image-generation subject — **is**
-persisted on every image turn; it's the field `build_delegated_image_marker`
-writes and the audit trio above rides alongside. What is genuinely not
-persisted is the fully **composed wire prompt** (style preset + persona
-appearance + this subject, assembled by `compose_image_prompt`): that string
-goes out only on the `image_request` frame's `composed_prompt` field,
-base64-encoded, and is never written to a row. An operator auditing the
-database will find the image-generation subject on every image turn — just
-not the wire-ready, style-and-appearance-wrapped version of it. Spec:
-`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`.
+`prompt` with no caption. `metadata.image.prompt` — the composer's `prompt`
+field, the actual image-generation subject — **is** persisted on every image
+turn; it's the field `build_delegated_image_marker` writes and the audit
+trio above rides alongside.
+
+**Every composer call — success or failure, from any caller — is separately
+recorded in `engine.chat_images_events`** (migration 0045): the full usage
+block, the assembled wire prompt (`composed_prompt` — style preset + persona
+appearance + subject, exactly what an image vendor would receive), the
+chain-walk facts (`attempts` / `last_failure`), and the five raw inputs the
+composer saw. `metadata.image.compose_event_id` points at that row — reverse
+lookup runs assistant row → `compose_event_id` → `chat_images_events`, never
+the other way. Usage/cost and the composed wire prompt are *not* duplicated
+onto `chat_messages.metadata.image` itself; reconcile either against the
+audit table (join on `compose_event_id`) or the generation id against your
+provider's logs. See [LLM audit → Image-path event
+tables](llm-audit.md#image-path-event-tables). Specs:
+`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`
+(`metadata.image` keys above) and
+`docs/superpowers/specs/2026-08-14-image-audit-events-design.md`
+(`chat_images_events`).
 
 ### `[tasks.chat_vision]` — image input (vision pre-stage, opt-in)
 

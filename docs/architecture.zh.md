@@ -101,7 +101,8 @@ eros-engine-server :8080
     │              │
     │              ▼
     ├─► routes::persona（/persona/{instance_id}/image/compose）
-    │       └─► 只调用出图 prompt 合成器 LLM——不落任何表
+    │       └─► 出图 prompt 合成器 LLM——落一行到 chat_images_events，
+    │           其余不落任何表（无聊天状态、无好感度、无记忆）
     │
     └────────────► Postgres（`engine` schema）
                        chat_sessions / chat_messages
@@ -110,6 +111,7 @@ eros-engine-server :8080
                        persona_genomes / persona_instances
                        human_insights
                        companion_decision_events
+                       chat_images_events / chat_vision_events
 ```
 
 post-process spawn 返回 `()` 是 fire-and-forget 設計——用戶面前的響應不會被 affinity / memory / insight 寫入阻塞。它們任何一個失敗，對話回覆還是會落地；失敗會記日誌但不會冒給用戶。
@@ -161,7 +163,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0044_decision_event_inputs
+│   ├── migrations/           # 0000_schema → 0046_chat_vision_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo

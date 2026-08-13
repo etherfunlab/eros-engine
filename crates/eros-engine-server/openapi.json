@@ -2392,7 +2392,7 @@
               },
               {
                 "$ref": "#/components/schemas/AffinityScopeDto",
-                "description": "Which affinity halves feed this turn's relationship line — same field\nname, value space, and default (`bond`) as the chat message stream:\n`\"full\" | \"bond_and_chemistry\" | \"bond\" | \"chemistry\" | \"none\"`, or an\narray of axis names such as `[\"warmth\", \"trust\"]`. Axes flatten to the\ntwo injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒\nchemistry half). When both this and the deprecated `relationship_scope`\nare sent, this field wins."
+                "description": "Which affinity halves feed this turn's relationship line — same field\nname, value space, and default (`bond`) as the chat message stream:\n`\"full\" | \"bond_and_chemistry\" | \"bond\" | \"chemistry\" | \"none\"`, or an\narray of axis names such as `[\"warmth\", \"trust\"]`. Axes flatten to the\ntwo injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒\nchemistry half)."
               }
             ]
           },
@@ -2408,13 +2408,6 @@
               "null"
             ],
             "description": "How much long-term memory this turn may use — same field name, enum,\nwire values, and default (`neutral_and_relationship`) as the chat\nstream. The first successfully-assembling turn's resolved insight\ntier is frozen into the bootstrap snapshot and never changes for the\nrest of the call."
-          },
-          "relationship_scope": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "**Deprecated** — superseded by `affinity_scope`; removed in the next\nminor release. Which halves of the relationship line to inject:\n`none | bond | chemistry | both`. Ignored when `affinity_scope` is\npresent. Note the two value spaces do not mix: `\"full\"` here (or\n`\"both\"` under `affinity_scope`) is a 422."
           }
         }
       }

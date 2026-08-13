@@ -355,8 +355,12 @@ caption, never the long prompt), plus — only when the composer LLM call
 succeeded — the audit trio `compose_variant` (the `filter_prompt` key/index
 that was selected, absent for a plain or built-in prompt), `compose_model`,
 and `compose_generation_id`. Absence of the trio means the turn had no
-successful compose (fail-open degradation, or composer not configured). The
-composed prompt itself is never persisted — storing it is the consumer's job.
+successful compose (fail-open degradation, or composer not configured). A
+`compose_event_id` pointer is present whenever the audit write itself
+succeeded — independent of whether the compose call did — and is the
+reachable link to `engine.chat_images_events`, where the composed **wire**
+prompt actually lives (the `metadata.image` marker never duplicates it); see
+[LLM audit → Image-path event tables](llm-audit.md#image-path-event-tables).
 The reference kind is not recorded.
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
@@ -494,16 +498,11 @@ Body fields:
   chemistry half. The audit trail: the **user** row records the raw value
   under `metadata.affinity_scope_raw` (and `metadata.memory_scope_raw`),
   each only when the request carried the field; the **assistant** row
-  keeps the legacy `metadata.relationship_scope` key for one release
-  (`"none" | "bond" | "chemistry" | "both"`, projected from the resolved
-  halves) plus the resolved `metadata.memory_scope`.
-- `relationship_scope` (optional, **deprecated** — removed in the next
-  minor release) — the pre-`affinity_scope` name of the same switch:
-  `"none"`, `"bond"`, `"chemistry"`, `"both"`. Ignored when
-  `affinity_scope` is present. The two value spaces do not mix: `"full"`
-  here, or `"both"` under `affinity_scope`, is a 422. Callers still
-  sending only this field see unchanged behavior — but note the default
-  when **neither** field is sent is now `bond` (previously `both`).
+  keeps the resolved **`metadata.affinity_scope`** — the same 6-bool
+  object (`warmth` / `trust` / `intrigue` / `intimacy` / `patience` /
+  `tension`), byte-identical in shape to what the
+  [chat message stream](#post-compchatsession_idmessagestream) writes —
+  plus the resolved `metadata.memory_scope`.
 - `memory_scope` (optional) — same field name, enum, and default
   (`"neutral_and_relationship"`) as the
   [chat message stream](#post-compchatsession_idmessagestream). On the
@@ -580,7 +579,7 @@ and its `content` always ends up as the interrupt's report:
 |---|---|---|
 | absent | non-empty | inserted, `truncated = true` |
 | absent | empty | no assistant row written |
-| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `relationship_scope` / `memory_scope` metadata preserved |
+| already exists (race) | non-empty | `content` overwritten, `truncated = true`; `model` / `usage` / `generation_id` and `affinity_scope` / `memory_scope` metadata preserved |
 | already exists (race) | empty | `content` left untouched |
 
 Repeated interrupt calls for the same turn are idempotent — the marker and
@@ -620,9 +619,10 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ### `POST /persona/{instance_id}/image/compose`
 
 Standalone image-prompt composition for a persona instance — a consumer that
-wants a prompt for arbitrary text, not a chat turn. **Nothing is persisted, no
-affinity runs, no memory is written.** The instance must belong to the JWT
-user (`403` otherwise; `404` when it does not exist). Requires
+wants a prompt for arbitrary text, not a chat turn. **No chat state is
+touched — no session, no messages, no affinity runs, no memory is written.**
+Every call is audited, though (see below). The instance must belong to the
+JWT user (`403` otherwise; `404` when it does not exist). Requires
 `[tasks.chat_image_prompt_compose]` (`501 compose_disabled` without it).
 
 The endpoint doubles as a composer test surface: the response carries `model`
@@ -645,6 +645,11 @@ Body fields:
 The composer payload is identical to the chat path's five slots, so one
 `filter_prompt` contract serves both callers (see
 [model-config.md](model-config.md)).
+
+Every call — success or failure, either streaming mode — is recorded in
+`engine.chat_images_events` (`source = "compose_endpoint"` or
+`"compose_endpoint_stream"`); see [LLM audit → Image-path event
+tables](llm-audit.md#image-path-event-tables).
 
 Both modes return the same five fields:
 

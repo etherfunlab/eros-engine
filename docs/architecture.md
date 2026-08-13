@@ -104,7 +104,8 @@ eros-engine-server :8080
     │              │
     │              ▼
     ├─► routes::persona (/persona/{instance_id}/image/compose)
-    │       └─► image-prompt composer LLM only — nothing persisted
+    │       └─► image-prompt composer LLM — audited to chat_images_events,
+    │           nothing else persisted (no chat state, no affinity, no memory)
     │
     └────────────► Postgres (`engine` schema)
                        chat_sessions / chat_messages
@@ -113,6 +114,7 @@ eros-engine-server :8080
                        persona_genomes / persona_instances
                        human_insights
                        companion_decision_events
+                       chat_images_events / chat_vision_events
 ```
 
 The post-process spawn returns `()` and is fire-and-forget by design — the user-facing response doesn't block on the affinity / memory / insight writes. If any of them fail, the chat reply still lands; failures are logged but not surfaced.
@@ -169,7 +171,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0044_decision_event_inputs
+│   ├── migrations/           # 0000_schema → 0046_chat_vision_events
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo

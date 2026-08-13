@@ -312,7 +312,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
 
-**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。合成后的提示词本身从不持久化——存储它是消费方的责任。不记录参考类型。
+**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。只要审计写入本身成功，就会带一个 `compose_event_id` 指针——不管合成本身有没有成功——它是通往 `engine.chat_images_events` 的可达链接，拼装出的**线上 wire** prompt 实际存在那张表里（`metadata.image` 标记从不重复存它）；详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。不记录参考类型。
 
 校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
 `[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
@@ -425,15 +425,11 @@ Body 字段：
   压平成关系描述的两半：bond 半（warmth / intimacy / tension 任一激活）与
   chemistry 半（trust / intrigue / patience 任一激活）。审计：**user** 行在
   `metadata.affinity_scope_raw`（及 `metadata.memory_scope_raw`）记录原样
-  取值，均为请求带了该字段才写；**assistant** 行的旧键
-  `metadata.relationship_scope` 保留一个版本（`"none" | "bond" |
-  "chemistry" | "both"`，由解析结果反投影而来），并新增解析后的
-  `metadata.memory_scope`。
-- `relationship_scope`（可选，**已废弃** —— 下个 minor 版本移除）——
-  `affinity_scope` 的旧名：`"none"`、`"bond"`、`"chemistry"`、`"both"`。
-  与 `affinity_scope` 同时出现时被忽略。两套取值空间不互通：在这里发
-  `"full"`，或在 `affinity_scope` 下发 `"both"`，都是 422。只发这个字段的
-  调用方行为不变——但**两个字段都不发**时的默认值已从 `both` 改为 `bond`。
+  取值，均为请求带了该字段才写；**assistant** 行保留解析后的
+  **`metadata.affinity_scope`**——同一个 6-bool 对象（`warmth` / `trust` /
+  `intrigue` / `intimacy` / `patience` / `tension`），与
+  [聊天消息流](#post-compchatsession_idmessagestream) 写入的形状逐字节
+  一致——并新增解析后的 `metadata.memory_scope`。
 - `memory_scope`（可选）—— 字段名、枚举值、默认值
   （`"neutral_and_relationship"`）都与
   [聊天消息流](#post-compchatsession_idmessagestream) 相同。session 里
@@ -500,7 +496,7 @@ Response `200`：
 |---|---|---|
 | 不存在 | 非空 | 插入一行，`truncated = true` |
 | 不存在 | 空 | 不写 assistant 行 |
-| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `relationship_scope` / `memory_scope` 元数据 |
+| 已存在（竞态） | 非空 | 覆盖 `content`，`truncated = true`；保留 `model` / `usage` / `generation_id` 和 `affinity_scope` / `memory_scope` 元数据 |
 | 已存在（竞态） | 空 | `content` 保持不动 |
 
 同一轮次重复调用打断接口是幂等的——标记和 upsert 都以 user 行的 id 为键，重试
@@ -540,7 +536,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ### `POST /persona/{instance_id}/image/compose`
 
 面向单个角色实例的独立图片提示词合成——给「想为任意文本拿一段提示词、而不是走
-一轮聊天」的消费方用。**不落任何表，不跑好感度，不写记忆。** 实例必须属于
+一轮聊天」的消费方用。**不碰任何聊天状态——不落 session，不落 message，不跑
+好感度，不写记忆。** 但每次调用都会被审计（见下文）。实例必须属于
 JWT 用户（否则 `403`；不存在时 `404`）。要求配置
 `[tasks.chat_image_prompt_compose]`（没有则 `501 compose_disabled`）。
 
@@ -561,6 +558,11 @@ Body 字段：
 
 合成器载荷与聊天路径的五个槽位完全一致，同一份 `filter_prompt` 契约同时服务两个
 调用方（见 [model-config.zh.md](model-config.zh.md)）。
+
+每一次调用——不管成功失败、不管哪种流式模式——都会记录进
+`engine.chat_images_events`（`source = "compose_endpoint"` 或
+`"compose_endpoint_stream"`）；见
+[LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。
 
 两种模式返回同样的五个字段：
 
