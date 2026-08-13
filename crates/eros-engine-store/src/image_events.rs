@@ -75,6 +75,65 @@ impl ImageComposeEventRepo<'_> {
     }
 }
 
+/// One `chat_vision_events` row — a single `chat_vision` describe call over a
+/// user-sent image.
+///
+/// `vision` duplicates the successful describe already merged into the user
+/// row's `metadata.vision`. That redundancy is deliberate: it lets this table
+/// answer "how many describes ran, on what, at what success rate" without
+/// joining `chat_messages` to establish a denominator.
+///
+/// The user's accompanying text is NOT stored — `message_id` points at
+/// `chat_messages.content`, and real user text is not duplicated across tables.
+pub struct ChatVisionEventInsert<'a> {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+    /// The `role='user'` row carrying the image.
+    pub message_id: Uuid,
+    pub status: &'a str,
+    pub image_url: &'a str,
+    pub vision: Option<serde_json::Value>,
+    pub model: Option<&'a str>,
+    pub usage: Option<serde_json::Value>,
+    pub generation_id: Option<&'a str>,
+    /// Models actually called off `[primary, ...fallback]`; 0 when
+    /// `[tasks.chat_vision]` is not configured.
+    pub attempts: i16,
+    /// `model_error` / `timeout` / `empty` / `unparseable` / `content_filter` /
+    /// `blank_description` / `refusal_pattern`; NULL when `status == "ok"`.
+    pub last_failure: Option<&'a str>,
+}
+
+pub struct ChatVisionEventRepo<'a> {
+    pub pool: &'a PgPool,
+}
+
+impl ChatVisionEventRepo<'_> {
+    /// Append one audit row. No id is returned: `message_id` is the linkage.
+    pub async fn record(&self, ev: ChatVisionEventInsert<'_>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.chat_vision_events \
+               (user_id, session_id, message_id, status, image_url, vision, model, \
+                usage, generation_id, attempts, last_failure) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(ev.user_id)
+        .bind(ev.session_id)
+        .bind(ev.message_id)
+        .bind(ev.status)
+        .bind(ev.image_url)
+        .bind(ev.vision)
+        .bind(ev.model)
+        .bind(ev.usage)
+        .bind(ev.generation_id)
+        .bind(ev.attempts)
+        .bind(ev.last_failure)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +239,80 @@ mod tests {
         .await
         .expect("query relrowsecurity for chat_images_events");
         assert!(enabled, "RLS must be enabled on engine.chat_images_events");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn vision_event_round_trips_ok_and_not_configured(pool: PgPool) {
+        let repo = ChatVisionEventRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let msg_ok = Uuid::new_v4();
+
+        repo.record(ChatVisionEventInsert {
+            user_id: user,
+            session_id: session,
+            message_id: msg_ok,
+            status: "ok",
+            image_url: "https://example.invalid/a.jpg",
+            vision: Some(serde_json::json!({"description": "a cat on a sofa"})),
+            model: Some("vendor/vision-1"),
+            usage: Some(serde_json::json!({"total_tokens": 41})),
+            generation_id: Some("gen_vision_1"),
+            attempts: 1,
+            last_failure: None,
+        })
+        .await
+        .unwrap();
+
+        // No [tasks.chat_vision] on this deployment: no call was made at all.
+        repo.record(ChatVisionEventInsert {
+            user_id: user,
+            session_id: session,
+            message_id: Uuid::new_v4(),
+            status: "not_configured",
+            image_url: "https://example.invalid/b.jpg",
+            vision: None,
+            model: None,
+            usage: None,
+            generation_id: None,
+            attempts: 0,
+            last_failure: None,
+        })
+        .await
+        .unwrap();
+
+        let (status, vision, attempts): (String, Option<serde_json::Value>, i16) = sqlx::query_as(
+            "SELECT status, vision, attempts FROM engine.chat_vision_events WHERE message_id = $1",
+        )
+        .bind(msg_ok)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "ok");
+        assert_eq!(
+            vision.expect("describe round-trips")["description"].as_str(),
+            Some("a cat on a sofa")
+        );
+        assert_eq!(attempts, 1);
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM engine.chat_vision_events WHERE user_id = $1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chat_vision_events_has_rls_enabled(pool: PgPool) {
+        let enabled: bool = sqlx::query_scalar(
+            "SELECT relrowsecurity FROM pg_class \
+             WHERE oid = 'engine.chat_vision_events'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query relrowsecurity for chat_vision_events");
+        assert!(enabled, "RLS must be enabled on engine.chat_vision_events");
     }
 }
