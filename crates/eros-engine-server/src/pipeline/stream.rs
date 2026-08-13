@@ -2118,20 +2118,31 @@ struct VisionOutcome {
     vision: serde_json::Value,
     vision_model: String,
     v_generation_id: Option<String>,
+    /// Full unfiltered usage block for the audit row.
+    usage: Option<serde_json::Value>,
 }
 
-/// Run the `chat_vision` describe over the image. Returns `Some(VisionOutcome)`
-/// only on a valid parse. Walks the configured model chain, trying the next model
-/// on any failure (transport, timeout, empty, unparseable, invalid); returns Some
-/// only on a valid describe. Any failure keeps the turn text-only and the
-/// placeholder path covers the undescribed image. Each call passes a single model
-/// (no internal fallback) so content-level failures also advance the chain.
+/// What one `chat_vision` chain walk produced, plus the audit facts a bare
+/// `Option<VisionOutcome>` throws away.
+struct VisionRun {
+    outcome: Option<VisionOutcome>,
+    attempts: i16,
+    last_failure: Option<&'static str>,
+}
+
+/// Run the `chat_vision` describe over the image. Returns a `VisionRun` carrying
+/// `Some(VisionOutcome)` only on a valid parse, plus the audit trio. Walks the
+/// configured model chain, trying the next model on any failure (transport,
+/// timeout, empty, unparseable, invalid); returns Some only on a valid describe.
+/// Any failure keeps the turn text-only and the placeholder path covers the
+/// undescribed image. Each call passes a single model (no internal fallback) so
+/// content-level failures also advance the chain.
 async fn run_vision(
     state: &AppState,
     v: &eros_engine_llm::model_config::ResolvedVision,
     image_url: &str,
     caption: &str,
-) -> Option<VisionOutcome> {
+) -> VisionRun {
     use eros_engine_llm::openrouter::VisionRequest;
     let caption = caption.trim();
     // Walk [primary, ...fallback] ourselves so a content-level failure (empty /
@@ -2141,7 +2152,10 @@ async fn run_vision(
     let chain: Vec<String> = std::iter::once(v.model.clone())
         .chain(v.fallback_model.iter().cloned())
         .collect();
+    let mut attempts: i16 = 0;
+    let mut last_failure: Option<&'static str> = None;
     for model_id in &chain {
+        attempts += 1;
         let req = VisionRequest {
             model: model_id.clone(),
             fallback_model: vec![],
@@ -2159,10 +2173,12 @@ async fn run_vision(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "chat_vision: model error; next");
+                last_failure = Some("model_error");
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "chat_vision: timeout; next");
+                last_failure = Some("timeout");
                 continue;
             }
         };
@@ -2170,27 +2186,39 @@ async fn run_vision(
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "chat_vision: empty reply; next");
+            last_failure = Some("empty");
             continue;
         }
         let vision = match parse_image_vision(&text) {
             Some(parsed) => parsed,
             None => {
                 tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
+                last_failure = Some("unparseable");
                 continue;
             }
         };
         if let Some(reason) = image_vision_invalidity(&vision, resp.finish_reason.as_deref()) {
             tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
+            last_failure = Some(reason);
             continue;
         }
         let vision_model = resp.model.unwrap_or_else(|| model_id.clone());
-        return Some(VisionOutcome {
-            vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
-            vision_model,
-            v_generation_id: resp.generation_id,
-        });
+        return VisionRun {
+            outcome: Some(VisionOutcome {
+                vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
+                vision_model,
+                v_generation_id: resp.generation_id,
+                usage: resp.usage,
+            }),
+            attempts,
+            last_failure: None,
+        };
     }
-    None
+    VisionRun {
+        outcome: None,
+        attempts,
+        last_failure,
+    }
 }
 
 /// Validity gate for an INPUT rewrite's `content`. Unlike
@@ -3849,13 +3877,31 @@ pub fn run_stream(
                 // Skip tipped turns (same as the input filter): a tip persists as
                 // role='gift_user' and carries no image (tip+image is rejected at
                 // validation), so describing it would waste the call.
+                // Every image-carrying, non-tipped turn writes exactly one
+                // chat_vision_events row, including the not-configured case —
+                // that's the only way to tell "no [tasks.chat_vision]" apart
+                // from "the describe ran and failed" in the audit trail.
                 if user_msg.tips_amount_usd.is_none() {
-                    if let (Some(image_url), Some(v)) = (
-                        user_msg.image_url.as_deref(),
-                        state.model_config.resolve_vision(),
-                    ) {
-                        if let Some(out) = run_vision(&state, &v, image_url, &user_msg.content).await
-                        {
+                    if let Some(image_url) = user_msg.image_url.as_deref() {
+                        let (run, status) = match state.model_config.resolve_vision() {
+                            Some(v) => {
+                                let run = run_vision(&state, &v, image_url, &user_msg.content).await;
+                                let status = if run.outcome.is_some() { "ok" } else { "exhausted" };
+                                (run, status)
+                            }
+                            // No [tasks.chat_vision]: nothing was called, but the
+                            // turn DID carry an image — recording that is the only
+                            // way to tell this apart from a failed describe.
+                            None => (
+                                VisionRun {
+                                    outcome: None,
+                                    attempts: 0,
+                                    last_failure: None,
+                                },
+                                "not_configured",
+                            ),
+                        };
+                        if let Some(out) = run.outcome.as_ref() {
                             if let Err(e) = chat_repo
                                 .set_user_image_vision(
                                     user_msg.user_message_id,
@@ -3867,6 +3913,30 @@ pub fn run_stream(
                             {
                                 tracing::warn!("stream: chat_vision metadata persist failed: {e}");
                             }
+                        }
+                        let repo = eros_engine_store::image_events::ChatVisionEventRepo {
+                            pool: &state.pool,
+                        };
+                        if let Err(e) = repo
+                            .record(eros_engine_store::image_events::ChatVisionEventInsert {
+                                user_id: user_msg.user_id,
+                                session_id: user_msg.session_id,
+                                message_id: user_msg.user_message_id,
+                                status,
+                                image_url,
+                                vision: run.outcome.as_ref().map(|o| o.vision.clone()),
+                                model: run.outcome.as_ref().map(|o| o.vision_model.as_str()),
+                                usage: run.outcome.as_ref().and_then(|o| o.usage.clone()),
+                                generation_id: run
+                                    .outcome
+                                    .as_ref()
+                                    .and_then(|o| o.v_generation_id.as_deref()),
+                                attempts: run.attempts,
+                                last_failure: run.last_failure,
+                            })
+                            .await
+                        {
+                            tracing::warn!(error = %e, "chat_vision_events: audit write failed");
                         }
                     }
                 }
@@ -7139,6 +7209,120 @@ data: [DONE]\n\n";
         assert_eq!(last_failure.as_deref(), Some("model_error"));
     }
 
+    /// A turn carrying an image on a deployment with no `[tasks.chat_vision]`
+    /// writes a `not_configured` row. Today this case is indistinguishable
+    /// from "the describe ran and failed" — both just leave `metadata.vision`
+    /// absent.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_turn_without_vision_task_writes_a_not_configured_event(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "gen_chat", "model": "primary",
+                    "choices": [{"message": {"content": "嗯"}}]
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // No [tasks.chat_vision] section at all.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "看这个",
+                "01J9000000000000000000000V",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "看这个".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: Some("https://example.invalid/u.jpg".into()),
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (status, image_url, attempts, vision): (
+            String,
+            String,
+            i16,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, image_url, attempts, vision FROM engine.chat_vision_events \
+                 WHERE message_id = $1",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .expect("one vision event row for an image-carrying turn");
+
+        assert_eq!(status, "not_configured");
+        assert_eq!(image_url, "https://example.invalid/u.jpg");
+        assert_eq!(attempts, 0, "no model was called");
+        assert_eq!(vision, None);
+    }
+
+    /// `run_variant_turn` forces an image-*generation* turn (`image: Some(...)`)
+    /// but carries no incoming user image (`image_url: None`). What makes the
+    /// describe never run — and no `chat_vision_events` row appear — is the
+    /// absent `image_url`, not the turn being text-only.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn turn_without_user_image_writes_no_vision_event(pool: PgPool) {
+        let (_reqs, _frames) =
+            run_variant_turn(&pool, None, wiremock::ResponseTemplate::new(500)).await;
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_vision_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
     /// Spec 2026-08-02-provider-body-params: an [[providers.openrouter.body]]
     /// rule scoped to a task reaches that task's wire body end-to-end
     /// (config parse → boot accessor → client → per-attempt merge).
@@ -10133,6 +10317,41 @@ data: [DONE]\n\n";
             meta.unwrap()["vision"]["description"],
             "一只猫在沙滩",
             "vision describe must be merged into the user row metadata"
+        );
+
+        // The `ok` arm of the chat_vision_events audit write — the other status
+        // this call site can reach besides `not_configured`.
+        #[allow(clippy::type_complexity)]
+        let (status, image_url, attempts, vision, model, generation_id, usage): (
+            String,
+            String,
+            i16,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, image_url, attempts, vision, model, generation_id, usage \
+             FROM engine.chat_vision_events WHERE message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .expect("one vision event row for the ok describe");
+
+        assert_eq!(status, "ok");
+        assert_eq!(image_url, "https://x/y.png");
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            vision.expect("describe round-trips")["description"],
+            "一只猫在沙滩"
+        );
+        assert_eq!(model.as_deref(), Some("vis/m"));
+        assert_eq!(generation_id.as_deref(), Some("gv"));
+        assert_eq!(
+            usage.as_ref().and_then(|u| u.get("total_tokens")),
+            Some(&serde_json::json!(2)),
+            "usage stores the FULL unfiltered OpenRouter usage block: {usage:?}"
         );
     }
 
