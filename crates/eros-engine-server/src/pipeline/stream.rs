@@ -2565,13 +2565,15 @@ pub(crate) struct ComposeRun {
 
 /// Generate the image prompt (and its caption) via the optional composer LLM.
 /// Walks `[model] + fallback` on transport failure (error/timeout/empty);
-/// returns the parsed prompt/caption plus the audit trio on first success, or
-/// `None` (caller falls back to an empty subject — the portrait path). Never
-/// blocks or fails the image turn. Mirrors `run_input_filter`.
+/// returns a `ComposeRun` carrying the parsed prompt/caption plus the audit
+/// trio in `outcome` on first success, or `outcome: None` (caller falls back
+/// to an empty subject — the portrait path) alongside how many models were
+/// attempted and why the last one failed. Never blocks or fails the image
+/// turn. Mirrors `run_input_filter`.
 ///
 /// Shared with `routes/persona.rs`: the standalone compose endpoint's
-/// non-stream mode maps a `None` here to a 502 instead of the chat path's
-/// fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
+/// non-stream mode maps an `outcome: None` here to a 502 instead of the chat
+/// path's fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
 pub(crate) async fn run_image_prompt_compose(
     state: &AppState,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
@@ -2880,7 +2882,15 @@ async fn build_delegated_image_prompt(
     };
     let source = match plan.action_type {
         ActionType::ReplyImage => "chat_reply_image",
-        _ => "chat_reply_text_image",
+        ActionType::ReplyTextImage => "chat_reply_text_image",
+        other => {
+            tracing::warn!(
+                ?other,
+                "image-compose: unexpected action_type for a delegated image turn; \
+                 labelling source as chat_reply_text_image"
+            );
+            "chat_reply_text_image"
+        }
     };
     let compose_event_id = record_compose_event(
         &state.pool,
@@ -7021,7 +7031,20 @@ data: [DONE]\n\n";
         .await;
 
         #[allow(clippy::type_complexity)]
-        let (id, status, subject, caption, composed, variant, model, gen, attempts, inputs): (
+        let (
+            id,
+            status,
+            subject,
+            caption,
+            composed,
+            variant,
+            model,
+            gen,
+            attempts,
+            inputs,
+            source,
+            usage,
+        ): (
             Uuid,
             String,
             Option<String>,
@@ -7032,9 +7055,11 @@ data: [DONE]\n\n";
             Option<String>,
             i16,
             serde_json::Value,
+            String,
+            Option<serde_json::Value>,
         ) = sqlx::query_as(
             "SELECT id, status, subject, caption, composed_prompt, variant, model, \
-                    generation_id, attempts, inputs \
+                    generation_id, attempts, inputs, source, usage \
              FROM engine.chat_images_events",
         )
         .fetch_one(&pool)
@@ -7056,6 +7081,18 @@ data: [DONE]\n\n";
         assert_eq!(attempts, 1);
         assert_eq!(inputs["latest_user_msg"].as_str(), Some("hi"));
         assert_eq!(inputs["style"].as_str(), Some("realistic"));
+        assert_eq!(
+            source, "chat_reply_image",
+            "run_variant_turn forces ActionType::ReplyImage — the image-only source"
+        );
+        assert_eq!(
+            usage
+                .as_ref()
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(|v| v.as_i64()),
+            Some(88),
+            "usage stores the FULL unfiltered OpenRouter usage block: {usage:?}"
+        );
 
         let stamped: Option<String> = sqlx::query_scalar(
             "SELECT metadata->'image'->>'compose_event_id' FROM engine.chat_messages \
@@ -7380,6 +7417,140 @@ data: [DONE]\n\n";
             "marker must not store a generation id"
         );
         assert!(img.get("url").is_none(), "marker must not store a url");
+    }
+
+    /// Sibling of `reply_text_image_appends_image_request_and_marker`, but the
+    /// composer SUCCEEDS this time. The `reply_text_image` path writes its
+    /// audit row from a different call site than the image-only insert (the
+    /// spawn/join pair around `compose_handle`, landing via
+    /// `merge_assistant_image_meta` rather than `insert_assistant_batch`) —
+    /// nothing else pins that `source` is labelled correctly there, or that
+    /// the merge actually stamps the SAME row id the audit write produced
+    /// (Task 3 review, round 1).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_compose_event_source_and_merge_stamp(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I would absolutely love that for you, \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"let me slip into something far more comfortable and show you every bit of it\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9,\"total_tokens\":11},\"id\":\"gen-r\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"pde/judge\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
+        // Composer: configured and SUCCEEDING, unlike the sibling test above —
+        // the merge-path stamp only exists to observe when there is a real
+        // audit row id to stamp.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen_compose_merge",
+                "model": "composer",
+                "choices": [{"message": {"content":
+                    "{\"prompt\":\"she looks over her shoulder\",\"caption\":\"回眸\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9222222222222222222222A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (event_id, source): (Uuid, String) =
+            sqlx::query_as("SELECT id, source FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .expect("exactly one compose event row");
+        assert_eq!(
+            source, "chat_reply_text_image",
+            "the reply_text_image spawn/join path, not the image-only insert"
+        );
+
+        let stamped: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->'image'->>'compose_event_id' FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' AND metadata->'image' IS NOT NULL",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stamped.as_deref(),
+            Some(event_id.to_string().as_str()),
+            "merge_assistant_image_meta stamps the SAME audit row id the compose write produced"
+        );
     }
 
     /// An image-promising turn whose TEXT half comes back empty is an
