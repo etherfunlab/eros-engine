@@ -6,6 +6,7 @@ pub mod chat;
 pub mod decision;
 pub mod error_handling;
 pub mod human_insight;
+pub mod image_events;
 pub mod insight;
 pub mod memory;
 pub mod persona;
