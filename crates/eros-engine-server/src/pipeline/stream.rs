@@ -5918,13 +5918,12 @@ data: [DONE]\n\n";
     /// surface as `Done{ghost_fallback:true}` tagged
     /// `metadata.fallback_reason = "empty_completion"`, NOT the
     /// pseudo-ghost/Error truncation path. The `output_regex` rule below
-    /// targets the chain model ("primary") purely so `regex_targets_chain`
-    /// forces FILTERED mode — an unpinned/untargeted rule would silently
-    /// fall through to LIVE mode instead (see
-    /// `regex_strip_to_empty_becomes_ghost_fallback` above) — but its
-    /// pattern never matches anything, so it's a pure mode-selection no-op
-    /// and the empty-completion branch (which returns before the regex is
-    /// ever applied) never touches it.
+    /// targets the chain model ("primary") and never matches anything. It was
+    /// written to force FILTERED mode via `regex_targets_chain`; that mechanism
+    /// is gone (`filtered_mode` is now `llm_filter_arms` alone, since the live
+    /// burst gained `StreamScrubber`), so the rule is inert and this test
+    /// exercises the LIVE empty-completion site. The assertion it makes holds
+    /// on that path and is what is locked here.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn empty_completion_last_attempt_becomes_ghost_fallback(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -6049,11 +6048,11 @@ data: [DONE]\n\n";
     /// stream whose delta never carries a `content` field, so `acc` stays
     /// empty and `finish_reason` is never `"length"` — an empty completion on
     /// the LAST (here, only) chain attempt in the un-buffered path, which
-    /// interleaves persist → Done → accept/advance per attempt. Unlike the
-    /// filtered-mode sibling above, this test carries NO `output_regex` rule
-    /// and no LLM `filter` — `test_state`'s bare defaults leave both
-    /// `regex_targets_chain` and `llm_filter_arms` false, so `filtered_mode`
-    /// is false and the turn runs the LIVE branch under test. Must surface as
+    /// interleaves persist → Done → accept/advance per attempt. This test
+    /// carries NO `output_regex` rule and no LLM `filter` — `test_state`'s bare
+    /// defaults leave `llm_filter_arms` false, so `filtered_mode` is false and
+    /// the turn runs the LIVE branch under test. (The sibling above reaches the
+    /// same branch by a different route; its regex rule is inert.) Must surface as
     /// `Done{ghost_fallback:true}` tagged `metadata.fallback_reason =
     /// "empty_completion"`, NOT the pseudo-ghost/Error truncation path that
     /// the sibling `run_stream_reply_terminates_cleanly_with_mock_openrouter`
@@ -7280,20 +7279,191 @@ data: [DONE]\n\n";
                 .any(|f| matches!(f, ProtocolFrame::Error { .. })),
             "empty text half must not error"
         );
-        // Persisted row: no fallback_reason tag.
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->>'fallback_reason' FROM engine.chat_messages \
+        // Persisted row: it EXISTS (fetch_one — with fetch_optional a row that
+        // was never inserted would read identically to an untagged one, since
+        // the insert failure path only warns), holds the empty text half, and
+        // carries no fallback_reason tag.
+        let (content, reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, metadata->>'fallback_reason' FROM engine.chat_messages \
              WHERE user_message_id = $1 AND role = 'assistant'",
         )
         .bind(user_message_id)
-        .fetch_optional(&pool)
+        .fetch_one(&pool)
         .await
-        .unwrap()
-        .flatten();
+        .unwrap();
+        assert_eq!(content, "", "the empty text half is persisted as-is");
         assert_eq!(reason, None, "row must not be tagged as a ghost fallback");
     }
 
-    /// Review finding (2026-08-02, issue #212 fix wave): the sibling test above
+    /// The OTHER half of the `promises_image()` exemption, and the shape this
+    /// actually takes in production: the model DOES return text, but the whole
+    /// reply is one bracketed artifact (`[你给对方发送了一张照片]`), so
+    /// `apply_output_regex` strips it to empty and the turn lands on the
+    /// regex-strip-to-empty branch — not the empty-completion branch the
+    /// sibling test above covers. Since `output_regex` stopped forcing
+    /// buffering, a regex-only chain runs the LIVE burst, so this is the live
+    /// `regex_ghost` site.
+    ///
+    /// The discriminator is deliberate: the chat mock returns NON-empty content,
+    /// so `empty_completion` is false and the only route to an empty persisted
+    /// row is the regex strip. An image-promising turn there must not be tagged
+    /// ghost — the trailing `image_request` is the payload.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn reply_text_image_regex_strip_to_empty_is_not_ghost_fallback(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // A reply that is ENTIRELY a bracketed artifact: non-empty completion,
+        // stripped to "" by the rule below.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片]\"}}],\
+                    \"id\":\"gen-rs\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"primary\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"pde/judge\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content":
+                    "{\"action\":\"reply_text_image\",\"inner_state\":\"想给你看\"}"}}],
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Bracket-only rule scoped to the served chain model, built through
+        // `from_toml_str` + `compile_output_regex()` so `regex` stays out of
+        // this crate's direct deps (mirrors the sibling regex tests).
+        let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"primary\"\n\
+             [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+             [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n\
+             [[tasks.chat_companion.output_regex]]\nmodels = [\"primary\"]\npattern = '^\\s*\\[[^\\]]*\\]\\s*$'\n",
+        )
+        .unwrap();
+        state.output_regex = std::sync::Arc::new(
+            regex_cfg
+                .compile_output_regex()
+                .expect("bracket-only pattern compiles"),
+        );
+        state.model_config = std::sync::Arc::new(regex_cfg);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9111111111111111111111C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f,
+                ProtocolFrame::Done {
+                    ghost_fallback: true,
+                    ..
+                }
+            )),
+            "a stripped-to-empty image turn must not be tagged ghost_fallback: {frames:?}"
+        );
+        // The artifact itself never reached the client.
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Delta { .. })),
+            "no Delta for an artifact-only reply: {frames:?}"
+        );
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let ir_pos = types
+            .iter()
+            .position(|t| t == "image_request")
+            .expect("image_request still present on a stripped-empty text half");
+        let done_pos = types
+            .iter()
+            .position(|t| t == "done")
+            .expect("done present");
+        assert!(
+            done_pos < ir_pos,
+            "image_request comes after done: {types:?}"
+        );
+        // The row EXISTS (fetch_one, not fetch_optional — a missing row would
+        // otherwise read as an untagged one), was stripped to empty, and carries
+        // no ghost tag.
+        let (content, reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT content, metadata->>'fallback_reason' FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, "", "the artifact must be stripped from the row");
+        assert_eq!(reason, None, "row must not be tagged as a ghost fallback");
+    }
+
+    /// Review finding (2026-08-02, issue #212 fix wave):
+    /// `reply_text_image_appends_image_request_and_marker` (above)
     /// gives the composer a failing (500) mock, so the concurrently spawned
     /// compose task returns almost instantly — the join at the end of the
     /// burst is trivially satisfied and proves nothing about ordering under a
@@ -11250,17 +11420,26 @@ data: [DONE]\n\n";
         );
     }
 
-    /// Codex P2 (PR #141, round 3): the FILTERED empty-completion path
-    /// must retain an (empty) produced row like the live/regex-strip paths —
-    /// otherwise a ReplyTextImage turn's trailing image_request (gated on
-    /// `produced.last()`) silently drops the image half in filtered mode only.
+    /// Codex P2 (PR #141, round 3): the empty-completion path must retain an
+    /// (empty) produced row, otherwise a ReplyTextImage turn's trailing
+    /// image_request (gated on `produced.last()`) silently drops the image half.
     /// Since the `promises_image()` exemption, an image-promising turn on this
     /// path is additionally NOT tagged ghost_fallback (the empty text half is
     /// an accepted image-only reply) — retention and the exemption are asserted
-    /// together here; the plain-ReplyText ghost tagging keeps its own coverage
-    /// in `empty_completion_last_attempt_becomes_ghost_fallback`.
+    /// together here.
+    ///
+    /// NOTE ON MODE: this test passes `filter: None`, and `filtered_mode` is now
+    /// `llm_filter_arms` alone — `output_regex` stopped forcing buffering when
+    /// the live burst gained `StreamScrubber`. So the never-matching regex rule
+    /// below no longer selects the filtered burst (it is inert), and this test
+    /// drives the LIVE empty-completion site. The name and comment said
+    /// "filtered" until 2026-08-13; they described the pre-scrubber mode
+    /// selection, not what the test runs. The FILTERED empty-completion site
+    /// (`filtered_mode == true`, i.e. an LLM output_filter whose turn-level
+    /// predicates pass) has no test of its own — pre-existing gap, tracked
+    /// separately, not introduced here.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn filtered_empty_completion_ghost_retains_produced_row(pool: PgPool) {
+    async fn live_empty_completion_image_turn_is_not_ghost_and_retains_produced_row(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::path as wm_path;
@@ -11286,7 +11465,9 @@ data: [DONE]\n\n";
                 format!("{}/api/v1/chat/completions", mock.uri()),
             ),
         );
-        // Never-matching regex targeting "primary" forces FILTERED mode.
+        // Never-matching regex targeting "primary". Inert since `output_regex`
+        // stopped forcing buffering (see the mode note on this test); kept so
+        // the strip runs and is proven not to interfere with the empty path.
         let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
             r#"
             [tasks.chat_companion]
@@ -11368,7 +11549,7 @@ data: [DONE]\n\n";
         assert_eq!(
             produced.len(),
             1,
-            "filtered empty completion must retain a produced row so ReplyTextImage's \
+            "empty completion must retain a produced row so ReplyTextImage's \
              image_request still fires; got {produced:?}"
         );
         assert_eq!(

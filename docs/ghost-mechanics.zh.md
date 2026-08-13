@@ -122,7 +122,7 @@ score = (1−0.05)×0.4 + (1−0.05)×0.4 + 0×0.2
 
 - **不是** 错误响应。HTTP 路由仍返 200。由于引擎采用 SSE 流式传输，ghost 轮会发出三帧后关闭流：`meta(action_type=ghost, model=null)` → `done(usage=null, generation_id=null)` → `final`。不会发出 `delta` 帧，也不会调用任何 LLM。
 - **不是** LLM 调用失败。走默认规则引擎时决策纯 Rust，从不问 LLM。配置了可选的 LLM PDE 判断器之后，由判断器提出动作，但 `ghost_permitted` 仍会否决硬安全规则不允许的 ghost，而 `ghosting` 开关可以把每一个 ghost 判定强行拉回 `reply_text`——见 [model-config.zh.md](model-config.zh.md)。
-- **不是** 回合沉默的唯一成因。回复文本解析为空是另一条路径：模型返回了空补全，或 `apply_output_regex` 把一条纯 artifact 的回复剥到一无所剩（那里的 fail-safe 是刻意移除的）。这种回合照常落一行内容为空的助手回复行，在线上表现为 `done(ghost_fallback=true)`、`metadata.fallback_reason` 为 `empty_completion` 或 `regex_strip`，并且 **不动** `ghost_streak` / `total_ghosts` / `last_ghost_at`——人格没有做任何决定，只是这条回复回来就是空的。
+- **不是** 回合沉默的唯一成因。回复文本解析为空是另一条路径：模型返回了空补全，或 `apply_output_regex` 把一条纯 artifact 的回复剥到一无所剩（那里的 fail-safe 是刻意移除的）。这种回合照常落一行内容为空的助手回复行，在线上表现为 `done(ghost_fallback=true)`、`metadata.fallback_reason` 为 `empty_completion` 或 `regex_strip`，并且 **不动** `ghost_streak` / `total_ghosts` / `last_ghost_at`——人格没有做任何决定，只是这条回复回来就是空的。唯一的例外：承诺出图的轮次（`reply_text_image`）在这两条路径上都**不打标**。它的文本半边为空意味着这是一条纯图片回复——用户真正收到的载荷是尾随的 `image_request`——所以它上报 `ghost_fallback=false`、不落 `fallback_reason`，并按一条正常回复处理（也就是说，它**会**重置 `ghost_streak`）。
 - **不是** 永遠沉默。時間衰退會恢復 `patience`、軟化 `tension`；最終人格會回應下一條消息。
 
 ## 源碼
