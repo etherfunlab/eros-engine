@@ -418,19 +418,6 @@ fn relationship_line(affinity: &Affinity, scope: AffinityScope) -> Option<String
     }
 }
 
-/// Back-projection of the resolved scope into the legacy audit vocabulary.
-/// The assistant row's `relationship_scope` key keeps this shape for one
-/// release (spec 2026-08-12) so deployers reading the old key see identical
-/// values; next release the key becomes the resolved `affinity_scope`.
-fn legacy_scope_label(scope: &AffinityScope) -> &'static str {
-    match (scope.any_bond_axis(), scope.any_chemistry_axis()) {
-        (false, false) => "none",
-        (true, false) => "bond",
-        (false, true) => "chemistry",
-        (true, true) => "both",
-    }
-}
-
 /// Inputs for one voice turn. The user utterance is already persisted (by the
 /// route) as the latest history row, so the wire messages come from history —
 /// `content` is carried separately only because the per-turn recall needs it
@@ -818,8 +805,11 @@ pub fn run_voice_turn(
         // gets the FULL unfiltered usage; the wire `Done` frame below gets a
         // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        // Symmetric with the chat stream's assistant row: the resolved 6-bool
+        // scope, not a back-projected label (spec 2026-08-14; the legacy
+        // `relationship_scope` key shipped for one release in v1.2.0).
         let scope_metadata = serde_json::json!({
-            "relationship_scope": legacy_scope_label(&turn.affinity_scope),
+            "affinity_scope": turn.affinity_scope,
             "memory_scope": turn.memory_scope,
         });
         if !acc.is_empty() {
@@ -1447,16 +1437,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_scope_label_projects_halves() {
-        assert_eq!(legacy_scope_label(&AffinityScope::full()), "both");
-        assert_eq!(legacy_scope_label(&AffinityScope::bond()), "bond");
-        assert_eq!(legacy_scope_label(&AffinityScope::chemistry()), "chemistry");
-        assert_eq!(legacy_scope_label(&AffinityScope::none()), "none");
-        let w = AffinityScope::from_axes(&[eros_engine_core::scope::AffinityAxis::Warmth]);
-        assert_eq!(legacy_scope_label(&w), "bond");
-    }
-
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_voice_turn_streams_delta_then_done_and_persists(pool: sqlx::PgPool) {
         use eros_engine_llm::model_config::ModelConfig;
@@ -1571,15 +1551,21 @@ data: [DONE]\n\n";
         assert_eq!(channel.as_deref(), Some("voice"));
 
         // Resolved scope audited on the assistant row.
-        let scope_meta: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->>'relationship_scope' FROM engine.chat_messages \
+        let scope_meta: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata->'affinity_scope' FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'assistant'",
         )
         .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(scope_meta.as_deref(), Some("both"));
+        assert_eq!(
+            scope_meta,
+            serde_json::json!({
+                "warmth": true, "trust": true, "intrigue": true,
+                "intimacy": true, "patience": true, "tension": true
+            })
+        );
 
         let ms: Option<String> = sqlx::query_scalar(
             "SELECT metadata->>'memory_scope' FROM engine.chat_messages \

@@ -1017,7 +1017,7 @@ impl<'a> ChatRepo<'a> {
     /// `metadata` is in NEITHER branch's SET list, so it is never refreshed on
     /// conflict in either case: the first writer's metadata stands. That is
     /// deliberate — it is what preserves an interrupt's `voice_interrupt`
-    /// marker (and the generator's `relationship_scope`) against a later
+    /// marker (and the generator's `affinity_scope`) against a later
     /// conflicting write, and the marker is the very key this CASE reads.
     ///
     /// `usage` additionally falls back to the existing row's value when the
@@ -3250,13 +3250,13 @@ mod tests {
             None,
             Some("gen-1"),
             false,
-            Some(&serde_json::json!({"relationship_scope": "both"})),
+            Some(&serde_json::json!({"affinity_scope": "both"})),
         )
         .await
         .unwrap();
         let (role, aat, channel, scope): (String, Option<String>, Option<String>, Option<String>) =
             sqlx::query_as(
-                "SELECT role, assistant_action_type, channel, metadata->>'relationship_scope' \
+                "SELECT role, assistant_action_type, channel, metadata->>'affinity_scope' \
                  FROM engine.chat_messages WHERE id = $1",
             )
             .bind(aid)
@@ -4369,7 +4369,7 @@ mod tests {
         let repo = ChatRepo { pool: &pool };
         let (session_id, user_mid) = seed_voice_turn(&pool, "hello").await;
         let usage = serde_json::json!({"total_tokens": 42});
-        let scope = serde_json::json!({"relationship_scope": "both"});
+        let scope = serde_json::json!({"affinity_scope": "both"});
         repo.insert_voice_assistant_message(
             session_id,
             user_mid,
@@ -4410,7 +4410,7 @@ mod tests {
         assert_eq!(gen.as_deref(), Some("gen-9"));
         assert!(truncated);
         assert_eq!(
-            meta["relationship_scope"], "both",
+            meta["affinity_scope"], "both",
             "generator metadata preserved"
         );
         assert_eq!(

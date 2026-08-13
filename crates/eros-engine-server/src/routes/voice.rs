@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use ulid::Ulid;
 
-use eros_engine_core::scope::{AffinityScope, MemoryScope, RelationshipScope};
+use eros_engine_core::scope::MemoryScope;
 use eros_engine_store::chat::{ChatRepo, LatestTurnLookup, VoiceUserInsert};
 use eros_engine_store::persona::PersonaRepo;
 
@@ -42,18 +42,9 @@ pub struct VoiceTurnRequest {
     /// `"full" | "bond_and_chemistry" | "bond" | "chemistry" | "none"`, or an
     /// array of axis names such as `["warmth", "trust"]`. Axes flatten to the
     /// two injectable halves (any bond axis ⇒ bond half, any chemistry axis ⇒
-    /// chemistry half). When both this and the deprecated `relationship_scope`
-    /// are sent, this field wins.
+    /// chemistry half).
     #[serde(default)]
     pub affinity_scope: Option<crate::routes::companion_stream::AffinityScopeDto>,
-    /// **Deprecated** — superseded by `affinity_scope`; removed in the next
-    /// minor release. Which halves of the relationship line to inject:
-    /// `none | bond | chemistry | both`. Ignored when `affinity_scope` is
-    /// present. Note the two value spaces do not mix: `"full"` here (or
-    /// `"both"` under `affinity_scope`) is a 422.
-    #[serde(default)]
-    #[schema(value_type = Option<String>)]
-    pub relationship_scope: Option<RelationshipScope>,
     /// How much long-term memory this turn may use — same field name, enum,
     /// wire values, and default (`neutral_and_relationship`) as the chat
     /// stream. The first successfully-assembling turn's resolved insight
@@ -250,23 +241,14 @@ pub async fn voice_turn_stream(
             )
         })?;
 
-    // Resolution precedence: new field ⇒ legacy field ⇒ chat-parity default.
-    // The legacy enum still type-checks even when overridden (a garbage value
-    // 422s regardless), and maps onto the constructors that reproduce its old
-    // behavior exactly.
-    let affinity_scope = match (req.affinity_scope.as_ref(), req.relationship_scope) {
-        (Some(dto), _) => dto.resolve(),
-        (None, Some(rs)) => match rs {
-            RelationshipScope::None => AffinityScope::none(),
-            RelationshipScope::Bond => AffinityScope::bond(),
-            RelationshipScope::Chemistry => AffinityScope::chemistry(),
-            RelationshipScope::Both => AffinityScope::full(),
-        },
-        (None, None) => AffinityScope::default(), // bond — chat parity
-    };
-    // Pre-resolve raw snapshot on the user row, mirroring the chat stream's
-    // sparse `_raw` keys. The legacy field is NOT echoed here — its audit
-    // stays on the assistant row's legacy key for this release.
+    // Resolution: the request field, else the chat-parity default.
+    let affinity_scope = req
+        .affinity_scope
+        .as_ref()
+        .map(|dto| dto.resolve())
+        .unwrap_or_default(); // bond — chat parity
+                              // Pre-resolve raw snapshot on the user row, mirroring the chat stream's
+                              // sparse `_raw` keys.
     let mut raw = serde_json::Map::new();
     if let Some(ms) = req.memory_scope.as_ref() {
         raw.insert(
@@ -590,29 +572,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn voice_422_when_relationship_scope_invalid(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let session_id = seed(&pool, user_id).await;
-        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
-        let jwt = mint_jwt(user_id);
-        let resp = post_voice(
-            &mut app,
-            session_id,
-            &jwt,
-            json!({
-                "content": "hi",
-                "client_msg_id": "01J2222222222222222222222A",
-                "relationship_scope": "romance"
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    /// `memory_scope` is a typed enum on the wire, exactly like
-    /// `relationship_scope`: an unknown value is a payload error, not a
-    /// silent fallback to the default.
+    /// `memory_scope` is a typed enum on the wire: an unknown value is a
+    /// payload error, not a silent fallback to the default.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn voice_422_when_memory_scope_invalid(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -729,98 +690,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    /// And the mirror: the new vocabulary's `"full"` under the LEGACY field.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn voice_422_when_relationship_scope_uses_new_value(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let session_id = seed(&pool, user_id).await;
-        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
-        let resp = post_voice(
-            &mut app,
-            session_id,
-            &mint_jwt(user_id),
-            json!({
-                "content": "hi",
-                "client_msg_id": "01J2222222222222222222222A",
-                "relationship_scope": "full"
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    /// Precedence never bypasses type validation: even when `affinity_scope`
-    /// is present (and would win), a garbage legacy value is still a 422 —
-    /// the whole body deserializes before precedence runs.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn voice_422_when_overridden_relationship_scope_is_garbage(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let session_id = seed(&pool, user_id).await;
-        let mut app = build_router(with_voice(crate::routes::companion::test_state(pool)));
-        let resp = post_voice(
-            &mut app,
-            session_id,
-            &mint_jwt(user_id),
-            json!({
-                "content": "hi",
-                "client_msg_id": "01J2222222222222222222222A",
-                "affinity_scope": "bond",
-                "relationship_scope": "romance"
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    /// Both fields sent ⇒ affinity_scope wins. Observable in the audit trail:
-    /// the assistant row's legacy key carries the WINNER's projection, and the
-    /// user row echoes only the new field's raw value.
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn affinity_scope_wins_over_relationship_scope(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let session_id = seed(&pool, user_id).await;
-        seed_affinity(&pool, session_id, user_id).await;
-        let wire = run_mocked_turn(
-            &pool,
-            session_id,
-            user_id,
-            json!({
-                "content": "hi",
-                "client_msg_id": "01J9SCOPEPREC0000000000001",
-                "relationship_scope": "both",
-                "affinity_scope": "none"
-            }),
-        )
-        .await;
-        // The winner is `none`: with an affinity row seeded (the line WOULD
-        // render), neither half may reach the model.
-        assert!(
-            !wire.contains(BOND_LINE_MARK) && !wire.contains(CHEM_LINE_MARK),
-            "affinity_scope none must suppress the relationship line: {wire}"
-        );
-        let (legacy, memory): (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT metadata->>'relationship_scope', metadata->>'memory_scope' \
-             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(legacy.as_deref(), Some("none"), "affinity_scope must win");
-        assert_eq!(memory.as_deref(), Some("neutral_and_relationship"));
-        let raw: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->>'affinity_scope_raw' \
-             FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(raw.as_deref(), Some("none"), "user row echoes the raw DTO");
-    }
-
-    /// Neither field ⇒ chat-parity default `bond` (deliberate change from the
-    /// old `both`), and NO raw keys on the user row (sparse audit).
+    /// Neither field ⇒ chat-parity default `bond`, and NO raw keys on the
+    /// user row (sparse audit).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn omitted_scopes_default_to_bond_with_no_raw_audit(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -837,8 +708,8 @@ mod tests {
             wire.contains(BOND_LINE_MARK) && !wire.contains(CHEM_LINE_MARK),
             "default bond must serve the bond half only: {wire}"
         );
-        let legacy: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->>'relationship_scope' \
+        let scope: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata->'affinity_scope' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
         )
         .bind(session_id)
@@ -846,8 +717,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            legacy.as_deref(),
-            Some("bond"),
+            scope,
+            serde_json::json!({
+                "warmth": true, "trust": false, "intrigue": false,
+                "intimacy": true, "patience": false, "tension": true
+            }),
             "omitted ⇒ chat default bond"
         );
         let user_meta_null: bool = sqlx::query_scalar(
@@ -859,59 +733,6 @@ mod tests {
         .await
         .unwrap();
         assert!(user_meta_null, "no fields sent ⇒ no raw audit keys");
-    }
-
-    /// Invariant 7 (spec 2026-08-12): a caller still sending ONLY the legacy
-    /// field sees identical behavior — `both` keeps serving both halves of
-    /// the relationship line — and identical audit: the assistant row's
-    /// legacy key echoes `both`, while the legacy field produces NO raw echo
-    /// on the user row (its audit home stays the assistant row this release).
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn legacy_relationship_scope_alone_is_byte_compatible(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let session_id = seed(&pool, user_id).await;
-        seed_affinity(&pool, session_id, user_id).await;
-        let wire = run_mocked_turn(
-            &pool,
-            session_id,
-            user_id,
-            json!({
-                "content": "hi",
-                "client_msg_id": "01J9SCOPELEGACY00000000001",
-                "relationship_scope": "both"
-            }),
-        )
-        .await;
-        assert!(
-            wire.contains(BOND_LINE_MARK) && wire.contains(CHEM_LINE_MARK),
-            "legacy both must keep serving BOTH halves: {wire}"
-        );
-        let (legacy, memory): (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT metadata->>'relationship_scope', metadata->>'memory_scope' \
-             FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            legacy.as_deref(),
-            Some("both"),
-            "audit value unchanged for legacy callers"
-        );
-        assert_eq!(memory.as_deref(), Some("neutral_and_relationship"));
-        let user_meta_null: bool = sqlx::query_scalar(
-            "SELECT metadata IS NULL FROM engine.chat_messages \
-             WHERE session_id = $1 AND role = 'user'",
-        )
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            user_meta_null,
-            "the legacy field is never echoed as a raw key"
-        );
     }
 
     /// The axes-array shape resolves (chemistry half from a chemistry axis)
@@ -938,15 +759,21 @@ mod tests {
             wire.contains(CHEM_LINE_MARK) && !wire.contains(BOND_LINE_MARK),
             "[\"trust\"] must serve the chemistry half only: {wire}"
         );
-        let legacy: Option<String> = sqlx::query_scalar(
-            "SELECT metadata->>'relationship_scope' \
+        let scope: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata->'affinity_scope' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant'",
         )
         .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(legacy.as_deref(), Some("chemistry"));
+        assert_eq!(
+            scope,
+            serde_json::json!({
+                "warmth": false, "trust": true, "intrigue": false,
+                "intimacy": false, "patience": false, "tension": false
+            })
+        );
         let (raw_scope, raw_memory): (Option<serde_json::Value>, Option<String>) = sqlx::query_as(
             "SELECT metadata->'affinity_scope_raw', metadata->>'memory_scope_raw' \
              FROM engine.chat_messages WHERE session_id = $1 AND role = 'user'",
@@ -957,6 +784,42 @@ mod tests {
         .unwrap();
         assert_eq!(raw_scope, Some(serde_json::json!(["trust"])));
         assert_eq!(raw_memory.as_deref(), Some("none"));
+    }
+
+    /// The field is gone, so an unknown-value `relationship_scope` is now just
+    /// an ignored unknown key — NOT a 422. Locks in that the removal did not
+    /// leave a validation stub behind, and that such a request falls to the
+    /// `bond` default.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn legacy_relationship_scope_is_ignored_and_defaults_to_bond(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let session_id = seed(&pool, user_id).await;
+        run_mocked_turn(
+            &pool,
+            session_id,
+            user_id,
+            json!({
+                "content": "hi",
+                "client_msg_id": "01J2222222222222222222222A",
+                "relationship_scope": "romance"
+            }),
+        )
+        .await;
+
+        let scope: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata->'affinity_scope' FROM engine.chat_messages \
+             WHERE role = 'assistant' AND session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scope["warmth"], serde_json::json!(true));
+        assert_eq!(scope["intimacy"], serde_json::json!(true));
+        assert_eq!(scope["tension"], serde_json::json!(true));
+        assert_eq!(scope["trust"], serde_json::json!(false));
+        assert_eq!(scope["intrigue"], serde_json::json!(false));
+        assert_eq!(scope["patience"], serde_json::json!(false));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
