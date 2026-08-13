@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use eros_engine_core::affinity::{bar, Affinity, RelationshipLabel};
+use eros_engine_core::affinity::{Affinity, RelationshipLabel};
 
 /// Point-in-time projection of a session's `Affinity`. Same field set
 /// as the historical `AffinityDebugResponse`; renamed because it now
@@ -25,9 +25,12 @@ pub struct AffinitySnapshot {
     pub total_ghosts: i32,
     pub relationship_label: Option<String>,
     pub updated_at: String,
-    /// Friendship bar fill, 0..1 (curve-applied; render as %).
+    /// Friendship line score, 0..1 — the real stored composite, no display
+    /// curve (affinity 3.0 dropped the `bar()` projection; nonlinearity now
+    /// lives in the write-side tier decay, so the raw value already reads
+    /// fast-early/slow-late).
     pub bond: f64,
-    /// Romance bar fill, 0..1 (curve-applied; render as %).
+    /// Romance line score, 0..1 — real stored composite, no display curve.
     pub chemistry: f64,
     /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`).
     pub bond_label: String,
@@ -62,8 +65,8 @@ impl From<Affinity> for AffinitySnapshot {
             // and never a stale pre-migration value from the stored column.
             relationship_label: Some(label_to_str(a.legacy_relationship_label())),
             updated_at: a.updated_at.to_rfc3339(),
-            bond: bar(a.bond_score()),
-            chemistry: bar(a.chemistry_score()),
+            bond: a.bond_score(),
+            chemistry: a.chemistry_score(),
             bond_label: a.bond_label().as_key().to_string(),
             chemistry_label: a.chemistry_label().as_key().to_string(),
         }
@@ -125,13 +128,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_exposes_bond_chemistry_bars_and_labels() {
+    fn snapshot_exposes_raw_line_scores_and_labels() {
         // bond = (0+0.9+0.9)/3 = 0.6 → tier3 close_friend ; chemistry = 0 → spark
         let snap = AffinitySnapshot::from(affinity(0.0, 0.9, 0.9, 0.0, 0.0));
         assert_eq!(snap.bond_label, "close_friend");
         assert_eq!(snap.chemistry_label, "spark");
-        // bar(0.6): tier3 band 0.50 + (0.6-0.35)/0.27*0.25
-        assert!((snap.bond - (0.50 + (0.6 - 0.35) / 0.27 * 0.25)).abs() < 1e-9);
+        // Affinity 3.0: the real composite, not a bar()-projected 0.7315.
+        assert!((snap.bond - 0.6).abs() < 1e-9);
         assert!((snap.chemistry).abs() < 1e-9);
         // legacy label derived on read: bond (tier3) leads, neither tier1 → friend
         assert_eq!(snap.relationship_label.as_deref(), Some("friend"));

@@ -44,16 +44,16 @@ pub struct AffinityDeltas {
 }
 
 impl Affinity {
-    /// Apply LLM-evaluated deltas with EMA smoothing.
-    /// `ema_inertia ∈ [0, 1]` — 0 means full update; v1 default is 0.5 (gain 0.5).
-    pub fn apply_deltas(&mut self, d: &AffinityDeltas, ema_inertia: f64) {
-        let blend = 1.0 - ema_inertia;
-        self.warmth = clamp(self.warmth + blend * d.warmth, -1.0, 1.0);
-        self.trust = clamp(self.trust + blend * d.trust, 0.0, 1.0);
-        self.intrigue = clamp(self.intrigue + blend * d.intrigue, 0.0, 1.0);
-        self.intimacy = clamp(self.intimacy + blend * d.intimacy, 0.0, 1.0);
-        self.patience = clamp(self.patience + blend * d.patience, 0.0, 1.0);
-        self.tension = clamp(self.tension + blend * d.tension, 0.0, 1.0);
+    /// Apply committed deltas directly, clamping each axis to its range.
+    /// No EMA here since 3.0: damping lives in `grade_turn`'s tier decay, so a
+    /// committed delta means exactly what it says.
+    pub fn apply_deltas(&mut self, d: &AffinityDeltas) {
+        self.warmth = clamp(self.warmth + d.warmth, -1.0, 1.0);
+        self.trust = clamp(self.trust + d.trust, 0.0, 1.0);
+        self.intrigue = clamp(self.intrigue + d.intrigue, 0.0, 1.0);
+        self.intimacy = clamp(self.intimacy + d.intimacy, 0.0, 1.0);
+        self.patience = clamp(self.patience + d.patience, 0.0, 1.0);
+        self.tension = clamp(self.tension + d.tension, 0.0, 1.0);
         self.updated_at = Utc::now();
     }
 
@@ -152,24 +152,6 @@ fn tier_index(score: f64) -> u8 {
     } else {
         5
     }
-}
-
-/// Map a 0..1 line score to a 0..1 bar fill. Bands are NOT even: tiers 1–4 fill
-/// 25% / 25% / 25% / 20% and tier 5 fills the top 5% (`[0.95, 1.0]`). The apex band
-/// is deliberately narrow so the ceiling reads as rare, but wide enough that the bar
-/// still moves across tier 5's 0.10 raw span (avoids lv4→lv5 damping). Linear within
-/// each band; higher tiers span more raw score, so the bar fills fast early and crawls
-/// near the top. Tunable alongside the thresholds.
-pub fn bar(score: f64) -> f64 {
-    let (lo, hi, band_lo, band_hi) = match tier_index(score) {
-        1 => (0.0, TIER1_HI, 0.0, 0.25),
-        2 => (TIER1_HI, TIER2_HI, 0.25, 0.50),
-        3 => (TIER2_HI, TIER3_HI, 0.50, 0.75),
-        4 => (TIER3_HI, TIER4_HI, 0.75, 0.95),
-        _ => (TIER4_HI, 1.0, 0.95, 1.0),
-    };
-    let within = ((score - lo) / (hi - lo)).clamp(0.0, 1.0);
-    (band_lo + within * (band_hi - band_lo)).clamp(0.0, 1.0)
 }
 
 /// Friendship-line tier (pure function of `bond_score`). Serialised snake_case
@@ -339,6 +321,227 @@ impl Affinity {
     }
 }
 
+// ─── Affinity 3.0 write-side pipeline (grades → raw → decay → penalty → gate) ───
+//
+// The judge reports per-axis *grades* (0..=4 magnitude + direction, folded to a
+// signed integer at parse time); the engine owns every number. A grade converts
+// to a raw delta, positive raw is damped by the line's tier, line-exclusive
+// axes pay a cross-line penalty while the counterpart line is high, and the
+// resulting real delta passes a threshold accumulator before it commits.
+// Design spec: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
+
+/// Tuning knobs for the 3.0 pipeline, env-driven server-side. Defaults
+/// reproduce the 2.0 effective single-turn envelope exactly: grade ±4 lands
+/// +0.20 / −0.30 per axis, the same caps the old ±0.4/−0.6 clamp yielded after
+/// EMA 0.5 — the ceiling is unchanged, only the interior shape is new.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffinityTuning {
+    /// Raw score per grade step (`AFFINITY_GRADE_UNIT`).
+    pub grade_unit: f64,
+    /// Extra multiplier on negative raw scores (`AFFINITY_NEG_FACTOR`) —
+    /// keeps 2.0's "slow up, fast down" asymmetry.
+    pub neg_factor: f64,
+    /// Positive-delta damping per tier 1..=5 (`AFFINITY_TIER_DECAY`).
+    pub tier_decay: [f64; 5],
+    /// Cross-line penalty ceiling κ (`AFFINITY_CROSS_PENALTY`).
+    pub cross_penalty: f64,
+    /// Counterpart line score where the penalty starts (`AFFINITY_CROSS_PENALTY_START`).
+    pub cross_penalty_start: f64,
+    /// Commit threshold θ (`AFFINITY_DELTA_THRESHOLD`); 0 commits every turn.
+    pub delta_threshold: f64,
+    /// Positive-raw multiplier for demo sessions (`AFFINITY_DEMO_BOOST`);
+    /// replaces the retired demo EMA inertia.
+    pub demo_boost: f64,
+}
+
+impl Default for AffinityTuning {
+    fn default() -> Self {
+        Self {
+            grade_unit: 0.05,
+            neg_factor: 1.5,
+            tier_decay: [1.0, 0.70, 0.45, 0.25, 0.10],
+            cross_penalty: 0.05,
+            cross_penalty_start: 0.35,
+            delta_threshold: 0.0,
+            demo_boost: 1.4,
+        }
+    }
+}
+
+/// Signed judge grades, one per evaluated axis, −4..=4 (out-of-range input is
+/// clamped). 0 = nothing happened, the overwhelmingly common verdict.
+/// `patience` is absent by construction: it stays on its absolute channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxisGrades {
+    pub warmth: i8,
+    pub trust: i8,
+    pub intrigue: i8,
+    pub intimacy: i8,
+    pub tension: i8,
+}
+
+/// Per-axis balance the threshold gate is still holding back. Persisted as
+/// JSONB on the affinity row; absent column reads as all-zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PendingDeltas {
+    #[serde(default)]
+    pub warmth: f64,
+    #[serde(default)]
+    pub trust: f64,
+    #[serde(default)]
+    pub intrigue: f64,
+    #[serde(default)]
+    pub intimacy: f64,
+    #[serde(default)]
+    pub tension: f64,
+}
+
+impl PendingDeltas {
+    pub fn is_zero(&self) -> bool {
+        self.warmth == 0.0
+            && self.trust == 0.0
+            && self.intrigue == 0.0
+            && self.intimacy == 0.0
+            && self.tension == 0.0
+    }
+}
+
+/// One turn through the 3.0 pipeline.
+/// `raw` = grade conversion (boost applied) + rule deltas, pre-decay — what the
+/// event row records as `deltas`. `committed` = what actually applies to the
+/// axes this turn (zero while the gate holds). `pending` = the gate's new
+/// balance. `patience` is a rule axis: its rule delta passes through both
+/// `raw` and `committed` untouched (no decay, penalty or gating), so the
+/// judge-failure fallback still lands 1:1.
+#[derive(Debug, Clone, Default)]
+pub struct GradeTurnOutcome {
+    pub raw: AffinityDeltas,
+    pub committed: AffinityDeltas,
+    pub pending: PendingDeltas,
+}
+
+/// Run one judge verdict through conversion, tier decay, cross-line penalty
+/// and the threshold gate. Pure: reads the *pre-turn* affinity snapshot (all
+/// axes use the same tier lookup, so ordering inside a turn cannot matter) and
+/// returns what to apply; the caller owns clamping and persistence.
+pub fn grade_turn(
+    a: &Affinity,
+    grades: &AxisGrades,
+    rule: &AffinityDeltas,
+    pending: &PendingDeltas,
+    boost: f64,
+    t: &AffinityTuning,
+) -> GradeTurnOutcome {
+    // Pre-turn snapshot: every axis reads the same tiers and counterparts.
+    let bond = a.bond_score();
+    let chem = a.chemistry_score();
+    let bond_tier = tier_index(bond) as usize;
+    let chem_tier = tier_index(chem) as usize;
+
+    let decay = |tier: usize| t.tier_decay[tier - 1];
+    let penalty = |counterpart: f64| {
+        let start = t.cross_penalty_start;
+        let ramp = ((counterpart - start).max(0.0) / (1.0 - start)).powi(2);
+        t.cross_penalty * ramp
+    };
+
+    // grade → raw: positive grades earn unit × boost, negative grades cost
+    // unit × neg_factor. Rule nudges join pre-decay.
+    let raw = |g: i8, rule_d: f64| {
+        let g = f64::from(g.clamp(-4, 4));
+        let judge = if g >= 0.0 {
+            g * t.grade_unit * boost
+        } else {
+            g * t.grade_unit * t.neg_factor
+        };
+        judge + rule_d
+    };
+
+    // ρ = D·max(r,0) + min(r,0) − P·1[judged]: positive part damped, negative
+    // part full price, the penalty only charged when the judge touched the axis.
+    let real = |r: f64, own_tier: usize, counterpart: Option<f64>, judged: bool| {
+        let p = match counterpart {
+            Some(y) if judged => penalty(y),
+            _ => 0.0,
+        };
+        decay(own_tier) * r.max(0.0) + r.min(0.0) - p
+    };
+
+    // Threshold gate: signed accumulation, everything commits once |acc| ≥ θ.
+    let gate = |rho: f64, pend: f64| {
+        let acc = pend + rho;
+        if acc.abs() >= t.delta_threshold {
+            (acc, 0.0)
+        } else {
+            (0.0, acc)
+        }
+    };
+
+    let axis = |g: i8, rule_d: f64, own_tier: usize, counterpart: Option<f64>, pend: f64| {
+        let r = raw(g, rule_d);
+        let rho = real(r, own_tier, counterpart, g != 0);
+        let (committed, pend) = gate(rho, pend);
+        (r, committed, pend)
+    };
+
+    let max_tier = bond_tier.max(chem_tier);
+    let (w_raw, w_com, w_pend) = axis(grades.warmth, rule.warmth, max_tier, None, pending.warmth);
+    let (t_raw, t_com, t_pend) = axis(
+        grades.trust,
+        rule.trust,
+        bond_tier,
+        Some(chem),
+        pending.trust,
+    );
+    let (ig_raw, ig_com, ig_pend) = axis(
+        grades.intrigue,
+        rule.intrigue,
+        bond_tier,
+        Some(chem),
+        pending.intrigue,
+    );
+    let (im_raw, im_com, im_pend) = axis(
+        grades.intimacy,
+        rule.intimacy,
+        chem_tier,
+        Some(bond),
+        pending.intimacy,
+    );
+    let (tn_raw, tn_com, tn_pend) = axis(
+        grades.tension,
+        rule.tension,
+        chem_tier,
+        Some(bond),
+        pending.tension,
+    );
+
+    GradeTurnOutcome {
+        raw: AffinityDeltas {
+            warmth: w_raw,
+            trust: t_raw,
+            intrigue: ig_raw,
+            intimacy: im_raw,
+            tension: tn_raw,
+            patience: rule.patience,
+        },
+        committed: AffinityDeltas {
+            warmth: w_com,
+            trust: t_com,
+            intrigue: ig_com,
+            intimacy: im_com,
+            tension: tn_com,
+            patience: rule.patience,
+        },
+        pending: PendingDeltas {
+            warmth: w_pend,
+            trust: t_pend,
+            intrigue: ig_pend,
+            intimacy: im_pend,
+            tension: tn_pend,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,17 +571,14 @@ mod tests {
     #[test]
     fn apply_deltas_clamps_to_valid_ranges() {
         let mut a = fresh();
-        a.apply_deltas(
-            &AffinityDeltas {
-                warmth: 5.0, // would push past 1.0
-                trust: -2.0, // would push below 0.0
-                intrigue: 0.1,
-                intimacy: 0.0,
-                patience: 0.0,
-                tension: 0.0,
-            },
-            /*ema_inertia*/ 0.0,
-        ); // no smoothing → direct apply
+        a.apply_deltas(&AffinityDeltas {
+            warmth: 5.0, // would push past 1.0
+            trust: -2.0, // would push below 0.0
+            intrigue: 0.1,
+            intimacy: 0.0,
+            patience: 0.0,
+            tension: 0.0,
+        });
         assert_eq!(a.warmth, 1.0, "warmth clamps to 1.0 (max)");
         assert_eq!(a.trust, 0.0, "trust clamps to 0.0 (min)");
         assert!((a.intrigue - 0.6).abs() < 1e-9);
@@ -387,52 +587,26 @@ mod tests {
     #[test]
     fn warmth_can_go_negative_others_cannot() {
         let mut a = fresh();
-        a.apply_deltas(
-            &AffinityDeltas {
-                warmth: -2.0, // -1.0 floor
-                trust: 0.0,
-                intrigue: 0.0,
-                intimacy: 0.0,
-                patience: 0.0,
-                tension: 0.0,
-            },
-            0.0,
-        );
+        a.apply_deltas(&AffinityDeltas {
+            warmth: -2.0, // -1.0 floor
+            trust: 0.0,
+            intrigue: 0.0,
+            intimacy: 0.0,
+            patience: 0.0,
+            tension: 0.0,
+        });
         assert_eq!(a.warmth, -1.0);
     }
 
     #[test]
-    fn ema_smoothing_applies_inertia() {
-        // EMA with inertia=0.8: blended = (1.0 - 0.8) * delta = 0.2 * delta
-        let mut a = fresh();
-        let before = a.warmth;
-        a.apply_deltas(
-            &AffinityDeltas {
-                warmth: 0.5,
-                trust: 0.0,
-                intrigue: 0.0,
-                intimacy: 0.0,
-                patience: 0.0,
-                tension: 0.0,
-            },
-            0.8,
-        );
-        assert!((a.warmth - (before + 0.5 * 0.2)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn apply_deltas_combined_then_gains_and_clamps() {
-        // A pre-summed (rule + llm) delta on a hot axis at v1 pacing
-        // (ema_inertia 0.5 → gain 0.5): 0.3 + 0.5 * 0.15 = 0.375.
+    fn apply_deltas_is_direct_no_smoothing() {
+        // A committed delta from grade_turn applies verbatim: 0.3 + 0.15 = 0.45.
         let mut a = fresh(); // warmth 0.3
-        a.apply_deltas(
-            &AffinityDeltas {
-                warmth: 0.15,
-                ..Default::default()
-            },
-            0.5,
-        );
-        assert!((a.warmth - 0.375).abs() < 1e-9);
+        a.apply_deltas(&AffinityDeltas {
+            warmth: 0.15,
+            ..Default::default()
+        });
+        assert!((a.warmth - 0.45).abs() < 1e-9);
     }
 
     #[test]
@@ -607,23 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn bar_maps_tiers_to_bands() {
-        // Tier lower edges land on their band's lower edge.
-        assert!((bar(0.0)).abs() < 1e-9);
-        assert!((bar(0.15) - 0.25).abs() < 1e-9);
-        assert!((bar(0.35) - 0.50).abs() < 1e-9);
-        assert!((bar(0.62) - 0.75).abs() < 1e-9);
-        assert!((bar(0.9) - 0.95).abs() < 1e-9); // tier 5 lower edge
-        assert!((bar(1.0) - 1.0).abs() < 1e-9);
-        // midpoint of tier 1 [0,0.15) → 0.075 → half of the 0..0.25 band
-        assert!((bar(0.075) - 0.125).abs() < 1e-9);
-        // tier 4 midpoint 0.76 → 0.75 + 0.5*(0.95-0.75) = 0.85 (inside [0.75,0.95))
-        assert!((bar(0.76) - 0.85).abs() < 1e-9);
-        // tier 5 midpoint 0.95 → 0.95 + 0.5*(1.0-0.95) = 0.975
-        assert!((bar(0.95) - 0.975).abs() < 1e-9);
-    }
-
-    #[test]
     fn labels_map_from_scores() {
         let mut a = fresh();
         a.warmth = 0.0;
@@ -722,6 +879,312 @@ mod tests {
         assert_eq!(bond.from, "acquaintance");
         assert_eq!(bond.to, "close_friend");
         assert!(d.chemistry.is_none());
+    }
+
+    // ─── affinity 3.0 pipeline ───
+
+    fn zeroed() -> Affinity {
+        let mut a = fresh();
+        a.warmth = 0.0;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        a
+    }
+
+    fn turn(
+        a: &Affinity,
+        grades: AxisGrades,
+        rule: AffinityDeltas,
+        pending: PendingDeltas,
+        boost: f64,
+        t: &AffinityTuning,
+    ) -> GradeTurnOutcome {
+        grade_turn(a, &grades, &rule, &pending, boost, t)
+    }
+
+    /// P3 envelope continuity: with defaults, grade +4 lands +0.20 and grade −4
+    /// lands −0.30 — the 2.0 effective caps, bit for bit. patience never moves.
+    #[test]
+    fn grade_envelope_matches_2_0_effective_caps() {
+        let a = zeroed();
+        let o = turn(
+            &a,
+            AxisGrades {
+                warmth: 4,
+                trust: -4,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        assert!((o.raw.warmth - 0.2).abs() < 1e-9);
+        assert!((o.committed.warmth - 0.2).abs() < 1e-9);
+        assert!((o.committed.trust - (-0.3)).abs() < 1e-9);
+        assert_eq!(o.raw.patience, 0.0);
+        assert_eq!(o.committed.patience, 0.0);
+    }
+
+    /// Positive raw is damped by the OWN line's tier; a counterpart line inside
+    /// the grace zone charges no penalty, past it the quadratic ramp starts.
+    #[test]
+    fn positive_decays_by_own_tier_and_pays_counterpart_ramp() {
+        let mut a = zeroed();
+        a.trust = 0.75;
+        a.intrigue = 0.75; // bond = 0.5 → tier 3; chemistry = 0 → tier 1
+        let o = turn(
+            &a,
+            AxisGrades {
+                trust: 2,
+                intimacy: 2,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        // trust: own tier 3 → 0.45 × 0.10, counterpart chem 0 → no penalty
+        assert!((o.committed.trust - 0.045).abs() < 1e-9);
+        // intimacy: own tier 1 → ×1.0, counterpart bond 0.5 → κ·((0.15/0.65)²)
+        let p = 0.05 * (0.15f64 / 0.65).powi(2);
+        assert!((o.committed.intimacy - (0.10 - p)).abs() < 1e-9);
+    }
+
+    /// warmth feeds both lines, so its damping reads the FURTHER line's tier
+    /// (same max rule as the intimacy rung) and it never pays the penalty.
+    #[test]
+    fn warmth_decays_by_max_tier_and_is_penalty_exempt() {
+        let mut a = zeroed();
+        a.warmth = 0.85;
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chemistry = 0.95 → tier 5; bond ≈ 0.283 → tier 2
+        let o = turn(
+            &a,
+            AxisGrades {
+                warmth: 2,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        assert!((o.committed.warmth - 0.1 * 0.10).abs() < 1e-9);
+    }
+
+    /// A positive push on an exclusive axis can be penalised through zero when
+    /// the counterpart line is maxed — the friend-zone wall.
+    #[test]
+    fn penalty_flips_small_positive_pushes_negative() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chemistry = 1.0; bond = 1/3 → tier 2
+        let g1 = turn(
+            &a,
+            AxisGrades {
+                trust: 1,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        // 0.7 × 0.05 − 0.05 = −0.015: honest effort, net loss
+        assert!((g1.committed.trust - (-0.015)).abs() < 1e-9);
+        let g2 = turn(
+            &a,
+            AxisGrades {
+                trust: 2,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        // 0.7 × 0.10 − 0.05 = +0.02: a clearer moment still lands
+        assert!((g2.committed.trust - 0.02).abs() < 1e-9);
+    }
+
+    /// Negative raw is never damped by tier, and the penalty stacks on top.
+    #[test]
+    fn negative_skips_decay_and_pays_extra() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chemistry = 1.0
+        a.trust = 0.9;
+        a.intrigue = 0.9; // bond ≈ 0.933 → tier 5 (own tier must not soften the loss)
+        let o = turn(
+            &a,
+            AxisGrades {
+                trust: -2,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        // −2 × 0.05 × 1.5 = −0.15, minus κ·φ(1.0) = 0.05 → −0.20
+        assert!((o.committed.trust - (-0.20)).abs() < 1e-9);
+    }
+
+    /// P6: the pipeline charges events, not rent — an all-zero verdict moves
+    /// nothing no matter how high the lines sit, and pending survives intact.
+    #[test]
+    fn zero_verdict_charges_nothing() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.trust = 1.0;
+        a.intrigue = 1.0;
+        a.intimacy = 1.0;
+        a.tension = 1.0;
+        let pending = PendingDeltas {
+            trust: 0.02,
+            ..Default::default()
+        };
+        let t = AffinityTuning {
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+        let o = turn(
+            &a,
+            AxisGrades::default(),
+            AffinityDeltas::default(),
+            pending,
+            1.0,
+            &t,
+        );
+        assert_eq!(o.committed.trust, 0.0);
+        assert_eq!(o.committed.warmth, 0.0);
+        assert!((o.pending.trust - 0.02).abs() < 1e-9);
+    }
+
+    /// Rule nudges ride the same decay but never trigger the penalty (only a
+    /// judge-touched axis pays it).
+    #[test]
+    fn rule_only_delta_decays_but_pays_no_penalty() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chem 1.0; bond 1/3 → tier 2
+        let o = turn(
+            &a,
+            AxisGrades::default(),
+            AffinityDeltas {
+                intrigue: 0.02,
+                ..Default::default()
+            },
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        assert!((o.committed.intrigue - 0.7 * 0.02).abs() < 1e-9);
+    }
+
+    /// The decision-doc threshold example, verbatim: θ=0.5, real scores
+    /// 0.1 / 0.2 / 0.3 per turn → committed deltas 0 / 0 / 0.6.
+    #[test]
+    fn threshold_accumulates_until_it_clears() {
+        let a = zeroed(); // trust stays 0 (nothing commits), so tier stays 1 and D=1
+        let t = AffinityTuning {
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut pending = PendingDeltas::default();
+        let mut committed = Vec::new();
+        for r in [0.1, 0.2, 0.3] {
+            let o = turn(
+                &a,
+                AxisGrades::default(),
+                AffinityDeltas {
+                    trust: r,
+                    ..Default::default()
+                },
+                pending,
+                1.0,
+                &t,
+            );
+            committed.push(o.committed.trust);
+            pending = o.pending;
+        }
+        assert_eq!(committed[0], 0.0);
+        assert_eq!(committed[1], 0.0);
+        assert!((committed[2] - 0.6).abs() < 1e-9);
+        assert!(pending.is_zero());
+    }
+
+    /// Demo boost multiplies positive raw only; losses stay full price.
+    #[test]
+    fn demo_boost_is_positive_only() {
+        let a = zeroed();
+        let o = turn(
+            &a,
+            AxisGrades {
+                warmth: 1,
+                trust: -1,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.4,
+            &AffinityTuning::default(),
+        );
+        assert!((o.committed.warmth - 0.07).abs() < 1e-9);
+        assert!((o.committed.trust - (-0.075)).abs() < 1e-9);
+    }
+
+    /// patience is a rule axis: its rule delta passes through the pipeline
+    /// untouched — no decay, no penalty, no threshold gate — so the fallback
+    /// path (judge eval failed, rule nudges only) still lands 1:1.
+    #[test]
+    fn rule_patience_passes_through_ungated() {
+        let a = zeroed();
+        let t = AffinityTuning {
+            delta_threshold: 0.5, // must NOT buffer patience
+            ..Default::default()
+        };
+        let o = turn(
+            &a,
+            AxisGrades::default(),
+            AffinityDeltas {
+                patience: -0.02,
+                ..Default::default()
+            },
+            PendingDeltas::default(),
+            1.0,
+            &t,
+        );
+        assert!((o.committed.patience - (-0.02)).abs() < 1e-9);
+        assert!((o.raw.patience - (-0.02)).abs() < 1e-9);
+    }
+
+    /// Out-of-range grades clamp instead of scaling: the judge cannot mint
+    /// more than a ±4 verdict no matter what it emits.
+    #[test]
+    fn grades_clamp_to_plus_minus_four() {
+        let a = zeroed();
+        let o = turn(
+            &a,
+            AxisGrades {
+                warmth: 9,
+                trust: -9,
+                ..Default::default()
+            },
+            AffinityDeltas::default(),
+            PendingDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+        );
+        assert!((o.committed.warmth - 0.2).abs() < 1e-9);
+        assert!((o.committed.trust - (-0.3)).abs() < 1e-9);
     }
 
     #[test]

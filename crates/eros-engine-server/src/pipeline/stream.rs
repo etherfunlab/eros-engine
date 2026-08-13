@@ -1929,9 +1929,10 @@ fn build_pde_ctx(
     // deep relationships as shallow, so both buckets arrive as engine-owned
     // lines. Unconditional, like 图片能力 — the low end of either scale is
     // itself a signal, so a missing line must never read as "rung 1".
+    // Buckets ONLY, no numbers: raw scores would re-open the float comparison
+    // the buckets exist to remove. The numeric state lives in the decision
+    // row's `inputs` snapshot instead (issue #254).
     let rung = a.intimacy_rung();
-    let bond = a.bond_score();
-    let chemistry = a.chemistry_score();
     let patience_band = match a.patience_band() {
         eros_engine_core::affinity::PatienceBand::High => "高",
         eros_engine_core::affinity::PatienceBand::Mid => "中",
@@ -1961,20 +1962,13 @@ fn build_pde_ctx(
     };
     format!(
         "{persona_block}[最近对话]\n{transcript}\n\n\
-         [关系状态] warmth={:.2} trust={:.2} intrigue={:.2} intimacy={:.2} patience={:.2} tension={:.2}\n\
-         [亲密度] 当前档位=第 {rung} 档（bond={bond:.2} chemistry={chemistry:.2}）\n\
+         [亲密度] 当前档位=第 {rung} 档\n\
          [耐心] 当前档位={patience_band}\n\
          [信号] message_count={} hours_since_last_message={:.1} ghost_streak={} hours_since_last_ghost={}\n\
          [图片能力] 本轮可发图={image_flag}\n\
          [近期图片] 最近{INPUT_FILTER_CONTEXT_TURNS}条消息内已发图={img_count} 张；上一条 AI 消息是图片={last_img}（以本行计数为准，对话记录里的图片标记仅供参考）\n\
          {product_qa_section}\n\
          [用户最新消息]\n{latest}",
-        a.warmth,
-        a.trust,
-        a.intrigue,
-        a.intimacy,
-        a.patience,
-        a.tension,
         s.message_count,
         s.hours_since_last_message,
         s.ghost_streak,
@@ -1982,6 +1976,34 @@ fn build_pde_ctx(
             .map(|h| format!("{h:.1}"))
             .unwrap_or_else(|| "none".into()),
     )
+}
+
+/// Engine-computed relationship state as shown to the judge this run (issue
+/// #254): the two discrete labels the prompt carries, plus the line scores and
+/// raw axes they were cut from — the prompt itself no longer carries any
+/// number, so this snapshot is the only place the gate's inputs survive.
+/// Written to `companion_decision_events.inputs`; fail-open at the call site.
+fn pde_inputs_snapshot(a: &eros_engine_core::affinity::Affinity) -> serde_json::Value {
+    let band = match a.patience_band() {
+        eros_engine_core::affinity::PatienceBand::High => "high",
+        eros_engine_core::affinity::PatienceBand::Mid => "mid",
+        eros_engine_core::affinity::PatienceBand::Low => "low",
+    };
+    serde_json::json!({
+        "v": 1,
+        "intimacy_rung": a.intimacy_rung(),
+        "patience_band": band,
+        "bond": a.bond_score(),
+        "chemistry": a.chemistry_score(),
+        "axes": {
+            "warmth": a.warmth,
+            "trust": a.trust,
+            "intrigue": a.intrigue,
+            "intimacy": a.intimacy,
+            "patience": a.patience,
+            "tension": a.tension,
+        },
+    })
 }
 
 /// Serializable view of a verdict for the audit `payload` column.
@@ -3223,6 +3245,10 @@ pub fn run_stream(
             let ev_msg = user_msg.user_message_id;
             let status = run.status.as_str();
             let acted = plan.action_type;
+            // Snapshot of the affinity state the judge's payload was built
+            // from (issue #254). The prompt carries only the buckets; this row
+            // keeps the numbers.
+            let inputs = Some(pde_inputs_snapshot(&input.affinity));
             tokio::spawn(async move {
                 let proposed = run.verdict.as_ref().map(|v| v.action.as_str());
                 let payload: Option<serde_json::Value> = match &run.verdict {
@@ -3241,6 +3267,7 @@ pub fn run_stream(
                         action: Some(action_str),
                         proposed_action: proposed,
                         payload,
+                        inputs,
                         model: run.model.as_deref(),
                         usage: run.usage.clone(),
                         generation_id: run.generation_id.as_deref(),
@@ -9356,7 +9383,7 @@ data: [DONE]\n\n";
     // call. The judge call and the chat call hit the SAME `/api/v1/chat/completions`
     // path on the one mock server, so they are routed by body content — the judge
     // body carries its own model id (`pde/judge`) and the `build_pde_ctx` context
-    // (`[关系状态]`); the chat body carries the chat model id (`deepseek/x`). Those
+    // (`[亲密度]`); the chat body carries the chat model id (`deepseek/x`). Those
     // two `body_string_contains` predicates are mutually exclusive.
     //
     // The `companion_decision_events` audit row is written fire-and-forget
@@ -9520,7 +9547,7 @@ data: [DONE]\n\n";
         );
         let judge_sent = String::from_utf8_lossy(&reqs[0].body);
         assert!(
-            judge_sent.contains("pde/judge") && judge_sent.contains("[关系状态]"),
+            judge_sent.contains("pde/judge") && judge_sent.contains("[亲密度]"),
             "the single call must be the PDE judge (carries build_pde_ctx); got {judge_sent}",
         );
     }
@@ -11372,7 +11399,7 @@ data: [DONE]\n\n";
         };
         let ctx = build_pde_ctx(&t, &input, true, None);
         let persona_at = ctx.find("[角色人格]").expect("persona block present");
-        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        let rel_at = ctx.find("[亲密度]").expect("relationship bucket present");
         assert!(
             persona_at < rel_at,
             "persona must precede relationship: {ctx}"
@@ -11399,10 +11426,13 @@ data: [DONE]\n\n";
         );
     }
 
-    /// Both engine-owned bucket lines render between [关系状态] and [信号],
-    /// with the composites at the same {:.2} as the axes above them.
+    /// Both engine-owned bucket lines render before [信号], as labels ONLY —
+    /// affinity 3.0 removed every number from the judge's payload (the六轴
+    /// [关系状态] line and the bond/chemistry parenthetical): the buckets are
+    /// authoritative, and the numeric state lives in the decision row's
+    /// `inputs` snapshot instead.
     #[test]
-    fn pde_ctx_renders_intimacy_and_patience_buckets() {
+    fn pde_ctx_renders_buckets_only_no_numbers() {
         let mut input = fixture_decision_input();
         input.affinity.warmth = 0.9;
         input.affinity.trust = 0.9;
@@ -11412,20 +11442,23 @@ data: [DONE]\n\n";
         input.affinity.patience = 0.8;
         let ctx = build_pde_ctx(&JudgeTranscript::default(), &input, true, None);
         assert!(
-            ctx.contains("[亲密度] 当前档位=第 3 档（bond=0.90 chemistry=0.30）"),
-            "intimacy line carries the rung and both composites: {ctx}"
+            ctx.contains("[亲密度] 当前档位=第 3 档\n"),
+            "intimacy line carries the rung and nothing else: {ctx}"
         );
         assert!(
             ctx.contains("[耐心] 当前档位=高"),
             "patience band line present: {ctx}"
         );
-        let rel_at = ctx.find("[关系状态]").expect("relationship block present");
+        assert!(
+            !ctx.contains("[关系状态]") && !ctx.contains("warmth=") && !ctx.contains("bond="),
+            "no numeric affinity state may reach the judge: {ctx}"
+        );
         let rung_at = ctx.find("[亲密度]").expect("intimacy line present");
         let patience_at = ctx.find("[耐心]").expect("patience line present");
         let signal_at = ctx.find("[信号]").expect("signal block present");
         assert!(
-            rel_at < rung_at && rung_at < patience_at && patience_at < signal_at,
-            "buckets sit between [关系状态] and [信号]: {ctx}"
+            rung_at < patience_at && patience_at < signal_at,
+            "buckets sit before [信号]: {ctx}"
         );
     }
 

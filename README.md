@@ -37,7 +37,7 @@ This is not a generic agent framework. It is the stateful core for products wher
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
 │  │ post-process, spawned after reply              │     │
-│  │   • affinity: persist 6D delta + EMA           │     │
+│  │   • affinity: persist 6D graded turn           │     │
 │  │   • memory:   Voyage embed → pgvector upsert   │     │
 │  │   • insight:  extract facts → JSONB merge      │     │
 │  └────────────────────────────────────────────────┘     │
@@ -83,7 +83,7 @@ Bring your own Postgres and `.env`; the same `docker/Dockerfile` can be deployed
 ## Documentation
 
 - [Architecture](docs/architecture.md) — crate boundaries, pipeline phases, and data flow.
-- [Affinity model](docs/affinity-model.md) — relationship dimensions, smoothing, decay, and labels.
+- [Affinity model](docs/affinity-model.md) — relationship dimensions, graded scoring, decay, and labels.
 - [Ghost mechanics](docs/ghost-mechanics.md) — when and why a companion may stay silent.
 - [Memory layers](docs/memory-layers.md) — profile and relationship memory, embeddings, and retrieval.
 - [World system](docs/world-system.md) — experimental World Memories, World Town, and World Stories simulations.

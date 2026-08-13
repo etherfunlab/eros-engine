@@ -7,6 +7,8 @@ use uuid::Uuid;
 /// One `companion_decision_events` row. `payload` is the full verdict JSON when
 /// the judge parsed, or the raw model text on a parse error. `proposed_action`
 /// is the judge's pre-guardrail action (NULL unless `status == "ok"`).
+/// `inputs` is the engine-computed relationship state the judge was shown
+/// (issue #254) — engine-supplied, never model output, NULL when unavailable.
 pub struct DecisionEventInsert<'a> {
     pub run_id: Uuid,
     pub user_id: Uuid,
@@ -16,6 +18,7 @@ pub struct DecisionEventInsert<'a> {
     pub action: Option<&'a str>,
     pub proposed_action: Option<&'a str>,
     pub payload: Option<serde_json::Value>,
+    pub inputs: Option<serde_json::Value>,
     pub model: Option<&'a str>,
     pub usage: Option<serde_json::Value>,
     pub generation_id: Option<&'a str>,
@@ -31,8 +34,8 @@ impl DecisionEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.companion_decision_events \
                (run_id, user_id, session_id, message_id, status, action, \
-                proposed_action, payload, model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                proposed_action, payload, inputs, model, usage, generation_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
         .bind(ev.run_id)
         .bind(ev.user_id)
@@ -42,6 +45,7 @@ impl DecisionEventRepo<'_> {
         .bind(ev.action)
         .bind(ev.proposed_action)
         .bind(ev.payload)
+        .bind(ev.inputs)
         .bind(ev.model)
         .bind(ev.usage)
         .bind(ev.generation_id)
@@ -71,6 +75,10 @@ mod tests {
             action: Some("reply_text"),
             proposed_action: Some("ghost"),
             payload: Some(serde_json::json!({"action":"ghost","inner_state":"想躲"})),
+            inputs: Some(serde_json::json!({
+                "v": 1, "intimacy_rung": 2, "patience_band": "mid",
+                "bond": 0.41, "chemistry": 0.27,
+            })),
             model: Some("x-ai/grok-4-mini"),
             usage: Some(serde_json::json!({"total_tokens": 12})),
             generation_id: Some("gen_1"),
@@ -78,7 +86,8 @@ mod tests {
         .await
         .unwrap();
 
-        // parse_error row: raw text payload, NULL proposed_action
+        // parse_error row: raw text payload, NULL proposed_action, NULL inputs
+        // (the fail-open path when snapshot serialisation fails).
         repo.record(DecisionEventInsert {
             run_id: Uuid::new_v4(),
             user_id: user,
@@ -88,6 +97,7 @@ mod tests {
             action: Some("reply_text"),
             proposed_action: None,
             payload: Some(serde_json::Value::String("garbage from model".into())),
+            inputs: None,
             model: Some("x-ai/grok-4-mini"),
             usage: None,
             generation_id: None,
@@ -95,8 +105,13 @@ mod tests {
         .await
         .unwrap();
 
-        let (status, action, proposed): (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT status, action, proposed_action FROM engine.companion_decision_events \
+        let (status, action, proposed, inputs): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, action, proposed_action, inputs FROM engine.companion_decision_events \
              WHERE run_id = $1",
         )
         .bind(run_ok)
@@ -106,6 +121,9 @@ mod tests {
         assert_eq!(status, "ok");
         assert_eq!(action.as_deref(), Some("reply_text"));
         assert_eq!(proposed.as_deref(), Some("ghost"));
+        let inputs = inputs.expect("engine-supplied inputs snapshot round-trips");
+        assert_eq!(inputs["intimacy_rung"].as_i64(), Some(2));
+        assert_eq!(inputs["patience_band"].as_str(), Some("mid"));
 
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM engine.companion_decision_events WHERE user_id = $1",

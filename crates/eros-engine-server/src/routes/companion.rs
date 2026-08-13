@@ -73,7 +73,7 @@ pub struct StartChatRequest {
     /// Optional genome id. Required when `instance_id` is absent.
     pub genome_id: Option<Uuid>,
     /// Mark the new session as a demo. Persisted to `metadata.is_demo` and
-    /// read by the affinity pipeline to apply `demo_ema_inertia` instead
+    /// read by the affinity pipeline to apply `AFFINITY_DEMO_BOOST` instead
     /// of the global value, so meters move visibly within the turn budget.
     /// Ignored when resuming an existing session.
     #[serde(default)]
@@ -777,8 +777,9 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         auth,
         config: crate::state::ServerConfig {
             expose_affinity_debug: true,
-            ema_inertia: 0.0, // no smoothing → deltas applied 1:1 in tests
-            demo_ema_inertia: 0.0,
+            // Default tuning: at a fresh seed (tier 1, no counterpart penalty)
+            // rule deltas land 1:1, matching the old no-smoothing test setup.
+            affinity_tuning: eros_engine_core::affinity::AffinityTuning::default(),
             bind_addr: "127.0.0.1:0".into(),
             // Sweeper disabled in tests — unit tests don't spawn it
             // and the fields are just for AppState completeness.

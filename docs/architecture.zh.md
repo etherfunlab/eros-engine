@@ -40,7 +40,8 @@ PDE 決策                eros_engine_core::pde::decide(&input) → ActionPlan
                         （默认规则型；可通过
                          [tasks.pde_decision].filter_prompt 启用 LLM 判断器，
                          失败时回退到规则引擎；判断结果记录到
-                         companion_decision_events）
+                         companion_decision_events——payload = 模型返回的，
+                         inputs = 引擎供给它看的状态）
        │
        ▼
 action 分派             run_stream 里的 inline `match plan.action_type`：
@@ -57,7 +58,8 @@ chat 執行               若有 ChatRequest：state.openrouter.execute(req).awa
        │
        ▼
 spawn post_process     tokio::spawn——跟返回響應並行：
-                        - affinity 寫入（LLM 評估 6 維 Δ → DB）
+                        - affinity 寫入（LLM 判官报档位 →
+                          引擎写入管线 → DB）
                         - memory   （Voyage embed → pgvector upsert）
                         - insight  （LLM 抽事实 → human_insights UPSERT，
                           按列增量更新）
@@ -147,7 +149,7 @@ user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断�
 crates/
 ├── eros-engine-core/
 │   └── src/
-│       ├── affinity.rs       # 6 維向量 + EMA + 時間衰退 + 標籤
+│       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
 │       ├── ghost.rs          # 評分公式 + 4 層保護
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
@@ -159,7 +161,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0040_persona_instance_fks
+│   ├── migrations/           # 0000_schema → 0044_decision_event_inputs
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -182,7 +184,7 @@ crates/
 
 ## 子頁面
 
-- [好感度模型](affinity-model.zh.md)——6 個維度、EMA、時間衰退、關係標籤
+- [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP

@@ -40,7 +40,8 @@ PDE decide             eros_engine_core::pde::decide(&input) → ActionPlan
                        (rules-based by default; opt-in LLM judge via
                         [tasks.pde_decision].filter_prompt, fail-open to
                         rule engine; verdict audited to
-                        companion_decision_events)
+                        companion_decision_events — payload = what the model
+                        returned, inputs = the engine-computed state it saw)
        │
        ▼
 action dispatch        inline `match plan.action_type` in run_stream:
@@ -57,7 +58,8 @@ chat exec              if Some(req): state.openrouter.execute(req).await?
        │
        ▼
 spawn post_process     tokio::spawn — runs concurrent with response return:
-                       - affinity persist (LLM evaluates 6-dim Δ → DB)
+                       - affinity persist (LLM judge grades the turn →
+                         engine grade pipeline → DB)
                        - memory   (Voyage embed → pgvector upsert)
                        - insight  (LLM extracts facts → human_insights UPSERT,
                          per-column incremental)
@@ -155,7 +157,7 @@ Two reasons:
 crates/
 ├── eros-engine-core/
 │   └── src/
-│       ├── affinity.rs       # 6-dim vector + EMA + time decay + labels
+│       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
 │       ├── ghost.rs          # score formula + 4-tier protection
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
@@ -167,7 +169,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0040_persona_instance_fks
+│   ├── migrations/           # 0000_schema → 0044_decision_event_inputs
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -190,7 +192,7 @@ crates/
 
 ## Sub-pages
 
-- [Affinity model](affinity-model.md) — 6 dimensions, EMA, time decay, relationship labels
+- [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP

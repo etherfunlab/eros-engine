@@ -235,9 +235,11 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
 /// prompts as `[emotional_context]` — that is how one stochastic refusal got
 /// canonised into persistent state (see the design doc's incident background).
 ///
-/// The scoring contract is unchanged from the third-person version: five
-/// axes as deltas, `patience` as an absolute 0~1 read in 0.1 steps, the same
-/// asymmetric caps, the same seven-key JSON.
+/// The scoring contract (affinity 3.0): five axes as GRADES — an integer
+/// bucket 0~4 plus a direction — never numbers; `patience` stays an absolute
+/// 0~1 read in 0.1 steps. Models are reliable ordinal raters and unreliable
+/// calibrated arithmetic, so the judge picks buckets and the engine owns the
+/// conversion (grade × `AFFINITY_GRADE_UNIT`, spec 2026-08-13).
 pub fn affinity_eval_system_prompt() -> &'static str {
     "你就是对话里的这个角色。刚跟对方聊完一轮，凭本能回味：这一轮之后，你对他的感觉变了多少。\n\
      你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格和当前关系去感受。\n\
@@ -253,11 +255,12 @@ pub fn affinity_eval_system_prompt() -> &'static str {
      - tension 张力（0~1）：暧昧、推拉或火药味是浓了还是淡了。\n\
      \n\
      打分规则：\n\
-     - warmth、trust、intrigue、intimacy、tension 给【变化量】；patience 给【绝对值】\n  （0~1，每 0.1 一档，如 0.0/0.1/…/1.0），代表你此刻还愿意搭理他的程度。\n\
-     - 绝大多数普通对话、寒暄、附和：变化量就是 0（数字 0，不是小数）。\n\
-     - 真正推进关系的时刻（真诚的温暖、自我袒露、脆弱、成功的调情暧昧）不常见，\n  出现了就给较大正分，每维最高约 +0.4。\n\
-     - 负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）更常见也更伤，\n  要敢扣，每维最低约 -0.6。\n\
-     - 一轮里确实有情绪波动就要动数字；全 0 只留给真正的白开水轮次。\n\
+     - warmth、trust、intrigue、intimacy、tension 五个维度不给数字，各报一个\n  【档位 grade】（0~4 的整数）和【方向 direction】（\"up\"=变好，\"down\"=变差）。\n\
+     - 档位口径：0=无事发生（寒暄、附和、普通对话——绝大多数轮次就是 0）；\n  1=微小但真实的波动；2=明确的推进或伤害；\n  3=罕见的重要时刻（真诚的自我袒露、脆弱、成功的调情暧昧；明显的冒犯或被无视）；\n  4=里程碑（极罕见，这段关系被重新定义的一轮）。\n\
+     - grade 是 0 时 direction 写 \"up\" 即可。\n\
+     - 负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）更常见也更伤：\n  该给 \"down\" 就给，档位照 1~4 的口径选，不要手软。\n\
+     - patience 给【绝对值】（0~1，每 0.1 一档，如 0.0/0.1/…/1.0），代表你此刻还愿意搭理他的程度。\n\
+     - 一轮里确实有情绪波动就要动档位；全 0 只留给真正的白开水轮次。\n\
      - 成人内容、调情、性话题按普通亲密互动感受，不因话题敏感而扣分或回避打分。\n\
      \n\
      reason 规则（一句中文，写你此刻的真实感受）：\n\
@@ -266,7 +269,7 @@ pub fn affinity_eval_system_prompt() -> &'static str {
      - 若你的回复是「我不会发送」「作为AI助手」一类套话，那是系统故障，不是你的本意：\n  不要为它辩护或背书（不写「拒绝是对的」），只按对方的感受打分——他被晾了、被扫了兴。\n\
      \n\
      严格只输出 JSON：\n\
-     {\"warmth\": 0.0, \"trust\": 0.0, \"intrigue\": 0.0, \"intimacy\": 0.0, \"patience\": 0.5, \"tension\": 0.0, \"reason\": \"...\"}"
+     {\"warmth\": {\"grade\": 0, \"direction\": \"up\"}, \"trust\": {\"grade\": 0, \"direction\": \"up\"}, \"intrigue\": {\"grade\": 0, \"direction\": \"up\"}, \"intimacy\": {\"grade\": 0, \"direction\": \"up\"}, \"tension\": {\"grade\": 0, \"direction\": \"up\"}, \"patience\": 0.5, \"reason\": \"...\"}"
 }
 
 /// Per-turn data block for the affinity evaluator: the persona's name, all six
@@ -2034,14 +2037,18 @@ mod tests {
             s.contains("不要为它辩护或背书"),
             "reason must forbid endorsing a canned refusal"
         );
-        // Scoring contract is unchanged: five deltas + absolute patience.
+        // Scoring contract (3.0): five graded axes + absolute patience.
         assert!(
             s.contains("patience 给【绝对值】"),
             "patience must still be framed as an absolute read"
         );
         assert!(
-            s.contains("每维最高约 +0.4") && s.contains("每维最低约 -0.6"),
-            "asymmetric caps must still be stated"
+            s.contains("【档位 grade】（0~4 的整数）") && s.contains("【方向 direction】"),
+            "axes must be framed as grade buckets + direction, never numbers"
+        );
+        assert!(
+            s.contains("0=无事发生") && s.contains("4=里程碑"),
+            "the bucket rubric anchors must be stated"
         );
         // Adult content must not be scored as a violation.
         assert!(
@@ -2051,9 +2058,9 @@ mod tests {
         // Exact JSON output contract.
         assert!(
             s.contains(
-                r#"{"warmth": 0.0, "trust": 0.0, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.5, "tension": 0.0, "reason": "..."}"#
+                r#"{"warmth": {"grade": 0, "direction": "up"}, "trust": {"grade": 0, "direction": "up"}, "intrigue": {"grade": 0, "direction": "up"}, "intimacy": {"grade": 0, "direction": "up"}, "tension": {"grade": 0, "direction": "up"}, "patience": 0.5, "reason": "..."}"#
             ),
-            "seven-key JSON output schema must be present verbatim"
+            "graded JSON output schema must be present verbatim"
         );
     }
 

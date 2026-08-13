@@ -13,22 +13,22 @@
 | `trust` | 0.0 ↔ 1.0 | `0.0` | 话题深度，是否愿意暴露自己。Bond 轴。 |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | 好奇心、追问动力，抗 ghost 的主力。Bond 轴。 |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | 内部梗、昵称、回头呼应之前的细节。Chemistry 轴。 |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。当该轮 LLM 给出绝对值读数时（0~1，每 0.1 档），与规则 delta 合并后直接写入（不走 EMA）；没有读数时规则 delta 单独走常规 EMA 路径（见下文）。始终夹钳到 `[0, 1]`。不计入两条线。 |
+| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。当该轮 LLM 给出绝对值读数时（0~1，每 0.1 档），与规则 delta 合并后直接写入；没有读数时规则 delta 单独按 1:1 应用（见下文）。始终夹钳到 `[0, 1]`。不计入两条线。 |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | 推拉、玩闹式的小摩擦、傲娇空间。Chemistry 轴。 |
 
 只有 `warmth` 可以为负值。其余五个都限制在 `[0, 1]`。每次更新都会对六个轴做夹钳（clamp）。
 
 **默认种子**值仅对迁移 `0029` 之后创建的新行生效，已有行不受影响。
 
-### EMA 平滑
+### 无平滑——按档位写入
 
-LLM 评估出的 deltas 会通过指数移动平均应用，避免大幅跳变：
+自好感度 3.0 起，写入路径上不再有 EMA。评估器报告的是每轴**档位（grade）**而非数字 delta；引擎把档位换算成分数、做衰减与门控（见[写入管线](#写入管线好感度-30)），再把提交的 delta 按 1:1 应用：
 
 ```
-new_value = clamp(old_value + (1 − ema_inertia) × delta)
+new_value = clamp(old_value + committed_delta)
 ```
 
-默认 `ema_inertia = 0.5`（环境变量 `EMA_INERTIA` 可调）。在该默认值下，delta `+0.5` 在这一轮会移动 `+0.25`。以 `metadata.is_demo` 开启的会话改用 `DEMO_EMA_INERTIA`（默认 `0.3`），让 demo 场次的好感度表能更快看到变化——同样 `+0.5` 的 delta 在该惯性下会移动 `+0.35`。
+提交的 delta 就是字面意义上的变化量——EMA 曾经承担的阻尼现在由管线里的分档衰减负责。以 `metadata.is_demo` 开启的会话会把正向评分乘以 `AFFINITY_DEMO_BOOST`（默认 `1.4`），让 demo 场次的好感度表在短暂的轮次预算内有可见的移动。
 
 ### 时间衰退
 
@@ -46,15 +46,15 @@ tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 
 ### Patience：LLM 绝对读数 + 规则 delta
 
-`patience` 不再是纯规则轴。每轮的 `affinity_evaluation`（与其余五轴同一次 LLM 调用，不产生新的往返）中，模型现在会额外给出一个**绝对**的 `patience` 读数（`0.0`–`1.0`，每 `0.1` 一档，代表当前对用户还剩多少耐心，而非变化量）。引擎把模型读数四舍五入到最近的 `0.1` 并夹钳到 `[0, 1]`，记为 `L`。
+`patience` 不是档位轴。每轮的 `affinity_evaluation`（与其余五轴同一次 LLM 调用，不产生新的往返）中，模型会额外给出一个**绝对**的 `patience` 读数（`0.0`–`1.0`，每 `0.1` 一档，代表当前对用户还剩多少耐心，而非变化量）。引擎把模型读数四舍五入到最近的 `0.1` 并夹钳到 `[0, 1]`，记为 `L`。
 
 PDE 仍照常计算这一轮回复/主动消息的规则 delta `R`（`predict_reply_deltas`：长消息 +0.02 / 极短消息 −0.02 / 超过 24 小时未活动 −0.05）——这部分不变。
 
-本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。±0.4/−0.6 非对称上限在更早的 `parse_affinity_eval` 中就已作用于五个 LLM delta 轴——patience 从不受这两项上限约束。持久化时，`apply_deltas` 照常先跑一遍（六轴统一走 EMA 平滑，再各自夹钳到自己的区间——`warmth` 为 `[-1, 1]`，其余为 `[0, 1]`），随后 patience 被 `patience_target` **直接覆盖**——绕过 EMA 平滑（仍会夹钳到 `[0, 1]`）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
+本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。持久化时，写入管线照常先跑一遍——但 `patience` 从管线中原样穿过：它的规则 delta 从不参与分档衰减、跨线惩罚或阈值门控，按 1:1 应用并夹钳。随后 patience 被 `patience_target` **直接覆盖**（仍会夹钳到 `[0, 1]`）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
 
-**兜底：** 当本轮没有 LLM patience 读数时——Proactive、用户消息过短、助手回复为空、`no_persona_or_affinity`（persona 加载失败或不存在好感度行）、或评估调用报错/超时/模型省略了 `patience` 字段——`patience_target` 为 `None`，patience 走**旧路径**：把 `R` 通过 EMA 叠加并夹钳。
+**兜底：** 当本轮没有 LLM patience 读数时——Proactive、用户消息过短、助手回复为空、`no_persona_or_affinity`（persona 加载失败或不存在好感度行）、或评估调用报错/超时/模型省略了 `patience` 字段——`patience_target` 为 `None`，只应用规则 delta `R`（1:1，夹钳）。
 
-**Ghost 走独立路径，不是兜底。** Ghost 回合根本不会进入 `persist_with_event`——`persist_affinity` 把它分派给 `record_ghost`，该函数不接收任何 delta、从不跑 `apply_deltas`/EMA，只递增 `ghost_streak` / `total_ghosts` / `last_ghost_at`（写入的是全零 `effective_deltas`）。PDE 的 `ghost_affinity_deltas()`（patience `−0.05`、tension `+0.05`——与 `predict_reply_deltas` 是不同的函数）会被计算进 `ActionPlan`，但在持久化时被丢弃。因此 Ghost 回合的 `patience` 既不会被任何 delta 移动，也不会经过 EMA——只有 ghost 计数器会变化。
+**Ghost 走独立路径，不是兜底。** Ghost 回合根本不会进入 `persist_with_event`——`persist_affinity` 把它分派给 `record_ghost`，该函数不接收任何档位或 delta、从不跑写入管线，只递增 `ghost_streak` / `total_ghosts` / `last_ghost_at`（写入的是全零 `effective_deltas`）。PDE 的 `ghost_affinity_deltas()`（patience `−0.05`、tension `+0.05`——与 `predict_reply_deltas` 是不同的函数）会被计算进 `ActionPlan`，但在持久化时被丢弃。因此 Ghost 回合的 `patience` 完全不动——只有 ghost 计数器会变化。
 
 ## 两条衍生线
 
@@ -73,11 +73,11 @@ bond ≈ chemistry ≈ 0.033——两条线均在第 1 档（陌生人）。
 
 > **命名注意：** `AffinityScope::bond()/chemistry()`（用于 prompt 注入范围控制、`length_score`）采用的是*不同的*轴分组——那是一套更早的独立划分，为避免回复长度的回归而有意保留。此处的 `bond_score`/`chemistry_score` 与其完全独立。
 
-## 分档与进度条曲线
+## 分档
 
-每条线有**五档**，分档的原始分数区间逐档拉宽（越往上越难），直到顶端一个窄小的第 5 档：
+每条线有**五档**，分档的分数区间逐档拉宽（越往上越难），直到顶端一个窄小的第 5 档：
 
-| 档位 | 原始分数区间 | 区间宽度 |
+| 档位 | 分数区间 | 区间宽度 |
 |------|-----------|-----|
 | 1 | `[0.00, 0.15)` | 0.15 |
 | 2 | `[0.15, 0.35)` | 0.20 |
@@ -85,21 +85,9 @@ bond ≈ chemistry ≈ 0.033——两条线均在第 1 档（陌生人）。
 | 4 | `[0.62, 0.90)` | 0.28 |
 | 5 | `[0.90, 1.00]` | 0.10 |
 
-**进度条值（0–1，由前端渲染）：** 第 1–4 档分别占进度条的 25% / 25% / 25% / 20%，第 5 档占顶端 5%，档内线性：
+API 按原样返回每条线的分数：`AffinitySnapshot.bond` / `.chemistry` 是真实存储的合成值（0..1），不再套任何显示曲线（好感度 3.0 删掉了旧的分档进度条投影）。投影曾经在渲染层伪造的「前期快、后期磨」节奏现在是真实的：写侧的分档衰减（见[写入管线](#写入管线好感度-30)）按本线档位削减正向增益，高档确实要更多轮次才能跨越。前端要做分档进度条，可用分数和上表的档位边界自行推导。
 
-```
-bar(raw) = band_lo(档位) + (raw − tier_lo) / (tier_hi − tier_lo) × band_width(档位)
-  第 1 档: 0.00 + (raw − 0.00) / 0.15 × 0.25  →  [0.00, 0.25)
-  第 2 档: 0.25 + (raw − 0.15) / 0.20 × 0.25  →  [0.25, 0.50)
-  第 3 档: 0.50 + (raw − 0.35) / 0.27 × 0.25  →  [0.50, 0.75)
-  第 4 档: 0.75 + (raw − 0.62) / 0.28 × 0.20  →  [0.75, 0.95)
-  第 5 档: 0.95 + (raw − 0.90) / 0.10 × 0.05  →  [0.95, 1.00]
-夹钳到 [0, 1]
-```
-
-由于高档跨越更大的原始好感度区间，进度条前期填充很快，接近 100% 时会放慢——前两档简单、后两档是磨练——无需字面的 `exp()`。固定的每轮原始 delta 在高档时对进度条的推动也*更小*。第 5 档是刻意收窄的 5% 顶档，让「满级」显得稀有，同时仍保留足够空间，使进度条能在其 0.10 的原始分跨度内继续移动（避免 lv4→lv5 的 damping）。
-
-所有阈值和区间均为可调常量。
+所有分档阈值均为可调常量。
 
 ## 分档标签
 
@@ -128,24 +116,31 @@ legacy_relationship_label(bond, chemistry):
 
 `frenemy` 已停止输出，但在枚举中仍可解析，供历史行使用。`stranger` 现在是明确的"两条线均在第 1 档"情况——不再需要旧五个阈值条件全部未命中。
 
-## 评估分布与非对称上限
+## 评估器协议：档位，不是数字
 
-**上限（非对称）。** 评估器的每轴原始输出在 `parse_affinity_eval` 中被非对称夹钳：
+**档位（好感度 3.0）。** 评估器从不输出数字 delta。五个档位轴（`warmth` / `trust` / `intrigue` / `intimacy` / `tension`）每轴报告一个 `0`–`4` 的整数**档位（grade）**加一个**方向（direction）**：
 
+```json
+{
+  "warmth":   {"grade": 0, "direction": "up"},
+  "trust":    {"grade": 1, "direction": "up"},
+  "intrigue": {"grade": 0, "direction": "up"},
+  "intimacy": {"grade": 0, "direction": "up"},
+  "tension":  {"grade": 2, "direction": "down"},
+  "patience": 0.5,
+  "reason": "…"
+}
 ```
-POS_CAP = +0.4    NEG_CAP = −0.6
-effective_delta = raw.clamp(NEG_CAP, POS_CAP)
-```
 
-以 EMA blend 0.5（`ema_inertia = 0.5`）计，每轮单轴最大值为 **+0.2**（增益）和 **−0.3**（损失）——非对称上限让一次糟糕的回合比一次好的回合影响更大。
+- **档位口径：** `0` = 无事发生（寒暄、附和——绝大多数轮次的裁决）；`1` = 微小但真实的波动；`2` = 明确的推进或伤害；`3` = 罕见的重要时刻（真诚的自我袒露、脆弱、成功的调情；明显的冒犯或被无视）；`4` = 里程碑——这段关系被重新定义的一轮（极罕见）。
+- **方向**为 `"up"` / `"down"`；负面时刻（冷漠、敷衍/重复的回复、无聊、越界、冲突、被无视）在 prompt 中被引导为更常见也更该出手。
+- `patience` 仍是 0~1 的绝对读数、每 0.1 一档（见上文），不是档位。
 
-**分布（通过 prompt 塑造）。** 评估器会被引导成以下输出形态：
+引擎把 `{grade, direction}` 折叠成 `−4..+4` 的有符号整数。模型做序数评级可靠、做校准算术不可靠——所以判官选档位，数字全部由引擎持有。
 
-- **绝大多数轮次：恰好 `0`** —— 普通闲聊和应答得分为零。
-- **罕见正值** —— 仅在真正推动关系的时刻（真实的温暖、自我披露、脆弱坦露、成功的调情）才产生；可以较大（单轴最高约 +0.4）。
-- **更易触发的负值** —— 冷漠、敷衍/重复的回复、无聊、越界、冲突、被无视均会触发；可以更大（单轴最低约 −0.6）。
+**畸形裁决整体拒绝。** JSON 不可解析，或任一轴畸形——非整数或越界的档位、未知的方向——都会让 `parse_affinity_eval` 拒绝整份裁决：档位全零、无 patience 读数、reason 为空。该轮的规则 delta 仍会持久化，评估器失败从不丢失好感度事件。（缺省的轴或 `null` 档位不算畸形——按档位 0 处理；`"grade": "2"` 这种带引号的整数会被抢救回来。）
 
-EMA 平滑和时间衰退**不变**——只有上限和 prompt 指引发生了变化。
+**单轮包络（与 2.0 一致）。** 按默认调参，档位 `+4` 换算为单轴 `+0.20`、档位 `−4` 为 `−0.30`——正是旧 ±0.4/−0.6 夹钳经 EMA 0.5 后的每轮有效上限。「一次糟糕的回合比一次好的回合影响更大」的非对称性由 `AFFINITY_NEG_FACTOR` 延续；变的只是内部形状。
 
 **语域与 `reason` 卫生规则。** 评估器 prompt 用角色的第一人称写（「你就是这个角色，
 这一轮之后你对他的感觉变了多少」），不是第三人称分析型评审；调用时拆成静态 `system`
@@ -155,6 +150,54 @@ EMA 平滑和时间衰退**不变**——只有上限和 prompt 指引发生了�
 系统提示——评估器若为一次拒绝找理由，那个立场就被写进了角色的持久状态。该 prompt 由
 引擎持有，刻意不可配置，见
 `docs/superpowers/specs/2026-08-02-affinity-eval-hygiene-design.md`。
+
+## 写入管线（好感度 3.0）
+
+判官报档位，数字全部由引擎持有。每份裁决在引擎侧经过四个阶段（`eros-engine-core/src/affinity.rs` 的 `grade_turn`），对回合前快照计算、在好感度行锁下应用：
+
+```
+档位 → 原始分 → 分档衰减 → 跨线惩罚 → 阈值门控 → 夹钳
+```
+
+**1. 换算。** 有符号档位 `g` 换算成原始分 `r`：
+
+```
+r = g × AFFINITY_GRADE_UNIT                        （正向；demo 会话另乘 AFFINITY_DEMO_BOOST）
+r = g × AFFINITY_GRADE_UNIT × AFFINITY_NEG_FACTOR  （负向）
+```
+
+默认值 `0.05` / `1.5`：档位 `+4` = `+0.20`、`−4` = `−0.30`——即 2.0 的包络。PDE 的规则微调（如长消息 intrigue `+0.02`）在衰减前并入原始分。
+
+**2. 分档衰减（仅正向）。** 正向原始分乘以本线档位对应的系数 `AFFINITY_TIER_DECAY`（默认第 1–5 档为 `1.0, 0.70, 0.45, 0.25, 0.10`）。`trust`/`intrigue` 读 Bond 的档位；`intimacy`/`tension` 读 Chemistry 的；`warmth`（两条线共享）读较高一线的档位（两者取 max）。负向原始分**从不**衰减——损失在任何档位都是全价。读侧进度条投影删除后，「前期快、后期磨」的节奏就落在这里。
+
+**3. 跨线惩罚。** 当判官动了只属于一条线的轴（档位 ≠ 0）时，*另一条*线的高度会对这次移动收税：
+
+```
+penalty = κ × ((y − y₀)⁺ / (1 − y₀))²
+  y  = 另一条线的分数
+  κ  = AFFINITY_CROSS_PENALTY        （默认 0.05）
+  y₀ = AFFINITY_CROSS_PENALTY_START  （默认 0.35）
+```
+
+高 Bond 让 Chemistry 更难涨，反之亦然：小幅正向推进可能净值为负（friend-zone 之墙），负向推进则亏得更多。`warmth` 豁免（它同时供给两条线），纯规则轮次（判官档位 0）也豁免——管线只对事件收费，不收租金。
+
+**4. 阈值门控。** 每轴维护一个有符号累加器。本轮的实际分并入后，只有当 `|累计值| ≥ AFFINITY_DELTA_THRESHOLD`（默认 `0` = 每轮都提交）时整笔余额才提交；未达阈值时缓存在 `companion_affinity.pending_deltas`（JSONB，迁移 `0043`），该轴本轮不动。
+
+提交的 delta 随后按 1:1 应用并夹钳到各轴区间（`warmth` 为 `[-1,1]`，其余为 `[0,1]`）。`patience` 绕过全部四个阶段——它的规则 delta 原样穿过，绝对值覆盖在其后进行（见上文）。
+
+### 调参旋钮
+
+服务端环境变量，逐项回退到默认值；默认值复现 2.0 的每轮有效包络：
+
+| 环境变量 | 默认值 | 含义 |
+|---------|---------|---------|
+| `AFFINITY_GRADE_UNIT` | `0.05` | 每档位对应的原始分 |
+| `AFFINITY_NEG_FACTOR` | `1.5` | 负向原始分的附加乘数——延续「涨得慢、跌得快」 |
+| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | 第 1–5 档的正向衰减系数（逗号分隔；不是恰好 5 个有限值时保持默认） |
+| `AFFINITY_CROSS_PENALTY` | `0.05` | 跨线惩罚上限 κ |
+| `AFFINITY_CROSS_PENALTY_START` | `0.35` | 惩罚开始生效的另一线分数（y₀） |
+| `AFFINITY_DELTA_THRESHOLD` | `0.0` | 提交阈值 θ；`0` = 每轮都提交 |
+| `AFFINITY_DEMO_BOOST` | `1.4` | `metadata.is_demo` 会话的正向乘数（取代已退役的 demo EMA 惯性） |
 
 ## 持久化
 
@@ -167,11 +210,23 @@ bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + trust 
 chemistry GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + intimacy + tension)  / 3))) STORED
 ```
 
-进度条曲线和分档标签仅存在于核心读层。DB 存储的原始合成值与 API 层面的进度条值是不同的概念。
+分档标签仅存在于核心读层；API 直接返回存储的合成值本身——不存在独立的显示值。
 
 ### 降低的默认种子
 
 新行的列默认值（同样在迁移 `0029` 中）被设置为使新会话的 bond ≈ chemistry ≈ 0.033——两条线均在第 1 档，遗留标签为 `stranger`。已有行不受影响。
+
+### 待提交余额（阈值门控）
+
+迁移 `0043` 在 `engine.companion_affinity` 上新增 `pending_deltas JSONB`——阈值门控尚未放行的每轴余额。只由带档位的消息路径写入；`NULL`（所有 3.0 之前的旧行，以及从未被门控的行）等同于全零。
+
+### 事件行
+
+每个 delta 轮次向 `engine.companion_affinity_events` 追加一行：
+
+- `deltas` —— 本轮的**原始分**：档位换算（含 demo boost）加规则微调，衰减前。
+- `effective_deltas` —— **实际应用**的每轴变化，`after − before`。它涵盖分档衰减、跨线惩罚、门控、patience 覆盖与夹钳；被门控缓存的轮次为全零。
+- `context` —— `affinity_reason`（评估器的 `reason`）、未跑评估时的 `eval_skip_reason`、判官的有符号 `grades` 原样，以及门控的 `pending_after` 余额。
 
 ### 每轮标签变化
 
@@ -201,8 +256,8 @@ label_changes = {
   "intimacy": 0.05,
   "patience": 0.55,
   "tension": 0.04,
-  "bond": 0.32,
-  "chemistry": 0.28,
+  "bond": 0.21,
+  "chemistry": 0.17,
   "bond_label": "friend",
   "chemistry_label": "flirtation",
   "ghost_streak": 0,
@@ -212,13 +267,13 @@ label_changes = {
 }
 ```
 
-- `bond` / `chemistry` —— 进度条值（0–1，曲线映射后），非原始合成值。
+- `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线。
 - `bond_label` / `chemistry_label` —— 上述 10 个档位键之一。
 - `relationship_label` —— 遗留映射值（`stranger / friend / slow_burn / romantic`）。
 
 ### BFF `/bff/v1/comp/affinity/{session_id}/event`
 
-此接口返回每轮好感度 delta，不受 `EXPOSE_AFFINITY_DEBUG` 控制。除现有的 `effective_deltas`（每轴 EMA 后）外，事件现还包含：
+此接口返回每轮好感度 delta，不受 `EXPOSE_AFFINITY_DEBUG` 控制。除现有的 `effective_deltas`（每轴实际应用的变化，`after − before`）外，事件现还包含：
 
 ```json
 {
@@ -242,17 +297,17 @@ label_changes = {
 }
 ```
 
-- `effective_deltas_computed` —— 本轮精确的 bond/chemistry 行增量，在持久化时从取下界前后的分数计算得出，存储于事件行（`companion_affinity_events.effective_line_deltas`）。取值单位为原始合成增量（非进度条百分比），适合每轮"+X bond / +Y chemistry"的脉冲显示。迁移前的旧行此字段为 `null` / 缺省。
+- `effective_deltas_computed` —— 本轮精确的 bond/chemistry 行增量，在持久化时从取下界前后的分数计算得出，存储于事件行（`companion_affinity_events.effective_line_deltas`）。取值单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮"+X bond / +Y chemistry"的脉冲显示。迁移前的旧行此字段为 `null` / 缺省。
 - `label_changes` —— 本轮引擎权威的档位变化；无档位变化时为 `null`（或缺省）。前端无需自行计算变化，直接消费此字段。
 
 两个字段同样镜像到调试接口 `GET /comp/affinity/{session_id}/event` 的条目上。
 
 ## 源码
 
-- `crates/eros-engine-core/src/affinity.rs` —— 类型、EMA、时间衰退、bond/chemistry 分数、分档、进度条、标签、diff_labels
-- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost），迁移 0029
-- `crates/eros-engine-server/src/pipeline/post_process.rs` —— LLM 评估，非对称夹钳
+- `crates/eros-engine-core/src/affinity.rs` —— 类型、`grade_turn` 写入管线、时间衰退、bond/chemistry 分数、分档、标签、diff_labels
+- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost），迁移 0029/0043
+- `crates/eros-engine-server/src/pipeline/post_process.rs` —— LLM 评估，档位解析
 - `crates/eros-engine-server/src/prompt.rs` —— 好感度 → 态度指令 + 评估 prompt
-- `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（进度条 + 标签）
+- `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（合成分数 + 标签）
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 事件接口
 - `crates/eros-engine-server/src/routes/debug.rs` —— 调试事件日志

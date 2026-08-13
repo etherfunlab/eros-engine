@@ -70,8 +70,9 @@ session。默认 `false`/缺省保持原本的恢复优先行为。语音通话�
 缺省时 `genome_id` 才是必填。
 
 可选的 `is_demo` 字段：把新建的 session 标记为 demo。持久化到 session 的
-`metadata.is_demo`，好感度管线读它来用 `demo_ema_inertia` 替代全局值，
-让好感度条在 demo 的轮次预算内有可见的移动。恢复已有 session 时忽略。
+`metadata.is_demo`，好感度管线读它来把正向评分乘以 `AFFINITY_DEMO_BOOST`
+（默认 `1.4`），让好感度表在 demo 的轮次预算内有可见的移动。恢复已有
+session 时忽略。
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
@@ -662,7 +663,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 ### `GET /comp/affinity/{session_id}`
 
-实时 6 轴向量 + Bond/Chemistry 进度条与标签 + ghost 统计 + 遗留关系标签。受 `EXPOSE_AFFINITY_DEBUG=true` 环境变量控制；关闭时返 404。
+实时 6 轴向量 + Bond/Chemistry 分数与标签 + ghost 统计 + 遗留关系标签。受 `EXPOSE_AFFINITY_DEBUG=true` 环境变量控制；关闭时返 404。
 
 ```json
 {
@@ -672,8 +673,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   "intimacy": 0.05,
   "patience": 0.55,
   "tension": 0.04,
-  "bond": 0.32,
-  "chemistry": 0.28,
+  "bond": 0.21,
+  "chemistry": 0.17,
   "bond_label": "friend",
   "chemistry_label": "flirtation",
   "ghost_streak": 0,
@@ -683,7 +684,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 }
 ```
 
-- `bond` / `chemistry` —— 进度条值（0–1，曲线映射后）。
+- `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线
+  （节奏的非线性在写侧的分档衰减里——见
+  [affinity-model.zh.md](affinity-model.zh.md)）。
 - `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
 - `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
 - `relationship_label` —— 遗留映射值（`stranger | friend | slow_burn | romantic`；`frenemy` 已停止输出）。
@@ -693,8 +696,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
 
 该 session 的好感度**事件日志**，分页、最新在前。和向量路由一样受
-`EXPOSE_AFFINITY_DEBUG=true` 控制（关闭时 404）。每条同时带原始的每轮
-`deltas`（EMA 前）、实际应用的 `effective_deltas`（EMA 后）、折叠后的
+`EXPOSE_AFFINITY_DEBUG=true` 控制（关闭时 404）。每条同时带每轮的
+`deltas`（本轮原始分：档位换算 + 规则微调，衰减前）、实际应用的
+`effective_deltas`（`after − before`；被阈值门控缓存的轮次全为零）、折叠后的
 `effective_deltas_computed`，以及档位跨越时的 `label_changes`。`event_type`
 可选用于过滤；`limit` 默认 20（上限 100）。
 
@@ -705,8 +709,8 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
       "event_id": "…",
       "event_type": "message",
       "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
-      "effective_deltas_computed": { "bond": 0.02, "chemistry": 0.006 },
+      "effective_deltas": { "warmth": 0.042, "trust": 0.014, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
+      "effective_deltas_computed": { "bond": 0.019, "chemistry": 0.007 },
       "label_changes": null,
       "created_at": "…"
     }
@@ -716,7 +720,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `event_type` 过滤可取 `message | gift | proactive | ghost | time_decay`
 （`time_decay` 为预留，当前代码不写入）。若要一个**不受** debug 开关控制、
-只返回最新一条（仅 EMA 后）的前端用面板，用下面的 BFF 路由
+只返回最新一条（仅实际应用变化）的前端用面板，用下面的 BFF 路由
 `GET /bff/v1/comp/affinity/{session_id}/event`。
 
 ## BFF（`/bff/v1/*`）
@@ -787,7 +791,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
-最近一次用户轮次的好感度 delta（post-EMA），供前端做逐轮观测。与
+最近一次用户轮次的好感度 delta（实际应用的每轴变化），供前端做逐轮观测。与
 canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
 `EXPOSE_AFFINITY_DEBUG` 控制（这块归前端所有）——但仍做 JWT + ownership 检查。
 
@@ -827,7 +831,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 ∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
 全为零。
 
-- `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为原始合成增量（非进度条百分比），适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
+- `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
 
 ## 錯誤響應

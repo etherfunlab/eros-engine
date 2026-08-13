@@ -482,7 +482,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
-| `affinity_evaluation` | `pipeline::post_process`（每轮六轴 affinity delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
+| `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——五个档位轴加一个 patience 绝对读数，由引擎侧换算成 delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -530,14 +530,14 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：
 
-- LLM 接收最近的对话、关系状态和对话信号，并返回 JSON verdict，其中包含：
+- LLM 接收最近的对话、引擎算好的关系档位（`[亲密度] 当前档位=第 N 档` 与 `[耐心] 当前档位=高/中/低`——从不给原始好感度数字）和对话信号，并返回 JSON verdict，其中包含：
   - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（图片变体需要同时满足两个条件——请求包含 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置，因为判断器本身不写图片 prompt；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `tone`（选填）：这一轮回复该用的语气/口吻，一句话——在文本类动作上注入 reply prompt 的 `[reply_tone]` 区块；缺省则不注入
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 两次，ghost cooldown 为一小时。
-- 每次判断器调用都会记录到 `companion_decision_events` 以供审计。
+- 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴。fire-and-forget 写入；历史行保持 `NULL`。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 

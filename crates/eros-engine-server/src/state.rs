@@ -92,6 +92,44 @@ pub(crate) fn parse_bool_flag(raw: Option<&str>) -> bool {
     raw.map(|v| v == "1" || v == "true").unwrap_or(false)
 }
 
+/// Affinity 3.0 tuning from `AFFINITY_*` env vars, falling back per-knob to
+/// the core defaults (which reproduce the 2.0 effective envelope). The decay
+/// table is comma-separated and must supply exactly 5 finite values or the
+/// default table stays.
+pub(crate) fn affinity_tuning_from_env() -> eros_engine_core::affinity::AffinityTuning {
+    let mut t = eros_engine_core::affinity::AffinityTuning::default();
+    let f = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
+    if let Some(v) = f("AFFINITY_GRADE_UNIT") {
+        t.grade_unit = v;
+    }
+    if let Some(v) = f("AFFINITY_NEG_FACTOR") {
+        t.neg_factor = v;
+    }
+    if let Some(v) = f("AFFINITY_CROSS_PENALTY") {
+        t.cross_penalty = v;
+    }
+    if let Some(v) = f("AFFINITY_CROSS_PENALTY_START") {
+        t.cross_penalty_start = v;
+    }
+    if let Some(v) = f("AFFINITY_DELTA_THRESHOLD") {
+        t.delta_threshold = v;
+    }
+    if let Some(v) = f("AFFINITY_DEMO_BOOST") {
+        t.demo_boost = v;
+    }
+    if let Ok(raw) = std::env::var("AFFINITY_TIER_DECAY") {
+        let vals: Vec<f64> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .collect();
+        if let Ok(table) = <[f64; 5]>::try_from(vals) {
+            t.tier_decay = table;
+        }
+    }
+    t
+}
+
 /// Knobs for the world-memories subsystem. Defaults: disabled off, prompt
 /// injection off, town disabled off, stories disabled off, stories-prompt
 /// injection off, 300-second sweep cadence.
@@ -186,11 +224,10 @@ impl Drop for StreamSlotGuard {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub expose_affinity_debug: bool,
-    pub ema_inertia: f64,
-    /// Override inertia for sessions opened with `is_demo: true`. Smaller =
-    /// each turn's delta is blended more aggressively, so the meters move
-    /// visibly across an 8-turn demo. Falls back to `ema_inertia` if unset.
-    pub demo_ema_inertia: f64,
+    /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
+    /// the 2.0 effective single-turn envelope; see
+    /// `eros_engine_core::affinity::AffinityTuning`.
+    pub affinity_tuning: eros_engine_core::affinity::AffinityTuning,
     pub bind_addr: String,
     /// How often the dreaming-lite sweeper wakes up to look for idle
     /// sessions. Set to `Duration::ZERO` (env `DREAMING_DISABLED=1`) to
@@ -234,10 +271,6 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_env() -> Self {
-        let ema_inertia = std::env::var("EMA_INERTIA")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.5);
         let dreaming_disabled = parse_bool_flag(std::env::var("DREAMING_DISABLED").ok().as_deref());
         let dreaming_voice_disabled =
             parse_bool_flag(std::env::var("DREAMING_VOICE_DISABLED").ok().as_deref());
@@ -272,11 +305,7 @@ impl ServerConfig {
             expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-            ema_inertia,
-            demo_ema_inertia: std::env::var("DEMO_EMA_INERTIA")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.3),
+            affinity_tuning: affinity_tuning_from_env(),
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             dreaming_tick,
             dreaming_idle_threshold,

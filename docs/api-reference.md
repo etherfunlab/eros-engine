@@ -75,9 +75,10 @@ the server picks (or auto-creates) the user's instance for the supplied
 `genome_id`; `genome_id` is required only when `instance_id` is absent.
 
 Optional `is_demo` field: marks the new session as a demo. Persisted to the
-session's `metadata.is_demo` and read by the affinity pipeline to apply
-`demo_ema_inertia` instead of the global value, so meters move visibly within
-a demo's turn budget. Ignored when resuming an existing session.
+session's `metadata.is_demo` and read by the affinity pipeline to multiply
+positive judge scores by `AFFINITY_DEMO_BOOST` (default `1.4`), so meters
+move visibly within a demo's turn budget. Ignored when resuming an existing
+session.
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
@@ -752,7 +753,7 @@ The flat, typed `human_insights` row for this user — the same columns the insi
 
 ### `GET /comp/affinity/{session_id}`
 
-Live 6-axis vector + Bond/Chemistry bars and labels + ghost stats + legacy
+Live 6-axis vector + Bond/Chemistry scores and labels + ghost stats + legacy
 relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404
 when disabled.
 
@@ -764,8 +765,8 @@ when disabled.
   "intimacy": 0.05,
   "patience": 0.55,
   "tension": 0.04,
-  "bond": 0.32,
-  "chemistry": 0.28,
+  "bond": 0.21,
+  "chemistry": 0.17,
   "bond_label": "friend",
   "chemistry_label": "flirtation",
   "ghost_streak": 0,
@@ -775,7 +776,9 @@ when disabled.
 }
 ```
 
-- `bond` / `chemistry` — bar values (0–1, curve-applied).
+- `bond` / `chemistry` — the real stored composite scores (0–1); no display
+  curve is applied (the pacing nonlinearity lives in the write-side tier
+  decay — see [affinity-model.md](affinity-model.md)).
 - `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
 - `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
 - `relationship_label` — legacy mapped value (`stranger | friend | slow_burn | romantic`; `frenemy` retired from emission).
@@ -787,10 +790,12 @@ to render a live radar or inspect the derived lines.
 
 Paginated affinity **event log** for the session, newest first. Same
 `EXPOSE_AFFINITY_DEBUG=true` gate as the vector route (404 when disabled). Each
-entry carries the raw per-turn `deltas` (pre-EMA), the applied
-`effective_deltas` (post-EMA), the folded `effective_deltas_computed`, and
-`label_changes` when a tier crossed. Optional `event_type` filters the log;
-`limit` defaults to 20 (capped at 100).
+entry carries the per-turn `deltas` (the turn's raw scores: grade conversion
+plus rule nudges, pre-decay), the applied `effective_deltas` (`after −
+before`; all-zero on a threshold-gated turn), the folded
+`effective_deltas_computed`, and `label_changes` when a tier crossed.
+Optional `event_type` filters the log; `limit` defaults to 20 (capped at
+100).
 
 ```json
 {
@@ -799,8 +804,8 @@ entry carries the raw per-turn `deltas` (pre-EMA), the applied
       "event_id": "…",
       "event_type": "message",
       "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas": { "warmth": 0.03, "trust": 0.01, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.01 },
-      "effective_deltas_computed": { "bond": 0.02, "chemistry": 0.006 },
+      "effective_deltas": { "warmth": 0.042, "trust": 0.014, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
+      "effective_deltas_computed": { "bond": 0.019, "chemistry": 0.007 },
       "label_changes": null,
       "created_at": "…"
     }
@@ -811,7 +816,7 @@ entry carries the raw per-turn `deltas` (pre-EMA), the applied
 The `event_type` filter accepts `message | gift | proactive | ghost |
 time_decay` (`time_decay` is reserved — not written by current code). For a
 per-turn frontend surface that is **not** debug-gated and returns only the
-latest event (post-EMA only), use the BFF route
+latest event (applied change only), use the BFF route
 `GET /bff/v1/comp/affinity/{session_id}/event` below.
 
 ## BFF (`/bff/v1/*`)
@@ -889,8 +894,8 @@ not the grand total of rows in the session.
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
-Latest user-turn affinity delta (post-EMA), for per-turn frontend
-observation. Unlike the canonical `/comp/affinity/{session_id}` debug
+Latest user-turn affinity delta (the applied per-axis change), for per-turn
+frontend observation. Unlike the canonical `/comp/affinity/{session_id}` debug
 route, this is **not** gated by `EXPOSE_AFFINITY_DEBUG` (the frontend owns
 this surface) — but it is still JWT + ownership checked.
 
@@ -933,8 +938,9 @@ reports all-zero `effective_deltas`.
 
 - `effective_deltas_computed` — exact floored per-turn line delta computed at
   persist time from the floored before/after bond/chemistry scores; read from
-  the stored event column. Raw-composite units (not bar-percent). Good for a
-  "+X bond / +Y chemistry" per-turn pulse. May be absent on pre-migration rows.
+  the stored event column. Composite-score units — the same 0..1 scale as the
+  snapshot's `bond`/`chemistry`. Good for a "+X bond / +Y chemistry" per-turn
+  pulse. May be absent on pre-migration rows.
 - `label_changes` — engine-authoritative tier transition (`null` / absent when
   no tier crossed this turn). Frontend stops computing this itself.
 

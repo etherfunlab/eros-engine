@@ -558,8 +558,9 @@ max_tokens  = 400
 #"""
 
 # Per-turn six-axis affinity evaluation (post-process, semantic axes).
-# Scores how a single chat turn should move warmth/trust/intimacy plus the
-# content nudges to intrigue/tension, as small per-turn deltas. Runs only on
+# Grades how a single chat turn moved warmth/trust/intrigue/intimacy/tension —
+# an integer bucket 0~4 plus a direction per axis, converted to scores by the
+# engine (affinity 3.0) — plus an absolute patience read. Runs only on
 # Reply turns, after the SSE stream — never blocks the chat response.
 # claude-haiku-4.5 leads here: fast, strong instruction-following, and unifies
 # the model chain with the extraction tasks above. deepseek-v4-flash +

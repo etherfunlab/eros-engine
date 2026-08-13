@@ -1276,7 +1276,7 @@
           "bond": {
             "type": "number",
             "format": "double",
-            "description": "Friendship bar fill, 0..1 (curve-applied; render as %)."
+            "description": "Friendship line score, 0..1 — the real stored composite, no display\ncurve (affinity 3.0 dropped the `bar()` projection; nonlinearity now\nlives in the write-side tier decay, so the raw value already reads\nfast-early/slow-late)."
           },
           "bond_label": {
             "type": "string",
@@ -1285,7 +1285,7 @@
           "chemistry": {
             "type": "number",
             "format": "double",
-            "description": "Romance bar fill, 0..1 (curve-applied; render as %)."
+            "description": "Romance line score, 0..1 — real stored composite, no display curve."
           },
           "chemistry_label": {
             "type": "string",
@@ -2181,7 +2181,7 @@
               "boolean",
               "null"
             ],
-            "description": "Mark the new session as a demo. Persisted to `metadata.is_demo` and\nread by the affinity pipeline to apply `demo_ema_inertia` instead\nof the global value, so meters move visibly within the turn budget.\nIgnored when resuming an existing session."
+            "description": "Mark the new session as a demo. Persisted to `metadata.is_demo` and\nread by the affinity pipeline to apply `AFFINITY_DEMO_BOOST` instead\nof the global value, so meters move visibly within the turn budget.\nIgnored when resuming an existing session."
           }
         }
       },

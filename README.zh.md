@@ -36,7 +36,7 @@
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
 │  │ post-process, spawned after reply              │     │
-│  │   • affinity: persist 6D delta + EMA           │     │
+│  │   • affinity: persist 6D graded turn           │     │
 │  │   • memory:   Voyage embed → pgvector upsert   │     │
 │  │   • insight:  extract facts → JSONB merge      │     │
 │  └────────────────────────────────────────────────┘     │
@@ -82,7 +82,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 ## 文档
 
 - [架构](docs/architecture.zh.md)——crate 边界、pipeline 阶段和数据流。
-- [亲密度模型](docs/affinity-model.zh.md)——关系维度、平滑、衰减和标签。
+- [亲密度模型](docs/affinity-model.zh.md)——关系维度、档位评分、衰减和标签。
 - [ghost 机制](docs/ghost-mechanics.zh.md)——伴侣何时以及为何保持沉默。
 - [记忆分层](docs/memory-layers.zh.md)——画像与关系记忆、embedding 和检索。
 - [世界系统](docs/world-system.zh.md)——实验性的 World Memories、World Town 与 World Stories 模拟。

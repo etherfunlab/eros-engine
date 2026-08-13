@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Affinity row persistence + EMA-smoothed event recording.
+//! Affinity row persistence + graded-turn event recording.
 //!
-//! Domain math (EMA blending, label inference) lives in
+//! Domain math (the 3.0 grade pipeline, label inference) lives in
 //! `eros_engine_core::affinity`. This module strictly handles I/O.
 
 use chrono::{DateTime, Utc};
-use eros_engine_core::affinity::{Affinity, AffinityDeltas, RelationshipLabel};
+use eros_engine_core::affinity::{
+    grade_turn, Affinity, AffinityDeltas, AffinityTuning, AxisGrades, PendingDeltas,
+    RelationshipLabel,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -28,6 +31,8 @@ pub struct AffinityRow {
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
     pub relationship_label: Option<String>,
+    /// Threshold-gate balance (migration 0043). NULL = all-zero.
+    pub pending_deltas: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -246,20 +251,34 @@ impl<'a> AffinityRepo<'a> {
         Ok(rows.into_iter().filter_map(|(r,)| r).collect())
     }
 
-    /// Apply EMA-smoothed deltas in core, persist updated row, log event —
-    /// all in a single transaction. The current vector is re-read **inside**
-    /// the tx under `SELECT ... FOR UPDATE`, so overlapping same-session
-    /// writes serialize instead of clobbering each other (the lost-update
-    /// bug the six-axis activation makes real — design spec §6.2). Time
+    /// Run one judge verdict through the 3.0 pipeline in core, persist the
+    /// updated row, log the event — all in a single transaction. The current
+    /// vector AND the threshold-gate balance are re-read **inside** the tx
+    /// under `SELECT ... FOR UPDATE`, so overlapping same-session writes
+    /// serialize instead of clobbering each other (the lost-update bug the
+    /// six-axis activation makes real — design spec §6.2), and the tier lookup
+    /// the decay/penalty terms depend on always reads committed state. Time
     /// decay is computed from the locked row, not a pre-read snapshot.
     /// Mutates `affinity` in place to reflect the persisted state.
-    /// `patience_target: Some(p)` overwrites patience with `p` directly after `apply_deltas`, bypassing EMA smoothing (the value is still `[0,1]`-clamped); `None` keeps the EMA path.
+    ///
+    /// Event row semantics: `deltas` = the turn's raw scores (grade conversion
+    /// plus rule nudges, pre-decay); `effective_deltas` = the applied change,
+    /// i.e. after − before, zero on a gated turn; `context` additionally
+    /// carries the judge's `grades` verbatim and the gate's `pending_after`
+    /// balance.
+    ///
+    /// `patience_target: Some(p)` overwrites patience with `p` after the
+    /// pipeline (still `[0,1]`-clamped) — patience is judge-owned as an
+    /// absolute; `None` leaves the rule delta from `rule_deltas.patience`
+    /// (passed through 1:1 by `grade_turn`) as the only patience movement.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern; patience_target is the odd one out
     pub async fn persist_with_event(
         &self,
         affinity: &mut Affinity,
-        deltas: &AffinityDeltas,
-        ema_inertia: f64,
+        grades: &AxisGrades,
+        rule_deltas: &AffinityDeltas,
+        boost: f64,
+        tuning: &AffinityTuning,
         event_type: &str,
         context: serde_json::Value,
         meta: Option<&crate::OpenRouterCallMeta>,
@@ -274,6 +293,11 @@ impl<'a> AffinityRepo<'a> {
         .bind(affinity.id)
         .fetch_one(&mut *tx)
         .await?;
+        let pending: PendingDeltas = locked
+            .pending_deltas
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         let mut current = locked.into_domain();
 
         // Decay from the locked row, then snapshot the pre-delta baseline so
@@ -289,16 +313,14 @@ impl<'a> AffinityRepo<'a> {
             tension: current.tension,
         };
 
-        current.apply_deltas(deltas, ema_inertia);
+        let outcome = grade_turn(&current, grades, rule_deltas, &pending, boost, tuning);
+        current.apply_deltas(&outcome.committed);
 
-        // patience is LLM-owned as an ABSOLUTE this turn: overwrite the EMA'd
-        // value with the target (L + rule_delta), bypassing EMA smoothing (the
-        // value is still clamped to [0,1] below). The ±0.4/−0.6 caps never
-        // applied to patience in the first place — they're per-axis in
-        // parse_affinity_eval, on the five LLM delta axes only.
-        // L and the rule delta are both independent of the current value, so
-        // this direct set is race-safe. `apply_deltas` is left unchanged; its
-        // EMA'd patience from above is simply discarded here.
+        // patience is judge-owned as an ABSOLUTE this turn: overwrite with the
+        // target (L + rule_delta), still clamped to [0,1]. L and the rule
+        // delta are both independent of the current value, so this direct set
+        // is race-safe. The rule-delta patience applied by `apply_deltas`
+        // above (the eval-failure fallback) is simply discarded here.
         if let Some(p) = patience_target {
             current.patience = p.clamp(0.0, 1.0);
         }
@@ -317,7 +339,7 @@ impl<'a> AffinityRepo<'a> {
             "chemistry": current.chemistry_score() - before_affinity.chemistry_score(),
         });
 
-        // Post-EMA effective change = after − before (captures EMA + clamping).
+        // Effective change = after − before (captures gating + clamping).
         let effective = AffinityDeltas {
             warmth: current.warmth - before.warmth,
             trust: current.trust - before.trust,
@@ -331,7 +353,7 @@ impl<'a> AffinityRepo<'a> {
             "UPDATE engine.companion_affinity \
              SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
                  patience = $6, tension = $7, \
-                 relationship_label = $8, updated_at = now() \
+                 relationship_label = $8, pending_deltas = $9, updated_at = now() \
              WHERE id = $1",
         )
         .bind(current.id)
@@ -342,10 +364,23 @@ impl<'a> AffinityRepo<'a> {
         .bind(current.patience)
         .bind(current.tension)
         .bind(label_to_str(label))
+        .bind(serde_json::to_value(outcome.pending).ok())
         .execute(&mut *tx)
         .await?;
 
-        let deltas_json = serde_json::to_value(deltas).unwrap_or_default();
+        // The audit trail keeps the judge's verdict verbatim and the gate's
+        // new balance next to whatever context the caller supplied.
+        let mut context = context;
+        if let Some(obj) = context.as_object_mut() {
+            if let Ok(g) = serde_json::to_value(grades) {
+                obj.insert("grades".into(), g);
+            }
+            if let Ok(p) = serde_json::to_value(outcome.pending) {
+                obj.insert("pending_after".into(), p);
+            }
+        }
+
+        let deltas_json = serde_json::to_value(&outcome.raw).unwrap_or_default();
         let effective_json = serde_json::to_value(&effective).unwrap_or_default();
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
@@ -413,6 +448,26 @@ impl<'a> AffinityRepo<'a> {
 mod tests {
     use super::*;
     use crate::testutil::seed_persona_instance;
+
+    /// Persist a rule-deltas-only "message" turn with default tuning: at a
+    /// fresh seed every line sits in tier 1 (decay ×1.0) and an ungraded axis
+    /// pays no penalty, so the rule values land 1:1 — which keeps the numeric
+    /// expectations below identical to the direct-apply era.
+    async fn persist_rule(repo: &AffinityRepo<'_>, a: &mut Affinity, rule: AffinityDeltas) {
+        repo.persist_with_event(
+            a,
+            &AxisGrades::default(),
+            &rule,
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
 
     async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
@@ -533,18 +588,18 @@ mod tests {
             .unwrap();
         let before_warmth = a.warmth;
 
-        let deltas = AffinityDeltas {
-            warmth: 0.4,
-            trust: 0.2,
-            intrigue: 0.0,
-            intimacy: 0.0,
-            patience: 0.0,
-            tension: 0.0,
-        };
+        // Graded verdict: warmth +2 / trust +2 at a fresh seed (tier 1, no
+        // penalty) → +0.10 each.
         repo.persist_with_event(
             &mut a,
-            &deltas,
-            0.0, // no smoothing → full apply
+            &AxisGrades {
+                warmth: 2,
+                trust: 2,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
             "message",
             serde_json::json!({ "source": "test" }),
             None,
@@ -595,7 +650,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn persist_with_event_records_post_ema_effective(pool: PgPool) {
+    async fn persist_with_event_records_raw_and_effective(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -605,15 +660,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Raw delta +0.4 warmth with EMA inertia 0.8 → effective = 0.2 * 0.4 = 0.08.
-        let deltas = AffinityDeltas {
-            warmth: 0.4,
-            ..Default::default()
-        };
+        // Grade +4 warmth at a fresh seed: raw = 4 × 0.05 = 0.20, and with
+        // tier-1 decay ×1.0 and no gate it applies verbatim — no EMA anywhere.
         repo.persist_with_event(
             &mut a,
-            &deltas,
-            0.8,
+            &AxisGrades {
+                warmth: 4,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
             None,
@@ -631,14 +688,139 @@ mod tests {
         .await
         .unwrap();
 
-        // Pre-EMA stored verbatim.
-        assert!((row.0["warmth"].as_f64().unwrap() - 0.4).abs() < 1e-9);
-        // Post-EMA effective = blend * raw = 0.2 * 0.4 = 0.08, NOT 0.4.
+        // deltas column = the turn's raw score.
+        assert!((row.0["warmth"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        // effective = applied change: same 0.2, proving the EMA halving is gone.
         let eff = row.1.expect("effective_deltas present");
         assert!(
-            (eff["warmth"].as_f64().unwrap() - 0.08).abs() < 1e-9,
-            "effective warmth should be EMA-smoothed 0.08, got {eff}"
+            (eff["warmth"].as_f64().unwrap() - 0.2).abs() < 1e-9,
+            "effective warmth should be the direct 0.2, got {eff}"
         );
+    }
+
+    /// The threshold gate: real scores below θ buffer in `pending_deltas`
+    /// (axes untouched, effective zero), and the next turn that lifts the
+    /// balance past θ commits the whole accumulated amount.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn threshold_gate_buffers_then_flushes(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        let tuning = AffinityTuning {
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas {
+                trust: 0.1,
+                ..Default::default()
+            },
+            1.0,
+            &tuning,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.trust, 0.0, "gated turn moves nothing");
+        let pending: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT pending_deltas FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            (pending.unwrap()["trust"].as_f64().unwrap() - 0.1).abs() < 1e-9,
+            "the balance persists on the row"
+        );
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas {
+                trust: 0.5,
+                ..Default::default()
+            },
+            1.0,
+            &tuning,
+            "message",
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            (a.trust - 0.6).abs() < 1e-9,
+            "0.1 + 0.5 clears θ=0.5 and commits in full, got {}",
+            a.trust
+        );
+        let pending: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT pending_deltas FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending.unwrap()["trust"].as_f64().unwrap(),
+            0.0,
+            "flush resets the balance"
+        );
+    }
+
+    /// The event context carries the judge's verdict and the gate balance next
+    /// to whatever the caller supplied.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_context_carries_grades_and_pending(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades {
+                warmth: 2,
+                trust: -1,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({ "affinity_reason": "他坦白了" }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ctx: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ctx["affinity_reason"].as_str(), Some("他坦白了"));
+        assert_eq!(ctx["grades"]["warmth"].as_i64(), Some(2));
+        assert_eq!(ctx["grades"]["trust"].as_i64(), Some(-1));
+        assert!(ctx["pending_after"].is_object());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -652,22 +834,16 @@ mod tests {
             .await
             .unwrap();
         // trust starts at 0.0 (lowered seed from migration 0029); push it past
-        // the [0,1] ceiling with no smoothing.
-        let deltas = AffinityDeltas {
-            trust: 5.0,
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        // the [0,1] ceiling via an oversized rule delta.
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                trust: 5.0,
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
 
         let eff: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT effective_deltas FROM engine.companion_affinity_events WHERE affinity_id = $1",
@@ -718,11 +894,11 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        let start_warmth = base.warmth; // default 0.3
+        let start_warmth = base.warmth; // lowered seed 0.1
 
-        // Two overlapping writers, each +0.1 warmth at full gain (ema 0.0).
-        // Without row locking the second UPDATE clobbers the first and the
-        // result is 0.4 (one lost increment); with FOR UPDATE it is 0.5.
+        // Two overlapping writers, each a warmth +2 verdict (+0.10 at tier 1).
+        // Without row locking the second UPDATE clobbers the first and one
+        // increment is lost; with FOR UPDATE both land.
         let p1 = pool.clone();
         let p2 = pool.clone();
         let h1 = tokio::spawn(async move {
@@ -730,11 +906,13 @@ mod tests {
             let mut a = repo.load(session_id).await.unwrap().unwrap();
             repo.persist_with_event(
                 &mut a,
-                &AffinityDeltas {
-                    warmth: 0.1,
+                &AxisGrades {
+                    warmth: 2,
                     ..Default::default()
                 },
-                0.0,
+                &AffinityDeltas::default(),
+                1.0,
+                &AffinityTuning::default(),
                 "message",
                 serde_json::json!({}),
                 None,
@@ -748,11 +926,13 @@ mod tests {
             let mut a = repo.load(session_id).await.unwrap().unwrap();
             repo.persist_with_event(
                 &mut a,
-                &AffinityDeltas {
-                    warmth: 0.1,
+                &AxisGrades {
+                    warmth: 2,
                     ..Default::default()
                 },
-                0.0,
+                &AffinityDeltas::default(),
+                1.0,
+                &AffinityTuning::default(),
                 "message",
                 serde_json::json!({}),
                 None,
@@ -791,26 +971,19 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        // Defaults warmth 0.3 / intimacy 0.0 / tension 0.1 → not Romantic.
-        // Cross the Romantic thresholds (warmth>=0.7, intimacy>=0.4,
-        // tension>=0.3) at full gain — confirms the now-live axes drive labels.
-        let deltas = AffinityDeltas {
-            warmth: 0.5,   // 0.3 -> 0.8
-            intimacy: 0.5, // 0.0 -> 0.5
-            tension: 0.3,  // 0.1 -> 0.4
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        // Push chemistry ahead of bond and past tier 3 via rule deltas (fresh
+        // seed → tier 1, so they land 1:1) — confirms the live axes drive labels.
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                warmth: 0.5,   // 0.1 -> 0.6
+                intimacy: 0.5, // 0.0 -> 0.5
+                tension: 0.3,  // 0.0 -> 0.3
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(
             reloaded.relationship_label,
@@ -1085,25 +1258,19 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        let deltas = AffinityDeltas {
-            warmth: 0.5,
-            trust: 0.4,
-            intrigue: 0.6,
-            intimacy: 0.3,
-            patience: 0.0,
-            tension: 0.2,
-        };
-        repo.persist_with_event(
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                warmth: 0.5,
+                trust: 0.4,
+                intrigue: 0.6,
+                intimacy: 0.3,
+                patience: 0.0,
+                tension: 0.2,
+            },
         )
-        .await
-        .unwrap();
+        .await;
         let (bond, chemistry): (f64, f64) =
             sqlx::query_as("SELECT bond, chemistry FROM engine.companion_affinity WHERE id = $1")
                 .bind(a.id)
@@ -1125,22 +1292,16 @@ mod tests {
             .await
             .unwrap();
         // Push chemistry high → romantic.
-        let deltas = AffinityDeltas {
-            intimacy: 0.9,
-            tension: 0.9,
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                intimacy: 0.9,
+                tension: 0.9,
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(
             reloaded.relationship_label,
@@ -1163,32 +1324,33 @@ mod tests {
             "fresh seed patience is 0.5"
         );
 
-        // A rule delta that WOULD (via EMA 0.8 → blend 0.2) move patience to
-        // 0.5 + 0.2*0.4 = 0.58, plus an absolute target of 0.9. The target must
-        // win: patience lands on 0.9, NOT 0.58.
-        let deltas = AffinityDeltas {
-            patience: 0.4,
-            ..Default::default()
-        };
+        // Rule delta 0.4 alone would land patience on 0.5 + 0.4 = 0.9; the
+        // absolute target 0.7 must win over that pass-through, so the two
+        // outcomes are distinguishable.
         repo.persist_with_event(
             &mut a,
-            &deltas,
-            0.8,
+            &AxisGrades::default(),
+            &AffinityDeltas {
+                patience: 0.4,
+                ..Default::default()
+            },
+            1.0,
+            &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
             None,
-            Some(0.9),
+            Some(0.7),
         )
         .await
         .unwrap();
 
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert!(
-            (reloaded.patience - 0.9).abs() < 1e-9,
-            "patience_target set directly, bypassing EMA; got {}",
+            (reloaded.patience - 0.7).abs() < 1e-9,
+            "patience_target overrides the rule pass-through; got {}",
             reloaded.patience
         );
-        assert!((a.patience - 0.9).abs() < 1e-9, "in-memory mutated too");
+        assert!((a.patience - 0.7).abs() < 1e-9, "in-memory mutated too");
 
         let eff: (Option<serde_json::Value>,) = sqlx::query_as(
             "SELECT effective_deltas FROM engine.companion_affinity_events WHERE affinity_id = $1",
@@ -1199,13 +1361,13 @@ mod tests {
         .unwrap();
         let effective = eff.0.expect("effective_deltas present");
         assert!(
-            (effective["patience"].as_f64().unwrap() - 0.4).abs() < 1e-9,
-            "effective patience = target(0.9) − before(0.5) = 0.4, got {effective}"
+            (effective["patience"].as_f64().unwrap() - 0.2).abs() < 1e-9,
+            "effective patience = target(0.7) − before(0.5) = 0.2, got {effective}"
         );
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn persist_with_event_patience_none_keeps_ema_path(pool: PgPool) {
+    async fn persist_with_event_patience_none_applies_rule_delta_directly(pool: PgPool) {
         let repo = AffinityRepo { pool: &pool };
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -1215,27 +1377,22 @@ mod tests {
             .await
             .unwrap();
 
-        let deltas = AffinityDeltas {
-            patience: 0.4,
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        // The eval-failure fallback: no absolute target, only the rule nudge,
+        // which grade_turn passes through 1:1 — 0.5 + 0.4 = 0.9.
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.8,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                patience: 0.4,
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
 
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
-        // EMA blend 0.2 * 0.4 = 0.08 → 0.5 + 0.08 = 0.58.
         assert!(
-            (reloaded.patience - 0.58).abs() < 1e-9,
-            "None → normal EMA path; got {}",
+            (reloaded.patience - 0.9).abs() < 1e-9,
+            "None → rule delta lands 1:1; got {}",
             reloaded.patience
         );
     }
@@ -1251,34 +1408,18 @@ mod tests {
             .await
             .unwrap();
         // Big positive turn crosses bond tier 1 → 4.
-        let deltas = AffinityDeltas {
-            trust: 0.9,
-            intrigue: 0.9,
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                trust: 0.9,
+                intrigue: 0.9,
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
         // Flat turn crosses nothing.
-        repo.persist_with_event(
-            &mut a,
-            &AffinityDeltas::default(),
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        persist_rule(&repo, &mut a, AffinityDeltas::default()).await;
         let rows: Vec<Option<serde_json::Value>> = sqlx::query_scalar(
             "SELECT label_changes FROM engine.companion_affinity_events \
              WHERE affinity_id = $1 ORDER BY created_at ASC, id ASC",
@@ -1306,23 +1447,18 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        // Seed warmth negative so a raw axis fold would differ from the floored truth.
-        // Fresh seed warmth=0.1; push it to -0.3 this turn (ema 0.0 = full apply).
-        let deltas = AffinityDeltas {
-            warmth: -0.4,
-            ..Default::default()
-        };
-        repo.persist_with_event(
+        // Seed warmth negative so a raw axis fold would differ from the floored
+        // truth. Fresh seed warmth=0.1; a negative rule delta lands 1:1
+        // (negatives skip decay), pushing it to -0.3 this turn.
+        persist_rule(
+            &repo,
             &mut a,
-            &deltas,
-            0.0,
-            "message",
-            serde_json::json!({}),
-            None,
-            None,
+            AffinityDeltas {
+                warmth: -0.4,
+                ..Default::default()
+            },
         )
-        .await
-        .unwrap();
+        .await;
         // before: warmth 0.1, bond=(0.1+0+0)/3=0.0333 ; after: warmth -0.3 → floored 0 → bond 0.
         // exact line delta = 0 - 0.0333 = -0.0333 (a raw fold would give -0.4/3 = -0.133).
         let line: serde_json::Value = sqlx::query_scalar(
@@ -1351,14 +1487,6 @@ mod tests {
             .await
             .unwrap();
 
-        let deltas = AffinityDeltas {
-            warmth: 0.1,
-            trust: 0.0,
-            intrigue: 0.0,
-            intimacy: 0.0,
-            patience: 0.0,
-            tension: 0.0,
-        };
         let meta = crate::OpenRouterCallMeta {
             generation_id: Some("gen-aff".into()),
             model: Some("aff/m".into()),
@@ -1366,8 +1494,13 @@ mod tests {
         };
         repo.persist_with_event(
             &mut a,
-            &deltas,
-            0.0,
+            &AxisGrades {
+                warmth: 2,
+                ..Default::default()
+            },
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
             "message",
             serde_json::json!({}),
             Some(&meta),
