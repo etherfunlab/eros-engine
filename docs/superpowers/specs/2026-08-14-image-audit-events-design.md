@@ -142,6 +142,14 @@ Column notes:
   portrait fallback, and this column is then the only record anywhere of what
   was drawn. NULL only on the standalone endpoint's `exhausted` row, which
   502s without assembling anything.
+
+  The column earns its place on the table's own terms, not on the scarcity of
+  the value elsewhere: **one row must be auditable on its own**, without
+  joining `chat_messages` to reconstruct what was drawn, and the table must
+  stay **independently extensible** — a future composer retry, or any caller
+  with no message to join to, records a complete row without a schema change.
+  (`chat_messages.metadata.image` is not that record: its `prompt` key holds
+  the composer's short *subject*, never the assembled wire string.)
 - **`variant`** — the resolved `prompt_variant` key. `"raw"` is an ordinary key,
   not a skip.
 - **`usage`** — the **full unfiltered** usage block, `serde_json::to_value`'d,
