@@ -618,9 +618,12 @@ async fn compose_stream(
         let (subject, caption) = parse_compose_reply(acc.trim());
         match failure {
             Some(message) => {
-                // Died after opening — a chunk carrying `usage` may already
-                // have landed before the failure, so the accumulated block
-                // (not None) is what a caller was actually billed for.
+                // Died after opening — a chunk carrying `usage` (and, same
+                // reasoning, `model` / `generation_id`) may already have
+                // landed before the failure, and that's exactly what makes
+                // an accumulated-but-billed call reconcilable against the
+                // OpenRouter log instead of just a token count with nothing
+                // to point it at.
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
@@ -634,9 +637,9 @@ async fn compose_stream(
                         caption: None,
                         composed_prompt: None,
                         variant: variant_key.as_deref(),
-                        model: None,
+                        model: Some(served_model.as_deref().unwrap_or(attempted_model.as_str())),
                         usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
-                        generation_id: None,
+                        generation_id: generation_id.as_deref(),
                         attempts,
                         last_failure: Some("stream_died_midway"),
                     },
@@ -674,9 +677,9 @@ async fn compose_stream(
                         caption: None,
                         composed_prompt: None,
                         variant: variant_key.as_deref(),
-                        model: None,
+                        model: Some(served_model.as_deref().unwrap_or(attempted_model.as_str())),
                         usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
-                        generation_id: None,
+                        generation_id: generation_id.as_deref(),
                         attempts,
                         last_failure: Some(last_failure),
                     },
@@ -1144,7 +1147,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .expect("exactly one compose event row");
+        .expect("a compose event row");
         assert_eq!(source, "compose_endpoint");
         assert_eq!(status, "exhausted");
         assert_eq!(subject, None);
@@ -1237,6 +1240,15 @@ mod tests {
         );
         assert_eq!(attempts, 1);
         assert_eq!(last_failure, None);
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "no duplicate row from a retried or double-counted write"
+        );
     }
 
     /// Collect the `data:` frames out of an SSE body (keep-alive comment lines
@@ -1497,7 +1509,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await
-        .expect("exactly one compose event row");
+        .expect("a compose event row");
         assert_eq!(source, "compose_endpoint_stream");
         assert_eq!(status, "exhausted");
         assert_eq!(composed, None);
@@ -1586,6 +1598,15 @@ mod tests {
         );
         assert_eq!(attempts, 1);
         assert_eq!(last_failure, None);
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.chat_images_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "no duplicate row from a retried or double-counted write"
+        );
     }
 
     /// A candidate that opens (yields a first token) and then dies via an
@@ -1596,7 +1617,13 @@ mod tests {
     async fn compose_stream_records_exhausted_event_when_stream_dies_midway(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
-        let chunk1 = json!({"choices": [{"delta": {"content": "STREAMED PART"}}]});
+        // model/id ride the content chunk that opens the candidate — the
+        // audit row must keep both even though the call ultimately failed.
+        let chunk1 = json!({
+            "choices": [{"delta": {"content": "STREAMED PART"}}],
+            "model": "served/composer-model",
+            "id": "gen-midway",
+        });
         let chunk_err = json!({"error": {"code": 500, "message": "boom mid-stream"}});
         let sse_body = format!("data: {chunk1}\n\ndata: {chunk_err}\n\ndata: [DONE]\n\n");
         let mock = MockServer::start().await;
@@ -1626,26 +1653,32 @@ mod tests {
         );
 
         #[allow(clippy::type_complexity)]
-        let (source, status, subject, composed, model, attempts, last_failure): (
+        let (source, status, subject, composed, model, generation_id, attempts, last_failure): (
             String,
             String,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
-             FROM engine.chat_images_events",
+            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
+             last_failure FROM engine.chat_images_events",
         )
         .fetch_one(&pool)
         .await
-        .expect("exactly one compose event row");
+        .expect("a compose event row");
         assert_eq!(source, "compose_endpoint_stream");
         assert_eq!(status, "exhausted");
         assert_eq!(subject, None);
         assert_eq!(composed, None);
-        assert_eq!(model, None);
+        assert_eq!(
+            model.as_deref(),
+            Some("served/composer-model"),
+            "the call was billed against this model — the row must say which"
+        );
+        assert_eq!(generation_id.as_deref(), Some("gen-midway"));
         assert_eq!(
             attempts, 1,
             "the candidate that opened counts as one attempt"
@@ -1692,26 +1725,31 @@ mod tests {
         );
 
         #[allow(clippy::type_complexity)]
-        let (source, status, subject, composed, model, attempts, last_failure): (
+        let (source, status, subject, composed, model, generation_id, attempts, last_failure): (
             String,
             String,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
-             FROM engine.chat_images_events",
+            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
+             last_failure FROM engine.chat_images_events",
         )
         .fetch_one(&pool)
         .await
-        .expect("exactly one compose event row");
+        .expect("a compose event row");
         assert_eq!(source, "compose_endpoint_stream");
         assert_eq!(status, "exhausted");
         assert_eq!(subject, None);
         assert_eq!(composed, None);
-        assert_eq!(model, None);
+        // Neither mocked chunk ever carries a `model`/`id` field, so this
+        // proves the OTHER half of the fix: falling back to the attempted
+        // model id rather than to `None` when the provider never echoes one.
+        assert_eq!(model.as_deref(), Some("composer"));
+        assert_eq!(generation_id, None);
         assert_eq!(attempts, 1);
         assert_eq!(last_failure.as_deref(), Some("empty"));
     }
@@ -1726,7 +1764,11 @@ mod tests {
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let reply = r#"{"prompt":"","caption":"审计"}"#;
-        let chunk = json!({"choices": [{"delta": {"content": reply}}]});
+        let chunk = json!({
+            "choices": [{"delta": {"content": reply}}],
+            "model": "served/composer-model",
+            "id": "gen-blank-prompt",
+        });
         let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
         let mock = MockServer::start().await;
         Mock::given(wm_path("/api/v1/chat/completions"))
@@ -1755,26 +1797,28 @@ mod tests {
         );
 
         #[allow(clippy::type_complexity)]
-        let (source, status, subject, composed, model, attempts, last_failure): (
+        let (source, status, subject, composed, model, generation_id, attempts, last_failure): (
             String,
             String,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             i16,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT source, status, subject, composed_prompt, model, attempts, last_failure \
-             FROM engine.chat_images_events",
+            "SELECT source, status, subject, composed_prompt, model, generation_id, attempts, \
+             last_failure FROM engine.chat_images_events",
         )
         .fetch_one(&pool)
         .await
-        .expect("exactly one compose event row");
+        .expect("a compose event row");
         assert_eq!(source, "compose_endpoint_stream");
         assert_eq!(status, "exhausted");
         assert_eq!(subject, None);
         assert_eq!(composed, None);
-        assert_eq!(model, None);
+        assert_eq!(model.as_deref(), Some("served/composer-model"));
+        assert_eq!(generation_id.as_deref(), Some("gen-blank-prompt"));
         assert_eq!(attempts, 1);
         assert_eq!(last_failure.as_deref(), Some("empty_prompt"));
     }
