@@ -1369,6 +1369,17 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 /// Per-model timeout for a single filter LLM call.
 pub(crate) const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Cap on a single audit-table INSERT (`chat_images_events` /
+/// `chat_vision_events`). Fail-open already covers a write that errors —
+/// this bounds one that stalls instead: a saturated pool or a wedged
+/// connection must not delay the turn's own response (the image marker, the
+/// endpoint's JSON body, the pre-stream 502, the terminal SSE frame) behind
+/// an await that never returns. Deliberately much shorter than
+/// `FILTER_TIMEOUT`: this is one local Postgres round trip, not a
+/// network LLM call, so a generous LLM-sized budget would hide exactly the
+/// stall this timeout exists to bound.
+pub(crate) const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Max wait for a chat stream to OPEN (connect + queue + response headers).
 /// A provider that accepts the socket but never sends headers must not hold
 /// the turn — timeout ⇒ attempt fails ⇒ chain advances. `pub(crate)`: the
@@ -2186,11 +2197,20 @@ async fn run_vision(
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "chat_vision: model error; next");
                 last_failure = Some("model_error");
+                // Transport failure: nothing came back, so any identity
+                // captured by an EARLIER content-level failure this chain
+                // walk must not survive to describe THIS attempt's outcome.
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "chat_vision: timeout; next");
                 last_failure = Some("timeout");
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
         };
@@ -2541,18 +2561,25 @@ pub(crate) fn compose_inputs_json(
     })
 }
 
-/// Fail-open audit write. Returns the new row id, or `None` when the INSERT
-/// failed — warned and dropped, never propagated: a missing audit row costs the
-/// linkage, never the turn.
+/// Fail-open audit write, bounded by `AUDIT_WRITE_TIMEOUT` so a stalled pool
+/// or connection cannot delay the turn. Returns the new row id, or `None`
+/// when the INSERT failed OR timed out — both are warned and dropped, never
+/// propagated: a missing audit row costs the linkage, never the turn. The
+/// write is still awaited (not detached), so the ordering the
+/// `compose_event_id` linkage depends on holds — this only bounds it.
 pub(crate) async fn record_compose_event(
     pool: &sqlx::PgPool,
     ev: eros_engine_store::image_events::ImageComposeEventInsert<'_>,
 ) -> Option<uuid::Uuid> {
     let repo = eros_engine_store::image_events::ImageComposeEventRepo { pool };
-    match repo.record(ev).await {
-        Ok(id) => Some(id),
-        Err(e) => {
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, repo.record(ev)).await {
+        Ok(Ok(id)) => Some(id),
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "chat_images_events: audit write failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("chat_images_events: audit write timed out");
             None
         }
     }
@@ -2703,11 +2730,20 @@ pub(crate) async fn run_image_prompt_compose(
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
                 last_failure = Some("model_error");
+                // Transport failure: nothing came back, so any identity
+                // captured by an EARLIER content-level failure this chain
+                // walk must not survive to describe THIS attempt's outcome.
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "image-compose: timeout; next");
                 last_failure = Some("timeout");
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
         };
@@ -4003,8 +4039,14 @@ pub fn run_stream(
                         let repo = eros_engine_store::image_events::ChatVisionEventRepo {
                             pool: &state.pool,
                         };
-                        if let Err(e) = repo
-                            .record(eros_engine_store::image_events::ChatVisionEventInsert {
+                        // Fail-open AND bounded (Fix 3): a stalled pool or
+                        // connection must not delay this reply turn behind
+                        // an audit write that never returns. Still awaited,
+                        // not detached, so write ordering holds — only
+                        // bounded.
+                        match tokio::time::timeout(
+                            AUDIT_WRITE_TIMEOUT,
+                            repo.record(eros_engine_store::image_events::ChatVisionEventInsert {
                                 user_id: user_msg.user_id,
                                 session_id: user_msg.session_id,
                                 message_id: user_msg.user_message_id,
@@ -4034,10 +4076,17 @@ pub fn run_stream(
                                     .or(run.last_generation_id.as_deref()),
                                 attempts: run.attempts,
                                 last_failure: run.last_failure,
-                            })
-                            .await
+                            }),
+                        )
+                        .await
                         {
-                            tracing::warn!(error = %e, "chat_vision_events: audit write failed");
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "chat_vision_events: audit write failed");
+                            }
+                            Err(_) => {
+                                tracing::warn!("chat_vision_events: audit write timed out");
+                            }
                         }
                     }
                 }
@@ -10528,23 +10577,30 @@ data: [DONE]\n\n";
         );
     }
 
-    /// The `exhausted` arm: `[tasks.chat_vision]` IS configured but the sole
-    /// chain model's reply never parses as `ImageVision`. `attempts`/
+    /// The `exhausted` arm: `[tasks.chat_vision]` IS configured, the PRIMARY
+    /// model's reply never parses as `ImageVision` (a CONTENT-level failure —
+    /// the mock carries `model` / `id` / `usage`, just like a real billed
+    /// response would), and the FALLBACK model then fails at the TRANSPORT
+    /// level (a bare 500, so no response body to bill at all). `attempts`/
     /// `last_failure` are written deep inside `run_vision`'s chain-walk loop —
     /// nothing else in the suite reads them back from the DB, so this is the
     /// only test that would catch `last_failure` failing to propagate out of
     /// that loop, or `attempts` being off by one. Mirrors
-    /// `vision_turn_folds_description_and_persists`'s harness with a failing
-    /// describe reply instead of a valid one.
+    /// `vision_turn_folds_description_and_persists`'s harness with failing
+    /// describe replies instead of a valid one.
     ///
-    /// `unparseable` is a CONTENT-level failure — the mock reply is prose,
-    /// not JSON, but the provider did answer and OpenRouter billed the call
-    /// (the mock carries `model` / `id` / `usage`, just like a real response
-    /// would). So this is also the test that pins `model` / `generation_id` /
-    /// `usage` surviving onto an `exhausted` row instead of going NULL
-    /// (final-review fix, 2026-08-14): only a pure transport failure
-    /// (`model_error` / `timeout`), where no response ever came back, should
-    /// leave those three NULL.
+    /// This also pins two invariants for the audit row, in tension with each
+    /// other, which is exactly why the chain needs two distinct failure
+    /// shapes to prove both:
+    /// - a CONTENT-level failure's `model` / `generation_id` / `usage` must
+    ///   survive onto an `exhausted` row instead of going NULL (final-review
+    ///   fix, 2026-08-14) — the provider answered and was billed even though
+    ///   the reply was unusable;
+    /// - a LATER TRANSPORT-level failure must not inherit an EARLIER
+    ///   attempt's billing identity (codex Fix 1, 2026-08-14): once the
+    ///   fallback dies at transport level, nothing came back from THAT
+    ///   attempt, so the row must NOT attribute `vis/bad`'s identity to a
+    ///   `last_failure` that actually came from `vis/gone`.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn exhausted_vision_chain_writes_an_event_with_last_failure(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -10554,9 +10610,10 @@ data: [DONE]\n\n";
 
         let mock = MockServer::start().await;
 
-        // Vision model ("vis/bad"): replies with prose that never parses as the
-        // ImageVision JSON schema — the chain walk records this as "unparseable"
-        // and (with no fallback configured) the chain is exhausted after 1 attempt.
+        // Primary vision model ("vis/bad"): replies with prose that never
+        // parses as the ImageVision JSON schema — a CONTENT-level failure
+        // ("unparseable") that DOES capture model/generation_id/usage before
+        // the chain advances to the fallback.
         let vis_body = serde_json::json!({
             "id": "gv_bad", "model": "vis/bad",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -10565,6 +10622,16 @@ data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("vis/bad"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vis_body))
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        // Fallback vision model ("vis/gone"): a bare 500 — a TRANSPORT-level
+        // failure ("model_error"). Nothing came back from this attempt, so
+        // the row's identity fields must end up NULL, not `vis/bad`'s.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("vis/gone"))
+            .respond_with(ResponseTemplate::new(500))
             .with_priority(2)
             .mount(&mock)
             .await;
@@ -10591,7 +10658,7 @@ data: [DONE]\n\n";
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
                 "[tasks.chat_companion]\nmodel=\"deepseek/y\"\n\
-                 [tasks.chat_vision]\nmodel=\"vis/bad\"\nfilter_prompt=\"DESCRIBE\"\n",
+                 [tasks.chat_vision]\nmodel=\"vis/bad\"\nfallback=[\"vis/gone\"]\nfilter_prompt=\"DESCRIBE\"\n",
             )
             .unwrap(),
         );
@@ -10661,23 +10728,31 @@ data: [DONE]\n\n";
         .expect("one vision event row for the exhausted describe");
 
         assert_eq!(status, "exhausted");
-        assert!(attempts >= 1, "at least the sole chain model was attempted");
+        assert_eq!(
+            attempts, 2,
+            "both the primary (content-level) and fallback (transport-level) were tried"
+        );
         assert_eq!(
             last_failure.as_deref(),
-            Some("unparseable"),
-            "the mock reply never parses as ImageVision JSON"
+            Some("model_error"),
+            "the LAST attempt (the fallback) failed at the transport level, not the primary's unparseable reply"
         );
         assert_eq!(vision, None, "no valid describe to record");
+        // Fix 1 (codex review, 2026-08-14): the fallback's transport failure
+        // must NOT inherit the primary's billing identity captured on its
+        // earlier content-level failure — nothing came back from the
+        // fallback attempt, so these must all be NULL.
         assert_eq!(
-            model.as_deref(),
-            Some("vis/bad"),
-            "the model answered and was billed even though the describe was unparseable"
+            model, None,
+            "a transport failure must not carry a stale EARLIER attempt's model"
         );
-        assert_eq!(generation_id.as_deref(), Some("gv_bad"));
         assert_eq!(
-            usage.as_ref().and_then(|u| u.get("total_tokens")),
-            Some(&serde_json::json!(2)),
-            "the billed call's usage must not be dropped on a content-level failure"
+            generation_id, None,
+            "a transport failure must not carry a stale EARLIER attempt's generation_id"
+        );
+        assert_eq!(
+            usage, None,
+            "a transport failure must not carry a stale EARLIER attempt's usage"
         );
     }
 

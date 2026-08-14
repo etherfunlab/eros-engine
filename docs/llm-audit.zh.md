@@ -176,9 +176,10 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 
 两张 append-only 表分别记录每一次图片合成器调用和 `chat_vision` describe
 调用。两张表都是**尽力而为的遥测，不是有保证的账本**：INSERT 会被 await，
-出错就 `warn!` 一条日志然后丢弃——一次审计写入失败只是丢掉这一行事件，
-绝不影响这一轮对话（与 `companion_decision_events` 同样的纪律）。两张表都
-没有外键：一行可能比它指向的东西活得更久，也可能先于它存在。
+但有一个较短的 `AUDIT_WRITE_TIMEOUT` 兜底，出错或超时都会 `warn!` 一条日志
+然后丢弃——一次审计写入失败或卡住只是丢掉这一行事件，绝不影响这一轮对话
+（与 `companion_decision_events` 同样的纪律）。两张表都没有外键：一行可能
+比它指向的东西活得更久，也可能先于它存在。
 
 与 `chat_messages`（从 `chat_sessions` 级联删除）不同，删除一个 session
 并不会连带删掉这两张表里的行——两张表都保存着原文用户文本
@@ -208,11 +209,11 @@ prompt，或者独立端点 `POST /persona/{instance_id}/image/compose` 的任�
 | `caption` | `TEXT?` | 合成器没写 caption 时为 NULL，包括非 JSON 回退的情形——此时整段回复变成 `subject`。 |
 | `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行是 NULL——它失败时根本没拼装任何东西。 |
 | `variant` | `TEXT?` | 解析出的 `prompt_variant` key；`"raw"` 是普通 key，不是跳过标记。 |
-| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式的 `empty`/`empty_prompt`/`stream_died_midway`（候选已经开流之后才失败）。只有在完全没有应答回来时才是 NULL：任意路径上的传输层失败（`model_error`/`timeout`）、流式端点自己「开流之前就耗尽」的 `stream_open_failed`，或者 `not_configured`（压根没发起调用）。 |
+| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式的 `empty`/`empty_prompt`/`stream_died_midway`。流式模式下，「provider 到底有没有应答」这条判据在候选**开流之前**（即产出第一个内容块之前）也同样适用：peek 循环里，一个候选先流出了 metadata（model/generation_id/usage），之后却没有任何内容就结束，记 `empty`；先流出 metadata、之后在第一个内容块前就死掉，记 `stream_died_midway`——两者都会保留那份 metadata，跟开流之后才出现的同名分支一样。只有在任意路径上完全没有应答回来时才是 NULL：传输层失败（`model_error`/`timeout`），或者流式端点的 `stream_open_failed`——现在它专指候选**什么都没捕获到**的情形（开流本身失败/超时，或者在第一个内容块之前就死掉/超时、且从未收到过任何 metadata 块），又或者 `not_configured`（压根没发起调用）。 |
 | `usage` | `JSONB?` | 完整未过滤的 OpenRouter usage 块，`serde_json::to_value` 出来的——`OPENROUTER_USAGE_HIDDEN_KEYS` 只过滤 wire 上那份回显，从不影响这里。与 `model` 同步：`model` 有值的地方它才有值。 |
 | `generation_id` | `TEXT?` | 与 `model` 同步。 |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`not_configured` 时为 `0`。 |
-| `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。`stream_open_failed` / `stream_died_midway` 只出现在独立端点的流式模式；聊天路径和该端点的非流式模式共用同一套链路遍历逻辑，只会报另外四个值。 |
+| `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。`stream_open_failed` / `stream_died_midway` 只出现在独立端点的流式模式；聊天路径和该端点的非流式模式共用同一套链路遍历逻辑，只会报另外四个值。**`empty` 在流式模式下也能出现**，不止链路遍历那两条路径——一个候选压根没开流（没有内容块），但确实先流出过一个 metadata 块，也记 `empty`，跟链路遍历里内容层面「空回复」那一支同名，因为两者说的是同一件事：provider 应答了，可能已经计费。 |
 | `created_at` | `TIMESTAMPTZ` | |
 
 `status` 刻意只有三个值：`exhausted` 表示「这次调用没产出可用的合成结果」，

@@ -451,6 +451,22 @@ async fn compose_stream(
     // exhausted — the audit row's `attempts`, mirroring the counter
     // `run_image_prompt_compose` keeps for the non-stream chain walk.
     let mut attempts: i16 = 0;
+    // Last-attempt identity + failure reason, overwritten on every iteration
+    // so only the FINAL candidate's evidence can reach the audit row if the
+    // whole chain never opens. Mirrors `run_image_prompt_compose`'s
+    // `last_model` / `last_generation_id` / `last_usage` (Fix 1's rule
+    // applies here too): cleared whenever nothing came back from THIS
+    // attempt (open failed, open timed out, died with no captured evidence,
+    // or timed out before a first token) so a stale earlier attempt's
+    // billing identity can never be attributed to a later transport
+    // failure; retained only when the evidence shows the provider actually
+    // answered — the stream completed with no content (`empty`), or it died
+    // mid-flight after already emitting model/generation_id/usage
+    // (`stream_died_midway`).
+    let mut last_model: Option<String> = None;
+    let mut last_generation_id: Option<String> = None;
+    let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
+    let mut last_failure: &'static str = "stream_open_failed";
     for model_id in chain {
         attempts += 1;
         // One budget per candidate, covering both the open and the whole
@@ -466,10 +482,19 @@ async fn compose_stream(
             Ok(Ok(ds)) => ds,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
+                // Nothing came back at all: clear (Fix 1's rule).
+                last_failure = "stream_open_failed";
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "compose endpoint: stream open timeout; next");
+                last_failure = "stream_open_failed";
+                last_model = None;
+                last_generation_id = None;
+                last_usage = None;
                 continue;
             }
         };
@@ -499,14 +524,47 @@ async fn compose_stream(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream died before first token; next");
+                    // Died before any content — but if this attempt already
+                    // captured model/generation_id/usage from an earlier
+                    // metadata chunk, the provider did answer and may have
+                    // been billed: retain that evidence and call it
+                    // `stream_died_midway`, the SSE analogue of the
+                    // non-stream mode's content-level failures. No evidence
+                    // at all ⇒ pure transport failure, same as an open
+                    // failure.
+                    if served_model.is_some() || generation_id.is_some() || usage.is_some() {
+                        last_failure = "stream_died_midway";
+                        last_model = served_model.clone().or_else(|| Some(model_id.clone()));
+                        last_generation_id = generation_id.clone();
+                        last_usage = usage.clone();
+                    } else {
+                        last_failure = "stream_open_failed";
+                        last_model = None;
+                        last_generation_id = None;
+                        last_usage = None;
+                    }
                     break;
                 }
                 Ok(None) => {
                     tracing::warn!(model = %model_id, "compose endpoint: stream ended with no content; next");
+                    // The stream completed normally with no content token —
+                    // the provider answered (and may have been billed); this
+                    // is the SSE equivalent of the non-stream mode's `empty`
+                    // arm, not a transport failure. Retain whatever metadata
+                    // this attempt captured.
+                    last_failure = "empty";
+                    last_model = served_model.clone().or_else(|| Some(model_id.clone()));
+                    last_generation_id = generation_id.clone();
+                    last_usage = usage.clone();
                     break;
                 }
                 Err(_) => {
                     tracing::warn!(model = %model_id, "compose endpoint: timeout before first token; next");
+                    // No completed response ⇒ transport failure, clear.
+                    last_failure = "stream_open_failed";
+                    last_model = None;
+                    last_generation_id = None;
+                    last_usage = None;
                     break;
                 }
             }
@@ -535,7 +593,13 @@ async fn compose_stream(
     }) = opened
     else {
         // No candidate ever produced a first token — nothing was assembled,
-        // so composed_prompt stays NULL, same as the non-stream exhausted arm.
+        // so composed_prompt stays NULL, same as the non-stream exhausted
+        // arm. `model` / `generation_id` / `usage` come from the LAST
+        // attempt's hoisted evidence, not a hardcoded NULL: a candidate that
+        // streamed metadata and then ended with no content (`empty`), or
+        // died mid-flight after already emitting some of that metadata
+        // (`stream_died_midway`), did get a response from the provider even
+        // though it never opened — see the per-arm decisions above.
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
@@ -549,11 +613,13 @@ async fn compose_stream(
                 caption: None,
                 composed_prompt: None,
                 variant: variant_key.as_deref(),
-                model: None,
-                usage: None,
-                generation_id: None,
+                model: last_model.as_deref(),
+                usage: last_usage
+                    .as_ref()
+                    .and_then(|u| serde_json::to_value(u).ok()),
+                generation_id: last_generation_id.as_deref(),
                 attempts,
-                last_failure: Some("stream_open_failed"),
+                last_failure: Some(last_failure),
             },
         )
         .await;
@@ -1520,6 +1586,91 @@ mod tests {
         assert_eq!(composed, None);
         assert_eq!(attempts, 1, "the sole configured model, no fallback");
         assert_eq!(last_failure.as_deref(), Some("stream_open_failed"));
+    }
+
+    /// codex Fix 2: a candidate that streams metadata (model/id/usage) and
+    /// then ends the SSE stream with NO content chunk at all is not a
+    /// transport failure — the stream completed normally, so the provider
+    /// answered and may have been billed. This is the peek loop's `Ok(None)`
+    /// arm firing on the LAST (only) candidate, so the chain still exhausts
+    /// and the endpoint still returns a pre-stream 502 — but the audit row
+    /// must record `last_failure = "empty"` (the SSE analogue of the
+    /// non-stream mode's content-level `empty` arm) with the metadata this
+    /// attempt captured, NOT the old hardcoded `stream_open_failed` / NULL
+    /// that a genuine transport failure gets (pinned by
+    /// `compose_stream_502_when_chain_exhausted` just above, left untouched).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_502_with_metadata_but_no_content_records_empty(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        // No `choices`/content at all — only the top-level metadata fields a
+        // real provider can emit ahead of the first content token.
+        let chunk = json!({
+            "id": "gen-metadata-only",
+            "model": "served/metadata-only-model",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4},
+        });
+        let sse_body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let mut app = build_router(with_composer(
+            crate::routes::companion::test_state(pool.clone()),
+            &mock.uri(),
+        ));
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "no candidate ever opened — this must stay a real pre-stream 502, unchanged by Fix 2"
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "upstream");
+
+        #[allow(clippy::type_complexity)]
+        let (source, status, composed, model, generation_id, usage, attempts, last_failure): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            i16,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT source, status, composed_prompt, model, generation_id, usage, attempts, \
+             last_failure FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a compose event row");
+        assert_eq!(source, "compose_endpoint_stream");
+        assert_eq!(status, "exhausted");
+        assert_eq!(composed, None);
+        assert_eq!(attempts, 1, "the sole configured model, no fallback");
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("empty"),
+            "the stream completed cleanly with no content — not a transport failure"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("served/metadata-only-model"),
+            "the provider answered and may have been billed; the row must say who"
+        );
+        assert_eq!(generation_id.as_deref(), Some("gen-metadata-only"));
+        assert_eq!(
+            usage.as_ref().and_then(|u| u.get("total_tokens")),
+            Some(&json!(4)),
+            "billed usage must not be dropped just because the chain never opened"
+        );
     }
 
     /// The stream mode's audit twin of `non_stream_compose_writes_a_compose_endpoint_event`:
