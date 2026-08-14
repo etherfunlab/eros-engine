@@ -70,6 +70,15 @@ pub async fn run(
         Event::UserMessage { content, .. } => content.clone(),
         _ => String::new(),
     };
+    // The resolved injection scope also steers the 3.1 write-side multipliers.
+    // Events that carry no scope (proactive / app-open) fall back to the empty
+    // scope, i.e. `ScopeMode::Neutral` — 3.0 behaviour, never a guessed
+    // disposition. The request default (`bond`) is a *caller* default and must
+    // not become an engine-side boost for turns the caller never scoped.
+    let affinity_scope = match &event {
+        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
+        _ => eros_engine_core::scope::AffinityScope::none(),
+    };
     let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
@@ -182,6 +191,7 @@ pub async fn run(
             plan.action_type,
             grades,
             rule_deltas,
+            affinity_scope,
             context,
             affinity_meta,
             patience_tgt,
@@ -211,6 +221,7 @@ async fn persist_affinity(
     action: ActionType,
     grades: eros_engine_core::affinity::AxisGrades,
     rule_deltas: eros_engine_core::affinity::AffinityDeltas,
+    affinity_scope: eros_engine_core::scope::AffinityScope,
     context: serde_json::Value,
     meta: Option<eros_engine_store::OpenRouterCallMeta>,
     patience_target: Option<f64>,
@@ -273,6 +284,7 @@ async fn persist_affinity(
                     &grades,
                     &rule_deltas,
                     boost,
+                    &affinity_scope,
                     &state.config.affinity_tuning,
                     event_type,
                     context,
@@ -1949,6 +1961,7 @@ mod tests {
             ActionType::ReplyText,
             eros_engine_core::affinity::AxisGrades::default(),
             rule_deltas,
+            eros_engine_core::scope::AffinityScope::none(),
             serde_json::json!({}),
             None,
             Some(0.93), // patience_target = clamp(L 0.9 + R 0.03)

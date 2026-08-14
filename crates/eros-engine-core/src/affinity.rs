@@ -321,14 +321,17 @@ impl Affinity {
     }
 }
 
-// ─── Affinity 3.0 write-side pipeline (grades → raw → decay → penalty → gate) ───
+// ─── Affinity write-side pipeline (scope → grades → raw → decay → penalty → gate) ───
 //
 // The judge reports per-axis *grades* (0..=4 magnitude + direction, folded to a
-// signed integer at parse time); the engine owns every number. A grade converts
-// to a raw delta, positive raw is damped by the line's tier, line-exclusive
-// axes pay a cross-line penalty while the counterpart line is high, and the
-// resulting real delta passes a threshold accumulator before it commits.
-// Design spec: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
+// signed integer at parse time); the engine owns every number. 3.1 first steers
+// the grades by the request's resolved `AffinityScope` (see `ScopeMode`), then
+// 3.0 runs unchanged: a grade converts to a raw delta, positive raw is damped by
+// the line's tier, line-exclusive axes pay a cross-line penalty while the
+// counterpart line is high, and the resulting real delta passes a threshold
+// accumulator before it commits.
+// Design specs: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
+//               docs/superpowers/specs/2026-08-14-affinity-31-scope-steering-design.md
 
 /// Tuning knobs for the 3.0 pipeline, env-driven server-side. Defaults
 /// set the single-turn envelope: grade ±4 lands +0.20 / −0.30 per axis.
@@ -350,6 +353,14 @@ pub struct AffinityTuning {
     /// Multiplier on the judge's positive raw component for demo sessions
     /// (`AFFINITY_DEMO_BOOST`); rule nudges are unaffected.
     pub demo_boost: f64,
+    /// Constant multiplier on positive raw for the bond-exclusive axes when the
+    /// resolved scope names the bond half only (`AFFINITY_SCOPE_BOND_BOOST`).
+    /// 1.0 disables the boost.
+    pub scope_bond_boost: f64,
+    /// Grade ladder applied to the chemistry-exclusive axes when the resolved
+    /// scope carries any chemistry axis (`AFFINITY_SCOPE_CHEM_LADDER`), indexed
+    /// by the positive grade 0..=4. The identity `[0,1,2,3,4]` disables it.
+    pub scope_chem_ladder: [i8; 5],
 }
 
 impl Default for AffinityTuning {
@@ -362,6 +373,55 @@ impl Default for AffinityTuning {
             cross_penalty_start: 0.35,
             delta_threshold: 0.0,
             demo_boost: 1.4,
+            scope_bond_boost: 1.5,
+            // g1 filtered, g2 halved, milestones untouched — see `ScopeMode`.
+            scope_chem_ladder: [0, 0, 1, 3, 4],
+        }
+    }
+}
+
+/// How a resolved `AffinityScope` steers the write side (affinity 3.1).
+///
+/// The scope field is *borrowed* here for the bond/chemistry mental model its
+/// two named values carry — not for the axis triads behind them. Those triads
+/// (`scope.rs`, 1.0-era) partition all six axes for prompt injection and
+/// `length_score`; the score composites (`bond_score`/`chemistry_score`, 2.0+)
+/// overlap on warmth and drop patience. Two different algebras on purpose;
+/// neither is a mis-grouping of the other.
+///
+/// Total over the six bools, so an axes array steers as predictably as a named
+/// value: an empty scope is neutral, anything touching the chemistry half
+/// suppresses, everything else boosts bond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeMode {
+    /// 3.0 behaviour verbatim.
+    Neutral,
+    /// Bond-exclusive axes earn `scope_bond_boost` on positive raw.
+    BoostBond,
+    /// Chemistry-exclusive positive grades drop through `scope_chem_ladder`.
+    /// A grade laddered to 0 reads as "the judge did not touch this axis", so
+    /// it charges no cross penalty either — the reason the ladder introduces no
+    /// break-even case that 3.0 did not already have.
+    SuppressChemistry,
+}
+
+impl ScopeMode {
+    pub fn of(scope: &crate::scope::AffinityScope) -> Self {
+        if scope.is_empty() {
+            Self::Neutral
+        } else if scope.any_chemistry_axis() {
+            Self::SuppressChemistry
+        } else {
+            Self::BoostBond
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            ScopeMode::Neutral => "neutral",
+            ScopeMode::BoostBond => "boost_bond",
+            ScopeMode::SuppressChemistry => "suppress_chemistry",
         }
     }
 }
@@ -411,25 +471,71 @@ impl PendingDeltas {
 /// balance. `patience` is a rule axis: its rule delta passes through both
 /// `raw` and `committed` untouched (no decay, penalty or gating), so the
 /// judge-failure fallback still lands 1:1.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GradeTurnOutcome {
     pub raw: AffinityDeltas,
     pub committed: AffinityDeltas,
     pub pending: PendingDeltas,
+    /// The grades actually converted, after scope steering. Equal to the
+    /// judge's grades under `ScopeMode::Neutral`. Audited alongside the
+    /// judge's originals so a committed 0 stays attributable: the judge said
+    /// nothing, or the ladder filtered it.
+    pub effective_grades: AxisGrades,
+    pub scope_mode: ScopeMode,
 }
 
-/// Run one judge verdict through conversion, tier decay, cross-line penalty
-/// and the threshold gate. Pure: reads the *pre-turn* affinity snapshot (all
-/// axes use the same tier lookup, so ordering inside a turn cannot matter) and
-/// returns what to apply; the caller owns clamping and persistence.
+impl Default for GradeTurnOutcome {
+    fn default() -> Self {
+        Self {
+            raw: AffinityDeltas::default(),
+            committed: AffinityDeltas::default(),
+            pending: PendingDeltas::default(),
+            effective_grades: AxisGrades::default(),
+            scope_mode: ScopeMode::Neutral,
+        }
+    }
+}
+
+/// Run one judge verdict through scope steering, conversion, tier decay,
+/// cross-line penalty and the threshold gate. Pure: reads the *pre-turn*
+/// affinity snapshot (all axes use the same tier lookup, so ordering inside a
+/// turn cannot matter) and returns what to apply; the caller owns clamping and
+/// persistence.
+///
+/// `scope` is the request's resolved injection scope, reused to steer the
+/// multipliers — see [`ScopeMode`]. An empty scope is neutral, i.e. 3.0
+/// verbatim.
 pub fn grade_turn(
     a: &Affinity,
     grades: &AxisGrades,
     rule: &AffinityDeltas,
     pending: &PendingDeltas,
     boost: f64,
+    scope: &crate::scope::AffinityScope,
     t: &AffinityTuning,
 ) -> GradeTurnOutcome {
+    // Scope steering (3.1). warmth is exempt from both directions: it feeds
+    // BOTH composites, so scaling it would leak the correction onto the other
+    // line — the same reason the cross penalty exempts it.
+    let mode = ScopeMode::of(scope);
+    let bond_mult = match mode {
+        ScopeMode::BoostBond => t.scope_bond_boost,
+        _ => 1.0,
+    };
+    let ladder = |g: i8| -> i8 {
+        match mode {
+            ScopeMode::SuppressChemistry if g > 0 => t.scope_chem_ladder[g.min(4) as usize],
+            _ => g,
+        }
+    };
+    let eff = AxisGrades {
+        warmth: grades.warmth,
+        trust: grades.trust,
+        intrigue: grades.intrigue,
+        intimacy: ladder(grades.intimacy),
+        tension: ladder(grades.tension),
+    };
+
     // Pre-turn snapshot: every axis reads the same tiers and counterparts.
     let bond = a.bond_score();
     let chem = a.chemistry_score();
@@ -443,12 +549,14 @@ pub fn grade_turn(
         t.cross_penalty * ramp
     };
 
-    // grade → raw: positive grades earn unit × boost, negative grades cost
-    // unit × neg_factor. Rule nudges join pre-decay.
-    let raw = |g: i8, rule_d: f64| {
+    // grade → raw: positive grades earn unit × boost × scope multiplier,
+    // negative grades cost unit × neg_factor (never scaled by scope — the
+    // correction raises the bar, it does not soften damage). Rule nudges join
+    // pre-decay.
+    let raw = |g: i8, rule_d: f64, mult: f64| {
         let g = f64::from(g.clamp(-4, 4));
         let judge = if g >= 0.0 {
-            g * t.grade_unit * boost
+            g * t.grade_unit * boost * mult
         } else {
             g * t.grade_unit * t.neg_factor
         };
@@ -475,42 +583,49 @@ pub fn grade_turn(
         }
     };
 
-    let axis = |g: i8, rule_d: f64, own_tier: usize, counterpart: Option<f64>, pend: f64| {
-        let r = raw(g, rule_d);
-        let rho = real(r, own_tier, counterpart, g != 0);
-        let (committed, pend) = gate(rho, pend);
-        (r, committed, pend)
-    };
+    // `g` here is the POST-ladder grade, so an axis the ladder zeroed reads as
+    // untouched and pays no cross penalty.
+    let axis =
+        |g: i8, rule_d: f64, own_tier: usize, counterpart: Option<f64>, pend: f64, mult: f64| {
+            let r = raw(g, rule_d, mult);
+            let rho = real(r, own_tier, counterpart, g != 0);
+            let (committed, pend) = gate(rho, pend);
+            (r, committed, pend)
+        };
 
     let max_tier = bond_tier.max(chem_tier);
-    let (w_raw, w_com, w_pend) = axis(grades.warmth, rule.warmth, max_tier, None, pending.warmth);
+    let (w_raw, w_com, w_pend) = axis(eff.warmth, rule.warmth, max_tier, None, pending.warmth, 1.0);
     let (t_raw, t_com, t_pend) = axis(
-        grades.trust,
+        eff.trust,
         rule.trust,
         bond_tier,
         Some(chem),
         pending.trust,
+        bond_mult,
     );
     let (ig_raw, ig_com, ig_pend) = axis(
-        grades.intrigue,
+        eff.intrigue,
         rule.intrigue,
         bond_tier,
         Some(chem),
         pending.intrigue,
+        bond_mult,
     );
     let (im_raw, im_com, im_pend) = axis(
-        grades.intimacy,
+        eff.intimacy,
         rule.intimacy,
         chem_tier,
         Some(bond),
         pending.intimacy,
+        1.0,
     );
     let (tn_raw, tn_com, tn_pend) = axis(
-        grades.tension,
+        eff.tension,
         rule.tension,
         chem_tier,
         Some(bond),
         pending.tension,
+        1.0,
     );
 
     GradeTurnOutcome {
@@ -537,6 +652,8 @@ pub fn grade_turn(
             intimacy: im_pend,
             tension: tn_pend,
         },
+        effective_grades: eff,
+        scope_mode: mode,
     }
 }
 
@@ -891,6 +1008,8 @@ mod tests {
         a
     }
 
+    /// 3.0-era helper: no scope steering (`none()` → `ScopeMode::Neutral`), so
+    /// every pre-3.1 expectation below still asserts the unsteered pipeline.
     fn turn(
         a: &Affinity,
         grades: AxisGrades,
@@ -899,7 +1018,31 @@ mod tests {
         boost: f64,
         t: &AffinityTuning,
     ) -> GradeTurnOutcome {
-        grade_turn(a, &grades, &rule, &pending, boost, t)
+        grade_turn(
+            a,
+            &grades,
+            &rule,
+            &pending,
+            boost,
+            &crate::scope::AffinityScope::none(),
+            t,
+        )
+    }
+
+    fn scoped(
+        a: &Affinity,
+        grades: AxisGrades,
+        scope: crate::scope::AffinityScope,
+    ) -> GradeTurnOutcome {
+        grade_turn(
+            a,
+            &grades,
+            &AffinityDeltas::default(),
+            &PendingDeltas::default(),
+            1.0,
+            &scope,
+            &AffinityTuning::default(),
+        )
     }
 
     /// P3 envelope continuity: with defaults, grade +4 lands +0.20 and grade −4
@@ -1210,6 +1353,205 @@ mod tests {
         );
         assert!((o.committed.warmth - 0.2).abs() < 1e-9);
         assert!((o.committed.trust - (-0.3)).abs() < 1e-9);
+    }
+
+    // ─── affinity 3.1 scope steering ───
+
+    /// The mode is a TOTAL function over the six bools, so an axes array steers
+    /// as predictably as a named value. Anything touching the chemistry half
+    /// suppresses; only a bond-half-exclusive scope boosts.
+    #[test]
+    fn scope_mode_is_total_over_the_six_bools() {
+        use crate::scope::{AffinityAxis, AffinityScope};
+        let of = |s: AffinityScope| ScopeMode::of(&s);
+        assert_eq!(of(AffinityScope::none()), ScopeMode::Neutral);
+        assert_eq!(of(AffinityScope::bond()), ScopeMode::BoostBond);
+        assert_eq!(of(AffinityScope::chemistry()), ScopeMode::SuppressChemistry);
+        assert_eq!(of(AffinityScope::full()), ScopeMode::SuppressChemistry);
+        // A mixed array lands on the suppress side — the default disposition.
+        assert_eq!(
+            of(AffinityScope::from_axes(&[
+                AffinityAxis::Warmth,
+                AffinityAxis::Trust
+            ])),
+            ScopeMode::SuppressChemistry
+        );
+        // A lone bond-half axis still boosts.
+        assert_eq!(
+            of(AffinityScope::from_axes(&[AffinityAxis::Warmth])),
+            ScopeMode::BoostBond
+        );
+        assert_eq!(ScopeMode::BoostBond.as_key(), "boost_bond");
+    }
+
+    /// `bond` scope: the bond-EXCLUSIVE axes take the constant. warmth feeds
+    /// both composites and is exempt, or the boost would leak onto chemistry.
+    #[test]
+    fn bond_scope_boosts_exclusive_axes_only_and_spares_warmth() {
+        let a = zeroed();
+        let o = scoped(
+            &a,
+            AxisGrades {
+                warmth: 2,
+                trust: 2,
+                intrigue: 2,
+                ..Default::default()
+            },
+            crate::scope::AffinityScope::bond(),
+        );
+        assert_eq!(o.scope_mode, ScopeMode::BoostBond);
+        // 2 × 0.05 × 1.5 = 0.15 on the exclusive axes …
+        assert!((o.committed.trust - 0.15).abs() < 1e-9);
+        assert!((o.committed.intrigue - 0.15).abs() < 1e-9);
+        // … and a plain 2 × 0.05 on shared warmth.
+        assert!((o.committed.warmth - 0.10).abs() < 1e-9);
+    }
+
+    /// The boost raises the bar, it does not soften damage: negative raw keeps
+    /// paying `neg_factor` and nothing else. (grade −1 rather than −2 so a
+    /// wrongly-applied 1.5 boost cannot alias the 1.5 neg_factor.)
+    #[test]
+    fn bond_scope_never_scales_losses() {
+        let a = zeroed();
+        let o = scoped(
+            &a,
+            AxisGrades {
+                trust: -1,
+                ..Default::default()
+            },
+            crate::scope::AffinityScope::bond(),
+        );
+        // −1 × 0.05 × 1.5 = −0.075; boosted would be −0.1125.
+        assert!((o.committed.trust - (-0.075)).abs() < 1e-9);
+    }
+
+    /// The ladder: g1 filtered, g2 halved, milestones untouched. Chemistry
+    /// axes only — trust/intrigue ride through at 3.0 rates under this mode.
+    #[test]
+    fn chemistry_scope_ladders_only_the_low_grades() {
+        let a = zeroed();
+        let grade = |g: i8| {
+            scoped(
+                &a,
+                AxisGrades {
+                    intimacy: g,
+                    ..Default::default()
+                },
+                crate::scope::AffinityScope::chemistry(),
+            )
+            .committed
+            .intimacy
+        };
+        assert_eq!(grade(1), 0.0, "g1 is filtered out entirely");
+        assert!((grade(2) - 0.05).abs() < 1e-9, "g2 lands as a g1");
+        assert!((grade(3) - 0.15).abs() < 1e-9, "g3 is untouched");
+        assert!((grade(4) - 0.20).abs() < 1e-9, "g4 is untouched");
+        // Losses are never laddered.
+        assert!((grade(-2) - (-0.15)).abs() < 1e-9);
+    }
+
+    /// The property the whole design rests on: a grade the ladder zeroes reads
+    /// as "the judge did not touch this axis", so it charges NO cross penalty.
+    /// Without that, halving small pushes while leaving the penalty at full
+    /// price would manufacture a friend-zone wall 3.0 never had.
+    #[test]
+    fn laddered_out_grade_pays_no_cross_penalty() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.trust = 1.0;
+        a.intrigue = 1.0; // bond = 1.0 — the most expensive counterpart there is
+        let g = AxisGrades {
+            intimacy: 1,
+            ..Default::default()
+        };
+        // 3.0 behaviour: the push lands, then the penalty takes more than it.
+        let neutral = scoped(&a, g, crate::scope::AffinityScope::none());
+        assert!(neutral.committed.intimacy < 0.0);
+        // 3.1 suppressed: nothing happens at all — not a smaller loss, zero.
+        let suppressed = scoped(&a, g, crate::scope::AffinityScope::chemistry());
+        assert_eq!(suppressed.committed.intimacy, 0.0);
+    }
+
+    /// `full` is the dominant production value and steers the suppress side —
+    /// and because the mode is exclusive, bond gets no boost on those turns.
+    #[test]
+    fn full_scope_suppresses_chemistry_without_boosting_bond() {
+        let a = zeroed();
+        let o = scoped(
+            &a,
+            AxisGrades {
+                trust: 2,
+                intimacy: 2,
+                tension: 1,
+                ..Default::default()
+            },
+            crate::scope::AffinityScope::full(),
+        );
+        assert_eq!(o.scope_mode, ScopeMode::SuppressChemistry);
+        assert!((o.committed.trust - 0.10).abs() < 1e-9, "no bond boost");
+        assert!((o.committed.intimacy - 0.05).abs() < 1e-9, "g2 → g1");
+        assert_eq!(o.committed.tension, 0.0, "g1 filtered");
+    }
+
+    /// The audit trail: a committed 0 must stay attributable. `effective_grades`
+    /// records what was converted; the judge's originals are logged beside it.
+    #[test]
+    fn effective_grades_record_what_the_ladder_did() {
+        let a = zeroed();
+        let judged = AxisGrades {
+            warmth: 1,
+            trust: 1,
+            intrigue: 0,
+            intimacy: 1,
+            tension: 2,
+        };
+        let o = scoped(&a, judged, crate::scope::AffinityScope::full());
+        assert_eq!(
+            o.effective_grades,
+            AxisGrades {
+                warmth: 1,
+                trust: 1,
+                intrigue: 0,
+                intimacy: 0, // filtered
+                tension: 1,  // halved
+            }
+        );
+        // Neutral steering leaves the grades verbatim.
+        let n = scoped(&a, judged, crate::scope::AffinityScope::none());
+        assert_eq!(n.effective_grades, judged);
+    }
+
+    /// Identity settings turn 3.1 off without a code path of its own.
+    #[test]
+    fn identity_tuning_reproduces_30_under_any_scope() {
+        let a = zeroed();
+        let t = AffinityTuning {
+            scope_bond_boost: 1.0,
+            scope_chem_ladder: [0, 1, 2, 3, 4],
+            ..Default::default()
+        };
+        let g = AxisGrades {
+            trust: 2,
+            intimacy: 1,
+            ..Default::default()
+        };
+        for scope in [
+            crate::scope::AffinityScope::bond(),
+            crate::scope::AffinityScope::full(),
+            crate::scope::AffinityScope::none(),
+        ] {
+            let o = grade_turn(
+                &a,
+                &g,
+                &AffinityDeltas::default(),
+                &PendingDeltas::default(),
+                1.0,
+                &scope,
+                &t,
+            );
+            assert!((o.committed.trust - 0.10).abs() < 1e-9);
+            assert!((o.committed.intimacy - 0.05).abs() < 1e-9);
+        }
     }
 
     #[test]

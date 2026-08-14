@@ -126,6 +126,9 @@ pub(crate) fn affinity_tuning_from(
             v >= 0.0
         });
         knob("AFFINITY_DEMO_BOOST", &mut t.demo_boost, |v| v >= 0.0);
+        knob("AFFINITY_SCOPE_BOND_BOOST", &mut t.scope_bond_boost, |v| {
+            v >= 0.0
+        });
     }
     if let Some(raw) = get("AFFINITY_TIER_DECAY") {
         match parse_tier_decay(&raw) {
@@ -135,7 +138,37 @@ pub(crate) fn affinity_tuning_from(
             }
         }
     }
+    if let Some(raw) = get("AFFINITY_SCOPE_CHEM_LADDER") {
+        match parse_chem_ladder(&raw) {
+            Some(table) => t.scope_chem_ladder = table,
+            None => {
+                tracing::warn!("invalid AFFINITY_SCOPE_CHEM_LADDER={raw:?}; keeping default table")
+            }
+        }
+    }
     t
+}
+
+/// Exactly five comma-separated grades in 0..=4, indexed by the judge's
+/// positive grade. Positional like `parse_tier_decay`, and rejected whole for
+/// the same reason. Slot 0 must stay 0 — a grade of 0 means the judge did not
+/// touch the axis, and minting a delta from it would charge rent on silence.
+/// Not required to be monotonic: an experiment that flattens the top is a
+/// legitimate tuning direction. `0,1,2,3,4` is the identity (3.1 off).
+pub(crate) fn parse_chem_ladder(raw: &str) -> Option<[i8; 5]> {
+    let fields: Vec<&str> = raw.split(',').collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let mut out = [0i8; 5];
+    for (slot, f) in out.iter_mut().zip(fields) {
+        let v = f.trim().parse::<i8>().ok()?;
+        if !(0..=4).contains(&v) {
+            return None;
+        }
+        *slot = v;
+    }
+    (out[0] == 0).then_some(out)
 }
 
 /// Exactly five comma-separated finite non-negative values — anything else
@@ -454,6 +487,31 @@ mod tests {
             parse_tier_decay("1.0, 0.70, 0.45, 0.25, 0.10"),
             Some([1.0, 0.70, 0.45, 0.25, 0.10])
         );
+    }
+
+    /// Same positional contract as the decay table, plus one extra invariant:
+    /// slot 0 must stay 0. A grade of 0 means "the judge did not touch this
+    /// axis" — minting a delta from it would charge rent on silence and, worse,
+    /// make the axis pay a cross-line penalty it never earned.
+    #[test]
+    fn chem_ladder_rejects_malformed_tables_wholesale() {
+        for bad in [
+            "1,0,1,3,4",   // slot 0 non-zero — would mint deltas from silence
+            "0,0,1,3",     // 4 fields
+            "0,0,1,3,4,4", // 6 fields
+            "0,0,1,3,5",   // out of the 0..=4 grade range
+            "0,0,-1,3,4",  // negative — the ladder never flips a sign
+            "0,0,bad,3,4",
+            "0,0,1.5,3,4", // fractional grades are not a thing
+            "",
+        ] {
+            assert_eq!(parse_chem_ladder(bad), None, "must reject: {bad:?}");
+        }
+        assert_eq!(parse_chem_ladder("0, 0, 1, 3, 4"), Some([0, 0, 1, 3, 4]));
+        // The identity is a legitimate value: 3.1 off without a code path.
+        assert_eq!(parse_chem_ladder("0,1,2,3,4"), Some([0, 1, 2, 3, 4]));
+        // Non-monotonic is allowed — flattening the top is a tuning direction.
+        assert_eq!(parse_chem_ladder("0,0,2,1,4"), Some([0, 0, 2, 1, 4]));
     }
 
     #[test]

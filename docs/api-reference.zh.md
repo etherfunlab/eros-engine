@@ -190,6 +190,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 > 更窄（旧行为注入全部六轴）。**省略 `affinity_scope` 并不等同于旧行为**。
 > 如需全轴注入，请显式指定 `"bond_and_chemistry"` 或 `"full"`。
 
+> **1.2.1 起：该字段同时影响计分。** 除了决定注入什么，`affinity_scope` 还决定
+> 本轮判官档位如何折算成分数增量：只点名 bond 半边的 scope 会增强 bond 独占轴；
+> 任何触及 chemistry 半边的 scope（含 `full`）会让 chemistry 独占轴过一道档位门槛。
+> `none` 不做任何转向。共享的 `warmth` 两个方向都豁免。
+> 只要注入分级、不要计分影响的部署，把 `AFFINITY_SCOPE_BOND_BOOST=1.0` 与
+> `AFFINITY_SCOPE_CHEM_LADDER=0,1,2,3,4` 设成恒等即可。详见
+> [好感度模型 → Scope 转向](affinity-model.zh.md#scope-转向好感度-31)。
+
 同时使用两个字段的示例：
 
 ```bash

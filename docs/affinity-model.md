@@ -308,11 +308,54 @@ reproduce the 2.0 effective single-turn envelope:
 | `AFFINITY_CROSS_PENALTY_START` | `0.35` | Counterpart score where the penalty ramp starts (y₀) |
 | `AFFINITY_DELTA_THRESHOLD` | `0.0` | Commit threshold θ; `0` commits every turn |
 | `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw (rule nudges unaffected) for `metadata.is_demo` sessions |
+| `AFFINITY_SCOPE_BOND_BOOST` | `1.5` | Constant on positive raw for bond-exclusive axes under a bond-half-only scope (see below); `1.0` disables |
+| `AFFINITY_SCOPE_CHEM_LADDER` | `0,0,1,3,4` | Grade ladder for chemistry-exclusive axes under a chemistry-touching scope, indexed by positive grade 0–4 (comma-separated; exactly 5 values in `0..=4` with slot 0 at `0`, else the whole default table stands); `0,1,2,3,4` disables |
 
 Every scalar is domain-checked at boot — non-finite or out-of-domain values
 (negative unit/factor/penalty/threshold/boost, a penalty start outside
 `[0, 1)`) keep the default and log a warning, so an env typo degrades to
 defaults instead of reaching the pipeline.
+
+## Scope steering (affinity 3.1)
+
+The request's [`affinity_scope`](api-reference.md#post-compchatsession_idmessagestream)
+does two jobs. Besides selecting which axes reach the prompt, it selects how
+the turn's grades convert — the same disposition that decides what a companion
+is *told* about the relationship also decides what the relationship *earns*.
+
+The field is borrowed for the bond/chemistry mental model its named values
+carry, not for the axis triads behind them. `ScopeMode` is total over the six
+bools, so an axes array steers as predictably as a named value:
+
+| Resolved scope | Mode | Effect |
+|---|---|---|
+| empty (`none`) | `neutral` | 3.0 verbatim |
+| any chemistry-half axis — `chemistry`, `full`, mixed arrays | `suppress_chemistry` | `intimacy` / `tension` positive grades pass through `AFFINITY_SCOPE_CHEM_LADDER` |
+| everything else — `bond`, bond-half arrays | `boost_bond` | `trust` / `intrigue` positive raw × `AFFINITY_SCOPE_BOND_BOOST` |
+
+Three properties hold by construction:
+
+- **Shared `warmth` is exempt from both directions.** It feeds both composites,
+  so scaling it would leak the correction onto the other line — the same reason
+  the cross-line penalty exempts it. Only line-exclusive axes are steered.
+- **Losses are never steered.** Negative raw keeps paying `AFFINITY_NEG_FACTOR`
+  and nothing else: the correction raises the bar, it does not soften damage.
+- **A laddered-out grade charges no cross-line penalty.** The ladder runs
+  *before* the pipeline, so a grade mapped to `0` reads as "the judge did not
+  touch this axis" and the penalty (charged only on touched axes) never fires.
+  This is why the default ladder introduces no break-even case 3.0 did not
+  already have: its `g3`/`g4` rows are identical to the unsteered ones, and
+  `g2` lands exactly on the unsteered `g1` row.
+
+The default ladder `0,0,1,3,4` filters `g1`, halves `g2` and leaves milestones
+untouched — "small talk stops counting as romance, a real moment still does."
+
+**Audit.** `companion_affinity_events.context` records `scope_mode` on every
+turn, and `effective_grades` whenever the ladder changed something. `grades`
+stays the judge's verdict verbatim, so a committed `0` remains attributable:
+the judge said nothing, or the ladder filtered it. Without the pair, watching
+evaluator drift across model swaps would read the engine's own corrections as
+model movement.
 
 ## Persistence
 

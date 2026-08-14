@@ -202,10 +202,46 @@ penalty = κ × ((y − y₀)⁺ / (1 − y₀))²
 | `AFFINITY_CROSS_PENALTY_START` | `0.35` | 惩罚开始生效的另一线分数（y₀） |
 | `AFFINITY_DELTA_THRESHOLD` | `0.0` | 提交阈值 θ；`0` = 每轮都提交 |
 | `AFFINITY_DEMO_BOOST` | `1.4` | `metadata.is_demo` 会话对判官正向原始分的乘数（规则微调不受影响） |
+| `AFFINITY_SCOPE_BOND_BOOST` | `1.5` | 仅点名 bond 半边的 scope 下，bond 独占轴正向原始分的常数乘数（见下）；`1.0` 即关闭 |
+| `AFFINITY_SCOPE_CHEM_LADDER` | `0,0,1,3,4` | 触及 chemistry 半边的 scope 下，chemistry 独占轴的档位门槛表，按正向档位 0–4 索引（逗号分隔；须恰好 5 个 `0..=4` 的值且第 0 格为 `0`，否则整表保持默认）；`0,1,2,3,4` 即关闭 |
 
 每个标量在启动时做域校验——非有限或越域的值（负的单位/系数/惩罚/阈值/乘数、
 不在 `[0, 1)` 内的起罚点）保持默认并记录警告：环境变量打错字只会退回默认值，
 不会进入管线。
+
+## Scope 转向（好感度 3.1）
+
+请求里的 [`affinity_scope`](api-reference.zh.md#post-compchatsession_idmessagestream)
+做两件事。除了决定哪些轴进入 prompt，它还决定本轮档位怎么折算 —— 同一个「关系取向」
+既决定伴侣**被告知**什么，也决定这段关系**挣到**什么。
+
+这里借用的是它两个具名值所携带的 bond/chemistry **心智**，不是它们背后的轴三元组。
+`ScopeMode` 对六个 bool 是全函数，所以轴数组的转向和具名值一样可预期：
+
+| 解析后的 scope | 模式 | 效果 |
+|---|---|---|
+| 空（`none`） | `neutral` | 与 3.0 逐格相同 |
+| 含任一 chemistry 半边轴 —— `chemistry`、`full`、混合数组 | `suppress_chemistry` | `intimacy` / `tension` 的正向档位过 `AFFINITY_SCOPE_CHEM_LADDER` |
+| 其余 —— `bond`、bond 半边数组 | `boost_bond` | `trust` / `intrigue` 的正向原始分 × `AFFINITY_SCOPE_BOND_BOOST` |
+
+三条性质由构造保证：
+
+- **共享的 `warmth` 两个方向都豁免。** 它同时喂两条合成线，缩放它会把修正泄漏到
+  另一条线上 —— 与跨线惩罚豁免 warmth 是同一个理由。只有线独占轴被转向。
+- **损失从不被转向。** 负向原始分照付 `AFFINITY_NEG_FACTOR`，此外什么都不加：
+  这个修正抬高门槛，不减轻伤害。
+- **被门槛滤掉的档位不计跨线惩罚。** 门槛在管线**之前**生效，映射到 `0` 的档位
+  读作「判官没有触碰这条轴」，而惩罚只对被触碰的轴收取，于是根本不触发。
+  这正是默认门槛表不引入任何 3.0 没有的失衡格的原因：它的 `g3`/`g4` 两行与未转向时
+  逐格相同，`g2` 恰好落在未转向的 `g1` 行上。
+
+默认门槛表 `0,0,1,3,4` 滤掉 `g1`、把 `g2` 减半、里程碑原样 ——
+即「闲聊不再算作浪漫，真正的时刻照算」。
+
+**审计。** `companion_affinity_events.context` 每轮都记 `scope_mode`，
+门槛实际改动了什么时另记 `effective_grades`。`grades` 保持判官原始verdict，
+所以一个提交为 `0` 的值始终可归因：是判官什么都没说，还是被门槛滤掉了。
+没有这一对，跨模型轮换观察判官漂移时会把引擎自己的修正读成模型的移动。
 
 ## 持久化
 
