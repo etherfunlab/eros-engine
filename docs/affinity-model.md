@@ -268,20 +268,35 @@ reads the further line's tier (max of both). Negative raw is **never**
 decayed — losses stay full price at any tier. This is where the easy-early /
 grind-at-the-top pacing lives now that the read-side bar projection is gone.
 
-**3. Cross-line penalty.** When the judge touched an axis exclusive to one
-line (grade ≠ 0), the *other* line's height taxes the move:
+**3. Cross-line penalty.** On an axis exclusive to one line, the *other* line's
+height taxes the move — **in proportion to the grade actually applied**:
 
 ```
-penalty = κ × ((y − y₀)⁺ / (1 − y₀))²
+penalty = κ × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
   y  = the OTHER line's score
+  g  = the applied grade (after any 3.1 scope steering)
   κ  = AFFINITY_CROSS_PENALTY        (default 0.05)
   y₀ = AFFINITY_CROSS_PENALTY_START  (default 0.35)
 ```
 
-High Bond makes Chemistry harder to grow and vice versa: a small positive
-push can net negative (the friend-zone wall), and a negative push loses even
-more. `warmth` is exempt (it feeds both lines), and rule-only turns (judge
-grade 0) are exempt — the pipeline charges events, not rent.
+High Bond makes Chemistry harder to grow and vice versa. `warmth` is exempt
+(it feeds both lines), and a grade of `0` charges nothing — rule-only turns and
+grades the 3.1 ladder filtered both land there. The pipeline charges events,
+not rent.
+
+The `|g|/4` factor is what keeps a positive verdict from reading as a loss.
+Ignoring rule nudges, the whole term is `ρ = g × (D_k·u − κ·φ(y)/4)`: the
+bracket does not depend on the grade, so **the sign of the outcome matches the
+sign of the verdict** — the grade sets the size, not the direction. A flat toll
+instead made the sign flip somewhere between g1 and g4, so an honest small push
+lost ground while a bigger one gained it, and the meter fell on a turn the judge
+had scored entirely positive.
+
+The double-high lock survives where it is meant to. The bracket is genuinely
+negative only at own tier 5 with a counterpart past ≈`0.761` (at defaults) —
+there *every* grade nets negative, uniformly. "You cannot be both a confidant
+and a lover" still holds at the apex; it stopped firing on ordinary
+mid-relationship turns.
 
 **4. Threshold gate.** Each axis keeps a signed accumulator. The turn's real
 score joins it, and the whole balance commits only once
@@ -355,7 +370,9 @@ turn, and `effective_grades` whenever the ladder changed something. `grades`
 stays the judge's verdict verbatim, so a committed `0` remains attributable:
 the judge said nothing, or the ladder filtered it. Without the pair, watching
 evaluator drift across model swaps would read the engine's own corrections as
-model movement.
+model movement. `cross_penalty_charged` joins them whenever a turn actually
+paid cross-line tax — with the penalty scaling by grade, how much a turn paid
+is no longer recoverable from the grades and the stored scores alone.
 
 ## Persistence
 

@@ -332,6 +332,7 @@ impl Affinity {
 // accumulator before it commits.
 // Design specs: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
 //               docs/superpowers/specs/2026-08-14-affinity-31-scope-steering-design.md
+//               docs/superpowers/specs/2026-08-14-cross-penalty-by-grade-design.md
 
 /// Tuning knobs for the 3.0 pipeline, env-driven server-side. Defaults
 /// set the single-turn envelope: grade ±4 lands +0.20 / −0.30 per axis.
@@ -482,6 +483,27 @@ pub struct GradeTurnOutcome {
     /// nothing, or the ladder filtered it.
     pub effective_grades: AxisGrades,
     pub scope_mode: ScopeMode,
+    /// Cross-line penalty actually charged this turn, per line-exclusive axis.
+    /// Now that the penalty scales with the grade rather than switching on and
+    /// off, "how much tax did this turn pay" is no longer derivable from the
+    /// grades alone — so it is recorded rather than reconstructed. warmth is
+    /// penalty-exempt and therefore absent.
+    pub cross_penalty_charged: CrossPenaltyCharged,
+}
+
+/// Per-axis cross-line penalty charged in one turn (always ≥ 0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CrossPenaltyCharged {
+    pub trust: f64,
+    pub intrigue: f64,
+    pub intimacy: f64,
+    pub tension: f64,
+}
+
+impl CrossPenaltyCharged {
+    pub fn is_zero(&self) -> bool {
+        self.trust == 0.0 && self.intrigue == 0.0 && self.intimacy == 0.0 && self.tension == 0.0
+    }
 }
 
 impl Default for GradeTurnOutcome {
@@ -492,6 +514,7 @@ impl Default for GradeTurnOutcome {
             pending: PendingDeltas::default(),
             effective_grades: AxisGrades::default(),
             scope_mode: ScopeMode::Neutral,
+            cross_penalty_charged: CrossPenaltyCharged::default(),
         }
     }
 }
@@ -563,14 +586,27 @@ pub fn grade_turn(
         judge + rule_d
     };
 
-    // ρ = D·max(r,0) + min(r,0) − P·1[judged]: positive part damped, negative
-    // part full price, the penalty only charged when the judge touched the axis.
-    let real = |r: f64, own_tier: usize, counterpart: Option<f64>, judged: bool| {
+    // ρ = D·max(r,0) + min(r,0) − P: positive part damped, negative part full
+    // price, and the cross penalty charged in PROPORTION to the grade actually
+    // applied — P = κ·φ(y)·(|g|/4).
+    //
+    // It used to be binary: any non-zero grade paid the full κ·φ(y). That made
+    // the tax independent of how much the axis moved, so at a high counterpart
+    // score a small honest push was charged the same as a milestone and netted
+    // negative — a positive verdict that lowers the score. The proportional form
+    // keeps the zero case exactly as it was (a grade of 0, including one the 3.1
+    // ladder filtered, charges nothing) and turns the old on/off step into the
+    // endpoint of a continuous rule.
+    //
+    // Magnitude, not sign: a negative grade already moves the axis away from the
+    // double-high position the penalty exists to discourage, so it pays in
+    // proportion too rather than at the old flat rate.
+    let real = |r: f64, own_tier: usize, counterpart: Option<f64>, g: i8| {
         let p = match counterpart {
-            Some(y) if judged => penalty(y),
-            _ => 0.0,
+            Some(y) => penalty(y) * f64::from(g.saturating_abs().min(4)) / 4.0,
+            None => 0.0,
         };
-        decay(own_tier) * r.max(0.0) + r.min(0.0) - p
+        (decay(own_tier) * r.max(0.0) + r.min(0.0) - p, p)
     };
 
     // Threshold gate: signed accumulation, everything commits once |acc| ≥ θ.
@@ -588,14 +624,15 @@ pub fn grade_turn(
     let axis =
         |g: i8, rule_d: f64, own_tier: usize, counterpart: Option<f64>, pend: f64, mult: f64| {
             let r = raw(g, rule_d, mult);
-            let rho = real(r, own_tier, counterpart, g != 0);
+            let (rho, charged) = real(r, own_tier, counterpart, g);
             let (committed, pend) = gate(rho, pend);
-            (r, committed, pend)
+            (r, committed, pend, charged)
         };
 
     let max_tier = bond_tier.max(chem_tier);
-    let (w_raw, w_com, w_pend) = axis(eff.warmth, rule.warmth, max_tier, None, pending.warmth, 1.0);
-    let (t_raw, t_com, t_pend) = axis(
+    let (w_raw, w_com, w_pend, _w_pen) =
+        axis(eff.warmth, rule.warmth, max_tier, None, pending.warmth, 1.0);
+    let (t_raw, t_com, t_pend, t_pen) = axis(
         eff.trust,
         rule.trust,
         bond_tier,
@@ -603,7 +640,7 @@ pub fn grade_turn(
         pending.trust,
         bond_mult,
     );
-    let (ig_raw, ig_com, ig_pend) = axis(
+    let (ig_raw, ig_com, ig_pend, ig_pen) = axis(
         eff.intrigue,
         rule.intrigue,
         bond_tier,
@@ -611,7 +648,7 @@ pub fn grade_turn(
         pending.intrigue,
         bond_mult,
     );
-    let (im_raw, im_com, im_pend) = axis(
+    let (im_raw, im_com, im_pend, im_pen) = axis(
         eff.intimacy,
         rule.intimacy,
         chem_tier,
@@ -619,7 +656,7 @@ pub fn grade_turn(
         pending.intimacy,
         1.0,
     );
-    let (tn_raw, tn_com, tn_pend) = axis(
+    let (tn_raw, tn_com, tn_pend, tn_pen) = axis(
         eff.tension,
         rule.tension,
         chem_tier,
@@ -654,6 +691,12 @@ pub fn grade_turn(
         },
         effective_grades: eff,
         scope_mode: mode,
+        cross_penalty_charged: CrossPenaltyCharged {
+            trust: t_pen,
+            intrigue: ig_pen,
+            intimacy: im_pen,
+            tension: tn_pen,
+        },
     }
 }
 
@@ -1090,9 +1133,13 @@ mod tests {
         );
         // trust: own tier 3 → 0.45 × 0.10, counterpart chem 0 → no penalty
         assert!((o.committed.trust - 0.045).abs() < 1e-9);
-        // intimacy: own tier 1 → ×1.0, counterpart bond 0.5 → κ·((0.15/0.65)²)
-        let p = 0.05 * (0.15f64 / 0.65).powi(2);
+        // intimacy: own tier 1 → ×1.0, counterpart bond 0.5 → κ·((0.15/0.65)²),
+        // charged at 2/4 because the judge graded this axis a 2 (the penalty is
+        // proportional to the applied grade, not a flat toll on any non-zero).
+        let p = 0.05 * (0.15f64 / 0.65).powi(2) * 2.0 / 4.0;
         assert!((o.committed.intimacy - (0.10 - p)).abs() < 1e-9);
+        assert!((o.cross_penalty_charged.intimacy - p).abs() < 1e-9);
+        assert_eq!(o.cross_penalty_charged.trust, 0.0, "counterpart below y₀");
     }
 
     /// warmth feeds both lines, so its damping reads the FURTHER line's tier
@@ -1117,43 +1164,82 @@ mod tests {
         assert!((o.committed.warmth - 0.1 * 0.10).abs() < 1e-9);
     }
 
-    /// A positive push on an exclusive axis can be penalised through zero when
-    /// the counterpart line is maxed — the friend-zone wall.
+    /// **Changed with proportional charging.** Under the old flat toll this
+    /// case asserted a g1 push netting −0.015 against a maxed counterpart while
+    /// a g2 netted +0.02 — the sign flipped between grades, which is what made
+    /// "the judge said up and the meter went down" possible.
+    ///
+    /// Charging in proportion makes `ρ = g · (D_k·u − κ·φ(y)/4)`: the bracket no
+    /// longer depends on the grade, so **the outcome's sign always matches the
+    /// verdict's** at this position. The grade sets the size, not the direction.
     #[test]
-    fn penalty_flips_small_positive_pushes_negative() {
+    fn penalty_scales_with_the_grade_so_the_sign_no_longer_flips() {
         let mut a = zeroed();
         a.warmth = 1.0;
         a.intimacy = 1.0;
         a.tension = 1.0; // chemistry = 1.0; bond = 1/3 → tier 2
-        let g1 = turn(
-            &a,
-            AxisGrades {
-                trust: 1,
-                ..Default::default()
-            },
-            AffinityDeltas::default(),
-            PendingDeltas::default(),
-            1.0,
-            &AffinityTuning::default(),
-        );
-        // 0.7 × 0.05 − 0.05 = −0.015: honest effort, net loss
-        assert!((g1.committed.trust - (-0.015)).abs() < 1e-9);
-        let g2 = turn(
-            &a,
-            AxisGrades {
-                trust: 2,
-                ..Default::default()
-            },
-            AffinityDeltas::default(),
-            PendingDeltas::default(),
-            1.0,
-            &AffinityTuning::default(),
-        );
-        // 0.7 × 0.10 − 0.05 = +0.02: a clearer moment still lands
-        assert!((g2.committed.trust - 0.02).abs() < 1e-9);
+        let at = |g: i8| {
+            turn(
+                &a,
+                AxisGrades {
+                    trust: g,
+                    ..Default::default()
+                },
+                AffinityDeltas::default(),
+                PendingDeltas::default(),
+                1.0,
+                &AffinityTuning::default(),
+            )
+        };
+        // g1: 0.70 × 0.05 − 0.05 × 1 × ¼ = +0.0225 — honest effort now lands.
+        assert!((at(1).committed.trust - 0.0225).abs() < 1e-9);
+        // g2: exactly double. Proportional in, proportional out.
+        assert!((at(2).committed.trust - 0.045).abs() < 1e-9);
+        assert!((at(4).committed.trust - 0.09).abs() < 1e-9);
+        for g in 1..=4 {
+            assert!(
+                at(g).committed.trust > 0.0,
+                "a positive verdict must not lower the score here (g{g})"
+            );
+        }
     }
 
-    /// Negative raw is never damped by tier, and the penalty stacks on top.
+    /// The double-high lock survives where it is meant to. At own tier 5 the
+    /// bracket `D₅·u − κ·φ(y)/4` is genuinely negative once the counterpart
+    /// passes ≈0.761, so every grade nets negative — uniformly, not just the
+    /// cheap ones. "You cannot be both" still holds at the apex; it just stopped
+    /// firing on ordinary mid-relationship turns.
+    #[test]
+    fn tier_five_against_a_high_counterpart_still_loses_at_every_grade() {
+        let mut a = zeroed();
+        a.warmth = 1.0;
+        a.trust = 1.0;
+        a.intrigue = 1.0; // bond = 1.0 — the counterpart
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chemistry = 1.0 → own tier 5
+        for g in 1..=4 {
+            let o = turn(
+                &a,
+                AxisGrades {
+                    intimacy: g,
+                    ..Default::default()
+                },
+                AffinityDeltas::default(),
+                PendingDeltas::default(),
+                1.0,
+                &AffinityTuning::default(),
+            );
+            // 0.10 × 0.05·g − 0.05 × 1 × g/4 = g × (0.005 − 0.0125) < 0
+            assert!(
+                (o.committed.intimacy - f64::from(g) * (0.005 - 0.0125)).abs() < 1e-9,
+                "g{g}"
+            );
+            assert!(o.committed.intimacy < 0.0, "g{g}");
+        }
+    }
+
+    /// Negative raw is never damped by tier, and the penalty still stacks on
+    /// top — now at the grade's share rather than the full toll.
     #[test]
     fn negative_skips_decay_and_pays_extra() {
         let mut a = zeroed();
@@ -1173,8 +1259,11 @@ mod tests {
             1.0,
             &AffinityTuning::default(),
         );
-        // −2 × 0.05 × 1.5 = −0.15, minus κ·φ(1.0) = 0.05 → −0.20
-        assert!((o.committed.trust - (-0.20)).abs() < 1e-9);
+        // −2 × 0.05 × 1.5 = −0.15, minus κ·φ(1.0) × 2/4 = 0.025 → −0.175.
+        // (Was −0.20 under the flat toll. The penalty reads the grade's
+        // MAGNITUDE, so a loss is taxed by how big it is, not a flat rate.)
+        assert!((o.committed.trust - (-0.175)).abs() < 1e-9);
+        assert!((o.cross_penalty_charged.trust - 0.025).abs() < 1e-9);
     }
 
     /// P6: the pipeline charges events, not rent — an all-zero verdict moves
@@ -1460,16 +1549,22 @@ mod tests {
         a.warmth = 1.0;
         a.trust = 1.0;
         a.intrigue = 1.0; // bond = 1.0 — the most expensive counterpart there is
+        a.intimacy = 1.0;
+        a.tension = 1.0; // chemistry = 1.0 → own tier 5, where a loss is possible
         let g = AxisGrades {
             intimacy: 1,
             ..Default::default()
         };
-        // 3.0 behaviour: the push lands, then the penalty takes more than it.
+        // Unsteered: the push lands, the penalty takes more than it.
         let neutral = scoped(&a, g, crate::scope::AffinityScope::none());
         assert!(neutral.committed.intimacy < 0.0);
-        // 3.1 suppressed: nothing happens at all — not a smaller loss, zero.
+        assert!(neutral.cross_penalty_charged.intimacy > 0.0);
+        // Suppressed: nothing happens at all — not a smaller loss, zero. The
+        // ladder maps g1 to 0, and a grade of 0 is simply where the proportional
+        // penalty starts.
         let suppressed = scoped(&a, g, crate::scope::AffinityScope::chemistry());
         assert_eq!(suppressed.committed.intimacy, 0.0);
+        assert_eq!(suppressed.cross_penalty_charged.intimacy, 0.0);
     }
 
     /// `full` is the dominant production value and steers the suppress side —
