@@ -112,9 +112,43 @@ penalty-exempt and never appears.
 - **Tier decay stays a five-step table.** The staircase is a separate concern
   from the toll's shape; making it continuous is not required for the sign
   property above and is not attempted here.
-- **No hysteresis at the tier endpoints.** A line crossing `0.90` back and forth
-  still flips its label each time. Real, observed in the same session, and out
-  of scope.
+- **No hysteresis at the tier endpoints.** Evaluated against recorded
+  `label_changes` and rejected — see below. A line crossing an endpoint back and
+  forth still flips its label each time.
+
+### Why not hysteresis
+
+Label whiplash is real and current, not a legacy artifact: **34.3% of tier
+transitions recorded under 3.0 are reversed** (12 of 35; the pre-3.0 corpus sits
+at 22.7%, 108 of 475 — so it did not improve). Every endpoint is affected, led by
+`beloved ↔ lover` and `flirtation ↔ spark`. Three findings still argue against a
+deadband:
+
+1. **The reversals are large real moves, not boundary jitter.** Under 3.0 the
+   reversal-causing `|Δline|` has median `0.0285` and max `0.0603`; only 2 of 12
+   fall under `0.01`. A deadband large enough to matter would need to be `≥0.03`
+   — roughly a third of the entire tier-5 span (`0.10`). That is not hysteresis,
+   it is redefining the ladder.
+2. **The cause is the rule this spec replaces.** Of the 3.0-era down-legs, three
+   of five landed on turns the judge scored *positive* (the other two were
+   genuine negative verdicts; none were silent). Adding a deadband now would mask
+   the symptom of a cause that has just been removed.
+3. **Real hysteresis costs state.** One-step memory demonstrably does not hold —
+   a score parked just below the endpoint flips on the following turn regardless
+   — so it needs a persisted per-line tier. That means an additive migration,
+   `tier_index` ceasing to be a pure function, and the label being allowed to
+   disagree with the score: the two-bookkeeping-spaces problem 3.0 deleted along
+   with `bar()`.
+
+The measurement to repeat once this ships is cheap: `context` now carries
+`grades`, `effective_grades`, `cross_penalty_charged` and `label_changes`
+together.
+
+A separate boundary is worth stating: `label_changes` is a faithful record of
+what the score did and should stay faithful. Whether a given transition deserves
+a "you levelled up" notification — and whether that notification should be
+debounced — is a consumer-side product decision, not a reason to change what the
+engine scores.
 
 ## 7. Compatibility
 
