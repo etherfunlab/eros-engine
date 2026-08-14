@@ -53,11 +53,21 @@ Ignoring rule nudges, the whole exclusive-axis term becomes
 ρ = g · (D_k·u − κ·φ(y)/4)
 ```
 
-The bracket does not contain `g`. Three consequences:
+More precisely, it factorises twice — the negative part is never decayed, so it
+has a bracket of its own:
 
-- **The sign of the outcome matches the sign of the verdict.** The grade sets
-  magnitude, not direction. "Judge says up, score falls" is structurally gone
-  wherever the bracket is positive.
+```
+g > 0:  ρ = g · (D_k·u − κ·φ(y)/4)
+g < 0:  ρ = g · (u·λ⁻ + κ·φ(y)/4)
+```
+
+Neither bracket contains `g`. Three consequences:
+
+- **The outcome cannot change sign between grades at a fixed position.** The
+  grade sets magnitude, not direction. This is the flat toll's failure mode
+  removed — it is *not* a promise that every positive verdict is a gain, which
+  remains a property of the position (below). The negative bracket is always
+  positive, so a negative verdict always lowers the axis.
 - **The break-even is a property of the position, not of the grade.** It solves
   to `φ(y*) = 4·D_k·u/κ`, which at defaults exceeds 1 for tiers 1–4 — those tiers
   can never be out-taxed at any grade. Only own tier 5 has a real break-even, at
@@ -66,6 +76,12 @@ The bracket does not contain `g`. Three consequences:
   against a counterpart past `0.761` every grade nets negative, uniformly. "You
   cannot be both a confidant and a lover" still holds at the apex; it simply
   stopped firing on ordinary mid-relationship turns.
+
+Rule nudges sit outside the factorisation: they join the raw score before decay
+but are not part of the penalty's grade, so a large enough opposing nudge could
+in principle invert the sign. None can today — the only rule deltas reaching a
+graded axis are `intrigue +0.02` and `tension +0.03`, both positive; every
+negative nudge lands on `patience`, which bypasses the pipeline.
 
 This is also a generalisation rather than a new concept: 3.1 already established
 "a grade laddered to 0 charges nothing". Proportional charging extends the same
@@ -98,11 +114,17 @@ from zero), so the chem/bond ratio lands at 1.26 rather than 1.08. Still far fro
 
 ## 5. Audit
 
-`companion_affinity_events.context` gains `cross_penalty_charged` — per
-line-exclusive axis, written only when a turn actually paid. With the penalty
-scaling by grade, how much was charged is no longer recoverable from the grades
-and the stored scores, so it is recorded rather than reconstructed. warmth is
-penalty-exempt and never appears.
+`companion_affinity_events.context` gains `cross_penalty_assessed` — per
+line-exclusive axis, written only when non-zero. With the penalty scaling by
+grade, the amount is no longer recoverable from the grades and the stored scores,
+so it is recorded rather than reconstructed. warmth is penalty-exempt and never
+appears.
+
+**Assessed, not applied**, and the name says so: the penalty is subtracted
+inside `ρ`, *before* the threshold gate, so on a gated turn nothing has reached
+the axis yet — the amount rides in `pending_deltas` rather than being lost (the
+gate re-times commits, it never rescales them), and the axis clamp can swallow
+part of a later commit besides.
 
 ## 6. Non-goals
 
@@ -141,7 +163,7 @@ deadband:
    with `bar()`.
 
 The measurement to repeat once this ships is cheap: `context` now carries
-`grades`, `effective_grades`, `cross_penalty_charged` and `label_changes`
+`grades`, `effective_grades`, `cross_penalty_assessed` and `label_changes`
 together.
 
 A separate boundary is worth stating: `label_changes` is a faithful record of

@@ -483,24 +483,29 @@ pub struct GradeTurnOutcome {
     /// nothing, or the ladder filtered it.
     pub effective_grades: AxisGrades,
     pub scope_mode: ScopeMode,
-    /// Cross-line penalty actually charged this turn, per line-exclusive axis.
-    /// Now that the penalty scales with the grade rather than switching on and
-    /// off, "how much tax did this turn pay" is no longer derivable from the
-    /// grades alone — so it is recorded rather than reconstructed. warmth is
-    /// penalty-exempt and therefore absent.
-    pub cross_penalty_charged: CrossPenaltyCharged,
+    /// Cross-line penalty *assessed* this turn, per line-exclusive axis.
+    ///
+    /// Assessed, not applied. It is subtracted inside `ρ` before the threshold
+    /// gate, so on a turn the gate buffers, nothing has reached the axis yet —
+    /// the amount rides along in `pending` rather than being lost (the gate
+    /// re-times commits, it never rescales them), and the caller's axis clamp
+    /// can swallow part of a commit besides. Now that the penalty scales with
+    /// the applied grade this is no longer derivable from the grades alone, so
+    /// it is recorded rather than reconstructed. warmth is penalty-exempt and
+    /// therefore absent.
+    pub cross_penalty_assessed: CrossPenaltyAssessed,
 }
 
-/// Per-axis cross-line penalty charged in one turn (always ≥ 0).
+/// Per-axis cross-line penalty assessed in one turn (always ≥ 0).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub struct CrossPenaltyCharged {
+pub struct CrossPenaltyAssessed {
     pub trust: f64,
     pub intrigue: f64,
     pub intimacy: f64,
     pub tension: f64,
 }
 
-impl CrossPenaltyCharged {
+impl CrossPenaltyAssessed {
     pub fn is_zero(&self) -> bool {
         self.trust == 0.0 && self.intrigue == 0.0 && self.intimacy == 0.0 && self.tension == 0.0
     }
@@ -514,7 +519,7 @@ impl Default for GradeTurnOutcome {
             pending: PendingDeltas::default(),
             effective_grades: AxisGrades::default(),
             scope_mode: ScopeMode::Neutral,
-            cross_penalty_charged: CrossPenaltyCharged::default(),
+            cross_penalty_assessed: CrossPenaltyAssessed::default(),
         }
     }
 }
@@ -587,16 +592,34 @@ pub fn grade_turn(
     };
 
     // ρ = D·max(r,0) + min(r,0) − P: positive part damped, negative part full
-    // price, and the cross penalty charged in PROPORTION to the grade actually
+    // price, and the cross penalty assessed in PROPORTION to the grade actually
     // applied — P = κ·φ(y)·(|g|/4).
     //
     // It used to be binary: any non-zero grade paid the full κ·φ(y). That made
     // the tax independent of how much the axis moved, so at a high counterpart
-    // score a small honest push was charged the same as a milestone and netted
-    // negative — a positive verdict that lowers the score. The proportional form
-    // keeps the zero case exactly as it was (a grade of 0, including one the 3.1
-    // ladder filtered, charges nothing) and turns the old on/off step into the
-    // endpoint of a continuous rule.
+    // score a small honest push was charged the same as a milestone. The
+    // proportional form keeps the zero case exactly as it was (a grade of 0,
+    // including one the 3.1 ladder filtered, charges nothing) and turns the old
+    // on/off step into the endpoint of a continuous rule.
+    //
+    // What it buys, stated exactly — ignoring rule nudges, ρ factorises:
+    //     g > 0:  ρ = g · (D_k·u·mult − κ·φ(y)/4)
+    //     g < 0:  ρ = g · (u·λ⁻ + κ·φ(y)/4)          (no decay on the negative part)
+    // Neither bracket contains g, so **the outcome cannot change sign between
+    // grades at a fixed position** — the flat toll's failure mode, where a small
+    // honest push lost ground while a bigger one gained it. The negative bracket
+    // is always positive, so a negative verdict always lowers the axis.
+    //
+    // It does NOT make every positive verdict a gain: whether the positive
+    // bracket is positive is a property of the POSITION, break-even at
+    // φ(y*) = 4·D_k·u·mult/κ. Past it every grade nets negative, uniformly —
+    // see `tier_five_against_a_high_counterpart_still_loses_at_every_grade`.
+    //
+    // Rule nudges sit outside this: they join `r` before decay but are not part
+    // of `g`, so a large enough opposing nudge could in principle invert the
+    // sign. None can today — the only rule deltas reaching a graded axis are
+    // intrigue +0.02 and tension +0.03, both positive (the negative ones all
+    // land on patience, which bypasses the pipeline).
     //
     // Magnitude, not sign: a negative grade already moves the axis away from the
     // double-high position the penalty exists to discourage, so it pays in
@@ -691,7 +714,7 @@ pub fn grade_turn(
         },
         effective_grades: eff,
         scope_mode: mode,
-        cross_penalty_charged: CrossPenaltyCharged {
+        cross_penalty_assessed: CrossPenaltyAssessed {
             trust: t_pen,
             intrigue: ig_pen,
             intimacy: im_pen,
@@ -1138,8 +1161,8 @@ mod tests {
         // proportional to the applied grade, not a flat toll on any non-zero).
         let p = 0.05 * (0.15f64 / 0.65).powi(2) * 2.0 / 4.0;
         assert!((o.committed.intimacy - (0.10 - p)).abs() < 1e-9);
-        assert!((o.cross_penalty_charged.intimacy - p).abs() < 1e-9);
-        assert_eq!(o.cross_penalty_charged.trust, 0.0, "counterpart below y₀");
+        assert!((o.cross_penalty_assessed.intimacy - p).abs() < 1e-9);
+        assert_eq!(o.cross_penalty_assessed.trust, 0.0, "counterpart below y₀");
     }
 
     /// warmth feeds both lines, so its damping reads the FURTHER line's tier
@@ -1173,7 +1196,7 @@ mod tests {
     /// longer depends on the grade, so **the outcome's sign always matches the
     /// verdict's** at this position. The grade sets the size, not the direction.
     #[test]
-    fn penalty_scales_with_the_grade_so_the_sign_no_longer_flips() {
+    fn penalty_scales_with_the_grade_so_the_outcome_cannot_flip_between_grades() {
         let mut a = zeroed();
         a.warmth = 1.0;
         a.intimacy = 1.0;
@@ -1263,7 +1286,7 @@ mod tests {
         // (Was −0.20 under the flat toll. The penalty reads the grade's
         // MAGNITUDE, so a loss is taxed by how big it is, not a flat rate.)
         assert!((o.committed.trust - (-0.175)).abs() < 1e-9);
-        assert!((o.cross_penalty_charged.trust - 0.025).abs() < 1e-9);
+        assert!((o.cross_penalty_assessed.trust - 0.025).abs() < 1e-9);
     }
 
     /// P6: the pipeline charges events, not rent — an all-zero verdict moves
@@ -1558,13 +1581,13 @@ mod tests {
         // Unsteered: the push lands, the penalty takes more than it.
         let neutral = scoped(&a, g, crate::scope::AffinityScope::none());
         assert!(neutral.committed.intimacy < 0.0);
-        assert!(neutral.cross_penalty_charged.intimacy > 0.0);
+        assert!(neutral.cross_penalty_assessed.intimacy > 0.0);
         // Suppressed: nothing happens at all — not a smaller loss, zero. The
         // ladder maps g1 to 0, and a grade of 0 is simply where the proportional
         // penalty starts.
         let suppressed = scoped(&a, g, crate::scope::AffinityScope::chemistry());
         assert_eq!(suppressed.committed.intimacy, 0.0);
-        assert_eq!(suppressed.cross_penalty_charged.intimacy, 0.0);
+        assert_eq!(suppressed.cross_penalty_assessed.intimacy, 0.0);
     }
 
     /// `full` is the dominant production value and steers the suppress side —

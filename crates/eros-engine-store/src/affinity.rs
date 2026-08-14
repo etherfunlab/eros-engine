@@ -413,15 +413,16 @@ impl<'a> AffinityRepo<'a> {
                 obj.insert("pending_after".into(), p);
             }
             // The cross-line penalty now scales with the applied grade, so how
-            // much tax a turn paid is no longer recoverable from the grades and
-            // the stored scores alone. Written only when something was actually
-            // charged, so it stays absent on the common quiet turn.
-            if !outcome.cross_penalty_charged.is_zero() {
-                if let Ok(p) = serde_json::to_value(outcome.cross_penalty_charged) {
-                    obj.insert("cross_penalty_charged".into(), p);
+            // much a turn was taxed is no longer recoverable from the grades and
+            // the stored scores alone. ASSESSED, not applied: on a gated turn it
+            // rides in `pending_after` rather than reaching the axis. Written
+            // only when non-zero, so it stays absent on the common quiet turn.
+            if !outcome.cross_penalty_assessed.is_zero() {
+                if let Ok(p) = serde_json::to_value(outcome.cross_penalty_assessed) {
+                    obj.insert("cross_penalty_assessed".into(), p);
                 }
             } else {
-                obj.remove("cross_penalty_charged");
+                obj.remove("cross_penalty_assessed");
             }
         }
 
@@ -667,7 +668,7 @@ mod tests {
         assert_eq!(ctx["scope_mode"], "suppress_chemistry");
         // Fresh row: both counterparts sit below y₀, so no tax was charged and
         // the key stays absent.
-        assert!(ctx.get("cross_penalty_charged").is_none());
+        assert!(ctx.get("cross_penalty_assessed").is_none());
         assert_eq!(ctx["grades"]["intimacy"], 1, "judge's verdict, verbatim");
         assert_eq!(ctx["effective_grades"]["intimacy"], 0, "ladder filtered it");
         assert_eq!(ctx["effective_grades"]["tension"], 1, "ladder halved it");
@@ -681,7 +682,7 @@ mod tests {
     /// derivable from the grades and the stored scores, so the event row carries
     /// it. Two grades at the same position must differ by exactly their ratio.
     #[sqlx::test(migrations = "./migrations")]
-    async fn event_context_records_the_cross_penalty_actually_charged(pool: PgPool) {
+    async fn event_context_records_the_cross_penalty_assessed(pool: PgPool) {
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
 
@@ -726,25 +727,29 @@ mod tests {
             .await
             .unwrap();
             sqlx::query_scalar::<_, serde_json::Value>(
-                "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+                "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1 \
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
             )
             .bind(a.id)
             .fetch_one(pool)
             .await
             .unwrap()
         }
+        // (Each call opens its own session, so `affinity_id` already selects a
+        // single event — the ORDER BY is belt-and-braces against a future edit
+        // that reuses one.)
 
         let g1 = charged(&pool, user_id, instance_id, 1).await;
         let g4 = charged(&pool, user_id, instance_id, 4).await;
-        let p1 = g1["cross_penalty_charged"]["intimacy"].as_f64().unwrap();
-        let p4 = g4["cross_penalty_charged"]["intimacy"].as_f64().unwrap();
+        let p1 = g1["cross_penalty_assessed"]["intimacy"].as_f64().unwrap();
+        let p4 = g4["cross_penalty_assessed"]["intimacy"].as_f64().unwrap();
         assert!(p1 > 0.0, "a maxed counterpart must charge something");
         assert!(
             (p4 - p1 * 4.0).abs() < 1e-9,
             "g4 pays exactly 4× g1: {p1} vs {p4}"
         );
         // Penalty-exempt warmth never appears with a charge.
-        assert_eq!(g4["cross_penalty_charged"].get("warmth"), None);
+        assert_eq!(g4["cross_penalty_assessed"].get("warmth"), None);
     }
 
     /// Unsteered turns must not grow an `effective_grades` key — it is written
