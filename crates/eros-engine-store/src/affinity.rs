@@ -387,12 +387,23 @@ impl<'a> AffinityRepo<'a> {
         // or the ladder filtered it. Without the pair, evaluator-drift watching
         // (the reason `grades` is logged at all) reads the engine's own
         // corrections as model movement.
-        let mut context = context;
+        // The engine owns these keys, so they are written unconditionally — a
+        // caller that supplied a non-object context (this is a published crate;
+        // the caller is not necessarily us) keeps its value under `caller`
+        // rather than silently costing the turn its audit trail.
+        let mut context = match context {
+            v @ serde_json::Value::Object(_) => v,
+            serde_json::Value::Null => serde_json::json!({}),
+            other => serde_json::json!({ "caller": other }),
+        };
         if let Some(obj) = context.as_object_mut() {
             if let Ok(g) = serde_json::to_value(grades) {
                 obj.insert("grades".into(), g);
             }
             obj.insert("scope_mode".into(), outcome.scope_mode.as_key().into());
+            // Removed first, so a caller-supplied key can never leave an
+            // unsteered turn looking corrected.
+            obj.remove("effective_grades");
             if outcome.effective_grades != *grades {
                 if let Ok(g) = serde_json::to_value(outcome.effective_grades) {
                     obj.insert("effective_grades".into(), g);
@@ -695,6 +706,84 @@ mod tests {
         assert_eq!(ctx["scope_mode"], "neutral");
         assert!(ctx.get("effective_grades").is_none());
         assert!((a.intimacy - 0.05).abs() < 1e-9);
+    }
+
+    /// This is a published crate, so the caller is not necessarily us. A
+    /// non-object context must not cost the turn its audit trail, and a
+    /// caller-supplied `effective_grades` must never survive to make an
+    /// unsteered turn look corrected.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn engine_owned_audit_keys_survive_hostile_caller_context(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        async fn write(
+            pool: &PgPool,
+            user_id: Uuid,
+            instance_id: Uuid,
+            ctx: serde_json::Value,
+        ) -> serde_json::Value {
+            let repo = AffinityRepo { pool };
+            let session = make_session(pool, user_id, instance_id).await;
+            let mut a = repo
+                .load_or_create(session, user_id, instance_id)
+                .await
+                .unwrap();
+            repo.persist_with_event(
+                &mut a,
+                &AxisGrades {
+                    trust: 1,
+                    ..Default::default()
+                },
+                &AffinityDeltas::default(),
+                1.0,
+                &AffinityScope::none(),
+                &AffinityTuning::default(),
+                "message",
+                ctx,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+            )
+            .bind(a.id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        // A null context still gets the engine's keys.
+        let ctx = write(&pool, user_id, instance_id, serde_json::Value::Null).await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+
+        // A non-object context is preserved rather than dropped, and does not
+        // block the audit keys.
+        let ctx = write(
+            &pool,
+            user_id,
+            instance_id,
+            serde_json::json!("a bare string"),
+        )
+        .await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+        assert_eq!(ctx["caller"], "a bare string");
+
+        // A spoofed key is cleared: this turn was NOT steered.
+        let ctx = write(
+            &pool,
+            user_id,
+            instance_id,
+            serde_json::json!({ "effective_grades": { "tension": 9 } }),
+        )
+        .await;
+        assert_eq!(ctx["scope_mode"], "neutral");
+        assert!(
+            ctx.get("effective_grades").is_none(),
+            "a caller must not be able to claim the ladder fired"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
