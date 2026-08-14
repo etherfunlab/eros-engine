@@ -69,14 +69,14 @@ eros-engine-llm   = "1.0"   # optional: model and embedding clients
 各 `v*` タグについて、複数アーキテクチャ対応のイメージを GitHub Container Registry へ公開しています。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:1.2.0
+docker pull ghcr.io/etherfunlab/eros-engine:1.2.1
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:1.2.0 serve
+  ghcr.io/etherfunlab/eros-engine:1.2.1 serve
 ```
 
 Postgres と `.env` は利用者側で用意してください。同じ `docker/Dockerfile` を任意のコンテナ環境へ配備できます。詳細は [Deploying](docs/deploying.md) を参照してください。
