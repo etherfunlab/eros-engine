@@ -118,6 +118,67 @@ pub struct CharacterInsightRepo<'a> {
 }
 
 impl CharacterInsightRepo<'_> {
+    /// Apply one extraction result incrementally, and append the post-merge
+    /// state to `character_insights_snapshot` in the same statement.
+    ///
+    /// Merge rules (identical to the human chain): extracted scalars
+    /// overwrite, absent/null scalars keep the stored value, arrays overwrite
+    /// only when the extraction produced a non-empty array. There is
+    /// deliberately no erase path. Single statement — no read-modify-write, so
+    /// concurrent extractions degrade to column-level (not whole-row)
+    /// last-write-wins.
+    ///
+    /// The snapshot rides a data-modifying CTE rather than a second query so
+    /// it cannot drift from the row it claims to describe. There is no sweeper
+    /// for that table; this is its only writer.
+    pub async fn apply_extraction(
+        &self,
+        instance_id: Uuid,
+        insights: &serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        let c = project_columns(insights);
+        sqlx::query(
+            "WITH upserted AS ( \
+                 INSERT INTO engine.character_insights \
+                     (instance_id, location, occupation, current_situation, desires, \
+                      vulnerabilities, habits, personal_values, likes, dislikes, relationships) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (instance_id) DO UPDATE SET \
+                     location          = COALESCE(EXCLUDED.location, character_insights.location), \
+                     occupation        = COALESCE(EXCLUDED.occupation, character_insights.occupation), \
+                     current_situation = COALESCE(EXCLUDED.current_situation, character_insights.current_situation), \
+                     desires           = COALESCE(EXCLUDED.desires, character_insights.desires), \
+                     vulnerabilities   = COALESCE(EXCLUDED.vulnerabilities, character_insights.vulnerabilities), \
+                     habits            = COALESCE(EXCLUDED.habits, character_insights.habits), \
+                     personal_values   = COALESCE(EXCLUDED.personal_values, character_insights.personal_values), \
+                     likes             = CASE WHEN EXCLUDED.likes = '{}' \
+                                              THEN character_insights.likes ELSE EXCLUDED.likes END, \
+                     dislikes          = CASE WHEN EXCLUDED.dislikes = '{}' \
+                                              THEN character_insights.dislikes ELSE EXCLUDED.dislikes END, \
+                     relationships     = CASE WHEN EXCLUDED.relationships = '{}' \
+                                              THEN character_insights.relationships ELSE EXCLUDED.relationships END, \
+                     updated_at        = now() \
+                 RETURNING * \
+             ) \
+             INSERT INTO engine.character_insights_snapshot (instance_id, snapshot, captured_at) \
+             SELECT instance_id, to_jsonb(upserted), now() FROM upserted",
+        )
+        .bind(instance_id)
+        .bind(c.location)
+        .bind(c.occupation)
+        .bind(c.current_situation)
+        .bind(c.desires)
+        .bind(c.vulnerabilities)
+        .bind(c.habits)
+        .bind(c.personal_values)
+        .bind(c.likes)
+        .bind(c.dislikes)
+        .bind(c.relationships)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn load(
         &self,
         instance_id: Uuid,
@@ -374,5 +435,107 @@ mod tests {
         let back = project_columns(&json);
         assert_eq!(back.location.as_deref(), Some("公司"));
         assert_eq!(back.likes, vec!["雨天"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_merges_incrementally_and_never_erases(pool: PgPool) {
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+
+        repo.apply_extraction(
+            instance_id,
+            &serde_json::json!({
+                "location": "公司",
+                "desires": "想去海边",
+                "likes": ["雨天"]
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Second extraction: overwrites one scalar, adds another, omits the
+        // rest, and sends an EMPTY likes array.
+        repo.apply_extraction(
+            instance_id,
+            &serde_json::json!({
+                "location": "用户家",
+                "habits": "凌晨才睡",
+                "likes": []
+            }),
+        )
+        .await
+        .unwrap();
+
+        let row = repo.load(instance_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.location.as_deref(),
+            Some("用户家"),
+            "present scalar overwrites"
+        );
+        assert_eq!(row.habits.as_deref(), Some("凌晨才睡"), "new scalar lands");
+        assert_eq!(
+            row.desires.as_deref(),
+            Some("想去海边"),
+            "absent scalar is kept"
+        );
+        assert_eq!(
+            row.likes,
+            vec!["雨天"],
+            "empty array must NOT erase — no erase path"
+        );
+        assert!(row.dislikes.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_appends_one_post_merge_snapshot_per_call(pool: PgPool) {
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+
+        repo.apply_extraction(instance_id, &serde_json::json!({ "location": "公司" }))
+            .await
+            .unwrap();
+        repo.apply_extraction(instance_id, &serde_json::json!({ "habits": "凌晨才睡" }))
+            .await
+            .unwrap();
+
+        let snaps: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT snapshot FROM engine.character_insights_snapshot \
+             WHERE instance_id = $1 ORDER BY captured_at, id",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snaps.len(), 2, "one snapshot per applied extraction");
+
+        // The snapshot is the POST-merge row, not the delta: the second one
+        // must still carry the location the second call never mentioned.
+        let second = &snaps[1].0;
+        assert_eq!(
+            second.get("location").and_then(|v| v.as_str()),
+            Some("公司")
+        );
+        assert_eq!(
+            second.get("habits").and_then(|v| v.as_str()),
+            Some("凌晨才睡")
+        );
+        // to_jsonb(row) is self-contained — it carries the key too.
+        assert!(second.get("instance_id").is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_bumps_updated_at_on_conflict(pool: PgPool) {
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+        repo.apply_extraction(instance_id, &serde_json::json!({ "location": "公司" }))
+            .await
+            .unwrap();
+        let first = repo.load(instance_id).await.unwrap().unwrap().updated_at;
+
+        repo.apply_extraction(instance_id, &serde_json::json!({ "location": "用户家" }))
+            .await
+            .unwrap();
+        let second = repo.load(instance_id).await.unwrap().unwrap().updated_at;
+        assert!(second >= first, "the stamp must move when values change");
     }
 }
