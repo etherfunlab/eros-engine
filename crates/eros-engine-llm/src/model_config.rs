@@ -5702,6 +5702,53 @@ presence_penalty = -0.5
         );
     }
 
+    /// The shipped example must configure BOTH stages of the character chain,
+    /// stage 1 with a prompt and stage 2 without one, and must keep the two
+    /// max_tokens budgets separate — the point of the split.
+    #[test]
+    fn shipped_example_configures_both_character_stages() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml must parse");
+
+        let s1 = cfg
+            .resolve_character_insight_extract()
+            .expect("stage 1 present with a prompt");
+        // Discriminating assertion: `角色` alone would NOT do — the human
+        // prompt in this same file says 角色扮演 / 角色的 twenty-odd times, so
+        // pasting it into the character block would pass that check. Assert
+        // the character prompt's own opening role line instead, and assert the
+        // human prompt's opening line is absent.
+        assert!(
+            s1.extract_prompt.contains("你是 AI 角色事实提取器"),
+            "stage-1 prompt must be the character extractor, not the human one"
+        );
+        assert!(
+            !s1.extract_prompt.contains("你是用户事实与画像信号提取器"),
+            "the human extractor prompt must not have been pasted into this block"
+        );
+
+        let s2_block = cfg
+            .tasks
+            .get("character_insight_structuring")
+            .expect("stage 2 block present");
+        assert!(
+            s2_block.filter_prompt.is_none(),
+            "stage 2 has no configurable prompt — it is built in prompt.rs"
+        );
+
+        let s2 = cfg.resolve_structuring(
+            "character_insight_structuring",
+            "character_insight_extraction",
+        );
+        assert_ne!(
+            s2.max_tokens, s1.max_tokens,
+            "separate budgets per stage is the point of splitting the block"
+        );
+
+        // And the whole thing still boots.
+        cfg.validate_extraction_prompts().expect("example boots");
+    }
+
     // ─── StyleKey presets ───────────────────────────────────────────────────
 
     #[test]

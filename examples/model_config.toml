@@ -439,6 +439,75 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 {"facts":["用户事实1"],"details":[{"content":"用户事实1","category":"preference","domain":"hobby","evidence_type":"explicit_statement","temporality":"atemporal","persistence":"stable","confidence":"high"}]}
 """
 
+# ─── Character insights (EXPERIMENTAL, v1.3.0) ──────────────────────────────
+# Builds a profile of the AI CHARACTER from the conversation, the mirror of
+# insight_extraction's profile of the human. Results are database-only: nothing
+# reads character_insights back into any prompt. Downstream reads it at
+# GET /comp/instance/{instance_id}/profile.
+#
+# COST: two extra OpenRouter calls per produced message per turn — roughly
+# doubles insight-side spend. Remove BOTH blocks to turn the feature off;
+# removing [tasks.character_insight_extraction] alone is enough, since it is
+# the on/off switch and stage 2 cannot run without its facts.
+#
+# Unlike insight_extraction, the two stages have SEPARATE blocks, so they can
+# run on different models and different token budgets. If you delete the
+# structuring block, stage 2 falls back to this block's parameters — never to
+# the global default model.
+[tasks.character_insight_extraction]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 800
+# Stage-1 system instruction. The server sends the turn ("用户: …\nAI: …") as a
+# separate user message. Dual-track output: `facts` (plain strings, fed to
+# stage 2) + `details` (per-fact metadata, persisted opaquely to
+# character_insights_events). The metadata vocabulary is owned by this prompt —
+# the engine stores whatever you emit and never validates it.
+filter_prompt = """
+你是 AI 角色事实提取器。从这一轮对话中提取关于【AI 角色】的、本回合新出现的、可长期复用的原子事实。
+
+对话身份（必须严格区分）：
+- 「AI:」= 虚构 AI 角色，这是唯一的提取对象；「用户:」= 屏幕前的真人，不是提取对象。
+- 只有角色在本回合实际说出口或做出的内容，才可能成为角色事实。
+- 用户的发言、经历、喜好、以及用户对角色的评价与期待都不是角色事实，只能作为理解角色发言的上下文。
+
+铁律 —— 只提取「这一轮真的说出口的当下信息」，不要归纳角色设定：
+- 角色的外貌、身世背景、性格总结、说话风格已经写在角色设定里，不在提取范围内。看到这类内容一律跳过，不要复述、不要归纳、不要改写。
+- 「她是个温柔的人」是设定归纳，不提取；「她说她今天在公司加班到十点」是当下信息，提取。
+
+提取维度（只提取这些）：
+- location: 角色此刻/近期人在哪（办公室、用户家、路上、某个城市）
+- occupation: 角色在这段关系里实际在做的工作，以对话为准，可能与她的背景设定不同
+- current_situation: 她最近的处境与正在经历的事
+- desires: 她说出口的想要与期待
+- vulnerabilities: 她露出的软肋、不安、害怕的事
+- habits: 她描述的作息与生活习惯
+- personal_values: 她表达的在意的事与价值取向
+- likes / dislikes: 她提到的喜好与厌恶
+- relationships: 她提到的人（家人、朋友、同事、其他角色）
+
+原子化：每条事实只表达一个主要命题。
+
+content 表达规则：第三人称、以「角色」开头；保留原始信息的具体程度、否定、条件、程度与不确定性；写成简洁、可独立理解的完整句子；不使用评价性或诊断性语言。
+
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣与敏感偏好都正常记录；忠实保留角色原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 8 条。没有新的角色事实时返回空数组。
+
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["角色说她今天在公司加班到十点"],"details":[{"content":"角色说她今天在公司加班到十点","field":"current_situation","evidence_type":"explicit_statement","confidence":"high"}]}
+"""
+
+# Stage 2 of the character chain: turns stage-1 facts into the ten-column
+# object. NO filter_prompt here — that prompt is built in the engine
+# (prompt.rs) and is not configurable, the same shape as affinity_evaluation.
+# Delete this block and stage 2 runs on the extraction block's parameters.
+[tasks.character_insight_structuring]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 600
+
 # Session-end memory extraction (dreaming-lite). Pulls a session's
 # chat_messages, emits 0-N {content, category} candidates, and the
 # sweeper writes them to companion_memories as profile-layer rows.
