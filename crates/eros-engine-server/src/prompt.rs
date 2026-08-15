@@ -2490,7 +2490,9 @@ mod tests {
     fn character_prompt_includes_existing_profile_json() {
         let existing = serde_json::json!({ "location": "公司" });
         let p = extract_character_insights_prompt(&[], Some(&existing));
-        assert!(p.contains("\"location\""));
-        assert!(p.contains("公司"));
+        assert!(
+            p.contains("\"location\": \"公司\""),
+            "the existing profile must be serialized into the prompt, not just the schema"
+        );
     }
 }
