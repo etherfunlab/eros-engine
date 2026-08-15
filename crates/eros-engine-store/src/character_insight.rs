@@ -192,6 +192,77 @@ impl CharacterInsightRepo<'_> {
     }
 }
 
+// ─── Audit ─────────────────────────────────────────────────────────
+
+/// How many characters of an unparseable reply are kept. Enough to tell a
+/// refusal from a truncated object; short enough that a runaway reply cannot
+/// bloat the table.
+const RAW_PAYLOAD_MAX_CHARS: usize = 2000;
+
+/// Audit payload for a `parse_error` row. The human chain stores NULL here,
+/// which makes a whole-turn refusal indistinguishable from malformed JSON —
+/// and refusal is the likeliest way a mined fact goes missing. Truncation
+/// counts characters, not bytes: byte slicing would panic mid-codepoint.
+pub fn parse_error_payload(raw: &str) -> serde_json::Value {
+    let truncated: String = raw.chars().take(RAW_PAYLOAD_MAX_CHARS).collect();
+    serde_json::json!({ "raw": truncated })
+}
+
+/// Names — never values — of the columns that were already populated when the
+/// structuring call was made. The structurer's input is facts PLUS the
+/// existing profile, so without this a fact missing from the output is
+/// ambiguous between "dropped" and "judged already covered".
+pub fn existing_keys(existing: Option<&serde_json::Value>) -> Vec<String> {
+    existing
+        .and_then(|v| v.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// One `character_insights_events` row to insert. `payload` is the
+/// `{facts, details}` object (`stage='extraction'`), the structured object plus
+/// `_existing_keys` (`stage='structuring'`), or `{raw}` on a parse error.
+pub struct CharacterInsightEventInsert<'a> {
+    pub run_id: Uuid,
+    pub instance_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub message_id: Option<Uuid>,
+    pub stage: &'a str,
+    pub status: &'a str,
+    pub payload: Option<serde_json::Value>,
+    pub meta: crate::OpenRouterCallMeta,
+}
+
+pub struct CharacterInsightEventRepo<'a> {
+    pub pool: &'a PgPool,
+}
+
+impl CharacterInsightEventRepo<'_> {
+    /// Append one audit row. Append-only; no FK on `instance_id`, so the trail
+    /// outlives the instance it describes.
+    pub async fn record(&self, ev: CharacterInsightEventInsert<'_>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO engine.character_insights_events \
+               (run_id, instance_id, session_id, message_id, stage, status, payload, \
+                model, usage, generation_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        )
+        .bind(ev.run_id)
+        .bind(ev.instance_id)
+        .bind(ev.session_id)
+        .bind(ev.message_id)
+        .bind(ev.stage)
+        .bind(ev.status)
+        .bind(ev.payload)
+        .bind(ev.meta.model)
+        .bind(ev.meta.usage)
+        .bind(ev.meta.generation_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +611,119 @@ mod tests {
             second > first,
             "ON CONFLICT must bump updated_at, not leave the INSERT-time stamp"
         );
+    }
+
+    #[test]
+    fn parse_error_payload_keeps_the_raw_reply_truncated_by_chars() {
+        // The likeliest shape of "a fact got dropped" is the structurer
+        // refusing the whole turn: refusal prose, nothing parses. Recording
+        // the text is what separates refusal from malformed JSON.
+        let p = parse_error_payload("I can't help with that request.");
+        assert_eq!(
+            p.get("raw").and_then(|v| v.as_str()),
+            Some("I can't help with that request.")
+        );
+
+        // Truncation counts CHARACTERS, not bytes — byte slicing would panic
+        // mid-codepoint on the Chinese replies this chain mostly sees.
+        let long: String = "抱歉".repeat(3000);
+        let p = parse_error_payload(&long);
+        let raw = p.get("raw").and_then(|v| v.as_str()).expect("raw");
+        assert_eq!(raw.chars().count(), 2000);
+    }
+
+    #[test]
+    fn existing_keys_lists_names_only_never_values() {
+        let existing = serde_json::json!({
+            "location": "公司",
+            "likes": ["雨天"]
+        });
+        let mut keys = existing_keys(Some(&existing));
+        keys.sort();
+        assert_eq!(keys, vec!["likes".to_string(), "location".to_string()]);
+
+        // No existing row at all ⇒ empty, not an error.
+        assert!(existing_keys(None).is_empty());
+        // A non-object (should never happen, but must not panic) ⇒ empty.
+        assert!(existing_keys(Some(&serde_json::json!("nope"))).is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_repo_records_both_stages_under_one_run_id(pool: PgPool) {
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let repo = CharacterInsightEventRepo { pool: &pool };
+        let run_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+
+        repo.record(CharacterInsightEventInsert {
+            run_id,
+            instance_id,
+            session_id: Some(session_id),
+            message_id: Some(message_id),
+            stage: "extraction",
+            status: "ok",
+            payload: Some(serde_json::json!({
+                "facts": ["角色说她今天在公司加班到十点"],
+                "details": []
+            })),
+            meta: crate::OpenRouterCallMeta {
+                generation_id: Some("gen-x".into()),
+                model: Some("ch/m".into()),
+                usage: Some(serde_json::json!({ "total_tokens": 11 })),
+            },
+        })
+        .await
+        .unwrap();
+
+        repo.record(CharacterInsightEventInsert {
+            run_id,
+            instance_id,
+            session_id: Some(session_id),
+            message_id: Some(message_id),
+            stage: "structuring",
+            status: "parse_error",
+            payload: Some(parse_error_payload("I can't help with that.")),
+            meta: crate::OpenRouterCallMeta::default(),
+        })
+        .await
+        .unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT stage, status, generation_id, payload, usage \
+             FROM engine.character_insights_events \
+             WHERE run_id = $1 ORDER BY stage",
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2, "two calls, one run_id");
+        // ORDER BY stage: 'extraction' < 'structuring'.
+        assert_eq!(rows[0].0, "extraction");
+        assert_eq!(rows[0].1, "ok");
+        assert_eq!(rows[0].2.as_deref(), Some("gen-x"));
+        assert_eq!(rows[0].4, Some(serde_json::json!({ "total_tokens": 11 })));
+        assert_eq!(rows[1].0, "structuring");
+        assert_eq!(rows[1].1, "parse_error");
+        // The refusal text survives instead of the human chain's NULL.
+        assert_eq!(
+            rows[1]
+                .3
+                .as_ref()
+                .and_then(|p| p.get("raw"))
+                .and_then(|v| v.as_str()),
+            Some("I can't help with that.")
+        );
+        assert_eq!(rows[1].2, None);
+        assert_eq!(rows[1].4, None);
     }
 }
