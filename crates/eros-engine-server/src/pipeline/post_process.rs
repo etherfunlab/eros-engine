@@ -2374,9 +2374,13 @@ mod tests {
 
         let mock = MockServer::start().await;
 
-        // Stage 1 — matched by the sentinel planted in filter_prompt.
+        // Stage 1 — matched by the sentinel planted in filter_prompt AND by its
+        // own resolved model, so a `resolve_structuring` regression that sends
+        // stage 1's model on the stage-2 call cannot accidentally match here
+        // too (this mock still requires the sentinel, which the structuring
+        // prompt never contains).
         let facts_body = serde_json::json!({
-            "id": "gen-ch-facts", "model": "ch/m",
+            "id": "gen-ch-facts", "model": "ch/stage-one",
             "usage": {"total_tokens": 2},
             "choices": [{"message": {"content":
                 "{\"facts\":[\"角色说她今天在公司加班到十点\"],\"details\":[]}"}}],
@@ -2384,32 +2388,42 @@ mod tests {
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("char-facts-sentinel"))
+            .and(body_string_contains("\"model\":\"ch/stage-one\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
             .mount(&mock)
             .await;
 
-        // Stage 2 — matched by a substring unique to CHARACTER_INSIGHTS_SCHEMA.
+        // Stage 2 — matched by a substring unique to CHARACTER_INSIGHTS_SCHEMA
+        // AND by its own resolved model. Without the model matcher, a broken
+        // `resolve_structuring` that falls back to stage 1's block would still
+        // send the structuring prompt (so the schema substring still matches)
+        // and this mock would return "ok" regardless of which block resolved —
+        // the model matcher is what makes that regression fail the request
+        // instead of passing silently.
         let struct_body = serde_json::json!({
-            "id": "gen-ch-struct", "model": "ch/m2",
+            "id": "gen-ch-struct", "model": "ch/stage-two",
             "usage": {"total_tokens": 3},
             "choices": [{"message": {"content": "{\"location\":\"公司\"}"}}],
         });
         Mock::given(method("POST"))
             .and(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("character_insights schema"))
+            .and(body_string_contains("\"model\":\"ch/stage-two\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
             .mount(&mock)
             .await;
 
         let instance_id = seed_persona_instance(&pool, uuid::Uuid::new_v4()).await;
         let mut state = crate::routes::companion::test_state(pool.clone());
-        // Two DISTINCT blocks with two DISTINCT models, so the audit rows prove
-        // each stage resolved to its own block rather than sharing one.
+        // Two DISTINCT blocks with two DISTINCT, non-prefix model ids (neither
+        // is a substring of the other), so the audit rows AND the mock match
+        // itself prove each stage resolved to its own block rather than
+        // sharing one.
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.character_insight_extraction]\nmodel=\"ch/m\"\n\
+                "[tasks.character_insight_extraction]\nmodel=\"ch/stage-one\"\n\
                  filter_prompt=\"char-facts-sentinel\"\n\n\
-                 [tasks.character_insight_structuring]\nmodel=\"ch/m2\"\n",
+                 [tasks.character_insight_structuring]\nmodel=\"ch/stage-two\"\n",
             )
             .unwrap(),
         );
@@ -2446,10 +2460,15 @@ mod tests {
         assert_eq!(rows[0].2, "ok");
         assert_eq!(rows[1].2, "ok");
         assert_eq!(rows[0].0, rows[1].0, "both stages must share one run_id");
-        // Distinct models prove resolve_structuring picked the dedicated block
-        // rather than reusing stage 1's.
-        assert_eq!(rows[0].3.as_deref(), Some("ch/m"));
-        assert_eq!(rows[1].3.as_deref(), Some("ch/m2"));
+        // The stage-2 request could only have matched its mock (via the
+        // "\"model\":\"ch/stage-two\"" body matcher above) if
+        // resolve_structuring actually resolved to the dedicated stage-2
+        // block — a fallback to stage 1's block would have sent
+        // "ch/stage-one" instead, matched neither mock, and made the whole
+        // call error out (so `rows.len() == 2` above would already have
+        // failed). These assertions confirm what landed in the audit row.
+        assert_eq!(rows[0].3.as_deref(), Some("ch/stage-one"));
+        assert_eq!(rows[1].3.as_deref(), Some("ch/stage-two"));
 
         // The structuring payload carries the audit addition.
         let payload: Option<serde_json::Value> = sqlx::query_scalar(
