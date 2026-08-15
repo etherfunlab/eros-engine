@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The AI character's conversation-derived profile, keyed on the relationship
 //! (`persona_instances.id`). Written incrementally by the character-insight
-//! extractor; read only by the audit path and the profile route. Deliberately
-//! never injected into any prompt.
+//! extractor; read by the audit path, the profile route, and — via
+//! `existing_as_extraction_json` — the extractor's own structuring stage.
+//!
+//! Deliberately NEVER injected into the character's chat prompt (nor voice,
+//! PDE, or the world system): feeding her own recorded behaviour back into
+//! her next turn is an echo loop.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
