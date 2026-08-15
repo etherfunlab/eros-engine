@@ -536,6 +536,9 @@ mod tests {
             .await
             .unwrap();
         let second = repo.load(instance_id).await.unwrap().unwrap().updated_at;
-        assert!(second >= first, "the stamp must move when values change");
+        assert!(
+            second > first,
+            "ON CONFLICT must bump updated_at, not leave the INSERT-time stamp"
+        );
     }
 }
