@@ -838,6 +838,72 @@ pub fn extract_structured_insights_prompt(
     )
 }
 
+/// Schema description used in `extract_character_insights_prompt`. Mirrors the
+/// JSON shape that `CharacterInsightRepo::apply_extraction` accepts (projected
+/// by `character_insight::project_columns`).
+///
+/// Deliberately absent: appearance, background, personality_traits, speech
+/// style. Their source of truth is `persona_genomes.system_prompt`, and an
+/// extractor that only sees turn text can only paraphrase them back with
+/// embellishment — which persists as drift and then reads back as fact.
+// Not called yet — Task 7 wires this into post_process.rs's extraction chain.
+#[allow(dead_code)]
+pub const CHARACTER_INSIGHTS_SCHEMA: &str = r#"
+character_insights schema（AI 角色画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
+{
+  "location": "string — 角色此刻/近期人在哪，写出具体场景。例：还在公司，加班到十点",
+  "occupation": "string — 角色在这段关系里实际在做的工作，以对话为准；她的背景设定里的职业不算，用户给的机会或她自己提到的现职才算。例：在用户介绍的画廊做兼职策展",
+  "current_situation": "string — 她最近的处境与正在经历的事，写成一两句具体总结。例：刚接了个大项目，连着两周没休息",
+  "desires": "string — 她说出口的想要与期待。例：想周末两个人一起去海边，不要再改约",
+  "vulnerabilities": "string — 她露出的软肋、不安、害怕的事。例：怕被丢下，所以总是先说没关系",
+  "habits": "string — 她描述的作息与生活习惯，写出具体模式。例：习惯凌晨才睡，早上靠冰美式醒",
+  "personal_values": "string — 她表达的在意的事与价值取向。例：把守约看得很重，讨厌临时改计划",
+  "likes": ["array of strings — 她提到的喜好，每项 4~12 个汉字的具体短语，带一个实际细节。例：喜欢下雨天的味道"],
+  "dislikes": ["array of strings — 她提到的厌恶，每项一个具体短语。例：讨厌被当成小孩哄"],
+  "relationships": ["array of strings — 她提到的人，带关系与一个细节。例：妹妹在读高三，每周打电话催她吃饭"]
+}
+填写规范：
+- schema 描述的是【AI 角色】本人 —— location、occupation 等都指角色，绝不是真人用户。
+- 只填【角色事实】清楚支持的字段；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
+- 绝不虚构、外推或编造事实中没有的信息。
+- 不要归纳角色的外貌、身世背景、性格特质或说话风格 —— 那些写在角色设定里，不属于本 schema，看到相关内容一律跳过。
+- 只输出上表列出的字段名，不要新增、不要改名。
+- 仅输出一个 JSON 对象，不要 markdown、不要解释。
+"#;
+
+/// Structuring-stage prompt for the character chain: take the facts mined in
+/// the extraction stage plus the character's existing profile (reverse-projected
+/// from `character_insights`), and fill in whatever fields the model is
+/// confident about. Output expected as a JSON object matching
+/// `CHARACTER_INSIGHTS_SCHEMA`.
+// Not called yet — Task 7 wires this into post_process.rs's extraction chain.
+#[allow(dead_code)]
+pub fn extract_character_insights_prompt(
+    facts: &[String],
+    existing_insights: Option<&serde_json::Value>,
+) -> String {
+    let facts_str = facts
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing_str = existing_insights
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+
+    format!(
+        "以下是从对话中提取的【AI 角色】事实：\n\
+         {facts_str}\n\n\
+         现有的角色画像（character_insights，供参考；如新事实能让某个已有字段更完整或更准确，\
+         请输出更新后的完整版本覆盖旧值，不要因为字段已存在就跳过或原样重复）：\n\
+         {existing_str}\n\n\
+         请根据上方的【角色事实】，填充以下 schema 中你有信心的字段。\
+         schema 描述的是【AI 角色】本人——location、occupation 等都指角色，绝不是真人用户：\n\
+         {CHARACTER_INSIGHTS_SCHEMA}\n\n\
+         仅输出 JSON，不要任何解释。",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2376,5 +2442,55 @@ mod tests {
             "directive must be inside the iron-rules block"
         );
         assert!(directive < output, "directive must come before [output]");
+    }
+
+    #[test]
+    fn character_prompt_renders_facts_and_all_ten_fields() {
+        let facts = vec!["角色说她今天在公司加班到十点".to_string()];
+        let p = extract_character_insights_prompt(&facts, None);
+        assert!(p.contains("- 角色说她今天在公司加班到十点"));
+        assert!(p.contains("character_insights schema"));
+        for field in [
+            "location",
+            "occupation",
+            "current_situation",
+            "desires",
+            "vulnerabilities",
+            "habits",
+            "personal_values",
+            "likes",
+            "dislikes",
+            "relationships",
+        ] {
+            assert!(p.contains(field), "schema must document `{field}`");
+        }
+        // Empty existing profile renders as "{}".
+        assert!(p.contains("{}"));
+    }
+
+    #[test]
+    fn character_prompt_carries_the_mirrored_anti_attribution_clause() {
+        // The human prompt says the schema is the real user, never the AI.
+        // This one must say the opposite, or the two chains will cross-write.
+        let p = extract_character_insights_prompt(&[], None);
+        assert!(p.contains("AI 角色"));
+        assert!(p.contains("绝不是真人用户"));
+    }
+
+    #[test]
+    fn character_prompt_forbids_summarising_genome_owned_dimensions() {
+        // The extractor never sees the genome (spec §5.3), so the ban on
+        // paraphrasing appearance/background/personality lives in the prompt.
+        let p = extract_character_insights_prompt(&[], None);
+        assert!(p.contains("外貌"));
+        assert!(p.contains("角色设定"));
+    }
+
+    #[test]
+    fn character_prompt_includes_existing_profile_json() {
+        let existing = serde_json::json!({ "location": "公司" });
+        let p = extract_character_insights_prompt(&[], Some(&existing));
+        assert!(p.contains("\"location\""));
+        assert!(p.contains("公司"));
     }
 }
