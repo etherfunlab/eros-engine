@@ -23,6 +23,10 @@ use eros_engine_llm::embedding::EmbeddingRouter;
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_store::affinity::AffinityRepo;
+use eros_engine_store::character_insight::{
+    existing_as_extraction_json as character_existing_json, existing_keys, parse_error_payload,
+    CharacterInsightEventInsert, CharacterInsightEventRepo, CharacterInsightRepo,
+};
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{existing_as_extraction_json, HumanInsightRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
@@ -199,7 +203,24 @@ pub async fn run(
         .await;
     };
 
-    tokio::join!(fut_insight, fut_memory, fut_affinity);
+    let fut_character_insight = async {
+        for m in &produced {
+            if !user_msg.is_empty() && !m.full_text.is_empty() {
+                extract_character_insights(
+                    &state,
+                    session_id,
+                    instance_id,
+                    m.message_id,
+                    &user_msg,
+                    &m.full_text,
+                    client_id.as_deref(),
+                )
+                .await;
+            }
+        }
+    };
+
+    tokio::join!(fut_insight, fut_memory, fut_affinity, fut_character_insight);
 }
 
 // ─── Affinity persistence ──────────────────────────────────────────
@@ -1045,6 +1066,282 @@ async fn extract_structured_insights(
             Some(CallAudit {
                 status: "parse_error",
                 payload: None,
+                meta,
+            }),
+        ),
+    }
+}
+
+// ─── Character insights ────────────────────────────────────────────
+
+const CHARACTER_EXTRACTION_TASK: &str = "character_insight_extraction";
+const CHARACTER_STRUCTURING_TASK: &str = "character_insight_structuring";
+
+/// Top-level entry for the character chain: extraction → structuring →
+/// incremental `character_insights` apply. Writes one
+/// `character_insights_events` row per OpenRouter call that returned a
+/// response, tied by a shared `run_id`.
+///
+/// Fail-open throughout: an audit insert, a load, or an apply that fails only
+/// warns. Nothing here may break the turn.
+///
+/// The result is DB-only by design — nothing reads `character_insights` back
+/// into a prompt (spec §7).
+#[allow(clippy::too_many_arguments)] // each arg is a distinct audit/context key
+async fn extract_character_insights(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+    message_id: Uuid,
+    user_msg: &str,
+    assistant_msg: &str,
+    audit_user: Option<&str>,
+) {
+    let run_id = Uuid::new_v4();
+
+    let (facts, facts_audit) =
+        extract_character_facts(state, session_id, user_msg, assistant_msg, audit_user).await;
+    if let Some(a) = facts_audit {
+        write_character_event(
+            &state.pool,
+            run_id,
+            instance_id,
+            session_id,
+            message_id,
+            "extraction",
+            a,
+        )
+        .await;
+    }
+    if facts.is_empty() {
+        return;
+    }
+
+    let repo = CharacterInsightRepo { pool: &state.pool };
+    let existing = match repo.load(instance_id).await {
+        Ok(row) => row.map(|r| character_existing_json(&r)),
+        Err(e) => {
+            tracing::warn!("character_insights load failed: {e}");
+            None
+        }
+    };
+
+    let (structured, struct_audit) =
+        structure_character_insights(state, session_id, &facts, existing.as_ref(), audit_user)
+            .await;
+    if let Some(a) = struct_audit {
+        write_character_event(
+            &state.pool,
+            run_id,
+            instance_id,
+            session_id,
+            message_id,
+            "structuring",
+            a,
+        )
+        .await;
+    }
+    if structured.as_object().is_none_or(|o| o.is_empty()) {
+        return;
+    }
+
+    if let Err(e) = repo.apply_extraction(instance_id, &structured).await {
+        tracing::warn!("character_insights apply failed: {e}");
+    }
+}
+
+/// Fail-open insert of one `character_insights_events` row.
+async fn write_character_event(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    instance_id: Uuid,
+    session_id: Uuid,
+    message_id: Uuid,
+    stage: &'static str,
+    audit: CallAudit,
+) {
+    let repo = CharacterInsightEventRepo { pool };
+    let ev = CharacterInsightEventInsert {
+        run_id,
+        instance_id,
+        session_id: Some(session_id),
+        message_id: Some(message_id),
+        stage,
+        status: audit.status,
+        payload: audit.payload,
+        meta: audit.meta,
+    };
+    if let Err(e) = repo.record(ev).await {
+        tracing::warn!("character insight event ({stage}) persist failed: {e}");
+    }
+}
+
+/// Stage 1. `None` for the resolved task is the feature's off switch — no
+/// block, no calls, no rows.
+async fn extract_character_facts(
+    state: &AppState,
+    session_id: Uuid,
+    user_msg: &str,
+    assistant_msg: &str,
+    audit_user: Option<&str>,
+) -> (Vec<String>, Option<CallAudit>) {
+    if assistant_msg.trim().is_empty() {
+        return (vec![], None);
+    }
+    let Some(resolved) = state.model_config.resolve_character_insight_extract() else {
+        return (vec![], None);
+    };
+
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.extract_prompt,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: crate::prompt::facts_user_message(user_msg, assistant_msg),
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(CHARACTER_EXTRACTION_TASK.into()),
+        ..Default::default()
+    };
+
+    let (raw, meta) = match state.openrouter.execute(req).await {
+        Ok(resp) => {
+            super::log_openrouter_usage(CHARACTER_EXTRACTION_TASK, Some(session_id), &resp);
+            (resp.reply.trim().to_string(), call_meta(&resp))
+        }
+        Err(e) => {
+            tracing::warn!("character fact extraction LLM call failed: {e}");
+            return (vec![], None);
+        }
+    };
+
+    match super::parse_llm_json::<serde_json::Value>(&raw) {
+        Some(v) => {
+            let facts = extract_facts_array(&v);
+            // `details` is opaque: the engine never validates its items nor
+            // zips them against `facts`. That contract is prompt-level.
+            let details = extract_details_array(&v);
+            let status = if facts.is_empty() { "empty" } else { "ok" };
+            // Build the payload BEFORE moving `facts` into the return tuple.
+            let payload = serde_json::json!({ "facts": facts, "details": details });
+            (
+                facts,
+                Some(CallAudit {
+                    status,
+                    payload: Some(payload),
+                    meta,
+                }),
+            )
+        }
+        // Unlike the human chain, the unparseable reply is KEPT: a whole-turn
+        // refusal and malformed JSON are otherwise the same row.
+        None => (
+            vec![],
+            Some(CallAudit {
+                status: "parse_error",
+                payload: Some(parse_error_payload(&raw)),
+                meta,
+            }),
+        ),
+    }
+}
+
+/// Stage 2. Parameters come from the dedicated block when present, else stage
+/// 1's — never from global defaults (see `resolve_structuring`).
+async fn structure_character_insights(
+    state: &AppState,
+    session_id: Uuid,
+    facts: &[String],
+    existing: Option<&serde_json::Value>,
+    audit_user: Option<&str>,
+) -> (serde_json::Value, Option<CallAudit>) {
+    let empty = || serde_json::Value::Object(serde_json::Map::new());
+    if facts.is_empty() {
+        return (empty(), None);
+    }
+
+    let prompt = crate::prompt::extract_character_insights_prompt(facts, existing);
+    let resolved = state
+        .model_config
+        .resolve_structuring(CHARACTER_STRUCTURING_TASK, CHARACTER_EXTRACTION_TASK);
+
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(CHARACTER_STRUCTURING_TASK.into()),
+        ..Default::default()
+    };
+
+    let (raw, meta) = match state.openrouter.execute(req).await {
+        Ok(r) => {
+            super::log_openrouter_usage(CHARACTER_STRUCTURING_TASK, Some(session_id), &r);
+            (r.reply.trim().to_string(), call_meta(&r))
+        }
+        Err(e) => {
+            tracing::warn!("character structuring LLM call failed: {e}");
+            return (empty(), None);
+        }
+    };
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .filter(|v| v.is_object())
+        .or_else(|| {
+            super::find_json_block(&raw)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .filter(|v| v.is_object())
+        });
+
+    match parsed {
+        Some(v) => {
+            let status = if v.as_object().is_some_and(|o| o.is_empty()) {
+                "empty"
+            } else {
+                "ok"
+            };
+            // Record which columns arrived pre-filled. Without it, a fact that
+            // does not appear in the output is ambiguous between "dropped" and
+            // "judged already covered".
+            let mut audited = v.clone();
+            if let Some(o) = audited.as_object_mut() {
+                o.insert(
+                    "_existing_keys".into(),
+                    serde_json::json!(existing_keys(existing)),
+                );
+            }
+            (
+                v,
+                Some(CallAudit {
+                    status,
+                    payload: Some(audited),
+                    meta,
+                }),
+            )
+        }
+        None => (
+            empty(),
+            Some(CallAudit {
+                status: "parse_error",
+                payload: Some(parse_error_payload(&raw)),
                 meta,
             }),
         ),
@@ -2024,5 +2321,159 @@ mod tests {
             !msgs[0].content.contains("我今天好累"),
             "system message must stay static across turns"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_chain_is_off_when_the_stage_one_task_is_absent(pool: sqlx::PgPool) {
+        // The stage-1 block is the whole on/off switch: with no
+        // [tasks.character_insight_extraction] there must be no LLM call and
+        // no rows at all. test_state()'s config carries no such block.
+        use crate::routes::companion::testutil::seed_persona_instance;
+        // Already imported at the top of this tests module by the human-chain
+        // tests; the inner `use` is harmless if it is.
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let state = crate::routes::companion::test_state(pool.clone());
+        let session_id = Uuid::new_v4();
+
+        extract_character_insights(
+            &state,
+            session_id,
+            instance_id,
+            Uuid::new_v4(),
+            "你今天在忙什么",
+            "还在公司，加班到十点",
+            None,
+        )
+        .await;
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0, "no task block ⇒ no calls, no audit rows");
+
+        let profiles: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(profiles, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_chain_writes_both_events_and_the_profile(pool: sqlx::PgPool) {
+        use crate::routes::companion::testutil::seed_persona_instance;
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Stage 1 — matched by the sentinel planted in filter_prompt.
+        let facts_body = serde_json::json!({
+            "id": "gen-ch-facts", "model": "ch/m",
+            "usage": {"total_tokens": 2},
+            "choices": [{"message": {"content":
+                "{\"facts\":[\"角色说她今天在公司加班到十点\"],\"details\":[]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("char-facts-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+
+        // Stage 2 — matched by a substring unique to CHARACTER_INSIGHTS_SCHEMA.
+        let struct_body = serde_json::json!({
+            "id": "gen-ch-struct", "model": "ch/m2",
+            "usage": {"total_tokens": 3},
+            "choices": [{"message": {"content": "{\"location\":\"公司\"}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("character_insights schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
+            .mount(&mock)
+            .await;
+
+        let instance_id = seed_persona_instance(&pool, uuid::Uuid::new_v4()).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        // Two DISTINCT blocks with two DISTINCT models, so the audit rows prove
+        // each stage resolved to its own block rather than sharing one.
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.character_insight_extraction]\nmodel=\"ch/m\"\n\
+                 filter_prompt=\"char-facts-sentinel\"\n\n\
+                 [tasks.character_insight_structuring]\nmodel=\"ch/m2\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        extract_character_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            instance_id,
+            uuid::Uuid::new_v4(),
+            "你今天在忙什么",
+            "还在公司，加班到十点",
+            None,
+        )
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(uuid::Uuid, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT run_id, stage, status, model FROM engine.character_insights_events \
+             WHERE instance_id = $1 ORDER BY stage",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "extraction + structuring; got {rows:?}");
+        assert_eq!(rows[0].1, "extraction");
+        assert_eq!(rows[1].1, "structuring");
+        assert_eq!(rows[0].2, "ok");
+        assert_eq!(rows[1].2, "ok");
+        assert_eq!(rows[0].0, rows[1].0, "both stages must share one run_id");
+        // Distinct models prove resolve_structuring picked the dedicated block
+        // rather than reusing stage 1's.
+        assert_eq!(rows[0].3.as_deref(), Some("ch/m"));
+        assert_eq!(rows[1].3.as_deref(), Some("ch/m2"));
+
+        // The structuring payload carries the audit addition.
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM engine.character_insights_events \
+             WHERE instance_id = $1 AND stage = 'structuring'",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            payload
+                .expect("structuring payload")
+                .get("_existing_keys")
+                .is_some(),
+            "structuring payload must record which columns arrived pre-filled"
+        );
+
+        // And the profile actually landed.
+        let row = eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .load(instance_id)
+            .await
+            .unwrap()
+            .expect("profile written");
+        assert_eq!(row.location.as_deref(), Some("公司"));
     }
 }

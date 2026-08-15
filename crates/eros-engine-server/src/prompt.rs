@@ -846,8 +846,6 @@ pub fn extract_structured_insights_prompt(
 /// style. Their source of truth is `persona_genomes.system_prompt`, and an
 /// extractor that only sees turn text can only paraphrase them back with
 /// embellishment — which persists as drift and then reads back as fact.
-// Not called yet — Task 7 wires this into post_process.rs's extraction chain.
-#[allow(dead_code)]
 pub const CHARACTER_INSIGHTS_SCHEMA: &str = r#"
 character_insights schema（AI 角色画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
 {
@@ -876,8 +874,6 @@ character_insights schema（AI 角色画像；所有字段可选；只输出下�
 /// from `character_insights`), and fill in whatever fields the model is
 /// confident about. Output expected as a JSON object matching
 /// `CHARACTER_INSIGHTS_SCHEMA`.
-// Not called yet — Task 7 wires this into post_process.rs's extraction chain.
-#[allow(dead_code)]
 pub fn extract_character_insights_prompt(
     facts: &[String],
     existing_insights: Option<&serde_json::Value>,
