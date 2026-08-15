@@ -2200,6 +2200,35 @@ impl ModelConfig {
         })
     }
 
+    /// Resolve the character-insight extraction (stage 1) prompt bundle.
+    /// `None` when `[tasks.character_insight_extraction]` is absent OR its
+    /// `filter_prompt` is blank — which is also the entire on/off switch for
+    /// the character-insight feature.
+    pub fn resolve_character_insight_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("character_insight_extraction")
+    }
+
+    /// Parameters for a structuring (stage-2) call: the dedicated block when
+    /// present, else the stage-1 block's.
+    ///
+    /// This exists to avoid a silent model swap. `resolve()` on an **absent**
+    /// task logs one warning and falls through to `defaults.fallback_model` /
+    /// `FALLBACK_MODEL`, so calling it directly on the stage-2 name would turn
+    /// "I only configured one block" into "you are now on some other model".
+    /// With the explicit fallback, one block reproduces the single-block
+    /// behaviour exactly and two blocks tune the stages independently.
+    ///
+    /// Parameterised over both names so the human chain's split reuses it
+    /// rather than copying it.
+    pub fn resolve_structuring(&self, stage2: &str, stage1: &str) -> ResolvedModel {
+        let name = if self.tasks.contains_key(stage2) {
+            stage2
+        } else {
+            stage1
+        };
+        self.resolve(name, None)
+    }
+
     /// Resolve the world-director bundle. `None` when `[tasks.world_director]`
     /// is absent OR its `filter_prompt` is blank — the sweeper goes inert.
     pub fn resolve_world_director(&self) -> Option<ResolvedWorldDirector> {
@@ -2327,15 +2356,21 @@ impl ModelConfig {
         })
     }
 
-    /// Boot-time validation for the two extraction tasks. A task **section that
-    /// is present** must carry a usable `filter_prompt` (else `Err`); an
-    /// **absent section** means that extraction is simply off (`Ok`). Returns a
-    /// ready-to-print message naming the first misconfigured task.
+    /// Boot-time validation for the prompt-bearing extraction tasks. A task
+    /// **section that is present** must carry a usable `filter_prompt` (else
+    /// `Err`); an **absent section** means that extraction is simply off
+    /// (`Ok`). Returns a ready-to-print message naming the first misconfigured
+    /// task.
     ///
-    /// Scoped to `insight_extraction` / `memory_extraction` — the only tasks the
-    /// boot gate makes mandatory-when-present.
+    /// `character_insight_structuring` is deliberately NOT here: its prompt is
+    /// built in `prompt.rs` and is not configurable, so its block is
+    /// parameters-only — the same shape as `affinity_evaluation`.
     pub fn validate_extraction_prompts(&self) -> Result<(), String> {
-        for name in ["insight_extraction", "memory_extraction"] {
+        for name in [
+            "insight_extraction",
+            "memory_extraction",
+            "character_insight_extraction",
+        ] {
             if self.tasks.contains_key(name) && self.resolve_extract(name).is_none() {
                 return Err(format!(
                     "[tasks.{name}] is present but its filter_prompt is unset — eros-engine \
@@ -2570,6 +2605,8 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "pde_decision",
     "insight_extraction",
     "memory_extraction",
+    "character_insight_extraction",
+    "character_insight_structuring",
     "affinity_evaluation",
     "world_director",
     "world_stories_director",
@@ -4949,6 +4986,101 @@ filter_prompt = "   "
         // Guards the dreaming sweeper's early-return condition (a later task).
         let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
         assert!(cfg.resolve_memory_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_character_insight_extract_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("").unwrap();
+        assert!(cfg.resolve_character_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_character_insight_extract_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_character_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_character_insight_extract_carries_prompt_and_model() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"ch/m\"\n\
+             filter_prompt = \"extract character facts\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_character_insight_extract().expect("resolves");
+        assert_eq!(r.model, "ch/m");
+        assert_eq!(r.extract_prompt, "extract character facts");
+    }
+
+    #[test]
+    fn resolve_structuring_falls_back_to_stage_one_not_global_defaults() {
+        // The trap this method exists for: resolve() on an ABSENT task warns
+        // once and drops to defaults.fallback_model / FALLBACK_MODEL. Asserting
+        // "not empty" would pass on exactly that failure, so assert the
+        // stage-1 model id specifically.
+        let cfg = ModelConfig::from_toml_str(
+            "[defaults]\nfallback_model = \"global/default\"\n\n\
+             [tasks.character_insight_extraction]\nmodel = \"stage1/m\"\n\
+             filter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_structuring(
+            "character_insight_structuring",
+            "character_insight_extraction",
+        );
+        assert_eq!(r.model, "stage1/m");
+        assert_ne!(r.model, "global/default");
+    }
+
+    #[test]
+    fn resolve_structuring_prefers_the_dedicated_block_when_present() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"stage1/m\"\nfilter_prompt = \"p\"\n\n\
+             [tasks.character_insight_structuring]\nmodel = \"stage2/m\"\nmax_tokens = 600\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_structuring(
+            "character_insight_structuring",
+            "character_insight_extraction",
+        );
+        assert_eq!(r.model, "stage2/m");
+        assert_eq!(r.max_tokens, 600);
+    }
+
+    #[test]
+    fn boot_gate_covers_character_extraction_but_not_structuring() {
+        // Stage 1 bears a prompt, so a blank one is a misconfiguration.
+        let bad = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"\"\n",
+        )
+        .unwrap();
+        let err = bad
+            .validate_extraction_prompts()
+            .expect_err("must refuse to boot");
+        assert!(
+            err.contains("character_insight_extraction"),
+            "err was: {err}"
+        );
+
+        // Stage 2 has NO configurable prompt (it is built in prompt.rs), so a
+        // block without one is correct and must boot.
+        let ok = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\n\
+             [tasks.character_insight_structuring]\nmodel = \"m2\"\n",
+        )
+        .unwrap();
+        assert!(ok.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn both_character_tasks_are_known_chat_tasks() {
+        // Unlisted names trigger the boot-time typo warning on
+        // [[providers.*.body]].tasks, so both must be registered.
+        assert!(KNOWN_CHAT_TASKS.contains(&"character_insight_extraction"));
+        assert!(KNOWN_CHAT_TASKS.contains(&"character_insight_structuring"));
     }
 
     #[test]
