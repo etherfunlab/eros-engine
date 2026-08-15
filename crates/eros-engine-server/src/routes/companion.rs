@@ -1975,8 +1975,12 @@ mod tests {
             )
             .body(Body::empty())
             .unwrap();
-        let (status, _) = testutil::send_request(&mut router, req).await;
+        let (status, body) = testutil::send_request(&mut router, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body["error"], "not_found",
+            "must be the handler's gate 404, not axum's unmatched-route 404"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
