@@ -598,6 +598,53 @@
         ]
       }
     },
+    "/comp/instance/{instance_id}/profile": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Typed `character_insights` profile for one relationship. The instance's\n`owner_uid` MUST match the JWT's user_id; mismatch returns 403, and an\nunknown or archived instance returns 404.",
+        "operationId": "get_character_profile",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharacterProfileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/user/{user_id}/profile": {
       "get": {
         "tags": [
@@ -1575,6 +1622,90 @@
           "chemistry": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "CharacterProfileResponse": {
+        "type": "object",
+        "description": "Typed `character_insights` profile for one relationship. All fields are\nnull/empty until the character chain has produced its first extraction.",
+        "required": [
+          "instance_id",
+          "likes",
+          "dislikes",
+          "relationships"
+        ],
+        "properties": {
+          "current_situation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "desires": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dislikes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "habits": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "likes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personal_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "None when the character has no insights row yet."
+          },
+          "vulnerabilities": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

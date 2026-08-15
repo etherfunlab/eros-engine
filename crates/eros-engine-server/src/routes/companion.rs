@@ -230,6 +230,63 @@ impl ProfileResponse {
     }
 }
 
+/// Typed `character_insights` profile for one relationship. All fields are
+/// null/empty until the character chain has produced its first extraction.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct CharacterProfileResponse {
+    pub instance_id: Uuid,
+    pub location: Option<String>,
+    pub occupation: Option<String>,
+    pub current_situation: Option<String>,
+    pub desires: Option<String>,
+    pub vulnerabilities: Option<String>,
+    pub habits: Option<String>,
+    pub personal_values: Option<String>,
+    pub likes: Vec<String>,
+    pub dislikes: Vec<String>,
+    pub relationships: Vec<String>,
+    /// None when the character has no insights row yet.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl CharacterProfileResponse {
+    fn from_row(
+        instance_id: Uuid,
+        row: Option<eros_engine_store::character_insight::CharacterInsightsRow>,
+    ) -> Self {
+        match row {
+            Some(r) => Self {
+                instance_id,
+                location: r.location,
+                occupation: r.occupation,
+                current_situation: r.current_situation,
+                desires: r.desires,
+                vulnerabilities: r.vulnerabilities,
+                habits: r.habits,
+                personal_values: r.personal_values,
+                likes: r.likes,
+                dislikes: r.dislikes,
+                relationships: r.relationships,
+                updated_at: Some(r.updated_at),
+            },
+            None => Self {
+                instance_id,
+                location: None,
+                occupation: None,
+                current_situation: None,
+                desires: None,
+                vulnerabilities: None,
+                habits: None,
+                personal_values: None,
+                likes: vec![],
+                dislikes: vec![],
+                relationships: vec![],
+                updated_at: None,
+            },
+        }
+    }
+}
+
 /// Mirror of `eros_engine_core::affinity::AffinityDeltas` with `ToSchema`
 /// for OpenAPI emission. Field-for-field conversion both ways.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -745,6 +802,43 @@ async fn get_profile(
     Ok(Json(ProfileResponse::from_row(user_id, row)))
 }
 
+/// Typed `character_insights` profile for one relationship. The instance's
+/// `owner_uid` MUST match the JWT's user_id; mismatch returns 403, and an
+/// unknown or archived instance returns 404.
+#[utoipa::path(
+    get,
+    path = "/comp/instance/{instance_id}/profile",
+    tag = "companion",
+    params(("instance_id" = Uuid, Path, description = "Persona instance id owned by the JWT user")),
+    responses(
+        (status = 200, body = CharacterProfileResponse),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "instance is not owned by the JWT user"),
+        (status = 404, description = "no such active instance")
+    ),
+    security(("bearer" = []))
+)]
+async fn get_character_profile(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    Extension(AuthUser(jwt_user)): Extension<AuthUser>,
+) -> Result<Json<CharacterProfileResponse>, AppError> {
+    // The path key is an instance, not a user, so ownership is read through
+    // the instance rather than compared against the path.
+    let gate = PersonaRepo { pool: &state.pool }
+        .load_instance_gate(instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such instance".into()))?;
+    if gate.owner_uid != jwt_user {
+        return Err(AppError::Forbidden("not your data".into()));
+    }
+
+    let row = eros_engine_store::character_insight::CharacterInsightRepo { pool: &state.pool }
+        .load(instance_id)
+        .await?;
+    Ok(Json(CharacterProfileResponse::from_row(instance_id, row)))
+}
+
 // ─── Router ─────────────────────────────────────────────────────────
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -753,6 +847,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_history))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
+        .routes(routes!(get_character_profile))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1811,5 +1906,100 @@ mod tests {
         assert_eq!(empty.future_plans, None);
         assert_eq!(empty.finance_status, None);
         assert_eq!(empty.updated_at, None);
+    }
+
+    // ─── Test 6: GET /comp/instance/{instance_id}/profile ───────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_profile_returns_the_row_for_its_owner(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vita").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        eros_engine_store::character_insight::CharacterInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({ "location": "公司", "likes": ["雨天"] }),
+            )
+            .await
+            .unwrap();
+
+        let state = test_state(pool.clone());
+        let mut router = testutil::build_router(state);
+        let req = Request::builder()
+            .uri(format!("/comp/instance/{instance_id}/profile"))
+            .header(
+                "authorization",
+                format!("Bearer {}", testutil::mint_test_jwt(owner)),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = testutil::send_request(&mut router, req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["location"], "公司");
+        assert_eq!(body["likes"][0], "雨天");
+        assert!(body["updated_at"].is_string());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_profile_403s_for_a_non_owner(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vita").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+
+        let state = test_state(pool.clone());
+        let mut router = testutil::build_router(state);
+        let req = Request::builder()
+            .uri(format!("/comp/instance/{instance_id}/profile"))
+            .header(
+                "authorization",
+                format!("Bearer {}", testutil::mint_test_jwt(intruder)),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = testutil::send_request(&mut router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_profile_404s_for_an_unknown_instance(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let state = test_state(pool.clone());
+        let mut router = testutil::build_router(state);
+        let req = Request::builder()
+            .uri(format!("/comp/instance/{}/profile", Uuid::new_v4()))
+            .header(
+                "authorization",
+                format!("Bearer {}", testutil::mint_test_jwt(user_id)),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = testutil::send_request(&mut router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_profile_is_all_null_before_the_first_extraction(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Vita").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+
+        let state = test_state(pool.clone());
+        let mut router = testutil::build_router(state);
+        let req = Request::builder()
+            .uri(format!("/comp/instance/{instance_id}/profile"))
+            .header(
+                "authorization",
+                format!("Bearer {}", testutil::mint_test_jwt(owner)),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = testutil::send_request(&mut router, req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["location"].is_null());
+        assert_eq!(body["likes"], serde_json::json!([]));
+        assert!(body["updated_at"].is_null(), "no row yet ⇒ null stamp");
     }
 }
