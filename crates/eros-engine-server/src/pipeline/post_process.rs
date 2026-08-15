@@ -1118,11 +1118,17 @@ async fn extract_character_insights(
     }
 
     let repo = CharacterInsightRepo { pool: &state.pool };
+    // A failed load must ABORT the run, not degrade to "no existing profile".
+    // The structuring prompt asks for complete replacement values, so running it
+    // without the stored row yields fields derived from this turn alone — and
+    // `apply_extraction` would then overwrite however many turns of accumulated
+    // profile with that narrower answer. A transient DB blip must not cost data.
+    // `Ok(None)` is different: it genuinely means no row yet, and proceeds.
     let existing = match repo.load(instance_id).await {
         Ok(row) => row.map(|r| character_existing_json(&r)),
         Err(e) => {
-            tracing::warn!("character_insights load failed: {e}");
-            None
+            tracing::warn!("character_insights load failed, skipping structuring: {e}");
+            return;
         }
     };
 
@@ -2494,5 +2500,100 @@ mod tests {
             .unwrap()
             .expect("profile written");
         assert_eq!(row.location.as_deref(), Some("公司"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_chain_aborts_when_the_existing_profile_cannot_be_loaded(pool: sqlx::PgPool) {
+        // A failed load must abort the run rather than degrade to "no existing
+        // profile". The structuring prompt asks for complete replacement values,
+        // so running stage 2 blind would produce fields derived from this turn
+        // alone, and apply_extraction would overwrite however many turns of
+        // accumulated profile with that narrower answer. A transient DB failure
+        // must not cost data.
+        //
+        // Fault injection: drop the profile table so `load` genuinely errors
+        // while everything else — the mocks, the audit table — still works.
+        use crate::routes::companion::testutil::seed_persona_instance;
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        let facts_body = serde_json::json!({
+            "id": "gen-ch-facts", "model": "ch/stage-one",
+            "usage": {"total_tokens": 2},
+            "choices": [{"message": {"content":
+                "{\"facts\":[\"角色说她今天在公司加班到十点\"],\"details\":[]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("char-facts-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+
+        // Mounted so that a regression which DOES reach stage 2 succeeds and
+        // writes a second audit row — making the assertion below fail loudly
+        // rather than passing because the call happened to error out.
+        let struct_body = serde_json::json!({
+            "id": "gen-ch-struct", "model": "ch/stage-two",
+            "usage": {"total_tokens": 3},
+            "choices": [{"message": {"content": "{\"location\":\"公司\"}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("character_insights schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
+            .mount(&mock)
+            .await;
+
+        let instance_id = seed_persona_instance(&pool, uuid::Uuid::new_v4()).await;
+        sqlx::query("DROP TABLE engine.character_insights")
+            .execute(&pool)
+            .await
+            .expect("drop the profile table to make load() fail");
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.character_insight_extraction]\nmodel=\"ch/stage-one\"\n\
+                 filter_prompt=\"char-facts-sentinel\"\n\n\
+                 [tasks.character_insight_structuring]\nmodel=\"ch/stage-two\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        extract_character_insights(
+            &state,
+            uuid::Uuid::new_v4(),
+            instance_id,
+            uuid::Uuid::new_v4(),
+            "你今天在忙什么",
+            "还在公司，加班到十点",
+            None,
+        )
+        .await;
+
+        // Stage 1 still audited (it ran before the load); stage 2 never did.
+        let stages: Vec<(String,)> = sqlx::query_as(
+            "SELECT stage FROM engine.character_insights_events \
+             WHERE instance_id = $1 ORDER BY stage",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stages.len(),
+            1,
+            "a failed load must abort before structuring; got {stages:?}"
+        );
+        assert_eq!(stages[0].0, "extraction");
     }
 }

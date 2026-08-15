@@ -164,8 +164,12 @@ no row at all. Two deliberate omissions carried over from
 
 - **No FK on `instance_id`.** The audit trail is append-only and must survive
   the instance it describes.
-- **No `owner_uid` column.** Derivable by joining `persona_instances`, whose
-  `owner_uid` never changes for a given instance.
+- **No `owner_uid` column.** While the instance exists, `owner_uid` is derivable
+  by joining `persona_instances`, and it never changes for a given instance.
+  The missing FK has a consequence here, though: rows whose instance has since
+  been deleted are no longer attributable, because the join has nothing to hit.
+  That is acceptable while nothing reads these tables by owner; adding
+  `owner_uid` is the fix if they ever need per-owner access or deletion.
 
 **`stage` values name the config block**, not the human-side `'facts'` /
 `'structured'`: seeing `stage='structuring'` tells you to go tune

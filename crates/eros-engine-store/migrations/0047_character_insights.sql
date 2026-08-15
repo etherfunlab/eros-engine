@@ -50,8 +50,12 @@ CREATE TABLE engine.character_insights (
 -- 'facts'/'structured', so reading the audit needs no lookup table.
 --
 -- No FK on instance_id: the trail must outlive the instance it describes.
--- No owner_uid column: derivable by joining persona_instances, whose owner_uid
--- never changes for a given instance.
+-- No owner_uid column: while the instance exists, owner_uid is derivable by
+-- joining persona_instances, and it never changes for a given instance. Note
+-- the consequence of the missing FK, though: rows whose instance has since been
+-- deleted are no longer attributable, because the join has nothing to hit. That
+-- is acceptable while nothing reads this table by owner; adding owner_uid would
+-- be the fix if these rows ever need per-owner access or deletion.
 CREATE TABLE engine.character_insights_events (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id        UUID NOT NULL,
