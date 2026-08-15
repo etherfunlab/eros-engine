@@ -142,7 +142,7 @@ CREATE TABLE engine.character_insights_events (
     instance_id   UUID NOT NULL,
     session_id    UUID,
     message_id    UUID,
-    stage         TEXT NOT NULL CHECK (stage IN ('facts','structured')),
+    stage         TEXT NOT NULL CHECK (stage IN ('extraction','structuring')),
     status        TEXT NOT NULL CHECK (status IN ('ok','empty','parse_error')),
     payload       JSONB,
     model         TEXT,
@@ -158,13 +158,54 @@ CREATE INDEX idx_character_insights_events_run
 ```
 
 One row per OpenRouter call that returned a response; the two stages of a run
-share a `run_id`. Same contract as `companion_insights_events`, including its
-two deliberate omissions:
+share a `run_id`. A call that never returned (transport error, timeout) writes
+no row at all. Two deliberate omissions carried over from
+`companion_insights_events`:
 
 - **No FK on `instance_id`.** The audit trail is append-only and must survive
   the instance it describes.
 - **No `owner_uid` column.** Derivable by joining `persona_instances`, whose
   `owner_uid` never changes for a given instance.
+
+**`stage` values name the config block**, not the human-side `'facts'` /
+`'structured'`: seeing `stage='structuring'` tells you to go tune
+`[tasks.character_insight_structuring]` with no lookup table in between (§5.4).
+
+#### `payload` — what each row must carry
+
+| stage | status | `payload` |
+|---|---|---|
+| `extraction` | `ok` / `empty` | `{"facts": [...], "details": [...]}` — the extractor's whole output |
+| `structuring` | `ok` / `empty` | the model's JSON object, plus `_existing_keys` |
+| either | `parse_error` | `{"raw": "<the unparseable reply, truncated to 2000 chars>"}` |
+
+Two departures from the human-side chain, both aimed at the same blind spot —
+**a fact the extractor mined and the structurer silently dropped**:
+
+1. **`parse_error` records the raw reply** instead of `NULL`. The likeliest
+   shape of "a fact got dropped" is not one field going missing, it is the
+   structurer *refusing the whole turn*: the model emits refusal prose, nothing
+   parses, and today the row says only "it failed". Keeping the text separates
+   malformed-JSON from refusal from empty reply, and shows which content drew
+   the refusal. This is not a new exposure surface — the `extraction` payload
+   already stores facts mined verbatim from the conversation — and the table is
+   RLS-locked to owner/`service_role`. Truncate at 2000 characters.
+
+2. **`structuring` payload carries `_existing_keys`**: the names (never the
+   values) of the columns that were already populated when the reverse-projected
+   row was handed to the model, e.g. `["location", "likes", "desires"]`. The
+   structurer's input is facts **plus** the existing profile; without knowing
+   which fields arrived pre-filled, a fact that does not appear in the output is
+   ambiguous between *dropped* and *judged already covered*. Key names alone
+   settle it without storing the content twice.
+
+Whether a given fact survived is otherwise answerable offline already: stage 1's
+payload **is** stage 2's fact input, and both rows share a `run_id`.
+
+Deliberately **not** added: asking the structurer to self-report which facts it
+discarded (a model grading its own omissions, paid for in output tokens), and
+recording the post-merge row (derivable from the payload and the deterministic
+merge rules in §4.1).
 
 ### 3.3 `engine.character_insights_snapshot`
 
@@ -259,20 +300,26 @@ SELECT instance_id, to_jsonb(upserted), now() FROM upserted;
 
 ### 5.1 Shape
 
-Two stages, mirroring `insight_extraction` exactly, both served by **one**
-config block:
+Two stages, each with **its own config block** — the one structural departure
+from the human chain, which serves both stages from a single
+`[tasks.insight_extraction]` section:
 
-1. **facts** — system message from `character_insight_extraction.filter_prompt`,
-   user message from the existing `prompt::facts_user_message` (`用户: … / AI: …`).
-   Parsed for `facts` (and the opaque `details` sibling), audited as
-   `stage='facts'`.
-2. **structured** — prompt built in `prompt.rs` from the stage-1 facts plus the
+1. **extraction** — system message from
+   `character_insight_extraction.filter_prompt`, user message from the existing
+   `prompt::facts_user_message` (`用户: … / AI: …`). Parsed for `facts` (and the
+   opaque `details` sibling), audited as `stage='extraction'`.
+2. **structuring** — prompt built in `prompt.rs` from the stage-1 facts plus the
    reverse-projected existing row, output parsed as a JSON object matching the
-   ten-column schema, audited as `stage='structured'`, then applied.
+   ten-column schema, audited as `stage='structuring'`, then applied.
 
-Both calls carry `task: Some("character_insight_extraction")`. `status` is
-`ok` / `empty` / `parse_error` on the same rules as the human side; a call that
-never returned (transport error / timeout) writes no row at all.
+Each call carries its own `task` name on the wire
+(`character_insight_extraction` / `character_insight_structuring`), where the
+human chain reports `insight_extraction` for both. That is most of the point of
+splitting: OpenRouter accounting and `[[providers.*.body]]` rules can finally
+tell the two apart, and `max_tokens` stops being one number covering two very
+different outputs (the human block's `1200` is a combined budget).
+
+`status` follows the same `ok` / `empty` / `parse_error` rules as the human side.
 
 ### 5.2 Wiring — `pipeline/post_process.rs`
 
@@ -316,25 +363,50 @@ genome.
 ### 5.4 Config — `crates/eros-engine-llm/src/model_config.rs`
 
 ```rust
+/// Stage 1. Prompt-bearing, so the existing extract resolver applies.
 pub fn resolve_character_insight_extract(&self) -> Option<ResolvedExtract> {
     self.resolve_extract("character_insight_extraction")
 }
+
+/// Stage-2 parameters: the dedicated block when present, else stage 1's.
+/// NEVER falls through to global defaults — an absent stage-2 section means
+/// "same model as stage 1", not "whatever FALLBACK_MODEL happens to be".
+pub fn resolve_structuring(&self, stage2: &str, stage1: &str) -> ResolvedModel {
+    let name = if self.tasks.contains_key(stage2) { stage2 } else { stage1 };
+    self.resolve(name, None)
+}
 ```
 
-- `KNOWN_CHAT_TASKS` gains `"character_insight_extraction"`.
-- `validate_extraction_prompts` gains it too: a section that is **present** with
-  a blank `filter_prompt` refuses boot, an **absent** section means the feature
-  is simply off. Same failure mode as the other two, same treatment.
+`resolve_structuring` exists because of a real trap: `resolve(task, None)` on an
+**absent** task logs one `warn!` and falls through to `defaults.fallback_model` /
+`FALLBACK_MODEL`. Calling it directly on the stage-2 name would therefore turn
+"I only configured one block" into a silent model swap. With the explicit
+fallback, one block reproduces today's behaviour exactly and two blocks tune the
+stages independently — so downstream upgrades with zero config changes.
 
-**The task block is the entire on/off switch.** No new flag, no new env var:
-`resolve_character_insight_extract()` returning `None` skips the whole chain,
-reusing the mechanism already in place for `insight_extraction`.
+**Stage 2's block carries no `filter_prompt`.** Its prompt is built in
+`prompt.rs` and is not configurable; the precedent is
+`[tasks.affinity_evaluation]`, which the shipped example deliberately ships
+without a prompt (and a test asserts it stays that way). Consequently:
+
+- `KNOWN_CHAT_TASKS` gains **both** `"character_insight_extraction"` and
+  `"character_insight_structuring"`.
+- `validate_extraction_prompts` gains **only** `character_insight_extraction`:
+  present-with-blank-`filter_prompt` refuses boot, absent means the feature is
+  off. The stage-2 block has no prompt to validate.
+
+**The stage-1 block is the entire on/off switch.** No new flag, no new env var:
+`resolve_character_insight_extract()` returning `None` skips the whole chain
+(both stages), reusing the mechanism already in place for `insight_extraction`.
+A stage-2 block present without stage 1 is dead config that does nothing —
+acceptable, since stage 2 cannot run without stage 1's facts.
 
 ### 5.5 Cost
 
 Two extra OpenRouter calls per produced message per turn — insight-side spend
-roughly doubles when enabled. `examples/model_config.toml` ships the block
-**enabled**, with a comment stating that it is experimental and what it costs.
+roughly doubles when enabled. `examples/model_config.toml` ships **both blocks**
+enabled, with a comment stating that the feature is experimental and what it
+costs, and with `max_tokens` set per stage rather than as one combined budget.
 The example file is a template to copy, not anyone's running config, so
 shipping it live is what gives the feature a baseline reading while the gate
 stays in the operator's hands.
@@ -398,6 +470,12 @@ which this is not.
   `character_insight_extraction.filter_prompt`, and passes when absent.
 - `resolve_character_insight_extract()` is `None` when the task is absent or its
   prompt is blank.
+- `resolve_structuring` returns the **stage-1** model when the stage-2 block is
+  absent, and the stage-2 model when present. The absent case must assert the
+  stage-1 model id specifically — asserting "not empty" would pass on the
+  global-default fall-through this method exists to prevent.
+- `parse_error` truncates a >2000-char reply and stores it under `raw`;
+  `_existing_keys` lists exactly the populated columns and no values.
 
 **Server:**
 - route returns 403 on owner mismatch, 404 on unknown/archived instance,
@@ -409,7 +487,34 @@ which this is not.
 Pre-PR gate, all four: `cargo fmt --check`, `clippy`, `test`, OpenAPI
 regeneration check.
 
-## 9. Version
+## 9. Follow-up — porting the split back to the human chain
+
+The two-block split (§5.4) and the audit additions (§3.2) are wanted on the
+human chain too, where the standing complaint is that extraction comes out
+**too thin** — and the readings needed to tune that are exactly what one merged
+block and a `NULL`-on-`parse_error` payload hide.
+
+**Deliberately a separate PR.** This spec is purely additive; the human chain is
+live in production, so touching it carries regression surface that should not
+ride along with a new feature.
+
+Names here are already chosen so that port needs no renaming, and in particular
+so that `insight_extraction` — which downstream configs set today — never has to
+change:
+
+| | stage 1 | stage 2 |
+|---|---|---|
+| character (this spec) | `character_insight_extraction` | `character_insight_structuring` |
+| human (follow-up) | `insight_extraction` *(unchanged)* | `insight_structuring` |
+
+`resolve_structuring(stage2, stage1)` is written parameterised over both names
+for the same reason: the human port calls it, it is not copied.
+
+`companion_insights_events.stage` keeps its existing `'facts'` / `'structured'`
+values — they are live data. The port records the mapping to
+`'extraction'` / `'structuring'` rather than rewriting history.
+
+## 10. Version
 
 Target `eros-engine` **1.3.0** — additive schema and a new endpoint, no breaking
 change. Release mechanics (version strings, OpenAPI, README docker pin, signed
