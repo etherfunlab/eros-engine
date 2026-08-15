@@ -543,6 +543,8 @@ input filter has no triggers, timing, or tiers).
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — five graded axes plus an absolute patience read, converted to deltas engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
+| `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
+| `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs`, same shape as `affinity_evaluation`; setting the key refuses to boot. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
@@ -555,7 +557,7 @@ input filter has no triggers, timing, or tiers).
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `character_insight_extraction`, `character_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` doesn't go through the generic `resolve()` path above — it has
@@ -994,14 +996,25 @@ once at boot; `AppState.embed: Arc<EmbeddingRouter>` serves `embed_query` /
 
 ### Enabling / disabling extraction
 
-`insight_extraction` (per-turn fact mining) and `memory_extraction` (session-end
-dreaming sweeper) are controlled by the **presence of their `[tasks.*_extraction]`
-section**:
+`insight_extraction` (per-turn fact mining), `memory_extraction` (session-end
+dreaming sweeper), and `character_insight_extraction` (stage 1 of the
+experimental character chain, §"Task names" above) are controlled by the
+**presence of their `[tasks.*_extraction]` section** — this is
+`validate_extraction_prompts()`'s gate, and all three names are in it:
 
 - **Section present** → `filter_prompt` is **required**; the server refuses to boot
   if it is blank or absent.
 - **Section absent** → that extraction is **off**. The engine boots and runs without
-  it (`insight_extraction` is skipped per turn; the dreaming sweeper stays inert).
+  it (`insight_extraction` is skipped per turn; the dreaming sweeper stays inert;
+  the character chain — both stages — never runs).
+
+`character_insight_structuring` (stage 2 of the character chain) is
+**deliberately NOT in this gate** — unlike the three tasks above, it carries no
+`filter_prompt` at all (its prompt is built in `prompt.rs`, not configured), so
+there is nothing to validate. If you copy the shipped example and blank out
+`[tasks.character_insight_extraction].filter_prompt` expecting the feature to
+just go quiet, it instead refuses to boot — remove the section entirely to
+disable the chain.
 
 > **Behavior change (0.6.x):** earlier releases made both sections mandatory (an
 > absent section boot-failed). They are now optional-by-omission. The shipped

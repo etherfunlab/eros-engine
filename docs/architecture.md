@@ -171,7 +171,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0046_chat_vision_events
+│   ├── migrations/           # 0000_schema → 0047_character_insights
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo
@@ -179,6 +179,7 @@ crates/
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
 │       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, per-field UPSERT)
+│       ├── character_insight.rs # CharacterInsightRepo + event/snapshot repos (AI character's profile, experimental)
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
 └── eros-engine-server/
     └── src/

@@ -763,6 +763,29 @@ The flat, typed `human_insights` row for this user — the same columns the insi
 
 `updated_at: null` means the user has no `human_insights` row yet — no extraction has landed — and every other field is `null`/`[]` in that response. There is no aggregate "training level" score anymore; `agent_training_level` and the raw `companion_insights` JSONB were removed with the companion_insights teardown (spec 2026-08-11) — the typed columns above are the whole surface now.
 
+### `GET /comp/instance/{instance_id}/profile`
+
+The flat, typed `character_insights` row for one relationship (`persona_instances.id`) — the AI character's own conversation-derived profile, the mirror of the human profile above. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown or archived (`status <> 'active'`) instance is 404. Experimental (v1.3.0) — see [2026-08-15-character-insights-design.md](superpowers/specs/2026-08-15-character-insights-design.md).
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": "the office, working late",
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": "2026-08-15T12:00:00Z"
+}
+```
+
+`updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Results are database-only: nothing here is read back into any chat prompt.
+
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)
 > were removed. A tip is now part of a normal stream turn — set

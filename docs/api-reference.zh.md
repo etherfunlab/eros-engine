@@ -666,6 +666,29 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `updated_at` 为 `null` 表示这个用户还没有 `human_insights` 行——还没跑过任何抽取——这时其余字段也都是 `null`/`[]`。现在没有汇总的"训练程度"分数了：`agent_training_level` 和原始的 `companion_insights` JSONB 都随 companion_insights 拆除（spec 2026-08-11）一起移除，上面这些类型化字段就是现在的全部返回内容。
 
+### `GET /comp/instance/{instance_id}/profile`
+
+某一段关系（`persona_instances.id`）扁平化、类型化的 `character_insights` 行——AI 角色自己那份从对话中抽取出来的画像，是上面人类画像的镜像。该 instance 的 `owner_uid` **必须**等于 JWT 的 user_id；否则 403。未知或已归档（`status <> 'active'`）的 instance 返回 404。实验特性（v1.3.0）——详见 [2026-08-15-character-insights-design.md](superpowers/specs/2026-08-15-character-insights-design.md)。
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": "还在公司加班",
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": "2026-08-15T12:00:00Z"
+}
+```
+
+`updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。结果只落库：这里的任何内容都不会被读回任何 chat prompt。
+
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）
 > 已移除。打赏现在是普通 stream 轮的一部分 —— 在

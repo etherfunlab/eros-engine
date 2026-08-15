@@ -163,7 +163,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0046_chat_vision_events
+│   ├── migrations/           # 0000_schema → 0047_character_insights
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo
@@ -171,6 +171,7 @@ crates/
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
 │       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，按字段 UPSERT）
+│       ├── character_insight.rs # CharacterInsightRepo + 事件/快照 repo（AI 角色自己的画像，实验特性）
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）
 └── eros-engine-server/
     └── src/

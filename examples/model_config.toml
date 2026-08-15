@@ -446,9 +446,15 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 # GET /comp/instance/{instance_id}/profile.
 #
 # COST: two extra OpenRouter calls per produced message per turn — roughly
-# doubles insight-side spend. Remove BOTH blocks to turn the feature off;
-# removing [tasks.character_insight_extraction] alone is enough, since it is
-# the on/off switch and stage 2 cannot run without its facts.
+# doubles insight-side spend. It also grows engine.character_insights_snapshot
+# by one row per turn that yields insights (apply_extraction writes a snapshot
+# on every applied call) — the human side's equivalent is a daily sweeper, so
+# this is far more rows for the same information, and there is no retention
+# policy yet (v1.3.0).
+#
+# Delete [tasks.character_insight_extraction] to turn the feature off — it is
+# the switch, and stage 2 cannot run without its facts. Deleting the
+# structuring block as well is optional tidiness.
 #
 # Unlike insight_extraction, the two stages have SEPARATE blocks, so they can
 # run on different models and different token budgets. If you delete the

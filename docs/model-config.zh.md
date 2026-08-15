@@ -483,6 +483,8 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——五个档位轴加一个 patience 绝对读数，由引擎侧换算成 delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
+| `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
+| `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，和 `affinity_evaluation` 同一种形状；设置该键会拒绝启动。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -495,7 +497,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`、`character_insight_extraction`、`character_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 
 `embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器
@@ -810,10 +812,21 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 
 ### 启用/禁用 extraction
 
-`insight_extraction`（每轮事实挖掘）和 `memory_extraction`（会话结束时的 dreaming sweeper）由其 `[tasks.*_extraction]` **章节是否存在**控制：
+`insight_extraction`（每轮事实挖掘）、`memory_extraction`（会话结束时的
+dreaming sweeper）和 `character_insight_extraction`（实验性角色链的
+stage 1，见上文"任务名"一节）都由各自 `[tasks.*_extraction]` **章节是否
+存在**控制——这就是 `validate_extraction_prompts()` 的闸门，三个名字都在
+这个闸门里：
 
 - **章节存在** → `filter_prompt` **必填**；若为空白或缺失，服务器会拒绝启动。
-- **章节缺失** → 该 extraction **关闭**。引擎可以正常启动和运行（每轮跳过 `insight_extraction`；dreaming sweeper 保持不生效）。
+- **章节缺失** → 该 extraction **关闭**。引擎可以正常启动和运行（每轮跳过
+  `insight_extraction`；dreaming sweeper 保持不生效；角色链两个 stage 都不会跑）。
+
+`character_insight_structuring`（角色链 stage 2）**故意不在这个闸门里**——
+与上面三个任务不同，它根本不接受 `filter_prompt`（它的 prompt 写死在
+`prompt.rs` 里，不可配置），所以没有可校验的东西。如果照抄示例配置、把
+`[tasks.character_insight_extraction].filter_prompt` 清空，指望功能安静关掉，
+结果会是拒绝启动——要关闭整条链，删掉整个 section。
 
 > **行为变更（0.6.x）：**早期版本要求两个章节都必须存在（缺少章节会导致启动失败）。现在可以通过省略章节来关闭。随附的 `examples/model_config.toml` 仍然保留两个章节，因此默认行为——同时启用两种 extraction——没有变化。
 

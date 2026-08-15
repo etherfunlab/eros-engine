@@ -173,6 +173,8 @@ as shown above.
   `chat_messages.model` / `.usage` / `.generation_id` for the chat completion
   (mirrored on `companion_affinity_events` for the affinity eval, on
   `companion_insights_events` for each `insight_extraction` call, on
+  `engine.character_insights_events` for each call of the experimental
+  character chain (§"Character insights" below), on
   `companion_decision_events` for each `pde_decision` judge run, on
   `chat_images_events` for every image-composer call, and on
   `chat_vision_events` for every `chat_vision` describe — see
@@ -193,6 +195,28 @@ as shown above.
   not content-checked.
 - **Interpret.** The engine does not group, aggregate, or alert on
   any audit field. Callers wire that themselves.
+
+## Character insights (experimental)
+
+`engine.character_insights_events` is the audit trail for the experimental
+character-insight chain (v1.3.0,
+[design spec](superpowers/specs/2026-08-15-character-insights-design.md)) —
+the mirror of `companion_insights_events` but for the AI character rather
+than the human. This is the whole point of that chain having two separate
+config task names (`character_insight_extraction` /
+`character_insight_structuring`) instead of one shared one the way the human
+chain shares `insight_extraction` for both its stages: it lets OpenRouter
+accounting and this table tell the extraction call apart from the structuring
+call. Concretely:
+
+- **`stage`** is `'extraction'` or `'structuring'` — naming the config block
+  each row came from, so `stage='structuring'` tells you which
+  `[tasks.*]` block to go tune with no lookup table in between. This is
+  unlike the human chain's `companion_insights_events.stage`, which uses
+  `'facts'` / `'structured'` and predates the config split.
+- **Both rows of one extraction run share a `run_id`** — the extraction call
+  and the structuring call it fed are joinable without going through
+  `session_id`/`message_id`.
 
 ## Image-path event tables
 

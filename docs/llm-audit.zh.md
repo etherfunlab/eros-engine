@@ -156,7 +156,8 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `generation_id` 三元组**是**会落库的：聊天补全落在
   `chat_messages.model` / `.usage` / `.generation_id`（好感度评估镜像在
   `companion_affinity_events`，每次 `insight_extraction` 调用落在
-  `companion_insights_events`，每次 `pde_decision` judge 运行落在
+  `companion_insights_events`，实验性角色链（见下文"角色画像"一节）的每次
+  调用落在 `engine.character_insights_events`，每次 `pde_decision` judge 运行落在
   `companion_decision_events`，每次图片合成器调用落在
   `chat_images_events`，每次 `chat_vision` describe 调用落在
   `chat_vision_events`——详见下面的[图片链路事件表](#图片链路事件表)；
@@ -171,6 +172,23 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
 - **不解读。**引擎不会按 audit 字段分组、聚合、报警。Caller 自己接。
+
+## 角色画像（实验特性）
+
+`engine.character_insights_events` 是实验性角色画像链（v1.3.0，
+[设计文档](superpowers/specs/2026-08-15-character-insights-design.md)）的审计
+轨迹——是 `companion_insights_events` 的镜像，只是对象换成了 AI 角色而不是
+真人用户。这正是这条链用两个独立配置任务名
+（`character_insight_extraction` / `character_insight_structuring`）而不是像
+人类链那样两个 stage 共用一个 `insight_extraction` 的意义所在：这样
+OpenRouter 计费和这张表才能分清哪次是抽取调用、哪次是结构化调用。具体来说：
+
+- **`stage`** 取值 `'extraction'` 或 `'structuring'`——直接对应各自的配置块
+  名字，看到 `stage='structuring'` 就知道该去调哪个 `[tasks.*]` 块，中间不需要
+  查任何映射表。这一点和人类链的 `companion_insights_events.stage`（取值
+  `'facts'` / `'structured'`，早于配置拆分那次改动）不一样。
+- **同一次抽取的两行共享同一个 `run_id`**——抽取调用和它喂给的结构化调用不
+  需要经过 `session_id`/`message_id` 就能直接关联。
 
 ## 图片链路事件表
 

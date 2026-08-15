@@ -1,7 +1,7 @@
 # character_insights — the AI character's conversation-derived profile (experimental) — Design
 
 - **Date:** 2026-08-15
-- **Status:** Draft
+- **Status:** Implemented
 - **Type:** New subsystem — one new extraction chain, three new tables, one new
   read endpoint. Additive; no existing behaviour changes.
 - **Owner:** enriquephl (sole dev)
@@ -233,6 +233,14 @@ yields insights, which is precisely what the human side's periodic sweeper
 exists to avoid. Acceptable at experiment volume; if it grows, the fix is a
 retention policy or a change-detection guard, and neither is designed here.
 
+This is the project's "open it up first, then ratchet the gate" posture, which
+only works if the open step leaves a reading behind. The concrete queries that
+would tell us it is time to tighten: `character_insights_events` grouped by
+`status` (a rising `parse_error` or `empty` share means the chain is mostly
+refusing or producing nothing, not that it's cheap and working); and
+rows-per-day on `character_insights_snapshot` (the actual storage-growth
+curve, to size a retention policy instead of guessing one).
+
 ## 4. Store — `crates/eros-engine-store/src/character_insight.rs`
 
 One module holds both repos; they are born and retired together. Registered in
@@ -272,9 +280,11 @@ rather than erroring, matching `str_array`.
 Merge semantics are **identical** to `HumanInsightRepo::apply_extraction`:
 extracted scalars overwrite, absent/null scalars keep the stored value, arrays
 overwrite only when the extraction produced a non-empty array, and there is
-deliberately **no erase path**. One statement, no read-modify-write, so
-concurrent extractions degrade to column-level last-write-wins rather than
-whole-row.
+deliberately **no *explicit* erase path**: absent and null scalars keep the
+stored value. An empty-string scalar DOES overwrite — `COALESCE` only treats
+`NULL` as "keep the old value", and `""` is non-NULL — matching the human
+chain's behaviour exactly. One statement, no read-modify-write, so concurrent
+extractions degrade to column-level last-write-wins rather than whole-row.
 
 The snapshot append rides the same statement via a CTE, so it stays atomic with
 the upsert and costs no extra round trip:
