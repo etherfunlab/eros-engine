@@ -5740,9 +5740,13 @@ presence_penalty = -0.5
             "character_insight_structuring",
             "character_insight_extraction",
         );
-        assert_ne!(
-            s2.max_tokens, s1.max_tokens,
-            "separate budgets per stage is the point of splitting the block"
+        assert_eq!(
+            s1.max_tokens, 800,
+            "stage 1 must resolve to its own block's budget"
+        );
+        assert_eq!(
+            s2.max_tokens, 600,
+            "stage 2 must resolve to its own block's budget, not stage 1's and not the global default"
         );
 
         // And the whole thing still boots.

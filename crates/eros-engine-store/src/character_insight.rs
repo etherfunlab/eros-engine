@@ -124,7 +124,10 @@ impl CharacterInsightRepo<'_> {
     /// Merge rules (identical to the human chain): extracted scalars
     /// overwrite, absent/null scalars keep the stored value, arrays overwrite
     /// only when the extraction produced a non-empty array. There is
-    /// deliberately no erase path. Single statement — no read-modify-write, so
+    /// deliberately no *explicit* erase path — absent and null scalars keep
+    /// the stored value; an empty-string scalar DOES overwrite (COALESCE only
+    /// treats NULL as absent, and `""` is non-NULL), matching the human
+    /// chain's `str_field`. Single statement — no read-modify-write, so
     /// concurrent extractions degrade to column-level (not whole-row)
     /// last-write-wins.
     ///
@@ -137,6 +140,13 @@ impl CharacterInsightRepo<'_> {
         insights: &serde_json::Value,
     ) -> Result<(), sqlx::Error> {
         let c = project_columns(insights);
+        // A parseable reply carrying none of our keys projects to all-defaults.
+        // Writing it would stamp updated_at and append a snapshot for a row with
+        // nothing in it, so the profile route would report "we have a profile"
+        // when we have none. The audit row already records what the model said.
+        if c == CharacterColumns::default() {
+            return Ok(());
+        }
         sqlx::query(
             "WITH upserted AS ( \
                  INSERT INTO engine.character_insights \
@@ -611,6 +621,65 @@ mod tests {
             second > first,
             "ON CONFLICT must bump updated_at, not leave the INSERT-time stamp"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_round_trips_all_ten_columns(pool: PgPool) {
+        // Ten DISTINCT values. Seven of the eleven binds are Option<String> and
+        // three are Vec<String>, so a positional swap inside either group is
+        // type-correct and silent — only distinct values catch it. This also
+        // covers every COALESCE target and every reverse-projection key.
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let all = serde_json::json!({
+            "location": "loc-1",
+            "occupation": "occ-2",
+            "current_situation": "cur-3",
+            "desires": "des-4",
+            "vulnerabilities": "vul-5",
+            "habits": "hab-6",
+            "personal_values": "val-7",
+            "likes": ["lik-8"],
+            "dislikes": ["dis-9"],
+            "relationships": ["rel-10"]
+        });
+
+        let repo = CharacterInsightRepo { pool: &pool };
+        repo.apply_extraction(instance_id, &all).await.unwrap();
+
+        let row = repo.load(instance_id).await.unwrap().expect("row");
+        let back = existing_as_extraction_json(&row);
+        assert_eq!(
+            back, all,
+            "every column must survive the write→read→project cycle in place"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_skips_write_on_all_default_projection(pool: PgPool) {
+        // {"foo": "bar"} is parseable and non-empty (passes the caller's
+        // is_empty() guard, status='ok'), but projects to all ten columns
+        // NULL/'{}' — writing it would stamp updated_at and append a snapshot
+        // for a profile that has nothing in it.
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let repo = CharacterInsightRepo { pool: &pool };
+
+        repo.apply_extraction(instance_id, &serde_json::json!({ "foo": "bar" }))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.load(instance_id).await.unwrap().is_none(),
+            "an all-default projection must not create a profile row"
+        );
+
+        let snaps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights_snapshot WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snaps, 0, "no snapshot for a row that was never written");
     }
 
     #[test]
