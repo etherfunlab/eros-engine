@@ -287,8 +287,12 @@ Per turn, on `companion_affinity_events.context`:
   distribution is unauditable without them).
 - `boost_warmth` / `boost_patience` — the B values in force that turn.
 - `decay_factor` — that turn's decay.
-- `warmth_delta` / `patience_delta` — post-decay snapshot convention.
-- `unit` — the per-line unit in force (window-boundary safety).
+- `units` — the per-line units in force, `{"bond": u, "chem": u}`
+  (window-boundary safety).
+- The endpoint deltas are **not** duplicated into `context`: the existing
+  `effective_deltas` event column already carries `warmth`/`patience`
+  after−before under the post-decay snapshot convention, and one fact gets
+  one carrier.
 
 First-week dashboard: level distribution for g_w/g_p (level-1 share decides
 whether the deferred smoothing is needed; level-2 share validates the

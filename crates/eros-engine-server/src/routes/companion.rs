@@ -1329,8 +1329,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "got body: {body}");
         // Defaults from migration 0048: level-2 endpoints over empty lines.
         let expect = (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0);
-        assert!((body["warmth"].as_f64().unwrap() - expect).abs() < 1e-3);
-        assert!((body["patience"].as_f64().unwrap() - expect).abs() < 1e-3);
+        assert!((body["warmth"].as_f64().unwrap() - expect).abs() < 1e-9);
+        assert!((body["patience"].as_f64().unwrap() - expect).abs() < 1e-9);
         assert!((body["intrigue"].as_f64().unwrap() - 0.0).abs() < 1e-9);
     }
 

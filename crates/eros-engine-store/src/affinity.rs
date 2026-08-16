@@ -572,8 +572,9 @@ mod tests {
             .unwrap();
         assert_eq!(a1.id, a2.id);
         // Stranger start (migration 0048): level-2 defaults over empty lines.
-        assert!((a1.warmth - 0.2436).abs() < 1e-3);
-        assert!((a1.patience - 0.2436).abs() < 1e-3);
+        let expect = (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0);
+        assert!((a1.warmth - expect).abs() < 1e-9);
+        assert!((a1.patience - expect).abs() < 1e-9);
         assert!((a1.intrigue).abs() < 1e-9);
     }
 
@@ -1720,10 +1721,11 @@ mod tests {
             .unwrap();
         assert_eq!(a.warmth_grade, 2);
         assert_eq!(a.patience_grade, 2);
-        // Fresh row: lines 0 ⇒ endpoints at the level-2 damped base (DB default).
+        // Fresh row: lines 0 ⇒ endpoints at the level-2 damped base — the DB
+        // default is the exact derivation expression, so parity is tight.
         let expect = (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0);
-        assert!((a.warmth - expect).abs() < 1e-3);
-        assert!((a.patience - expect).abs() < 1e-3);
+        assert!((a.warmth - expect).abs() < 1e-9);
+        assert!((a.patience - expect).abs() < 1e-9);
     }
 
     #[sqlx::test(migrations = "./migrations")]

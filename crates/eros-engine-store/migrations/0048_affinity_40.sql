@@ -29,10 +29,11 @@ ALTER TABLE engine.companion_affinity
 -- warmth range is now 0..1 (derived cache). New-row defaults: level 2 over
 -- empty lines ⇒ 1/3 · B(0) = 1/3 · (1 − 0.35·10/13) ≈ 0.2436 for both
 -- endpoints (patience start drops from 0.5 by design: strangers have limited
--- patience).
+-- patience). Exact expression, not a rounded literal, so the cache is
+-- bit-reproducible from the derivation before any refresh path runs.
 ALTER TABLE engine.companion_affinity
-    ALTER COLUMN warmth   SET DEFAULT 0.2436,
-    ALTER COLUMN patience SET DEFAULT 0.2436;
+    ALTER COLUMN warmth   SET DEFAULT ((1.0/3.0) * (1 - 0.35 * 10.0/13.0)),
+    ALTER COLUMN patience SET DEFAULT ((1.0/3.0) * (1 - 0.35 * 10.0/13.0));
 
 -- One-time cache refresh for existing rows (levels are all 2, so the φ floor
 -- cannot apply and decay is refreshed on next read anyway):
