@@ -2,82 +2,128 @@
 
 [English](affinity-model.md) · [中文](affinity-model.zh.md)
 
-好感度是一个六维向量，会在每个文本频道、非 `product_qa` 的对话轮次后变化，并折叠成两条衍生线——**Bond**（友情轴）和
-**Chemistry**（爱情轴）。语音频道和 `product_qa` 轮次从不写入好感度事件。每条线都有分层和标签。引擎是分数、标签、以及每轮标签变化的单一权威来源。
+好感度是一个六维向量，在每个文本通道、非 `product_qa` 的聊天回合更新。四条
+**线轴**折叠出两条派生线——**Bond**（友情线）与 **Chemistry**（浪漫线）；两个
+**端点轴**（`warmth`、`patience`）则是*派生量*：判官给出粗粒度的绝对档位，
+引擎用对侧线分数把它折成连续值。语音通道与 `product_qa` 回合从不写好感度事件。
+每条线有档位与标签，引擎是分数、标签与逐回合标签迁移的唯一权威来源。
 
 ## 六个基础轴
 
-| 轴 | 范围 | 默认种子 | 影响什么 |
-|------|-------|--------------|----------------|
-| `warmth` | −1.0 ↔ 1.0 | `0.1` | 语气、称呼。负值 = 戒备/敌意；正值 = 温暖/亲昵。折叠时对两条线均有贡献（取 0 为下界）。 |
-| `trust` | 0.0 ↔ 1.0 | `0.0` | 话题深度，是否愿意暴露自己。Bond 轴。 |
-| `intrigue` | 0.0 ↔ 1.0 | `0.0` | 好奇心、追问动力，抗 ghost 的主力。Bond 轴。 |
-| `intimacy` | 0.0 ↔ 1.0 | `0.0` | 内部梗、昵称、回头呼应之前的细节。Chemistry 轴。 |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | 对短消息/敷衍回复的容忍度；ghost 阈值的输入。当该轮 LLM 给出绝对值读数时（0~1，每 0.1 档），与规则 delta 合并后直接写入；没有读数时规则 delta 单独按 1:1 应用（见下文）。始终夹钳到 `[0, 1]`。不计入两条线。 |
-| `tension` | 0.0 ↔ 1.0 | `0.0` | 推拉、玩闹式的小摩擦、傲娇空间。Chemistry 轴。 |
+| 轴 | 范围 | 默认值 | 影响 |
+|------|-------|--------|------|
+| `warmth` | 0.0 ↔ 1.0 | ≈ `0.244`（派生） | 语气、称呼。**派生端点**（4.0）：`warmth = max(base(档位)·B(chemistry), φ·chemistry) × decay`。 |
+| `trust` | 0.0 ↔ 1.0 | `0.0` | 话题深度、自我袒露意愿。Bond 轴。 |
+| `intrigue` | 0.0 ↔ 1.0 | `0.0` | 好奇心、追问、反 ghost 驱动。Bond 轴。 |
+| `intimacy` | 0.0 ↔ 1.0 | `0.0` | 内梗、昵称、呼应早前细节。Chemistry 轴。 |
+| `patience` | 0.0 ↔ 1.0 | ≈ `0.244`（派生） | 对短消息/低投入消息的容忍度；ghost 阈值输入。**派生端点**（4.0）：`patience = max(base(档位)·B(bond), φ·bond) × decay`。 |
+| `tension` | 0.0 ↔ 1.0 | `0.0` | 推拉、俏皮摩擦、傲娇余地。Chemistry 轴。 |
 
-只有 `warmth` 可以为负值。其余五个都限制在 `[0, 1]`。每次更新都会对六个轴做夹钳（clamp）。
+六轴全部限定在 `[0, 1]`，每次更新都 clamp。每行的权威事实是四条线轴、两个判官
+**档位**（`warmth_grade` / `patience_grade`，`1..=3`，migration `0048`）与
+`updated_at`；存储的 `warmth`/`patience` 值是派生结果的物化缓存，在时间衰减
+运行的地方同步刷新。
 
-**默认种子**值仅对迁移 `0029` 之后创建的新行生效，已有行不受影响。
+### 档位化写入（线轴）
 
-### 按档位写入
-
-评估器报告的是每轴**档位（grade）**而非数字 delta；引擎把档位换算成分数、做衰减与门控（见[写入管线](#写入管线好感度-30)），再把提交的 delta 按 1:1 应用：
+判官报告的是逐轴*档位*而非数值增量；引擎把档位换算成分数、做衰减与门控（见
+[写入管线](#写入管线affinity-40)），再把提交的增量 1:1 应用：
 
 ```
 new_value = clamp(old_value + committed_delta)
 ```
 
-提交的 delta 就是字面意义上的变化量——阻尼由管线里的分档衰减负责，作用在写入之前而不是写入之上。以 `metadata.is_demo` 开启的会话会把正向评分乘以 `AFFINITY_DEMO_BOOST`（默认 `1.4`），让 demo 场次的好感度表在短暂的轮次预算内有可见的移动。
+提交增量就是字面含义——阻尼是管线里的档位衰减，发生在写入之前而非写入之上。
+`metadata.is_demo` 的会话给判官正分乘 `AFFINITY_DEMO_BOOST`（默认 `1.4`）。
 
-### 时间衰退
+### 时间衰减
 
-六个轴中有三个会在没有活动时随真实时间漂移。衰退采用懒计算，每次加载时根据 `updated_at` 计算：
+无活动时两条线轴随真实时间漂移，在每次加载时从 `updated_at` 惰性计算：
 
 ```
 days_elapsed = (now − updated_at) / 1 天
 
 intrigue = clamp(intrigue − 0.01  × days_elapsed, 0.0, 1.0)
-patience = clamp(patience + 0.005 × days_elapsed, 0.0, 1.0)
 tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 ```
 
-`warmth`、`trust`、`intimacy` 不衰退——它们是"深层"维度。
+`trust` 与 `intimacy` 不衰减——它们是「深层」维度。旧的 `patience` 每日上漂移
+已退役：端点的缺席处理是派生式里的乘性衰减（见下），它**冷却**而非治愈。
 
-### Patience：LLM 绝对读数 + 规则 delta
+## 派生端点（affinity 4.0）
 
-`patience` 不是档位轴。每轮的 `affinity_evaluation`（与其余五轴同一次 LLM 调用，不产生新的往返）中，模型会额外给出一个**绝对**的 `patience` 读数（`0.0`–`1.0`，每 `0.1` 一档，代表当前对用户还剩多少耐心，而非变化量）。引擎把模型读数四舍五入到最近的 `0.1` 并夹钳到 `[0, 1]`，记为 `L`。
-
-PDE 仍照常计算这一轮回复/主动消息的规则 delta `R`（`predict_reply_deltas`：长消息 +0.02 / 极短消息 −0.02 / 超过 24 小时未活动 −0.05）——这部分不变。
-
-本轮目标值为 `patience_target = clamp(L + R, 0, 1)`；该和值**不会**再被四舍五入回 0.1 档（网格只约束 LLM 读数，`R` 可以把结果推离网格）。持久化时，写入管线照常先跑一遍——但 `patience` 从管线中原样穿过：它的规则 delta 从不参与分档衰减、跨线惩罚或阈值门控，按 1:1 应用并夹钳。随后 patience 被 `patience_target` **直接覆盖**（仍会夹钳到 `[0, 1]`）。因为 `L` 和 `R` 都与当前存储值无关，这个写入在并发场景下是安全的，不需要读改写。
-
-**兜底：** 当本轮没有 LLM patience 读数时——Proactive、用户消息过短、助手回复为空、`no_persona_or_affinity`（persona 加载失败或不存在好感度行）、或评估调用报错/超时/模型省略了 `patience` 字段——`patience_target` 为 `None`，只应用规则 delta `R`（1:1，夹钳）。
-
-**Ghost 走独立路径，不是兜底。** Ghost 回合根本不会进入 `persist_with_event`——`persist_affinity` 把它分派给 `record_ghost`，该函数不接收任何档位或 delta、从不跑写入管线，只递增 `ghost_streak` / `total_ghosts` / `last_ghost_at`（写入的是全零 `effective_deltas`）。PDE 的 `ghost_affinity_deltas()`（patience `−0.05`、tension `+0.05`——与 `predict_reply_deltas` 是不同的函数）会被计算进 `ActionPlan`，但在持久化时被丢弃。因此 Ghost 回合的 `patience` 完全不动——只有 ghost 计数器会变化。
-
-## 两条衍生线
-
-六个轴会生成两个合成分数。`warm_pos` 是 `warmth.max(0.0)` —— 以 0 为下界，而不是整体平移；因此中性或冷漠的会话贡献为零：
+`warmth` 与 `patience` 不再是累积状态。每个判定回合，判官对每个端点报一个绝对
+**档位**——`1` 冷淡/不耐烦、`2` 常态（压倒性常见的裁定）、`3` 明显热络/上心——
+引擎据此派生连续值：
 
 ```
-bond      = (warm_pos + trust   + intrigue) / 3    ∈ [0, 1]
-chemistry = (warm_pos + intimacy + tension)  / 3    ∈ [0, 1]
+base(档位)  = (档位 − 1) / 3                     ∈ {0, 1/3, 2/3}
+B(x)        = 1 + λ·(x − 0.35)                   λ = (1.5−1)/(1−0.35) = 10/13
+decay(Δt)   = max(FLOOR, 1 − RATE·天数)          Δt 自 updated_at 起算
+
+warmth   = clamp01( max(base(w档)·B(chemistry), φ·chemistry) × decay )
+patience = clamp01( max(base(p档)·B(bond),      φ·bond)      × decay )
 ```
 
-`warmth` 会进入两条线：冷漠的回复会同时拉低 Bond 和 Chemistry。
-`patience` 不计入任何一条线——它由 LLM 绝对读数 + 规则 delta 维护，直接写入；两条线仍不含 patience（设计如此）。
+耦合方向的语义是**加成，不是相关**：chemistry 越深表达越温暖，bond 越深耐心
+越足。低 bond × 高 chemistry 天然给出傲娇形态（没耐心但热络）；高 bond × 低
+chemistry 给出老友形态（有耐心但冷静）——不需要提示词特判。
 
-以默认种子（`warmth 0.1`，`trust/intrigue/tension 0`）开始，新会话的
-bond ≈ chemistry ≈ 0.033——两条线均在第 1 档（陌生人）。
+每个常数都有锚点，没有拍脑袋数字：
 
-> **命名注意：** `AffinityScope::bond()/chemistry()`（用于 prompt 注入范围控制、`length_score`）采用的是*不同的*轴分组——那是一套更早的独立划分，为避免回复长度的回归而有意保留。此处的 `bond_score`/`chemistry_score` 与其完全独立。
+- **枢轴 `0.35` = 第 2 档上界**（同一常量）：对侧线爬进第 3 档那一刻加成转正；
+  之下真实值被压到基础分以下。`0.35`/`0.65` 同时也是判官输入与 patience 分带
+  的切点。
+- **`B(1) = 1.5`** 使 `⅔ × 1.5 = 1.0`：判官满档 × 对线满值恰好封顶。
+- **托底 `φ = 0.2`**（`AFFINITY_FLOOR_RATIO`）：档 1 的裁定读作
+  `φ·对线值` 而非绝对零——深关系冷场一轮仍有余温（对线 `0.9` 时为 `0.18`），
+  陌生人则归零。由于 `φ·x ≤ 0.2 < 0.244 = ⅓·B(0)`，托底只会作用于档 1，
+  永远不会改写非冷淡裁定。
+- **衰减**（`AFFINITY_TIME_DECAY_RATE` `0.02`/天，`AFFINITY_TIME_DECAY_FLOOR`
+  `0.5`）：7 天 → ×0.86，25 天以上 → ×0.5。久别冷却但不清零——老关系的韧性
+  由加成托住（bond `0.9` 满衰减后 patience 仍 ≈ `0.48`）。
 
-## 分档
+`decay = 1` 时的可达域：档 1 → `(0, 0.2]`（随对线连续），档 2 →
+`[0.244, 0.5]`，档 3 → `[0.487, 1.0]`。档位决定大区间，对线值决定区间内位置。
 
-每条线有**五档**，分档的分数区间逐档拉宽（越往上越难），直到顶端一个窄小的第 5 档：
+**逐回合 delta 照常输出。**`effective_deltas.warmth` / `.patience` 是派生值
+跨回合的 `after − before`，以衰减后快照为基准——缺席造成的落差不会记到回合头上。
 
-| 档位 | 分数区间 | 区间宽度 |
+**跳过的回合保持档位。**评估被跳过或失败时（`eval_skip_reason`），存储档位
+保持不变，端点按当前线值与衰减重新派生。旧的规则 delta 回退（±0.02 消息长度
+微调、超时 −0.05）已退役——停滞规则被衰减吸收。
+
+**Ghost 是独立路径。**Ghost 回合不进 `persist_with_event`，只更新
+`ghost_streak` / `total_ghosts` / `last_ghost_at`。PDE 的 ghost 增量只碰
+`tension`。
+
+## 两条派生线
+
+四条线轴产出两个合成分数。4.0 起两线不共享任何轴：
+
+```
+bond      = (trust    + intrigue) / 2    ∈ [0, 1]
+chemistry = (intimacy + tension)  / 2    ∈ [0, 1]
+```
+
+`bond` 是友情——信任加持续的兴趣；`chemistry` 是浪漫——亲近加张力。端点按构造
+被排除在两线之外（它们是线的*输出*）。
+
+默认种子（线轴全 0）下，新会话从 bond = chemistry = 0 开始——两线都在第 1 档
+（stranger）——两个端点在档 2 的受抑基础值 ≈ `0.244`。
+
+> **命名注记：**`AffinityScope::bond()/chemistry()`（用于注入范围、
+> `length_score`）采用*另一套*轴分组——那是 1.0 时代的分割，刻意不动以避免
+> 回复长度回归。按结构看它早就把 `warmth` 与 `intimacy`/`tension` 归为一族、
+> `patience` 与 `trust`/`intrigue` 归为一族——正是 4.0 耦合显式化的同一分族——
+> 但它的两个*线名*相对 2.0+ 的线是交叉的，这也是 scope 绝不能参与派生的
+> 原因之一。
+
+## 档位
+
+每条线有**五个档位**，分数间隔逐档变宽（每一步更贵），顶端是狭窄的第 5 档：
+
+| 档位 | 分数区间 | 间隔 |
 |------|-----------|-----|
 | 1 | `[0.00, 0.15)` | 0.15 |
 | 2 | `[0.15, 0.35)` | 0.20 |
@@ -85,293 +131,289 @@ bond ≈ chemistry ≈ 0.033——两条线均在第 1 档（陌生人）。
 | 4 | `[0.62, 0.90)` | 0.28 |
 | 5 | `[0.90, 1.00]` | 0.10 |
 
-API 按原样返回每条线的分数：`AffinitySnapshot.bond` / `.chemistry` 是真实存储的合成值（0..1），不再套任何显示曲线（好感度 3.0 删掉了旧的分档进度条投影）。投影曾经在渲染层伪造的「前期快、后期磨」节奏现在是真实的：写侧的分档衰减（见[写入管线](#写入管线好感度-30)）按本线档位削减正向增益，高档确实要更多轮次才能跨越。前端要做分档进度条，可用分数和上表的档位边界自行推导。
+API 原样报告每条线的分数：`AffinitySnapshot.bond` / `.chemistry` 就是真实存储
+的合成分，0..1，无显示曲线。「前期容易、后期磨」的节奏是真实的：写侧档位衰减
+按线自身档位压制正向增益。想画进度条的前端用分数和上表档界自行推导。
 
-所有分档阈值均为可调常量。
+所有档界都是可调常量。
 
-## 分档标签
+## 档位标签
 
-共有两组各五个标签，每条线一组（序列化为蛇形命名键）：
+两套独立的五标签，每线一套（序列化 snake_case）：
 
-| 线 | 第 1 档 | 第 2 档 | 第 3 档 | 第 4 档 | 第 5 档 |
+| 线 | 档 1 | 档 2 | 档 3 | 档 4 | 档 5 |
 |------|--------|--------|--------|--------|--------|
-| **Bond** | `acquaintance`（点头之交） | `friend`（朋友） | `close_friend`（好友） | `confidant`（知己） | `soulmate`（灵魂挚友） |
-| **Chemistry** | `spark`（来电） | `flirtation`（暧昧） | `crush`（心动） | `lover`（恋人） | `beloved`（至爱） |
+| **Bond** | `acquaintance` | `friend` | `close_friend` | `confidant` | `soulmate` |
+| **Chemistry** | `spark` | `flirtation` | `crush` | `lover` | `beloved` |
 
-`bond_label` 和 `chemistry_label` 始终是各自五个值之一——永不输出 `stranger`。`stranger` 状态仅由遗留字段传达（见下文）。
+`bond_label` 与 `chemistry_label` 永远取各自五个值之一——从不输出
+`stranger`。`stranger` 状态只由遗留字段承载（见下）。
 
 ## 遗留 `relationship_label`
 
-遗留字段保留旧名称集，保持对现有消费者的向后兼容。它现在是两个原始分数的纯函数（取代旧的临时 `infer_label` 启发式）：
+遗留字段沿用旧命名集合以保持向后兼容，是两个原始分数的纯函数：
 
 ```
 legacy_relationship_label(bond, chemistry):
   if tier(bond) == 1 AND tier(chemistry) == 1  →  stranger
-  let higher = (chemistry > bond) ? Chemistry : Bond   // 平局 → Bond
+  let higher = (chemistry > bond) ? Chemistry : Bond   // 平手 → Bond
   match higher:
     Bond                                         →  friend
     Chemistry if tier(chemistry) in {1, 2}       →  slow_burn
     Chemistry if tier(chemistry) in {3, 4, 5}    →  romantic
 ```
 
-`frenemy` 已停止输出，但在枚举中仍可解析，供历史行使用。`stranger` 现在是明确的"两条线均在第 1 档"情况——不再需要旧五个阈值条件全部未命中。
+`frenemy` 已停止输出，枚举中保留仅为解析历史行。
 
-## 评估器协议：档位，不是数字
+## 判官协议：全面 ordinal
 
-**档位（好感度 3.0）。** 评估器从不输出数字 delta。五个档位轴（`warmth` / `trust` / `intrigue` / `intimacy` / `tension`）每轴报告一个 `0`–`4` 的整数**档位（grade）**加一个**方向（direction）**：
+**判官在任何地方都不输出连续数值。**四条线轴（`trust` / `intrigue` /
+`intimacy` / `tension`）各报一个整数**档位** `0`–`4` 加**方向**；两个端点各报
+一个绝对**档** `1`–`3`：
 
 ```json
 {
-  "warmth":   {"grade": 0, "direction": "up"},
+  "warmth":   2,
   "trust":    {"grade": 1, "direction": "up"},
   "intrigue": {"grade": 0, "direction": "up"},
   "intimacy": {"grade": 0, "direction": "up"},
   "tension":  {"grade": 2, "direction": "down"},
-  "patience": 0.5,
+  "patience": 2,
   "reason": "…"
 }
 ```
 
-- **档位口径：** `0` = 无事发生（寒暄、附和——绝大多数轮次的裁决）；`1` = 微小但真实的波动；`2` = 明确的推进或伤害；`3` = 罕见的重要时刻（真诚的自我袒露、脆弱、成功的调情；明显的冒犯或被无视）；`4` = 里程碑——这段关系被重新定义的一轮（极罕见）。
-- **方向**为 `"up"` / `"down"`；负面时刻（冷漠、敷衍/重复的回复、无聊、越界、冲突、被无视）在 prompt 中被引导为更常见也更该出手。
-- `patience` 仍是 0~1 的绝对读数、每 0.1 一档（见上文），不是档位。
+- **档位口径：**`0` = 无事发生（寒暄、附和——压倒性常见的裁定）；`1` = 微小但
+  真实的波动；`2` = 明确的推进或伤害；`3` = 罕见的重要时刻；`4` = 里程碑
+  （极罕见）。
+- **方向**为 `"up"` / `"down"`；负面时刻被提示要果断给出。
+- **端点档口径：**`1` = 冷淡/不耐烦（明显冷场、敷衍、被冒犯）；`2` = 常态——
+  压倒性常见的裁定；`3` = 明显热络/上心。端点档是*本轮状态判读*，不是增量。
 
-引擎把 `{grade, direction}` 折叠成 `−4..+4` 的有符号整数。模型做序数评级可靠、做校准算术不可靠——所以判官选档位，数字全部由引擎持有。
+模型是可靠的 ordinal 评级者、不可靠的校准算术器——判官选桶，引擎拥有一切数字。
+用户看到的连续 `warmth`/`patience` 分布由上面的派生式从离散档折出来；4.0 移除
+了最后一处连续输出（旧的 0.1 步进 patience 读数，prod 实测挤在天花板）。
 
-**畸形裁决整体拒绝。** JSON 不可解析，或任一轴畸形——非整数或越界的档位、未知的方向——都会让 `parse_affinity_eval` 拒绝整份裁决：档位全零、无 patience 读数、reason 为空。该轮的规则 delta 仍会持久化，评估器失败从不丢失好感度事件。（缺省的轴或 `null` 档位不算畸形——按档位 0 处理；`"grade": "2"` 这种带引号的整数会被抢救回来。）
+**畸形裁定整份拒收。**无法解析的 JSON、任一畸形轴（非整数或越界档位、未知
+方向）、任一畸形端点档，都会让 `parse_affinity_eval` 拒掉整份裁定：档位全零、
+无端点读数、reason 置空。当回合的规则增量照常持久化，判官失败不会丢事件。
+（缺省轴或 `null` 档位读作档 0；缺省或 `null` 端点档读作「保持存储档位」；
+带引号的整数如 `"grade": "2"`、`"warmth": "3"` 可救回。）
 
-**单轮包络。** 按默认调参，档位 `+4` 换算为单轴 `+0.20`、档位 `−4` 为 `−0.30`。「一次糟糕的回合比一次好的回合影响更大」的非对称性由 `AFFINITY_NEG_FACTOR` 承担。
+**分带输入、端点除外。**每轮 payload 给判官看四条*线轴*的当前分带（低/中/高，
+切点 0.35 / 0.65），从不给原始浮点。当前 `warmth`/`patience` 值刻意**不注入**：
+绝对档判定的价值正在于无状态——给它看旧值会造成锚定，把这次重设计要移除的
+通胀原样带回来。
 
-**档位化输入。** 每轮 payload 给评估器看的六轴当前状态是粗档位（冷/低/中/高，
-切点 0.35 / 0.65 与耐心档一致；冷 = warmth 为负），从不给裸浮点——报档位的判官
-不该看见数字，否则会被重新锚定回档位协议刚移除的算术上。
-
-**语域与 `reason` 卫生规则。** 评估器 prompt 用角色的第一人称写（「你就是这个角色，
-这一轮之后你对他的感觉变了多少」），不是第三人称分析型评审；调用时拆成静态 `system`
-指令 + 每轮 `user` 数据两条消息。`reason` 规则禁止出现系统词汇（AI／助手／模型、拒绝
-机制、政策等），也禁止为回复里出现的套话式拒绝辩护。这条规则是有承重作用的：`reason`
-会写入 `companion_affinity_events.context`，并作为 `[emotional_context]` 重新注入后续
-系统提示——评估器若为一次拒绝找理由，那个立场就被写进了角色的持久状态。该 prompt 由
-引擎持有，刻意不可配置，见
+**口吻与 `reason` 卫生。**判官提示词以角色第一人称书写，不是第三方评审；以
+静态 `system` 指令加逐轮 `user` payload 发送。`reason` 规则禁止系统词汇
+（AI/助手/模型、拒绝、政策），禁止为触达回复的模板拒答背书。这是承重设计：
+`reason` 落 `companion_affinity_events.context` 并作为 `[emotional_context]`
+回注后续系统提示。提示词由引擎持有、刻意不可配置——见
 `docs/superpowers/specs/2026-08-02-affinity-eval-hygiene-design.md`。
 
-## 写入管线（好感度 3.0）
+## 写入管线（affinity 4.0）
 
-判官报档位，数字全部由引擎持有。每份裁决在引擎侧经过四个阶段（`eros-engine-core/src/affinity.rs` 的 `grade_turn`），对回合前快照计算、在好感度行锁下应用：
-
-```
-档位 → 原始分 → 分档衰减 → 跨线惩罚 → 阈值门控 → 夹钳
-```
-
-**1. 换算。** 有符号档位 `g` 换算成原始分 `r`：
+判官报档位，引擎拥有一切数字。每份裁定经过四个引擎侧阶段（`grade_turn`，
+`eros-engine-core/src/affinity.rs`），基于回合前快照计算、在好感度行锁下应用。
+端点从不进入这条管线。
 
 ```
-r = g × AFFINITY_GRADE_UNIT                        （正向；demo 会话另乘 AFFINITY_DEMO_BOOST）
-r = g × AFFINITY_GRADE_UNIT × AFFINITY_NEG_FACTOR  （负向）
+档位 → 原始分 → 档位衰减 → 跨线惩罚 → 阈值门 → clamp
+                                      → 端点派生
 ```
 
-默认值 `0.05` / `1.5`：档位 `+4` = `+0.20`、`−4` = `−0.30`——即 2.0 的包络。PDE 的规则微调（如长消息 intrigue `+0.02`）在衰减前并入原始分。
-
-**2. 分档衰减（仅正向）。** 正向原始分乘以本线档位对应的系数 `AFFINITY_TIER_DECAY`（默认第 1–5 档为 `1.0, 0.70, 0.45, 0.25, 0.10`）。`trust`/`intrigue` 读 Bond 的档位；`intimacy`/`tension` 读 Chemistry 的；`warmth`（两条线共享）读较高一线的档位（两者取 max）。负向原始分**从不**衰减——损失在任何档位都是全价。读侧进度条投影删除后，「前期快、后期磨」的节奏就落在这里。
-
-**3. 跨线惩罚。** 在只属于一条线的轴上，*另一条*线的高度会对这次移动收税，**且按实际生效的档位按比例收**：
+**1. 换算（按线）。**有符号档位 `g` 按所属线的单位换算：
 
 ```
-penalty = κ × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
-  y  = 另一条线的分数
-  g  = 实际生效的档位（经 3.1 scope 转向之后）
-  κ  = AFFINITY_CROSS_PENALTY        （默认 0.05）
-  y₀ = AFFINITY_CROSS_PENALTY_START  （默认 0.35）
+r = g × u_line                        （正向；demo 会话另乘 AFFINITY_DEMO_BOOST）
+r = g × u_line × AFFINITY_NEG_FACTOR  （负向）
+
+u_line = AFFINITY_GRADE_UNIT_BOND  （trust / intrigue，  默认 0.0786）
+       | AFFINITY_GRADE_UNIT_CHEM  （intimacy / tension，默认 0.0266）
 ```
 
-高 Bond 让 Chemistry 更难涨，反之亦然。`warmth` 豁免（它同时供给两条线）；档位为 `0` 时不收税——纯规则轮次与被 3.1 门槛滤掉的档位都落在这里。管线只对事件收费，不收租金。
+两个单位约 3 倍的差距是判官打分不对称性的实测结果（tension 约一半回合达到
+档 ≥2，trust 约 80% 回合打 0），写在明面上可供争论，而不是藏进档位重映射。
+PDE 规则微调（如长消息 intrigue `+0.02`）在衰减前并入原始分。
 
-`|g|/4` 这个因子的作用，是让结果不再取决于裁决**有多大**。忽略规则微调，整项可以因式分解：
+**2. 档位衰减（仅正向）。**正向原始分乘所属线的档位因子
+`AFFINITY_TIER_DECAY`（默认 `1.0, 0.70, 0.45, 0.25, 0.10` 对应档 1–5）。
+`trust`/`intrigue` 读 Bond 的档位；`intimacy`/`tension` 读 Chemistry 的。
+负向原始分**从不**衰减——任何档位下损失都是全价。
+
+**3. 跨线惩罚。***对侧*线的高度对这步动作收税——按实际应用的档位成比例，
+上限定义为所属线单位的倍数：
 
 ```
-g > 0:  ρ = g × (D_k·u − κ·φ(y)/4)
-g < 0:  ρ = g × (u·λ⁻ + κ·φ(y)/4)      （负向部分从不衰减）
+penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
+  y      = 对侧线分数
+  κ_line = AFFINITY_CROSS_PENALTY_RATIO × u_line   （比率默认 5/6）
+  y₀     = AFFINITY_CROSS_PENALTY_START            （默认 0.35）
 ```
 
-两个括号里都没有 `g`，所以**在同一个位置上，结果不会随档位改变符号**——档位决定幅度，不决定方向。这正是定额收税的失效模式：它让符号在 g1 与 g4 之间某处翻转，于是一次诚实的小推进反而掉分、更大的推进才涨分。负向那个括号恒为正，所以负向裁决总是让轴下降。
+高 Bond 让 Chemistry 更难长，反之亦然；档位 `0` 分文不收——管线对事件收费，
+不收租金。忽略规则微调，该项可因式分解：
 
-这**不是**在保证「任何正向裁决都是净涨」。正向括号本身是不是正的，取决于**位置**，收支平衡点在 `φ(y*) = 4·D_k·u/κ`——见下。
+```
+g > 0:  ρ = g·u · (D_k − ratio·φ(y)/4)
+g < 0:  ρ = g·u · (λ⁻ + ratio·φ(y)/4)      （负向部分从不衰减）
+```
 
-默认参数下这个平衡点在第 1–4 档都 > 1，也就是**这四档在任何档位下都收不成墙**。只有自身第 5 档有真正的平衡点，落在对手线 ≈`0.761`——越过它之后**每一个**档位都净亏，且是齐平地亏。「不能既是挚友又是恋人」在顶点依然成立，只是不再对普通的中段回合开火。
+两个括号里既没有 `g` **也没有 `u`**：固定位置上结果不会随档位翻符号，且
+盈亏平衡位置 `φ(y*) = 4·D_k/ratio` 对两条线一致、与单位无关——κ 绑定单位，
+正是防止按线单位悄悄挪动双高之墙的机制。默认值下只有自身第 5 档存在真实
+平衡点（对侧 ≈ `0.761`）；越过之后每个档位都统一净负。
 
-规则微调在这个因式分解之外：它在衰减前并入原始分，却不计入惩罚所用的档位，所以足够大的反向微调理论上能把符号翻过来。今天做不到——能落到档位轴上的规则微调只有 `intrigue +0.02` 与 `tension +0.03`，两个都是正的。
+**4. 阈值门。**每条线轴维护一个有符号累加器；本轮真实分并入后，只有
+`|累计| ≥ AFFINITY_DELTA_THRESHOLD`（默认 `0` = 每轮都提交）才整体提交，
+否则缓存在 `companion_affinity.pending_deltas`。
 
-**4. 阈值门控。** 每轴维护一个有符号累加器。本轮的实际分并入后，只有当 `|累计值| ≥ AFFINITY_DELTA_THRESHOLD`（默认 `0` = 每轮都提交）时整笔余额才提交；未达阈值时缓存在 `companion_affinity.pending_deltas`（JSONB，迁移 `0043`），该轴本轮不动。
-
-提交的 delta 随后按 1:1 应用并夹钳到各轴区间（`warmth` 为 `[-1,1]`，其余为 `[0,1]`）。`patience` 绕过全部四个阶段——它的规则 delta 原样穿过，绝对值覆盖在其后进行（见上文）。
+提交的增量 1:1 应用并 clamp 到 `[0,1]`。之后（若本轮读到）判官档位覆写存储
+档位，两个端点按回合后的线值重新派生。
 
 ### 调参旋钮
 
-服务端环境变量，逐项回退到默认值；默认值复现 2.0 的每轮有效包络：
+服务端环境变量，逐项回退到默认值：
 
-| 环境变量 | 默认值 | 含义 |
+| 环境变量 | 默认 | 含义 |
 |---------|---------|---------|
-| `AFFINITY_GRADE_UNIT` | `0.05` | 每档位对应的原始分 |
-| `AFFINITY_NEG_FACTOR` | `1.5` | 负向原始分的附加乘数——延续「涨得慢、跌得快」 |
-| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | 第 1–5 档的正向衰减系数（逗号分隔；不是恰好 5 个有限非负值时整表保持默认——大于 1 即放大，属合法调参方向） |
-| `AFFINITY_CROSS_PENALTY` | `0.05` | 跨线惩罚上限 κ |
-| `AFFINITY_CROSS_PENALTY_START` | `0.35` | 惩罚开始生效的另一线分数（y₀） |
-| `AFFINITY_DELTA_THRESHOLD` | `0.0` | 提交阈值 θ；`0` = 每轮都提交 |
-| `AFFINITY_DEMO_BOOST` | `1.4` | `metadata.is_demo` 会话对判官正向原始分的乘数（规则微调不受影响） |
-| `AFFINITY_SCOPE_BOND_BOOST` | `1.5` | 仅点名 bond 半边的 scope 下，bond 独占轴正向原始分的常数乘数（见下）；`1.0` 即关闭 |
-| `AFFINITY_SCOPE_CHEM_LADDER` | `0,0,1,3,4` | 触及 chemistry 半边的 scope 下，chemistry 独占轴的档位门槛表，按正向档位 0–4 索引（逗号分隔；须恰好 5 个 `0..=4` 的值且第 0 格为 `0`，否则整表保持默认）；`0,1,2,3,4` 即关闭 |
+| `AFFINITY_GRADE_UNIT_BOND` | `0.0786` | trust/intrigue 每档原始分 |
+| `AFFINITY_GRADE_UNIT_CHEM` | `0.0266` | intimacy/tension 每档原始分 |
+| `AFFINITY_NEG_FACTOR` | `1.5` | 负向原始分的额外乘数——保持「涨得慢、跌得快」 |
+| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | 档 1–5 的正向阻尼（逗号分隔；不是恰好 5 个有限非负值则整表保持默认） |
+| `AFFINITY_CROSS_PENALTY_RATIO` | `0.8333` | κ_line = ratio × u_line——平衡点与单位无关 |
+| `AFFINITY_CROSS_PENALTY_START` | `0.35` | 惩罚坡道起点（y₀） |
+| `AFFINITY_DELTA_THRESHOLD` | `0.0` | 提交阈值 θ；`0` = 每轮提交 |
+| `AFFINITY_DEMO_BOOST` | `1.4` | `metadata.is_demo` 会话判官正分乘数 |
+| `AFFINITY_FLOOR_RATIO` | `0.2` | 端点托底 φ；域检查封顶 `0.24`，确保永不改写非冷淡裁定 |
+| `AFFINITY_TIME_DECAY_RATE` | `0.02` | 端点缺席衰减（每天） |
+| `AFFINITY_TIME_DECAY_FLOOR` | `0.5` | 端点缺席衰减下限 |
 
-每个标量在启动时做域校验——非有限或越域的值（负的单位/系数/惩罚/阈值/乘数、
-不在 `[0, 1)` 内的起罚点）保持默认并记录警告：环境变量打错字只会退回默认值，
-不会进入管线。
+每个标量在启动时做域检查——非有限或越域的值保持默认并打警告，环境变量打错字
+只会退回默认，不会进入管线。
 
-## Scope 转向（好感度 3.1）
+端点锚点——枢轴 `0.35`（= 第 2 档上界）与 `B_MAX = 1.5`——是**代码常量**而非
+旋钮：它们是结构承诺（`⅔ × 1.5 = 1` 的恰好封顶性质），做成环境变量反而允许
+拧坏派生依赖的不变量。
 
-请求里的 [`affinity_scope`](api-reference.zh.md#post-compchatsession_idmessagestream)
-做两件事。除了决定哪些轴进入 prompt，它还决定本轮档位怎么折算 —— 同一个「关系取向」
-既决定伴侣**被告知**什么，也决定这段关系**挣到**什么。
+## Scope 调向：已退役
 
-这里借用的是它两个具名值所携带的 bond/chemistry **心智**，不是它们背后的轴三元组。
-`ScopeMode` 对六个 bool 是全函数，所以轴数组的转向和具名值一样可预期：
-
-| 解析后的 scope | 模式 | 效果 |
-|---|---|---|
-| 空（`none`） | `neutral` | 与 3.0 逐格相同 |
-| 含任一 chemistry 半边轴 —— `chemistry`、`full`、混合数组 | `suppress_chemistry` | `intimacy` / `tension` 的正向档位过 `AFFINITY_SCOPE_CHEM_LADDER` |
-| 其余 —— `bond`、bond 半边数组 | `boost_bond` | `trust` / `intrigue` 的正向原始分 × `AFFINITY_SCOPE_BOND_BOOST` |
-
-三条性质由构造保证：
-
-- **共享的 `warmth` 两个方向都豁免。** 它同时喂两条合成线，缩放它会把修正泄漏到
-  另一条线上 —— 与跨线惩罚豁免 warmth 是同一个理由。只有线独占轴被转向。
-- **损失从不被转向。** 负向原始分照付 `AFFINITY_NEG_FACTOR`，此外什么都不加：
-  这个修正抬高门槛，不减轻伤害。
-- **被门槛滤掉的档位不计跨线惩罚。** 门槛在管线**之前**生效，映射到 `0` 的档位
-  读作「判官没有触碰这条轴」，而惩罚只对被触碰的轴收取，于是根本不触发。
-  这正是默认门槛表不引入任何 3.0 没有的失衡格的原因：它的 `g3`/`g4` 两行与未转向时
-  逐格相同，`g2` 恰好落在未转向的 `g1` 行上。
-
-默认门槛表 `0,0,1,3,4` 滤掉 `g1`、把 `g2` 减半、里程碑原样 ——
-即「闲聊不再算作浪漫，真正的时刻照算」。
-
-**审计。** `companion_affinity_events.context` 每轮都记 `scope_mode`，
-门槛实际改动了什么时另记 `effective_grades`。`grades` 保持判官原始verdict，
-所以一个提交为 `0` 的值始终可归因：是判官什么都没说，还是被门槛滤掉了。
-没有这一对，跨模型轮换观察判官漂移时会把引擎自己的修正读成模型的移动。
-被计入跨线税的回合另记 `cross_penalty_assessed`——惩罚改为按档位比例收之后，
-一个回合到底被收了多少，已经无法只凭档位与存储分数反推。
-是**计入**不是**落地**：它在阈值门控之前从 `ρ` 里扣除，
-所以被门控缓存的回合上它还没碰到轴，而是留在 `pending_after` 里。
+Affinity 3.1 的写侧 scope 调向（`ScopeMode`、bond 加成与 chemistry 档位阶梯）
+在 4.0 退役。`affinity_scope` 重新回到只管读侧——门控提示注入与
+`length_score`，不再触碰写路径。端点派生也绝不能读 scope：B(x) 本来就把线的
+一切变化（包括任何调速）传导给端点，派生层若再读 scope，同一请求会沿两条路径
+落在同一端点上；且 scope 的 1.0 时代线名相对 2.0+ 的线是交叉的。
+`companion_affinity_events.context` 不再携带 `scope_mode` /
+`effective_grades`——新行上 `effective_grades` 的缺席就是退役落地的最干净验证。
 
 ## 持久化
 
 ### 生成列
 
-迁移 `0029` 在 `engine.companion_affinity` 上新增 `bond` 和 `chemistry` 两个 Postgres `GENERATED ALWAYS … STORED` 列。DB 在每次行插入或更新时从六轴重新计算它们，因此它们不会漂移。已有行会在迁移时自动填充（无需回填，引擎写路径无需改动）：
+Migration `0048` 把 `engine.companion_affinity` 上的 `bond`、`chemistry`
+重定义为 Postgres `GENERATED ALWAYS … STORED` 列（drop + 重建：Postgres 不能
+原地改生成表达式）。DB 在每次插入或更新时从线轴重算，不可能漂移：
 
 ```sql
-bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + trust    + intrigue) / 3))) STORED
-chemistry GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + intimacy + tension)  / 3))) STORED
+bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (trust    + intrigue) / 2))) STORED
+chemistry GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (intimacy + tension)  / 2))) STORED
 ```
 
-分档标签仅存在于核心读层；API 直接返回存储的合成值本身——不存在独立的显示值。
+不迁移任何轴数据：合成分在判官实际给过的分数上重定义。由此造成的存量行标签
+变动已在设计 spec 中测量并接受（中位两轮即可回位）。
 
-### 降低的默认种子
+### 端点档位
 
-新行的列默认值（同样在迁移 `0029` 中）被设置为使新会话的 bond ≈ chemistry ≈ 0.033——两条线均在第 1 档，遗留标签为 `stranger`。已有行不受影响。
+Migration `0048` 同时新增 `warmth_grade` / `patience_grade`（`SMALLINT NOT
+NULL DEFAULT 2`，范围检查 `1..=3`）——权威判官档位——并用档 2 的派生值回填
+`warmth`/`patience` 缓存列。新行默认把两个端点放在 ≈ `0.244`（陌生人开局
+耐心有限——刻意为之）。
 
-### 待提交余额（阈值门控）
+### Pending deltas（阈值门）
 
-迁移 `0043` 在 `engine.companion_affinity` 上新增 `pending_deltas JSONB`——阈值门控尚未放行的每轴余额。只由带档位的消息路径写入；`NULL`（所有 3.0 之前的旧行，以及从未被门控的行）等同于全零。
+`engine.companion_affinity` 上的 `pending_deltas JSONB` 存阈值门尚未放行的
+逐轴余额（4.0 起仅线轴；旧行里残留的 `warmth` 键被忽略并自然排空）。`NULL`
+读作全零。
 
 ### 事件行
 
-每个 delta 轮次向 `engine.companion_affinity_events` 追加一行：
+每个增量回合向 `engine.companion_affinity_events` 追加一行：
 
-- `deltas` —— 本轮的**原始分**：档位换算（含 demo boost）加规则微调，衰减前。
-- `effective_deltas` —— **实际应用**的每轴变化，`after − before`。它涵盖分档衰减、跨线惩罚、门控、patience 覆盖与夹钳；被门控缓存的轮次为全零。
-- `context` —— `affinity_reason`（评估器的 `reason`）、未跑评估时的 `eval_skip_reason`、判官的有符号 `grades` 原样，以及门控的 `pending_after` 余额。
+- `deltas` —— 本轮线轴的**原始分**（档位换算加规则微调，衰减前）；这里的
+  `warmth`/`patience` 恒为 `0.0`。
+- `effective_deltas` —— **实际应用**的逐轴变化，`after − before`。线轴上它
+  涵盖档位衰减、惩罚、门控与 clamp；端点上它*就是*本轮派生 delta。
+- `context` —— `affinity_reason`、未跑评估时的 `eval_skip_reason`、判官原样
+  的有符号 `grades`、门的 `pending_after`，以及 4.0 端点审计：
+  `warmth_grade`/`patience_grade`（仅本轮实际读到时）、
+  `boost_warmth`/`boost_patience`（当轮生效的 B 值）、`decay_factor`、
+  `units`（当轮生效的按线单位）。被收税的回合另有 `cross_penalty_assessed`。
 
-### 每轮标签变化
+### 逐回合标签变动
 
-迁移 `0029` 还在 `engine.companion_affinity_events` 上新增了 `label_changes JSONB` 列。每轮之后，引擎会对比 delta 前后的档位，范围限定在与 `effective_deltas` 相同的衰退窗口内：
+`engine.companion_affinity_events` 上的 `label_changes JSONB` 记录引擎权威的
+本轮档位迁移：
 
 ```
 label_changes = {
-  bond:      { from: "<档位键>", to: "<档位键>" }  // 若 bond 档位发生变化
-  chemistry: { from: "<档位键>", to: "<档位键>" }  // 若 chemistry 档位发生变化
+  bond:      { from: "<tier_key>", to: "<tier_key>" }  // bond 档位变化时
+  chemistry: { from: "<tier_key>", to: "<tier_key>" }  // chemistry 档位变化时
 }
-// 本轮无档位变化时为 NULL
+// 本轮无档位移动时为 NULL
 ```
 
-`from`/`to` 是档位键（如 `"acquaintance"`、`"friend"`）。遗留 `relationship_label` 的变化不包含在内，因为它可由快照推导。纯衰退导致的档位漂移不记录为离散事件；绝对快照始终可通过快照端点获取。
-
-## API 接口
+## API 表面
 
 ### `AffinitySnapshot`
 
-由 `GET /comp/affinity/{session_id}`（调试，受 `EXPOSE_AFFINITY_DEBUG` 控制）返回。快照包含：
+由 `GET /comp/affinity/{session_id}` 返回（debug，受 `EXPOSE_AFFINITY_DEBUG`
+门控）：
 
 ```json
 {
-  "warmth": 0.42,
+  "warmth": 0.52,
   "trust": 0.08,
   "intrigue": 0.12,
   "intimacy": 0.05,
-  "patience": 0.55,
+  "patience": 0.27,
   "tension": 0.04,
-  "bond": 0.21,
-  "chemistry": 0.17,
-  "bond_label": "friend",
-  "chemistry_label": "flirtation",
+  "bond": 0.10,
+  "chemistry": 0.045,
+  "bond_label": "acquaintance",
+  "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "friend",
-  "updated_at": "2026-06-30T12:00:00.000000Z"
+  "relationship_label": "stranger",
+  "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
 
-- `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线。
-- `bond_label` / `chemistry_label` —— 上述 10 个档位键之一。
+- `warmth` / `patience` —— 派生端点值（0–1，4.0 起无负值）。
+- `bond` / `chemistry` —— 真实存储的合成分（0–1），无显示曲线。
+- `bond_label` / `chemistry_label` —— 上表 10 个档位键之一。
 - `relationship_label` —— 遗留映射值（`stranger / friend / slow_burn / romantic`）。
 
 ### BFF `/bff/v1/comp/affinity/{session_id}/event`
 
-此接口返回每轮好感度 delta，不受 `EXPOSE_AFFINITY_DEBUG` 控制。除现有的 `effective_deltas`（每轴实际应用的变化，`after − before`）外，事件现还包含：
+该端点返回逐回合好感度增量，不受 `EXPOSE_AFFINITY_DEBUG` 门控。除
+`effective_deltas`（逐轴实际变化，`after − before`——`warmth`/`patience` 上
+即本轮派生 delta）外，事件还携带：
 
-```json
-{
-  "session_id": "…",
-  "event": {
-    "event_id": "…",
-    "event_type": "message",
-    "effective_deltas": {
-      "warmth": 0.06, "trust": 0.02, "intrigue": 0.0,
-      "intimacy": 0.0, "patience": 0.0, "tension": -0.02
-    },
-    "effective_deltas_computed": {
-      "bond": 0.027,
-      "chemistry": 0.013
-    },
-    "label_changes": {
-      "bond": { "from": "acquaintance", "to": "friend" }
-    },
-    "created_at": "…"
-  }
-}
-```
+- `effective_deltas_computed` —— 精确的本轮 bond/chemistry delta，持久化时
+  从前后分数计算并落在事件行上
+  （`companion_affinity_events.effective_line_deltas`）。旧行上为 `null`/缺省。
+- `label_changes` —— 引擎权威的本轮档位迁移；无档位移动时为 `null`（或缺省）。
 
-- `effective_deltas_computed` —— 本轮精确的 bond/chemistry 行增量，在持久化时从取下界前后的分数计算得出，存储于事件行（`companion_affinity_events.effective_line_deltas`）。取值单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮"+X bond / +Y chemistry"的脉冲显示。迁移前的旧行此字段为 `null` / 缺省。
-- `label_changes` —— 本轮引擎权威的档位变化；无档位变化时为 `null`（或缺省）。前端无需自行计算变化，直接消费此字段。
-
-两个字段同样镜像到调试接口 `GET /comp/affinity/{session_id}/event` 的条目上。
+两个字段同样镜像在 debug `GET /comp/affinity/{session_id}/event` 条目上。
 
 ## 源码
 
-- `crates/eros-engine-core/src/affinity.rs` —— 类型、`grade_turn` 写入管线、时间衰退、bond/chemistry 分数、分档、标签、diff_labels
-- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost），迁移 0029/0043
-- `crates/eros-engine-server/src/pipeline/post_process.rs` —— LLM 评估，档位解析
-- `crates/eros-engine-server/src/prompt.rs` —— 好感度 → 态度指令 + 评估 prompt
-- `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（合成分数 + 标签）
-- `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 事件接口
-- `crates/eros-engine-server/src/routes/debug.rs` —— 调试事件日志
+- `crates/eros-engine-core/src/affinity.rs` —— 类型、`grade_turn` 写入管线、端点派生、时间衰减、bond/chemistry 分数、档位、标签、diff_labels
+- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost）、migration 0048
+- `crates/eros-engine-server/src/pipeline/post_process.rs` —— LLM 评估、档位解析
+- `crates/eros-engine-server/src/prompt.rs` —— 好感度 → 态度指令 + 评估提示词
+- `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（合成分 + 标签）
+- `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 事件表面
+- `crates/eros-engine-server/src/routes/debug.rs` —— debug 事件日志
+- 设计 spec：`docs/superpowers/specs/2026-08-16-affinity-40-design.md`

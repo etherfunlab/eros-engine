@@ -38,7 +38,7 @@ This is not a generic agent framework. It is the stateful core for products wher
 │                                          │              │
 │  ┌───────────────────────────────────────┴────────┐     │
 │  │ post-process, spawned after reply              │     │
-│  │   • affinity: persist 6D graded turn           │     │
+│  │   • affinity: graded turn + derived endpoints           │     │
 │  │   • memory:   Voyage embed → pgvector upsert   │     │
 │  │   • insight:  extract facts → JSONB merge      │     │
 │  └────────────────────────────────────────────────┘     │

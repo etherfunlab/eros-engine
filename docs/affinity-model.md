@@ -3,34 +3,36 @@
 [English](affinity-model.md) · [中文](affinity-model.zh.md)
 
 Affinity is a six-dimensional vector that changes on every text-channel,
-non-`product_qa` chat turn and folds into two derived lines — **Bond**
-(friendship axis) and **Chemistry** (romance axis). Voice-channel and
-`product_qa` turns never write an affinity event. Each line has tiers and
-labels. The engine is the single source of truth for scores, labels, and
-per-turn label transitions.
+non-`product_qa` chat turn. Four **line axes** fold into two derived lines —
+**Bond** (friendship) and **Chemistry** (romance) — and the two **endpoint
+axes** (`warmth`, `patience`) are *derived quantities*: the judge reports a
+coarse absolute level, and the engine folds it into a continuous value using
+the counterpart line score. Voice-channel and `product_qa` turns never write
+an affinity event. Each line has tiers and labels. The engine is the single
+source of truth for scores, labels, and per-turn label transitions.
 
 ## The six base axes
 
-| Axis | Range | Default seed | What it shapes |
-|------|-------|--------------|----------------|
-| `warmth` | −1.0 ↔ 1.0 | `0.1` | Tone, address. Negative = guarded/hostile; positive = warm/affectionate. Shared into both Bond and Chemistry (floored at 0 when folding). |
+| Axis | Range | Default | What it shapes |
+|------|-------|---------|----------------|
+| `warmth` | 0.0 ↔ 1.0 | ≈ `0.244` (derived) | Tone, address. **Derived endpoint** (4.0): `warmth = max(base(level)·B(chemistry), φ·chemistry) × decay`. |
 | `trust` | 0.0 ↔ 1.0 | `0.0` | Topic depth, willingness to disclose self. Bond axis. |
 | `intrigue` | 0.0 ↔ 1.0 | `0.0` | Curiosity, follow-up questions, anti-ghost driver. Bond axis. |
 | `intimacy` | 0.0 ↔ 1.0 | `0.0` | Inside jokes, nicknames, callbacks to earlier details. Chemistry axis. |
-| `patience` | 0.0 ↔ 1.0 | `0.5` | Tolerance for short / low-effort messages; ghost-threshold input. When the LLM has an absolute read for the turn (0–1, 0.1 steps), it is combined with a rule delta and written directly; otherwise the rule delta alone applies 1:1 (see below). Always `[0,1]`-clamped. Excluded from both lines. |
+| `patience` | 0.0 ↔ 1.0 | ≈ `0.244` (derived) | Tolerance for short / low-effort messages; ghost-threshold input. **Derived endpoint** (4.0): `patience = max(base(level)·B(bond), φ·bond) × decay`. |
 | `tension` | 0.0 ↔ 1.0 | `0.0` | Push-pull, playful friction, tsundere affordance. Chemistry axis. |
 
-`warmth` is the only axis that can go negative. The other five are bounded to
-`[0, 1]`. All six axes are clamped on every update.
+All six axes are bounded to `[0, 1]` and clamped on every update. The
+authoritative facts per row are the four line axes, the two judge **levels**
+(`warmth_grade` / `patience_grade`, `1..=3`, migration `0048`), and
+`updated_at`; the stored `warmth`/`patience` values are a materialized cache
+of the derivation, refreshed wherever time decay runs.
 
-The **default seed** values above apply only to new rows (sessions that start
-after migration `0029`). Existing rows are unaffected.
-
-### Graded writes
+### Graded writes (line axes)
 
 The evaluator reports per-axis *grades* rather than numeric deltas; the engine
 converts them to scores, damps and gates them (see
-[Write pipeline](#write-pipeline-affinity-30)), and applies the committed
+[Write pipeline](#write-pipeline-affinity-40)), and applies the committed
 delta 1:1:
 
 ```
@@ -44,77 +46,104 @@ decay, applied before the write rather than to it. Sessions opened with
 
 ### Time decay
 
-Three axes drift with real time when there is no activity. Decay is computed
-lazily on each load from `updated_at`:
+Two line axes drift with real time when there is no activity. Decay is
+computed lazily on each load from `updated_at`:
 
 ```
 days_elapsed = (now − updated_at) / 1 day
 
 intrigue = clamp(intrigue − 0.01  × days_elapsed, 0.0, 1.0)
-patience = clamp(patience + 0.005 × days_elapsed, 0.0, 1.0)
 tension  = clamp(tension  − 0.005 × days_elapsed, 0.0, 1.0)
 ```
 
-`warmth`, `trust`, and `intimacy` do not decay — they are "deep" dimensions.
+`trust` and `intimacy` do not decay — they are "deep" dimensions. The old
+`patience` upward drift is retired: absence handling for the two endpoints is
+the multiplicative decay inside the derivation (below), which **cools** rather
+than heals.
 
-### Patience: LLM absolute read + rule delta
+## Derived endpoints (affinity 4.0)
 
-`patience` is not a graded axis. Each turn's `affinity_evaluation` call (the
-same LLM call that grades the other five axes — no new round-trip) also emits
-an **absolute** `patience` read (`0.0`–`1.0`, in `0.1` steps, representing
-how much patience remains for this user right now, not a change). The engine rounds
-the model's read to the nearest `0.1` and clamps to `[0, 1]` — call this `L`.
+`warmth` and `patience` are no longer accumulated state. Each judged turn the
+evaluator reports one absolute **level** per endpoint — `1` cold/impatient,
+`2` baseline (the overwhelmingly common verdict), `3` clearly warm/invested —
+and the engine derives the continuous value:
 
-The PDE still computes the reply/proactive-turn rule delta `R` as before
-(`predict_reply_deltas`: long user message `+0.02` / very short `−0.02` / stale gap
->24h `−0.05`) — unchanged.
+```
+base(level)  = (level − 1) / 3                          ∈ {0, 1/3, 2/3}
+B(x)         = 1 + λ·(x − 0.35)                         λ = (1.5−1)/(1−0.35) = 10/13
+decay(Δt)    = max(FLOOR, 1 − RATE·days)                Δt since updated_at
 
-The turn's target is `patience_target = clamp(L + R, 0, 1)`; the sum is **not**
-re-rounded to the `0.1` grid (the grid constrains the LLM read only, so `R` can nudge
-the result off-grid). On persist, the write pipeline runs first as usual —
-but `patience` passes through it untouched: its rule delta is never decayed,
-penalised, or threshold-gated, it applies 1:1 and clamps. Patience is then
-**overwritten directly** with `patience_target` (still `[0,1]`-clamped).
-Because both `L` and `R` are independent of the currently stored value, this
-write is race-safe with no read-modify-write needed.
+warmth   = clamp01( max(base(w_level)·B(chemistry), φ·chemistry) × decay )
+patience = clamp01( max(base(p_level)·B(bond),      φ·bond)      × decay )
+```
 
-**Fallback:** when there is no LLM patience read this turn — Proactive, a short user
-message, an empty assistant reply, `no_persona_or_affinity` (persona load fails or no
-affinity row exists), or the eval call erroring, timing out, or the model omitting the
-`patience` field — `patience_target` is `None` and the rule delta `R` alone is
-applied (1:1, clamped).
+The coupling direction is **amplification, not correlation**: deeper
+chemistry warms expression, deeper bond funds patience. Low bond × high
+chemistry natively produces the tsundere register (impatient but warm); high
+bond × low chemistry the old-friend register (patient but cool) — no prompt
+special-casing.
 
-**Ghost is a separate path, not a fallback.** A Ghost turn never reaches
-`persist_with_event` — `persist_affinity` dispatches it to `record_ghost` instead,
-which takes no grades or deltas, never runs the write pipeline, and only bumps
-`ghost_streak` / `total_ghosts` / `last_ghost_at` (it writes an all-zero
-`effective_deltas`). The PDE's `ghost_affinity_deltas()` (patience `−0.05`,
-tension `+0.05` — a function separate from `predict_reply_deltas`) is computed onto
-the `ActionPlan` but discarded at persist time. So on a Ghost turn `patience` does
-not move at all — only the ghost counters change.
+Every constant is anchored, not invented:
+
+- **Pivot `0.35` = tier-2 upper bound** (the same constant): the boost turns
+  positive the moment the counterpart line enters tier 3; below it the value
+  is damped under its base. `0.35`/`0.65` are also the band cuts used for the
+  judge's input and the patience bands.
+- **`B(1) = 1.5`** makes `⅔ × 1.5 = 1.0`: a full level times a full
+  counterpart line lands exactly at the ceiling.
+- **Floor `φ = 0.2`** (`AFFINITY_FLOOR_RATIO`): a level-1 verdict reads
+  `φ·counterpart` instead of an absolute zero — a deep relationship going
+  cold one turn keeps an ember (`0.18` at counterpart `0.9`), a stranger
+  reads ~0. Since `φ·x ≤ 0.2 < 0.244 = ⅓·B(0)`, the floor can only ever act
+  on level 1 — it never overrides a non-cold verdict.
+- **Decay** (`AFFINITY_TIME_DECAY_RATE` `0.02`/day,
+  `AFFINITY_TIME_DECAY_FLOOR` `0.5`): 7 days → ×0.86, 25+ days → ×0.5.
+  Absence cools but never zeroes — and an old relationship keeps a floor
+  through the boost (bond `0.9` at full decay still yields patience ≈ `0.48`).
+
+Reachable values at `decay = 1`: level 1 → `(0, 0.2]` (continuous in the
+counterpart), level 2 → `[0.244, 0.5]`, level 3 → `[0.487, 1.0]`. The level
+picks the band; the counterpart line picks the position inside it.
+
+**Per-turn deltas still exist.** `effective_deltas.warmth` / `.patience` are
+the derivation's `after − before` across the turn, measured against the
+post-decay snapshot — the absence gap is never attributed to the turn.
+
+**Skipped turns hold.** When the eval is skipped or fails
+(`eval_skip_reason`), the stored levels hold and the endpoints are simply
+re-derived with the current lines and decay. The old rule-delta fallback
+(`±0.02` message-length nudges, stale `−0.05`) is retired — the stale rule is
+absorbed by decay.
+
+**Ghost is a separate path.** A Ghost turn never reaches
+`persist_with_event` — it only bumps `ghost_streak` / `total_ghosts` /
+`last_ghost_at`. The PDE's ghost deltas touch `tension` only.
 
 ## The two derived lines
 
-The six axes produce two composite scores. `warm_pos` is `warmth.max(0.0)` —
-floored at zero, not shifted, so a neutral or cold session contributes nothing:
+The four line axes produce two composite scores. As of 4.0 the lines share
+nothing:
 
 ```
-bond      = (warm_pos + trust   + intrigue) / 3    ∈ [0, 1]
-chemistry = (warm_pos + intimacy + tension)  / 3    ∈ [0, 1]
+bond      = (trust    + intrigue) / 2    ∈ [0, 1]
+chemistry = (intimacy + tension)  / 2    ∈ [0, 1]
 ```
 
-`warmth` feeds both lines: cold replies reduce both Bond and Chemistry.
-`patience` is excluded from both — it is maintained by an LLM absolute read + rule
-delta and written directly; both lines still omit patience (by design).
+`bond` is friendship — trust plus continued interest. `chemistry` is romance —
+closeness plus charge. The endpoints are excluded from both lines by
+construction (they are the lines' *outputs*).
 
-With the default seed (`warmth 0.1`, `trust/intrigue/tension 0`), a fresh
-session starts at bond ≈ chemistry ≈ 0.033 — both in tier 1 (stranger).
+With the default seed (all line axes `0`), a fresh session starts at
+bond = chemistry = 0 — both in tier 1 (stranger) — and both endpoints at the
+level-2 damped base ≈ `0.244`.
 
 > **Naming note:** `AffinityScope::bond()/chemistry()` (used for
 > prompt-injection scoping, `length_score`) use a *different* axis grouping —
-> that is an older, separate split that is intentionally left alone to avoid
-> reply-length regressions. The `bond_score`/`chemistry_score` derived here are
-> independent.
+> that is the 1.0-era split, intentionally left alone to avoid reply-length
+> regressions. Structurally it grouped `warmth` with `intimacy`/`tension` and
+> `patience` with `trust`/`intrigue` — the same families 4.0's coupling makes
+> explicit — but its two *names* are crossed relative to the 2.0+ lines,
+> which is one reason the scope must never steer the derivation.
 
 ## Tiers
 
@@ -130,14 +159,11 @@ until a narrow apex tier 5:
 | 5 | `[0.90, 1.00]` | 0.10 |
 
 The API reports each line's score as-is: `AffinitySnapshot.bond` /
-`.chemistry` are the real stored composites, 0..1, with no display curve
-(affinity 3.0 deleted the old tier-band bar projection). The easy-early /
-grind-at-the-top pacing the projection used to fake at render time is now
-real: the write-side tier decay (see
-[Write pipeline](#write-pipeline-affinity-30)) damps positive gains by the
-line's own tier, so higher tiers genuinely take more turns to cross. A
-frontend that wants a per-tier progress bar derives it from the score and the
-tier bounds above.
+`.chemistry` are the real stored composites, 0..1, with no display curve.
+The easy-early / grind-at-the-top pacing is real: the write-side tier decay
+damps positive gains by the line's own tier, so higher tiers genuinely take
+more turns to cross. A frontend that wants a per-tier progress bar derives it
+from the score and the tier bounds above.
 
 All tier thresholds are tunable constants.
 
@@ -158,8 +184,7 @@ the legacy field (see below).
 ## Legacy `relationship_label`
 
 The legacy field keeps its old name set for backward compatibility with
-existing consumers. It is now a pure function of the two raw scores (replacing
-the old ad-hoc `infer_label` heuristic):
+existing consumers. It is a pure function of the two raw scores:
 
 ```
 legacy_relationship_label(bond, chemistry):
@@ -172,275 +197,234 @@ legacy_relationship_label(bond, chemistry):
 ```
 
 `frenemy` is retired from emission but remains parseable in the enum for
-historical rows. `stranger` is now the explicit "both tier 1" case — it no
-longer requires all five old threshold conditions to miss.
+historical rows.
 
-## Evaluator protocol: grades, not numbers
+## Evaluator protocol: fully ordinal
 
-**Grades (affinity 3.0).** The evaluator never outputs numeric deltas. For
-each of the five graded axes (`warmth` / `trust` / `intrigue` / `intimacy` /
-`tension`) it reports an integer **grade** `0`–`4` plus a **direction**:
+**The judge never outputs a continuous number anywhere.** For each of the
+four line axes (`trust` / `intrigue` / `intimacy` / `tension`) it reports an
+integer **grade** `0`–`4` plus a **direction**; for each endpoint it reports
+an absolute **level** `1`–`3`:
 
 ```json
 {
-  "warmth":   {"grade": 0, "direction": "up"},
+  "warmth":   2,
   "trust":    {"grade": 1, "direction": "up"},
   "intrigue": {"grade": 0, "direction": "up"},
   "intimacy": {"grade": 0, "direction": "up"},
   "tension":  {"grade": 2, "direction": "down"},
-  "patience": 0.5,
+  "patience": 2,
   "reason": "…"
 }
 ```
 
 - **Grade rubric:** `0` = nothing happened (chitchat, acknowledgements — the
   overwhelmingly common verdict); `1` = a small but real movement; `2` = a
-  clear push or a clear hurt; `3` = a rare significant moment (genuine
-  self-disclosure, vulnerability, flirtation that lands; an overt offense or
-  being ignored); `4` = a milestone — the turn that redefines the
-  relationship (extremely rare).
-- **Direction** is `"up"` / `"down"`; negative moments (coldness,
-  perfunctory/repetitive replies, boredom, boundary-crossing, conflict, being
-  ignored) are prompted to fire readily.
-- `patience` stays an absolute 0–1 read in 0.1 steps (see above), not a grade.
+  clear push or a clear hurt; `3` = a rare significant moment; `4` = a
+  milestone (extremely rare).
+- **Direction** is `"up"` / `"down"`; negative moments are prompted to fire
+  readily.
+- **Level rubric:** `1` = cold / impatient (visibly frosty, dismissive,
+  offended); `2` = baseline — the overwhelmingly common verdict; `3` =
+  clearly warm / invested. The level is a *state read for this turn*, not a
+  delta.
 
-The engine folds `{grade, direction}` into a signed integer `−4..+4`. Models
-are reliable ordinal raters and unreliable calibrated arithmetic — so the
-judge picks buckets and the engine owns every number.
+Models are reliable ordinal raters and unreliable calibrated arithmetic — so
+the judge picks buckets and the engine owns every number. The continuous
+`warmth`/`patience` distribution users see is folded out of the discrete
+levels by the derivation above; 4.0 removed the one remaining continuous
+output (the old 0.1-step patience read, which ceiling-packed in production).
 
-**Malformed verdicts reject wholesale.** Unparseable JSON, or any malformed
-axis — a non-integer or out-of-range grade, an unknown direction — rejects
-the whole verdict in `parse_affinity_eval`: all-zero grades, no patience
-read, empty reason. The turn's rule deltas still persist, so an evaluator
-failure never loses the affinity event. (An omitted axis or `null` grade is
-not malformed — it reads as grade 0; a quoted integer like `"grade": "2"` is
+**Malformed verdicts reject wholesale.** Unparseable JSON, any malformed
+axis — a non-integer or out-of-range grade, an unknown direction — or any
+malformed level rejects the whole verdict in `parse_affinity_eval`: all-zero
+grades, no level reads, empty reason. The turn's rule deltas still persist,
+so an evaluator failure never loses the affinity event. (An omitted axis or
+`null` grade reads as grade 0; an omitted or `null` level reads as "hold the
+stored level"; quoted integers like `"grade": "2"` or `"warmth": "3"` are
 salvaged.)
 
-**Single-turn envelope.** With default tuning, grade `+4` converts to `+0.20`
-and grade `−4` to `−0.30` per axis. The asymmetry — a bad turn costs more than
-a good turn gains — is `AFFINITY_NEG_FACTOR`.
-
-**Banded input.** The per-turn payload shows the evaluator its six current
-axis reads as coarse bands (冷/低/中/高, cut at 0.35 / 0.65 like the patience
-bands; 冷 = negative warmth), never raw floats — the judge that reports
-buckets is not shown the numbers, which would re-anchor it on the arithmetic
-the graded protocol removed.
+**Banded input, endpoints excluded.** The per-turn payload shows the
+evaluator the four current *line-axis* reads as coarse bands (低/中/高, cut at
+0.35 / 0.65), never raw floats. The current `warmth`/`patience` values are
+deliberately **not** injected: an absolute level read is valuable precisely
+because it is stateless — showing the previous value would anchor the judge
+and reproduce the inflation the redesign removes.
 
 **Register and `reason` hygiene.** The evaluator prompt is written in the
-character's own first-person voice ("you are this character; how did this turn
-change how you feel about him?"), not as a third-person analytical judge, and
-is sent as a static `system` instruction plus a per-turn `user` payload. Its
-`reason` rules forbid system vocabulary (AI/assistant/model, refusal, policy)
-and forbid endorsing a canned refusal that reached the reply. This is
-load-bearing: `reason` is persisted to `companion_affinity_events.context` and
-re-injected into later system prompts as `[emotional_context]`, so an
-evaluator that rationalises a refusal writes that stance into persona state.
-The prompt is engine-owned and deliberately not configurable — see
+character's own first-person voice, not as a third-person analytical judge,
+and is sent as a static `system` instruction plus a per-turn `user` payload.
+Its `reason` rules forbid system vocabulary (AI/assistant/model, refusal,
+policy) and forbid endorsing a canned refusal that reached the reply. This is
+load-bearing: `reason` is persisted to `companion_affinity_events.context`
+and re-injected into later system prompts as `[emotional_context]`. The
+prompt is engine-owned and deliberately not configurable — see
 `docs/superpowers/specs/2026-08-02-affinity-eval-hygiene-design.md`.
 
-## Write pipeline (affinity 3.0)
+## Write pipeline (affinity 4.0)
 
 The judge reports grades; the engine owns every number. Each verdict runs
 through four engine-side stages (`grade_turn` in
 `eros-engine-core/src/affinity.rs`), computed against the pre-turn snapshot
-and applied under the affinity row lock:
+and applied under the affinity row lock. The endpoints never enter this
+pipeline.
 
 ```
 grade → raw score → tier decay → cross-line penalty → threshold gate → clamp
+                                                    → endpoint derivation
 ```
 
-**1. Conversion.** A signed grade `g` converts to a raw score `r`:
+**1. Conversion, per line.** A signed grade `g` converts at its line's unit:
 
 ```
-r = g × AFFINITY_GRADE_UNIT                        (positive; × AFFINITY_DEMO_BOOST on demo sessions)
-r = g × AFFINITY_GRADE_UNIT × AFFINITY_NEG_FACTOR  (negative)
+r = g × u_line                        (positive; × AFFINITY_DEMO_BOOST on demo sessions)
+r = g × u_line × AFFINITY_NEG_FACTOR  (negative)
+
+u_line = AFFINITY_GRADE_UNIT_BOND  (trust / intrigue,   default 0.0786)
+       | AFFINITY_GRADE_UNIT_CHEM  (intimacy / tension, default 0.0266)
 ```
 
-Defaults `0.05` / `1.5`: grade `+4` = `+0.20`, grade `−4` = `−0.30` — the 2.0
-envelope. The PDE's rule nudges (e.g. intrigue `+0.02` on a long user
+The ~3× spread between the two units is the judge's measured grading
+asymmetry (tension reaches grade ≥2 on roughly half of turns while trust is
+graded 0 on ~80%), written down where it can be argued with instead of hidden
+in a grade remap. The PDE's rule nudges (e.g. intrigue `+0.02` on a long user
 message) join the raw score pre-decay.
 
 **2. Tier decay (positive only).** Positive raw is multiplied by the own
 line's tier factor, `AFFINITY_TIER_DECAY` (default `1.0, 0.70, 0.45, 0.25,
 0.10` for tiers 1–5). `trust`/`intrigue` read Bond's tier;
-`intimacy`/`tension` read Chemistry's; `warmth` (shared into both lines)
-reads the further line's tier (max of both). Negative raw is **never**
-decayed — losses stay full price at any tier. This is where the easy-early /
-grind-at-the-top pacing lives now that the read-side bar projection is gone.
+`intimacy`/`tension` read Chemistry's. Negative raw is **never** decayed —
+losses stay full price at any tier.
 
-**3. Cross-line penalty.** On an axis exclusive to one line, the *other* line's
-height taxes the move — **in proportion to the grade actually applied**:
-
-```
-penalty = κ × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
-  y  = the OTHER line's score
-  g  = the applied grade (after any 3.1 scope steering)
-  κ  = AFFINITY_CROSS_PENALTY        (default 0.05)
-  y₀ = AFFINITY_CROSS_PENALTY_START  (default 0.35)
-```
-
-High Bond makes Chemistry harder to grow and vice versa. `warmth` is exempt
-(it feeds both lines), and a grade of `0` charges nothing — rule-only turns and
-grades the 3.1 ladder filtered both land there. The pipeline charges events,
-not rent.
-
-The `|g|/4` factor is what stops the outcome depending on how big the verdict
-was. Ignoring rule nudges, the term factorises:
+**3. Cross-line penalty.** The *other* line's height taxes the move — in
+proportion to the grade actually applied, with the ceiling defined as a
+multiple of the line's own unit:
 
 ```
-g > 0:  ρ = g × (D_k·u − κ·φ(y)/4)
-g < 0:  ρ = g × (u·λ⁻ + κ·φ(y)/4)      (the negative part is never decayed)
+penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
+  y      = the OTHER line's score
+  κ_line = AFFINITY_CROSS_PENALTY_RATIO × u_line   (ratio default 5/6)
+  y₀     = AFFINITY_CROSS_PENALTY_START            (default 0.35)
 ```
 
-Neither bracket contains `g`, so **the outcome cannot change sign between grades
-at a fixed position** — the grade sets the size, not the direction. That is the
-flat toll's failure mode removed: it made the sign flip somewhere between g1 and
-g4, so an honest small push lost ground while a bigger one gained it. The
-negative bracket is always positive, so a negative verdict always lowers the
-axis.
+High Bond makes Chemistry harder to grow and vice versa; a grade of `0`
+charges nothing — the pipeline charges events, not rent. Ignoring rule
+nudges, the term factorises:
 
-This is **not** a promise that every positive verdict is a gain. Whether the
-positive bracket is positive is a property of the *position*, with break-even at
-`φ(y*) = 4·D_k·u/κ` — see below.
+```
+g > 0:  ρ = g·u · (D_k − ratio·φ(y)/4)
+g < 0:  ρ = g·u · (λ⁻ + ratio·φ(y)/4)      (the negative part is never decayed)
+```
 
-At defaults that break-even exceeds 1 for tiers 1–4, so those tiers cannot be
-out-taxed at any grade. Only own tier 5 has a real one, at a counterpart of
-≈`0.761` — past it *every* grade nets negative, uniformly. "You cannot be both a
-confidant and a lover" still holds at the apex; it stopped firing on ordinary
-mid-relationship turns.
+Neither bracket contains `g` **or `u`**: the outcome cannot change sign
+between grades at a fixed position, and the break-even position
+`φ(y*) = 4·D_k/ratio` is identical for both lines regardless of their units —
+tying κ to the unit is what keeps per-line units from silently moving the
+double-high wall. At defaults only own tier 5 has a real break-even
+(counterpart ≈ `0.761`); past it every grade nets negative, uniformly.
 
-Rule nudges sit outside this factorisation: they join the raw score before decay
-but are not part of the penalty's grade, so a large enough opposing nudge could
-in principle invert the sign. None can today — the only rule deltas that reach a
-graded axis are `intrigue +0.02` and `tension +0.03`, both positive.
-
-**4. Threshold gate.** Each axis keeps a signed accumulator. The turn's real
-score joins it, and the whole balance commits only once
+**4. Threshold gate.** Each line axis keeps a signed accumulator. The turn's
+real score joins it, and the whole balance commits only once
 `|accumulated| ≥ AFFINITY_DELTA_THRESHOLD` (default `0` = commit every turn);
-below the threshold it buffers in `companion_affinity.pending_deltas` (JSONB,
-migration `0043`) and the axis does not move this turn.
+below the threshold it buffers in `companion_affinity.pending_deltas`.
 
-Committed deltas then apply 1:1 and clamp to each axis's range (`[-1,1]` for
-`warmth`, `[0,1]` for the rest). `patience` bypasses all four stages — its
-rule delta passes through untouched and the absolute overwrite happens after
-(see above).
+Committed deltas then apply 1:1 and clamp to `[0,1]`. Afterwards the judge's
+levels (when read this turn) overwrite the stored levels, and both endpoints
+are re-derived from the post-turn lines.
 
 ### Tuning knobs
 
-Server-side env vars, each falling back per-knob to a default; the defaults
-reproduce the 2.0 effective single-turn envelope:
+Server-side env vars, each falling back per-knob to a default:
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `AFFINITY_GRADE_UNIT` | `0.05` | Raw score per grade step |
+| `AFFINITY_GRADE_UNIT_BOND` | `0.0786` | Raw score per grade step, trust/intrigue |
+| `AFFINITY_GRADE_UNIT_CHEM` | `0.0266` | Raw score per grade step, intimacy/tension |
 | `AFFINITY_NEG_FACTOR` | `1.5` | Extra multiplier on negative raw — keeps "slow up, fast down" |
-| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | Positive-delta damping per tier 1–5 (comma-separated; anything but exactly 5 finite non-negative values keeps the whole default table — factors above 1 amplify and are allowed) |
-| `AFFINITY_CROSS_PENALTY` | `0.05` | Cross-line penalty ceiling κ |
+| `AFFINITY_TIER_DECAY` | `1.0,0.70,0.45,0.25,0.10` | Positive-delta damping per tier 1–5 (comma-separated; anything but exactly 5 finite non-negative values keeps the whole default table) |
+| `AFFINITY_CROSS_PENALTY_RATIO` | `0.8333` | κ_line = ratio × u_line — the break-even stays unit-invariant |
 | `AFFINITY_CROSS_PENALTY_START` | `0.35` | Counterpart score where the penalty ramp starts (y₀) |
 | `AFFINITY_DELTA_THRESHOLD` | `0.0` | Commit threshold θ; `0` commits every turn |
-| `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw (rule nudges unaffected) for `metadata.is_demo` sessions |
-| `AFFINITY_SCOPE_BOND_BOOST` | `1.5` | Constant on positive raw for bond-exclusive axes under a bond-half-only scope (see below); `1.0` disables |
-| `AFFINITY_SCOPE_CHEM_LADDER` | `0,0,1,3,4` | Grade ladder for chemistry-exclusive axes under a chemistry-touching scope, indexed by positive grade 0–4 (comma-separated; exactly 5 values in `0..=4` with slot 0 at `0`, else the whole default table stands); `0,1,2,3,4` disables |
+| `AFFINITY_DEMO_BOOST` | `1.4` | Multiplier on the judge's positive raw for `metadata.is_demo` sessions |
+| `AFFINITY_FLOOR_RATIO` | `0.2` | Endpoint floor φ; domain-capped at `0.24` so it can never override a non-cold verdict |
+| `AFFINITY_TIME_DECAY_RATE` | `0.02` | Endpoint absence decay per day |
+| `AFFINITY_TIME_DECAY_FLOOR` | `0.5` | Endpoint absence decay floor |
 
 Every scalar is domain-checked at boot — non-finite or out-of-domain values
-(negative unit/factor/penalty/threshold/boost, a penalty start outside
-`[0, 1)`) keep the default and log a warning, so an env typo degrades to
-defaults instead of reaching the pipeline.
+keep the default and log a warning, so an env typo degrades to defaults
+instead of reaching the pipeline.
 
-## Scope steering (affinity 3.1)
+The endpoint anchors — the `0.35` pivot (= tier-2 upper bound) and
+`B_MAX = 1.5` — are **code constants**, not knobs: they are structural
+commitments (the exact-ceiling property `⅔ × 1.5 = 1`), and env-tuning them
+could break invariants the derivation relies on.
 
-The request's [`affinity_scope`](api-reference.md#post-compchatsession_idmessagestream)
-does two jobs. Besides selecting which axes reach the prompt, it selects how
-the turn's grades convert — the same disposition that decides what a companion
-is *told* about the relationship also decides what the relationship *earns*.
+## Scope steering: retired
 
-The field is borrowed for the bond/chemistry mental model its named values
-carry, not for the axis triads behind them. `ScopeMode` is total over the six
-bools, so an axes array steers as predictably as a named value:
-
-| Resolved scope | Mode | Effect |
-|---|---|---|
-| empty (`none`) | `neutral` | 3.0 verbatim |
-| any chemistry-half axis — `chemistry`, `full`, mixed arrays | `suppress_chemistry` | `intimacy` / `tension` positive grades pass through `AFFINITY_SCOPE_CHEM_LADDER` |
-| everything else — `bond`, bond-half arrays | `boost_bond` | `trust` / `intrigue` positive raw × `AFFINITY_SCOPE_BOND_BOOST` |
-
-Three properties hold by construction:
-
-- **Shared `warmth` is exempt from both directions.** It feeds both composites,
-  so scaling it would leak the correction onto the other line — the same reason
-  the cross-line penalty exempts it. Only line-exclusive axes are steered.
-- **Losses are never steered.** Negative raw keeps paying `AFFINITY_NEG_FACTOR`
-  and nothing else: the correction raises the bar, it does not soften damage.
-- **A laddered-out grade charges no cross-line penalty.** The ladder runs
-  *before* the pipeline, so a grade mapped to `0` reads as "the judge did not
-  touch this axis" and the penalty (charged only on touched axes) never fires.
-  This is why the default ladder introduces no break-even case 3.0 did not
-  already have: its `g3`/`g4` rows are identical to the unsteered ones, and
-  `g2` lands exactly on the unsteered `g1` row.
-
-The default ladder `0,0,1,3,4` filters `g1`, halves `g2` and leaves milestones
-untouched — "small talk stops counting as romance, a real moment still does."
-
-**Audit.** `companion_affinity_events.context` records `scope_mode` on every
-turn, and `effective_grades` whenever the ladder changed something. `grades`
-stays the judge's verdict verbatim, so a committed `0` remains attributable:
-the judge said nothing, or the ladder filtered it. Without the pair, watching
-evaluator drift across model swaps would read the engine's own corrections as
-model movement. `cross_penalty_assessed` joins them whenever a turn was taxed at
-all — with the penalty scaling by grade, the amount is no longer recoverable from
-the grades and the stored scores alone. *Assessed*, not applied: it is
-subtracted before the threshold gate, so on a gated turn it rides in
-`pending_after` rather than reaching the axis.
+Affinity 3.1's write-side scope steering (`ScopeMode`, the bond boost and the
+chemistry grade ladder) is retired in 4.0. `affinity_scope` is read-side only
+again — it gates prompt injection and `length_score`, and touches nothing on
+the write path. The endpoint derivation must never read the scope either:
+B(x) already transmits every line change (including any pace steering) to the
+endpoints, so a derivation layer that also read the scope would land the same
+request on the same endpoint twice; and the scope's 1.0-era names are crossed
+relative to the 2.0+ lines. `companion_affinity_events.context` stops
+carrying `scope_mode` / `effective_grades` — the absence of
+`effective_grades` on new rows is the retirement's cleanest verification.
 
 ## Persistence
 
 ### Generated columns
 
-Migration `0029` adds `bond` and `chemistry` as Postgres `GENERATED ALWAYS …
-STORED` columns on `engine.companion_affinity`. The DB recomputes them from the
-six axes on every row insert or update, so they cannot drift. Existing rows
-auto-populate at migration time (no backfill, no engine write code):
+Migration `0048` redefines `bond` and `chemistry` as Postgres `GENERATED
+ALWAYS … STORED` columns on `engine.companion_affinity` (drop + re-add:
+Postgres cannot alter a generation expression in place). The DB recomputes
+them from the line axes on every row insert or update, so they cannot drift:
 
 ```sql
-bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + trust    + intrigue) / 3))) STORED
-chemistry GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (GREATEST(warmth,0) + intimacy + tension)  / 3))) STORED
+bond      GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (trust    + intrigue) / 2))) STORED
+chemistry GENERATED ALWAYS AS (LEAST(1, GREATEST(0, (intimacy + tension)  / 2))) STORED
 ```
 
-Tier labels live only in the core read layer; the API returns the stored
-composite itself — there is no separate display value.
+No axis data is migrated: the composites are redefined over what the judge
+actually granted. The label churn this causes on live rows was measured and
+accepted in the design spec (median two turns to undo).
 
-### Lowered default seed
+### Endpoint levels
 
-The new-row column defaults (also migration `0029`) are set so a fresh session
-starts at bond ≈ chemistry ≈ 0.033 — tier 1 on both lines, legacy `stranger`.
-Existing rows are unaffected.
+Migration `0048` also adds `warmth_grade` / `patience_grade` (`SMALLINT NOT
+NULL DEFAULT 2`, range-checked `1..=3`) — the authoritative judge levels —
+and backfills the `warmth`/`patience` cache columns with the level-2
+derivation over each row's lines. New-row defaults put both endpoints at
+≈ `0.244` (a stranger starts with limited patience — deliberate).
 
 ### Pending deltas (threshold gate)
 
-Migration `0043` adds `pending_deltas JSONB` on `engine.companion_affinity` —
-the per-axis balance the threshold gate is still holding back. Written by the
-graded message path only; `NULL` (every pre-3.0 row, and rows never gated)
+`pending_deltas JSONB` on `engine.companion_affinity` holds the per-axis
+balance the threshold gate is still holding back (line axes only as of 4.0; a
+stale `warmth` key from older rows is ignored and drains naturally). `NULL`
 reads as all-zero.
 
 ### Event rows
 
 Each delta turn appends one row to `engine.companion_affinity_events`:
 
-- `deltas` — the turn's **raw scores**: grade conversion (demo boost
-  included) plus rule nudges, pre-decay.
-- `effective_deltas` — the **applied** per-axis change, `after − before`. It
-  captures tier decay, the cross-line penalty, gating, the patience
-  overwrite, and clamping; all-zero on a turn the gate buffered.
-- `context` — `affinity_reason` (the evaluator's `reason`),
-  `eval_skip_reason` when no eval ran, the judge's verbatim signed `grades`,
-  and the gate's `pending_after` balance.
+- `deltas` — the turn's **raw scores** on the line axes (grade conversion
+  plus rule nudges, pre-decay); `warmth`/`patience` are always `0.0` here.
+- `effective_deltas` — the **applied** per-axis change, `after − before`.
+  For the line axes it captures tier decay, the penalty, gating, and
+  clamping; for the endpoints it *is* the per-turn derivation delta.
+- `context` — `affinity_reason`, `eval_skip_reason` when no eval ran, the
+  judge's verbatim signed `grades`, the gate's `pending_after`, and the 4.0
+  endpoint audit: `warmth_grade`/`patience_grade` (only when read this turn),
+  `boost_warmth`/`boost_patience` (the B values in force), `decay_factor`,
+  and `units` (the per-line units in force). `cross_penalty_assessed` joins
+  them whenever a turn was taxed.
 
 ### Per-turn label changes
 
-Migration `0029` also adds `label_changes JSONB` on
-`engine.companion_affinity_events`. After each turn, the engine compares tiers
-before and after the delta, scoped to the same decay window as
-`effective_deltas`:
+`label_changes JSONB` on `engine.companion_affinity_events` records the
+engine-authoritative tier transition for the turn:
 
 ```
 label_changes = {
@@ -449,11 +433,6 @@ label_changes = {
 }
 // NULL when neither tier moved this turn
 ```
-
-`from`/`to` are tier keys (e.g. `"acquaintance"`, `"friend"`). The legacy
-`relationship_label` transition is omitted because it is derivable. Decay-only
-tier drift is not recorded as a discrete event; the absolute snapshot remains
-available.
 
 ## API surfaces
 
@@ -464,23 +443,25 @@ Returned by `GET /comp/affinity/{session_id}` (debug, gated by
 
 ```json
 {
-  "warmth": 0.42,
+  "warmth": 0.52,
   "trust": 0.08,
   "intrigue": 0.12,
   "intimacy": 0.05,
-  "patience": 0.55,
+  "patience": 0.27,
   "tension": 0.04,
-  "bond": 0.21,
-  "chemistry": 0.17,
-  "bond_label": "friend",
-  "chemistry_label": "flirtation",
+  "bond": 0.10,
+  "chemistry": 0.045,
+  "bond_label": "acquaintance",
+  "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "friend",
-  "updated_at": "2026-06-30T12:00:00.000000Z"
+  "relationship_label": "stranger",
+  "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
 
+- `warmth` / `patience` — the derived endpoint values (0–1, no negatives as
+  of 4.0).
 - `bond` / `chemistry` — the real stored composite scores (0–1); no display
   curve is applied.
 - `bond_label` / `chemistry_label` — one of the 10 tier keys above.
@@ -489,8 +470,9 @@ Returned by `GET /comp/affinity/{session_id}` (debug, gated by
 ### BFF `/bff/v1/comp/affinity/{session_id}/event`
 
 This endpoint returns the per-turn affinity delta and is not gated by
-`EXPOSE_AFFINITY_DEBUG`. In addition to the existing `effective_deltas`
-(per-axis applied change, `after − before`), the event now carries:
+`EXPOSE_AFFINITY_DEBUG`. In addition to `effective_deltas` (per-axis applied
+change, `after − before` — for `warmth`/`patience` this is the per-turn
+derivation delta), the event carries:
 
 ```json
 {
@@ -500,11 +482,11 @@ This endpoint returns the per-turn affinity delta and is not gated by
     "event_type": "message",
     "effective_deltas": {
       "warmth": 0.06, "trust": 0.02, "intrigue": 0.0,
-      "intimacy": 0.0, "patience": 0.0, "tension": -0.02
+      "intimacy": 0.0, "patience": 0.01, "tension": -0.02
     },
     "effective_deltas_computed": {
-      "bond": 0.027,
-      "chemistry": 0.013
+      "bond": 0.01,
+      "chemistry": -0.01
     },
     "label_changes": {
       "bond": { "from": "acquaintance", "to": "friend" }
@@ -515,24 +497,22 @@ This endpoint returns the per-turn affinity delta and is not gated by
 ```
 
 - `effective_deltas_computed` — the exact per-turn bond/chemistry delta,
-  computed at persist time from the floored before/after scores and stored on
-  the event row (`companion_affinity_events.effective_line_deltas`). Values
-  are composite-score units — the same 0..1 scale as the snapshot's
-  `bond`/`chemistry` — suitable for a per-turn "+X bond / +Y chemistry"
-  pulse. `null` / absent on pre-migration rows.
-- `label_changes` — engine-authoritative tier transition for this turn; `null`
-  (or absent) when no tier moved. The frontend stops computing transitions
-  itself.
+  computed at persist time from the before/after scores and stored on the
+  event row (`companion_affinity_events.effective_line_deltas`). `null` /
+  absent on pre-migration rows.
+- `label_changes` — engine-authoritative tier transition for this turn;
+  `null` (or absent) when no tier moved.
 
 Both fields are also mirrored on debug
 `GET /comp/affinity/{session_id}/event` entries.
 
 ## Source
 
-- `crates/eros-engine-core/src/affinity.rs` — types, `grade_turn` write pipeline, time decay, bond/chemistry scores, tiers, labels, diff_labels
-- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo` (persist_with_event, record_ghost), migrations 0029/0043
-- `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM evaluation, grade parsing
+- `crates/eros-engine-core/src/affinity.rs` — types, `grade_turn` write pipeline, endpoint derivation, time decay, bond/chemistry scores, tiers, labels, diff_labels
+- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo` (persist_with_event, record_ghost), migration 0048
+- `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM evaluation, grade/level parsing
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude directive + eval prompt
 - `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot` (composite scores + labels)
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF event surface
 - `crates/eros-engine-server/src/routes/debug.rs` — debug event log
+- Design spec: `docs/superpowers/specs/2026-08-16-affinity-40-design.md`

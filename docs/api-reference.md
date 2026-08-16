@@ -208,15 +208,10 @@ into the prompt. Accepted values:
 > `affinity_scope` is **not** equivalent to the old behavior. Use
 > `"bond_and_chemistry"` or `"full"` explicitly if you need all axes.
 
-> **Since 1.2.1 — this field also steers scoring.** Besides choosing what is
-> injected, `affinity_scope` selects how the turn's judge grades convert into
-> score deltas: a scope naming only the bond half boosts the bond-exclusive
-> axes, and any scope touching the chemistry half (including `full`) puts the
-> chemistry-exclusive axes through a grade ladder. `none` steers nothing.
-> Shared `warmth` is exempt either way. Deployments that want injection
-> scoping without scoring effects set `AFFINITY_SCOPE_BOND_BOOST=1.0` and
-> `AFFINITY_SCOPE_CHEM_LADDER=0,1,2,3,4`. See
-> [Affinity model → Scope steering](affinity-model.md#scope-steering-affinity-31).
+> **Since 1.3.0 the field is injection-only again.** The 3.1 write-side
+> steering (1.2.1) is retired: `affinity_scope` gates prompt injection and
+> `length_score` and has no effect on scoring. See
+> [Affinity model → Scope steering: retired](affinity-model.md#scope-steering-retired).
 
 Example using both fields:
 

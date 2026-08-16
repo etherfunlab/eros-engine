@@ -636,11 +636,11 @@ max_tokens  = 400
 #只根据资料作答；资料没有的信息明确说不知道，不编造。语气友好简洁，不扮演角色。
 #"""
 
-# Per-turn six-axis affinity evaluation (post-process, semantic axes).
-# Grades how a single chat turn moved warmth/trust/intrigue/intimacy/tension —
-# an integer bucket 0~4 plus a direction per axis, converted to scores by the
-# engine (affinity 3.0) — plus an absolute patience read. Runs only on
-# Reply turns, after the SSE stream — never blocks the chat response.
+# Per-turn affinity evaluation (post-process, semantic axes).
+# Grades how a single chat turn moved trust/intrigue/intimacy/tension — an
+# integer bucket 0~4 plus a direction per axis — and reads warmth/patience as
+# absolute 1..3 levels; the engine owns every conversion (affinity 4.0). Runs
+# only on Reply turns, after the SSE stream — never blocks the chat response.
 # claude-haiku-4.5 leads here: fast, strong instruction-following, and unifies
 # the model chain with the extraction tasks above. deepseek-v4-flash +
 # gemini-3.1-flash-lite fallback keep it alive if Anthropic is down.
