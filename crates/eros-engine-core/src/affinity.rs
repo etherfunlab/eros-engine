@@ -139,6 +139,56 @@ const _: () = assert!(
 const PATIENCE_LO: f64 = 0.35;
 const PATIENCE_HI: f64 = 0.65;
 
+// ─── Endpoint derivation (affinity 4.0) ─────────────────────────────
+//
+// warmth and patience are no longer accumulated state: the judge reports a
+// coarse absolute level (1 cold / 2 baseline / 3 warm) and the engine folds it
+// into a continuous value using the counterpart LINE score — chemistry warms
+// warmth, bond funds patience. Amplification, not correlation.
+// Design spec: docs/superpowers/specs/2026-08-16-affinity-40-design.md
+
+/// Boost at a counterpart score of 1.0. With base(3) = 2/3, a full judge level
+/// times a full counterpart line lands exactly at 1.0 — a structural
+/// commitment, so a code constant rather than a knob (the pivot below is
+/// `TIER2_HI` for the same reason: the boost turns positive the moment the
+/// counterpart line enters tier 3).
+pub const ENDPOINT_BOOST_MAX: f64 = 1.5;
+
+/// The judge's absolute endpoint levels for one turn. `None` = the judge
+/// omitted the field or the eval was skipped → hold the stored level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointLevelReads {
+    pub warmth: Option<i16>,
+    pub patience: Option<i16>,
+}
+
+/// base(g) = (g−1)/3 ∈ {0, 1/3, 2/3}; out-of-range stored levels clamp.
+fn endpoint_base(level: i16) -> f64 {
+    f64::from(level.clamp(1, 3) - 1) / 3.0
+}
+
+/// B(x) = 1 + λ·(x − TIER2_HI), λ = (B_MAX − 1)/(1 − TIER2_HI) = 10/13.
+/// Below the pivot the endpoint is damped under its base; above it, boosted.
+pub fn endpoint_boost(counterpart: f64) -> f64 {
+    let slope = (ENDPOINT_BOOST_MAX - 1.0) / (1.0 - TIER2_HI);
+    1.0 + slope * (counterpart - TIER2_HI)
+}
+
+/// Multiplicative absence decay: 1 − rate·days, floored. Linear like the
+/// line-axis drift; the floor keeps long absence from zeroing a relationship.
+pub fn endpoint_time_decay(days: f64, rate: f64, floor: f64) -> f64 {
+    (1.0 - rate * days.max(0.0)).max(floor)
+}
+
+/// One endpoint's real value. The φ·x floor only ever acts on level 1
+/// (φ·x ≤ φ < 1/3·B(0) for φ ≤ 0.2): a cold verdict decays to a
+/// relationship-scaled ember instead of an absolute zero, and it can never
+/// overwrite a non-cold verdict. clamp01 is float insurance, not mechanism.
+pub fn endpoint_value(level: i16, counterpart: f64, decay: f64, floor_ratio: f64) -> f64 {
+    let boosted = endpoint_base(level) * endpoint_boost(counterpart);
+    (boosted.max(floor_ratio * counterpart) * decay).clamp(0.0, 1.0)
+}
+
 /// 1..=5 tier index for a 0..1 line score.
 fn tier_index(score: f64) -> u8 {
     if score < TIER1_HI {
@@ -1688,5 +1738,63 @@ mod tests {
         let d = diff_labels(&before, &after).unwrap();
         assert_eq!(d.bond.unwrap().to, "close_friend");
         assert_eq!(d.chemistry.unwrap().to, "crush");
+    }
+
+    // ─── Endpoint derivation (4.0) ──────────────────────────────────
+
+    #[test]
+    fn endpoint_boost_anchors() {
+        // B(PIVOT)=1 exactly; B(1)=B_MAX; B(0)=1−0.35·10/13.
+        assert!((endpoint_boost(0.35) - 1.0).abs() < 1e-12);
+        assert!((endpoint_boost(1.0) - 1.5).abs() < 1e-12);
+        assert!((endpoint_boost(0.0) - (1.0 - 0.35 * 10.0 / 13.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn endpoint_value_exact_ceiling_and_ranges() {
+        // Level 3 × counterpart 1 × decay 1 = exactly 1.0 (no clamp doing work).
+        assert!((endpoint_value(3, 1.0, 1.0, 0.2) - 1.0).abs() < 1e-9);
+        // Level ranges at decay=1: L2 ∈ [0.2436, 0.5], L3 ∈ [0.4872, 1.0].
+        assert!(
+            (endpoint_value(2, 0.0, 1.0, 0.2) - (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0)).abs()
+                < 1e-9
+        );
+        assert!((endpoint_value(2, 1.0, 1.0, 0.2) - 0.5).abs() < 1e-9);
+        assert!(
+            (endpoint_value(3, 0.0, 1.0, 0.2) - (2.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0)).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn endpoint_floor_only_acts_on_level_one() {
+        // Level 1: value = φ·x (base 0, floor carries it).
+        assert!((endpoint_value(1, 0.9, 1.0, 0.2) - 0.18).abs() < 1e-9);
+        assert!((endpoint_value(1, 0.0, 1.0, 0.2) - 0.0).abs() < 1e-9);
+        // Level 2 at ANY counterpart beats the floor: φ·x ≤ 0.2 < 0.2436 ≤ base·B.
+        for x in [0.0, 0.35, 0.7, 1.0] {
+            let with_floor = endpoint_value(2, x, 1.0, 0.2);
+            let without = endpoint_value(2, x, 1.0, 0.0);
+            assert!(
+                (with_floor - without).abs() < 1e-12,
+                "floor must not touch level 2 at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_level_out_of_range_clamps() {
+        // Defensive: a stored 0 or 7 behaves as the nearest valid level.
+        assert_eq!(endpoint_value(0, 0.5, 1.0, 0.2), endpoint_value(1, 0.5, 1.0, 0.2));
+        assert_eq!(endpoint_value(7, 0.5, 1.0, 0.2), endpoint_value(3, 0.5, 1.0, 0.2));
+    }
+
+    #[test]
+    fn endpoint_time_decay_linear_with_floor() {
+        assert!((endpoint_time_decay(0.0, 0.02, 0.5) - 1.0).abs() < 1e-12);
+        assert!((endpoint_time_decay(7.0, 0.02, 0.5) - 0.86).abs() < 1e-12);
+        assert!((endpoint_time_decay(25.0, 0.02, 0.5) - 0.5).abs() < 1e-12);
+        assert!((endpoint_time_decay(60.0, 0.02, 0.5) - 0.5).abs() < 1e-12);
+        assert!((endpoint_time_decay(-3.0, 0.02, 0.5) - 1.0).abs() < 1e-12); // clock skew → no decay
     }
 }
