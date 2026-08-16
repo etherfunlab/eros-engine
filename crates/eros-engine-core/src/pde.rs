@@ -10,13 +10,9 @@ use crate::types::{ActionPlan, ActionType, DecisionInput, Event, ImageRef, Reply
 
 // Decision thresholds — tune here rather than at call sites.
 const LONG_MSG_CHARS: usize = 30;
-const SHORT_MSG_CHARS: usize = 3;
 const STALE_HOURS: f64 = 24.0;
 
 const INTRIGUE_LONG_BUMP: f64 = 0.02;
-const PATIENCE_LONG_BUMP: f64 = 0.02;
-const PATIENCE_SHORT_PENALTY: f64 = -0.02;
-const PATIENCE_STALE_PENALTY: f64 = -0.05;
 const TENSION_STALE_BUMP: f64 = 0.03;
 
 const ENERGY_COST_REPLY: f64 = 0.05;
@@ -24,7 +20,6 @@ const ENERGY_COST_PROACTIVE: f64 = 0.10;
 const ENERGY_COST_GHOST: f64 = 0.0;
 const ENERGY_COST_APP_OPEN: f64 = 0.0;
 
-const GHOST_DELTA_PATIENCE: f64 = -0.05;
 const GHOST_DELTA_TENSION: f64 = 0.05;
 
 /// Core decision function.
@@ -190,25 +185,22 @@ pub fn plan_for(
 /// Predict affinity delta sign based on user message length / signals.
 /// Conservative: small positive/negative heuristics only. Full evaluation
 /// remains deterministic so no LLM JSON parsing is needed here.
+/// As of 4.0 patience is judge-owned and derived (`refresh_endpoints`), so no
+/// rule delta touches it: the stale rule is absorbed by the endpoint time
+/// decay, and the message-length nudges were noise-level.
 fn predict_reply_deltas(input: &DecisionInput) -> AffinityDeltas {
     let mut d = AffinityDeltas::default();
 
     if let Event::UserMessage { content, .. } = &input.event {
         let chars = content.chars().count();
-        // Long, thoughtful user message — small intrigue/patience bump
+        // Long, thoughtful user message — small intrigue bump
         if chars >= LONG_MSG_CHARS {
             d.intrigue += INTRIGUE_LONG_BUMP;
-            d.patience += PATIENCE_LONG_BUMP;
-        }
-        // Very short/one-word — patience penalty
-        if chars <= SHORT_MSG_CHARS {
-            d.patience += PATIENCE_SHORT_PENALTY;
         }
     }
 
-    // Time gap large — patience penalty + tension bump
+    // Time gap large — tension bump
     if input.signals.hours_since_last_message > STALE_HOURS {
-        d.patience += PATIENCE_STALE_PENALTY;
         d.tension += TENSION_STALE_BUMP;
     }
 
@@ -217,7 +209,6 @@ fn predict_reply_deltas(input: &DecisionInput) -> AffinityDeltas {
 
 fn ghost_affinity_deltas() -> AffinityDeltas {
     AffinityDeltas {
-        patience: GHOST_DELTA_PATIENCE,
         tension: GHOST_DELTA_TENSION,
         ..Default::default()
     }
@@ -267,6 +258,8 @@ mod tests {
             intimacy: 0.2,
             patience: 0.5,
             tension: 0.1,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
@@ -416,7 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn test_long_absence_penalises_patience() {
+    fn test_long_absence_bumps_tension_not_patience() {
+        // 4.0: patience is judge-owned and derived; the stale rule only nudges
+        // tension now (absence cooling lives in the endpoint time decay).
         let mut signals = base_signals();
         signals.hours_since_last_message = 48.0;
 
@@ -427,7 +422,8 @@ mod tests {
             signals,
         };
         let plan = decide(&input);
-        assert!(plan.affinity_deltas.patience < 0.0);
+        assert!(plan.affinity_deltas.tension > 0.0);
+        assert_eq!(plan.affinity_deltas.patience, 0.0);
     }
 
     #[test]
@@ -444,7 +440,9 @@ mod tests {
     }
 
     #[test]
-    fn test_short_msg_and_stale_both_apply_to_patience() {
+    fn test_rule_deltas_never_touch_patience() {
+        // Even the old worst case (one-word message after a long gap) leaves
+        // patience alone — no rule path writes it any more.
         let mut signals = base_signals();
         signals.hours_since_last_message = 48.0;
         let input = DecisionInput {
@@ -454,8 +452,7 @@ mod tests {
             signals,
         };
         let plan = decide(&input);
-        // short penalty (-0.02) + stale penalty (-0.05) = -0.07
-        assert!((plan.affinity_deltas.patience - (-0.07)).abs() < 1e-9);
+        assert_eq!(plan.affinity_deltas.patience, 0.0);
     }
 
     fn test_decision_input() -> DecisionInput {

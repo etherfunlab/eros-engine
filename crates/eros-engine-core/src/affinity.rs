@@ -9,12 +9,17 @@ pub struct Affinity {
     pub session_id: Uuid,
     pub user_id: Uuid,
     pub instance_id: Uuid,
-    pub warmth: f64,   // -1.0 ..= 1.0
+    pub warmth: f64,   //  0.0 ..= 1.0 (derived cache, 4.0 — see refresh_endpoints)
     pub trust: f64,    //  0.0 ..= 1.0
     pub intrigue: f64, //  0.0 ..= 1.0
     pub intimacy: f64, //  0.0 ..= 1.0
-    pub patience: f64, //  0.0 ..= 1.0
+    pub patience: f64, //  0.0 ..= 1.0 (derived cache, 4.0)
     pub tension: f64,  //  0.0 ..= 1.0
+    /// Judge's last absolute warmth level (1..=3). Authoritative; `warmth` is
+    /// a materialized cache of `endpoint_value` over it.
+    pub warmth_grade: i16,
+    /// Judge's last absolute patience level (1..=3).
+    pub patience_grade: i16,
     pub ghost_streak: i32,
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
@@ -48,7 +53,7 @@ impl Affinity {
     /// Damping lives in `grade_turn`'s tier decay, so a committed delta means
     /// exactly what it says.
     pub fn apply_deltas(&mut self, d: &AffinityDeltas) {
-        self.warmth = clamp(self.warmth + d.warmth, -1.0, 1.0);
+        self.warmth = clamp(self.warmth + d.warmth, 0.0, 1.0);
         self.trust = clamp(self.trust + d.trust, 0.0, 1.0);
         self.intrigue = clamp(self.intrigue + d.intrigue, 0.0, 1.0);
         self.intimacy = clamp(self.intimacy + d.intimacy, 0.0, 1.0);
@@ -57,14 +62,30 @@ impl Affinity {
         self.updated_at = Utc::now();
     }
 
+    /// Per-day drift on the line axes only (intrigue cools, tension softens).
+    /// The old patience up-drift is retired: absence handling for the two
+    /// endpoints lives in `refresh_endpoints`' multiplicative decay, which
+    /// cools rather than heals — an old friend's resilience comes from
+    /// B(bond), not from a drift patch.
     pub fn apply_time_decay(&mut self) {
         let days = (Utc::now() - self.updated_at).num_minutes() as f64 / (60.0 * 24.0);
         if days <= 0.0 {
             return;
         }
         self.intrigue = clamp(self.intrigue - 0.01 * days, 0.0, 1.0);
-        self.patience = clamp(self.patience + 0.005 * days, 0.0, 1.0);
         self.tension = clamp(self.tension - 0.005 * days, 0.0, 1.0);
+    }
+
+    /// Recompute the two derived endpoints from the authoritative facts
+    /// (judge levels + line scores + time since last update). Runs wherever
+    /// `apply_time_decay` runs: the row-locked persist and the in-memory
+    /// read paths. Line scores no longer contain warmth, so there is no
+    /// circularity.
+    pub fn refresh_endpoints(&mut self, t: &AffinityTuning) {
+        let days = (Utc::now() - self.updated_at).num_minutes() as f64 / (60.0 * 24.0);
+        let decay = endpoint_time_decay(days, t.time_decay_rate, t.time_decay_floor);
+        self.warmth = endpoint_value(self.warmth_grade, self.chemistry_score(), decay, t.floor_ratio);
+        self.patience = endpoint_value(self.patience_grade, self.bond_score(), decay, t.floor_ratio);
     }
 
     /// Legacy 5-name relationship label (back-compat), derived purely from the
@@ -99,14 +120,16 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
-// ─── Bond / Chemistry lines (read-layer folds of the 6 axes) ────────
+// ─── Bond / Chemistry lines (read-layer folds of the 4 line axes) ───
 //
-// Two composites folded from the unchanged 6-axis base. `warmth` is shared into
-// both and FLOORED at 0 (a neutral/cold session contributes nothing, so a fresh
-// session sits near 0). `patience` is rule-owned and excluded.
+// As of 4.0 the two lines share nothing: bond is friendship (trust + continued
+// interest), chemistry is romance (closeness + charge). warmth and patience are
+// no longer inputs to either line — they are OUTPUTS, derived from the judge's
+// absolute levels amplified by the counterpart line (see endpoint derivation
+// below).
 //
-// Mirrored by the `bond`/`chemistry` GENERATED columns in store migration 0029
-// (warmth floored via GREATEST(warmth,0)). Keep the formula in sync.
+// Mirrored by the `bond`/`chemistry` GENERATED columns in store migration 0048.
+// Keep the formula in sync.
 
 /// Tier upper bounds on a line's 0..1 score. Widening by design: easy early, a
 /// grind near the top. Tier 1 = [0, T1), 2 = [T1, T2), 3 = [T2, T3),
@@ -301,18 +324,16 @@ pub fn diff_labels(before: &Affinity, after: &Affinity) -> Option<TurnLabelChang
 }
 
 impl Affinity {
-    /// 0..1 friendship composite. warmth floored at 0; mirrors the `bond`
-    /// generated column in migration 0029.
+    /// 0..1 friendship composite. Mirrors the `bond` generated column in
+    /// migration 0048.
     pub fn bond_score(&self) -> f64 {
-        let warm_pos = self.warmth.max(0.0);
-        clamp((warm_pos + self.trust + self.intrigue) / 3.0, 0.0, 1.0)
+        clamp((self.trust + self.intrigue) / 2.0, 0.0, 1.0)
     }
 
-    /// 0..1 romance composite. warmth floored at 0; mirrors the `chemistry`
-    /// generated column in migration 0029.
+    /// 0..1 romance composite. Mirrors the `chemistry` generated column in
+    /// migration 0048.
     pub fn chemistry_score(&self) -> f64 {
-        let warm_pos = self.warmth.max(0.0);
-        clamp((warm_pos + self.intimacy + self.tension) / 3.0, 0.0, 1.0)
+        clamp((self.intimacy + self.tension) / 2.0, 0.0, 1.0)
     }
 
     /// Friendship-line tier label.
@@ -371,32 +392,40 @@ impl Affinity {
     }
 }
 
-// ─── Affinity write-side pipeline (scope → grades → raw → decay → penalty → gate) ───
+// ─── Affinity write-side pipeline (grades → raw → decay → penalty → gate) ───
 //
 // The judge reports per-axis *grades* (0..=4 magnitude + direction, folded to a
-// signed integer at parse time); the engine owns every number. 3.1 first steers
-// the grades by the request's resolved `AffinityScope` (see `ScopeMode`), then
-// 3.0 runs unchanged: a grade converts to a raw delta, positive raw is damped by
-// the line's tier, line-exclusive axes pay a cross-line penalty while the
+// signed integer at parse time) for the FOUR line axes; the engine owns every
+// number. A grade converts to a raw delta at its line's unit, positive raw is
+// damped by the line's tier, every axis pays a cross-line penalty while the
 // counterpart line is high, and the resulting real delta passes a threshold
-// accumulator before it commits.
+// accumulator before it commits. The two endpoints (warmth/patience) never
+// enter this pipeline — they are derived, see `refresh_endpoints`. 3.1's
+// scope steering is retired: `AffinityScope` is read-side only again.
 // Design specs: docs/superpowers/specs/2026-08-13-affinity-30-grade-pipeline-design.md
-//               docs/superpowers/specs/2026-08-14-affinity-31-scope-steering-design.md
 //               docs/superpowers/specs/2026-08-14-cross-penalty-by-grade-design.md
+//               docs/superpowers/specs/2026-08-16-affinity-40-design.md
 
-/// Tuning knobs for the 3.0 pipeline, env-driven server-side. Defaults
-/// set the single-turn envelope: grade ±4 lands +0.20 / −0.30 per axis.
+/// Tuning knobs for the 4.0 pipeline, env-driven server-side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AffinityTuning {
-    /// Raw score per grade step (`AFFINITY_GRADE_UNIT`).
-    pub grade_unit: f64,
+    /// Raw score per grade step on the bond axes (`AFFINITY_GRADE_UNIT_BOND`).
+    /// The 2.96× spread between the two units is the judge's measured grading
+    /// asymmetry (tension reaches grade ≥2 on ~half of turns, trust is graded
+    /// 0 on ~80%), written down where it can be argued with.
+    pub grade_unit_bond: f64,
+    /// Raw score per grade step on the chemistry axes (`AFFINITY_GRADE_UNIT_CHEM`).
+    pub grade_unit_chem: f64,
     /// Extra multiplier on negative raw scores (`AFFINITY_NEG_FACTOR`) —
     /// keeps 2.0's "slow up, fast down" asymmetry.
     pub neg_factor: f64,
     /// Positive-delta damping per tier 1..=5 (`AFFINITY_TIER_DECAY`).
     pub tier_decay: [f64; 5],
-    /// Cross-line penalty ceiling κ (`AFFINITY_CROSS_PENALTY`).
-    pub cross_penalty: f64,
+    /// Cross-line penalty ceiling as a multiple of the line's unit
+    /// (`AFFINITY_CROSS_PENALTY_RATIO`): κ_line = ratio · u_line. Tying κ to
+    /// the unit makes the double-high break-even independent of the unit —
+    /// per-line units would otherwise silently move the wall.
+    pub cross_penalty_ratio: f64,
     /// Counterpart line score where the penalty starts (`AFFINITY_CROSS_PENALTY_START`).
     pub cross_penalty_start: f64,
     /// Commit threshold θ (`AFFINITY_DELTA_THRESHOLD`); 0 commits every turn.
@@ -404,85 +433,44 @@ pub struct AffinityTuning {
     /// Multiplier on the judge's positive raw component for demo sessions
     /// (`AFFINITY_DEMO_BOOST`); rule nudges are unaffected.
     pub demo_boost: f64,
-    /// Constant multiplier on positive raw for the bond-exclusive axes when the
-    /// resolved scope names the bond half only (`AFFINITY_SCOPE_BOND_BOOST`).
-    /// 1.0 disables the boost.
-    pub scope_bond_boost: f64,
-    /// Grade ladder applied to the chemistry-exclusive axes when the resolved
-    /// scope carries any chemistry axis (`AFFINITY_SCOPE_CHEM_LADDER`), indexed
-    /// by the positive grade 0..=4. The identity `[0,1,2,3,4]` disables it.
-    pub scope_chem_ladder: [i8; 5],
+    /// Endpoint floor ratio φ (`AFFINITY_FLOOR_RATIO`): a level-1 verdict
+    /// reads φ·counterpart instead of 0. Must stay ≤ 0.24 so the floor can
+    /// never touch a level-2 verdict (1/3·B(0) ≈ 0.2436).
+    pub floor_ratio: f64,
+    /// Endpoint absence decay per day (`AFFINITY_TIME_DECAY_RATE`).
+    pub time_decay_rate: f64,
+    /// Endpoint absence decay floor (`AFFINITY_TIME_DECAY_FLOOR`).
+    pub time_decay_floor: f64,
 }
 
 impl Default for AffinityTuning {
     fn default() -> Self {
         Self {
-            grade_unit: 0.05,
+            // Derived to reproduce the shipped 3.1 pace (tier 5 in ~99/98
+            // turns) after the shared warmth term and the chemistry ladder are
+            // both gone; re-derive on a full week of 4.0 data.
+            grade_unit_bond: 0.0786,
+            grade_unit_chem: 0.0266,
             neg_factor: 1.5,
             tier_decay: [1.0, 0.70, 0.45, 0.25, 0.10],
-            cross_penalty: 0.05,
+            // 5/6 = the 3.x κ/u ratio (0.05/0.06) made definitional.
+            cross_penalty_ratio: 5.0 / 6.0,
             cross_penalty_start: 0.35,
             delta_threshold: 0.0,
             demo_boost: 1.4,
-            scope_bond_boost: 1.5,
-            // g1 filtered, g2 halved, milestones untouched — see `ScopeMode`.
-            scope_chem_ladder: [0, 0, 1, 3, 4],
+            floor_ratio: 0.2,
+            time_decay_rate: 0.02,
+            time_decay_floor: 0.5,
         }
     }
 }
 
-/// How a resolved `AffinityScope` steers the write side (affinity 3.1).
-///
-/// The scope field is *borrowed* here for the bond/chemistry mental model its
-/// two named values carry — not for the axis triads behind them. Those triads
-/// (`scope.rs`, 1.0-era) partition all six axes for prompt injection and
-/// `length_score`; the score composites (`bond_score`/`chemistry_score`, 2.0+)
-/// overlap on warmth and drop patience. Two different algebras on purpose;
-/// neither is a mis-grouping of the other.
-///
-/// Total over the six bools, so an axes array steers as predictably as a named
-/// value: an empty scope is neutral, anything touching the chemistry half
-/// suppresses, everything else boosts bond.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeMode {
-    /// 3.0 behaviour verbatim.
-    Neutral,
-    /// Bond-exclusive axes earn `scope_bond_boost` on positive raw.
-    BoostBond,
-    /// Chemistry-exclusive positive grades drop through `scope_chem_ladder`.
-    /// A grade laddered to 0 reads as "the judge did not touch this axis", so
-    /// it charges no cross penalty either — the reason the ladder introduces no
-    /// break-even case that 3.0 did not already have.
-    SuppressChemistry,
-}
-
-impl ScopeMode {
-    pub fn of(scope: &crate::scope::AffinityScope) -> Self {
-        if scope.is_empty() {
-            Self::Neutral
-        } else if scope.any_chemistry_axis() {
-            Self::SuppressChemistry
-        } else {
-            Self::BoostBond
-        }
-    }
-
-    pub fn as_key(self) -> &'static str {
-        match self {
-            ScopeMode::Neutral => "neutral",
-            ScopeMode::BoostBond => "boost_bond",
-            ScopeMode::SuppressChemistry => "suppress_chemistry",
-        }
-    }
-}
-
-/// Signed judge grades, one per evaluated axis, −4..=4 (out-of-range input is
+/// Signed judge grades, one per line axis, −4..=4 (out-of-range input is
 /// clamped). 0 = nothing happened, the overwhelmingly common verdict.
-/// `patience` is absent by construction: it stays on its absolute channel.
+/// `warmth` and `patience` are absent by construction: they are absolute
+/// levels on the derived channel (`EndpointLevelReads`), not graded deltas.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxisGrades {
-    pub warmth: i8,
     pub trust: i8,
     pub intrigue: i8,
     pub intimacy: i8,
@@ -490,11 +478,10 @@ pub struct AxisGrades {
 }
 
 /// Per-axis balance the threshold gate is still holding back. Persisted as
-/// JSONB on the affinity row; absent column reads as all-zero.
+/// JSONB on the affinity row; absent column reads as all-zero. A stale
+/// `"warmth"` key from pre-4.0 rows is ignored by serde and drains naturally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct PendingDeltas {
-    #[serde(default)]
-    pub warmth: f64,
     #[serde(default)]
     pub trust: f64,
     #[serde(default)]
@@ -507,42 +494,30 @@ pub struct PendingDeltas {
 
 impl PendingDeltas {
     pub fn is_zero(&self) -> bool {
-        self.warmth == 0.0
-            && self.trust == 0.0
-            && self.intrigue == 0.0
-            && self.intimacy == 0.0
-            && self.tension == 0.0
+        self.trust == 0.0 && self.intrigue == 0.0 && self.intimacy == 0.0 && self.tension == 0.0
     }
 }
 
-/// One turn through the 3.0 pipeline.
-/// `raw` = grade conversion (boost applied) + rule deltas, pre-decay — what the
-/// event row records as `deltas`. `committed` = what actually applies to the
-/// axes this turn (zero while the gate holds). `pending` = the gate's new
-/// balance. `patience` is a rule axis: its rule delta passes through both
-/// `raw` and `committed` untouched (no decay, penalty or gating), so the
-/// judge-failure fallback still lands 1:1.
+/// One turn through the 4.0 pipeline.
+/// `raw` = grade conversion + rule deltas, pre-decay — what the event row
+/// records as `deltas`. `committed` = what actually applies to the axes this
+/// turn (zero while the gate holds). `pending` = the gate's new balance.
+/// The `warmth`/`patience` fields of `raw` and `committed` are always 0.0:
+/// the endpoints left the graded pipeline (see `refresh_endpoints`).
 #[derive(Debug, Clone)]
 pub struct GradeTurnOutcome {
     pub raw: AffinityDeltas,
     pub committed: AffinityDeltas,
     pub pending: PendingDeltas,
-    /// The grades actually converted, after scope steering. Equal to the
-    /// judge's grades under `ScopeMode::Neutral`. Audited alongside the
-    /// judge's originals so a committed 0 stays attributable: the judge said
-    /// nothing, or the ladder filtered it.
-    pub effective_grades: AxisGrades,
-    pub scope_mode: ScopeMode,
-    /// Cross-line penalty *assessed* this turn, per line-exclusive axis.
+    /// Cross-line penalty *assessed* this turn, per axis.
     ///
     /// Assessed, not applied. It is subtracted inside `ρ` before the threshold
     /// gate, so on a turn the gate buffers, nothing has reached the axis yet —
     /// the amount rides along in `pending` rather than being lost (the gate
     /// re-times commits, it never rescales them), and the caller's axis clamp
-    /// can swallow part of a commit besides. Now that the penalty scales with
-    /// the applied grade this is no longer derivable from the grades alone, so
-    /// it is recorded rather than reconstructed. warmth is penalty-exempt and
-    /// therefore absent.
+    /// can swallow part of a commit besides. The penalty scales with the
+    /// applied grade, so it is not derivable from the grades alone and is
+    /// recorded rather than reconstructed.
     pub cross_penalty_assessed: CrossPenaltyAssessed,
 }
 
@@ -567,53 +542,23 @@ impl Default for GradeTurnOutcome {
             raw: AffinityDeltas::default(),
             committed: AffinityDeltas::default(),
             pending: PendingDeltas::default(),
-            effective_grades: AxisGrades::default(),
-            scope_mode: ScopeMode::Neutral,
             cross_penalty_assessed: CrossPenaltyAssessed::default(),
         }
     }
 }
 
-/// Run one judge verdict through scope steering, conversion, tier decay,
-/// cross-line penalty and the threshold gate. Pure: reads the *pre-turn*
-/// affinity snapshot (all axes use the same tier lookup, so ordering inside a
-/// turn cannot matter) and returns what to apply; the caller owns clamping and
-/// persistence.
-///
-/// `scope` is the request's resolved injection scope, reused to steer the
-/// multipliers — see [`ScopeMode`]. An empty scope is neutral, i.e. 3.0
-/// verbatim.
+/// Run one judge verdict through conversion, tier decay, cross-line penalty
+/// and the threshold gate. Pure: reads the *pre-turn* affinity snapshot (all
+/// axes use the same tier lookup, so ordering inside a turn cannot matter)
+/// and returns what to apply; the caller owns clamping and persistence.
 pub fn grade_turn(
     a: &Affinity,
     grades: &AxisGrades,
     rule: &AffinityDeltas,
     pending: &PendingDeltas,
     boost: f64,
-    scope: &crate::scope::AffinityScope,
     t: &AffinityTuning,
 ) -> GradeTurnOutcome {
-    // Scope steering (3.1). warmth is exempt from both directions: it feeds
-    // BOTH composites, so scaling it would leak the correction onto the other
-    // line — the same reason the cross penalty exempts it.
-    let mode = ScopeMode::of(scope);
-    let bond_mult = match mode {
-        ScopeMode::BoostBond => t.scope_bond_boost,
-        _ => 1.0,
-    };
-    let ladder = |g: i8| -> i8 {
-        match mode {
-            ScopeMode::SuppressChemistry if g > 0 => t.scope_chem_ladder[g.min(4) as usize],
-            _ => g,
-        }
-    };
-    let eff = AxisGrades {
-        warmth: grades.warmth,
-        trust: grades.trust,
-        intrigue: grades.intrigue,
-        intimacy: ladder(grades.intimacy),
-        tension: ladder(grades.tension),
-    };
-
     // Pre-turn snapshot: every axis reads the same tiers and counterparts.
     let bond = a.bond_score();
     let chem = a.chemistry_score();
@@ -621,64 +566,53 @@ pub fn grade_turn(
     let chem_tier = tier_index(chem) as usize;
 
     let decay = |tier: usize| t.tier_decay[tier - 1];
-    let penalty = |counterpart: f64| {
+    // κ_line = ratio · u_line, so the break-even below is unit-independent.
+    let penalty = |counterpart: f64, kappa: f64| {
         let start = t.cross_penalty_start;
         let ramp = ((counterpart - start).max(0.0) / (1.0 - start)).powi(2);
-        t.cross_penalty * ramp
+        kappa * ramp
     };
 
-    // grade → raw: positive grades earn unit × boost × scope multiplier,
-    // negative grades cost unit × neg_factor (never scaled by scope — the
-    // correction raises the bar, it does not soften damage). Rule nudges join
-    // pre-decay.
-    let raw = |g: i8, rule_d: f64, mult: f64| {
+    // grade → raw at the line's unit: positive grades earn unit × boost,
+    // negative grades cost unit × neg_factor. Rule nudges join pre-decay.
+    let raw = |g: i8, rule_d: f64, unit: f64| {
         let g = f64::from(g.clamp(-4, 4));
         let judge = if g >= 0.0 {
-            g * t.grade_unit * boost * mult
+            g * unit * boost
         } else {
-            g * t.grade_unit * t.neg_factor
+            g * unit * t.neg_factor
         };
         judge + rule_d
     };
 
     // ρ = D·max(r,0) + min(r,0) − P: positive part damped, negative part full
     // price, and the cross penalty assessed in PROPORTION to the grade actually
-    // applied — P = κ·φ(y)·(|g|/4).
+    // applied — P = κ·φ(y)·(|g|/4), κ = ratio·u.
     //
-    // It used to be binary: any non-zero grade paid the full κ·φ(y). That made
-    // the tax independent of how much the axis moved, so at a high counterpart
-    // score a small honest push was charged the same as a milestone. The
-    // proportional form keeps the zero case exactly as it was (a grade of 0,
-    // including one the 3.1 ladder filtered, charges nothing) and turns the old
-    // on/off step into the endpoint of a continuous rule.
+    // Ignoring rule nudges, ρ factorises:
+    //     g > 0:  ρ = g·u · (D_k − ratio·φ(y)/4)
+    //     g < 0:  ρ = g·u · (λ⁻ + ratio·φ(y)/4)      (no decay on the negative part)
+    // Neither bracket contains g OR u, so the outcome cannot change sign
+    // between grades at a fixed position, and the break-even position
+    // φ(y*) = 4·D_k/ratio is the SAME for both lines regardless of their
+    // units — see `break_even_position_is_unit_invariant`. The negative
+    // bracket is always positive, so a negative verdict always lowers the
+    // axis.
     //
-    // What it buys, stated exactly — ignoring rule nudges, ρ factorises:
-    //     g > 0:  ρ = g · (D_k·u·mult − κ·φ(y)/4)
-    //     g < 0:  ρ = g · (u·λ⁻ + κ·φ(y)/4)          (no decay on the negative part)
-    // Neither bracket contains g, so **the outcome cannot change sign between
-    // grades at a fixed position** — the flat toll's failure mode, where a small
-    // honest push lost ground while a bigger one gained it. The negative bracket
-    // is always positive, so a negative verdict always lowers the axis.
+    // It does NOT make every positive verdict a gain: past y* every grade nets
+    // negative, uniformly — see
+    // `tier_five_against_a_high_counterpart_still_loses_at_every_grade`.
     //
-    // It does NOT make every positive verdict a gain: whether the positive
-    // bracket is positive is a property of the POSITION, break-even at
-    // φ(y*) = 4·D_k·u·mult/κ. Past it every grade nets negative, uniformly —
-    // see `tier_five_against_a_high_counterpart_still_loses_at_every_grade`.
+    // Rule nudges sit outside this: they join `r` before decay but are not
+    // part of `g`, so a large enough opposing nudge could in principle invert
+    // the sign. None can today — the only rule deltas reaching a graded axis
+    // are intrigue +0.02 and tension +0.03, both positive.
     //
-    // Rule nudges sit outside this: they join `r` before decay but are not part
-    // of `g`, so a large enough opposing nudge could in principle invert the
-    // sign. None can today — the only rule deltas reaching a graded axis are
-    // intrigue +0.02 and tension +0.03, both positive (the negative ones all
-    // land on patience, which bypasses the pipeline).
-    //
-    // Magnitude, not sign: a negative grade already moves the axis away from the
-    // double-high position the penalty exists to discourage, so it pays in
-    // proportion too rather than at the old flat rate.
-    let real = |r: f64, own_tier: usize, counterpart: Option<f64>, g: i8| {
-        let p = match counterpart {
-            Some(y) => penalty(y) * f64::from(g.saturating_abs().min(4)) / 4.0,
-            None => 0.0,
-        };
+    // Magnitude, not sign: a negative grade already moves the axis away from
+    // the double-high position the penalty exists to discourage, so it pays in
+    // proportion too rather than at a flat rate.
+    let real = |r: f64, own_tier: usize, counterpart: f64, kappa: f64, g: i8| {
+        let p = penalty(counterpart, kappa) * f64::from(g.saturating_abs().min(4)) / 4.0;
         (decay(own_tier) * r.max(0.0) + r.min(0.0) - p, p)
     };
 
@@ -692,78 +626,70 @@ pub fn grade_turn(
         }
     };
 
-    // `g` here is the POST-ladder grade, so an axis the ladder zeroed reads as
-    // untouched and pays no cross penalty.
-    let axis =
-        |g: i8, rule_d: f64, own_tier: usize, counterpart: Option<f64>, pend: f64, mult: f64| {
-            let r = raw(g, rule_d, mult);
-            let (rho, charged) = real(r, own_tier, counterpart, g);
-            let (committed, pend) = gate(rho, pend);
-            (r, committed, pend, charged)
-        };
+    let axis = |g: i8, rule_d: f64, own_tier: usize, counterpart: f64, pend: f64, unit: f64| {
+        let r = raw(g, rule_d, unit);
+        let kappa = t.cross_penalty_ratio * unit;
+        let (rho, charged) = real(r, own_tier, counterpart, kappa, g);
+        let (committed, pend) = gate(rho, pend);
+        (r, committed, pend, charged)
+    };
 
-    let max_tier = bond_tier.max(chem_tier);
-    let (w_raw, w_com, w_pend, _w_pen) =
-        axis(eff.warmth, rule.warmth, max_tier, None, pending.warmth, 1.0);
     let (t_raw, t_com, t_pend, t_pen) = axis(
-        eff.trust,
+        grades.trust,
         rule.trust,
         bond_tier,
-        Some(chem),
+        chem,
         pending.trust,
-        bond_mult,
+        t.grade_unit_bond,
     );
     let (ig_raw, ig_com, ig_pend, ig_pen) = axis(
-        eff.intrigue,
+        grades.intrigue,
         rule.intrigue,
         bond_tier,
-        Some(chem),
+        chem,
         pending.intrigue,
-        bond_mult,
+        t.grade_unit_bond,
     );
     let (im_raw, im_com, im_pend, im_pen) = axis(
-        eff.intimacy,
+        grades.intimacy,
         rule.intimacy,
         chem_tier,
-        Some(bond),
+        bond,
         pending.intimacy,
-        1.0,
+        t.grade_unit_chem,
     );
     let (tn_raw, tn_com, tn_pend, tn_pen) = axis(
-        eff.tension,
+        grades.tension,
         rule.tension,
         chem_tier,
-        Some(bond),
+        bond,
         pending.tension,
-        1.0,
+        t.grade_unit_chem,
     );
 
     GradeTurnOutcome {
         raw: AffinityDeltas {
-            warmth: w_raw,
+            warmth: 0.0, // endpoints are derived, never graded — see refresh_endpoints
             trust: t_raw,
             intrigue: ig_raw,
             intimacy: im_raw,
             tension: tn_raw,
-            patience: rule.patience,
+            patience: 0.0,
         },
         committed: AffinityDeltas {
-            warmth: w_com,
+            warmth: 0.0,
             trust: t_com,
             intrigue: ig_com,
             intimacy: im_com,
             tension: tn_com,
-            patience: rule.patience,
+            patience: 0.0,
         },
         pending: PendingDeltas {
-            warmth: w_pend,
             trust: t_pend,
             intrigue: ig_pend,
             intimacy: im_pend,
             tension: tn_pend,
         },
-        effective_grades: eff,
-        scope_mode: mode,
         cross_penalty_assessed: CrossPenaltyAssessed {
             trust: t_pen,
             intrigue: ig_pen,
@@ -790,6 +716,8 @@ mod tests {
             intimacy: 0.0,
             patience: 0.5,
             tension: 0.1,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
@@ -816,17 +744,18 @@ mod tests {
     }
 
     #[test]
-    fn warmth_can_go_negative_others_cannot() {
+    fn warmth_floors_at_zero_like_every_axis() {
+        // 4.0: warmth is 0..1 like everything else — no negative band.
         let mut a = fresh();
         a.apply_deltas(&AffinityDeltas {
-            warmth: -2.0, // -1.0 floor
+            warmth: -2.0,
             trust: 0.0,
             intrigue: 0.0,
             intimacy: 0.0,
             patience: 0.0,
             tension: 0.0,
         });
-        assert_eq!(a.warmth, -1.0);
+        assert_eq!(a.warmth, 0.0);
     }
 
     #[test]
@@ -841,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn time_decay_reduces_intrigue_recovers_patience_softens_tension() {
+    fn time_decay_reduces_intrigue_softens_tension_leaves_the_rest() {
         let mut a = fresh();
         a.intrigue = 0.5;
         a.patience = 0.5;
@@ -855,48 +784,26 @@ mod tests {
 
         // 10 days * -0.01/day = -0.1
         assert!((a.intrigue - 0.4).abs() < 1e-9);
-        // 10 days * +0.005/day = +0.05
-        assert!((a.patience - 0.55).abs() < 1e-9);
         // 10 days * -0.005/day = -0.05
         assert!((a.tension - 0.45).abs() < 1e-9);
-        // unchanged
+        // unchanged — the endpoints' absence handling lives in refresh_endpoints
+        assert_eq!(a.patience, 0.5);
         assert_eq!(a.warmth, 0.7);
         assert_eq!(a.trust, 0.6);
         assert_eq!(a.intimacy, 0.4);
     }
 
     #[test]
-    fn time_decay_clamps_at_floors_and_ceilings() {
+    fn time_decay_clamps_at_floors() {
         let mut a = fresh();
         a.intrigue = 0.05;
-        a.patience = 0.95;
         a.tension = 0.02;
         a.updated_at = Utc::now() - chrono::Duration::days(100);
 
         a.apply_time_decay();
 
         assert_eq!(a.intrigue, 0.0);
-        assert_eq!(a.patience, 1.0);
         assert_eq!(a.tension, 0.0);
-    }
-
-    #[test]
-    fn bond_chemistry_scores_fold_axes_with_warmth_floored() {
-        let mut a = fresh();
-        a.warmth = 0.2;
-        a.trust = 0.4;
-        a.intrigue = 0.6;
-        a.intimacy = 0.1;
-        a.tension = 0.3;
-        // bond = (0.2 + 0.4 + 0.6)/3 = 0.4
-        assert!((a.bond_score() - 0.4).abs() < 1e-9);
-        // chemistry = (0.2 + 0.1 + 0.3)/3 = 0.2
-        assert!((a.chemistry_score() - 0.2).abs() < 1e-9);
-        // negative warmth floors to 0 in the composite
-        a.warmth = -1.0;
-        a.trust = 0.0;
-        a.intrigue = 0.0;
-        assert!((a.bond_score()).abs() < 1e-9);
     }
 
     #[test]
@@ -1019,14 +926,14 @@ mod tests {
         a.intrigue = 0.0;
         assert_eq!(a.bond_label(), BondLabel::Acquaintance); // bond 0
         a.trust = 0.6;
-        a.intrigue = 0.6; // bond = 0.4 → tier 3
+        a.intrigue = 0.6; // bond = 0.6 → tier 3
         assert_eq!(a.bond_label(), BondLabel::CloseFriend);
         a.warmth = 0.0;
         a.intimacy = 0.0;
         a.tension = 0.0;
         assert_eq!(a.chemistry_label(), ChemistryLabel::Spark); // chem 0
-        a.intimacy = 1.0;
-        a.tension = 1.0; // chem = 0.667 → tier 4
+        a.intimacy = 0.8;
+        a.tension = 0.6; // chem = 0.7 → tier 4
         assert_eq!(a.chemistry_label(), ChemistryLabel::Lover);
         // tier 5 apex
         a.warmth = 1.0;
@@ -1103,8 +1010,8 @@ mod tests {
         before.intimacy = 0.0;
         before.tension = 0.0; // bond + chem both tier 1
         let mut after = before.clone();
-        after.trust = 0.9;
-        after.intrigue = 0.9; // bond = 0.6 → tier 3 (close_friend)
+        after.trust = 0.6;
+        after.intrigue = 0.6; // bond = 0.6 → tier 3 (close_friend)
         let d = diff_labels(&before, &after).unwrap();
         let bond = d.bond.unwrap();
         assert_eq!(bond.from, "acquaintance");
@@ -1112,7 +1019,7 @@ mod tests {
         assert!(d.chemistry.is_none());
     }
 
-    // ─── affinity 3.0 pipeline ───
+    // ─── grade pipeline (4.0) ───
 
     fn zeroed() -> Affinity {
         let mut a = fresh();
@@ -1124,8 +1031,6 @@ mod tests {
         a
     }
 
-    /// 3.0-era helper: no scope steering (`none()` → `ScopeMode::Neutral`), so
-    /// every pre-3.1 expectation below still asserts the unsteered pipeline.
     fn turn(
         a: &Affinity,
         grades: AxisGrades,
@@ -1134,64 +1039,17 @@ mod tests {
         boost: f64,
         t: &AffinityTuning,
     ) -> GradeTurnOutcome {
-        grade_turn(
-            a,
-            &grades,
-            &rule,
-            &pending,
-            boost,
-            &crate::scope::AffinityScope::none(),
-            t,
-        )
-    }
-
-    fn scoped(
-        a: &Affinity,
-        grades: AxisGrades,
-        scope: crate::scope::AffinityScope,
-    ) -> GradeTurnOutcome {
-        grade_turn(
-            a,
-            &grades,
-            &AffinityDeltas::default(),
-            &PendingDeltas::default(),
-            1.0,
-            &scope,
-            &AffinityTuning::default(),
-        )
-    }
-
-    /// P3 envelope continuity: with defaults, grade +4 lands +0.20 and grade −4
-    /// lands −0.30 — the 2.0 effective caps, bit for bit. patience never moves.
-    #[test]
-    fn grade_envelope_matches_2_0_effective_caps() {
-        let a = zeroed();
-        let o = turn(
-            &a,
-            AxisGrades {
-                warmth: 4,
-                trust: -4,
-                ..Default::default()
-            },
-            AffinityDeltas::default(),
-            PendingDeltas::default(),
-            1.0,
-            &AffinityTuning::default(),
-        );
-        assert!((o.raw.warmth - 0.2).abs() < 1e-9);
-        assert!((o.committed.warmth - 0.2).abs() < 1e-9);
-        assert!((o.committed.trust - (-0.3)).abs() < 1e-9);
-        assert_eq!(o.raw.patience, 0.0);
-        assert_eq!(o.committed.patience, 0.0);
+        grade_turn(a, &grades, &rule, &pending, boost, t)
     }
 
     /// Positive raw is damped by the OWN line's tier; a counterpart line inside
     /// the grace zone charges no penalty, past it the quadratic ramp starts.
     #[test]
     fn positive_decays_by_own_tier_and_pays_counterpart_ramp() {
+        let t = AffinityTuning::default();
         let mut a = zeroed();
         a.trust = 0.75;
-        a.intrigue = 0.75; // bond = 0.5 → tier 3; chemistry = 0 → tier 1
+        a.intrigue = 0.75; // bond = 0.75 → tier 4; chemistry = 0 → tier 1
         let o = turn(
             &a,
             AxisGrades {
@@ -1202,39 +1060,17 @@ mod tests {
             AffinityDeltas::default(),
             PendingDeltas::default(),
             1.0,
-            &AffinityTuning::default(),
+            &t,
         );
-        // trust: own tier 3 → 0.45 × 0.10, counterpart chem 0 → no penalty
-        assert!((o.committed.trust - 0.045).abs() < 1e-9);
-        // intimacy: own tier 1 → ×1.0, counterpart bond 0.5 → κ·((0.15/0.65)²),
-        // charged at 2/4 because the judge graded this axis a 2 (the penalty is
-        // proportional to the applied grade, not a flat toll on any non-zero).
-        let p = 0.05 * (0.15f64 / 0.65).powi(2) * 2.0 / 4.0;
-        assert!((o.committed.intimacy - (0.10 - p)).abs() < 1e-9);
+        // trust: own tier 4 → ×0.25 at the bond unit, counterpart chem 0 → no penalty
+        assert!((o.committed.trust - 2.0 * t.grade_unit_bond * 0.25).abs() < 1e-9);
+        // intimacy: own tier 1 → ×1.0 at the chem unit, counterpart bond 0.75 →
+        // κ_chem·((0.40/0.65)²), charged at 2/4 because the judge graded this
+        // axis a 2 (proportional to the applied grade, not a flat toll).
+        let p = t.cross_penalty_ratio * t.grade_unit_chem * (0.40f64 / 0.65).powi(2) * 2.0 / 4.0;
+        assert!((o.committed.intimacy - (2.0 * t.grade_unit_chem - p)).abs() < 1e-9);
         assert!((o.cross_penalty_assessed.intimacy - p).abs() < 1e-9);
         assert_eq!(o.cross_penalty_assessed.trust, 0.0, "counterpart below y₀");
-    }
-
-    /// warmth feeds both lines, so its damping reads the FURTHER line's tier
-    /// (same max rule as the intimacy rung) and it never pays the penalty.
-    #[test]
-    fn warmth_decays_by_max_tier_and_is_penalty_exempt() {
-        let mut a = zeroed();
-        a.warmth = 0.85;
-        a.intimacy = 1.0;
-        a.tension = 1.0; // chemistry = 0.95 → tier 5; bond ≈ 0.283 → tier 2
-        let o = turn(
-            &a,
-            AxisGrades {
-                warmth: 2,
-                ..Default::default()
-            },
-            AffinityDeltas::default(),
-            PendingDeltas::default(),
-            1.0,
-            &AffinityTuning::default(),
-        );
-        assert!((o.committed.warmth - 0.1 * 0.10).abs() < 1e-9);
     }
 
     /// **Changed with proportional charging.** Under the old flat toll this
@@ -1248,9 +1084,9 @@ mod tests {
     #[test]
     fn penalty_scales_with_the_grade_so_the_outcome_cannot_flip_between_grades() {
         let mut a = zeroed();
-        a.warmth = 1.0;
         a.intimacy = 1.0;
-        a.tension = 1.0; // chemistry = 1.0; bond = 1/3 → tier 2
+        a.tension = 1.0; // chemistry = 1.0 — the counterpart; bond = 0 → own tier 1
+        let t = AffinityTuning::default();
         let at = |g: i8| {
             turn(
                 &a,
@@ -1261,14 +1097,15 @@ mod tests {
                 AffinityDeltas::default(),
                 PendingDeltas::default(),
                 1.0,
-                &AffinityTuning::default(),
+                &t,
             )
         };
-        // g1: 0.70 × 0.05 − 0.05 × 1 × ¼ = +0.0225 — honest effort now lands.
-        assert!((at(1).committed.trust - 0.0225).abs() < 1e-9);
-        // g2: exactly double. Proportional in, proportional out.
-        assert!((at(2).committed.trust - 0.045).abs() < 1e-9);
-        assert!((at(4).committed.trust - 0.09).abs() < 1e-9);
+        // ρ = g·u_bond·(D₁ − ratio·φ(1)/4) = g·u_bond·(1 − 5/24): the bracket
+        // has no g in it, so honest effort lands and g2 is exactly double g1.
+        let unit_net = t.grade_unit_bond * (1.0 - t.cross_penalty_ratio / 4.0);
+        assert!((at(1).committed.trust - unit_net).abs() < 1e-9);
+        assert!((at(2).committed.trust - 2.0 * unit_net).abs() < 1e-9);
+        assert!((at(4).committed.trust - 4.0 * unit_net).abs() < 1e-9);
         for g in 1..=4 {
             assert!(
                 at(g).committed.trust > 0.0,
@@ -1284,12 +1121,15 @@ mod tests {
     /// firing on ordinary mid-relationship turns.
     #[test]
     fn tier_five_against_a_high_counterpart_still_loses_at_every_grade() {
+        let t = AffinityTuning::default();
         let mut a = zeroed();
-        a.warmth = 1.0;
         a.trust = 1.0;
         a.intrigue = 1.0; // bond = 1.0 — the counterpart
         a.intimacy = 1.0;
         a.tension = 1.0; // chemistry = 1.0 → own tier 5
+        // ρ = g·u_chem·(D₅ − ratio·φ(1)/4) = g·u_chem·(0.10 − 5/24) < 0.
+        let unit_net = t.grade_unit_chem * (0.10 - t.cross_penalty_ratio / 4.0);
+        assert!(unit_net < 0.0);
         for g in 1..=4 {
             let o = turn(
                 &a,
@@ -1300,11 +1140,10 @@ mod tests {
                 AffinityDeltas::default(),
                 PendingDeltas::default(),
                 1.0,
-                &AffinityTuning::default(),
+                &t,
             );
-            // 0.10 × 0.05·g − 0.05 × 1 × g/4 = g × (0.005 − 0.0125) < 0
             assert!(
-                (o.committed.intimacy - f64::from(g) * (0.005 - 0.0125)).abs() < 1e-9,
+                (o.committed.intimacy - f64::from(g) * unit_net).abs() < 1e-9,
                 "g{g}"
             );
             assert!(o.committed.intimacy < 0.0, "g{g}");
@@ -1315,12 +1154,12 @@ mod tests {
     /// top — now at the grade's share rather than the full toll.
     #[test]
     fn negative_skips_decay_and_pays_extra() {
+        let t = AffinityTuning::default();
         let mut a = zeroed();
-        a.warmth = 1.0;
         a.intimacy = 1.0;
         a.tension = 1.0; // chemistry = 1.0
         a.trust = 0.9;
-        a.intrigue = 0.9; // bond ≈ 0.933 → tier 5 (own tier must not soften the loss)
+        a.intrigue = 0.9; // bond = 0.9 → tier 5 (own tier must not soften the loss)
         let o = turn(
             &a,
             AxisGrades {
@@ -1330,13 +1169,14 @@ mod tests {
             AffinityDeltas::default(),
             PendingDeltas::default(),
             1.0,
-            &AffinityTuning::default(),
+            &t,
         );
-        // −2 × 0.05 × 1.5 = −0.15, minus κ·φ(1.0) × 2/4 = 0.025 → −0.175.
-        // (Was −0.20 under the flat toll. The penalty reads the grade's
-        // MAGNITUDE, so a loss is taxed by how big it is, not a flat rate.)
-        assert!((o.committed.trust - (-0.175)).abs() < 1e-9);
-        assert!((o.cross_penalty_assessed.trust - 0.025).abs() < 1e-9);
+        // −2·u_bond·1.5, minus κ_bond·φ(1.0)·2/4 on top — the penalty reads the
+        // grade's MAGNITUDE, so a loss is taxed by how big it is.
+        let p = t.cross_penalty_ratio * t.grade_unit_bond * 2.0 / 4.0;
+        let expect = -2.0 * t.grade_unit_bond * t.neg_factor - p;
+        assert!((o.committed.trust - expect).abs() < 1e-9);
+        assert!((o.cross_penalty_assessed.trust - p).abs() < 1e-9);
     }
 
     /// P6: the pipeline charges events, not rent — an all-zero verdict moves
@@ -1375,9 +1215,10 @@ mod tests {
     #[test]
     fn rule_only_delta_decays_but_pays_no_penalty() {
         let mut a = zeroed();
-        a.warmth = 1.0;
+        a.trust = 0.2;
+        a.intrigue = 0.3; // bond = 0.25 → own tier 2 (decay 0.70)
         a.intimacy = 1.0;
-        a.tension = 1.0; // chem 1.0; bond 1/3 → tier 2
+        a.tension = 1.0; // chem 1.0 — the counterpart, maximally expensive
         let o = turn(
             &a,
             AxisGrades::default(),
@@ -1454,272 +1295,68 @@ mod tests {
     /// Demo boost multiplies positive raw only; losses stay full price.
     #[test]
     fn demo_boost_is_positive_only() {
+        let t = AffinityTuning::default();
         let a = zeroed();
         let o = turn(
             &a,
             AxisGrades {
-                warmth: 1,
-                trust: -1,
+                trust: 1,
+                intimacy: -1,
                 ..Default::default()
             },
             AffinityDeltas::default(),
             PendingDeltas::default(),
             1.4,
-            &AffinityTuning::default(),
+            &t,
         );
-        assert!((o.committed.warmth - 0.07).abs() < 1e-9);
-        assert!((o.committed.trust - (-0.075)).abs() < 1e-9);
+        assert!((o.committed.trust - 1.4 * t.grade_unit_bond).abs() < 1e-9);
+        assert!((o.committed.intimacy - (-t.grade_unit_chem * t.neg_factor)).abs() < 1e-9);
     }
 
-    /// patience is a rule axis: its rule delta passes through the pipeline
-    /// untouched — no decay, no penalty, no threshold gate — so the fallback
-    /// path (judge eval failed, rule nudges only) still lands 1:1.
+    /// The endpoints left the pipeline: a rule patience delta (there are none
+    /// in production any more) is discarded, and raw/committed report 0.0 on
+    /// both endpoint fields — deriving them is `refresh_endpoints`' job.
     #[test]
-    fn rule_patience_passes_through_ungated() {
+    fn endpoint_fields_are_inert_in_the_pipeline() {
         let a = zeroed();
-        let t = AffinityTuning {
-            delta_threshold: 0.5, // must NOT buffer patience
-            ..Default::default()
-        };
         let o = turn(
             &a,
             AxisGrades::default(),
             AffinityDeltas {
+                warmth: 0.5,
                 patience: -0.02,
                 ..Default::default()
             },
             PendingDeltas::default(),
             1.0,
-            &t,
+            &AffinityTuning::default(),
         );
-        assert!((o.committed.patience - (-0.02)).abs() < 1e-9);
-        assert!((o.raw.patience - (-0.02)).abs() < 1e-9);
+        assert_eq!(o.raw.warmth, 0.0);
+        assert_eq!(o.committed.warmth, 0.0);
+        assert_eq!(o.raw.patience, 0.0);
+        assert_eq!(o.committed.patience, 0.0);
     }
 
     /// Out-of-range grades clamp instead of scaling: the judge cannot mint
     /// more than a ±4 verdict no matter what it emits.
     #[test]
     fn grades_clamp_to_plus_minus_four() {
+        let t = AffinityTuning::default();
         let a = zeroed();
         let o = turn(
             &a,
             AxisGrades {
-                warmth: 9,
-                trust: -9,
+                trust: 9,
+                intimacy: -9,
                 ..Default::default()
             },
             AffinityDeltas::default(),
             PendingDeltas::default(),
             1.0,
-            &AffinityTuning::default(),
+            &t,
         );
-        assert!((o.committed.warmth - 0.2).abs() < 1e-9);
-        assert!((o.committed.trust - (-0.3)).abs() < 1e-9);
-    }
-
-    // ─── affinity 3.1 scope steering ───
-
-    /// The mode is a TOTAL function over the six bools, so an axes array steers
-    /// as predictably as a named value. Anything touching the chemistry half
-    /// suppresses; only a bond-half-exclusive scope boosts.
-    #[test]
-    fn scope_mode_is_total_over_the_six_bools() {
-        use crate::scope::{AffinityAxis, AffinityScope};
-        let of = |s: AffinityScope| ScopeMode::of(&s);
-        assert_eq!(of(AffinityScope::none()), ScopeMode::Neutral);
-        assert_eq!(of(AffinityScope::bond()), ScopeMode::BoostBond);
-        assert_eq!(of(AffinityScope::chemistry()), ScopeMode::SuppressChemistry);
-        assert_eq!(of(AffinityScope::full()), ScopeMode::SuppressChemistry);
-        // A mixed array lands on the suppress side — the default disposition.
-        assert_eq!(
-            of(AffinityScope::from_axes(&[
-                AffinityAxis::Warmth,
-                AffinityAxis::Trust
-            ])),
-            ScopeMode::SuppressChemistry
-        );
-        // A lone bond-half axis still boosts.
-        assert_eq!(
-            of(AffinityScope::from_axes(&[AffinityAxis::Warmth])),
-            ScopeMode::BoostBond
-        );
-        assert_eq!(ScopeMode::BoostBond.as_key(), "boost_bond");
-    }
-
-    /// `bond` scope: the bond-EXCLUSIVE axes take the constant. warmth feeds
-    /// both composites and is exempt, or the boost would leak onto chemistry.
-    #[test]
-    fn bond_scope_boosts_exclusive_axes_only_and_spares_warmth() {
-        let a = zeroed();
-        let o = scoped(
-            &a,
-            AxisGrades {
-                warmth: 2,
-                trust: 2,
-                intrigue: 2,
-                ..Default::default()
-            },
-            crate::scope::AffinityScope::bond(),
-        );
-        assert_eq!(o.scope_mode, ScopeMode::BoostBond);
-        // 2 × 0.05 × 1.5 = 0.15 on the exclusive axes …
-        assert!((o.committed.trust - 0.15).abs() < 1e-9);
-        assert!((o.committed.intrigue - 0.15).abs() < 1e-9);
-        // … and a plain 2 × 0.05 on shared warmth.
-        assert!((o.committed.warmth - 0.10).abs() < 1e-9);
-    }
-
-    /// The boost raises the bar, it does not soften damage: negative raw keeps
-    /// paying `neg_factor` and nothing else. (grade −1 rather than −2 so a
-    /// wrongly-applied 1.5 boost cannot alias the 1.5 neg_factor.)
-    #[test]
-    fn bond_scope_never_scales_losses() {
-        let a = zeroed();
-        let o = scoped(
-            &a,
-            AxisGrades {
-                trust: -1,
-                ..Default::default()
-            },
-            crate::scope::AffinityScope::bond(),
-        );
-        // −1 × 0.05 × 1.5 = −0.075; boosted would be −0.1125.
-        assert!((o.committed.trust - (-0.075)).abs() < 1e-9);
-    }
-
-    /// The ladder: g1 filtered, g2 halved, milestones untouched. Chemistry
-    /// axes only — trust/intrigue ride through at 3.0 rates under this mode.
-    #[test]
-    fn chemistry_scope_ladders_only_the_low_grades() {
-        let a = zeroed();
-        let grade = |g: i8| {
-            scoped(
-                &a,
-                AxisGrades {
-                    intimacy: g,
-                    ..Default::default()
-                },
-                crate::scope::AffinityScope::chemistry(),
-            )
-            .committed
-            .intimacy
-        };
-        assert_eq!(grade(1), 0.0, "g1 is filtered out entirely");
-        assert!((grade(2) - 0.05).abs() < 1e-9, "g2 lands as a g1");
-        assert!((grade(3) - 0.15).abs() < 1e-9, "g3 is untouched");
-        assert!((grade(4) - 0.20).abs() < 1e-9, "g4 is untouched");
-        // Losses are never laddered.
-        assert!((grade(-2) - (-0.15)).abs() < 1e-9);
-    }
-
-    /// The property the whole design rests on: a grade the ladder zeroes reads
-    /// as "the judge did not touch this axis", so it charges NO cross penalty.
-    /// Without that, halving small pushes while leaving the penalty at full
-    /// price would manufacture a friend-zone wall 3.0 never had.
-    #[test]
-    fn laddered_out_grade_pays_no_cross_penalty() {
-        let mut a = zeroed();
-        a.warmth = 1.0;
-        a.trust = 1.0;
-        a.intrigue = 1.0; // bond = 1.0 — the most expensive counterpart there is
-        a.intimacy = 1.0;
-        a.tension = 1.0; // chemistry = 1.0 → own tier 5, where a loss is possible
-        let g = AxisGrades {
-            intimacy: 1,
-            ..Default::default()
-        };
-        // Unsteered: the push lands, the penalty takes more than it.
-        let neutral = scoped(&a, g, crate::scope::AffinityScope::none());
-        assert!(neutral.committed.intimacy < 0.0);
-        assert!(neutral.cross_penalty_assessed.intimacy > 0.0);
-        // Suppressed: nothing happens at all — not a smaller loss, zero. The
-        // ladder maps g1 to 0, and a grade of 0 is simply where the proportional
-        // penalty starts.
-        let suppressed = scoped(&a, g, crate::scope::AffinityScope::chemistry());
-        assert_eq!(suppressed.committed.intimacy, 0.0);
-        assert_eq!(suppressed.cross_penalty_assessed.intimacy, 0.0);
-    }
-
-    /// `full` is the dominant production value and steers the suppress side —
-    /// and because the mode is exclusive, bond gets no boost on those turns.
-    #[test]
-    fn full_scope_suppresses_chemistry_without_boosting_bond() {
-        let a = zeroed();
-        let o = scoped(
-            &a,
-            AxisGrades {
-                trust: 2,
-                intimacy: 2,
-                tension: 1,
-                ..Default::default()
-            },
-            crate::scope::AffinityScope::full(),
-        );
-        assert_eq!(o.scope_mode, ScopeMode::SuppressChemistry);
-        assert!((o.committed.trust - 0.10).abs() < 1e-9, "no bond boost");
-        assert!((o.committed.intimacy - 0.05).abs() < 1e-9, "g2 → g1");
-        assert_eq!(o.committed.tension, 0.0, "g1 filtered");
-    }
-
-    /// The audit trail: a committed 0 must stay attributable. `effective_grades`
-    /// records what was converted; the judge's originals are logged beside it.
-    #[test]
-    fn effective_grades_record_what_the_ladder_did() {
-        let a = zeroed();
-        let judged = AxisGrades {
-            warmth: 1,
-            trust: 1,
-            intrigue: 0,
-            intimacy: 1,
-            tension: 2,
-        };
-        let o = scoped(&a, judged, crate::scope::AffinityScope::full());
-        assert_eq!(
-            o.effective_grades,
-            AxisGrades {
-                warmth: 1,
-                trust: 1,
-                intrigue: 0,
-                intimacy: 0, // filtered
-                tension: 1,  // halved
-            }
-        );
-        // Neutral steering leaves the grades verbatim.
-        let n = scoped(&a, judged, crate::scope::AffinityScope::none());
-        assert_eq!(n.effective_grades, judged);
-    }
-
-    /// Identity settings turn 3.1 off without a code path of its own.
-    #[test]
-    fn identity_tuning_reproduces_30_under_any_scope() {
-        let a = zeroed();
-        let t = AffinityTuning {
-            scope_bond_boost: 1.0,
-            scope_chem_ladder: [0, 1, 2, 3, 4],
-            ..Default::default()
-        };
-        let g = AxisGrades {
-            trust: 2,
-            intimacy: 1,
-            ..Default::default()
-        };
-        for scope in [
-            crate::scope::AffinityScope::bond(),
-            crate::scope::AffinityScope::full(),
-            crate::scope::AffinityScope::none(),
-        ] {
-            let o = grade_turn(
-                &a,
-                &g,
-                &AffinityDeltas::default(),
-                &PendingDeltas::default(),
-                1.0,
-                &scope,
-                &t,
-            );
-            assert!((o.committed.trust - 0.10).abs() < 1e-9);
-            assert!((o.committed.intimacy - 0.05).abs() < 1e-9);
-        }
+        assert!((o.committed.trust - 4.0 * t.grade_unit_bond).abs() < 1e-9);
+        assert!((o.committed.intimacy - (-4.0 * t.grade_unit_chem * t.neg_factor)).abs() < 1e-9);
     }
 
     #[test]
@@ -1731,10 +1368,10 @@ mod tests {
         before.intimacy = 0.0;
         before.tension = 0.0;
         let mut after = before.clone();
-        after.trust = 0.9;
-        after.intrigue = 0.9; // bond → close_friend
-        after.intimacy = 0.9;
-        after.tension = 0.9; // chem = 0.6 → tier 3 (crush)
+        after.trust = 0.6;
+        after.intrigue = 0.6; // bond = 0.6 → tier 3 (close_friend)
+        after.intimacy = 0.5;
+        after.tension = 0.5; // chem = 0.5 → tier 3 (crush)
         let d = diff_labels(&before, &after).unwrap();
         assert_eq!(d.bond.unwrap().to, "close_friend");
         assert_eq!(d.chemistry.unwrap().to, "crush");
@@ -1787,6 +1424,121 @@ mod tests {
         // Defensive: a stored 0 or 7 behaves as the nearest valid level.
         assert_eq!(endpoint_value(0, 0.5, 1.0, 0.2), endpoint_value(1, 0.5, 1.0, 0.2));
         assert_eq!(endpoint_value(7, 0.5, 1.0, 0.2), endpoint_value(3, 0.5, 1.0, 0.2));
+    }
+
+    #[test]
+    fn composites_are_two_axis_means() {
+        let mut a = fresh();
+        a.warmth = 1.0; // must NOT leak into either line any more
+        a.trust = 0.4;
+        a.intrigue = 0.6;
+        a.intimacy = 0.3;
+        a.tension = 0.2;
+        assert!((a.bond_score() - 0.5).abs() < 1e-9);
+        assert!((a.chemistry_score() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn refresh_endpoints_tsundere_quadrant() {
+        // Low bond × high chem ⇒ low patience × high warmth, from one verdict pair.
+        let t = AffinityTuning::default();
+        let mut a = fresh();
+        a.trust = 0.1;
+        a.intrigue = 0.1; // bond = 0.1
+        a.intimacy = 0.9;
+        a.tension = 0.9; // chem = 0.9
+        a.warmth_grade = 3;
+        a.patience_grade = 3;
+        a.updated_at = Utc::now(); // decay ≈ 1
+        a.refresh_endpoints(&t);
+        // warmth = 2/3 · B(0.9) = 2/3 · 1.4231 ≈ 0.949
+        assert!((a.warmth - (2.0 / 3.0) * (1.0 + (10.0 / 13.0) * 0.55)).abs() < 1e-6);
+        // patience = 2/3 · B(0.1) = 2/3 · 0.8077 ≈ 0.538
+        assert!((a.patience - (2.0 / 3.0) * (1.0 - (10.0 / 13.0) * 0.25)).abs() < 1e-6);
+        assert!(a.warmth > a.patience, "tsundere: warm but impatient");
+    }
+
+    #[test]
+    fn time_decay_no_longer_drifts_patience_up() {
+        let mut a = fresh();
+        a.patience = 0.4;
+        a.updated_at = Utc::now() - chrono::Duration::days(10);
+        a.apply_time_decay();
+        assert!(
+            (a.patience - 0.4).abs() < 1e-12,
+            "patience drift retired; endpoint decay owns absence now"
+        );
+    }
+
+    #[test]
+    fn per_line_units_and_ratio_kappa() {
+        // A +2 trust grade at tier 1, no counterpart pressure, no gate:
+        // committed = 2 · u_bond · decay(tier1)=1.0. Same grade on intimacy → 2·u_chem.
+        let t = AffinityTuning::default();
+        let mut a = fresh();
+        a.warmth = 0.0;
+        a.trust = 0.0;
+        a.intrigue = 0.0;
+        a.intimacy = 0.0;
+        a.tension = 0.0;
+        let g = AxisGrades {
+            trust: 2,
+            intrigue: 0,
+            intimacy: 2,
+            tension: 0,
+        };
+        let out = grade_turn(
+            &a,
+            &g,
+            &AffinityDeltas::default(),
+            &PendingDeltas::default(),
+            1.0,
+            &t,
+        );
+        assert!((out.committed.trust - 2.0 * t.grade_unit_bond).abs() < 1e-9);
+        assert!((out.committed.intimacy - 2.0 * t.grade_unit_chem).abs() < 1e-9);
+        assert_eq!(out.committed.warmth, 0.0);
+        assert_eq!(out.committed.patience, 0.0);
+    }
+
+    #[test]
+    fn break_even_position_is_unit_invariant() {
+        // κ = ratio·u ⇒ φ(y*) = 4·D_k/ratio — the double-high wall cannot move
+        // with the unit. Verify by scanning for the sign flip of a +1 intimacy
+        // grade at chem tier 5, under two very different chem units.
+        let mut t1 = AffinityTuning::default();
+        let mut t2 = AffinityTuning::default();
+        t1.grade_unit_chem = 0.0266;
+        t2.grade_unit_chem = 0.10;
+        let y_star = |t: &AffinityTuning| {
+            let mut a = fresh();
+            a.warmth = 0.0;
+            a.intimacy = 1.0;
+            a.tension = 0.9; // own line (chem) tier 5
+            (0..=1000).map(|i| f64::from(i) / 1000.0).find(|&y| {
+                let mut b = a.clone();
+                b.trust = y;
+                b.intrigue = y; // counterpart bond = y
+                let g = AxisGrades {
+                    trust: 0,
+                    intrigue: 0,
+                    intimacy: 1,
+                    tension: 0,
+                };
+                let out = grade_turn(
+                    &b,
+                    &g,
+                    &AffinityDeltas::default(),
+                    &PendingDeltas::default(),
+                    1.0,
+                    t,
+                );
+                out.committed.intimacy < 0.0
+            })
+        };
+        let y1 = y_star(&t1);
+        assert!(y1.is_some(), "a break-even must exist at tier 5");
+        assert_eq!(y1, y_star(&t2), "κ tied to unit ⇒ wall does not move with the unit");
     }
 
     #[test]
