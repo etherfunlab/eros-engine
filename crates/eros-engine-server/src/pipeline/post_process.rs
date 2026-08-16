@@ -1449,7 +1449,11 @@ mod tests {
         ] {
             let (g, lv, reason) = parse_affinity_eval(raw);
             assert_eq!(g, AxisGrades::default(), "whole verdict zeroed: {raw}");
-            assert_eq!(lv, EndpointLevelReads::default(), "levels distrusted with the verdict: {raw}");
+            assert_eq!(
+                lv,
+                EndpointLevelReads::default(),
+                "levels distrusted with the verdict: {raw}"
+            );
             assert!(reason.is_empty(), "reason distrusted too: {raw}");
         }
     }
@@ -1482,7 +1486,10 @@ mod tests {
     fn parse_affinity_eval_salvages_unambiguous_slips() {
         let raw = r#"{"warmth":"3","trust":{"grade":"2"},"intimacy":{"direction":"down"},"patience":"2","reason":"x"}"#;
         let (g, lv, _) = parse_affinity_eval(raw);
-        assert_eq!(g.trust, 2, "quoted integer grade + missing direction salvaged");
+        assert_eq!(
+            g.trust, 2,
+            "quoted integer grade + missing direction salvaged"
+        );
         assert_eq!(g.intimacy, 0, "missing grade means nothing happened");
         assert_eq!(lv.warmth, Some(3), "quoted integer level is salvaged");
         assert_eq!(lv.patience, Some(2));
@@ -1499,7 +1506,11 @@ mod tests {
         ] {
             let (g, lv, _) = parse_affinity_eval(raw);
             assert_eq!(g.trust, 1, "grades unaffected: {raw}");
-            assert_eq!(lv, EndpointLevelReads::default(), "omitted level → hold: {raw}");
+            assert_eq!(
+                lv,
+                EndpointLevelReads::default(),
+                "omitted level → hold: {raw}"
+            );
         }
     }
 

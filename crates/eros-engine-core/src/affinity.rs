@@ -84,8 +84,14 @@ impl Affinity {
     pub fn refresh_endpoints(&mut self, t: &AffinityTuning) {
         let days = (Utc::now() - self.updated_at).num_minutes() as f64 / (60.0 * 24.0);
         let decay = endpoint_time_decay(days, t.time_decay_rate, t.time_decay_floor);
-        self.warmth = endpoint_value(self.warmth_grade, self.chemistry_score(), decay, t.floor_ratio);
-        self.patience = endpoint_value(self.patience_grade, self.bond_score(), decay, t.floor_ratio);
+        self.warmth = endpoint_value(
+            self.warmth_grade,
+            self.chemistry_score(),
+            decay,
+            t.floor_ratio,
+        );
+        self.patience =
+            endpoint_value(self.patience_grade, self.bond_score(), decay, t.floor_ratio);
     }
 
     /// Legacy 5-name relationship label (back-compat), derived purely from the
@@ -504,7 +510,7 @@ impl PendingDeltas {
 /// turn (zero while the gate holds). `pending` = the gate's new balance.
 /// The `warmth`/`patience` fields of `raw` and `committed` are always 0.0:
 /// the endpoints left the graded pipeline (see `refresh_endpoints`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GradeTurnOutcome {
     pub raw: AffinityDeltas,
     pub committed: AffinityDeltas,
@@ -533,17 +539,6 @@ pub struct CrossPenaltyAssessed {
 impl CrossPenaltyAssessed {
     pub fn is_zero(&self) -> bool {
         self.trust == 0.0 && self.intrigue == 0.0 && self.intimacy == 0.0 && self.tension == 0.0
-    }
-}
-
-impl Default for GradeTurnOutcome {
-    fn default() -> Self {
-        Self {
-            raw: AffinityDeltas::default(),
-            committed: AffinityDeltas::default(),
-            pending: PendingDeltas::default(),
-            cross_penalty_assessed: CrossPenaltyAssessed::default(),
-        }
     }
 }
 
@@ -1127,7 +1122,7 @@ mod tests {
         a.intrigue = 1.0; // bond = 1.0 — the counterpart
         a.intimacy = 1.0;
         a.tension = 1.0; // chemistry = 1.0 → own tier 5
-        // ρ = g·u_chem·(D₅ − ratio·φ(1)/4) = g·u_chem·(0.10 − 5/24) < 0.
+                         // ρ = g·u_chem·(D₅ − ratio·φ(1)/4) = g·u_chem·(0.10 − 5/24) < 0.
         let unit_net = t.grade_unit_chem * (0.10 - t.cross_penalty_ratio / 4.0);
         assert!(unit_net < 0.0);
         for g in 1..=4 {
@@ -1422,8 +1417,14 @@ mod tests {
     #[test]
     fn endpoint_level_out_of_range_clamps() {
         // Defensive: a stored 0 or 7 behaves as the nearest valid level.
-        assert_eq!(endpoint_value(0, 0.5, 1.0, 0.2), endpoint_value(1, 0.5, 1.0, 0.2));
-        assert_eq!(endpoint_value(7, 0.5, 1.0, 0.2), endpoint_value(3, 0.5, 1.0, 0.2));
+        assert_eq!(
+            endpoint_value(0, 0.5, 1.0, 0.2),
+            endpoint_value(1, 0.5, 1.0, 0.2)
+        );
+        assert_eq!(
+            endpoint_value(7, 0.5, 1.0, 0.2),
+            endpoint_value(3, 0.5, 1.0, 0.2)
+        );
     }
 
     #[test]
@@ -1538,7 +1539,11 @@ mod tests {
         };
         let y1 = y_star(&t1);
         assert!(y1.is_some(), "a break-even must exist at tier 5");
-        assert_eq!(y1, y_star(&t2), "κ tied to unit ⇒ wall does not move with the unit");
+        assert_eq!(
+            y1,
+            y_star(&t2),
+            "κ tied to unit ⇒ wall does not move with the unit"
+        );
     }
 
     #[test]
