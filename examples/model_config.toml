@@ -506,7 +506,11 @@ content 表达规则：第三人称、以「角色」开头；保留原始信息
 
 # Stage 2 of the character chain: turns stage-1 facts into the ten-column
 # object. NO filter_prompt here — that prompt is built in the engine
-# (prompt.rs) and is not configurable, the same shape as affinity_evaluation.
+# (prompt.rs) and is not configurable, the same shape as affinity_evaluation:
+# setting the key REFUSES TO BOOT (in any shape, blank included) rather than
+# being silently ignored, because it has to stay in lockstep with the
+# character_insights columns it fills. To change what gets extracted, edit
+# [tasks.character_insight_extraction].filter_prompt above.
 # Delete this block and stage 2 runs on the extraction block's parameters.
 [tasks.character_insight_structuring]
 model = "anthropic/claude-haiku-4.5"

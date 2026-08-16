@@ -242,6 +242,14 @@ async fn run_server() -> Result<()> {
         anyhow::bail!(msg);
     }
 
+    // Same placement rationale as the affinity gate directly above: shape-
+    // independent, so a variant-shaped filter_prompt under
+    // [tasks.character_insight_structuring] gets the accurate "this prompt is
+    // engine-owned" message rather than the generic variant one.
+    if let Err(msg) = model_config.validate_structuring_prompt_unset() {
+        anyhow::bail!(msg);
+    }
+
     // Prompt-variant shape gate runs before the resolver-based checks below
     // (extraction / product_qa). Those detect "unset" via
     // `PromptSpec::as_plain()`, under which a variant shape (array/table)
@@ -485,6 +493,17 @@ mod tests {
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_affinity_prompt_unset()
             .expect("shipped example must not set an affinity filter_prompt");
+    }
+
+    /// The shipped example's [tasks.character_insight_structuring] block is
+    /// parameters-only by design — it MUST pass the structuring dead-config
+    /// gate, or `main` bails on the config we tell people to copy.
+    #[test]
+    fn shipped_model_config_satisfies_structuring_prompt_boot_gate() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        cfg.validate_structuring_prompt_unset()
+            .expect("shipped example must not set a structuring filter_prompt");
     }
 
     /// Every `[tasks.*.tiers.*]` block in the shipped example is commented out

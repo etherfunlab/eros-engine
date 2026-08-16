@@ -484,7 +484,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——五个档位轴加一个 patience 绝对读数，由引擎侧换算成 delta；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
-| `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里。注意与 `affinity_evaluation` 的差别：这个键上没有 boot 闸门，写了不会拒绝启动，而是被静默忽略的死配置。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
+| `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -823,8 +823,12 @@ stage 1，见上文"任务名"一节）都由各自 `[tasks.*_extraction]` **章
   `insight_extraction`；dreaming sweeper 保持不生效；角色链两个 stage 都不会跑）。
 
 `character_insight_structuring`（角色链 stage 2）**故意不在这个闸门里**——
-与上面三个任务不同，它根本不接受 `filter_prompt`（它的 prompt 写死在
-`prompt.rs` 里，不可配置），所以没有可校验的东西。如果照抄示例配置、把
+因为这个闸门要求必须有 prompt，而 stage 2 必须没有。它被反方向的闸门管着：
+它的 prompt 写死在 `prompt.rs` 里，所以给它设置 `filter_prompt` 会拒绝启动
+（见上面的 `affinity_evaluation`，同一条死配置规则）。「不在这个闸门里」
+是「被另一个闸门管着」，不是「没人管」。
+
+如果照抄示例配置、把
 `[tasks.character_insight_extraction].filter_prompt` 清空，指望功能安静关掉，
 结果会是拒绝启动——要关闭整条链，删掉整个 section。
 

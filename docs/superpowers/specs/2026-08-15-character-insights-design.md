@@ -407,7 +407,14 @@ without a prompt (and a test asserts it stays that way). Consequently:
   `"character_insight_structuring"`.
 - `validate_extraction_prompts` gains **only** `character_insight_extraction`:
   present-with-blank-`filter_prompt` refuses boot, absent means the feature is
-  off. The stage-2 block has no prompt to validate.
+  off. The stage-2 block has no prompt to require.
+- `validate_structuring_prompt_unset` gates stage 2 in the **opposite**
+  direction: a `filter_prompt` set there refuses boot, in any shape including
+  blank. *(Added as a follow-up after the initial merge — the first cut left
+  the key as silently-ignored dead config, which is exactly what
+  `validate_affinity_prompt_unset` and `validate_tier_blocks` exist to
+  prevent. Two gates rather than one because they enforce opposite things: one
+  requires the key, the other forbids it.)*
 
 **The stage-1 block is the entire on/off switch.** No new flag, no new env var:
 `resolve_character_insight_extract()` returning `None` skips the whole chain

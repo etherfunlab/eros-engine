@@ -2463,6 +2463,49 @@ impl ModelConfig {
         Ok(())
     }
 
+    /// Boot gate for `[tasks.character_insight_structuring].filter_prompt` —
+    /// the second key in this config that parses but is never read.
+    ///
+    /// The character chain's structuring stage builds its prompt in
+    /// `prompt.rs`: the ten-column schema it must emit is the same schema
+    /// `project_columns` reads back, so letting an operator rewrite it would
+    /// let the two drift apart silently — every unrecognised key is dropped on
+    /// projection, so the symptom is columns that quietly stop filling, not an
+    /// error. `resolve_structuring` returns a `ResolvedModel`, which carries no
+    /// `filter_prompt` field at all, so a value set here was never read.
+    ///
+    /// Same treatment as [`Self::validate_affinity_prompt_unset`] and for the
+    /// same reason: dead config must never silently no-op. Rejects the key in
+    /// EVERY shape, blank included — blank leniency exists for keys that are
+    /// actually read, and here it would reproduce the exact silence this gate
+    /// removes. Every other field on the block (model, fallback, temperature,
+    /// max_tokens, sampling, reasoning) stays configurable; those are the whole
+    /// point of the block existing separately from stage 1.
+    ///
+    /// Deliberately NOT folded together with the affinity gate: they are two
+    /// short checks with different rationales, and this codebase prefers three
+    /// similar sites to a premature abstraction. The third — the human chain's
+    /// `insight_structuring`, once that split lands — is the moment to unify.
+    pub fn validate_structuring_prompt_unset(&self) -> Result<(), String> {
+        const STRUCTURING_TASK: &str = "character_insight_structuring";
+        let has_prompt = self
+            .tasks
+            .get(STRUCTURING_TASK)
+            .is_some_and(|t| t.filter_prompt.is_some());
+        if has_prompt {
+            return Err(format!(
+                "[tasks.{STRUCTURING_TASK}].filter_prompt is set, but the structuring stage's \
+                 prompt is engine-owned and deliberately not configurable — it was never read, \
+                 and eros-engine refuses to boot rather than let it silently no-op. The prompt \
+                 must stay in lockstep with the character_insights columns it fills. Remove the \
+                 key; model/fallback/temperature/max_tokens/sampling/reasoning remain \
+                 configurable. To change what stage 1 extracts, set \
+                 [tasks.character_insight_extraction].filter_prompt instead."
+            ));
+        }
+        Ok(())
+    }
+
     /// Boot gate for `[tasks.<name>.tiers.<tier>]` blocks under tasks that
     /// never resolve with a tier (issue #215).
     ///
@@ -5067,12 +5110,18 @@ filter_prompt = "   "
 
         // Stage 2 has NO configurable prompt (it is built in prompt.rs), so a
         // block without one is correct and must boot.
+        //
+        // "Not in THIS gate" is not "ungated": a filter_prompt set on stage 2
+        // is dead config and refused by `validate_structuring_prompt_unset`.
+        // The two gates are separate because they enforce opposite things —
+        // this one requires the key, that one forbids it.
         let ok = ModelConfig::from_toml_str(
             "[tasks.character_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n\n\
              [tasks.character_insight_structuring]\nmodel = \"m2\"\n",
         )
         .unwrap();
         assert!(ok.validate_extraction_prompts().is_ok());
+        assert!(ok.validate_structuring_prompt_unset().is_ok());
     }
 
     #[test]
@@ -6666,6 +6715,87 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
     }
 
     // ─── validate_affinity_prompt_unset ──────────────────────────────────
+    #[test]
+    fn structuring_filter_prompt_absent_boots() {
+        // The shape the shipped example uses: parameters only.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\nmax_tokens = 600\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_ok());
+    }
+
+    #[test]
+    fn structuring_task_absent_boots() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_ok());
+    }
+
+    #[test]
+    fn structuring_filter_prompt_set_refuses_to_boot() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\n\
+             filter_prompt = \"emit the ten columns\"\n",
+        )
+        .unwrap();
+        let err = cfg
+            .validate_structuring_prompt_unset()
+            .expect_err("a set filter_prompt must refuse to boot");
+        assert!(
+            err.contains("[tasks.character_insight_structuring].filter_prompt"),
+            "{err}"
+        );
+        assert!(err.contains("refuses to boot"), "{err}");
+        // The message must point at the key that IS configurable, or an
+        // operator who wanted to change extraction has nowhere to go.
+        assert!(
+            err.contains("[tasks.character_insight_extraction].filter_prompt"),
+            "error must name the configurable alternative: {err}"
+        );
+    }
+
+    #[test]
+    fn structuring_blank_filter_prompt_also_refuses_to_boot() {
+        // Blank is NOT the lenient "commented out" case: the key is dead config
+        // in every shape, so accepting blank would reproduce the exact silence
+        // this gate exists to remove.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\nfilter_prompt = \"\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_err());
+    }
+
+    #[test]
+    fn structuring_variant_shaped_filter_prompt_also_refuses_to_boot() {
+        // Shape-independent: a table/array-shaped prompt reads as `None` through
+        // `as_plain()`, so a resolver-based check would miss it entirely. This
+        // gate asks only whether the key exists.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\n\
+             filter_prompt = { a = \"x\", b = \"y\" }\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_err());
+    }
+
+    #[test]
+    fn structuring_gate_ignores_a_prompt_on_the_extraction_block() {
+        // Stage 1 is prompt-bearing and REQUIRED to have one. The two gates must
+        // not cross-fire.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_extraction]\nmodel = \"m\"\n\
+             filter_prompt = \"mine character facts\"\n\n\
+             [tasks.character_insight_structuring]\nmodel = \"m2\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_ok());
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
     #[test]
     fn affinity_filter_prompt_absent_boots() {
         let cfg = ModelConfig::from_toml_str(

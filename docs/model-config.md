@@ -544,7 +544,7 @@ input filter has no triggers, timing, or tiers).
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — five graded axes plus an absolute patience read, converted to deltas engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
-| `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs`. Note the contrast with `affinity_evaluation`: there is no boot gate on this key, so a value set on it is silently ignored dead config rather than a boot failure. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
+| `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `character_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
@@ -1009,9 +1009,13 @@ experimental character chain, §"Task names" above) are controlled by the
   the character chain — both stages — never runs).
 
 `character_insight_structuring` (stage 2 of the character chain) is
-**deliberately NOT in this gate** — unlike the three tasks above, it carries no
-`filter_prompt` at all (its prompt is built in `prompt.rs`, not configured), so
-there is nothing to validate. If you copy the shipped example and blank out
+**deliberately NOT in this gate**, because this gate *requires* a prompt and
+stage 2 must not have one. It is gated in the opposite direction instead: its
+prompt is built in `prompt.rs`, so setting `filter_prompt` on it refuses to boot
+(see `affinity_evaluation` above — same dead-config rule). "Not in this gate"
+means "gated the other way", not "ungated".
+
+If you copy the shipped example and blank out
 `[tasks.character_insight_extraction].filter_prompt` expecting the feature to
 just go quiet, it instead refuses to boot — remove the section entirely to
 disable the chain.
