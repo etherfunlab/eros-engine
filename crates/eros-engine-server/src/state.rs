@@ -114,9 +114,18 @@ pub(crate) fn affinity_tuning_from(
                 _ => tracing::warn!("invalid {name}={raw:?}; keeping default {}", *slot),
             }
         };
-        knob("AFFINITY_GRADE_UNIT", &mut t.grade_unit, |v| v >= 0.0);
+        knob("AFFINITY_GRADE_UNIT_BOND", &mut t.grade_unit_bond, |v| {
+            v >= 0.0
+        });
+        knob("AFFINITY_GRADE_UNIT_CHEM", &mut t.grade_unit_chem, |v| {
+            v >= 0.0
+        });
         knob("AFFINITY_NEG_FACTOR", &mut t.neg_factor, |v| v >= 0.0);
-        knob("AFFINITY_CROSS_PENALTY", &mut t.cross_penalty, |v| v >= 0.0);
+        knob(
+            "AFFINITY_CROSS_PENALTY_RATIO",
+            &mut t.cross_penalty_ratio,
+            |v| v >= 0.0,
+        );
         knob(
             "AFFINITY_CROSS_PENALTY_START",
             &mut t.cross_penalty_start,
@@ -126,8 +135,16 @@ pub(crate) fn affinity_tuning_from(
             v >= 0.0
         });
         knob("AFFINITY_DEMO_BOOST", &mut t.demo_boost, |v| v >= 0.0);
-        knob("AFFINITY_SCOPE_BOND_BOOST", &mut t.scope_bond_boost, |v| {
+        // ≤ 0.24 keeps the floor strictly below level 2's minimum
+        // (1/3·B(0) ≈ 0.2436), so it can never override a non-cold verdict.
+        knob("AFFINITY_FLOOR_RATIO", &mut t.floor_ratio, |v| {
+            (0.0..=0.24).contains(&v)
+        });
+        knob("AFFINITY_TIME_DECAY_RATE", &mut t.time_decay_rate, |v| {
             v >= 0.0
+        });
+        knob("AFFINITY_TIME_DECAY_FLOOR", &mut t.time_decay_floor, |v| {
+            (0.0..=1.0).contains(&v)
         });
     }
     if let Some(raw) = get("AFFINITY_TIER_DECAY") {
@@ -138,37 +155,7 @@ pub(crate) fn affinity_tuning_from(
             }
         }
     }
-    if let Some(raw) = get("AFFINITY_SCOPE_CHEM_LADDER") {
-        match parse_chem_ladder(&raw) {
-            Some(table) => t.scope_chem_ladder = table,
-            None => {
-                tracing::warn!("invalid AFFINITY_SCOPE_CHEM_LADDER={raw:?}; keeping default table")
-            }
-        }
-    }
     t
-}
-
-/// Exactly five comma-separated grades in 0..=4, indexed by the judge's
-/// positive grade. Positional like `parse_tier_decay`, and rejected whole for
-/// the same reason. Slot 0 must stay 0 — a grade of 0 means the judge did not
-/// touch the axis, and minting a delta from it would charge rent on silence.
-/// Not required to be monotonic: an experiment that flattens the top is a
-/// legitimate tuning direction. `0,1,2,3,4` is the identity (3.1 off).
-pub(crate) fn parse_chem_ladder(raw: &str) -> Option<[i8; 5]> {
-    let fields: Vec<&str> = raw.split(',').collect();
-    if fields.len() != 5 {
-        return None;
-    }
-    let mut out = [0i8; 5];
-    for (slot, f) in out.iter_mut().zip(fields) {
-        let v = f.trim().parse::<i8>().ok()?;
-        if !(0..=4).contains(&v) {
-            return None;
-        }
-        *slot = v;
-    }
-    (out[0] == 0).then_some(out)
 }
 
 /// Exactly five comma-separated finite non-negative values — anything else
@@ -409,20 +396,28 @@ mod tests {
     #[test]
     fn affinity_tuning_valid_values_apply() {
         let t = tuning_with(&[
-            ("AFFINITY_GRADE_UNIT", "0.04"),
+            ("AFFINITY_GRADE_UNIT_BOND", "0.09"),
+            ("AFFINITY_GRADE_UNIT_CHEM", "0.03"),
             ("AFFINITY_NEG_FACTOR", "2.0"),
-            ("AFFINITY_CROSS_PENALTY", "0.03"),
+            ("AFFINITY_CROSS_PENALTY_RATIO", "1.0"),
             ("AFFINITY_CROSS_PENALTY_START", "0.5"),
             ("AFFINITY_DELTA_THRESHOLD", "0.05"),
             ("AFFINITY_DEMO_BOOST", "1.2"),
+            ("AFFINITY_FLOOR_RATIO", "0.15"),
+            ("AFFINITY_TIME_DECAY_RATE", "0.05"),
+            ("AFFINITY_TIME_DECAY_FLOOR", "0.4"),
             ("AFFINITY_TIER_DECAY", "1.0, 0.8, 0.6, 0.4, 0.2"),
         ]);
-        assert_eq!(t.grade_unit, 0.04);
+        assert_eq!(t.grade_unit_bond, 0.09);
+        assert_eq!(t.grade_unit_chem, 0.03);
         assert_eq!(t.neg_factor, 2.0);
-        assert_eq!(t.cross_penalty, 0.03);
+        assert_eq!(t.cross_penalty_ratio, 1.0);
         assert_eq!(t.cross_penalty_start, 0.5);
         assert_eq!(t.delta_threshold, 0.05);
         assert_eq!(t.demo_boost, 1.2);
+        assert_eq!(t.floor_ratio, 0.15);
+        assert_eq!(t.time_decay_rate, 0.05);
+        assert_eq!(t.time_decay_floor, 0.4);
         assert_eq!(t.tier_decay, [1.0, 0.8, 0.6, 0.4, 0.2]);
     }
 
@@ -437,14 +432,19 @@ mod tests {
             ("AFFINITY_CROSS_PENALTY_START", "1.5"),
             ("AFFINITY_CROSS_PENALTY_START", "NaN"),
             ("AFFINITY_CROSS_PENALTY_START", "-0.1"),
-            ("AFFINITY_GRADE_UNIT", "-0.05"),
-            ("AFFINITY_GRADE_UNIT", "inf"),
-            ("AFFINITY_GRADE_UNIT", "abc"),
+            ("AFFINITY_GRADE_UNIT_BOND", "-0.05"),
+            ("AFFINITY_GRADE_UNIT_CHEM", "inf"),
+            ("AFFINITY_GRADE_UNIT_BOND", "abc"),
             ("AFFINITY_NEG_FACTOR", "-1"),
-            ("AFFINITY_CROSS_PENALTY", "-0.05"),
+            ("AFFINITY_CROSS_PENALTY_RATIO", "-0.05"),
             ("AFFINITY_DELTA_THRESHOLD", "-0.5"),
             ("AFFINITY_DELTA_THRESHOLD", "NaN"),
             ("AFFINITY_DEMO_BOOST", "-2"),
+            // floor_ratio past 0.24 could override a level-2 verdict
+            ("AFFINITY_FLOOR_RATIO", "0.3"),
+            ("AFFINITY_FLOOR_RATIO", "-0.1"),
+            ("AFFINITY_TIME_DECAY_RATE", "-0.02"),
+            ("AFFINITY_TIME_DECAY_FLOOR", "1.5"),
         ] {
             let t = tuning_with(&[(name, bad)]);
             assert_eq!(t, d, "{name}={bad} must keep every default");
@@ -458,10 +458,10 @@ mod tests {
     #[test]
     fn affinity_tuning_permits_unusual_but_sound_values() {
         let t = tuning_with(&[
-            ("AFFINITY_GRADE_UNIT", "0"),
+            ("AFFINITY_GRADE_UNIT_BOND", "0"),
             ("AFFINITY_TIER_DECAY", "1.5,1.0,0.45,0.0,0.10"),
         ]);
-        assert_eq!(t.grade_unit, 0.0, "unit 0 = judge channel disabled");
+        assert_eq!(t.grade_unit_bond, 0.0, "unit 0 = judge channel disabled");
         assert_eq!(
             t.tier_decay,
             [1.5, 1.0, 0.45, 0.0, 0.10],
@@ -487,31 +487,6 @@ mod tests {
             parse_tier_decay("1.0, 0.70, 0.45, 0.25, 0.10"),
             Some([1.0, 0.70, 0.45, 0.25, 0.10])
         );
-    }
-
-    /// Same positional contract as the decay table, plus one extra invariant:
-    /// slot 0 must stay 0. A grade of 0 means "the judge did not touch this
-    /// axis" — minting a delta from it would charge rent on silence and, worse,
-    /// make the axis pay a cross-line penalty it never earned.
-    #[test]
-    fn chem_ladder_rejects_malformed_tables_wholesale() {
-        for bad in [
-            "1,0,1,3,4",   // slot 0 non-zero — would mint deltas from silence
-            "0,0,1,3",     // 4 fields
-            "0,0,1,3,4,4", // 6 fields
-            "0,0,1,3,5",   // out of the 0..=4 grade range
-            "0,0,-1,3,4",  // negative — the ladder never flips a sign
-            "0,0,bad,3,4",
-            "0,0,1.5,3,4", // fractional grades are not a thing
-            "",
-        ] {
-            assert_eq!(parse_chem_ladder(bad), None, "must reject: {bad:?}");
-        }
-        assert_eq!(parse_chem_ladder("0, 0, 1, 3, 4"), Some([0, 0, 1, 3, 4]));
-        // The identity is a legitimate value: 3.1 off without a code path.
-        assert_eq!(parse_chem_ladder("0,1,2,3,4"), Some([0, 1, 2, 3, 4]));
-        // Non-monotonic is allowed — flattening the top is a tuning direction.
-        assert_eq!(parse_chem_ladder("0,0,2,1,4"), Some([0, 0, 2, 1, 4]));
     }
 
     #[test]

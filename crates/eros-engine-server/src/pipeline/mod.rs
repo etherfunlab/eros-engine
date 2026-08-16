@@ -157,6 +157,8 @@ mod tests {
             intimacy: 0.0,
             patience: 0.5,
             tension: 0.1,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,

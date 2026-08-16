@@ -74,15 +74,8 @@ pub async fn run(
         Event::UserMessage { content, .. } => content.clone(),
         _ => String::new(),
     };
-    // The resolved injection scope also steers the 3.1 write-side multipliers.
-    // Events that carry no scope (proactive / app-open) fall back to the empty
-    // scope, i.e. `ScopeMode::Neutral` — 3.0 behaviour, never a guessed
-    // disposition. The request default (`bond`) is a *caller* default and must
-    // not become an engine-side boost for turns the caller never scoped.
-    let affinity_scope = match &event {
-        Event::UserMessage { affinity_scope, .. } => *affinity_scope,
-        _ => eros_engine_core::scope::AffinityScope::none(),
-    };
+    // As of 4.0 the request's affinity scope is read-side only (prompt
+    // injection gating); nothing in the write path consumes it any more.
     let client_id = client_id_from_event(&event);
 
     let fut_insight = async {
@@ -140,7 +133,7 @@ pub async fn run(
             eval_text.trim().is_empty(),
         );
 
-        let (grades, patience_abs, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
+        let (grades, levels, reason, affinity_meta, skip_reason) = if pre_skip.is_none() {
             let persona_repo = PersonaRepo { pool: &state.pool };
             let affinity_repo = AffinityRepo { pool: &state.pool };
             let persona_name = match persona_repo.load_companion(instance_id).await {
@@ -164,7 +157,7 @@ pub async fn run(
                 }
                 _ => (
                     eros_engine_core::affinity::AxisGrades::default(),
-                    None,
+                    eros_engine_core::affinity::EndpointLevelReads::default(),
                     String::new(),
                     None,
                     Some("no_persona_or_affinity"),
@@ -173,18 +166,19 @@ pub async fn run(
         } else {
             (
                 eros_engine_core::affinity::AxisGrades::default(),
-                None,
+                eros_engine_core::affinity::EndpointLevelReads::default(),
                 String::new(),
                 None,
                 pre_skip,
             )
         };
 
-        // Grades and rule deltas travel separately into the store, which runs
-        // the 3.0 pipeline (convert → decay → penalty → gate) under the row
-        // lock so the tier lookups always read committed state.
+        // Grades, rule deltas and endpoint levels travel separately into the
+        // store, which runs the 4.0 pipeline (convert → decay → penalty →
+        // gate, then the endpoint derivation) under the row lock so the tier
+        // lookups always read committed state. On a skipped/failed eval the
+        // levels are `None` and the stored levels hold.
         let rule_deltas = plan.affinity_deltas.clone();
-        let patience_tgt = patience_target(patience_abs, rule_deltas.patience);
         let context = build_affinity_context(&reason, skip_reason);
 
         persist_affinity(
@@ -195,10 +189,9 @@ pub async fn run(
             plan.action_type,
             grades,
             rule_deltas,
-            affinity_scope,
             context,
             affinity_meta,
-            patience_tgt,
+            levels,
         )
         .await;
     };
@@ -225,7 +218,7 @@ pub async fn run(
 
 // ─── Affinity persistence ──────────────────────────────────────────
 
-/// Run the graded turn through the 3.0 pipeline (or ghost counters) and write
+/// Run the graded turn through the 4.0 pipeline (or ghost counters) and write
 /// to DB.
 ///
 /// NOTE: `ghost_streak = 0` reset for non-Ghost actions happens in
@@ -242,10 +235,9 @@ async fn persist_affinity(
     action: ActionType,
     grades: eros_engine_core::affinity::AxisGrades,
     rule_deltas: eros_engine_core::affinity::AffinityDeltas,
-    affinity_scope: eros_engine_core::scope::AffinityScope,
     context: serde_json::Value,
     meta: Option<eros_engine_store::OpenRouterCallMeta>,
-    patience_target: Option<f64>,
+    levels: eros_engine_core::affinity::EndpointLevelReads,
 ) {
     let repo = AffinityRepo { pool: &state.pool };
 
@@ -305,12 +297,11 @@ async fn persist_affinity(
                     &grades,
                     &rule_deltas,
                     boost,
-                    &affinity_scope,
                     &state.config.affinity_tuning,
                     event_type,
                     context,
                     meta.as_ref(),
-                    patience_target,
+                    levels,
                 )
                 .await
             {
@@ -456,13 +447,14 @@ fn fold_grade(axis: &LlmAxisGrade) -> Option<i8> {
     Some(sign * n as i8)
 }
 
-/// Raw shape of the affinity evaluator's JSON output. Missing axes default to
-/// grade 0. `patience` is read as an absolute (snapped to 0.1), separate from
-/// the graded axes, and parsed leniently (see `de_lenient_patience`).
+/// Raw shape of the affinity evaluator's JSON output. Missing line axes
+/// default to grade 0. `warmth`/`patience` are absolute LEVELS (1..=3, 4.0),
+/// kept as raw JSON values so a quoted integer can be salvaged in
+/// `fold_level` without failing the whole eval on a formatting slip.
 #[derive(Debug, Default, serde::Deserialize)]
 struct LlmAffinityEval {
     #[serde(default)]
-    warmth: LlmAxisGrade,
+    warmth: serde_json::Value,
     #[serde(default)]
     trust: LlmAxisGrade,
     #[serde(default)]
@@ -471,83 +463,74 @@ struct LlmAffinityEval {
     intimacy: LlmAxisGrade,
     #[serde(default)]
     tension: LlmAxisGrade,
-    #[serde(default, deserialize_with = "de_lenient_patience")]
-    patience: Option<f64>,
+    #[serde(default)]
+    patience: serde_json::Value,
     #[serde(default)]
     reason: String,
 }
 
-/// Lenient deserializer for the optional absolute `patience` read. A quoted
-/// number (`"patience":"0.5"`) is a common LLM formatting slip; without this,
-/// serde would fail the *entire* `LlmAffinityEval` parse on it and drop the five
-/// valid delta axes too. Accepts a JSON number or a *finite* numeric string →
-/// `Some`; null / bool / any other shape / a non-finite string (`"NaN"`,
-/// `"inf"`, which `f64::from_str` otherwise accepts) → `None`. Never errors, so
-/// a malformed patience value can only affect patience — never the deltas — and
-/// a non-finite value can never reach `snap_patience`/`clamp` (they preserve
-/// NaN) or be persisted as a patience target.
-fn de_lenient_patience<'de, D>(de: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v = <serde_json::Value as serde::Deserialize>::deserialize(de)?;
-    Ok(match v {
-        // JSON numbers cannot encode NaN/inf, so the number path is finite by construction.
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
-        _ => None,
-    })
+/// Fold one endpoint's absolute level. Integer (or integer-valued string)
+/// 1..=3 → `Ok(Some)`; null / omitted → `Ok(None)` (hold the stored level);
+/// anything else → `Err` — which rejects the whole verdict, same policy as
+/// `fold_grade` (the engine refuses to guess what a malformed level meant).
+fn fold_level(v: &serde_json::Value) -> Result<Option<i16>, ()> {
+    let n = match v {
+        serde_json::Value::Number(n) => n.as_f64().ok_or(())?,
+        serde_json::Value::String(s) => s.trim().parse::<f64>().map_err(|_| ())?,
+        serde_json::Value::Null => return Ok(None),
+        _ => return Err(()),
+    };
+    if !n.is_finite() || n.fract() != 0.0 || !(1.0..=3.0).contains(&n) {
+        return Err(());
+    }
+    Ok(Some(n as i16))
 }
 
-/// Snap the LLM's absolute patience read to the nearest 0.1 step, clamped to
-/// [0,1]. The 0.1 quantisation is a spec contract on the read only — a model
-/// that emits 0.83 is snapped to 0.8.
-fn snap_patience(v: f64) -> f64 {
-    ((v * 10.0).round() / 10.0).clamp(0.0, 1.0)
-}
-
-/// Parse the evaluator output into signed judge grades. Any failure —
-/// non-JSON, no object, or ANY malformed axis (non-integer / out-of-range
-/// grade, unknown direction) — rejects the whole verdict: all-zero grades, no
-/// patience read, empty reason, so the rule deltas still persist and the
-/// affinity write never fails because the evaluator failed. Returns a
-/// 3-tuple: (grades, snapped_patience, reason).
-fn parse_affinity_eval(raw: &str) -> (eros_engine_core::affinity::AxisGrades, Option<f64>, String) {
-    use eros_engine_core::affinity::AxisGrades;
-    let rejected = (AxisGrades::default(), None, String::new());
+/// Parse the evaluator output into signed judge grades plus the two absolute
+/// endpoint levels. Any failure — non-JSON, no object, ANY malformed axis
+/// (non-integer / out-of-range grade, unknown direction) or malformed level —
+/// rejects the whole verdict: all-zero grades, no level reads, empty reason,
+/// so the rule deltas still persist and the affinity write never fails
+/// because the evaluator failed. Returns (grades, levels, reason).
+fn parse_affinity_eval(
+    raw: &str,
+) -> (
+    eros_engine_core::affinity::AxisGrades,
+    eros_engine_core::affinity::EndpointLevelReads,
+    String,
+) {
+    use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
+    let rejected = (
+        AxisGrades::default(),
+        EndpointLevelReads::default(),
+        String::new(),
+    );
     let parsed: Option<LlmAffinityEval> = super::parse_llm_json(raw);
     let Some(e) = parsed else {
         return rejected;
     };
     let folded = [
-        fold_grade(&e.warmth),
         fold_grade(&e.trust),
         fold_grade(&e.intrigue),
         fold_grade(&e.intimacy),
         fold_grade(&e.tension),
     ];
-    let [Some(warmth), Some(trust), Some(intrigue), Some(intimacy), Some(tension)] = folded else {
+    let [Some(trust), Some(intrigue), Some(intimacy), Some(tension)] = folded else {
+        return rejected;
+    };
+    let (Ok(warmth), Ok(patience)) = (fold_level(&e.warmth), fold_level(&e.patience)) else {
         return rejected;
     };
     (
         AxisGrades {
-            warmth,
             trust,
             intrigue,
             intimacy,
             tension,
         },
-        e.patience.map(snap_patience),
+        EndpointLevelReads { warmth, patience },
         e.reason,
     )
-}
-
-/// Combine the LLM's absolute patience read `L` with the PDE rule delta into
-/// the turn's absolute patience target. `None` (no LLM read) → the caller
-/// falls back to the rule-delta pass-through path. The sum is NOT re-snapped —
-/// the 0.1 grid constrains the LLM read only, so the rule nudge survives.
-fn patience_target(patience_abs: Option<f64>, rule_delta: f64) -> Option<f64> {
-    patience_abs.map(|l| (l + rule_delta).clamp(0.0, 1.0))
 }
 
 const AFFINITY_TASK: &str = "affinity_evaluation";
@@ -709,12 +692,12 @@ async fn evaluate_affinity(
     audit_user: Option<&str>,
 ) -> (
     eros_engine_core::affinity::AxisGrades,
-    Option<f64>,
+    eros_engine_core::affinity::EndpointLevelReads,
     String,
     Option<eros_engine_store::OpenRouterCallMeta>,
     Option<&'static str>,
 ) {
-    use eros_engine_core::affinity::AxisGrades;
+    use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
 
     let resolved = state.model_config.resolve(AFFINITY_TASK, None);
     let req = ChatRequest {
@@ -745,7 +728,7 @@ async fn evaluate_affinity(
                 tracing::warn!("affinity eval LLM call failed: {e}");
                 return (
                     AxisGrades::default(),
-                    None,
+                    EndpointLevelReads::default(),
                     String::new(),
                     None,
                     Some("eval_error"),
@@ -757,7 +740,7 @@ async fn evaluate_affinity(
             );
                 return (
                     AxisGrades::default(),
-                    None,
+                    EndpointLevelReads::default(),
                     String::new(),
                     None,
                     Some("eval_timeout"),
@@ -765,12 +748,12 @@ async fn evaluate_affinity(
             }
         };
 
-    let (grades, patience_abs, reason) = parse_affinity_eval(&raw);
+    let (grades, levels, reason) = parse_affinity_eval(&raw);
     tracing::debug!(affinity_reason = %reason, "affinity eval parsed");
     // Eval ran, but a salvaged response can still lack a generation_id — mark it
     // so a NULL audit join key is never left unexplained.
     let skip = meta.as_ref().and_then(meta_skip_reason);
-    (grades, patience_abs, reason, meta, skip)
+    (grades, levels, reason, meta, skip)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -1434,14 +1417,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_affinity_eval_valid_grades_and_reason() {
-        let raw = r#"{"warmth":{"grade":2,"direction":"up"},"trust":{"grade":1,"direction":"up"},"intimacy":{"grade":3,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":1,"direction":"down"},"reason":"暖"}"#;
-        let (g, _p, reason) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 2);
+    fn parse_affinity_eval_valid_grades_levels_and_reason() {
+        let raw = r#"{"warmth":3,"trust":{"grade":1,"direction":"up"},"intimacy":{"grade":3,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":1,"direction":"down"},"patience":2,"reason":"暖"}"#;
+        let (g, lv, reason) = parse_affinity_eval(raw);
         assert_eq!(g.trust, 1);
         assert_eq!(g.intimacy, 3);
         assert_eq!(g.intrigue, 0);
         assert_eq!(g.tension, -1, "direction down folds to a negative grade");
+        assert_eq!(lv.warmth, Some(3));
+        assert_eq!(lv.patience, Some(2));
         assert_eq!(reason, "暖");
     }
 
@@ -1450,150 +1434,99 @@ mod tests {
     /// meant. Rule deltas persist regardless, so nothing is lost but the eval.
     #[test]
     fn parse_affinity_eval_rejects_malformed_grades_wholesale() {
-        use eros_engine_core::affinity::AxisGrades;
+        use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
         for raw in [
             // out-of-range bucket
-            r#"{"warmth":{"grade":5,"direction":"up"},"trust":{"grade":1,"direction":"up"},"reason":"x"}"#,
+            r#"{"trust":{"grade":5,"direction":"up"},"intimacy":{"grade":1,"direction":"up"},"reason":"x"}"#,
             // negative bucket (sign belongs to direction, not the grade)
-            r#"{"warmth":{"grade":-1,"direction":"up"},"reason":"x"}"#,
+            r#"{"trust":{"grade":-1,"direction":"up"},"reason":"x"}"#,
             // fractional bucket — 3.0 explicitly stopped asking for numbers
-            r#"{"warmth":{"grade":1.5,"direction":"up"},"reason":"x"}"#,
+            r#"{"trust":{"grade":1.5,"direction":"up"},"reason":"x"}"#,
             // unknown direction
-            r#"{"warmth":{"grade":1,"direction":"sideways"},"reason":"x"}"#,
+            r#"{"trust":{"grade":1,"direction":"sideways"},"reason":"x"}"#,
             // wrong-typed grade
-            r#"{"warmth":{"grade":true,"direction":"up"},"reason":"x"}"#,
+            r#"{"trust":{"grade":true,"direction":"up"},"reason":"x"}"#,
         ] {
-            let (g, p, reason) = parse_affinity_eval(raw);
+            let (g, lv, reason) = parse_affinity_eval(raw);
             assert_eq!(g, AxisGrades::default(), "whole verdict zeroed: {raw}");
-            assert_eq!(p, None, "patience distrusted with the verdict: {raw}");
+            assert_eq!(lv, EndpointLevelReads::default(), "levels distrusted with the verdict: {raw}");
+            assert!(reason.is_empty(), "reason distrusted too: {raw}");
+        }
+    }
+
+    /// A malformed LEVEL rejects the whole verdict too — same policy as the
+    /// grades: 4.0's judge contract has exactly two shapes, and anything else
+    /// is not worth guessing about.
+    #[test]
+    fn parse_affinity_eval_rejects_malformed_levels_wholesale() {
+        use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
+        for raw in [
+            r#"{"warmth":5,"trust":{"grade":2,"direction":"up"},"reason":"x"}"#, // out of 1..=3
+            r#"{"warmth":0,"reason":"x"}"#,                                      // below range
+            r#"{"warmth":1.5,"reason":"x"}"#,                                    // fractional
+            r#"{"warmth":true,"reason":"x"}"#,                                   // wrong type
+            r#"{"patience":{"grade":2},"reason":"x"}"#, // 3.x object shape on an endpoint
+            r#"{"patience":"abc","reason":"x"}"#,       // non-numeric string
+            r#"{"patience":"NaN","reason":"x"}"#,       // non-finite
+        ] {
+            let (g, lv, reason) = parse_affinity_eval(raw);
+            assert_eq!(g, AxisGrades::default(), "whole verdict zeroed: {raw}");
+            assert_eq!(lv, EndpointLevelReads::default(), "levels zeroed: {raw}");
             assert!(reason.is_empty(), "reason distrusted too: {raw}");
         }
     }
 
     /// Formatting slips that are unambiguous ARE salvaged: a quoted integer
-    /// grade, an omitted direction (defaults up), an omitted grade (0).
+    /// grade or level, an omitted direction (defaults up), an omitted grade (0).
     #[test]
     fn parse_affinity_eval_salvages_unambiguous_slips() {
-        let raw = r#"{"warmth":{"grade":"2","direction":"up"},"trust":{"grade":1},"intimacy":{"direction":"down"},"reason":"x"}"#;
-        let (g, _p, _) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 2, "quoted integer grade is salvaged");
-        assert_eq!(g.trust, 1, "missing direction defaults to up");
+        let raw = r#"{"warmth":"3","trust":{"grade":"2"},"intimacy":{"direction":"down"},"patience":"2","reason":"x"}"#;
+        let (g, lv, _) = parse_affinity_eval(raw);
+        assert_eq!(g.trust, 2, "quoted integer grade + missing direction salvaged");
         assert_eq!(g.intimacy, 0, "missing grade means nothing happened");
+        assert_eq!(lv.warmth, Some(3), "quoted integer level is salvaged");
+        assert_eq!(lv.patience, Some(2));
     }
 
+    /// Omitted / null levels are a HOLD, not an error: the judge saying
+    /// nothing about an endpoint keeps the stored level.
     #[test]
-    fn parse_affinity_eval_reads_patience_as_absolute_snapped() {
-        // 0.83 snaps to the nearest 0.1 → 0.8; the graded axes are unaffected.
-        let raw = r#"{"warmth":{"grade":1,"direction":"up"},"patience":0.83,"reason":"x"}"#;
-        let (g, p, _) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 1);
-        assert_eq!(p, Some(0.8), "patience is read as a snapped absolute");
-    }
-
-    #[test]
-    fn parse_affinity_eval_patience_clamped() {
-        assert_eq!(parse_affinity_eval(r#"{"patience":1.4}"#).1, Some(1.0));
-        assert_eq!(parse_affinity_eval(r#"{"patience":-0.3}"#).1, Some(0.0));
-    }
-
-    #[test]
-    fn parse_affinity_eval_absent_patience_is_none() {
-        let (_g, p, _) =
-            parse_affinity_eval(r#"{"warmth":{"grade":1,"direction":"up"},"reason":"x"}"#);
-        assert_eq!(p, None, "model omitting patience → None → fallback path");
-    }
-
-    #[test]
-    fn parse_affinity_eval_garbage_patience_none() {
-        let (_d, p, _) = parse_affinity_eval("not json at all");
-        assert_eq!(p, None);
-    }
-
-    #[test]
-    fn parse_affinity_eval_quoted_patience_salvaged_grades_survive() {
-        // A quoted number ("0.5") is a common LLM slip. It must NOT fail the
-        // whole struct parse (which would zero the valid graded axes too):
-        // the grades survive AND the numeric string is salvaged + snapped.
-        let raw = r#"{"warmth":{"grade":1,"direction":"up"},"trust":{"grade":2,"direction":"up"},"patience":"0.5","reason":"x"}"#;
-        let (g, p, _) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 1, "warmth survives a bad patience");
-        assert_eq!(g.trust, 2, "trust survives a bad patience");
-        assert_eq!(p, Some(0.5), "quoted numeric patience is salvaged");
-    }
-
-    #[test]
-    fn parse_affinity_eval_malformed_patience_ignored_grades_survive() {
-        // Non-numeric / wrong-typed patience → None, but the graded axes still
-        // parse (the regression codex flagged: one bad optional field must not
-        // discard the whole turn's affinity update).
+    fn parse_affinity_eval_absent_levels_hold() {
+        use eros_engine_core::affinity::EndpointLevelReads;
         for raw in [
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":"abc","reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":true,"reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":{"v":1},"reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":null,"reason":"x"}"#,
-            // Non-finite quoted strings: `f64::from_str` accepts these, but they
-            // must NOT leak (NaN survives snap/clamp and would poison scoring).
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":"NaN","reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":"inf","reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":"-inf","reason":"x"}"#,
-            r#"{"warmth":{"grade":1,"direction":"up"},"patience":"infinity","reason":"x"}"#,
+            r#"{"trust":{"grade":1,"direction":"up"},"reason":"x"}"#,
+            r#"{"warmth":null,"patience":null,"trust":{"grade":1,"direction":"up"},"reason":"x"}"#,
         ] {
-            let (g, p, _) = parse_affinity_eval(raw);
-            assert_eq!(g.warmth, 1, "warmth survives: {raw}");
-            assert_eq!(p, None, "malformed patience → None: {raw}");
+            let (g, lv, _) = parse_affinity_eval(raw);
+            assert_eq!(g.trust, 1, "grades unaffected: {raw}");
+            assert_eq!(lv, EndpointLevelReads::default(), "omitted level → hold: {raw}");
         }
     }
 
     #[test]
-    fn patience_target_combines_absolute_and_rule_delta() {
-        // L 0.9 + rule delta 0.03 = 0.93, no snap on the sum. Float arithmetic →
-        // compare with a tolerance, NOT assert_eq! on the raw f64 (0.9+0.03 is
-        // not bit-identical to the 0.93 literal).
-        let t = patience_target(Some(0.9), 0.03).expect("Some");
-        assert!((t - 0.93).abs() < 1e-9, "got {t}");
-        // clamps land on exact bound literals → assert_eq is safe here.
-        assert_eq!(patience_target(Some(1.0), 0.05), Some(1.0)); // ceiling clamp
-        assert_eq!(patience_target(Some(0.0), -0.05), Some(0.0)); // floor clamp
-                                                                  // no LLM read → None (fallback path)
-        assert_eq!(patience_target(None, -0.02), None);
-    }
-
-    #[test]
-    fn snap_patience_rounds_to_nearest_tenth_and_clamps() {
-        assert_eq!(snap_patience(0.83), 0.8);
-        assert_eq!(snap_patience(0.86), 0.9); // rounds up to the nearest 0.1
-        assert_eq!(snap_patience(0.84), 0.8); // rounds down
-        assert_eq!(snap_patience(0.04), 0.0);
-        assert_eq!(snap_patience(1.4), 1.0);
-        assert_eq!(snap_patience(-0.2), 0.0);
-        // NOTE: 0.85 is intentionally NOT tested — as an f64 it is 8.4999…×10,
-        // so it snaps to 0.8, not 0.9; the exact half-point is representation-
-        // dependent and a poor test anchor.
-    }
-
-    #[test]
     fn parse_affinity_eval_garbage_returns_default() {
-        use eros_engine_core::affinity::AxisGrades;
-        let (g, _p, reason) = parse_affinity_eval("not json at all");
+        use eros_engine_core::affinity::{AxisGrades, EndpointLevelReads};
+        let (g, lv, reason) = parse_affinity_eval("not json at all");
         assert_eq!(g, AxisGrades::default());
+        assert_eq!(lv, EndpointLevelReads::default());
         assert!(reason.is_empty());
     }
 
     #[test]
     fn parse_affinity_eval_missing_fields_default_zero() {
-        let raw = r#"{"warmth":{"grade":1,"direction":"up"},"reason":"only warmth"}"#;
-        let (g, _p, _) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 1);
+        let raw = r#"{"warmth":2,"reason":"only a level"}"#;
+        let (g, lv, _) = parse_affinity_eval(raw);
+        assert_eq!(lv.warmth, Some(2));
         assert_eq!(g.trust, 0);
         assert_eq!(g.intimacy, 0);
     }
 
     #[test]
     fn parse_affinity_eval_extracts_from_fenced_block() {
-        let raw =
-            "```json\n{\"warmth\":{\"grade\":1,\"direction\":\"up\"},\"reason\":\"fenced\"}\n```";
-        let (g, _p, reason) = parse_affinity_eval(raw);
-        assert_eq!(g.warmth, 1);
+        let raw = "```json\n{\"warmth\":2,\"trust\":{\"grade\":1,\"direction\":\"up\"},\"reason\":\"fenced\"}\n```";
+        let (g, lv, reason) = parse_affinity_eval(raw);
+        assert_eq!(g.trust, 1);
+        assert_eq!(lv.warmth, Some(2));
         assert_eq!(reason, "fenced");
     }
 
@@ -2211,9 +2144,9 @@ mod tests {
             rows[0].1
         );
 
-        // The rule-based delta (user-derived, not from the empty reply) still
-        // moved the vector: default patience 0.5 - 0.02 = 0.48 (patience rule
-        // deltas pass through the 3.0 pipeline 1:1).
+        // 4.0: patience is a derived endpoint. A skipped eval holds the
+        // stored level (default 2) and no rule delta touches it, so the row
+        // reads exactly the level-2 derivation over bond 0.
         let patience: f64 = sqlx::query_scalar(
             "SELECT patience FROM engine.companion_affinity WHERE session_id = $1",
         )
@@ -2221,15 +2154,15 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        let expect = (1.0 / 3.0) * eros_engine_core::affinity::endpoint_boost(0.0);
         assert!(
-            (patience - 0.48).abs() < 1e-9,
-            "rule delta (-0.02 patience) still applied even though the reply \
-             was empty; got {patience}"
+            (patience - expect).abs() < 1e-6,
+            "patience stays the held-level derivation on a skipped eval; got {patience}"
         );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn persist_affinity_sets_patience_from_target(pool: sqlx::PgPool) {
+    async fn persist_affinity_sets_levels_and_discards_rule_patience(pool: sqlx::PgPool) {
         use eros_engine_store::affinity::AffinityRepo;
 
         let user_id = Uuid::new_v4();
@@ -2243,17 +2176,17 @@ mod tests {
         .await
         .unwrap();
         // persist_affinity calls load_or_create, but seeding the row first is
-        // explicit and lets us assert against a known 0.5 seed.
+        // explicit and lets us assert against a known level-2 seed.
         AffinityRepo { pool: &pool }
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
 
-        // The rule pass-through alone would land patience at 0.5 + 0.03 = 0.53.
-        // Passing Some(0.93) must win → 0.93.
+        // A (hypothetical) rule patience nudge must be discarded; the judge's
+        // level 3 must land as the derivation 2/3·B(bond=0).
         let state = crate::routes::companion::test_state(pool.clone());
         let rule_deltas = eros_engine_core::affinity::AffinityDeltas {
-            patience: 0.03, // the rule delta R (also present in the target sum)
+            patience: 0.03,
             ..Default::default()
         };
         persist_affinity(
@@ -2264,23 +2197,27 @@ mod tests {
             ActionType::ReplyText,
             eros_engine_core::affinity::AxisGrades::default(),
             rule_deltas,
-            eros_engine_core::scope::AffinityScope::none(),
             serde_json::json!({}),
             None,
-            Some(0.93), // patience_target = clamp(L 0.9 + R 0.03)
+            eros_engine_core::affinity::EndpointLevelReads {
+                warmth: None,
+                patience: Some(3),
+            },
         )
         .await;
 
-        let patience: f64 = sqlx::query_scalar(
-            "SELECT patience FROM engine.companion_affinity WHERE session_id = $1",
+        let (patience, patience_grade): (f64, i16) = sqlx::query_as(
+            "SELECT patience, patience_grade FROM engine.companion_affinity WHERE session_id = $1",
         )
         .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
+        assert_eq!(patience_grade, 3);
+        let expect = (2.0 / 3.0) * eros_engine_core::affinity::endpoint_boost(0.0);
         assert!(
-            (patience - 0.93).abs() < 1e-9,
-            "patience_target set directly through the server layer (not 0.53); got {patience}"
+            (patience - expect).abs() < 1e-6,
+            "level 3 derives through the server layer (rule nudge discarded); got {patience}"
         );
     }
 
@@ -2297,6 +2234,8 @@ mod tests {
             intimacy: 0.22,
             patience: 0.66,
             tension: 0.13,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,

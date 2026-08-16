@@ -893,6 +893,8 @@ mod tests {
             intimacy,
             patience: 0.5,
             tension,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
@@ -1308,8 +1310,8 @@ mod tests {
 
     #[test]
     fn high_bond_low_chemistry_keeps_romance_restrained() {
-        // bond (0.9+0.9+0.9)/3 = 0.9 ⇒ tier 5 Soulmate;
-        // chemistry (0.9+0+0)/3 = 0.3 ⇒ tier 2 Flirtation.
+        // bond (0.9+0.9)/2 = 0.9 ⇒ tier 5 Soulmate;
+        // chemistry 0 ⇒ tier 1 Spark.
         let a = affinity_at(0.9, 0.9, 0.9, 0.0, 0.0);
         let p = build_voice_prompt(
             &genome(),
@@ -1328,9 +1330,9 @@ mod tests {
 
     #[test]
     fn high_chemistry_appends_affectionate_clause() {
-        // bond (0.9+0.2+0.2)/3 ≈ 0.433 ⇒ tier 3 CloseFriend;
-        // chemistry (0.9+0.9+0.9)/3 = 0.9 ⇒ tier 5 Beloved.
-        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9);
+        // bond (0.5+0.5)/2 = 0.5 ⇒ tier 3 CloseFriend;
+        // chemistry (0.9+0.9)/2 = 0.9 ⇒ tier 5 Beloved.
+        let a = affinity_at(0.9, 0.5, 0.5, 0.9, 0.9);
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",
@@ -1345,8 +1347,8 @@ mod tests {
 
     #[test]
     fn chemistry_boundary_switches_clause_at_crush() {
-        // (0+0.52+0.50)/3 ≈ 0.34 ⇒ tier 2: still the subtle clause.
-        let low = affinity_at(0.0, 0.0, 0.0, 0.52, 0.50);
+        // (0.34+0.32)/2 = 0.33 ⇒ tier 2: still the subtle clause.
+        let low = affinity_at(0.0, 0.0, 0.0, 0.34, 0.32);
         let p_low = build_voice_prompt(
             &genome(),
             "D",
@@ -1357,7 +1359,7 @@ mod tests {
         );
         assert!(p_low.contains("faint, unspoken spark"));
         assert!(!p_low.contains("growing attraction"));
-        // (0+0.54+0.54)/3 = 0.36 ⇒ tier 3: switches to the Crush clause.
+        // (0.54+0.54)/2 = 0.54 ⇒ tier 3: switches to the Crush clause.
         let high = affinity_at(0.0, 0.0, 0.0, 0.54, 0.54);
         let p_high = build_voice_prompt(
             &genome(),
@@ -1387,7 +1389,7 @@ mod tests {
 
     #[test]
     fn scope_bond_emits_base_only() {
-        let a = affinity_at(0.9, 0.2, 0.2, 0.9, 0.9); // CloseFriend / Beloved
+        let a = affinity_at(0.9, 0.5, 0.5, 0.9, 0.9); // CloseFriend / Beloved
         let p = build_voice_prompt(
             &genome(),
             "DIRECTIVE",

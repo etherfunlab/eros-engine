@@ -118,6 +118,8 @@ mod tests {
             intimacy,
             patience: 0.5,
             tension,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
@@ -129,11 +131,11 @@ mod tests {
 
     #[test]
     fn snapshot_exposes_raw_line_scores_and_labels() {
-        // bond = (0+0.9+0.9)/3 = 0.6 → tier3 close_friend ; chemistry = 0 → spark
-        let snap = AffinitySnapshot::from(affinity(0.0, 0.9, 0.9, 0.0, 0.0));
+        // bond = (0.6+0.6)/2 = 0.6 → tier3 close_friend ; chemistry = 0 → spark
+        let snap = AffinitySnapshot::from(affinity(0.0, 0.6, 0.6, 0.0, 0.0));
         assert_eq!(snap.bond_label, "close_friend");
         assert_eq!(snap.chemistry_label, "spark");
-        // Affinity 3.0: the real composite, not a bar()-projected 0.7315.
+        // The real composite, not a projection.
         assert!((snap.bond - 0.6).abs() < 1e-9);
         assert!((snap.chemistry).abs() < 1e-9);
         // legacy label derived on read: bond (tier3) leads, neither tier1 → friend

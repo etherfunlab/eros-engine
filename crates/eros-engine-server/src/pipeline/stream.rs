@@ -3355,7 +3355,11 @@ pub fn run_stream(
             .load_or_create(user_msg.session_id, user_msg.user_id, user_msg.instance_id)
             .await
         {
-            Ok(mut a) => { a.apply_time_decay(); a }
+            Ok(mut a) => {
+                a.apply_time_decay();
+                a.refresh_endpoints(&state.config.affinity_tuning);
+                a
+            }
             Err(e) => {
                 tracing::warn!("stream: affinity load failed: {e}");
                 yield ProtocolFrame::Error {
@@ -5354,6 +5358,8 @@ mod tests {
             intimacy: 0.2,
             patience: 0.2,
             tension: 0.5,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,

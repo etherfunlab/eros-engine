@@ -66,6 +66,7 @@ async fn get_affinity(
         return Err(AppError::Forbidden("not your session".into()));
     }
     a.apply_time_decay();
+    a.refresh_endpoints(&state.config.affinity_tuning);
     Ok(Json(AffinitySnapshot::from(a)))
 }
 

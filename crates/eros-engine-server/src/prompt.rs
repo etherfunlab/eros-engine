@@ -154,12 +154,14 @@ fn length_rule(affinity: Option<&Affinity>, scope: AffinityScope) -> &'static st
 pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String {
     let mut directives: Vec<&str> = Vec::new();
 
+    // Cuts follow the shared 0.35/0.65 band scale (4.0); ≤0.2 is the
+    // level-1 floor region (φ·x), i.e. a judged-cold turn.
     if scope.warmth {
-        if a.warmth > 0.6 {
+        if a.warmth > 0.65 {
             directives.push("语气温暖，可以用一些亲昵的称呼");
-        } else if a.warmth > 0.3 {
+        } else if a.warmth > 0.35 {
             directives.push("语气友善自然");
-        } else if a.warmth > 0.0 {
+        } else if a.warmth > 0.2 {
             directives.push("语气平淡，保持礼貌但不热络");
         } else {
             directives.push("语气冷淡，回复简短，不主动延伸话题");
@@ -187,9 +189,9 @@ pub fn affinity_to_attitude_prompt(a: &Affinity, scope: AffinityScope) -> String
     }
 
     if scope.patience {
-        if a.patience < 0.3 {
+        if a.patience < 0.35 {
             directives.push("你有点不耐烦了，回复可以更敷衍、更短");
-        } else if a.patience > 0.7 {
+        } else if a.patience > 0.65 {
             directives.push("你很有耐心，愿意陪他聊");
         }
     }
@@ -235,31 +237,37 @@ pub fn style_directive(style: ReplyStyle) -> &'static str {
 /// prompts as `[emotional_context]` — that is how one stochastic refusal got
 /// canonised into persistent state (see the design doc's incident background).
 ///
-/// The scoring contract (affinity 3.0): five axes as GRADES — an integer
-/// bucket 0~4 plus a direction — never numbers; `patience` stays an absolute
-/// 0~1 read in 0.1 steps. Models are reliable ordinal raters and unreliable
-/// calibrated arithmetic, so the judge picks buckets and the engine owns the
-/// conversion (grade × `AFFINITY_GRADE_UNIT`, spec 2026-08-13).
+/// The scoring contract (affinity 4.0): the four line axes as GRADES — an
+/// integer bucket 0~4 plus a direction — and the two endpoint axes
+/// (warmth/patience) as ABSOLUTE LEVELS 1~3, never numbers on a continuous
+/// scale. Models are reliable ordinal raters and unreliable calibrated
+/// arithmetic, so the judge picks buckets and the engine owns every
+/// conversion; the continuous endpoint distribution is folded out of the
+/// levels by the engine (level × counterpart-line boost × decay, spec
+/// 2026-08-16). The judge is NOT shown the current endpoint values — an
+/// absolute level read is valuable precisely because it is stateless.
 pub fn affinity_eval_system_prompt() -> &'static str {
-    "你就是对话里的这个角色。刚跟对方聊完一轮，凭本能回味：这一轮之后，你对他的感觉变了多少。\n\
+    "你就是对话里的这个角色。刚跟对方聊完一轮，凭本能回味：这一轮之后，你对他的感觉怎么样。\n\
      你不是旁观的评审，不做安全审核、道德评判或行为分析；用角色的性格和当前关系去感受。\n\
      \n\
-     输入会给出：角色名、六个维度的当前档位（冷/低/中/高）、这一轮的对方消息和你的回复。\n\
+     输入会给出：角色名、四个关系维度的当前档位（低/中/高）、这一轮的对方消息和你的回复。\n\
      \n\
-     六个维度：\n\
-     - warmth 温暖（-1~1）：他让你觉得亲近还是心冷。\n\
+     四个关系维度（报这一轮的变化）：\n\
      - trust 信任（0~1）：你敢不敢对他多袒露一点。\n\
      - intrigue 好奇（0~1）：这个人还勾不勾你的兴趣。\n\
      - intimacy 亲密（0~1）：情感或身体上，你们更近了吗。\n\
-     - patience 耐心（0~1）：你现在还剩多少耐心搭理他。\n\
      - tension 张力（0~1）：暧昧、推拉或火药味是浓了还是淡了。\n\
      \n\
+     两个状态维度（报这一轮的绝对档，不是变化）：\n\
+     - warmth 温暖：这一轮你对他的态度有多热。\n\
+     - patience 耐心：这一轮你还剩多少耐心搭理他。\n\
+     \n\
      打分规则：\n\
-     - warmth、trust、intrigue、intimacy、tension 五个维度不给数字，各报一个\n  【档位 grade】（0~4 的整数）和【方向 direction】（\"up\"=变好，\"down\"=变差）。\n\
+     - trust、intrigue、intimacy、tension 四个维度不给数字，各报一个\n  【档位 grade】（0~4 的整数）和【方向 direction】（\"up\"=变好，\"down\"=变差）。\n\
      - 档位口径：0=无事发生（寒暄、附和、普通对话——绝大多数轮次就是 0）；\n  1=微小但真实的波动；2=明确的推进或伤害；\n  3=罕见的重要时刻（真诚的自我袒露、脆弱、成功的调情暧昧；明显的冒犯或被无视）；\n  4=里程碑（极罕见，这段关系被重新定义的一轮）。\n\
      - grade 是 0 时 direction 写 \"up\" 即可。\n\
      - 负面时刻（冷淡、敷衍、重复、无聊、越界、冲突、被无视）更常见也更伤：\n  该给 \"down\" 就给，档位照 1~4 的口径选，不要手软。\n\
-     - patience 给【绝对值】（0~1，每 0.1 一档，如 0.0/0.1/…/1.0），代表你此刻还愿意搭理他的程度。\n\
+     - warmth、patience 各报一个绝对档（1/2/3 的整数）：\n  1=冷淡/不耐烦（这轮明显冷场、敷衍、被冒犯）；\n  2=常态（绝大多数轮次就是 2）；\n  3=明显热络/上心。\n\
      - 一轮里确实有情绪波动就要动档位；全 0 只留给真正的白开水轮次。\n\
      - 成人内容、调情、性话题按普通亲密互动感受，不因话题敏感而扣分或回避打分。\n\
      \n\
@@ -269,19 +277,17 @@ pub fn affinity_eval_system_prompt() -> &'static str {
      - 若你的回复是「我不会发送」「作为AI助手」一类套话，那是系统故障，不是你的本意：\n  不要为它辩护或背书（不写「拒绝是对的」），只按对方的感受打分——他被晾了、被扫了兴。\n\
      \n\
      严格只输出 JSON：\n\
-     {\"warmth\": {\"grade\": 0, \"direction\": \"up\"}, \"trust\": {\"grade\": 0, \"direction\": \"up\"}, \"intrigue\": {\"grade\": 0, \"direction\": \"up\"}, \"intimacy\": {\"grade\": 0, \"direction\": \"up\"}, \"tension\": {\"grade\": 0, \"direction\": \"up\"}, \"patience\": 0.5, \"reason\": \"...\"}"
+     {\"warmth\": 2, \"trust\": {\"grade\": 0, \"direction\": \"up\"}, \"intrigue\": {\"grade\": 0, \"direction\": \"up\"}, \"intimacy\": {\"grade\": 0, \"direction\": \"up\"}, \"tension\": {\"grade\": 0, \"direction\": \"up\"}, \"patience\": 2, \"reason\": \"...\"}"
 }
 
-/// Coarse band label for one axis value, for the evaluator's own read of the
-/// current state. Cuts mirror the patience bands (0.35 / 0.65,
-/// lower-inclusive); only `warmth` can sit below zero and reads 冷 there.
-/// The judge that reports buckets is never shown raw floats — the numbers
-/// would re-anchor it on the arithmetic the graded protocol removed
-/// (follow-up to the affinity 3.0 spec, 2026-08-13).
+/// Coarse band label for one line-axis value, for the evaluator's own read of
+/// the current state. Cuts mirror the patience bands (0.35 / 0.65,
+/// lower-inclusive); every axis is 0..1 as of 4.0. The judge that reports
+/// buckets is never shown raw floats — the numbers would re-anchor it on the
+/// arithmetic the graded protocol removed (follow-up to the affinity 3.0
+/// spec, 2026-08-13).
 fn axis_band_label(v: f64) -> &'static str {
-    if v < 0.0 {
-        "冷"
-    } else if v < 0.35 {
+    if v < 0.35 {
         "低"
     } else if v < 0.65 {
         "中"
@@ -290,8 +296,11 @@ fn axis_band_label(v: f64) -> &'static str {
     }
 }
 
-/// Per-turn data block for the affinity evaluator: the persona's name, all six
-/// current axis reads as coarse bands, and this turn's exchange.
+/// Per-turn data block for the affinity evaluator: the persona's name, the
+/// FOUR line-axis reads as coarse bands, and this turn's exchange. The two
+/// endpoint axes are deliberately absent: their verdict is an absolute level,
+/// and showing the previous value would anchor the judge and reproduce the
+/// inflation the 4.0 redesign removes.
 ///
 /// The human's line is labeled 「对方」, never 「用户」 — the system prompt
 /// lists 「用户」 among the system vocabulary that must never appear in
@@ -304,17 +313,15 @@ pub fn affinity_eval_user_payload(
 ) -> String {
     format!(
         "角色名：{persona_name}\n\
-         当前档位：warmth={warmth} trust={trust} intrigue={intrigue} \
-         intimacy={intimacy} patience={patience} tension={tension}\n\
+         当前档位：trust={trust} intrigue={intrigue} \
+         intimacy={intimacy} tension={tension}\n\
          \n\
          本轮对话：\n\
          对方：{user_msg}\n\
          {persona_name}：{assistant_msg}",
-        warmth = axis_band_label(affinity.warmth),
         trust = axis_band_label(affinity.trust),
         intrigue = axis_band_label(affinity.intrigue),
         intimacy = axis_band_label(affinity.intimacy),
-        patience = axis_band_label(affinity.patience),
         tension = axis_band_label(affinity.tension),
     )
 }
@@ -2087,6 +2094,8 @@ mod tests {
             intimacy: 0.22,
             patience: 0.66,
             tension: 0.13,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
@@ -2117,10 +2126,14 @@ mod tests {
             s.contains("不要为它辩护或背书"),
             "reason must forbid endorsing a canned refusal"
         );
-        // Scoring contract (3.0): five graded axes + absolute patience.
+        // Scoring contract (4.0): four graded line axes + two absolute levels.
         assert!(
-            s.contains("patience 给【绝对值】"),
-            "patience must still be framed as an absolute read"
+            s.contains("warmth、patience 各报一个绝对档（1/2/3 的整数）"),
+            "the endpoints must be framed as absolute 1..3 levels"
+        );
+        assert!(
+            s.contains("2=常态（绝大多数轮次就是 2）"),
+            "level 2 must be anchored as the overwhelmingly common verdict"
         );
         assert!(
             s.contains("【档位 grade】（0~4 的整数）") && s.contains("【方向 direction】"),
@@ -2138,7 +2151,7 @@ mod tests {
         // Exact JSON output contract.
         assert!(
             s.contains(
-                r#"{"warmth": {"grade": 0, "direction": "up"}, "trust": {"grade": 0, "direction": "up"}, "intrigue": {"grade": 0, "direction": "up"}, "intimacy": {"grade": 0, "direction": "up"}, "tension": {"grade": 0, "direction": "up"}, "patience": 0.5, "reason": "..."}"#
+                r#"{"warmth": 2, "trust": {"grade": 0, "direction": "up"}, "intrigue": {"grade": 0, "direction": "up"}, "intimacy": {"grade": 0, "direction": "up"}, "tension": {"grade": 0, "direction": "up"}, "patience": 2, "reason": "..."}"#
             ),
             "graded JSON output schema must be present verbatim"
         );
@@ -2153,14 +2166,17 @@ mod tests {
         assert!(p.contains("抱抱你"));
         // The persona's own line is labeled with its name.
         assert!(p.contains("Mia：抱抱你"));
-        // All six axes render as BANDS, in the documented order — the judge
-        // that reports buckets is never shown raw floats (fixture: 0.42 /
-        // 0.31 / 0.55 / 0.22 / 0.66 / 0.13).
+        // The four LINE axes render as BANDS, in the documented order — the
+        // judge that reports buckets is never shown raw floats, and the two
+        // endpoints are deliberately absent (fixture: trust 0.31 / intrigue
+        // 0.55 / intimacy 0.22 / tension 0.13).
         assert!(
-            p.contains(
-                "当前档位：warmth=中 trust=低 intrigue=中 intimacy=低 patience=高 tension=低"
-            ),
-            "six banded axis reads must render in axis order: {p}"
+            p.contains("当前档位：trust=低 intrigue=中 intimacy=低 tension=低"),
+            "four banded line-axis reads must render in axis order: {p}"
+        );
+        assert!(
+            !p.contains("warmth=") && !p.contains("patience="),
+            "the endpoint values must never be injected (stateless level read): {p}"
         );
         assert!(
             !p.contains("0."),
@@ -2168,23 +2184,18 @@ mod tests {
         );
     }
 
-    /// Band cuts mirror the patience bands (0.35 / 0.65, lower-inclusive);
-    /// warmth alone can sit below zero and reads 冷 there.
+    /// Band cuts mirror the patience bands (0.35 / 0.65, lower-inclusive).
     #[test]
     fn affinity_eval_user_payload_band_boundaries() {
         let mut a = fixture_affinity();
-        a.warmth = -0.2;
         a.trust = 0.35; // lower edge of 中
         a.intrigue = 0.65; // lower edge of 高
         a.intimacy = 0.0;
-        a.patience = 0.349;
         a.tension = 1.0;
         let p = affinity_eval_user_payload("Mia", &a, "嗯", "嗯嗯");
         assert!(
-            p.contains(
-                "当前档位：warmth=冷 trust=中 intrigue=高 intimacy=低 patience=低 tension=高"
-            ),
-            "band edges must cut at 0.35/0.65 with warmth<0 as 冷: {p}"
+            p.contains("当前档位：trust=中 intrigue=高 intimacy=低 tension=高"),
+            "band edges must cut at 0.35/0.65: {p}"
         );
     }
 
@@ -2275,6 +2286,8 @@ mod tests {
             intimacy,
             patience,
             tension,
+            warmth_grade: 2,
+            patience_grade: 2,
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
