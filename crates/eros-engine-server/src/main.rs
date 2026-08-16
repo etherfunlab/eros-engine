@@ -570,6 +570,45 @@ mod tests {
         assert!(unset_err.contains("unset"), "{unset_err}");
     }
 
+    /// Ordering regression, sibling of the one above and the reason
+    /// `validate_structuring_prompt_unset` sits BEFORE `validate_prompt_variants`
+    /// in `main`. A variant-shaped `[tasks.character_insight_structuring]
+    /// .filter_prompt` trips both gates, so whichever runs first is the message
+    /// the operator actually sees. The structuring gate's is the actionable one:
+    /// it says the prompt is engine-owned and names the stage-1 key to edit
+    /// instead. The variant gate only reports that variants are unreadable here,
+    /// which would send an operator off to fix the shape of a key that must not
+    /// exist at all.
+    #[test]
+    fn variant_shaped_structuring_prompt_reports_the_actionable_error() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.character_insight_structuring]\nmodel = \"m\"\n\
+             filter_prompt = { a = \"x\", b = \"y\" }\n",
+        )
+        .expect("parses");
+
+        let gate_err = cfg
+            .validate_structuring_prompt_unset()
+            .expect_err("a variant-shaped structuring prompt must refuse to boot");
+        assert!(gate_err.contains("engine-owned"), "{gate_err}");
+        assert!(
+            gate_err.contains("[tasks.character_insight_extraction].filter_prompt"),
+            "the message an operator sees must name the key that IS configurable: {gate_err}"
+        );
+
+        // Pins the masking this ordering prevents: the variant gate also errors
+        // on this config, but its message is about prompt SHAPE — advice for a
+        // key that should simply be deleted.
+        let variant_err = cfg
+            .validate_prompt_variants()
+            .expect_err("the variant gate also rejects this config, for a shallower reason");
+        assert!(
+            !variant_err.contains("engine-owned"),
+            "if the variant gate ever gained the actionable wording, this ordering \
+             test stops meaning anything: {variant_err}"
+        );
+    }
+
     #[test]
     fn example_config_output_regex_compiles() {
         let text = include_str!("../../../examples/model_config.toml");
