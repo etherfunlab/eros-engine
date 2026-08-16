@@ -175,7 +175,9 @@ impl AffinityScope {
     /// Composite length score per the #40 spec. `None` when no axis is in scope
     /// (caller falls back to the strictest tier, matching `affinity = None`).
     pub fn length_score(self, a: &Affinity) -> Option<f64> {
-        let warm01 = clamp01((a.warmth + 1.0) / 2.0);
+        // warmth is 0..1 as of 4.0; the old (w+1)/2 shift would inflate this
+        // half by 0.25.
+        let warm01 = clamp01(a.warmth);
         let bond = clamp01((warm01 + a.intimacy + a.tension) / 3.0);
         let chemistry = clamp01((a.trust + a.intrigue + a.patience) / 3.0);
         let bond_active = self.warmth || self.intimacy || self.tension;
@@ -319,9 +321,9 @@ mod tests {
 
     #[test]
     fn length_score_named_cases() {
-        // warmth=0 → warm01=0.5; intimacy=0.5; tension=0.5 → bond=0.5
+        // warmth=0.5 (0..1 as of 4.0) → warm01=0.5; intimacy=0.5; tension=0.5 → bond=0.5
         // trust=0.9; intrigue=0.9; patience=0.9 → chemistry=0.9
-        let a = affinity(0.0, 0.9, 0.9, 0.5, 0.9, 0.5);
+        let a = affinity(0.5, 0.9, 0.9, 0.5, 0.9, 0.5);
         let bond = AffinityScope::bond().length_score(&a).unwrap();
         let chem = AffinityScope::chemistry().length_score(&a).unwrap();
         let full = AffinityScope::full().length_score(&a).unwrap();
@@ -333,7 +335,7 @@ mod tests {
 
     #[test]
     fn length_score_array_activates_both_triads() {
-        let a = affinity(0.0, 0.9, 0.9, 0.5, 0.9, 0.5);
+        let a = affinity(0.5, 0.9, 0.9, 0.5, 0.9, 0.5);
         // warmth ∈ bond, trust ∈ chemistry → both active → avg
         let s = AffinityScope::from_axes(&[AffinityAxis::Warmth, AffinityAxis::Trust]);
         assert!((s.length_score(&a).unwrap() - 0.7).abs() < 1e-9);
