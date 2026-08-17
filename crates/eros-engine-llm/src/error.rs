@@ -56,7 +56,15 @@ pub enum LlmError {
     },
 
     /// Every candidate in the chain failed. Carries the whole walk.
-    #[error("openrouter: all {} candidates failed", failures.len())]
+    ///
+    /// Display renders the LAST failure alongside the count: a chain error is
+    /// what `tracing::warn!("...{e}")` prints at every call site in the server,
+    /// and a bare count would tell an operator nothing about why the turn died.
+    #[error(
+        "openrouter: all {} candidates failed; last: {}",
+        failures.len(),
+        failures.last().map(ToString::to_string).unwrap_or_else(|| "(none)".into())
+    )]
     Chain {
         failures: Vec<crate::failure::AttemptFailure>,
     },
@@ -85,6 +93,44 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "openrouter: model thedrummer/cydonia-24b-v4.1 returned byte-BPE garbled output"
+        );
+    }
+
+    #[test]
+    fn chain_error_display_names_the_last_failure_not_just_the_count() {
+        // A chain error is what every server-side tracing::warn!("...{e}")
+        // prints. A bare count tells an operator nothing about why the turn
+        // died.
+        use crate::failure::{AttemptFailure, UpstreamAttempt};
+        let e = LlmError::Chain {
+            failures: vec![
+                AttemptFailure::Upstream(UpstreamAttempt {
+                    task: "chat_companion".into(),
+                    model: "a/m".into(),
+                    http_status: 503,
+                    provider_code: None,
+                    error_type: None,
+                    upstream_provider_code: None,
+                    retry_after_s: None,
+                    message: "code=503: no provider".into(),
+                }),
+                AttemptFailure::Upstream(UpstreamAttempt {
+                    task: "chat_companion".into(),
+                    model: "b/m".into(),
+                    http_status: 529,
+                    provider_code: None,
+                    error_type: None,
+                    upstream_provider_code: None,
+                    retry_after_s: None,
+                    message: "code=529: Overloaded".into(),
+                }),
+            ],
+        };
+        let s = e.to_string();
+        assert!(s.contains('2'), "must carry the attempt count: {s}");
+        assert!(
+            s.contains("code=529: Overloaded"),
+            "must carry the LAST failure, not the first: {s}"
         );
     }
 }
