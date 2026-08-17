@@ -684,6 +684,7 @@ async fn compose_stream(
                 model: served_model.clone(),
                 usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                 finish_reason: None,
+                failures: Vec::new(),
             },
         );
         let (subject, caption) = parse_compose_reply(acc.trim());

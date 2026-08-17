@@ -401,6 +401,11 @@ pub struct ChatResponse {
     /// Present as `"content_filter"` when Gemini/OpenAI mid-response
     /// safety truncation fires; callers can gate on this value.
     pub finish_reason: Option<String>,
+    /// Every hop that failed before the served one. Populated on success too:
+    /// a turn that recovered on the second model still has to report what the
+    /// first one said, which used to leave no trace anywhere.
+    #[serde(default)]
+    pub failures: Vec<crate::failure::AttemptFailure>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -799,9 +804,10 @@ impl OpenRouterClient {
             ));
         }
 
-        let mut last_err: Option<LlmError> = None;
+        let mut failures: Vec<crate::failure::AttemptFailure> = Vec::new();
+        let task = req.task.as_deref().unwrap_or("");
         // Latest recoverable byte-BPE garble seen while walking the chain, kept
-        // separately from `last_err` so a LATER non-garble failure (transport /
+        // separately from `failures` so a LATER non-garble failure (transport /
         // status / decode) can't discard a repairable earlier garble. Tuple:
         // (model, raw, finish_reason).
         let mut last_garbled: Option<(String, String, Option<String>)> = None;
@@ -822,7 +828,10 @@ impl OpenRouterClient {
                 )
                 .await
             {
-                Ok(resp) => return Ok(resp),
+                Ok(mut resp) => {
+                    resp.failures = failures;
+                    return Ok(resp);
+                }
                 Err(e) => {
                     if let LlmError::Garbled {
                         model,
@@ -838,6 +847,9 @@ impl OpenRouterClient {
                                 Some((model.clone(), raw.clone(), finish_reason.clone()));
                         }
                     }
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
                         "openrouter: all candidates exhausted"
@@ -863,7 +875,6 @@ impl OpenRouterClient {
                             "{msg}"
                         );
                     }
-                    last_err = Some(e);
                 }
             }
         }
@@ -885,9 +896,10 @@ impl OpenRouterClient {
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
                 // downstream validity gates still see the safety signal.
                 finish_reason,
+                failures: failures.clone(),
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: no models configured".into())))
+        Err(LlmError::Chain { failures })
     }
 
     /// Execute a one-shot vision describe, walking the candidate chain
@@ -904,7 +916,10 @@ impl OpenRouterClient {
                 "openrouter: vision has no models configured".into(),
             ));
         }
-        let mut last_err: Option<LlmError> = None;
+        let mut failures: Vec<crate::failure::AttemptFailure> = Vec::new();
+        // `VisionRequest` carries no `task` field (see `VISION_TASK` above) —
+        // the vision pre-stage is single-purpose, so its task name is fixed.
+        let task = VISION_TASK;
         // Latest recoverable garble, kept separate so a later non-garble failure
         // can't discard a repairable earlier garble (mirrors `execute`). Tuple:
         // (model, raw, finish_reason).
@@ -914,7 +929,9 @@ impl OpenRouterClient {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (endpoint); next");
-                    last_err = Some(e);
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
@@ -951,7 +968,10 @@ impl OpenRouterClient {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
-                    last_err = Some(e.into());
+                    let e: LlmError = e.into();
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
@@ -960,10 +980,9 @@ impl OpenRouterClient {
                 let retry_after = retry_after_secs(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
-                last_err = Some(LlmError::Status(
-                    status,
-                    parse_error_body(&text),
-                    retry_after,
+                let e = LlmError::Status(status, parse_error_body(&text), retry_after);
+                failures.push(crate::failure::AttemptFailure::from_llm_error(
+                    task, model, &e,
                 ));
                 continue;
             }
@@ -971,7 +990,10 @@ impl OpenRouterClient {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(model = %model, error = %e, "openrouter: vision attempt failed (transport); next");
-                    last_err = Some(e.into());
+                    let e: LlmError = e.into();
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     continue;
                 }
             };
@@ -980,7 +1002,9 @@ impl OpenRouterClient {
                 Err(e) => {
                     let err = decode_or_api_error(&body, e);
                     tracing::warn!(model = %model, error = %err, "openrouter: vision attempt failed (decode); next");
-                    last_err = Some(err);
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &err,
+                    ));
                     continue;
                 }
             };
@@ -993,15 +1017,27 @@ impl OpenRouterClient {
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
                 // Retain only a COMPLETE garble for last-resort salvage; a
-                // length-truncated garble is incomplete, so route it to last_err
-                // (the caller fails open) rather than salvaging partial JSON.
+                // length-truncated garble is incomplete, so route it to
+                // `failures` (the caller fails open) rather than salvaging
+                // partial JSON.
                 if finish_reason.as_deref() == Some("length") {
-                    last_err = Some(LlmError::Garbled {
+                    let e = LlmError::Garbled {
                         model: model.to_string(),
                         raw,
                         finish_reason,
-                    });
+                    };
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                 } else {
+                    let e = LlmError::Garbled {
+                        model: model.to_string(),
+                        raw: raw.clone(),
+                        finish_reason: finish_reason.clone(),
+                    };
+                    failures.push(crate::failure::AttemptFailure::from_llm_error(
+                        task, model, &e,
+                    ));
                     last_garbled = Some((model.to_string(), raw, finish_reason));
                 }
                 continue;
@@ -1024,6 +1060,7 @@ impl OpenRouterClient {
                 model: model_out,
                 usage: parsed.usage,
                 finish_reason,
+                failures,
             });
         }
         // Exhausted with no clean describe. If any candidate returned recoverable
@@ -1043,9 +1080,10 @@ impl OpenRouterClient {
                 // Preserve the upstream finish_reason (e.g. "content_filter") so
                 // run_vision's validity gate still sees the safety signal.
                 finish_reason,
+                failures: failures.clone(),
             });
         }
-        Err(last_err.unwrap_or_else(|| LlmError::Config("openrouter: vision no models".into())))
+        Err(LlmError::Chain { failures })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1170,6 +1208,7 @@ impl OpenRouterClient {
             model: model_out,
             usage: parsed.usage,
             finish_reason,
+            failures: Vec::new(),
         })
     }
 
@@ -1916,10 +1955,106 @@ mod tests {
             })
             .await
             .expect_err("all fail");
-        assert!(
-            matches!(err, LlmError::Status(s, _, _) if s.as_u16() == 500),
-            "expected last 500, got {err:?}"
-        );
+        match err {
+            LlmError::Chain { failures } => {
+                let last = failures.last().expect("at least one failure");
+                match last {
+                    crate::failure::AttemptFailure::Upstream(a) => {
+                        assert_eq!(a.http_status, 500, "expected last 500, got {a:?}")
+                    }
+                    other => panic!("expected Upstream, got {other:?}"),
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_reports_the_failed_hop_even_when_a_fallback_recovers() {
+        // The whole point: a turn that recovered used to leave no trace at all.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_string_contains("primary/m"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(529)
+                    .set_body_string(r#"{"error":{"code":529,"message":"Overloaded"}}"#),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::body_string_contains("fallback/m"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"hi"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url("k".into(), server.uri());
+        let resp = client
+            .execute(ChatRequest {
+                model: "primary/m".into(),
+                fallback_model: vec!["fallback/m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fallback should recover");
+
+        assert_eq!(resp.reply, "hi");
+        assert_eq!(resp.failures.len(), 1, "the 529 hop must be reported");
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => {
+                assert_eq!(a.http_status, 529);
+                assert_eq!(a.model, "primary/m");
+                assert_eq!(a.task, "chat_companion");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_returns_chain_error_carrying_every_hop() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":503,"message":"no provider"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url("k".into(), server.uri());
+        let err = client
+            .execute(ChatRequest {
+                model: "a/m".into(),
+                fallback_model: vec!["b/m".into(), "c/m".into()],
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
+                task: Some("chat_companion".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("all candidates fail");
+
+        match err {
+            LlmError::Chain { failures } => {
+                assert_eq!(failures.len(), 3, "one entry per hop");
+                for f in &failures {
+                    match f {
+                        crate::failure::AttemptFailure::Upstream(a) => {
+                            assert_eq!(a.http_status, 503)
+                        }
+                        other => panic!("expected Upstream, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     // ─── B-err1: bounded + redacted provider error body ─────────────────────
@@ -2194,7 +2329,13 @@ mod tests {
             })
             .await
             .expect_err("403 fails the chain");
-        let shown = err.to_string();
+        let shown = match &err {
+            LlmError::Chain { failures } => match failures.last() {
+                Some(crate::failure::AttemptFailure::Upstream(a)) => a.message.clone(),
+                other => panic!("expected Upstream, got {other:?}"),
+            },
+            other => panic!("expected Chain, got {other:?}"),
+        };
         assert!(
             !shown.contains("RAW USER CHAT"),
             "flagged_input leaked into error: {shown}"
@@ -2277,10 +2418,19 @@ mod tests {
             })
             .await
             .expect_err("a 200 error envelope must fail, not decode-silently");
-        assert!(
-            matches!(&err, LlmError::Provider(m) if m.to_string().contains("provider exploded")),
-            "expected Provider with the embedded message, got {err:?}"
-        );
+        match err {
+            LlmError::Chain { failures } => match failures.last() {
+                Some(crate::failure::AttemptFailure::Upstream(a)) => {
+                    assert_eq!(a.http_status, 200, "mid-stream error rides a 200: {a:?}");
+                    assert!(
+                        a.message.contains("provider exploded"),
+                        "expected the embedded message, got {a:?}"
+                    );
+                }
+                other => panic!("expected Upstream, got {other:?}"),
+            },
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3439,10 +3589,19 @@ data: [DONE]\n\n";
             })
             .await
             .expect_err("length-truncated garble must NOT be salvaged");
-        assert!(
-            matches!(err, LlmError::Garbled { .. }),
-            "expected the Garbled error to surface (caller fails open), got {err:?}"
-        );
+        match err {
+            LlmError::Chain { failures } => match failures.last() {
+                Some(crate::failure::AttemptFailure::Gateway(g)) => {
+                    assert_eq!(
+                        g.kind,
+                        crate::failure::GatewayKind::Decode,
+                        "expected the garble to surface as a failure (caller fails open), got {g:?}"
+                    )
+                }
+                other => panic!("expected Gateway, got {other:?}"),
+            },
+            other => panic!("expected Chain, got {other:?}"),
+        }
     }
 
     #[tokio::test]

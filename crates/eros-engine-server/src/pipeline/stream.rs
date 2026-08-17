@@ -3824,6 +3824,7 @@ pub fn run_stream(
                         model: served_model.clone(),
                         usage: usage_full.clone(),
                         finish_reason: None,
+                        failures: Vec::new(),
                     },
                 );
 
