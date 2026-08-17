@@ -637,9 +637,20 @@ fn drive_chat_burst(
                 let effective_ghost = is_ghost_fallback || regex_ghost;
 
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
-                // Everything the chain walked over to reach this row, including
-                // the hops a recovered turn silently skipped past.
-                let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
+                // One turn, one authoritative list: only the row that CONCLUDES
+                // the turn carries it. `!truncated` is exactly that row here —
+                // the served reply, the last-attempt empty ghost, or the
+                // regex-stripped ghost. A superseded truncated bubble writes
+                // NULL: it is sometimes dropped outright (the ghost path retains
+                // only its own row), and parking the chain's failures on a row
+                // that can vanish would lose them. When the chain exhausts
+                // instead, the pseudo-ghost / garble-repaired row below is the
+                // concluding row and carries the list.
+                let (llm_attempts, gateway_errors) = if truncated {
+                    (None, None)
+                } else {
+                    split_failures(&chain_failures)
+                };
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
                     llm_attempts,
@@ -984,6 +995,9 @@ fn drive_chat_burst(
                     let msg_uuid: Uuid = msg_ulid.into();
                     let usage_full =
                         last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    // Filtered mode never persists a superseded attempt, so both
+                    // of its persist sites ARE concluding rows — no `truncated`
+                    // gate needed here, unlike live mode.
                     let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
                     let row = eros_engine_store::chat::AssistantInsert {
                         llm_attempts,
@@ -1477,6 +1491,11 @@ pub(crate) const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// network LLM call, so a generous LLM-sized budget would hide exactly the
 /// stall this timeout exists to bound.
 pub(crate) const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `[tasks.*]` key the out-of-character product-answer executor serves. Stamped
+/// on every failure that executor records, so one `chat_messages` row says which
+/// chain broke without the reader inferring it from `channel`.
+const PRODUCT_QA_TASK: &str = "chat_product_qa";
 
 /// Max wait for a chat stream to OPEN (connect + queue + response headers).
 /// A provider that accepts the socket but never sends headers must not hold
@@ -3830,6 +3849,12 @@ pub fn run_stream(
                 let mut last_gen_id: Option<String> = None;
                 let mut served_model: Option<String> = None;
                 let mut truncated = false;
+                // Same contract as the companion chain's two loops: genuine
+                // transport/status failures and local timeouts accumulate; a
+                // candidate that returned 200 and merely produced unusable
+                // content (length / content_filter cut, or nothing at all)
+                // pushes nothing, because that call succeeded and was billed.
+                let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
                 // Built once; only the served model differs per candidate, so
                 // execute_stream_as borrows it (no per-candidate prompt clone).
                 let qa_req = eros_engine_llm::openrouter::ChatRequest {
@@ -3838,9 +3863,12 @@ pub fn run_stream(
                     max_tokens: p.max_tokens,
                     sampling: p.sampling,
                     reasoning: p.reasoning.clone(),
-                    task: Some("chat_product_qa".into()),
+                    task: Some(PRODUCT_QA_TASK.into()),
                     ..Default::default()
                 };
+                // `candidates` is moved by the loop below; keep its length for
+                // the chain-exhausted record.
+                let candidate_count = candidates.len();
                 'candidates: for model_id in candidates {
                     last_usage = None;
                     last_gen_id = None;
@@ -3855,12 +3883,28 @@ pub fn run_stream(
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             tracing::warn!(model = %model_id, error = %e, "product_qa: open stream failed");
+                            chain_failures.push(
+                                eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                    PRODUCT_QA_TASK, &model_id, &e,
+                                ),
+                            );
                             if acc.is_empty() { continue 'candidates; }
                             truncated = true;
                             break 'candidates;
                         }
                         Err(_) => {
                             tracing::warn!(model = %model_id, "product_qa: open timeout");
+                            chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                                eros_engine_llm::failure::GatewayError {
+                                    task: PRODUCT_QA_TASK.to_string(),
+                                    model: Some(model_id.clone()),
+                                    kind: eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                                    message: format!(
+                                        "stream open timeout after {}s",
+                                        STREAM_OPEN_TIMEOUT.as_secs()
+                                    ),
+                                },
+                            ));
                             if acc.is_empty() { continue 'candidates; }
                             truncated = true;
                             break 'candidates;
@@ -3878,6 +3922,17 @@ pub fn run_stream(
                             Ok(item) => item,
                             Err(_) => {
                                 tracing::warn!(model = %model_id, "product_qa: total timeout");
+                                chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                                    eros_engine_llm::failure::GatewayError {
+                                        task: PRODUCT_QA_TASK.to_string(),
+                                        model: Some(model_id.clone()),
+                                        kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                                        message: format!(
+                                            "stream total timeout after {}s",
+                                            STREAM_TOTAL_TIMEOUT.as_secs()
+                                        ),
+                                    },
+                                ));
                                 if acc.is_empty() { continue 'candidates; }
                                 truncated = true;
                                 break 'candidates;
@@ -3899,6 +3954,11 @@ pub fn run_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::warn!(model = %model_id, error = %e, "product_qa: mid-stream error");
+                                chain_failures.push(
+                                    eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                        PRODUCT_QA_TASK, &model_id, &e,
+                                    ),
+                                );
                                 if acc.is_empty() { continue 'candidates; }
                                 truncated = true;
                                 break 'candidates;
@@ -3916,6 +3976,16 @@ pub fn run_stream(
                 // hold (spec §4). Never degrade to the companion reply path — the
                 // companion doesn't know the product facts.
                 if acc.is_empty() {
+                    // `acc` can only still be empty when every candidate hit a
+                    // `continue 'candidates` — i.e. the whole chain is spent.
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: PRODUCT_QA_TASK.to_string(),
+                            model: None,
+                            kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+                            message: format!("all {candidate_count} candidates failed"),
+                        },
+                    ));
                     let phrase = ErrorHandlingRepo { pool: &state.pool }
                         .pick_chat_stream_fallback_phrase()
                         .await
@@ -3948,7 +4018,10 @@ pub fn run_stream(
                             // No phrase configured: same terminal shape as the voice
                             // path's all-candidates failure. (Parity note: like a
                             // normal chat failure, retry of this client_msg_id will
-                            // 409 until a row exists.)
+                            // 409 until a row exists.) No row means nowhere to write
+                            // the accumulated failures — they stay in the logs, as
+                            // they did before. Manufacturing a row here just to hold
+                            // them would change replay/idempotency semantics.
                             yield ProtocolFrame::Error {
                                 code: StreamErrorCode::UpstreamUnavailable,
                                 retryable: true,
@@ -3961,6 +4034,10 @@ pub fn run_stream(
                 }
 
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                // This executor persists exactly ONE row per turn — it has no
+                // superseded-bubble concept — so this row is always the
+                // concluding row and always owns the whole list.
+                let (qa_attempts, qa_gateways) = split_failures(&chain_failures);
                 if let Err(e) = chat_repo
                     .insert_product_qa_assistant_message(
                         user_msg.session_id,
@@ -3971,6 +4048,8 @@ pub fn run_stream(
                         usage_full.as_ref(),
                         last_gen_id.as_deref(),
                         truncated,
+                        qa_attempts.as_ref(),
+                        qa_gateways.as_ref(),
                     )
                     .await
                 {
@@ -11714,6 +11793,143 @@ data: [DONE]\n\n";
         );
     }
 
+    /// `chat_product_qa` is the third `chat_messages` call site in the spec's §3
+    /// table, and it walks its own hand-rolled candidate loop rather than
+    /// `drive_chat_burst`. Same shape as the companion recovered-chain test, but
+    /// a 507 so a copy-paste onto the wrong path fails loudly.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_product_qa_chain_persists_the_507_on_the_answer_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge routes the turn to the product-QA executor.
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        // Primary executor is out of storage; the fallback answers normally.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-a"))
+            .respond_with(
+                ResponseTemplate::new(507)
+                    .set_body_string(r#"{"error":{"code":507,"message":"Insufficient Storage"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let answer = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ANSWER\"}}],",
+            "\"id\":\"gen-qa\",\"model\":\"qa/exec-b\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(answer, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品能用几年",
+                "01JPQARECOVERED507000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品能用几年".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let (content, channel, attempts, gateways): (
+            String,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, channel, llm_attempts, gateway_errors \
+             FROM engine.chat_messages WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "ANSWER", "the fallback executor served the answer");
+        assert_eq!(channel.as_deref(), Some("product_qa"));
+        let attempts = attempts.expect("the failed executor hop must be recorded");
+        assert_eq!(attempts[0]["http_status"], 507);
+        assert_eq!(attempts[0]["model"], "qa/exec-a");
+        assert_eq!(
+            attempts[0]["task"], "chat_product_qa",
+            "the task must name the executor's chain, not chat_companion",
+        );
+        assert!(
+            gateways.is_none(),
+            "the chain recovered, so no chain_exhausted and no gateway fact: {gateways:?}",
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_stream_pde_judge_reply_injects_reply_tone(pool: PgPool) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -12486,6 +12702,135 @@ data: [DONE]\n\n";
         assert!(
             gateways.is_none(),
             "nothing broke on our side of the wire, so that column stays NULL: {gateways:?}",
+        );
+    }
+
+    /// One turn, one authoritative list. Live mode persists a bubble for every
+    /// attempt, so without a gate the same failure would land on both the
+    /// superseded bubble and the served row and `jsonb_array_length` would
+    /// double-count across rows. The NULL is the half that regresses silently,
+    /// so it is asserted explicitly.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn only_the_concluding_row_carries_the_chain_failures(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("bad/m"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_string(r#"{"error":{"code":502,"message":"Bad gateway"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"served\"}}],",
+            "\"id\":\"gen-g\",\"model\":\"good/m\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("good/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"bad/m\"\nfallback=[\"good/m\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JCONCLUDINGROWONLY00001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            bool,
+            String,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT truncated, content, llm_attempts, gateway_errors \
+                 FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "live mode persists the superseded bubble and the served row: {rows:?}",
+        );
+        let (truncated, _, superseded_attempts, superseded_gateways) = &rows[0];
+        assert!(*truncated, "row 0 is the superseded bubble: {rows:?}");
+        assert!(
+            superseded_attempts.is_none() && superseded_gateways.is_none(),
+            "a superseded bubble owns no list — it can be dropped outright: {rows:?}",
+        );
+        let (truncated, content, served_attempts, _) = &rows[1];
+        assert!(!*truncated, "row 1 is the concluding row: {rows:?}");
+        assert_eq!(content, "served");
+        assert_eq!(
+            served_attempts
+                .as_ref()
+                .expect("the concluding row owns the list")[0]["http_status"],
+            502,
         );
     }
 

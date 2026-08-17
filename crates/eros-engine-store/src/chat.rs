@@ -1145,12 +1145,14 @@ impl<'a> ChatRepo<'a> {
         usage: Option<&serde_json::Value>,
         generation_id: Option<&str>,
         truncated: bool,
+        llm_attempts: Option<&serde_json::Value>,
+        gateway_errors: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO engine.chat_messages \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
-              generation_id, assistant_action_type, channel) \
-             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'product_qa')",
+              generation_id, assistant_action_type, channel, llm_attempts, gateway_errors) \
+             VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'product_qa', $9, $10)",
         )
         .bind(id)
         .bind(session_id)
@@ -1160,6 +1162,8 @@ impl<'a> ChatRepo<'a> {
         .bind(model)
         .bind(usage)
         .bind(generation_id)
+        .bind(llm_attempts)
+        .bind(gateway_errors)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -4108,6 +4112,11 @@ mod tests {
             Some(&usage),
             Some("gen_pq_1"),
             false,
+            Some(&serde_json::json!([{
+                "task": "chat_product_qa", "model": "down/m",
+                "http_status": 507, "message": "insufficient storage"
+            }])),
+            None,
         )
         .await
         .unwrap();
@@ -4122,6 +4131,19 @@ mod tests {
         assert_eq!(row.assistant_action_type.as_deref(), Some("reply"));
         assert_eq!(row.user_message_id, Some(user_id));
         assert_eq!(row.generation_id.as_deref(), Some("gen_pq_1"));
+
+        // The two audit columns are write-only (not on `ChatMessage`), so read
+        // them directly: the upstream side round-trips, the empty side is NULL.
+        let (attempts, gateways): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT llm_attempts, gateway_errors FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(aid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts.unwrap()[0]["http_status"], 507);
+        assert!(gateways.is_none(), "an empty side stays NULL, never []");
     }
 
     #[sqlx::test(migrations = "./migrations")]
