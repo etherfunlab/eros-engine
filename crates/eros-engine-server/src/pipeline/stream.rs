@@ -596,6 +596,8 @@ fn drive_chat_burst(
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
                     id: msg_uuid,
                     content: persist_content.clone(),
                     assistant_action_type: persist_action.into(),
@@ -896,6 +898,8 @@ fn drive_chat_burst(
                     let usage_full =
                         last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
                     let row = eros_engine_store::chat::AssistantInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         id: msg_uuid,
                         content: String::new(),
                         assistant_action_type: persist_action.into(),
@@ -1159,6 +1163,8 @@ fn drive_chat_burst(
 
             let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             let row = eros_engine_store::chat::AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: msg_uuid,
                 content: visible.clone(),
                 assistant_action_type: persist_action.into(),
@@ -3034,6 +3040,8 @@ async fn build_delegated_image_prompt(
     let compose_event_id = record_compose_event(
         &state.pool,
         eros_engine_store::image_events::ImageComposeEventInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             source,
             user_id,
             instance_id: Some(persona.instance.id),
@@ -3141,6 +3149,8 @@ async fn build_stream_failure_pseudo_ghost(
 
     let chat_repo = ChatRepo { pool };
     let row = eros_engine_store::chat::AssistantInsert {
+        llm_attempts: None,
+        gateway_errors: None,
         id: msg_uuid,
         content: phrase.clone(),
         assistant_action_type: persist_action.into(),
@@ -3245,6 +3255,8 @@ async fn build_garble_repaired_replacement(
 
     let chat_repo = ChatRepo { pool };
     let row = eros_engine_store::chat::AssistantInsert {
+        llm_attempts: None,
+        gateway_errors: None,
         id: msg_uuid,
         content: repaired.clone(),
         assistant_action_type: persist_action.into(),
@@ -3565,6 +3577,8 @@ pub fn run_stream(
                 let repo = eros_engine_store::decision::DecisionEventRepo { pool: &pool };
                 if let Err(e) = repo
                     .record(eros_engine_store::decision::DecisionEventInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         run_id,
                         user_id: ev_user,
                         session_id: Some(ev_session),
@@ -3891,6 +3905,8 @@ pub fn run_stream(
                     );
                     image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         id: msg_uuid,
                         content: String::new(),
                         assistant_action_type: "reply".into(),
@@ -4052,6 +4068,8 @@ pub fn run_stream(
                         match tokio::time::timeout(
                             AUDIT_WRITE_TIMEOUT,
                             repo.record(eros_engine_store::image_events::ChatVisionEventInsert {
+                                llm_attempts: None,
+                                gateway_errors: None,
                                 user_id: user_msg.user_id,
                                 session_id: user_msg.session_id,
                                 message_id: user_msg.user_message_id,

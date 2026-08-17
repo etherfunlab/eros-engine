@@ -309,6 +309,8 @@ pub async fn compose_image(
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 source: "compose_endpoint",
                 user_id,
                 instance_id: Some(instance_id),
@@ -334,6 +336,8 @@ pub async fn compose_image(
     record_compose_event(
         &state.pool,
         ImageComposeEventInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             source: "compose_endpoint",
             user_id,
             instance_id: Some(instance_id),
@@ -603,6 +607,8 @@ async fn compose_stream(
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 source: "compose_endpoint_stream",
                 user_id,
                 instance_id: Some(instance_id),
@@ -699,6 +705,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),
@@ -739,6 +747,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),
@@ -770,6 +780,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),

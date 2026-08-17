@@ -585,4 +585,29 @@ mod migration_tests {
         .unwrap();
         assert_eq!(n, 1, "missing idx_world_posts_reply");
     }
+
+    /// One shape across five tables is the whole point — a fleet-wide error
+    /// view must be a single UNION ALL.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0050_adds_both_jsonb_columns_to_every_target_table(pool: PgPool) {
+        for table in [
+            "engine.chat_messages",
+            "engine.chat_vision_events",
+            "engine.chat_images_events",
+            "engine.companion_decision_events",
+            "engine.companion_affinity_events",
+        ] {
+            let sql = "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = split_part($1, '.', 1) \
+                   AND table_name = split_part($1, '.', 2) \
+                   AND column_name IN ('llm_attempts', 'gateway_errors') \
+                   AND data_type = 'jsonb'";
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(n, 2, "{table} must have both jsonb columns");
+        }
+    }
 }

@@ -309,6 +309,8 @@ impl<'a> AffinityRepo<'a> {
         context: serde_json::Value,
         meta: Option<&crate::OpenRouterCallMeta>,
         levels: EndpointLevelReads,
+        llm_attempts: Option<serde_json::Value>,
+        gateway_errors: Option<serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -489,8 +491,9 @@ impl<'a> AffinityRepo<'a> {
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
-                state_before, state_after, model, usage, generation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                state_before, state_after, model, usage, generation_id, \
+                llm_attempts, gateway_errors) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(current.id)
         .bind(event_type)
@@ -504,6 +507,8 @@ impl<'a> AffinityRepo<'a> {
         .bind(meta.and_then(|m| m.model.clone()))
         .bind(meta.and_then(|m| m.usage.clone()))
         .bind(meta.and_then(|m| m.generation_id.clone()))
+        .bind(llm_attempts)
+        .bind(gateway_errors)
         .execute(&mut *tx)
         .await?;
 
@@ -600,6 +605,8 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -757,6 +764,8 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -812,6 +821,8 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -862,6 +873,8 @@ mod tests {
                 ctx,
                 None,
                 EndpointLevelReads::default(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -934,6 +947,8 @@ mod tests {
             serde_json::json!({ "source": "test" }),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1006,6 +1021,8 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1061,6 +1078,8 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1090,6 +1109,8 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1148,6 +1169,8 @@ mod tests {
                     serde_json::json!({}),
                     None,
                     EndpointLevelReads::default(),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1203,6 +1226,8 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1258,6 +1283,8 @@ mod tests {
             serde_json::json!({ "affinity_reason": "他坦白了" }),
             None,
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1378,6 +1405,8 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1398,6 +1427,8 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2027,6 +2058,8 @@ mod tests {
             serde_json::json!({}),
             None,
             levels,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2198,6 +2231,8 @@ mod tests {
             serde_json::json!({}),
             Some(&meta),
             EndpointLevelReads::default(),
+            None,
+            None,
         )
         .await
         .unwrap();

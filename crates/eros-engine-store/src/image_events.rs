@@ -36,6 +36,11 @@ pub struct ImageComposeEventInsert<'a> {
     pub attempts: i16,
     /// Why the last attempt failed; NULL when `status == "ok"`.
     pub last_failure: Option<&'a str>,
+    /// Provider-layer failures for the chains behind this call, as a JSON
+    /// array. `None` when nothing failed; an empty array is never written.
+    pub llm_attempts: Option<serde_json::Value>,
+    /// Gateway-layer failures for the same chains.
+    pub gateway_errors: Option<serde_json::Value>,
 }
 
 pub struct ImageComposeEventRepo<'a> {
@@ -51,8 +56,8 @@ impl ImageComposeEventRepo<'_> {
             "INSERT INTO engine.chat_images_events \
                (source, user_id, instance_id, session_id, status, inputs, subject, \
                 caption, composed_prompt, variant, model, usage, generation_id, \
-                attempts, last_failure) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                attempts, last_failure, llm_attempts, gateway_errors) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              RETURNING id",
         )
         .bind(ev.source)
@@ -70,6 +75,8 @@ impl ImageComposeEventRepo<'_> {
         .bind(ev.generation_id)
         .bind(ev.attempts)
         .bind(ev.last_failure)
+        .bind(ev.llm_attempts)
+        .bind(ev.gateway_errors)
         .fetch_one(self.pool)
         .await
     }
@@ -107,9 +114,15 @@ pub struct ChatVisionEventInsert<'a> {
     /// Models actually called off `[primary, ...fallback]`; 0 when
     /// `[tasks.chat_vision]` is not configured.
     pub attempts: i16,
-    /// `model_error` / `timeout` / `empty` / `unparseable` / `content_filter` /
-    /// `blank_description` / `refusal_pattern`; NULL when `status == "ok"`.
+    /// `empty` / `unparseable` / `content_filter` / `blank_description` /
+    /// `refusal_pattern` / `upstream_error` / `gateway_error`; NULL when
+    /// `status == "ok"`.
     pub last_failure: Option<&'a str>,
+    /// Provider-layer failures for the chains behind this call, as a JSON
+    /// array. `None` when nothing failed; an empty array is never written.
+    pub llm_attempts: Option<serde_json::Value>,
+    /// Gateway-layer failures for the same chains.
+    pub gateway_errors: Option<serde_json::Value>,
 }
 
 pub struct ChatVisionEventRepo<'a> {
@@ -122,8 +135,8 @@ impl ChatVisionEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.chat_vision_events \
                (user_id, session_id, message_id, status, image_url, vision, model, \
-                usage, generation_id, attempts, last_failure) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                usage, generation_id, attempts, last_failure, llm_attempts, gateway_errors) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
         .bind(ev.user_id)
         .bind(ev.session_id)
@@ -136,6 +149,8 @@ impl ChatVisionEventRepo<'_> {
         .bind(ev.generation_id)
         .bind(ev.attempts)
         .bind(ev.last_failure)
+        .bind(ev.llm_attempts)
+        .bind(ev.gateway_errors)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -176,6 +191,8 @@ mod tests {
                 generation_id: Some("gen_compose_1"),
                 attempts: 1,
                 last_failure: None,
+                llm_attempts: None,
+                gateway_errors: None,
             })
             .await
             .unwrap();
@@ -204,6 +221,8 @@ mod tests {
             generation_id: None,
             attempts: 2,
             last_failure: Some("timeout"),
+            llm_attempts: None,
+            gateway_errors: None,
         })
         .await
         .unwrap();
@@ -268,6 +287,8 @@ mod tests {
             generation_id: Some("gen_vision_1"),
             attempts: 1,
             last_failure: None,
+            llm_attempts: None,
+            gateway_errors: None,
         })
         .await
         .unwrap();
@@ -285,6 +306,8 @@ mod tests {
             generation_id: None,
             attempts: 0,
             last_failure: None,
+            llm_attempts: None,
+            gateway_errors: None,
         })
         .await
         .unwrap();

@@ -2026,6 +2026,8 @@ mod tests {
                     session.id,
                     uid,
                     &[AssistantInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         id: Uuid::new_v4(),
                         content: format!("a{n}"),
                         assistant_action_type: "reply".into(),

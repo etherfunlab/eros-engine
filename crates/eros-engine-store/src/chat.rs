@@ -602,6 +602,11 @@ pub struct AssistantInsert {
     /// trait info is known (potentially `{"prompt_traits": []}`). NULL on
     /// legacy rows from before this column existed.
     pub metadata: Option<serde_json::Value>,
+    /// Provider-layer failures for the chains that produced this row, as a JSON
+    /// array. `None` when nothing failed; an empty array is never written.
+    pub llm_attempts: Option<serde_json::Value>,
+    /// Gateway-layer failures for the same chains.
+    pub gateway_errors: Option<serde_json::Value>,
 }
 
 /// Outcome of `upsert_user_message_idempotent`. The application uses this
@@ -783,6 +788,30 @@ impl<'a> ChatRepo<'a> {
         Ok(())
     }
 
+    /// Stamp a `role='user'` row with the input filter's per-attempt failures.
+    ///
+    /// Separate from `set_user_input_rewrite`, which fires only when a rewrite
+    /// succeeded — this one fires whenever the chain had at least one failure,
+    /// rewrite or not. Leaves `content` and every other column untouched.
+    pub async fn set_user_llm_failures(
+        &self,
+        user_message_id: Uuid,
+        llm_attempts: Option<serde_json::Value>,
+        gateway_errors: Option<serde_json::Value>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages \
+             SET llm_attempts = $2, gateway_errors = $3 \
+             WHERE id = $1 AND role = 'user'",
+        )
+        .bind(user_message_id)
+        .bind(llm_attempts)
+        .bind(gateway_errors)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Merge a `chat_vision` describe result into a `role='user'` row's
     /// metadata. Top-level JSONB merge; `COALESCE` handles a NULL metadata
     /// column. Leaves `content`, `pre_filter_content`, and existing keys (e.g.
@@ -897,9 +926,10 @@ impl<'a> ChatRepo<'a> {
                     continues_from_message_id, truncated, model, usage, generation_id, \
                     assistant_action_type, \
                     pre_filter_content, filter_model, filter_triggers, \
-                    f_client_msg_id, f_generation_id, metadata) \
+                    f_client_msg_id, f_generation_id, metadata, \
+                    llm_attempts, gateway_errors) \
                  VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8, $9, $10, \
-                         $11, $12, $13, $14, $15, $16)",
+                         $11, $12, $13, $14, $15, $16, $17, $18)",
             )
             .bind(row.id)
             .bind(session_id)
@@ -917,6 +947,8 @@ impl<'a> ChatRepo<'a> {
             .bind(f_client_msg_id)
             .bind(f_generation_id)
             .bind(&row.metadata)
+            .bind(&row.llm_attempts)
+            .bind(&row.gateway_errors)
             .execute(&mut *tx)
             .await?;
         }
@@ -1610,6 +1642,8 @@ mod tests {
             s.id,
             first,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "hi back".into(),
                 assistant_action_type: "reply".into(),
@@ -1893,6 +1927,8 @@ mod tests {
             "traits": { "any": ["nsfw_boost"], "when": "absent" }
         });
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "filtered reply".into(),
             assistant_action_type: "reply".into(),
@@ -1951,6 +1987,8 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "plain reply".into(),
             assistant_action_type: "reply".into(),
@@ -2024,6 +2062,8 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "filtered no gen".into(),
             assistant_action_type: "reply".into(),
@@ -2075,6 +2115,8 @@ mod tests {
         // Empty-trigger case: filter ran (filter_model set) but no predicates
         // fired, so filter_triggers is JSON null → must land as SQL NULL.
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "filtered empty-trigger".into(),
             assistant_action_type: "reply".into(),
@@ -2127,6 +2169,8 @@ mod tests {
         };
         let metadata = serde_json::json!({ "prompt_traits": ["nsfw_boost", "tsundere"] });
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "hi".into(),
             assistant_action_type: "reply".into(),
@@ -2165,6 +2209,8 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "hi".into(),
             assistant_action_type: "reply".into(),
@@ -2207,6 +2253,8 @@ mod tests {
             "tier": "gold"
         });
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "hi".into(),
             assistant_action_type: "reply".into(),
@@ -2254,6 +2302,8 @@ mod tests {
             other => panic!("expected Inserted, got {other:?}"),
         };
         let row = AssistantInsert {
+            llm_attempts: None,
+            gateway_errors: None,
             id: Uuid::new_v4(),
             content: "hi back".into(),
             assistant_action_type: "reply".into(),
@@ -2291,6 +2341,8 @@ mod tests {
             s.id,
             u1,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "a1".into(),
                 assistant_action_type: "reply".into(),
@@ -2318,6 +2370,8 @@ mod tests {
             s.id,
             u2,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "a2".into(),
                 assistant_action_type: "reply".into(),
@@ -2360,6 +2414,8 @@ mod tests {
                 s.id,
                 user_id,
                 &[AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
                     id: Uuid::new_v4(),
                     content: format!("a{n}"),
                     assistant_action_type: "reply".into(),
@@ -2404,6 +2460,8 @@ mod tests {
             s.id,
             u1,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "a1".into(),
                 assistant_action_type: "reply".into(),
@@ -2453,6 +2511,8 @@ mod tests {
             s.id,
             u1,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "a1".into(),
                 assistant_action_type: "reply".into(),
@@ -2500,6 +2560,8 @@ mod tests {
             s.id,
             u1,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "thanks!".into(),
                 assistant_action_type: "reply".into(),
@@ -2611,6 +2673,98 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn insert_assistant_batch_round_trips_llm_attempts_and_gateway_errors(pool: PgPool) {
+        let attempts = serde_json::json!([{
+            "task": "chat_companion",
+            "model": "x-ai/grok-4.20",
+            "http_status": 529,
+            "provider_code": "529",
+            "message": "code=529: Overloaded"
+        }]);
+        let gateway = serde_json::json!([{
+            "task": "chat_companion",
+            "kind": "chain_exhausted",
+            "message": "all candidates failed"
+        }]);
+
+        let session = throwaway_session(&pool).await;
+        let repo = ChatRepo { pool: &pool };
+        let id = Uuid::new_v4();
+        repo.insert_assistant_batch(
+            session.id,
+            Uuid::new_v4(),
+            &[AssistantInsert {
+                id,
+                content: "hi".into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                model: Some("fallback/m".into()),
+                usage: None,
+                generation_id: None,
+                filter_audit: None,
+                metadata: None,
+                llm_attempts: Some(attempts.clone()),
+                gateway_errors: Some(gateway.clone()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let (got_a, got_g): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT llm_attempts, gateway_errors FROM engine.chat_messages WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(got_a.unwrap()[0]["http_status"], 529);
+        assert_eq!(got_g.unwrap()[0]["kind"], "chain_exhausted");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_user_llm_failures_stamps_the_user_row_only(pool: PgPool) {
+        // The input filter rewrites the user message, so its failures belong on
+        // the user row — where its success audit already lives.
+        let repo = ChatRepo { pool: &pool };
+        let session = throwaway_session(&pool).await;
+        let umid = match repo
+            .upsert_user_message_idempotent(
+                session.id,
+                "hello",
+                "01J0000000000000000000000C",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let attempts = serde_json::json!([{
+            "task": "chat_input_filter",
+            "model": "infilt/primary",
+            "http_status": 429,
+            "message": "code=429: rate limited"
+        }]);
+        repo.set_user_llm_failures(umid, Some(attempts), None)
+            .await
+            .unwrap();
+
+        let (content, got): (String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT content, llm_attempts FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "hello", "content must be untouched");
+        assert_eq!(got.unwrap()[0]["task"], "chat_input_filter");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn recent_turn_pairs_before_message_uses_msg_sent_at_not_now(pool: PgPool) {
         let repo = ChatRepo { pool: &pool };
         let s = throwaway_session(&pool).await;
@@ -2628,6 +2782,8 @@ mod tests {
             s.id,
             u1,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: Uuid::new_v4(),
                 content: "a1".into(),
                 assistant_action_type: "reply".into(),
@@ -2845,6 +3001,8 @@ mod tests {
             s.id,
             u,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: aid,
                 content: String::new(),
                 assistant_action_type: "reply".into(),
@@ -2903,6 +3061,8 @@ mod tests {
                     session.id,
                     uid,
                     &[AssistantInsert {
+                        llm_attempts: None,
+                        gateway_errors: None,
                         id: Uuid::new_v4(),
                         content: format!("assistant-{n}"),
                         assistant_action_type: "reply".into(),
@@ -3122,6 +3282,8 @@ mod tests {
             s.id,
             user_msg_id,
             &[AssistantInsert {
+                llm_attempts: None,
+                gateway_errors: None,
                 id: msg_id,
                 content: "fell through to text".into(),
                 assistant_action_type: "reply".into(),

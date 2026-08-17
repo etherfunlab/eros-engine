@@ -981,6 +981,8 @@ mod tests {
                 session_id,
                 user_msg_id,
                 &[AssistantInsert {
+                    llm_attempts: None,
+                    gateway_errors: None,
                     id: assistant_uuid,
                     content: "replayed reply".into(),
                     assistant_action_type: "reply".into(),

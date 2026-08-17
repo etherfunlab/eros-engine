@@ -22,6 +22,11 @@ pub struct DecisionEventInsert<'a> {
     pub model: Option<&'a str>,
     pub usage: Option<serde_json::Value>,
     pub generation_id: Option<&'a str>,
+    /// Provider-layer failures for the chains behind this call, as a JSON
+    /// array. `None` when nothing failed; an empty array is never written.
+    pub llm_attempts: Option<serde_json::Value>,
+    /// Gateway-layer failures for the same chains.
+    pub gateway_errors: Option<serde_json::Value>,
 }
 
 pub struct DecisionEventRepo<'a> {
@@ -34,8 +39,9 @@ impl DecisionEventRepo<'_> {
         sqlx::query(
             "INSERT INTO engine.companion_decision_events \
                (run_id, user_id, session_id, message_id, status, action, \
-                proposed_action, payload, inputs, model, usage, generation_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                proposed_action, payload, inputs, model, usage, generation_id, \
+                llm_attempts, gateway_errors) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
         )
         .bind(ev.run_id)
         .bind(ev.user_id)
@@ -49,6 +55,8 @@ impl DecisionEventRepo<'_> {
         .bind(ev.model)
         .bind(ev.usage)
         .bind(ev.generation_id)
+        .bind(ev.llm_attempts)
+        .bind(ev.gateway_errors)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -82,6 +90,8 @@ mod tests {
             model: Some("x-ai/grok-4-mini"),
             usage: Some(serde_json::json!({"total_tokens": 12})),
             generation_id: Some("gen_1"),
+            llm_attempts: None,
+            gateway_errors: None,
         })
         .await
         .unwrap();
@@ -101,6 +111,8 @@ mod tests {
             model: Some("x-ai/grok-4-mini"),
             usage: None,
             generation_id: None,
+            llm_attempts: None,
+            gateway_errors: None,
         })
         .await
         .unwrap();
@@ -133,5 +145,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn decision_status_accepts_pointer_values_and_historical_ones(pool: PgPool) {
+        let repo = DecisionEventRepo { pool: &pool };
+        for status in [
+            "ok",
+            "empty",
+            "parse_error",
+            "timeout",
+            "error",
+            "upstream_error",
+            "gateway_error",
+        ] {
+            repo.record(DecisionEventInsert {
+                run_id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                session_id: None,
+                message_id: None,
+                status,
+                action: None,
+                proposed_action: None,
+                payload: None,
+                inputs: None,
+                model: None,
+                usage: None,
+                generation_id: None,
+                llm_attempts: None,
+                gateway_errors: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("status {status} must be accepted: {e}"));
+        }
     }
 }

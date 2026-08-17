@@ -302,6 +302,8 @@ async fn persist_affinity(
                     context,
                     meta.as_ref(),
                     levels,
+                    None,
+                    None,
                 )
                 .await
             {
