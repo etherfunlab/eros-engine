@@ -214,8 +214,9 @@ pub(crate) struct ParsedErrorBody {
 
 impl ParsedErrorBody {
     /// For call sites that have prose rather than an error envelope. Not
-    /// called outside tests yet — a follow-up task wires it into the
-    /// non-JSON `LlmError::Status`/`Stream` construction sites.
+    /// called outside tests yet — Task 3 wires it into the non-JSON
+    /// `LlmError::Status`/`Stream` construction sites and removes this
+    /// `#[allow(dead_code)]`.
     #[allow(dead_code)]
     pub(crate) fn message_only(s: &str) -> Self {
         Self {
@@ -312,22 +313,15 @@ pub(crate) fn parse_error_body(raw: &str) -> ParsedErrorBody {
         body.message.as_deref().unwrap_or("")
     );
     if let Some(p) = meta_str("provider_name") {
-        out.push_str(&format!(" provider={p}"));
+        out.push_str(&format!(" [provider={p}]"));
     }
     if let Some(reasons) = meta
         .and_then(|m| m.get("reasons"))
         .and_then(|v| v.as_array())
     {
-        let joined: Vec<String> = reasons
-            .iter()
-            .map(|r| {
-                r.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| r.to_string())
-            })
-            .collect();
+        let joined: Vec<&str> = reasons.iter().filter_map(|r| r.as_str()).collect();
         if !joined.is_empty() {
-            out.push_str(&format!(" moderation_reasons={}", joined.join(",")));
+            out.push_str(&format!(" [moderation_reasons={}]", joined.join(",")));
         }
     }
 
@@ -2054,6 +2048,38 @@ mod tests {
         assert_eq!(p.error_type, None);
         assert_eq!(p.provider_code, None);
         assert_eq!(p.message, "stream terminated with finish_reason=error");
+    }
+
+    #[test]
+    fn parse_error_body_display_is_byte_identical_to_the_legacy_format() {
+        // scrub_error_body's output shape is an operator-facing log format. The
+        // three inherited tests use .contains(), which cannot see a dropped
+        // bracket — this one pins the whole string.
+        let raw = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "slow down",
+                "metadata": { "provider_name": "SomeProvider", "reasons": ["sexual", "violence"] }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            parse_error_body(&raw).to_string(),
+            "code=429: slow down [provider=SomeProvider] [moderation_reasons=sexual,violence]"
+        );
+    }
+
+    #[test]
+    fn parse_error_body_drops_non_string_moderation_reasons() {
+        let raw = serde_json::json!({
+            "error": { "code": 403, "message": "no", "metadata": { "reasons": [{"x": 1}] } }
+        })
+        .to_string();
+        let out = parse_error_body(&raw).to_string();
+        assert_eq!(
+            out, "code=403: no",
+            "a non-string reason contributes nothing"
+        );
     }
 
     #[test]
