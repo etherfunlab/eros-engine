@@ -227,7 +227,7 @@ pub struct ParsedErrorBody {
 
 impl ParsedErrorBody {
     /// For call sites that have prose rather than an error envelope.
-    pub(crate) fn message_only(s: &str) -> Self {
+    pub fn message_only(s: &str) -> Self {
         Self {
             message: s.to_string(),
             ..Default::default()
@@ -360,6 +360,29 @@ fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
         )))
     } else {
         LlmError::Decode(err)
+    }
+}
+
+/// Build the `ParsedErrorBody` for a mid-stream provider error frame (a
+/// top-level `error` object on an otherwise-200 SSE stream). The `"mid-stream
+/// error: "` marker is the only thing that distinguishes this from a 200-body
+/// error envelope caught by `decode_or_api_error` — nothing was sent there,
+/// whereas here the provider started streaming and then failed, so partial
+/// content may already be out. Both classify as `Provider` errors at
+/// `http_status: 200`, so without the marker nothing tells them apart. No
+/// vendor name in the marker: this client also serves Venice and any custom
+/// OpenAI-compatible endpoint via the `@provider` suffix, and `"openrouter
+/// ..."` on a Venice stream would simply be false.
+fn mid_stream_error_body(code: Option<&serde_json::Value>, message: &str) -> ParsedErrorBody {
+    let code = code.map(|c| c.to_string());
+    ParsedErrorBody {
+        code: code.clone(),
+        message: body_preview(&format!(
+            "mid-stream error: code={}: {}",
+            code.as_deref().unwrap_or("?"),
+            message
+        )),
+        ..Default::default()
     }
 }
 
@@ -1293,16 +1316,10 @@ impl OpenRouterClient {
                                     // Keep the code structured — this used to
                                     // be format!("code={:?}") into a String,
                                     // which destroyed it.
-                                    let code = err.code.map(|c| c.to_string());
-                                    return Some(Err(LlmError::Provider(ParsedErrorBody {
-                                        code: code.clone(),
-                                        message: body_preview(&format!(
-                                            "code={}: {}",
-                                            code.as_deref().unwrap_or("?"),
-                                            err.message
-                                        )),
-                                        ..Default::default()
-                                    })));
+                                    return Some(Err(LlmError::Provider(mid_stream_error_body(
+                                        err.code.as_ref(),
+                                        &err.message,
+                                    ))));
                                 }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
                                 if choice.finish_reason.as_deref() == Some("error") {
@@ -2071,6 +2088,25 @@ mod tests {
         assert_eq!(p.error_type, None);
         assert_eq!(p.provider_code, None);
         assert_eq!(p.message, "stream terminated with finish_reason=error");
+    }
+
+    #[test]
+    fn mid_stream_error_message_keeps_a_marker_and_the_code() {
+        // The marker is the only thing separating "the provider died mid-stream,
+        // partial content may already be out" from "the provider returned an error
+        // envelope with a 200 and nothing was sent" — both are Provider errors that
+        // classify as upstream at http_status 200.
+        let body = mid_stream_error_body(Some(&serde_json::json!(529)), "Overloaded");
+        assert_eq!(body.to_string(), "mid-stream error: code=529: Overloaded");
+    }
+
+    #[test]
+    fn mid_stream_error_message_with_no_code() {
+        let body = mid_stream_error_body(None, "provider blew up");
+        assert_eq!(
+            body.to_string(),
+            "mid-stream error: code=?: provider blew up"
+        );
     }
 
     #[test]

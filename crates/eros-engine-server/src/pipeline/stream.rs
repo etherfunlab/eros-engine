@@ -4603,10 +4603,9 @@ mod tests {
         // Provider error frames (a 200 SSE frame carrying `error`) are their
         // own failure mode, distinct from transport drops (spec §4.2).
         assert_eq!(
-            chunk_err_outcome(&LlmError::Provider(ParsedErrorBody {
-                message: "openrouter mid-stream error: code=Some(502): upstream".into(),
-                ..Default::default()
-            })),
+            chunk_err_outcome(&LlmError::Provider(ParsedErrorBody::message_only(
+                "mid-stream error: code=502: upstream"
+            ))),
             "error_frame"
         );
         // The byte-level idle watchdog's io::Error rides through
