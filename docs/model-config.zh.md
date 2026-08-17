@@ -490,8 +490,8 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
 | `world_director` | `pipeline::world::sweeper`，经由 `resolve_world_director()`（后台按 owner 逐一执行的世界状态 director 轮次；任务块缺失/空白、设置了 `WORLD_DISABLED`，或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
 | `world_stories_director` | `pipeline::story::run_stories_scan`，由 `pipeline::world::sweeper` 调用，经由 `resolve_world_stories_director()`（按 owner 逐一执行的故事轮次，还要求 `world_director` 已配置；任务块缺失/空白，或设置了 `WORLD_STORIES_DISABLED` 时关闭） | live（opt-in） |
-| `world_comment` | `pipeline::world_town::sweeper`，经由 `resolve_world_comment()`（每小时一次的 world-town 评论轮次；任务块缺失/空白，或设置了 `WORLD_DISABLED`、`WORLD_TOWN_DISABLED` 时关闭） | live（opt-in） |
-| `world_reply` | `pipeline::world_town::sweeper`，经由 `resolve_world_reply()`（对 world-town 帖子上用户评论的去抖/冷却/限额 responder 回复；任务块缺失/空白，或设置了 `WORLD_DISABLED`、`WORLD_TOWN_DISABLED` 时关闭） | live（opt-in） |
+| `world_comment` | `pipeline::world_town::sweeper`，经由 `resolve_world_comment()`（每小时一次的 world-town 评论轮次，还要求 `world_director` 已配置——贴文只能在它下游产生；任务块缺失/空白、设置了 `WORLD_DISABLED` 或 `WORLD_TOWN_DISABLED`、或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
+| `world_reply` | `pipeline::world_town::sweeper`，经由 `resolve_world_reply()`（对 world-town 帖子上用户评论的去抖/冷却/限额 responder 回复，还要求 `world_director` 已配置；任务块缺失/空白、设置了 `WORLD_DISABLED` 或 `WORLD_TOWN_DISABLED`、或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
 | `embedding` | 启动时的 `EmbeddingRouter::from_config()`（`main.rs`），经由 `ModelConfig::resolve_embedding()`——把 `embed_query`/`embed_document`/`embed_documents` 路由到原生 Voyage、内置 OpenRouter embeddings 端点、或某个 `[providers]` 条目；块缺失 = 原生 Voyage `voyage-4-lite` | live |
 
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
@@ -538,7 +538,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
   - `tone`（选填）：这一轮回复该用的语气/口吻，一句话——在文本类动作上注入 reply prompt 的 `[reply_tone]` 区块；缺省则不注入
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
-- **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 两次，ghost cooldown 为一小时。
+- **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。
 - 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴。fire-and-forget 写入；历史行保持 `NULL`。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。

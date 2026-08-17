@@ -357,7 +357,7 @@ Both inversions are outages: doing step 3's work in step 1 selects columns that
 do not exist yet; doing step 1's work in step 3 leaves a reader on a dropped
 column.
 
-`docs/migrating/affinity-4.1.md` is the downstream-facing instruction set.
+`docs/migrating/affinity-4-0-v1-3-1.md` is the downstream-facing instruction set.
 
 ## 9. Testing
 

@@ -101,7 +101,7 @@ Every constant is anchored, not invented:
   Absence cools but never zeroes — and an old relationship keeps a floor
   through the boost (bond `0.9` at full decay still yields patience ≈ `0.48`).
 
-Reachable values at `decay = 1`: level 1 → `(0, 0.2]` (continuous in the
+Reachable values at `decay = 1`: level 1 → `[0.0, 0.2]` (continuous in the
 counterpart), level 2 → `[0.244, 0.5]`, level 3 → `[0.487, 1.0]`. The level
 picks the band; the counterpart line picks the position inside it.
 
@@ -489,6 +489,15 @@ derivation delta), the event carries:
     "label_changes": {
       "bond": { "from": "acquaintance", "to": "friend" }
     },
+    "state_after": {
+      "warmth": 0.58, "trust": 0.21, "intrigue": 0.09,
+      "intimacy": 0.04, "patience": 0.44, "tension": 0.02,
+      "bond": 0.15, "chemistry": 0.03,
+      "bond_tier": 2, "chem_tier": 1,
+      "warmth_grade": 2, "patience_grade": 2,
+      "ghost_streak": 0, "total_ghosts": 0,
+      "updated_at": "…"
+    },
     "created_at": "…"
   }
 }
@@ -500,17 +509,22 @@ derivation delta), the event carries:
   absent on pre-migration rows.
 - `label_changes` — engine-authoritative tier transition for this turn;
   `null` (or absent) when no tier moved.
+- `state_after` — the whole post-turn vector (six axes, both line scores,
+  both tier numbers, both judge levels, the ghost counters, `updated_at`),
+  read from `companion_affinity_events.state_after`. Absent on rows written
+  before migration 0049.
 
-Both fields are stored on the event row, so a direct query against
-`engine.companion_affinity_events` sees them alongside `state_before` /
-`state_after`.
+All three are stored on the event row. The matching `state_before` column is
+not served here — replaying a range of turns is a direct query against
+`engine.companion_affinity_events`.
 
 ## Source
 
 - `crates/eros-engine-core/src/affinity.rs` — types, `grade_turn` write pipeline, endpoint derivation, time decay, bond/chemistry scores, tiers, labels, diff_labels
-- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo` (persist_with_event, record_ghost), migration 0048
+- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo` (persist_with_event, record_ghost), migrations 0048–0049
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM evaluation, grade/level parsing
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude directive + eval prompt
 - `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot` (composite scores + labels)
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF affinity surface (value + event)
-- Design spec: `docs/superpowers/specs/2026-08-16-affinity-40-design.md`
+- Design spec: `docs/superpowers/specs/2026-08-16-affinity-40-design.md` — the line math, endpoint derivation, tiers
+- Design spec: `docs/superpowers/specs/2026-08-17-affinity-41-design.md` — stored tier columns, event state snapshots, the value endpoint

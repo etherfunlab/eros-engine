@@ -39,8 +39,9 @@ Score alone doesn't decide. Four rules run in priority order before the threshol
 1. message_count < 10            → never ghost
                                     (relationship still nascent)
 
-2. ghost_streak ≥ 2              → never ghost twice in a row
-                                    (avoid the "she's gone" cliff)
+2. ghost_streak ≥ 2              → never ghost a third time in a row
+                                    (two consecutive are allowed; the
+                                     third is what reads as "she's gone")
 
 3. last_ghost < 1h ago           → cooldown
                                     (if I just ghosted you, give it a beat)

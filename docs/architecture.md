@@ -28,7 +28,7 @@ The dependency graph is strictly downward — `core` doesn't know about `llm`, `
 
 ## Pipeline
 
-`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage)` orchestrates a single chat turn, returning an SSE frame stream:
+`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage, prefetched_persona: Option<CompanionPersona>)` orchestrates a single chat turn, returning an SSE frame stream:
 
 ```
 load context           load persona via PersonaRepo
@@ -63,7 +63,9 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                        - memory   (Voyage embed → pgvector upsert)
                        - insight  (LLM extracts facts → human_insights UPSERT,
                          per-column incremental)
-                       (the three run concurrently via tokio::join!)
+                       - character insight (LLM extracts facts about the AI
+                         persona → character_insights UPSERT, experimental)
+                       (the four run concurrently via tokio::join!)
 ```
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
@@ -150,7 +152,7 @@ See [voice barge-in](superpowers/specs/2026-08-11-voice-barge-in-interrupt-desig
 
 Two reasons:
 
-1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 69 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
+1. **Reasoning load.** Affinity math, ghost decisions, and PDE rules are the load-bearing logic. Keeping them I/O-free means a 0-dep cargo test runs in 0ms and never flakes on network. The 87 tests in `core` are the safety net for everything above. (The opt-in LLM judge layer lives in `server`, not `core`, so `core` stays zero-I/O.)
 2. **Embeddability.** Anyone wanting to build a different product on top — journaling agent, language tutor, coaching companion — can pull in `core` without inheriting the HTTP shape, the Postgres schema, or the JWT auth. The 6-dim affinity model is the part most worth lifting; we made that easy.
 
 ## File structure
@@ -171,7 +173,7 @@ crates/
 │       ├── voyage.rs         # 512-dim embeddings, fail-loud on empty key
 │       └── model_config.rs   # TOML loader
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0047_character_insights
+│   ├── migrations/           # 0000_schema → 0049_affinity_tiers_and_event_state
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions builder
 │       ├── chat.rs           # ChatRepo

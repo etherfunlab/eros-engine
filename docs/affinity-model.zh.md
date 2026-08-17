@@ -83,7 +83,7 @@ chemistry 给出老友形态（有耐心但冷静）——不需要提示词特�
   `0.5`）：7 天 → ×0.86，25 天以上 → ×0.5。久别冷却但不清零——老关系的韧性
   由加成托住（bond `0.9` 满衰减后 patience 仍 ≈ `0.48`）。
 
-`decay = 1` 时的可达域：档 1 → `(0, 0.2]`（随对线连续），档 2 →
+`decay = 1` 时的可达域：档 1 → `[0.0, 0.2]`（随对线连续），档 2 →
 `[0.244, 0.5]`，档 3 → `[0.487, 1.0]`。档位决定大区间，对线值决定区间内位置。
 
 **逐回合 delta 照常输出。**`effective_deltas.warmth` / `.patience` 是派生值
@@ -402,16 +402,20 @@ label_changes = {
   从前后分数计算并落在事件行上
   （`companion_affinity_events.effective_line_deltas`）。旧行上为 `null`/缺省。
 - `label_changes` —— 引擎权威的本轮档位迁移；无档位移动时为 `null`（或缺省）。
+- `state_after` —— 本轮结束时的整个向量（六轴、两条线的分数、两个档位序号、
+  两个判官档位、ghost 计数、`updated_at`），取自
+  `companion_affinity_events.state_after`。migration 0049 之前写入的行上缺省。
 
-两个字段都落在事件行上，所以直查 `engine.companion_affinity_events` 时会与
-`state_before` / `state_after` 一并看到。
+三个字段都落在事件行上。对应的 `state_before` 列不在此端点返回——要重放一段
+回合请直查 `engine.companion_affinity_events`。
 
 ## 源码
 
 - `crates/eros-engine-core/src/affinity.rs` —— 类型、`grade_turn` 写入管线、端点派生、时间衰减、bond/chemistry 分数、档位、标签、diff_labels
-- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost）、migration 0048
+- `crates/eros-engine-store/src/affinity.rs` —— `AffinityRepo`（persist_with_event、record_ghost）、migrations 0048–0049
 - `crates/eros-engine-server/src/pipeline/post_process.rs` —— LLM 评估、档位解析
 - `crates/eros-engine-server/src/prompt.rs` —— 好感度 → 态度指令 + 评估提示词
 - `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（合成分 + 标签）
-- `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 事件表面
-- 设计 spec：`docs/superpowers/specs/2026-08-16-affinity-40-design.md`
+- `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 好感度表面（value + event）
+- 设计 spec：`docs/superpowers/specs/2026-08-16-affinity-40-design.md` —— 线的数学、端点派生、档位
+- 设计 spec：`docs/superpowers/specs/2026-08-17-affinity-41-design.md` —— 档位列落库、事件状态快照、绝对值端点

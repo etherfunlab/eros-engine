@@ -900,11 +900,13 @@ pub struct TaskConfig {
     /// Read only by `resolve_voice`.
     #[serde(default)]
     pub recall: Option<bool>,
-    /// world_director-only: hours between per-owner director rounds. Read only
-    /// on `[tasks.world_director]` (like `ghosting` on pde_decision). Default 24.
+    /// Hours between per-owner rounds. Read on `[tasks.world_director]`
+    /// (default 24) and `[tasks.world_stories_director]` (default 8); the two
+    /// resolve it independently, so the default depends on which block it is in.
     #[serde(default)]
     pub interval_hours: Option<u32>,
-    /// world_director-only: days of world_memories script retention. Default 30.
+    /// Days of script retention, read on the same two director blocks as
+    /// `interval_hours`. Default 30 in both.
     #[serde(default)]
     pub retention_days: Option<u32>,
     /// world_comment-only: seconds between hourly comment rounds. Read only

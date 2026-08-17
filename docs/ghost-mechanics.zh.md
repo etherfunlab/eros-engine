@@ -39,8 +39,9 @@ pub fn score(a: &Affinity) -> f64 {
 1. message_count < 10            → 永遠不 ghost
                                     （關係還幼嫩）
 
-2. ghost_streak ≥ 2              → 不連 ghost 兩次
-                                    （避免「她走了」的崖式體感）
+2. ghost_streak ≥ 2              → 不連 ghost 第三次
+                                    （连两次是允许的；第三次才会
+                                      读成「她走了」的崖式体感）
 
 3. last_ghost < 1 小時前          → 冷靜期
                                     （剛 ghost 過你，緩一緩）

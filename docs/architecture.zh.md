@@ -28,7 +28,7 @@
 
 ## Pipeline
 
-`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage)` 編排單輪對話，返回 SSE 帧流：
+`pipeline::stream::run_stream(state: Arc<AppState>, user_msg: PersistedUserMessage, prefetched_persona: Option<CompanionPersona>)` 編排單輪對話，返回 SSE 帧流：
 
 ```
 加載上下文              用 PersonaRepo 加載人格
@@ -63,7 +63,9 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                         - memory   （Voyage embed → pgvector upsert）
                         - insight  （LLM 抽事实 → human_insights UPSERT，
                           按列增量更新）
-                        （三个 future 经 tokio::join! 并发执行）
+                        - character insight（LLM 抽 AI 角色自身的事实 →
+                          character_insights UPSERT，实验特性）
+                        （四个 future 经 tokio::join! 并发执行）
 ```
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
@@ -142,7 +144,7 @@ user 行上带 `metadata.voice_interrupt` 表示这一轮是用户主动打断�
 
 兩個原因：
 
-1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 69 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
+1. **思考負擔。** 好感度數學、ghost 決策、PDE 規則——這些是承重邏輯。把它們做成無 I/O 的，意味著 0 依賴的 cargo test 0ms 跑完，不會因為網絡抖動而 flake。`core` 的 87 個測試是上層所有東西的安全網。（可选 LLM 判断器层在 `server` 里，不在 `core` 里，所以 `core` 保持零 I/O。）
 2. **可嵌入性。** 任何想在這個基礎上做別的產品的人——日記式 agent、語言教練、教練類陪伴——可以只拉 `core` 進來，不用繼承 HTTP 的形狀、Postgres schema、JWT auth。六維好感度模型才是別人最想拿走的部份；我們把這件事做成輕巧的。
 
 ## 文件結構
@@ -163,7 +165,7 @@ crates/
 │       ├── voyage.rs         # 512 維 embedding，空 key 直接 fail
 │       └── model_config.rs   # TOML 加載器
 ├── eros-engine-store/
-│   ├── migrations/           # 0000_schema → 0047_character_insights
+│   ├── migrations/           # 0000_schema → 0049_affinity_tiers_and_event_state
 │   └── src/
 │       ├── pool.rs           # PgPoolOptions 構造
 │       ├── chat.rs           # ChatRepo

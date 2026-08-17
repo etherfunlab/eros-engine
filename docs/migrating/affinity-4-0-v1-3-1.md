@@ -1,13 +1,12 @@
-# Migrating to Affinity 4.1
+# Migrating to the v1.3.1 affinity surface
 
-**Applies to:** clients of `eros-engine` upgrading to the release that carries
-store migration `0049` (the version number is set at release time; match on the
-migration, not on a number quoted here).
+**Applies to:** clients of `eros-engine` upgrading to `v1.3.1`, the release that
+carries store migration `0049`.
 **Design:** [`docs/superpowers/specs/2026-08-17-affinity-41-design.md`](../superpowers/specs/2026-08-17-affinity-41-design.md)
 
-Affinity 4.1 changes no scoring math. It changes where the relationship tier
-lives, what the audit trail records, and how a client is supposed to read an
-absolute affinity value.
+**The Affinity 4.0 scoring math is unchanged.** What changes is where the
+relationship tier lives, what the audit trail records, and how a client is
+supposed to read an absolute affinity value.
 
 **If you do nothing, two things break:** any endpoint call behind
 `EXPOSE_AFFINITY_DEBUG` starts returning 404, and any SQL that selects

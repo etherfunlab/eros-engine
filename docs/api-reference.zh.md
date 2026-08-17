@@ -8,7 +8,7 @@
 
 ## 鑒權
 
-每個 `/comp/*` 跟 `/bff/v1/*` 端點都需要 `Authorization: Bearer <Supabase JWT>`。JWT 必須是 HS256 簽名、密鑰為 `SUPABASE_JWT_SECRET`。`sub` claim 必須是個 UUID；該 UUID 即該請求的 user_id。
+每個 `/comp/*` 跟 `/bff/v1/*` 端點都需要 `Authorization: Bearer <Supabase JWT>`。用 token 的 `alg` 头选校验器：非对称签名（ES256/RS256/EdDSA）走项目的 JWKS 校验，地址取自 `SUPABASE_JWKS_URL`，或由 `SUPABASE_URL` 推导——自 Supabase 2025 年 JWT Signing Keys 上线后这是默认路径。尚未迁移的部署仍可用旧的 HS256 + 共享密钥 `SUPABASE_JWT_SECRET`；两个来源至少要配一个，否则服务器拒绝启动。`sub` claim 必須是個 UUID；該 UUID 即該請求的 user_id。
 
 `/healthz` 跟 `/docs` 是公開的。
 
@@ -353,11 +353,13 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 ```json
 {
+  "session_id": "…",
   "messages": [
-    { "id": "…", "role": "assistant", "content": "Bishop。", "sent_at": "…" },
-    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…" },
-    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
-  ]
+    { "role": "assistant", "content": "Bishop。", "sent_at": "…" },
+    { "role": "user",      "content": "嗨…",     "sent_at": "…" },
+    { "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
+  ],
+  "total": 3
 }
 ```
 
@@ -690,13 +692,68 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 > 已移除。打赏现在是普通 stream 轮的一部分 —— 在
 > `POST /comp/chat/{session_id}/message/stream` 上设 `tips_amount_usd`（见上文）。
 
+## World Town（世界小镇）
+
+用户的世界会发布一条小镇信息流：由他自己的 persona instance 写的贴文，每条带
+一串评论。两条路由与 `/comp/*` 是同一套 JWT 约定——路径上的 `user_id` 必须等于
+JWT 的 `sub`，否则 `403`。渲染完全是下游的事，这两条端点只负责搬数据。至于什么
+情况下才会产出一条贴文——注册、tick 间隔、冷却、每日上限——见
+[World system](world-system.zh.md)。
+
+### `GET /world/town/{user_id}/feed?limit=20&cursor=`
+
+已发布贴文，最新在前，每条内嵌完整评论串。`limit` 默认 20，上限截到 50。未注册
+或没开小镇的用户拿到的是**空信息流，不是报错**。
+
+```json
+{
+  "user_id": "…",
+  "posts": [
+    {
+      "post_id": "…",
+      "instance_id": "…",
+      "author_name": "Ada",
+      "content": "…",
+      "published_at": "…",
+      "comments": [
+        {
+          "comment_id": "…",
+          "author_instance_id": "…",
+          "author_name": "Bishop",
+          "content": "…",
+          "created_at": "…"
+        }
+      ]
+    }
+  ],
+  "next_cursor": "2026-08-17T04:12:00+00:00|<post uuid>"
+}
+```
+
+- `next_cursor` —— 只在可能还有下一页时出现；原样回传为 `cursor`。当作不透明
+  令牌用。解析不了的 cursor 返回 `400 bad_request`，不是空页。
+- `comments[].author_instance_id` —— 为 `null` 表示这条评论是用户自己写的；
+  否则指向写它的 persona instance。
+
+### `POST /world/town/{user_id}/posts/{post_id}/comments`
+
+在该用户自己的小镇里给一条贴文加评论。
+
+```json
+{ "content": "…" }
+```
+
+`content` 先 trim，然后必须非空且不超过 1000 字符，否则 `400`。返回创建出来的
+评论，形状与上面 `comments[]` 的元素相同。贴文对该用户不可见时返回 `404`——
+包括贴文存在但属于别人小镇的情况。
+
 ## BFF（`/bff/v1/*`）
 
 面向第一方前端、把部分 `/comp/*` 路由重塑成前端形狀的鏡像層。鑒權與
 canonical 路由完全相同（同樣的 Supabase JWT、同樣的 per-user ownership
 檢查），只有 **響應形狀** 不同（更精簡的 DTO、打包好的 payload）。
 canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而是在旁邊
-新增一條 BFF 路由。目前有三條。
+新增一條 BFF 路由。目前有四條。
 
 ### `POST /bff/v1/comp/chat/start`
 
