@@ -322,10 +322,14 @@ fn drive_chat_burst(
         // actually used to serve this turn — pair with the user row's
         // memory_scope_raw / affinity_scope_raw to surface allow-list / shape
         // mismatches with a single metadata->>'...' diff); includes tier only
-        // when the request carried one (omit key entirely when None). When the
-        // filter chain failed entirely (fail-open), also writes the per-attempt
-        // audit log so ops can identify these rows.
-        let build_metadata = |filter_failure: Option<&FilterFailOpen>| -> Option<serde_json::Value> {
+        // when the request carried one (omit key entirely when None).
+        // `filter_attempts` is written whenever ANY filter attempt failed, not
+        // only on fail-open — a chain that recovered on its second model still
+        // reports what the first one said. `filter_outcome` stays the sole
+        // authority on whether the chain as a whole succeeded.
+        let build_metadata = |filter_failure: Option<&FilterFailOpen>,
+                               filter_attempts: &[FilterAttemptFailure]|
+         -> Option<serde_json::Value> {
             let mut m = serde_json::Map::new();
             m.insert("prompt_traits".into(), serde_json::json!(&trait_tags));
             m.insert(
@@ -339,10 +343,12 @@ fn drive_chat_burst(
             if let Some(t) = tier.as_deref() {
                 m.insert("tier".into(), serde_json::json!(t));
             }
+            if !filter_attempts.is_empty() {
+                m.insert("filter_attempts".into(), serde_json::json!(filter_attempts));
+            }
             if let Some(fail) = filter_failure {
                 m.insert("filter_outcome".into(), serde_json::json!("fail_open"));
                 m.insert("f_client_msg_id".into(), serde_json::json!(&fail.f_client_msg_id));
-                m.insert("filter_attempts".into(), serde_json::json!(&fail.attempts));
             }
             Some(serde_json::Value::Object(m))
         };
@@ -665,11 +671,11 @@ fn drive_chat_burst(
                     generation_id: last_gen_id.clone(),
                     filter_audit,
                     metadata: if is_ghost_fallback {
-                        ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                        ghost_fallback_metadata(build_metadata(None, &[]), "empty_completion")
                     } else if regex_ghost {
-                        ghost_fallback_metadata(build_metadata(None), "regex_strip")
+                        ghost_fallback_metadata(build_metadata(None, &[]), "regex_strip")
                     } else {
-                        build_metadata(None)
+                        build_metadata(None, &[])
                     },
                 };
                 if let Err(e) = chat_repo
@@ -1012,9 +1018,9 @@ fn drive_chat_burst(
                         generation_id: last_gen_id.clone(),
                         filter_audit: None,
                         metadata: if is_ghost {
-                            ghost_fallback_metadata(build_metadata(None), "empty_completion")
+                            ghost_fallback_metadata(build_metadata(None, &[]), "empty_completion")
                         } else {
-                            build_metadata(None)
+                            build_metadata(None, &[])
                         },
                     };
                     if let Err(e) = chat_repo
@@ -1177,17 +1183,18 @@ fn drive_chat_burst(
                 })
             };
 
-            let (visible, filter_audit, filter_failure): (
+            let (visible, filter_audit, filter_failure, filter_attempts): (
                 String,
                 Option<eros_engine_store::chat::FilterAudit>,
                 Option<FilterFailOpen>,
+                Vec<FilterAttemptFailure>,
             ) = if !regex_indices.is_empty() && cleaned.is_empty() {
                 // The regex strip emptied the WHOLE reply (artifact-only): this
                 // is terminal. Do NOT hand "" to the LLM output_filter — a
                 // rewrite model can return non-empty text and resurrect a bubble,
                 // defeating the no-content-bubble guarantee. Emit nothing; the
                 // regex audit (raw on pre_filter_content) still records the strip.
-                (String::new(), regex_audit(&acc), None)
+                (String::new(), regex_audit(&acc), None, Vec::new())
             } else {
                 match f_opt {
                     Some(f) => {
@@ -1229,7 +1236,12 @@ fn drive_chat_burst(
                                     f_client_msg_id: out.f_client_msg_id,
                                     f_generation_id: out.f_generation_id,
                                 };
-                                (out.filtered_text, Some(audit), None)
+                                // The filter chain's own accumulated failures merge
+                                // into the burst's chain_failures accumulator so they
+                                // inherit the concluding-row rule automatically —
+                                // no second, parallel write path.
+                                chain_failures.extend(out.failures);
+                                (out.filtered_text, Some(audit), None, out.attempts)
                             }
                             Err(fail) => {
                                 tracing::warn!(
@@ -1237,14 +1249,16 @@ fn drive_chat_burst(
                                     attempts = ?fail.attempts,
                                     "filter: all models in chain failed validity; falling open"
                                 );
+                                chain_failures.extend(fail.failures.clone());
+                                let attempts = fail.attempts.clone();
                                 // Fail open to the regex-cleaned text (strip still applies).
-                                (cleaned.clone(), regex_audit(&acc), Some(fail))
+                                (cleaned.clone(), regex_audit(&acc), Some(fail), attempts)
                             }
                         },
-                        None => (cleaned.clone(), regex_audit(&acc), None), // LLM models-miss
+                        None => (cleaned.clone(), regex_audit(&acc), None, Vec::new()), // LLM models-miss
                     }
                 }
-                None => (cleaned.clone(), regex_audit(&acc), None), // regex-only turn
+                None => (cleaned.clone(), regex_audit(&acc), None, Vec::new()), // regex-only turn
                 }
             };
             // Empty visible text (regex-strip-to-empty, case a) means nothing
@@ -1281,9 +1295,12 @@ fn drive_chat_burst(
                 generation_id: last_gen_id.clone(),
                 filter_audit,
                 metadata: if is_ghost {
-                    ghost_fallback_metadata(build_metadata(filter_failure.as_ref()), "regex_strip")
+                    ghost_fallback_metadata(
+                        build_metadata(filter_failure.as_ref(), &filter_attempts),
+                        "regex_strip",
+                    )
                 } else {
-                    build_metadata(filter_failure.as_ref())
+                    build_metadata(filter_failure.as_ref(), &filter_attempts)
                 },
             };
             if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
@@ -1347,23 +1364,31 @@ fn extract_text(
 /// served (from `ChatResponse.model`), falling back to the requested primary
 /// model if the response omits it. `f_generation_id` mirrors the optional
 /// nature of `ChatResponse.generation_id` so SQL NULL propagates cleanly.
+/// `attempts` / `failures` cover the models the chain walked PAST before
+/// landing this success — a recovered chain still reports what broke.
 struct RunFilterOutcome {
     filtered_text: String,
     retries_filter: u32,
     filter_model: String,
     f_client_msg_id: String,
     f_generation_id: Option<String>,
+    attempts: Vec<FilterAttemptFailure>,
+    failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
 /// One filter-chain attempt that did NOT produce a valid filtered reply.
-/// Recorded into `chat_messages.metadata.filter_attempts[]` when fail-open
-/// kicks in so ops can see WHY filter didn't apply on this row.
+/// Recorded into `chat_messages.metadata.filter_attempts[]` whenever any
+/// attempt failed — not only on fail-open — so ops can see WHY a model was
+/// walked past even on a chain that ultimately recovered.
 #[derive(Debug, Clone, serde::Serialize)]
 struct FilterAttemptFailure {
     /// OpenRouter model id of the attempted filter model.
     model: String,
-    /// Stable lowercase ASCII label. Same vocabulary as
-    /// `filter_output_invalidity` plus `"error"`, `"timeout"`, `"empty"`.
+    /// Stable lowercase ASCII label. Four content verdicts shared with
+    /// `filter_output_invalidity` (`"content_filter"`, `"refusal_pattern"`,
+    /// `"too_short"`) plus `"empty"`, plus two pointer values —
+    /// `"upstream_error"` / `"gateway_error"` — naming which audit column
+    /// (`llm_attempts` / `gateway_errors`) holds the transport detail.
     reason: &'static str,
 }
 
@@ -1374,6 +1399,7 @@ struct FilterAttemptFailure {
 struct FilterFailOpen {
     f_client_msg_id: String,
     attempts: Vec<FilterAttemptFailure>,
+    failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
 // ── Output validity gate ─────────────────────────────────────────────────────
@@ -1563,6 +1589,7 @@ async fn run_output_filter(
         .chain(f.fallback_model.iter().cloned())
         .collect();
     let mut attempts: Vec<FilterAttemptFailure> = Vec::with_capacity(chain.len());
+    let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for (idx, model_id) in chain.iter().enumerate() {
         let req = ChatRequest {
             model: model_id.clone(),
@@ -1588,17 +1615,38 @@ async fn run_output_filter(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "filter: model error; walking to next");
+                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    "chat_output_filter",
+                    model_id,
+                    &e,
+                );
+                let reason = match &f {
+                    eros_engine_llm::failure::AttemptFailure::Upstream(_) => "upstream_error",
+                    eros_engine_llm::failure::AttemptFailure::Gateway(_) => "gateway_error",
+                };
+                failures.push(f);
                 attempts.push(FilterAttemptFailure {
                     model: model_id.clone(),
-                    reason: "error",
+                    reason,
                 });
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "filter: model timeout; walking to next");
+                // The filter's per-model timeout is a whole-call timeout
+                // (FILTER_TIMEOUT wraps the non-streaming `execute`), so it maps
+                // to TotalTimeout, not OpenTimeout.
+                failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                    eros_engine_llm::failure::GatewayError {
+                        task: "chat_output_filter".into(),
+                        model: Some(model_id.clone()),
+                        kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                        message: format!("filter timeout after {}s", FILTER_TIMEOUT.as_secs()),
+                    },
+                ));
                 attempts.push(FilterAttemptFailure {
                     model: model_id.clone(),
-                    reason: "timeout",
+                    reason: "gateway_error",
                 });
                 continue;
             }
@@ -1638,12 +1686,30 @@ async fn run_output_filter(
             filter_model,
             f_client_msg_id,
             f_generation_id: resp.generation_id,
+            attempts,
+            failures,
         });
     }
     Err(FilterFailOpen {
         f_client_msg_id,
         attempts,
+        failures,
     })
+}
+
+/// The `filter_attempts[].reason` vocabulary, in one place so the retirement is
+/// checkable. `error` and `timeout` are gone: they were transport facts wedged
+/// into a content vocabulary, and the detail now lives in the audit columns.
+#[cfg(test)]
+fn filter_attempt_reason_vocabulary() -> &'static [&'static str] {
+    &[
+        "empty",
+        "content_filter",
+        "refusal_pattern",
+        "too_short",
+        "upstream_error",
+        "gateway_error",
+    ]
 }
 
 // ── Input filter (user-input rewrite) ────────────────────────────────────────
@@ -2574,12 +2640,19 @@ async fn build_input_filter_transcript(
 /// false}`, an unparseable verdict, blank content, or a refusal — is a
 /// DEFINITIVE keep: it returns `None` immediately and does NOT try the remaining
 /// models, so a fallback can never rewrite a message the primary left alone.
+/// The second element of the return is the accumulated transport failures —
+/// only the transport arms push to it; every content-level early return means
+/// the call succeeded (the provider was fine, the answer was not usable), so
+/// it carries whatever was accumulated before that point and nothing more.
 async fn run_input_filter(
     state: &AppState,
     f: &eros_engine_llm::model_config::ResolvedInputFilter,
     recent_transcript: &str,
     raw_input: &str,
-) -> Option<InputRewrite> {
+) -> (
+    Option<InputRewrite>,
+    Vec<eros_engine_llm::failure::AttemptFailure>,
+) {
     use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let transcript = if recent_transcript.trim().is_empty() {
         "（无）"
@@ -2590,6 +2663,7 @@ async fn run_input_filter(
     let chain: Vec<String> = std::iter::once(f.model.clone())
         .chain(f.fallback_model.iter().cloned())
         .collect();
+    let mut failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in &chain {
         let req = ChatRequest {
             model: model_id.clone(),
@@ -2615,10 +2689,25 @@ async fn run_input_filter(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "input-filter: model error; next");
+                failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    "chat_input_filter",
+                    model_id,
+                    &e,
+                ));
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "input-filter: timeout; next");
+                // Same whole-call timeout as the output filter: FILTER_TIMEOUT
+                // wraps the non-streaming `execute`, so this is TotalTimeout.
+                failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                    eros_engine_llm::failure::GatewayError {
+                        task: "chat_input_filter".into(),
+                        model: Some(model_id.clone()),
+                        kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                        message: format!("filter timeout after {}s", FILTER_TIMEOUT.as_secs()),
+                    },
+                ));
                 continue;
             }
         };
@@ -2632,34 +2721,39 @@ async fn run_input_filter(
         // walk). The model responded but not with a usable rewrite; walking to a
         // fallback here would risk rewriting a meaningful message the primary
         // left alone. Only transport failures above (error/timeout/empty) walk.
+        // The call succeeded, so `failures` is returned as accumulated so far —
+        // never appended to on these paths.
         let verdict = match parse_input_filter_verdict(&text) {
             Some(v) => v,
             None => {
                 tracing::warn!(model = %model_id, "input-filter: unparseable verdict; keep original");
-                return None;
+                return (None, failures);
             }
         };
         if !verdict.rewrite {
-            return None; // meaningful → keep (definitive)
+            return (None, failures); // meaningful → keep (definitive)
         }
         let content = verdict.content.unwrap_or_default().trim().to_string();
         if content.is_empty() {
             tracing::warn!(model = %model_id, "input-filter: rewrite=true but blank content; keep original");
-            return None;
+            return (None, failures);
         }
         if let Some(reason) = rewrite_content_invalidity(&content, resp.finish_reason.as_deref()) {
             tracing::warn!(model = %model_id, invalidity = %reason, "input-filter: invalid rewrite content; keep original");
-            return None;
+            return (None, failures);
         }
         let filter_model = resp.model.unwrap_or_else(|| model_id.clone());
-        return Some(InputRewrite {
-            rewritten_text: content,
-            filter_model,
-            reason: verdict.reason.filter(|r| !r.trim().is_empty()),
-            f_generation_id: resp.generation_id,
-        });
+        return (
+            Some(InputRewrite {
+                rewritten_text: content,
+                filter_model,
+                reason: verdict.reason.filter(|r| !r.trim().is_empty()),
+                f_generation_id: resp.generation_id,
+            }),
+            failures,
+        );
     }
-    None // chain exhausted → keep
+    (None, failures) // chain exhausted → keep
 }
 
 /// Assemble the composer's user message from the appearance, recent scene,
@@ -4381,9 +4475,22 @@ pub fn run_stream(
                             .await
                             .transcript
                         };
-                        if let Some(rw) =
-                            run_input_filter(&state, &f, &transcript, &user_msg.content).await
-                        {
+                        let (rewrite, in_failures) =
+                            run_input_filter(&state, &f, &transcript, &user_msg.content).await;
+                        // Best-effort audit write, written whether or not a
+                        // rewrite was produced — this is the gap
+                        // `set_user_input_rewrite` (fires only on success)
+                        // leaves behind. Must never fail the turn.
+                        let (ia, ig) = split_failures(&in_failures);
+                        if ia.is_some() || ig.is_some() {
+                            if let Err(e) = chat_repo
+                                .set_user_llm_failures(user_msg.user_message_id, ia, ig)
+                                .await
+                            {
+                                tracing::warn!("input-filter failure audit write failed: {e}");
+                            }
+                        }
+                        if let Some(rw) = rewrite {
                             match chat_repo
                                 .set_user_input_rewrite(
                                     user_msg.user_message_id,
@@ -4906,6 +5013,22 @@ mod tests {
         // An empty side is NULL, never `[]` — one way to say "nothing to record".
         let (a, g) = split_failures(&[]);
         assert!(a.is_none() && g.is_none());
+    }
+
+    #[test]
+    fn filter_attempt_reasons_lose_the_transport_values() {
+        // `error` and `timeout` were transport facts wedged into a content
+        // vocabulary. The remaining four are genuine content verdicts.
+        let vocab = filter_attempt_reason_vocabulary();
+        for gone in ["error", "timeout"] {
+            assert!(!vocab.contains(&gone), "{gone} must be retired");
+        }
+        for kept in ["empty", "content_filter", "refusal_pattern", "too_short"] {
+            assert!(vocab.contains(&kept), "{kept} must survive");
+        }
+        for added in ["upstream_error", "gateway_error"] {
+            assert!(vocab.contains(&added), "{added} must be present");
+        }
     }
 
     #[test]
@@ -9514,6 +9637,130 @@ data: [DONE]\n\n";
         }
     }
 
+    /// Today `filter_attempts` appears only on fail-open, so a filter chain
+    /// that recovered on its second model left nothing behind. It is now
+    /// written whenever any attempt failed, with `filter_outcome` staying the
+    /// sole authority on whether the chain as a whole succeeded.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_output_filter_chain_still_writes_its_attempts(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("filt/primary"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string(r#"{"error":{"code":429,"message":"slow down"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        // The output filter uses the non-streaming `execute()` path; its text
+        // must clear MIN_FILTERED_OUTPUT_CHARS to pass the validity gate.
+        let filt_text = "clean text 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。多说几句话让它足够长。";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("filt/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"choices":[{{"message":{{"content":"{filt_text}"}}}}]}}"#
+            )))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"filt/primary\"\nfallback=[\"filt/fallback\"]\n\
+                 filter_prompt=\"REWRITE\"\ntrigger = { random = 1.0 }\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JRECOVEREDFILT0000000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (meta, attempts): (Option<serde_json::Value>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT metadata, llm_attempts FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let meta = meta.unwrap();
+        assert!(
+            meta.get("filter_outcome").is_none(),
+            "the chain recovered, so it is not fail-open: {meta}"
+        );
+        assert_eq!(meta["filter_attempts"][0]["reason"], "upstream_error");
+        let attempts = attempts.unwrap();
+        let filt = attempts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["task"] == "chat_output_filter")
+            .expect("the filter hop must be recorded");
+        assert_eq!(filt["http_status"], 429);
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn filter_success_does_not_write_fail_open_metadata(pool: PgPool) {
         // Sanity: when filter succeeds the metadata does NOT contain
@@ -10398,6 +10645,110 @@ data: [DONE]\n\n";
             triggers,
             Some(serde_json::json!({"reason": "meaningless digits"}))
         );
+    }
+
+    /// The input filter is the one LLM call site that had no failure record of
+    /// any kind — not even a coarse marker. Its failures now land on the
+    /// `role='user'` row, where its success audit already lives
+    /// (`set_user_input_rewrite`), written whether or not a rewrite was
+    /// produced — exactly the gap `set_user_input_rewrite` (fires only on
+    /// success) leaves behind.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn input_filter_failure_lands_on_the_user_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("infilt/m"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":503,"message":"no provider"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\ninput_filter=true\n\
+                 [tasks.chat_input_filter]\nmodel=\"infilt/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JINFILTFAILURE000000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (content, attempts): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, llm_attempts FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'user' ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "hi", "no rewrite happened, content is untouched");
+        let attempts = attempts.expect("the failed input-filter hop must be recorded");
+        assert_eq!(attempts[0]["task"], "chat_input_filter");
+        assert_eq!(attempts[0]["http_status"], 503);
     }
 
     // Regression (codex P2): a content-level non-verdict from the primary
