@@ -180,7 +180,10 @@ fn check_dim(embedding: &[f32], model: &str) -> Result<(), LlmError> {
 /// capped first — the same bounded-log guarantee the chat client upholds
 /// (issue #188).
 fn status_error(status: reqwest::StatusCode, body: &str) -> LlmError {
-    LlmError::Status(status, crate::openrouter::scrub_error_body(body))
+    LlmError::Status(
+        status,
+        crate::openrouter::parse_error_body(body).to_string(),
+    )
 }
 
 /// Parse a Voyage batch response body into ordered vectors, enforcing that

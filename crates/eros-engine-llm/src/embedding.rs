@@ -93,7 +93,10 @@ impl EmbedHttpClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            let err = LlmError::Status(status, crate::openrouter::scrub_error_body(&text));
+            let err = LlmError::Status(
+                status,
+                crate::openrouter::parse_error_body(&text).to_string(),
+            );
             tracing::warn!("embeddings: {err}");
             return Err(err);
         }

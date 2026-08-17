@@ -193,64 +193,150 @@ fn body_preview(s: &str) -> String {
     }
 }
 
-/// Turn a raw provider error body into a bounded, redacted one-line string safe
-/// for ordinary logs. Best-effort parses the OpenRouter
-/// `{"error":{code,message,metadata}}` envelope and keeps only `code`
-/// (as `serde_json::Value` — codes are sometimes strings, not ints), a
+/// A provider error body, parsed into parts instead of flattened to a string.
+///
+/// `Display` reproduces exactly what `scrub_error_body` used to return, so every
+/// log line and every existing assertion is byte-identical; the named fields are
+/// what the audit columns read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ParsedErrorBody {
+    /// OpenRouter `error.code` (numeric) or Venice `error.code` (string),
+    /// rendered as its JSON text so a numeric `529` and a string
+    /// `"MODEL_OVERLOADED"` stay distinguishable.
+    pub code: Option<String>,
+    /// OpenRouter `metadata.error_type`, or the OpenAI-compatible `error.type`.
+    pub error_type: Option<String>,
+    /// OpenRouter `metadata.provider_code` — the provider's own upstream code.
+    pub provider_code: Option<String>,
+    /// Bounded, single-line, prompt-free.
+    pub message: String,
+}
+
+impl ParsedErrorBody {
+    /// For call sites that have prose rather than an error envelope. Not
+    /// called outside tests yet — a follow-up task wires it into the
+    /// non-JSON `LlmError::Status`/`Stream` construction sites.
+    #[allow(dead_code)]
+    pub(crate) fn message_only(s: &str) -> Self {
+        Self {
+            message: s.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+impl std::fmt::Display for ParsedErrorBody {
+    /// `message` is already the fully assembled, bounded, single-line string
+    /// that `scrub_error_body` used to return — code and metadata are folded
+    /// into it by `parse_error_body`. The named fields are a parallel view for
+    /// the audit columns, not extra text to append here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Turn a raw provider error body into parts instead of flattening it to a
+/// string. Best-effort parses the OpenRouter `{"error":{code,message,metadata}}`
+/// envelope and keeps `code` (as `serde_json::Value` — codes are sometimes
+/// strings, not ints), `metadata.error_type` / `metadata.provider_code`, a
 /// length-capped `message`, and — from a moderation `metadata` block —
 /// `provider_name` + `reasons`. It deliberately DROPS `metadata.flagged_input`,
 /// which is an excerpt of the user's flagged prompt that a moderation rejection
-/// echoes back (logging it would leak raw chat content). Non-envelope bodies
-/// fall back to a plain length-capped preview.
+/// echoes back (logging it would leak raw chat content). Also handles Venice's
+/// two shapes: the OpenAI-compatible envelope (semantic name in string `code`,
+/// family in `type`, no `metadata`) and the bare `{"error": "..."}` string form.
+/// Non-envelope bodies fall back to a plain length-capped preview.
 ///
-/// `pub(crate)`: the voyage client reuses this for its own status-error
-/// bodies (issue #188) — the envelope parse simply falls through to the
-/// capped preview for non-OpenRouter shapes.
-pub(crate) fn scrub_error_body(raw: &str) -> String {
+/// `pub(crate)`: the voyage and embeddings clients reuse this for their own
+/// status-error bodies (issue #188) — the envelope parse simply falls through
+/// to the capped preview for non-OpenRouter shapes.
+pub(crate) fn parse_error_body(raw: &str) -> ParsedErrorBody {
     #[derive(Deserialize)]
     struct Env {
-        error: ErrBody,
+        error: ErrField,
     }
+    // Venice returns either a bare string or an object under `error`.
     #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ErrField {
+        Text(String),
+        Body(Box<ErrBody>),
+    }
+    #[derive(Deserialize, Default)]
     struct ErrBody {
         #[serde(default)]
         code: Option<serde_json::Value>,
         #[serde(default)]
         message: Option<String>,
+        /// OpenAI-compatible family name (Venice). OpenRouter puts its
+        /// equivalent under `metadata.error_type`, read below.
+        #[serde(default, rename = "type")]
+        ty: Option<String>,
         #[serde(default)]
         metadata: Option<serde_json::Value>,
     }
+
     let Ok(env) = serde_json::from_str::<Env>(raw) else {
-        return body_preview(raw);
+        return ParsedErrorBody {
+            message: body_preview(raw),
+            ..Default::default()
+        };
     };
-    let code = env
-        .error
-        .code
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".into());
-    // Assemble the raw parts, then run the WHOLE string through body_preview
-    // once. provider_name / reasons are provider-controlled and could carry
-    // newlines or be arbitrarily long, so the single final flatten+cap is what
-    // upholds the "bounded, single-line" guarantee for every field — not just
-    // the message.
+    let body = match env.error {
+        ErrField::Text(t) => ErrBody {
+            message: Some(t),
+            ..Default::default()
+        },
+        ErrField::Body(b) => *b,
+    };
+
+    let code = body.code.map(|c| c.to_string());
+    let meta = body.metadata.as_ref();
+    let meta_str = |key: &str| -> Option<String> {
+        meta.and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let error_type = meta_str("error_type").or(body.ty);
+    let provider_code = meta_str("provider_code");
+
+    // Assemble the human-readable parts, then run the WHOLE string through
+    // body_preview once. provider_name / reasons are provider-controlled and
+    // could carry newlines or be arbitrarily long, so the single final
+    // flatten+cap is what upholds the "bounded, single-line" guarantee for
+    // every field — not just the message. flagged_input is never read: it is
+    // the user's own prompt excerpt and must not reach a log or an audit row.
     let mut out = format!(
-        "code={code}: {}",
-        env.error.message.as_deref().unwrap_or("")
+        "code={}: {}",
+        code.as_deref().unwrap_or("?"),
+        body.message.as_deref().unwrap_or("")
     );
-    // Provider identity + moderation reasons are safe to surface; flagged_input
-    // (the user's prompt excerpt) is never read.
-    if let Some(meta) = env.error.metadata.as_ref() {
-        if let Some(provider) = meta.get("provider_name").and_then(|v| v.as_str()) {
-            out.push_str(&format!(" [provider={provider}]"));
-        }
-        if let Some(reasons) = meta.get("reasons").and_then(|v| v.as_array()) {
-            let rs: Vec<&str> = reasons.iter().filter_map(|v| v.as_str()).collect();
-            if !rs.is_empty() {
-                out.push_str(&format!(" [moderation_reasons={}]", rs.join(",")));
-            }
+    if let Some(p) = meta_str("provider_name") {
+        out.push_str(&format!(" provider={p}"));
+    }
+    if let Some(reasons) = meta
+        .and_then(|m| m.get("reasons"))
+        .and_then(|v| v.as_array())
+    {
+        let joined: Vec<String> = reasons
+            .iter()
+            .map(|r| {
+                r.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| r.to_string())
+            })
+            .collect();
+        if !joined.is_empty() {
+            out.push_str(&format!(" moderation_reasons={}", joined.join(",")));
         }
     }
-    body_preview(&out)
+
+    ParsedErrorBody {
+        code,
+        error_type,
+        provider_code,
+        message: body_preview(&out),
+    }
 }
 
 /// A 200 body that failed to decode as a chat/vision completion: if it is in
@@ -266,7 +352,7 @@ fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
     if is_api_error {
         LlmError::Provider(format!(
             "openrouter 200 error body: {}",
-            scrub_error_body(body)
+            parse_error_body(body)
         ))
     } else {
         LlmError::Decode(err)
@@ -846,7 +932,10 @@ impl OpenRouterClient {
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
-                last_err = Some(LlmError::Status(status, scrub_error_body(&text)));
+                last_err = Some(LlmError::Status(
+                    status,
+                    parse_error_body(&text).to_string(),
+                ));
                 continue;
             }
             let body = match resp.text().await {
@@ -991,7 +1080,10 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, scrub_error_body(&text)));
+            return Err(LlmError::Status(
+                status,
+                parse_error_body(&text).to_string(),
+            ));
         }
 
         // Read as text so a 200 body that is actually an error envelope
@@ -1135,7 +1227,10 @@ impl OpenRouterClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Status(status, scrub_error_body(&text)));
+            return Err(LlmError::Status(
+                status,
+                parse_error_body(&text).to_string(),
+            ));
         }
 
         // Observability: connect+headers latency and the negotiated HTTP
@@ -1824,7 +1919,7 @@ mod tests {
             }
         })
         .to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(
             !out.contains("SECRET USER PROMPT TEXT"),
             "flagged_input leaked: {out}"
@@ -1853,7 +1948,7 @@ mod tests {
             }
         })
         .to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(!out.contains('\n'), "must be single-line: {out:?}");
         assert!(
             out.chars().count() <= ERROR_PREVIEW_MAX + 1,
@@ -1866,17 +1961,99 @@ mod tests {
     fn scrub_error_body_handles_numeric_code_and_non_envelope() {
         // Numeric code (Value, not i64-restricted) round-trips.
         let raw = serde_json::json!({"error": {"code": 402, "message": "no credits"}}).to_string();
-        let out = scrub_error_body(&raw);
+        let out = parse_error_body(&raw).to_string();
         assert!(out.contains("code=402"), "{out}");
         assert!(out.contains("no credits"), "{out}");
         // Non-envelope junk falls back to a bounded preview.
         let junk: String = "boom ".repeat(100);
-        let out = scrub_error_body(&junk);
+        let out = parse_error_body(&junk).to_string();
         assert!(
             out.chars().count() <= ERROR_PREVIEW_MAX + 1,
             "bounded: {}",
             out.len()
         );
+    }
+
+    #[test]
+    fn parse_error_body_extracts_openrouter_metadata_fields() {
+        // error_type and metadata.provider_code were never extracted before —
+        // scrub_error_body read only code / message / provider_name / reasons.
+        let raw = serde_json::json!({
+            "error": {
+                "code": 529,
+                "message": "Overloaded",
+                "metadata": {
+                    "error_type": "overloaded",
+                    "provider_code": "anthropic:overloaded_error"
+                }
+            }
+        })
+        .to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code.as_deref(), Some("529"));
+        assert_eq!(p.error_type.as_deref(), Some("overloaded"));
+        assert_eq!(
+            p.provider_code.as_deref(),
+            Some("anthropic:overloaded_error")
+        );
+    }
+
+    #[test]
+    fn parse_error_body_reads_venice_openai_compatible_shape() {
+        // Venice's OpenAI-compatible envelope puts the semantic name in `code`
+        // (a string) and the family in `type`. No `metadata` at all.
+        let raw = serde_json::json!({
+            "error": {
+                "message": "The model is currently overloaded",
+                "type": "rate_limit_error",
+                "param": null,
+                "code": "MODEL_OVERLOADED"
+            }
+        })
+        .to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code.as_deref(), Some("\"MODEL_OVERLOADED\""));
+        assert_eq!(p.error_type.as_deref(), Some("rate_limit_error"));
+        assert!(p.message.contains("overloaded"), "{}", p.message);
+    }
+
+    #[test]
+    fn parse_error_body_reads_venice_bare_string_shape() {
+        let raw = serde_json::json!({ "error": "Authentication failed" }).to_string();
+        let p = parse_error_body(&raw);
+        assert_eq!(p.code, None);
+        assert!(p.message.contains("Authentication failed"), "{}", p.message);
+    }
+
+    #[test]
+    fn parse_error_body_display_matches_legacy_scrub_output() {
+        // The Display impl is what every existing log line and assertion sees.
+        let raw = serde_json::json!({
+            "error": {
+                "code": "moderation",
+                "message": "flagged",
+                "metadata": {
+                    "reasons": ["sexual"],
+                    "flagged_input": "SECRET USER PROMPT TEXT",
+                    "provider_name": "SomeProvider"
+                }
+            }
+        })
+        .to_string();
+        let out = parse_error_body(&raw).to_string();
+        assert!(!out.contains("SECRET USER PROMPT TEXT"), "leaked: {out}");
+        assert!(out.contains("code=\"moderation\""), "{out}");
+        assert!(out.contains("provider=SomeProvider"), "{out}");
+        assert!(out.contains("moderation_reasons=sexual"), "{out}");
+    }
+
+    #[test]
+    fn parse_error_body_message_only_keeps_the_text_and_no_code() {
+        let p = ParsedErrorBody::message_only("stream terminated with finish_reason=error");
+        assert_eq!(p.code, None);
+        assert_eq!(p.error_type, None);
+        assert_eq!(p.provider_code, None);
+        assert_eq!(p.message, "stream terminated with finish_reason=error");
     }
 
     #[test]
