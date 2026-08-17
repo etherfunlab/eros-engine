@@ -21,11 +21,11 @@ const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Max gap between SSE *bytes* before a live stream is declared dead.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Marker prefix of the idle-watchdog error message. Pub so the pipeline's
-/// stream-metrics outcome mapping can recognize an idle timeout after the
-/// message has been stringified through the SSE layer's `Transport error:`
-/// wrapper into `LlmError::Stream` (issue #188 — spec §4.2 lists
-/// `"idle_timeout"` as its own outcome, distinct from `"chunk_error"`).
+/// Marker prefix of the idle-watchdog error message. Pub so failure
+/// classification can recognize an idle timeout after the message has been
+/// stringified through the SSE layer's `Transport error:` wrapper into
+/// `LlmError::Stream` (issue #188 — `GatewayKind::IdleTimeout` stays distinct
+/// from `GatewayKind::Transport`).
 pub const STREAM_IDLE_TIMEOUT_MSG: &str = "openrouter stream idle timeout";
 
 /// Gap-bound a fallible stream: an idle period longer than `idle` between

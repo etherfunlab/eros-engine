@@ -299,6 +299,10 @@ fn drive_chat_burst(
             return;
         }
 
+        // The task every hop of this burst serves — stamped on each recorded
+        // failure so one audit row identifies which `[tasks.*]` chain broke.
+        let task_name: &str = req.task.as_deref().unwrap_or("chat_companion");
+
         let tag_refs: Vec<&str> = trait_tags.iter().map(String::as_str).collect();
         // A turn buffers (no live deltas) ONLY when the LLM output_filter's
         // turn-level predicates pass — an LLM rewrite is inherently un-streamable
@@ -356,6 +360,10 @@ fn drive_chat_burst(
             // exhausts, so a complete garble isn't discarded just because a LATER
             // fallback failed differently (mirrors OpenRouterClient::execute).
             let mut last_complete_garble: Option<String> = None;
+            // Every genuine transport/status failure this chain walked over.
+            // Content verdicts (length / content_filter / empty / garbled) push
+            // nothing: those calls succeeded at the HTTP level and were billed.
+            let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
             for (idx, model_id) in chain.iter().enumerate() {
                 // Model-keyed config tables (display / output_regex / trigger)
                 // are written with bare ids; model_id here is the full config
@@ -410,7 +418,20 @@ fn drive_chat_burst(
                                         STREAM_TOTAL_TIMEOUT.as_secs()
                                     );
                                     truncated = true;
-                                    attempt_outcome = "total_timeout";
+                                    // A local deadline: there is no LlmError to
+                                    // classify, so the gateway fact is built here.
+                                    attempt_outcome = "gateway_error";
+                                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                                        eros_engine_llm::failure::GatewayError {
+                                            task: task_name.to_string(),
+                                            model: Some(model_id.clone()),
+                                            kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                                            message: format!(
+                                                "stream total timeout after {}s",
+                                                STREAM_TOTAL_TIMEOUT.as_secs()
+                                            ),
+                                        },
+                                    ));
                                     break;
                                 }
                             };
@@ -456,6 +477,11 @@ fn drive_chat_burst(
                                     tracing::warn!("stream: upstream chunk err: {e}");
                                     truncated = true;
                                     attempt_outcome = chunk_err_outcome(&e);
+                                    chain_failures.push(
+                                        eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                            task_name, model_id, &e,
+                                        ),
+                                    );
                                     break;
                                 }
                             }
@@ -468,7 +494,12 @@ fn drive_chat_burst(
                     Ok(Err(e)) => {
                         tracing::warn!("stream: upstream open err: {e}");
                         truncated = true;
-                        attempt_outcome = "open_error";
+                        attempt_outcome = chunk_err_outcome(&e);
+                        chain_failures.push(
+                            eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                task_name, model_id, &e,
+                            ),
+                        );
                     }
                     Err(_) => {
                         tracing::warn!(
@@ -476,7 +507,19 @@ fn drive_chat_burst(
                             STREAM_OPEN_TIMEOUT.as_secs()
                         );
                         truncated = true;
-                        attempt_outcome = "open_timeout";
+                        // Local deadline again: no LlmError exists to classify.
+                        attempt_outcome = "gateway_error";
+                        chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                            eros_engine_llm::failure::GatewayError {
+                                task: task_name.to_string(),
+                                model: Some(model_id.clone()),
+                                kind: eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                                message: format!(
+                                    "stream open timeout after {}s",
+                                    STREAM_OPEN_TIMEOUT.as_secs()
+                                ),
+                            },
+                        ));
                     }
                 }
 
@@ -594,10 +637,13 @@ fn drive_chat_burst(
                 let effective_ghost = is_ghost_fallback || regex_ghost;
 
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                // Everything the chain walked over to reach this row, including
+                // the hops a recovered turn silently skipped past.
+                let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
                 // Persist BEFORE yielding Done (spec §2.3 risk R7).
                 let row = eros_engine_store::chat::AssistantInsert {
-                    llm_attempts: None,
-                    gateway_errors: None,
+                    llm_attempts,
+                    gateway_errors,
                     id: msg_uuid,
                     content: persist_content.clone(),
                     assistant_action_type: persist_action.into(),
@@ -701,6 +747,9 @@ fn drive_chat_burst(
                             fallback_retries,
                             Some(msg_ulid),
                             repaired,
+                            task_name,
+                            chain.len(),
+                            &chain_failures,
                         )
                         .await;
                         {
@@ -727,6 +776,9 @@ fn drive_chat_burst(
                         // the pseudo-ghost to it so clients + replay can stitch
                         // them as one logical conversation turn.
                         Some(msg_ulid),
+                        task_name,
+                        chain.len(),
+                        &chain_failures,
                     )
                     .await
                     {
@@ -769,6 +821,9 @@ fn drive_chat_burst(
         // error we fail open and emit the original.
         // `filter` is None when the turn buffers solely because of output_regex.
         let f_opt = filter.as_ref();
+        // Same accumulator contract as live mode: transport/status failures and
+        // local timeouts only; content verdicts leave no entry.
+        let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
         for (idx, model_id) in chain.iter().enumerate() {
             // Model-keyed config tables (display / output_regex / trigger)
             // are written with bare ids; model_id here is the full config
@@ -809,7 +864,18 @@ fn drive_chat_burst(
                                     STREAM_TOTAL_TIMEOUT.as_secs()
                                 );
                                 truncated = true;
-                                attempt_outcome = "total_timeout";
+                                attempt_outcome = "gateway_error";
+                                chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                                    eros_engine_llm::failure::GatewayError {
+                                        task: task_name.to_string(),
+                                        model: Some(model_id.clone()),
+                                        kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                                        message: format!(
+                                            "stream total timeout after {}s",
+                                            STREAM_TOTAL_TIMEOUT.as_secs()
+                                        ),
+                                    },
+                                ));
                                 break;
                             }
                         };
@@ -837,6 +903,11 @@ fn drive_chat_burst(
                                 tracing::warn!("stream(filtered): chunk err: {e}");
                                 truncated = true;
                                 attempt_outcome = chunk_err_outcome(&e);
+                                chain_failures.push(
+                                    eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                                        task_name, model_id, &e,
+                                    ),
+                                );
                                 break;
                             }
                         }
@@ -846,7 +917,12 @@ fn drive_chat_burst(
                 Ok(Err(e)) => {
                     tracing::warn!("stream(filtered): open err: {e}");
                     truncated = true;
-                    attempt_outcome = "open_error";
+                    attempt_outcome = chunk_err_outcome(&e);
+                    chain_failures.push(
+                        eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                            task_name, model_id, &e,
+                        ),
+                    );
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -854,7 +930,18 @@ fn drive_chat_burst(
                         STREAM_OPEN_TIMEOUT.as_secs()
                     );
                     truncated = true;
-                    attempt_outcome = "open_timeout";
+                    attempt_outcome = "gateway_error";
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: task_name.to_string(),
+                            model: Some(model_id.clone()),
+                            kind: eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                            message: format!(
+                                "stream open timeout after {}s",
+                                STREAM_OPEN_TIMEOUT.as_secs()
+                            ),
+                        },
+                    ));
                 }
             }
 
@@ -897,9 +984,10 @@ fn drive_chat_burst(
                     let msg_uuid: Uuid = msg_ulid.into();
                     let usage_full =
                         last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                    let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
                     let row = eros_engine_store::chat::AssistantInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
+                        llm_attempts,
+                        gateway_errors,
                         id: msg_uuid,
                         content: String::new(),
                         assistant_action_type: persist_action.into(),
@@ -988,6 +1076,9 @@ fn drive_chat_burst(
                         // Filtered mode never persists intermediate truncated
                         // attempts, so there is no prior bubble to continue from.
                         None,
+                        task_name,
+                        chain.len(),
+                        &chain_failures,
                     )
                     .await
                     {
@@ -1162,9 +1253,10 @@ fn drive_chat_burst(
             }
 
             let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
             let row = eros_engine_store::chat::AssistantInsert {
-                llm_attempts: None,
-                gateway_errors: None,
+                llm_attempts,
+                gateway_errors,
                 id: msg_uuid,
                 content: visible.clone(),
                 assistant_action_type: persist_action.into(),
@@ -1396,22 +1488,43 @@ pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// a stream that keeps trickling forever.
 pub(crate) const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Spec §4.2 outcome label for an `Err` item mid-consume. Provider error
-/// frames (`LlmError::Provider`) and the byte-level idle watchdog are their
-/// own failure modes — folding them into `"chunk_error"` made dashboards
-/// undercount idle timeouts and blend provider failures into transport drops
-/// (issue #188). Everything else (transport reset, parse) stays
-/// `"chunk_error"`.
+/// The attempt's terminal disposition, for `stream_metrics`. Transport-shaped
+/// labels are gone: `open_error` covered status, transport, decode and config
+/// alike, which told a dashboard nothing. What survives here are the content
+/// verdicts plus two pointer values naming which audit column holds the detail.
 fn chunk_err_outcome(e: &eros_engine_llm::LlmError) -> &'static str {
-    match e {
-        eros_engine_llm::LlmError::Provider(_) => "error_frame",
-        eros_engine_llm::LlmError::Stream(msg)
-            if msg.contains(eros_engine_llm::openrouter::STREAM_IDLE_TIMEOUT_MSG) =>
-        {
-            "idle_timeout"
-        }
-        _ => "chunk_error",
+    use eros_engine_llm::failure::AttemptFailure;
+    match AttemptFailure::from_llm_error("", "", e) {
+        AttemptFailure::Upstream(_) => "upstream_error",
+        AttemptFailure::Gateway(_) => "gateway_error",
     }
+}
+
+/// Split one accumulated failure list into the two column payloads. An empty
+/// side is `None`, never `[]` — there is one way to say "nothing to record".
+pub(crate) fn split_failures(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    use eros_engine_llm::failure::AttemptFailure;
+    let ups: Vec<_> = failures
+        .iter()
+        .filter_map(|f| match f {
+            AttemptFailure::Upstream(a) => Some(a),
+            AttemptFailure::Gateway(_) => None,
+        })
+        .collect();
+    let gws: Vec<_> = failures
+        .iter()
+        .filter_map(|f| match f {
+            AttemptFailure::Gateway(g) => Some(g),
+            AttemptFailure::Upstream(_) => None,
+        })
+        .collect();
+    let j = |empty: bool, v: serde_json::Value| if empty { None } else { Some(v) };
+    (
+        j(ups.is_empty(), serde_json::json!(ups)),
+        j(gws.is_empty(), serde_json::json!(gws)),
+    )
 }
 
 /// Run the output-filter LLM over `original`, walking the (already
@@ -3103,6 +3216,9 @@ async fn build_stream_failure_pseudo_ghost(
     affinity_scope: eros_engine_core::scope::AffinityScope,
     fallback_retries: u32,
     continues_from_ulid: Option<Ulid>,
+    task_name: &str,
+    chain_len: usize,
+    chain_failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> Option<(
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
@@ -3147,10 +3263,25 @@ async fn build_stream_failure_pseudo_ghost(
     }
     let metadata = Some(serde_json::Value::Object(meta_map));
 
+    // The whole chain's failures plus the chain-scoped verdict — this row is
+    // the only place the codes that killed the turn can still be read.
+    // `metadata.retries_chat` stays: a hop lost to a content verdict leaves no
+    // entry here, so the count is not derivable from these columns.
+    let mut failures = chain_failures.to_vec();
+    failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+        eros_engine_llm::failure::GatewayError {
+            task: task_name.to_string(),
+            model: None,
+            kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+            message: format!("all {chain_len} candidates failed"),
+        },
+    ));
+    let (llm_attempts, gateway_errors) = split_failures(&failures);
+
     let chat_repo = ChatRepo { pool };
     let row = eros_engine_store::chat::AssistantInsert {
-        llm_attempts: None,
-        gateway_errors: None,
+        llm_attempts,
+        gateway_errors,
         id: msg_uuid,
         content: phrase.clone(),
         assistant_action_type: persist_action.into(),
@@ -3226,6 +3357,9 @@ async fn build_garble_repaired_replacement(
     fallback_retries: u32,
     continues_from_ulid: Option<Ulid>,
     repaired: String,
+    task_name: &str,
+    chain_len: usize,
+    chain_failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> (
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
@@ -3253,10 +3387,23 @@ async fn build_garble_repaired_replacement(
     }
     let metadata = Some(serde_json::Value::Object(meta_map));
 
+    // Same contract as the pseudo-ghost: the chain still exhausted, the text is
+    // just salvaged from a garbled hop rather than read out of the config table.
+    let mut failures = chain_failures.to_vec();
+    failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+        eros_engine_llm::failure::GatewayError {
+            task: task_name.to_string(),
+            model: None,
+            kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+            message: format!("all {chain_len} candidates failed"),
+        },
+    ));
+    let (llm_attempts, gateway_errors) = split_failures(&failures);
+
     let chat_repo = ChatRepo { pool };
     let row = eros_engine_store::chat::AssistantInsert {
-        llm_attempts: None,
-        gateway_errors: None,
+        llm_attempts,
+        gateway_errors,
         id: msg_uuid,
         content: repaired.clone(),
         assistant_action_type: persist_action.into(),
@@ -4616,36 +4763,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_err_outcome_separates_error_frame_and_idle_timeout() {
+    fn chunk_err_outcome_reports_the_layer_not_a_fuzzy_label() {
         use eros_engine_llm::openrouter::ParsedErrorBody;
         use eros_engine_llm::LlmError;
-        // Provider error frames (a 200 SSE frame carrying `error`) are their
-        // own failure mode, distinct from transport drops (spec §4.2).
+        // `open_error` used to cover status, transport, decode and config
+        // alike. The label now names the column that holds the detail — the
+        // provider spoke here, so it is an upstream fact.
         assert_eq!(
             chunk_err_outcome(&LlmError::Provider(ParsedErrorBody::message_only(
                 "mid-stream error: code=502: upstream"
             ))),
-            "error_frame"
+            "upstream_error"
         );
         // The byte-level idle watchdog's io::Error rides through
         // eventsource-stream's `Transport error: {inner}` Display into
-        // LlmError::Stream; the shared marker constant is the contract.
+        // LlmError::Stream; the shared marker constant is the contract. The
+        // idle/transport distinction is not lost — it moved into
+        // gateway_errors[].kind, which is SQL-queryable.
         let idle = LlmError::Stream(format!(
             "Transport error: {}: no bytes for 45s",
             eros_engine_llm::openrouter::STREAM_IDLE_TIMEOUT_MSG
         ));
-        assert_eq!(chunk_err_outcome(&idle), "idle_timeout");
-        // Everything else stays the generic transport/parse label.
+        assert_eq!(chunk_err_outcome(&idle), "gateway_error");
         assert_eq!(
             chunk_err_outcome(&LlmError::Stream(
                 "Transport error: connection reset by peer".into()
             )),
-            "chunk_error"
+            "gateway_error"
         );
         assert_eq!(
             chunk_err_outcome(&LlmError::StreamParse("not a delta".into())),
-            "chunk_error"
+            "gateway_error"
         );
+    }
+
+    #[test]
+    fn split_failures_separates_the_two_columns_and_nulls_empty_sides() {
+        use eros_engine_llm::failure::{
+            AttemptFailure, GatewayError, GatewayKind, UpstreamAttempt,
+        };
+        let fs = vec![
+            AttemptFailure::Upstream(UpstreamAttempt {
+                task: "chat_companion".into(),
+                model: "a/m".into(),
+                http_status: 529,
+                provider_code: None,
+                error_type: None,
+                upstream_provider_code: None,
+                retry_after_s: None,
+                message: "overloaded".into(),
+            }),
+            AttemptFailure::Gateway(GatewayError {
+                task: "chat_companion".into(),
+                model: Some("b/m".into()),
+                kind: GatewayKind::OpenTimeout,
+                message: "open timeout".into(),
+            }),
+        ];
+        let (a, g) = split_failures(&fs);
+        assert_eq!(a.as_ref().unwrap()[0]["http_status"], 529);
+        assert_eq!(g.as_ref().unwrap()[0]["kind"], "open_timeout");
+
+        // An empty side is NULL, never `[]` — one way to say "nothing to record".
+        let (a, g) = split_failures(&[]);
+        assert!(a.is_none() && g.is_none());
     }
 
     #[test]
@@ -12192,6 +12373,347 @@ data: [DONE]\n\n";
             produced[0].full_text, "hi there",
             "produced must carry the clean fallback, not the superseded garbled attempt",
         );
+    }
+
+    /// THE test for this feature. Primary returns 529, the fallback serves the
+    /// turn normally, and the row records what the primary said — before this
+    /// change that failure left no trace anywhere but a `tracing::warn!`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_chat_chain_persists_the_529_on_the_assistant_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("primary/m"))
+            .respond_with(
+                ResponseTemplate::new(529)
+                    .set_body_string(r#"{"error":{"code":529,"message":"Overloaded"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"fallback/m\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fallback/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"primary/m\"\nfallback=[\"fallback/m\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01JRECOVERED529LIVE0000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let (content, attempts, gateways): (
+            String,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, llm_attempts, gateway_errors FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "hello", "the turn is served normally");
+        let attempts = attempts.expect("the failed hop must be recorded");
+        assert_eq!(attempts[0]["http_status"], 529);
+        assert_eq!(attempts[0]["model"], "primary/m");
+        assert_eq!(attempts[0]["task"], "chat_companion");
+        assert!(
+            gateways.is_none(),
+            "nothing broke on our side of the wire, so that column stays NULL: {gateways:?}",
+        );
+    }
+
+    /// Filtered mode walks its own copy of the chain. A change applied to only
+    /// one of the two loops is an incomplete change, so the 529 must land on
+    /// the row a filtered turn persists too.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_filtered_chain_persists_the_529_on_the_assistant_row(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("primary/m"))
+            .respond_with(
+                ResponseTemplate::new(529)
+                    .set_body_string(r#"{"error":{"code":529,"message":"Overloaded"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let clean = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ORIG\"}}],",
+            "\"id\":\"gen-f\",\"model\":\"fallback/m\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fallback/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(clean, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        // The output filter uses the non-streaming `execute()` path; its text
+        // must clear MIN_FILTERED_OUTPUT_CHARS to pass the validity gate.
+        let filt_text = "FILT_START 她轻轻地望向窗外，思绪飘向了远方。阳光洒在她的脸上，温柔而明亮。她记得那个夏天的每一天，岁月如流水般逝去，带走了所有的悲欢离合。 FILT_END";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("fast/m"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gf", "model": "fast/m",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": filt_text}}],
+            })))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"primary/m\"\nfallback=[\"fallback/m\"]\noutput_filter=true\n\
+                 [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"REWRITE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JRECOVERED529FILT000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (content, attempts): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT content, llm_attempts FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            content.contains("FILT_START"),
+            "the filtered turn is served normally, got {content:?}",
+        );
+        let attempts = attempts.expect("the failed hop must be recorded in filtered mode too");
+        assert_eq!(attempts[0]["http_status"], 529);
+        assert_eq!(attempts[0]["model"], "primary/m");
+        assert_eq!(attempts[0]["task"], "chat_companion");
+    }
+
+    /// The pseudo-ghost used to be the worst row in the table: it replaced the
+    /// whole failed chain with a canned phrase and kept none of the codes. It
+    /// now carries every hop plus the chain-scoped verdict.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn exhausted_chain_pseudo_ghost_records_the_hops_and_the_verdict(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Single-model chain, and that model is down: one upstream fact plus
+        // the chain-scoped gateway verdict.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":"unavailable","message":"down"}}"#),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"only/m\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hello there friend",
+                "01JEXHAUSTEDCHAINAUDIT001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hello there friend".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        #[allow(clippy::type_complexity)]
+        let (attempts, gateways, metadata): (
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT llm_attempts, gateway_errors, metadata FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant' \
+               AND metadata->>'fallback_reason' = 'stream_failure' \
+             ORDER BY sent_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the exhausted chain must leave a pseudo-ghost row");
+
+        let attempts = attempts.expect("the 503 must survive on the pseudo-ghost");
+        assert_eq!(attempts[0]["http_status"], 503);
+        assert_eq!(attempts[0]["model"], "only/m");
+        let gateways = gateways.expect("the chain-scoped verdict lives in the gateway column");
+        assert_eq!(gateways[0]["kind"], "chain_exhausted");
+        assert!(
+            gateways[0].get("model").is_none(),
+            "chain_exhausted is chain-scoped and names no model: {gateways}",
+        );
+        // The table's own business verdict is not derivable from the columns
+        // (a content-verdict hop leaves no entry), so it stays.
+        assert_eq!(metadata["retries_chat"], serde_json::json!(0));
     }
 
     /// Codex P2 (PR #141): a NON-last empty completion in LIVE mode is a
