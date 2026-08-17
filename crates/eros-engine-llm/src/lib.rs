@@ -4,6 +4,7 @@
 pub mod byte_bpe;
 pub mod embedding;
 pub mod error;
+pub mod failure;
 pub mod model_config;
 pub mod openrouter;
 pub mod provider;
