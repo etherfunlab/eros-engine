@@ -186,7 +186,7 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 | 角色 | 经由 instance 取 `persona_genomes`：名字、人格、backstory（canon） |
 | 当前 insight + digest | `persona_story_insights` 行（`last_run_at IS NULL` ⇒ 首轮初始化） |
 | 近期事件（12 条） | `persona_story_events`，按时间顺序——保连贯性、防重复 |
-| 亲密度快照 | 最新会话的六轴 + bond + chemistry + relationship_label——仅供参考 |
+| 亲密度快照 | 最新会话的六轴 + bond + chemistry + 两条线的档位名——仅供参考 |
 | 聊天证据 | 该 (owner, instance) 最近 `context_days`（默认 7 天）内的消息，按轮数上限截断 |
 
 | 输出 | 去向 |

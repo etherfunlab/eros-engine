@@ -101,7 +101,6 @@ pub struct StoryAffinity {
     pub tension: f64,
     pub bond: f64,
     pub chemistry: f64,
-    pub relationship_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,7 +351,7 @@ impl<'a> StoryRepo<'a> {
     ) -> Result<Option<StoryAffinity>, sqlx::Error> {
         sqlx::query_as(
             "SELECT ca.warmth, ca.trust, ca.intrigue, ca.intimacy, ca.patience, ca.tension, \
-                    ca.bond, ca.chemistry, ca.relationship_label \
+                    ca.bond, ca.chemistry \
              FROM engine.companion_affinity ca \
              JOIN engine.chat_sessions cs ON cs.id = ca.session_id \
              WHERE ca.user_id = $1 AND ca.instance_id = $2 \
@@ -978,7 +977,10 @@ mod tests {
         let owner = Uuid::new_v4();
         let inst = seed_instance(&pool, owner, "A", "active").await;
         assert!(repo.affinity_snapshot(owner, inst).await.unwrap().is_none());
-        for (label, ago) in [("旧识", "10 days"), ("挚友", "1 hour")] {
+        // `trust` is the discriminator (it feeds bond) now that the legacy
+        // relationship_label column is gone: the newer session's value is the
+        // one the snapshot must return.
+        for (trust, ago) in [(0.1_f64, "10 days"), (0.8_f64, "1 hour")] {
             let s: Uuid = sqlx::query_scalar(
                 "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at) \
                  VALUES ($1, $2, now() - $3::interval) RETURNING id",
@@ -991,12 +993,12 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO engine.companion_affinity \
-                 (session_id, user_id, instance_id, relationship_label) VALUES ($1, $2, $3, $4)",
+                 (session_id, user_id, instance_id, trust) VALUES ($1, $2, $3, $4)",
             )
             .bind(s)
             .bind(owner)
             .bind(inst)
-            .bind(label)
+            .bind(trust)
             .execute(&pool)
             .await
             .unwrap();
@@ -1006,8 +1008,12 @@ mod tests {
             .await
             .unwrap()
             .expect("snapshot");
-        assert_eq!(snap.relationship_label.as_deref(), Some("挚友"));
-        assert!(snap.bond >= 0.0 && snap.chemistry >= 0.0);
+        assert!(
+            (snap.trust - 0.8).abs() < 1e-9,
+            "latest-active session wins"
+        );
+        assert!((snap.bond - 0.4).abs() < 1e-9); // (0.8 + 0) / 2
+        assert!(snap.chemistry >= 0.0);
     }
 
     fn unit_embedding(seed: usize) -> Vec<f32> {

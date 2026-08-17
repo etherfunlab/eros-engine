@@ -16,12 +16,60 @@
     }
   ],
   "paths": {
+    "/bff/v1/comp/affinity/{session_id}": {
+      "get": {
+        "tags": [
+          "bff-companion"
+        ],
+        "summary": "Absolute affinity for a session, refreshed at read time — the supported way\nfor a client to render a relationship.",
+        "description": "`apply_time_decay()` + `refresh_endpoints()` run before serialising, and\nthat is the whole reason this endpoint exists rather than a direct read of\n`engine.companion_affinity`: as of 4.0 `warmth`/`patience` are derived from\nthe judge level, the counterpart line and the elapsed gap, with the columns\nholding only a write-time cache. A reader that selects the columns gets a\nrelationship that reads warmer the longer the user has been away.\n\nReturns both the tier number and the tier key, so a client needs neither a\nthreshold table nor an ordered tier array.",
+        "operationId": "bff_get_affinity_value",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BffAffinityValueResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/bff/v1/comp/affinity/{session_id}/event": {
       "get": {
         "tags": [
           "bff-companion"
         ],
-        "summary": "Latest user-turn affinity delta as committed. For per-turn FE observation.\nNOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +\nownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
+        "summary": "Latest user-turn affinity delta as committed. For per-turn FE observation;\nJWT + ownership checked. With `?after=<event_id>` the request long-polls (see\n[`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into\none held request.",
         "operationId": "bff_get_affinity_delta",
         "parameters": [
           {
@@ -188,132 +236,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "not your session"
-          },
-          "404": {
-            "description": "session not found"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/comp/affinity/{session_id}": {
-      "get": {
-        "tags": [
-          "debug"
-        ],
-        "summary": "Inspect the live affinity vector for a session. The session must be\nowned by the JWT user; otherwise 403.",
-        "operationId": "get_affinity",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AffinitySnapshot"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "not your session"
-          },
-          "404": {
-            "description": "session has no affinity"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/comp/affinity/{session_id}/event": {
-      "get": {
-        "tags": [
-          "debug"
-        ],
-        "summary": "Paginated affinity-event log for a session — raw + committed deltas.\nDebug-gated (same router as get_affinity).",
-        "operationId": "get_affinity_events",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Chat session id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max rows (default 20, capped at 100)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Page offset, default 0",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "event_type",
-            "in": "query",
-            "description": "Filter: message|ghost|gift|proactive|time_decay",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AffinityEventsResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "invalid event_type"
           },
           "401": {
             "description": "missing or invalid bearer"
@@ -1193,91 +1115,6 @@
           }
         }
       },
-      "AffinityEventEntry": {
-        "type": "object",
-        "required": [
-          "event_id",
-          "event_type",
-          "deltas",
-          "created_at"
-        ],
-        "properties": {
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deltas": {
-            "$ref": "#/components/schemas/AffinityDeltasDto",
-            "description": "Raw delta the pipeline decided, before decay and gating."
-          },
-          "effective_deltas": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/AffinityDeltasDto",
-                "description": "Effective change actually committed (after − before). None for pre-0014 rows."
-              }
-            ]
-          },
-          "effective_deltas_computed": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/BondChemistryDeltas",
-                "description": "Committed delta folded into the two lines (raw-composite units). None for\npre-0014 rows with no `effective_deltas`."
-              }
-            ]
-          },
-          "event_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "Stable unique id of this event (FE freshness/dedup key)."
-          },
-          "event_type": {
-            "type": "string"
-          },
-          "label_changes": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/TurnLabelChangesDto",
-                "description": "Per-turn tier transition; absent when no tier moved."
-              }
-            ]
-          }
-        }
-      },
-      "AffinityEventsResponse": {
-        "type": "object",
-        "required": [
-          "session_id",
-          "events",
-          "total"
-        ],
-        "properties": {
-          "events": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AffinityEventEntry"
-            }
-          },
-          "session_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "total": {
-            "type": "integer",
-            "description": "Count returned in this page (== events.len()), NOT the grand total.",
-            "minimum": 0
-          }
-        }
-      },
       "AffinityScopeDto": {
         "oneOf": [
           {
@@ -1303,7 +1140,7 @@
       },
       "AffinitySnapshot": {
         "type": "object",
-        "description": "Point-in-time projection of a session's `Affinity`. Same field set\nas the historical `AffinityDebugResponse`; renamed because it now\nflows through non-debug surfaces too.",
+        "description": "Point-in-time projection of a session's `Affinity`.\n\nSerialise this only from an `Affinity` that has had `apply_time_decay()`\nand `refresh_endpoints()` applied: `warmth` and `patience` are derived as\nof 4.0 and their stored columns are a write-time cache, so a snapshot taken\nstraight off the row reads systematically warm.",
         "required": [
           "warmth",
           "trust",
@@ -1316,6 +1153,8 @@
           "updated_at",
           "bond",
           "chemistry",
+          "bond_tier",
+          "chem_tier",
           "bond_label",
           "chemistry_label"
         ],
@@ -1328,6 +1167,18 @@
           "bond_label": {
             "type": "string",
             "description": "Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`)."
+          },
+          "bond_tier": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Friendship tier, 1..=5. Returned alongside the key so a client needs\nneither the thresholds nor an ordered tier array.",
+            "minimum": 0
+          },
+          "chem_tier": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Romance tier, 1..=5.",
+            "minimum": 0
           },
           "chemistry": {
             "type": "number",
@@ -1353,12 +1204,6 @@
           "patience": {
             "type": "number",
             "format": "double"
-          },
-          "relationship_label": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "tension": {
             "type": "number",
@@ -1427,6 +1272,9 @@
                 "description": "Engine-authoritative per-turn tier transition; absent when no tier moved."
               }
             ]
+          },
+          "state_after": {
+            "description": "Post-turn absolute state — axes, both line scores, both tiers, both\njudge levels. Absent on rows written before migration 0049.\n\nTakes the place of client-side accumulation: with this, a consumer\nadopts the authoritative absolute value every turn instead of adding\ndeltas to a running total. It is a WRITE-TIME snapshot, so after an\nabsence only `GET /bff/v1/comp/affinity/{sid}` is correct — that one\nrefreshes the derived endpoints at read."
           }
         }
       },
@@ -1444,6 +1292,29 @@
               {
                 "$ref": "#/components/schemas/BffAffinityDelta",
                 "description": "None when no user-turn event yet (brand-new, or only time_decay), or\nwhen the latest user-turn event predates migration 0014."
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "BffAffinityValueResponse": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "affinity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AffinitySnapshot",
+                "description": "None when the session has no affinity row yet. The row is created on\nthe first turn, so a just-started session legitimately has none —\nrender an empty relationship, not an error."
               }
             ]
           },

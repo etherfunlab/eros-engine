@@ -261,7 +261,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
 - **OpenRouter 归因（可选）：**在模型配置的 `[providers.openrouter]` 下声明一个 `headers` 表——`HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`——给每个出站 OpenRouter 调用加归因头，让部署出现在 OpenRouter 的应用面板上；不写这个条目（或不写它的 `headers` key）就保持匿名。见 [model-config.zh.md → 通过 `[providers].openrouter` 覆盖内置端点](model-config.zh.md#通过-providersopenrouter-覆盖内置端点)。旧的 `OPENROUTER_APP_REFERER` / `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_CATEGORIES` 环境变量已软废弃：仍然设置也只会被静默忽略，不是启动报错；`OPENROUTER_BASE_URL` 则彻底移除——改用 `[providers].openrouter.chat` / `.embeddings` 覆盖端点 URL。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
-- **Affinity debug：** `GET /comp/affinity/{session_id}` 受 `EXPOSE_AFFINITY_DEBUG=true` 控制。生產部署一般關掉；如果你的前端要實時畫好感度雷達圖，再打開。
+- **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态。两条都做 JWT + ownership 检查、都常驻——4.1 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/affinity-4.1.md](migrating/affinity-4.1.md)。
 - **日誌：** `RUST_LOG=info` 是默認。`RUST_LOG=debug,sqlx=warn` 看到除 SQLx 查詢噪音以外的一切。
 - **成本：** OSS 部署默认 chat 使用一个快速廉价的模型、insight 抽取使用一个高质量抽取模型（当前默认值见 `examples/model_config.toml`）。一轮典型对话花费 ≪ $0.001 美元 token 成本，加上一个 Voyage embedding 调用（每个值得记住的事实约 $0.000003）。10000 轮对话花个位数美元。
 

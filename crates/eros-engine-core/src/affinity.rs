@@ -23,19 +23,8 @@ pub struct Affinity {
     pub ghost_streak: i32,
     pub last_ghost_at: Option<DateTime<Utc>>,
     pub total_ghosts: i32,
-    pub relationship_label: Option<RelationshipLabel>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationshipLabel {
-    Stranger,
-    Romantic,
-    Friend,
-    Frenemy,
-    SlowBurn,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,27 +81,6 @@ impl Affinity {
         );
         self.patience =
             endpoint_value(self.patience_grade, self.bond_score(), decay, t.floor_ratio);
-    }
-
-    /// Legacy 5-name relationship label (back-compat), derived purely from the
-    /// two line scores — replaces the old multi-axis `infer_label` heuristic.
-    /// New consumers should read `bond_label`/`chemistry_label`. `frenemy` is
-    /// retired from emission (kept in the enum for parse compat).
-    pub fn legacy_relationship_label(&self) -> RelationshipLabel {
-        let bond = self.bond_score();
-        let chem = self.chemistry_score();
-        if tier_index(bond) == 1 && tier_index(chem) == 1 {
-            return RelationshipLabel::Stranger;
-        }
-        if chem > bond {
-            if tier_index(chem) >= 3 {
-                RelationshipLabel::Romantic
-            } else {
-                RelationshipLabel::SlowBurn
-            }
-        } else {
-            RelationshipLabel::Friend
-        }
     }
 }
 
@@ -218,8 +186,12 @@ pub fn endpoint_value(level: i16, counterpart: f64, decay: f64, floor_ratio: f64
     (boosted.max(floor_ratio * counterpart) * decay).clamp(0.0, 1.0)
 }
 
-/// 1..=5 tier index for a 0..1 line score.
-fn tier_index(score: f64) -> u8 {
+/// 1..=5 tier index for a 0..1 line score. The single authority for the tier
+/// ladder: the `bond_tier`/`chem_tier` columns are this function's result
+/// projected for SQL consumers, and clients read that rather than re-deriving
+/// (spec 2026-08-17-affinity-41-design.md §3.1). Adding a tier is a change
+/// here plus a backfill — the table's shape does not encode the tier count.
+pub fn tier_index(score: f64) -> u8 {
     if score < TIER1_HI {
         1
     } else if score < TIER2_HI {
@@ -255,6 +227,24 @@ impl BondLabel {
             BondLabel::Soulmate => "soulmate",
         }
     }
+
+    /// Name a tier index. Out-of-range clamps rather than panicking: the input
+    /// can come from a stored column written by an older engine.
+    pub fn from_tier(tier: u8) -> Self {
+        match tier.clamp(1, 5) {
+            1 => BondLabel::Acquaintance,
+            2 => BondLabel::Friend,
+            3 => BondLabel::CloseFriend,
+            4 => BondLabel::Confidant,
+            _ => BondLabel::Soulmate,
+        }
+    }
+
+    /// Name the tier a raw 0..1 bond score falls in — for callers holding a
+    /// score without an `Affinity` (e.g. a projection row).
+    pub fn from_score(score: f64) -> Self {
+        Self::from_tier(tier_index(score))
+    }
 }
 
 /// Romance-line tier (pure function of `chemistry_score`).
@@ -277,6 +267,22 @@ impl ChemistryLabel {
             ChemistryLabel::Lover => "lover",
             ChemistryLabel::Beloved => "beloved",
         }
+    }
+
+    /// Name a tier index; see [`BondLabel::from_tier`].
+    pub fn from_tier(tier: u8) -> Self {
+        match tier.clamp(1, 5) {
+            1 => ChemistryLabel::Spark,
+            2 => ChemistryLabel::Flirtation,
+            3 => ChemistryLabel::Crush,
+            4 => ChemistryLabel::Lover,
+            _ => ChemistryLabel::Beloved,
+        }
+    }
+
+    /// Name the tier a raw 0..1 chemistry score falls in.
+    pub fn from_score(score: f64) -> Self {
+        Self::from_tier(tier_index(score))
     }
 }
 
@@ -342,26 +348,25 @@ impl Affinity {
         clamp((self.intimacy + self.tension) / 2.0, 0.0, 1.0)
     }
 
+    /// 1..=5 friendship-line tier. Persisted to `companion_affinity.bond_tier`
+    /// so SQL consumers get the engine's own result instead of re-deriving it.
+    pub fn bond_tier(&self) -> u8 {
+        tier_index(self.bond_score())
+    }
+
+    /// 1..=5 romance-line tier; persisted to `companion_affinity.chem_tier`.
+    pub fn chem_tier(&self) -> u8 {
+        tier_index(self.chemistry_score())
+    }
+
     /// Friendship-line tier label.
     pub fn bond_label(&self) -> BondLabel {
-        match tier_index(self.bond_score()) {
-            1 => BondLabel::Acquaintance,
-            2 => BondLabel::Friend,
-            3 => BondLabel::CloseFriend,
-            4 => BondLabel::Confidant,
-            _ => BondLabel::Soulmate,
-        }
+        BondLabel::from_tier(self.bond_tier())
     }
 
     /// Romance-line tier label.
     pub fn chemistry_label(&self) -> ChemistryLabel {
-        match tier_index(self.chemistry_score()) {
-            1 => ChemistryLabel::Spark,
-            2 => ChemistryLabel::Flirtation,
-            3 => ChemistryLabel::Crush,
-            4 => ChemistryLabel::Lover,
-            _ => ChemistryLabel::Beloved,
-        }
+        ChemistryLabel::from_tier(self.chem_tier())
     }
 
     /// Coarse 1..=3 intimacy rung for the PDE image gate, taken over whichever
@@ -716,7 +721,6 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
-            relationship_label: None,
             created_at: now,
             updated_at: now,
         }
@@ -940,53 +944,6 @@ mod tests {
         assert_eq!(a.chemistry_label(), ChemistryLabel::Beloved);
         assert_eq!(BondLabel::Soulmate.as_key(), "soulmate");
         assert_eq!(ChemistryLabel::Beloved.as_key(), "beloved");
-    }
-
-    #[test]
-    fn legacy_label_stranger_when_both_tier1() {
-        let mut a = fresh();
-        a.warmth = 0.0;
-        a.trust = 0.0;
-        a.intrigue = 0.0;
-        a.intimacy = 0.0;
-        a.tension = 0.0;
-        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Stranger);
-    }
-
-    #[test]
-    fn legacy_label_friend_when_bond_leads() {
-        let mut a = fresh();
-        // bond = (0.3+0.6+0.6)/3 = 0.5 ; chem = (0.3+0+0)/3 = 0.1
-        a.warmth = 0.3;
-        a.trust = 0.6;
-        a.intrigue = 0.6;
-        a.intimacy = 0.0;
-        a.tension = 0.0;
-        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Friend);
-    }
-
-    #[test]
-    fn legacy_label_romantic_when_chemistry_high() {
-        let mut a = fresh();
-        // chem = (0.3+0.9+0.9)/3 = 0.7 (tier4) ; bond = 0.1
-        a.warmth = 0.3;
-        a.intimacy = 0.9;
-        a.tension = 0.9;
-        a.trust = 0.0;
-        a.intrigue = 0.0;
-        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::Romantic);
-    }
-
-    #[test]
-    fn legacy_label_slow_burn_when_chemistry_leads_but_mid() {
-        let mut a = fresh();
-        // chem = (0.3+0.3+0.2)/3 ≈ 0.267 (tier2) ; bond = 0.1 (tier1)
-        a.warmth = 0.3;
-        a.intimacy = 0.3;
-        a.tension = 0.2;
-        a.trust = 0.0;
-        a.intrigue = 0.0;
-        assert_eq!(a.legacy_relationship_label(), RelationshipLabel::SlowBurn);
     }
 
     #[test]

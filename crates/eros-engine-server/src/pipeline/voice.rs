@@ -373,8 +373,8 @@ async fn reload_bootstrap_winner(
 }
 
 /// One relationship-tone line, derived at read time from the affinity row's
-/// bond/chemistry tiers — never from the cached `relationship_label`, which
-/// the voice path (no per-turn affinity eval) would leave stale forever.
+/// bond/chemistry tiers. The voice path runs no per-turn affinity eval, so
+/// anything cached rather than derived would sit stale forever here.
 /// The resolved `AffinityScope` flattens to the two halves this line can
 /// inject: any bond axis ⇒ the bond half, any chemistry axis ⇒ the
 /// chemistry half.
@@ -872,8 +872,7 @@ mod tests {
         }
     }
 
-    /// Affinity row landing on chosen tiers via raw axis values; cached
-    /// relationship_label deliberately None — the line must not read it.
+    /// Affinity row landing on chosen tiers via raw axis values.
     fn affinity_at(
         warmth: f64,
         trust: f64,
@@ -898,7 +897,6 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
-            relationship_label: None,
             created_at: now,
             updated_at: now,
         }

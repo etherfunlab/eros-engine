@@ -218,7 +218,7 @@ the moment chat activity resumes — no catch-up rounds.
 | Persona | `persona_genomes` via instance: name, personality, backstory (canon) |
 | Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
 | Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
-| Affinity snapshot | latest session's six axes + bond + chemistry + relationship label — advisory only |
+| Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only |
 | Chat evidence | messages of this (owner, instance), last `context_days` (default 7), capped by turn count |
 
 | Output | Where it goes |

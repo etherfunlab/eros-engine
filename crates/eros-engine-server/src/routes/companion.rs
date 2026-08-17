@@ -871,7 +871,6 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         pool,
         auth,
         config: crate::state::ServerConfig {
-            expose_affinity_debug: true,
             // Default tuning: at a fresh seed (tier 1, no counterpart penalty)
             // rule deltas land 1:1.
             affinity_tuning: eros_engine_core::affinity::AffinityTuning::default(),
@@ -1028,7 +1027,6 @@ mod tests {
         body::Body,
         http::{header, Request, StatusCode},
     };
-    use eros_engine_store::affinity::AffinityRepo;
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -1279,8 +1277,6 @@ mod tests {
         assert_eq!(channel_of(voice_session), Some("voice".to_string()));
     }
 
-    // ─── Bonus: debug affinity endpoint round-trips when enabled ────
-
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn start_chat_passes_for_legacy_genome(pool: PgPool) {
         // Unchanged path: legacy seed-persona must still work.
@@ -1300,38 +1296,6 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(&mut app, req).await;
         assert_eq!(status, StatusCode::OK);
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn debug_affinity_returns_vector_for_owner(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Solace").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        // Pre-create the affinity row so the debug GET has something to read.
-        let repo = AffinityRepo { pool: &pool };
-        let _ = repo
-            .load_or_create(session_id, user_id, instance_id)
-            .await
-            .unwrap();
-
-        let state = test_state(pool);
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-
-        let req = Request::builder()
-            .uri(format!("/comp/affinity/{session_id}"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap();
-        let (status, body) = send_request(&mut app, req).await;
-        assert_eq!(status, StatusCode::OK, "got body: {body}");
-        // Defaults from migration 0048: level-2 endpoints over empty lines.
-        let expect = (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0);
-        assert!((body["warmth"].as_f64().unwrap() - expect).abs() < 1e-9);
-        assert!((body["patience"].as_f64().unwrap() - expect).abs() < 1e-9);
-        assert!((body["intrigue"].as_f64().unwrap() - 0.0).abs() < 1e-9);
     }
 
     // ─── Prompt-traits validator unit tests ─────────────────────────

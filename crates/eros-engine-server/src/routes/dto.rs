@@ -2,17 +2,19 @@
 //! Shared response DTOs used by more than one routing subtree.
 //!
 //! Currently holds:
-//!   * `AffinitySnapshot` — point-in-time view of the 6-axis affinity
-//!     vector, returned by `/comp/affinity/{sid}` (debug, gated by
-//!     `EXPOSE_AFFINITY_DEBUG`).
+//!   * `AffinitySnapshot` — point-in-time view of the affinity vector,
+//!     returned by `GET /bff/v1/comp/affinity/{sid}`.
 
 use serde::{Deserialize, Serialize};
 
-use eros_engine_core::affinity::{Affinity, RelationshipLabel};
+use eros_engine_core::affinity::Affinity;
 
-/// Point-in-time projection of a session's `Affinity`. Same field set
-/// as the historical `AffinityDebugResponse`; renamed because it now
-/// flows through non-debug surfaces too.
+/// Point-in-time projection of a session's `Affinity`.
+///
+/// Serialise this only from an `Affinity` that has had `apply_time_decay()`
+/// and `refresh_endpoints()` applied: `warmth` and `patience` are derived as
+/// of 4.0 and their stored columns are a write-time cache, so a snapshot taken
+/// straight off the row reads systematically warm.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct AffinitySnapshot {
     pub warmth: f64,
@@ -23,7 +25,6 @@ pub struct AffinitySnapshot {
     pub tension: f64,
     pub ghost_streak: i32,
     pub total_ghosts: i32,
-    pub relationship_label: Option<String>,
     pub updated_at: String,
     /// Friendship line score, 0..1 — the real stored composite, no display
     /// curve (affinity 3.0 dropped the `bar()` projection; nonlinearity now
@@ -32,21 +33,15 @@ pub struct AffinitySnapshot {
     pub bond: f64,
     /// Romance line score, 0..1 — real stored composite, no display curve.
     pub chemistry: f64,
+    /// Friendship tier, 1..=5. Returned alongside the key so a client needs
+    /// neither the thresholds nor an ordered tier array.
+    pub bond_tier: u8,
+    /// Romance tier, 1..=5.
+    pub chem_tier: u8,
     /// Friendship tier key (`acquaintance`/`friend`/`close_friend`/`confidant`/`soulmate`).
     pub bond_label: String,
     /// Romance tier key (`spark`/`flirtation`/`crush`/`lover`/`beloved`).
     pub chemistry_label: String,
-}
-
-fn label_to_str(l: RelationshipLabel) -> String {
-    match l {
-        RelationshipLabel::Stranger => "stranger",
-        RelationshipLabel::Romantic => "romantic",
-        RelationshipLabel::Friend => "friend",
-        RelationshipLabel::Frenemy => "frenemy",
-        RelationshipLabel::SlowBurn => "slow_burn",
-    }
-    .to_string()
 }
 
 impl From<Affinity> for AffinitySnapshot {
@@ -60,13 +55,11 @@ impl From<Affinity> for AffinitySnapshot {
             tension: a.tension,
             ghost_streak: a.ghost_streak,
             total_ghosts: a.total_ghosts,
-            // Legacy field, derived on read (like bond/chemistry below) so it is
-            // always consistent with the new lines — never NULL on a fresh row
-            // and never a stale pre-migration value from the stored column.
-            relationship_label: Some(label_to_str(a.legacy_relationship_label())),
             updated_at: a.updated_at.to_rfc3339(),
             bond: a.bond_score(),
             chemistry: a.chemistry_score(),
+            bond_tier: a.bond_tier(),
+            chem_tier: a.chem_tier(),
             bond_label: a.bond_label().as_key().to_string(),
             chemistry_label: a.chemistry_label().as_key().to_string(),
         }
@@ -123,7 +116,6 @@ mod tests {
             ghost_streak: 0,
             last_ghost_at: None,
             total_ghosts: 0,
-            relationship_label: None,
             created_at: now,
             updated_at: now,
         }
@@ -138,18 +130,24 @@ mod tests {
         // The real composite, not a projection.
         assert!((snap.bond - 0.6).abs() < 1e-9);
         assert!((snap.chemistry).abs() < 1e-9);
-        // legacy label derived on read: bond (tier3) leads, neither tier1 → friend
-        assert_eq!(snap.relationship_label.as_deref(), Some("friend"));
     }
 
     #[test]
-    fn snapshot_legacy_label_derived_on_read_not_stored() {
-        // Fresh low-seed row (warmth 0.1, rest 0) with a NULL stored label still
-        // reads as "stranger" — the legacy field is derived, not read from the
-        // column. Guards the "fresh session = stranger" goal (codex #132 P2).
-        let a = affinity(0.1, 0.0, 0.0, 0.0, 0.0); // relationship_label: None
-        let snap = AffinitySnapshot::from(a);
-        assert_eq!(snap.relationship_label.as_deref(), Some("stranger"));
+    fn snapshot_tier_number_and_key_agree() {
+        // Both are emitted so a client needs no threshold table; they must never
+        // disagree — same `tier_index` behind each.
+        let snap = AffinitySnapshot::from(affinity(0.0, 0.6, 0.6, 0.0, 0.0));
+        assert_eq!(snap.bond_tier, 3);
+        assert_eq!(snap.bond_label, "close_friend");
+        assert_eq!(snap.chem_tier, 1);
+        assert_eq!(snap.chemistry_label, "spark");
+    }
+
+    #[test]
+    fn snapshot_of_fresh_row_is_bottom_tier() {
+        let snap = AffinitySnapshot::from(affinity(0.1, 0.0, 0.0, 0.0, 0.0));
+        assert_eq!(snap.bond_tier, 1);
+        assert_eq!(snap.chem_tier, 1);
         assert_eq!(snap.bond_label, "acquaintance");
         assert_eq!(snap.chemistry_label, "spark");
     }

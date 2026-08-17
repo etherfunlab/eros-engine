@@ -146,24 +146,19 @@ API 原样报告每条线的分数：`AffinitySnapshot.bond` / `.chemistry` 就�
 | **Bond** | `acquaintance` | `friend` | `close_friend` | `confidant` | `soulmate` |
 | **Chemistry** | `spark` | `flirtation` | `crush` | `lover` | `beloved` |
 
-`bond_label` 与 `chemistry_label` 永远取各自五个值之一——从不输出
-`stranger`。`stranger` 状态只由遗留字段承载（见下）。
+`bond_label` 与 `chemistry_label` 永远取各自五个值之一。哪条线都还没起步的
+关系读作 `acquaintance` + `spark`，两条都是第 1 档——没有单独的「stranger」
+状态，4.1 起也没有承载它的遗留标签了。
 
-## 遗留 `relationship_label`
+## 档位序号会落库
 
-遗留字段沿用旧命名集合以保持向后兼容，是两个原始分数的纯函数：
+每次写入都会把 `tier_index` 自己的结果落到 `companion_affinity.bond_tier` /
+`.chem_tier`，这样调不到引擎的 SQL 消费者也能拿到权威档位，而不必照着抄来的
+阈值表自己从分数换算。这两列对引擎侧是只写的：引擎代码手上有分数，直接调
+`bond_tier()`。
 
-```
-legacy_relationship_label(bond, chemistry):
-  if tier(bond) == 1 AND tier(chemistry) == 1  →  stranger
-  let higher = (chemistry > bond) ? Chemistry : Bond   // 平手 → Bond
-  match higher:
-    Bond                                         →  friend
-    Chemistry if tier(chemistry) in {1, 2}       →  slow_burn
-    Chemistry if tier(chemistry) in {3, 4, 5}    →  romantic
-```
-
-`frenemy` 已停止输出，枚举中保留仅为解析历史行。
+阈值只存在于一处（`tier_index`），所以加一档是改那个函数加一次回填——表的形状
+并不编码档位有几个。
 
 ## 判官协议：全面 ordinal
 
@@ -367,8 +362,8 @@ label_changes = {
 
 ### `AffinitySnapshot`
 
-由 `GET /comp/affinity/{session_id}` 返回（debug，受 `EXPOSE_AFFINITY_DEBUG`
-门控）：
+由 `GET /bff/v1/comp/affinity/{session_id}` 返回，读取时会重新刷新
+（`apply_time_decay` + `refresh_endpoints`）：
 
 ```json
 {
@@ -380,23 +375,26 @@ label_changes = {
   "tension": 0.04,
   "bond": 0.10,
   "chemistry": 0.045,
+  "bond_tier": 1,
+  "chem_tier": 1,
   "bond_label": "acquaintance",
   "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "stranger",
   "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
 
 - `warmth` / `patience` —— 派生端点值（0–1，4.0 起无负值）。
 - `bond` / `chemistry` —— 真实存储的合成分（0–1），无显示曲线。
+- `bond_tier` / `chem_tier` —— 1..=5 档位序号，即 `tier_index` 自己的结果。
+  会持久化到行上的 `bond_tier` / `chem_tier` 两列供 SQL 消费者使用；客户端读这
+  两者之一，不要自己从分数换算。
 - `bond_label` / `chemistry_label` —— 上表 10 个档位键之一。
-- `relationship_label` —— 遗留映射值（`stranger / friend / slow_burn / romantic`）。
 
 ### BFF `/bff/v1/comp/affinity/{session_id}/event`
 
-该端点返回逐回合好感度增量，不受 `EXPOSE_AFFINITY_DEBUG` 门控。除
+该端点返回逐回合好感度增量。除
 `effective_deltas`（逐轴实际变化，`after − before`——`warmth`/`patience` 上
 即本轮派生 delta）外，事件还携带：
 

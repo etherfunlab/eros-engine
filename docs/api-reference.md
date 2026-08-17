@@ -786,76 +786,6 @@ The flat, typed `character_insights` row for one relationship (`persona_instance
 > were removed. A tip is now part of a normal stream turn — set
 > `tips_amount_usd` on `POST /comp/chat/{session_id}/message/stream` (see above).
 
-## Debug
-
-### `GET /comp/affinity/{session_id}`
-
-Live 6-axis vector + Bond/Chemistry scores and labels + ghost stats + legacy
-relationship label. Gated by `EXPOSE_AFFINITY_DEBUG=true` env var; returns 404
-when disabled.
-
-```json
-{
-  "warmth": 0.42,
-  "trust": 0.08,
-  "intrigue": 0.12,
-  "intimacy": 0.05,
-  "patience": 0.55,
-  "tension": 0.04,
-  "bond": 0.21,
-  "chemistry": 0.17,
-  "bond_label": "friend",
-  "chemistry_label": "flirtation",
-  "ghost_streak": 0,
-  "total_ghosts": 0,
-  "relationship_label": "friend",
-  "updated_at": "2026-06-30T12:00:00.000000Z"
-}
-```
-
-- `bond` / `chemistry` — the real stored composite scores (0–1); no display
-  curve is applied (the pacing nonlinearity lives in the write-side tier
-  decay — see [affinity-model.md](affinity-model.md)).
-- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
-- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
-- `relationship_label` — legacy mapped value (`stranger | friend | slow_burn | romantic`; `frenemy` retired from emission).
-
-Production deploys typically keep this off. Turn it on if your frontend wants
-to render a live radar or inspect the derived lines.
-
-### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
-
-Paginated affinity **event log** for the session, newest first. Same
-`EXPOSE_AFFINITY_DEBUG=true` gate as the vector route (404 when disabled). Each
-entry carries the per-turn `deltas` (the turn's raw scores: grade conversion
-plus rule nudges, pre-decay), the applied `effective_deltas` (`after −
-before`; all-zero on a threshold-gated turn), the folded
-`effective_deltas_computed`, and `label_changes` when a tier crossed.
-Optional `event_type` filters the log; `limit` defaults to 20 (capped at
-100).
-
-```json
-{
-  "events": [
-    {
-      "event_id": "…",
-      "event_type": "message",
-      "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas": { "warmth": 0.042, "trust": 0.014, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas_computed": { "bond": 0.019, "chemistry": 0.007 },
-      "label_changes": null,
-      "created_at": "…"
-    }
-  ]
-}
-```
-
-The `event_type` filter accepts `message | gift | proactive | ghost |
-time_decay` (`time_decay` is reserved — not written by current code). For a
-per-turn frontend surface that is **not** debug-gated and returns only the
-latest event (applied change only), use the BFF route
-`GET /bff/v1/comp/affinity/{session_id}/event` below.
-
 ## BFF (`/bff/v1/*`)
 
 A frontend-shaped mirror of selected `/comp/*` routes for first-party
@@ -895,8 +825,8 @@ The body is the canonical start body plus one BFF-only field:
 ```
 
 Affinity is intentionally **not** bundled here — the frontend reads it
-separately (see the affinity event route below), which keeps bootstrap
-independent of `EXPOSE_AFFINITY_DEBUG`.
+separately via the two affinity routes below, so a cold mount that does not
+need a relationship pays nothing for one.
 
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
@@ -931,10 +861,9 @@ not the grand total of rows in the session.
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
-Latest user-turn affinity delta (the applied per-axis change), for per-turn
-frontend observation. Unlike the canonical `/comp/affinity/{session_id}` debug
-route, this is **not** gated by `EXPOSE_AFFINITY_DEBUG` (the frontend owns
-this surface) — but it is still JWT + ownership checked.
+Latest user-turn affinity delta (the applied per-axis change) **plus the
+post-turn absolute state**, for per-turn frontend observation. JWT + ownership
+checked.
 
 Query parameters (both optional):
 
@@ -963,6 +892,13 @@ Query parameters (both optional):
     "label_changes": {
       "bond": { "from": "acquaintance", "to": "friend" }
     },
+    "state_after": {
+      "warmth": 0.31, "trust": 0.44, "intrigue": 0.40,
+      "intimacy": 0.19, "patience": 0.27, "tension": 0.17,
+      "bond": 0.42, "chemistry": 0.18,
+      "bond_tier": 3, "chem_tier": 2,
+      "warmth_grade": 2, "patience_grade": 2
+    },
     "created_at": "…"
   }
 }
@@ -980,6 +916,54 @@ reports all-zero `effective_deltas`.
   pulse. May be absent on pre-migration rows.
 - `label_changes` — engine-authoritative tier transition (`null` / absent when
   no tier crossed this turn). Frontend stops computing this itself.
+- `state_after` — the post-turn absolute state, read from the stored event
+  column (absent on rows written before migration `0049`). This replaces
+  client-side accumulation: adopt it as the new absolute value each turn
+  instead of adding deltas to a running total. It is a **write-time**
+  snapshot — after an absence only `GET /bff/v1/comp/affinity/{session_id}`
+  is correct, because that route refreshes the derived endpoints at read.
+
+### `GET /bff/v1/comp/affinity/{session_id}`
+
+Absolute affinity for the session, **refreshed at read time** — the supported
+way for a client to render a relationship. JWT + ownership checked, same
+status codes as the event route above (404 unknown session, 403 someone
+else's).
+
+```json
+{
+  "session_id": "…",
+  "affinity": {
+    "warmth": 0.3106, "trust": 0.4402, "intrigue": 0.4024,
+    "intimacy": 0.1901, "patience": 0.2740, "tension": 0.1703,
+    "bond": 0.4213, "chemistry": 0.1802,
+    "bond_tier": 3, "chem_tier": 2,
+    "bond_label": "close_friend", "chemistry_label": "flirtation",
+    "ghost_streak": 0, "total_ghosts": 2,
+    "updated_at": "2026-08-17T14:02:11Z"
+  }
+}
+```
+
+`affinity` is `null` when the session has no affinity row yet — the row is
+created on the first turn, so a just-started session legitimately has none.
+
+- `bond` / `chemistry` — the real stored composite scores (0–1); no display
+  curve (the pacing nonlinearity lives in the write-side tier decay — see
+  [affinity-model.md](affinity-model.md)).
+- `bond_tier` / `chem_tier` — 1..=5. Returned alongside the keys so a client
+  needs neither the thresholds nor an ordered tier array. **Do not re-derive
+  the tier from the score**; the thresholds are engine-owned and a local copy
+  will drift.
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
+
+`apply_time_decay()` + `refresh_endpoints()` run before the response is
+serialised, and that is the reason to call this rather than read
+`engine.companion_affinity` directly: `warmth` and `patience` are derived from
+the judge level, the counterpart line and the elapsed gap, with the stored
+columns holding only a write-time cache. A direct `SELECT` returns a
+relationship that reads warmer the longer the user has been away.
 
 ## Error responses
 

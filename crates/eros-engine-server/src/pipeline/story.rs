@@ -112,11 +112,16 @@ fn story_user_payload(
         "延续这个角色的人生：在现有 insight 与近期 events 的基础上推进生活，输出更新后的完整 insight 与当期 events。"
     };
     let affinity_json = affinity.map(|a| {
+        use eros_engine_core::affinity::{BondLabel, ChemistryLabel};
+        // Named tiers rather than the retired 4-name legacy label (4.1): they
+        // carry more, they match what the user is shown, and an LLM can use a
+        // discrete absolute label where it cannot use a continuous reading.
         serde_json::json!({
             "warmth": a.warmth, "trust": a.trust, "intrigue": a.intrigue,
             "intimacy": a.intimacy, "patience": a.patience, "tension": a.tension,
             "bond": a.bond, "chemistry": a.chemistry,
-            "relationship_label": a.relationship_label,
+            "bond_label": BondLabel::from_score(a.bond).as_key(),
+            "chemistry_label": ChemistryLabel::from_score(a.chemistry).as_key(),
         })
     });
     let chat: Vec<serde_json::Value> = chat_pairs

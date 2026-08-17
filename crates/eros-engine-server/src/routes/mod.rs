@@ -18,7 +18,6 @@ use crate::state::AppState;
 pub mod bff;
 pub mod companion;
 pub mod companion_stream;
-pub mod debug;
 pub mod dto;
 pub mod health;
 pub mod persona;
@@ -27,7 +26,7 @@ pub mod world_town;
 
 /// Compose the full app router with auth layers attached.
 ///
-/// The `#[utoipa::path]` annotations on companion / debug handlers
+/// The `#[utoipa::path]` annotations on companion handlers
 /// already include the full route prefix, so we MERGE rather than NEST:
 /// nesting would double the prefix to `/comp/comp/...`. Each auth layer
 /// attaches only to its merged sub-router, so the public `/healthz`
@@ -37,7 +36,6 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(voice::router())
-        .merge(debug::router(state.config.expose_affinity_debug))
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
@@ -50,13 +48,12 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
 /// middleware (which doesn't affect the spec) and minus any need for a real
 /// `AppState` (which would otherwise require a live DB pool). Used by the
 /// `print-openapi` subcommand and the CI drift check.
-pub fn router_for_openapi(expose_affinity_debug: bool) -> OpenApiRouter<AppState> {
+pub fn router_for_openapi() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .merge(health::router())
         .merge(companion::router())
         .merge(companion_stream::router())
         .merge(voice::router())
-        .merge(debug::router(expose_affinity_debug))
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())

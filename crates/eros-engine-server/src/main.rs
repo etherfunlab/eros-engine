@@ -73,11 +73,8 @@ async fn main() -> Result<()> {
 /// `openapi-snapshot` job diffs this against the committed snapshot to
 /// catch handlers/types added without `#[utoipa::path]` / `ToSchema`.
 fn run_print_openapi() -> Result<()> {
-    // expose_affinity_debug=true so the debug routes are always present
-    // in the snapshot. The snapshot is the union of every possible route,
-    // not the production-deploy subset.
     let (_router, api) = OpenApiRouter::<crate::state::AppState>::with_openapi(ApiDoc::openapi())
-        .merge(routes::router_for_openapi(true))
+        .merge(routes::router_for_openapi())
         .split_for_parts();
     let json = api
         .to_pretty_json()
@@ -417,7 +414,6 @@ async fn run_server() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!(
         addr = %cfg.bind_addr,
-        debug_affinity = cfg.expose_affinity_debug,
         "eros-engine starting"
     );
     axum::serve(listener, app).await?;

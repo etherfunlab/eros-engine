@@ -178,26 +178,21 @@ snake_case):
 | **Chemistry** | `spark` | `flirtation` | `crush` | `lover` | `beloved` |
 
 `bond_label` and `chemistry_label` are always one of their respective five
-values — they never emit `stranger`. The `stranger` state is conveyed only by
-the legacy field (see below).
+values. A relationship that has not started anywhere reads as
+`acquaintance` + `spark`, both tier 1 — there is no separate "stranger"
+state, and as of 4.1 no separate legacy label carrying one.
 
-## Legacy `relationship_label`
+## Tier numbers are stored
 
-The legacy field keeps its old name set for backward compatibility with
-existing consumers. It is a pure function of the two raw scores:
+Every write persists `tier_index`'s own result to
+`companion_affinity.bond_tier` / `.chem_tier`, so a SQL consumer that cannot
+call the engine still gets the authoritative tier instead of re-deriving it
+from the score against a copied threshold table. Those columns are write-only
+from the engine's side: engine code holds the score and calls `bond_tier()`.
 
-```
-legacy_relationship_label(bond, chemistry):
-  if tier(bond) == 1 AND tier(chemistry) == 1  →  stranger
-  let higher = (chemistry > bond) ? Chemistry : Bond   // tie → Bond
-  match higher:
-    Bond                                         →  friend
-    Chemistry if tier(chemistry) in {1, 2}       →  slow_burn
-    Chemistry if tier(chemistry) in {3, 4, 5}    →  romantic
-```
-
-`frenemy` is retired from emission but remains parseable in the enum for
-historical rows.
+The thresholds live in exactly one place (`tier_index`), which is why adding a
+tier is a change to that function plus a backfill — the table's shape does not
+encode how many tiers exist.
 
 ## Evaluator protocol: fully ordinal
 
@@ -438,8 +433,8 @@ label_changes = {
 
 ### `AffinitySnapshot`
 
-Returned by `GET /comp/affinity/{session_id}` (debug, gated by
-`EXPOSE_AFFINITY_DEBUG`). The snapshot includes:
+Returned by `GET /bff/v1/comp/affinity/{session_id}`, refreshed at read time
+(`apply_time_decay` + `refresh_endpoints`). The snapshot includes:
 
 ```json
 {
@@ -451,11 +446,12 @@ Returned by `GET /comp/affinity/{session_id}` (debug, gated by
   "tension": 0.04,
   "bond": 0.10,
   "chemistry": 0.045,
+  "bond_tier": 1,
+  "chem_tier": 1,
   "bond_label": "acquaintance",
   "chemistry_label": "spark",
   "ghost_streak": 0,
   "total_ghosts": 0,
-  "relationship_label": "stranger",
   "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
@@ -464,13 +460,15 @@ Returned by `GET /comp/affinity/{session_id}` (debug, gated by
   of 4.0).
 - `bond` / `chemistry` — the real stored composite scores (0–1); no display
   curve is applied.
+- `bond_tier` / `chem_tier` — the 1..=5 tier index, `tier_index`'s own result.
+  Persisted to the row's `bond_tier` / `chem_tier` columns for SQL consumers;
+  clients read one of the two rather than re-deriving from the score.
 - `bond_label` / `chemistry_label` — one of the 10 tier keys above.
-- `relationship_label` — legacy mapped value (`stranger / friend / slow_burn / romantic`).
 
 ### BFF `/bff/v1/comp/affinity/{session_id}/event`
 
-This endpoint returns the per-turn affinity delta and is not gated by
-`EXPOSE_AFFINITY_DEBUG`. In addition to `effective_deltas` (per-axis applied
+This endpoint returns the per-turn affinity delta. In addition to
+`effective_deltas` (per-axis applied
 change, `after − before` — for `warmth`/`patience` this is the per-turn
 derivation delta), the event carries:
 

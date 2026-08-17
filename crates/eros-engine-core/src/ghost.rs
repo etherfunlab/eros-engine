@@ -86,7 +86,6 @@ mod tests {
             ghost_streak,
             last_ghost_at: None,
             total_ghosts: 0,
-            relationship_label: None,
             created_at: now,
             updated_at: now,
         }

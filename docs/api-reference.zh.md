@@ -690,70 +690,6 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 > 已移除。打赏现在是普通 stream 轮的一部分 —— 在
 > `POST /comp/chat/{session_id}/message/stream` 上设 `tips_amount_usd`（见上文）。
 
-## Debug
-
-### `GET /comp/affinity/{session_id}`
-
-实时 6 轴向量 + Bond/Chemistry 分数与标签 + ghost 统计 + 遗留关系标签。受 `EXPOSE_AFFINITY_DEBUG=true` 环境变量控制；关闭时返 404。
-
-```json
-{
-  "warmth": 0.42,
-  "trust": 0.08,
-  "intrigue": 0.12,
-  "intimacy": 0.05,
-  "patience": 0.55,
-  "tension": 0.04,
-  "bond": 0.21,
-  "chemistry": 0.17,
-  "bond_label": "friend",
-  "chemistry_label": "flirtation",
-  "ghost_streak": 0,
-  "total_ghosts": 0,
-  "relationship_label": "friend",
-  "updated_at": "2026-06-30T12:00:00.000000Z"
-}
-```
-
-- `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线
-  （节奏的非线性在写侧的分档衰减里——见
-  [affinity-model.zh.md](affinity-model.zh.md)）。
-- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
-- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
-- `relationship_label` —— 遗留映射值（`stranger | friend | slow_burn | romantic`；`frenemy` 已停止输出）。
-
-生产部署通常关着。若前端需要渲染实时雷达图或检查衍生线，再打开。
-
-### `GET /comp/affinity/{session_id}/event?limit=20&offset=0&event_type=message`
-
-该 session 的好感度**事件日志**，分页、最新在前。和向量路由一样受
-`EXPOSE_AFFINITY_DEBUG=true` 控制（关闭时 404）。每条同时带每轮的
-`deltas`（本轮原始分：档位换算 + 规则微调，衰减前）、实际应用的
-`effective_deltas`（`after − before`；被阈值门控缓存的轮次全为零）、折叠后的
-`effective_deltas_computed`，以及档位跨越时的 `label_changes`。`event_type`
-可选用于过滤；`limit` 默认 20（上限 100）。
-
-```json
-{
-  "events": [
-    {
-      "event_id": "…",
-      "event_type": "message",
-      "deltas":           { "warmth": 0.06, "trust": 0.02, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas": { "warmth": 0.042, "trust": 0.014, "intrigue": 0.0, "intimacy": 0.0, "patience": 0.0, "tension": -0.02 },
-      "effective_deltas_computed": { "bond": 0.019, "chemistry": 0.007 },
-      "label_changes": null,
-      "created_at": "…"
-    }
-  ]
-}
-```
-
-`event_type` 过滤可取 `message | gift | proactive | ghost | time_decay`
-（`time_decay` 为预留，当前代码不写入）。若要一个**不受** debug 开关控制、
-只返回最新一条（仅实际应用变化）的前端用面板，用下面的 BFF 路由
-`GET /bff/v1/comp/affinity/{session_id}/event`。
-
 ## BFF（`/bff/v1/*`）
 
 面向第一方前端、把部分 `/comp/*` 路由重塑成前端形狀的鏡像層。鑒權與
@@ -790,8 +726,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 }
 ```
 
-這裡 **不會** 打包 affinity——前端單獨讀取（見下面的 affinity event
-路由），這樣 bootstrap 就與 `EXPOSE_AFFINITY_DEBUG` 解耦。
+這裡 **不會** 打包 affinity——前端單獨讀取（见下面两条 affinity 路由），
+所以不需要关系数据的冷启动不必为它付代价。
 
 ### `GET /bff/v1/comp/chat/{session_id}/history?limit=50&offset=0`
 
@@ -822,9 +758,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 
 ### `GET /bff/v1/comp/affinity/{session_id}/event`
 
-最近一次用户轮次的好感度 delta（实际应用的每轴变化），供前端做逐轮观测。与
-canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
-`EXPOSE_AFFINITY_DEBUG` 控制（这块归前端所有）——但仍做 JWT + ownership 检查。
+最近一次用户轮次的好感度 delta（实际应用的每轴变化），**外加该轮结束时的绝对
+状态**，供前端做逐轮观测。做 JWT + ownership 检查。
 
 查询参数（均可选）：
 
@@ -852,6 +787,13 @@ canonical 的 `/comp/affinity/{session_id}` debug 路由不同，它**不受**
     "label_changes": {
       "bond": { "from": "acquaintance", "to": "friend" }
     },
+    "state_after": {
+      "warmth": 0.31, "trust": 0.44, "intrigue": 0.40,
+      "intimacy": 0.19, "patience": 0.27, "tension": 0.17,
+      "bond": 0.42, "chemistry": 0.18,
+      "bond_tier": 3, "chem_tier": 2,
+      "warmth_grade": 2, "patience_grade": 2
+    },
     "created_at": "…"
   }
 }
@@ -864,6 +806,48 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 
 - `effective_deltas_computed` —— 精确的每轮行增量，在持久化时从取下界前后的 bond/chemistry 分数计算得出，存储于事件行。单位为合成分增量——与快照的 `bond`/`chemistry` 同一 0..1 刻度——适合每轮 "+X bond / +Y chemistry" 脉冲显示。迁移前的旧行可能缺省。
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
+- `state_after` —— 该轮结束时的绝对状态，读自事件行的存储列（migration `0049`
+  之前写入的行没有这个字段）。它取代客户端的增量累加：每轮直接采用这个权威绝对
+  值，而不是把 delta 加到本地running total 上。它是**写入时**的快照——隔了一段
+  时间之后只有 `GET /bff/v1/comp/affinity/{session_id}` 是对的，那条路由会在读
+  的时候重算衍生端点。
+
+### `GET /bff/v1/comp/affinity/{session_id}`
+
+该 session 的绝对好感度，**在读取时重新刷新**——客户端渲染关系的正规路径。做
+JWT + ownership 检查，状态码与上面的 event 路由一致（未知 session 404，别人的
+session 403）。
+
+```json
+{
+  "session_id": "…",
+  "affinity": {
+    "warmth": 0.3106, "trust": 0.4402, "intrigue": 0.4024,
+    "intimacy": 0.1901, "patience": 0.2740, "tension": 0.1703,
+    "bond": 0.4213, "chemistry": 0.1802,
+    "bond_tier": 3, "chem_tier": 2,
+    "bond_label": "close_friend", "chemistry_label": "flirtation",
+    "ghost_streak": 0, "total_ghosts": 2,
+    "updated_at": "2026-08-17T14:02:11Z"
+  }
+}
+```
+
+`affinity` 为 `null` 表示该 session 还没有好感度行——行是在第一轮对话时创建的，
+所以刚开的 session 没有是正常的。
+
+- `bond` / `chemistry` —— 真实存储的合成分数（0–1）；不套任何显示曲线（节奏的
+  非线性在写侧的分档衰减里——见 [affinity-model.zh.md](affinity-model.zh.md)）。
+- `bond_tier` / `chem_tier` —— 1..=5。与 key 一起返回，所以客户端既不需要阈值表
+  也不需要有序档位数组。**不要自己从分数换算档位**：阈值归引擎所有，本地抄一份
+  迟早会漂。
+- `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
+- `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
+
+响应序列化前会跑 `apply_time_decay()` + `refresh_endpoints()`，这正是要调这条
+路由而不是直读 `engine.companion_affinity` 的理由：`warmth` 与 `patience` 由判官
+档位、对位线分数和间隔时长推导而来，存储列只是写入时的缓存。直接 `SELECT` 拿到
+的关系，用户离开越久读起来越热。
 
 ## 錯誤響應
 

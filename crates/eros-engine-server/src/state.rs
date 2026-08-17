@@ -271,7 +271,6 @@ impl Drop for StreamSlotGuard {
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    pub expose_affinity_debug: bool,
     /// Affinity 3.0 pipeline knobs (`AFFINITY_*` env vars). Defaults reproduce
     /// the 2.0 effective single-turn envelope; see
     /// `eros_engine_core::affinity::AffinityTuning`.
@@ -350,9 +349,6 @@ impl ServerConfig {
             std::env::var("SNAPSHOT_TZ").ok().as_deref(),
         );
         Self {
-            expose_affinity_debug: std::env::var("EXPOSE_AFFINITY_DEBUG")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
             affinity_tuning: affinity_tuning_from_env(),
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             dreaming_tick,

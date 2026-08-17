@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! BFF affinity surface (`/bff/v1/comp/affinity/*`).
 //!
-//! See docs/superpowers/specs/2026-05-20-affinity-event-delta-design.md §4.
+//! See docs/superpowers/specs/2026-05-20-affinity-event-delta-design.md §4 and
+//! docs/superpowers/specs/2026-08-17-affinity-41-design.md §6 (the value
+//! endpoint, and `state_after` on the event shape).
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -17,7 +19,7 @@ use eros_engine_store::affinity::AffinityRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::{require_session_for_user, AffinityDeltasDto};
-use crate::routes::dto::{BondChemistryDeltas, TurnLabelChangesDto};
+use crate::routes::dto::{AffinitySnapshot, BondChemistryDeltas, TurnLabelChangesDto};
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
@@ -37,6 +39,16 @@ pub struct BffAffinityDelta {
     /// Engine-authoritative per-turn tier transition; absent when no tier moved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label_changes: Option<TurnLabelChangesDto>,
+    /// Post-turn absolute state — axes, both line scores, both tiers, both
+    /// judge levels. Absent on rows written before migration 0049.
+    ///
+    /// Takes the place of client-side accumulation: with this, a consumer
+    /// adopts the authoritative absolute value every turn instead of adding
+    /// deltas to a running total. It is a WRITE-TIME snapshot, so after an
+    /// absence only `GET /bff/v1/comp/affinity/{sid}` is correct — that one
+    /// refreshes the derived endpoints at read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_after: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -74,9 +86,8 @@ const LONG_POLL_MAX_WAIT_MS: u64 = 25_000;
 /// resolves on the first tick or two.
 const LONG_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Latest user-turn affinity delta as committed. For per-turn FE observation.
-/// NOT behind EXPOSE_AFFINITY_DEBUG (the FE owns this surface); still JWT +
-/// ownership checked. With `?after=<event_id>` the request long-polls (see
+/// Latest user-turn affinity delta as committed. For per-turn FE observation;
+/// JWT + ownership checked. With `?after=<event_id>` the request long-polls (see
 /// [`BffAffinityDeltaQuery`]), collapsing the per-turn short-poll loop into
 /// one held request.
 #[utoipa::path(
@@ -140,6 +151,7 @@ async fn bff_get_affinity_delta(
             effective_deltas,
             effective_deltas_computed,
             label_changes,
+            state_after: r.state_after,
             created_at: r.created_at,
         })
     });
@@ -147,8 +159,72 @@ async fn bff_get_affinity_delta(
     Ok(Json(BffAffinityDeltaResponse { session_id, event }))
 }
 
+// ─── Absolute value ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BffAffinityValueResponse {
+    pub session_id: Uuid,
+    /// None when the session has no affinity row yet. The row is created on
+    /// the first turn, so a just-started session legitimately has none —
+    /// render an empty relationship, not an error.
+    pub affinity: Option<AffinitySnapshot>,
+}
+
+/// Absolute affinity for a session, refreshed at read time — the supported way
+/// for a client to render a relationship.
+///
+/// `apply_time_decay()` + `refresh_endpoints()` run before serialising, and
+/// that is the whole reason this endpoint exists rather than a direct read of
+/// `engine.companion_affinity`: as of 4.0 `warmth`/`patience` are derived from
+/// the judge level, the counterpart line and the elapsed gap, with the columns
+/// holding only a write-time cache. A reader that selects the columns gets a
+/// relationship that reads warmer the longer the user has been away.
+///
+/// Returns both the tier number and the tier key, so a client needs neither a
+/// threshold table nor an ordered tier array.
+#[utoipa::path(
+    get,
+    path = "/bff/v1/comp/affinity/{session_id}",
+    tag = "bff-companion",
+    params(("session_id" = Uuid, Path, description = "Chat session id")),
+    responses(
+        (status = 200, body = BffAffinityValueResponse),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "not your session"),
+        (status = 404, description = "session not found")
+    ),
+    security(("bearer" = []))
+)]
+async fn bff_get_affinity_value(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+) -> Result<Json<BffAffinityValueResponse>, AppError> {
+    // Ownership via the same helper as the event endpoint, so both BFF
+    // affinity routes report one status-code contract (404 unknown / 403 not
+    // yours). No redundant `user_id` filter on the affinity row itself:
+    // `companion_affinity.session_id` is UNIQUE and ownership is settled here.
+    require_session_for_user(&state, session_id, user_id).await?;
+
+    let affinity = AffinityRepo { pool: &state.pool }
+        .load(session_id)
+        .await?
+        .map(|mut a| {
+            a.apply_time_decay();
+            a.refresh_endpoints(&state.config.affinity_tuning);
+            AffinitySnapshot::from(a)
+        });
+
+    Ok(Json(BffAffinityValueResponse {
+        session_id,
+        affinity,
+    }))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(bff_get_affinity_delta))
+    OpenApiRouter::new()
+        .routes(routes!(bff_get_affinity_delta))
+        .routes(routes!(bff_get_affinity_value))
 }
 
 #[cfg(test)]
@@ -278,25 +354,6 @@ mod tests {
         let (status, body) = send_request(&mut app, req(&token, session_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["event"].is_null());
-    }
-
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_affinity_present_when_debug_gate_closed(pool: PgPool) {
-        // BFF is NOT behind EXPOSE_AFFINITY_DEBUG.
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Aria").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
-        seed_event(&pool, aid, "message", 0.05, 10).await;
-
-        let mut state = test_state(pool);
-        state.config.expose_affinity_debug = false; // closed — must NOT hide BFF
-        let mut app = build_router(state);
-        let token = mint_test_jwt(user_id);
-        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["event"]["event_type"], "message");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -487,5 +544,233 @@ mod tests {
             .unwrap();
         let (status, _b) = send_request(&mut app, r).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ─── Value endpoint ─────────────────────────────────────────────
+
+    fn value_req(token: &str, sid: Uuid) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("/bff/v1/comp/affinity/{sid}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_returns_scores_tiers_and_labels(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+        // bond = (0.6 + 0.6) / 2 = 0.6 → tier 3.
+        sqlx::query("UPDATE engine.companion_affinity SET trust = 0.6, intrigue = 0.6 WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, value_req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let a = &body["affinity"];
+        assert!((a["bond"].as_f64().unwrap() - 0.6).abs() < 1e-9);
+        assert_eq!(a["bond_tier"], 3);
+        assert_eq!(a["bond_label"], "close_friend");
+        assert_eq!(a["chem_tier"], 1);
+        assert_eq!(a["chemistry_label"], "spark");
+        // The retired legacy label must not reappear on the new surface.
+        assert!(a.get("relationship_label").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_refreshes_endpoints_at_read(pool: PgPool) {
+        // The whole point of the endpoint over a direct SELECT: warmth is a
+        // derived cache, and an absence must cool it at READ time.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET warmth = 0.9, warmth_grade = 3, intimacy = 0.5, tension = 0.5, \
+                 updated_at = now() - interval '30 days' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stored: f64 = sqlx::query_scalar(
+            "SELECT warmth FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, value_req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let served = body["affinity"]["warmth"].as_f64().unwrap();
+        assert!(
+            served < stored,
+            "a 30-day absence must cool warmth at read: served {served} vs stored {stored}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_null_when_no_affinity_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        // No affinity row: the session has not had its first turn.
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, value_req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["affinity"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_403_on_other_users_session(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        seed_affinity(&pool, session_id, owner, instance_id).await;
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(intruder);
+        let (status, _b) = send_request(&mut app, value_req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_404_on_unknown_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, _b) = send_request(&mut app, value_req(&token, Uuid::new_v4())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_401_without_bearer(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let r = Request::builder()
+            .uri(format!("/bff/v1/comp/affinity/{session_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _b) = send_request(&mut app, r).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn retired_debug_routes_are_gone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        for path in [
+            format!("/comp/affinity/{session_id}"),
+            format!("/comp/affinity/{session_id}/event"),
+        ] {
+            let r = Request::builder()
+                .uri(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _b) = send_request(&mut app, r).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} must be retired");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_event_omits_state_after_on_legacy_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
+        seed_event(&pool, aid, "message", 0.05, 10).await; // no state columns
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["event"].get("state_after").is_none());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_event_serves_state_after(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, state_after) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3)",
+        )
+        .bind(aid)
+        .bind(json!({ "trust": 0.3 }))
+        .bind(json!({ "bond": 0.42, "bond_tier": 3, "chem_tier": 1 }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["event"]["state_after"]["bond_tier"], 3);
+        assert!((body["event"]["state_after"]["bond"].as_f64().unwrap() - 0.42).abs() < 1e-9);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_value_fresh_row_serves_endpoint_defaults(pool: PgPool) {
+        // Migrated from the retired debug route: a fresh row's derived
+        // endpoints are level 2 over empty lines, i.e. 1/3 · B(0).
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Solace").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        seed_affinity(&pool, session_id, user_id, instance_id).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, value_req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let a = &body["affinity"];
+        let expect = (1.0 / 3.0) * (1.0 - 0.35 * 10.0 / 13.0);
+        assert!((a["warmth"].as_f64().unwrap() - expect).abs() < 1e-9);
+        assert!((a["patience"].as_f64().unwrap() - expect).abs() < 1e-9);
+        assert!(a["intrigue"].as_f64().unwrap().abs() < 1e-9);
+        assert_eq!(a["bond_tier"], 1);
+        assert_eq!(a["chem_tier"], 1);
     }
 }
