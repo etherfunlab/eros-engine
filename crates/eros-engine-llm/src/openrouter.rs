@@ -3655,6 +3655,169 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn execute_vision_reports_the_failed_hop_even_when_a_fallback_recovers() {
+        // Vision variant of execute_reports_the_failed_hop_even_when_a_fallback_recovers.
+        // execute_vision has its own (non-call_once) control flow, so this must be
+        // exercised separately, not just inferred from the chat test. 502 (not
+        // chat's 529) so a copy-paste that accidentally hit the chat path fails
+        // loudly instead of passing silently.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vision-primary/m"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_string(r#"{"error":{"code":502,"message":"Bad Gateway"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vision-fallback/m"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "{\"description\":\"a cat\"}" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vision-primary/m".into(),
+                fallback_model: vec!["vision-fallback/m".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect("fallback should recover");
+
+        assert_eq!(resp.reply, "{\"description\":\"a cat\"}");
+        assert_eq!(resp.failures.len(), 1, "the 502 hop must be reported");
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => {
+                assert_eq!(a.http_status, 502);
+                assert_eq!(a.model, "vision-primary/m");
+                assert_eq!(a.task, VISION_TASK);
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_vision_returns_chain_error_carrying_every_hop() {
+        // Vision variant of execute_returns_chain_error_carrying_every_hop.
+        // Vision-shaped model slugs (va/vb/vc, not chat's a/b/c) so a copy-paste
+        // that mixed up the two chains would show up in the failed model name.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"code":503,"message":"no provider"}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "k".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let err = client
+            .execute_vision(VisionRequest {
+                model: "va/m".into(),
+                fallback_model: vec!["vb/m".into(), "vc/m".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect_err("all candidates fail");
+
+        match err {
+            LlmError::Chain { failures } => {
+                assert_eq!(failures.len(), 3, "one entry per hop");
+                for f in &failures {
+                    match f {
+                        crate::failure::AttemptFailure::Upstream(a) => {
+                            assert_eq!(a.http_status, 503)
+                        }
+                        other => panic!("expected Upstream, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_vision_salvage_return_carries_the_failures_too() {
+        // Mirrors execute_returns_repaired_garble_even_when_later_candidate_fails:
+        // primary "vp" returns recoverable garble, fallback "vf1" then fails with a
+        // non-garble status error. The salvage must still return vp's repaired text
+        // AND report both hops in `failures` — this exercises the
+        // `failures: failures.clone()` on execute_vision's salvage return, which
+        // was previously verified only by reading the code.
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vp"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(garbled_content()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"model": "vf1"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenRouterClient::with_base_url(
+            "test-key".into(),
+            format!("{}/api/v1/chat/completions", server.uri()),
+        );
+        let resp = client
+            .execute_vision(VisionRequest {
+                model: "vp".into(),
+                fallback_model: vec!["vf1".into()],
+                system_prompt: "describe".into(),
+                image_url: "https://example/x.png".into(),
+                caption: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                reasoning: None,
+                sampling: crate::model_config::Sampling::default(),
+            })
+            .await
+            .expect("earlier garble salvaged despite later non-garble failure");
+        assert_eq!(resp.reply, "Hi there\nbye");
+        assert_eq!(resp.model.as_deref(), Some("vp"));
+        assert_eq!(
+            resp.failures.len(),
+            2,
+            "salvage still failed on the way there — both hops must be reported"
+        );
+    }
+
+    #[tokio::test]
     async fn vision_custom_provider_bare_model_no_prefs_suffixed_audit() {
         let server_b = MockServer::start().await;
         Mock::given(path("/v1/chat/completions"))
