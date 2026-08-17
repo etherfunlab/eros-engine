@@ -193,13 +193,26 @@ fn body_preview(s: &str) -> String {
     }
 }
 
+/// `Retry-After` as whole seconds. The delta-seconds form is honoured; the
+/// HTTP-date form returns `None` rather than being resolved against a clock —
+/// the engine does not act on this value, it only records and forwards it.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u32> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
 /// A provider error body, parsed into parts instead of flattened to a string.
 ///
 /// `Display` reproduces exactly what `scrub_error_body` used to return, so every
 /// log line and every existing assertion is byte-identical; the named fields are
 /// what the audit columns read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ParsedErrorBody {
+pub struct ParsedErrorBody {
     /// OpenRouter `error.code` (numeric) or Venice `error.code` (string),
     /// rendered as its JSON text so a numeric `529` and a string
     /// `"MODEL_OVERLOADED"` stay distinguishable.
@@ -213,11 +226,7 @@ pub(crate) struct ParsedErrorBody {
 }
 
 impl ParsedErrorBody {
-    /// For call sites that have prose rather than an error envelope. Not
-    /// called outside tests yet — Task 3 wires it into the non-JSON
-    /// `LlmError::Status`/`Stream` construction sites and removes this
-    /// `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// For call sites that have prose rather than an error envelope.
     pub(crate) fn message_only(s: &str) -> Self {
         Self {
             message: s.to_string(),
@@ -248,10 +257,11 @@ impl std::fmt::Display for ParsedErrorBody {
 /// family in `type`, no `metadata`) and the bare `{"error": "..."}` string form.
 /// Non-envelope bodies fall back to a plain length-capped preview.
 ///
-/// `pub(crate)`: the voyage and embeddings clients reuse this for their own
+/// `pub`: `ParsedErrorBody` sits in `LlmError`, a `pub` type, so this must be
+/// too. The voyage and embeddings clients also reuse it for their own
 /// status-error bodies (issue #188) — the envelope parse simply falls through
 /// to the capped preview for non-OpenRouter shapes.
-pub(crate) fn parse_error_body(raw: &str) -> ParsedErrorBody {
+pub fn parse_error_body(raw: &str) -> ParsedErrorBody {
     #[derive(Deserialize)]
     struct Env {
         error: ErrField,
@@ -344,10 +354,10 @@ fn decode_or_api_error(body: &str, err: serde_json::Error) -> LlmError {
         .and_then(|v| v.get("error").cloned())
         .is_some();
     if is_api_error {
-        LlmError::Provider(format!(
+        LlmError::Provider(ParsedErrorBody::message_only(&format!(
             "openrouter 200 error body: {}",
             parse_error_body(body)
-        ))
+        )))
     } else {
         LlmError::Decode(err)
     }
@@ -924,11 +934,13 @@ impl OpenRouterClient {
             };
             let status = resp.status();
             if !status.is_success() {
+                let retry_after = retry_after_secs(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 tracing::warn!(model = %model, %status, "openrouter: vision attempt failed (status); next");
                 last_err = Some(LlmError::Status(
                     status,
-                    parse_error_body(&text).to_string(),
+                    parse_error_body(&text),
+                    retry_after,
                 ));
                 continue;
             }
@@ -1073,10 +1085,12 @@ impl OpenRouterClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             return Err(LlmError::Status(
                 status,
-                parse_error_body(&text).to_string(),
+                parse_error_body(&text),
+                retry_after,
             ));
         }
 
@@ -1099,9 +1113,9 @@ impl OpenRouterClient {
         // Fail the attempt so `execute`'s chain advances rather than returning a
         // partial reply that callers' validity gates would accept as complete.
         if finish_reason.as_deref() == Some("error") {
-            return Err(LlmError::Provider(
-                "openrouter: non-stream completion finished with finish_reason=error".into(),
-            ));
+            return Err(LlmError::Provider(ParsedErrorBody::message_only(
+                "openrouter: non-stream completion finished with finish_reason=error",
+            )));
         }
         if crate::byte_bpe::looks_byte_garbled(&raw) {
             tracing::error!(
@@ -1220,10 +1234,12 @@ impl OpenRouterClient {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_secs(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             return Err(LlmError::Status(
                 status,
-                parse_error_body(&text).to_string(),
+                parse_error_body(&text),
+                retry_after,
             ));
         }
 
@@ -1273,20 +1289,27 @@ impl OpenRouterClient {
                                 // all-None chunk that lets a partial reply
                                 // persist as a clean success.
                                 if let Some(err) = frame.error {
-                                    // body_preview: err.message is provider-
-                                    // controlled — keep the logged error bounded
-                                    // and single-line like every other body.
-                                    return Some(Err(LlmError::Provider(format!(
-                                        "openrouter mid-stream error: code={:?}: {}",
-                                        err.code,
-                                        body_preview(&err.message)
-                                    ))));
+                                    // The provider spoke inside a 200 stream.
+                                    // Keep the code structured — this used to
+                                    // be format!("code={:?}") into a String,
+                                    // which destroyed it.
+                                    let code = err.code.map(|c| c.to_string());
+                                    return Some(Err(LlmError::Provider(ParsedErrorBody {
+                                        code: code.clone(),
+                                        message: body_preview(&format!(
+                                            "code={}: {}",
+                                            code.as_deref().unwrap_or("?"),
+                                            err.message
+                                        )),
+                                        ..Default::default()
+                                    })));
                                 }
                                 let choice = frame.choices.into_iter().next().unwrap_or_default();
                                 if choice.finish_reason.as_deref() == Some("error") {
                                     return Some(Err(LlmError::Provider(
-                                        "openrouter stream terminated with finish_reason=error"
-                                            .into(),
+                                        ParsedErrorBody::message_only(
+                                            "openrouter stream terminated with finish_reason=error",
+                                        ),
                                     )));
                                 }
                                 Some(Ok(DeltaChunk {
@@ -1877,7 +1900,7 @@ mod tests {
             .await
             .expect_err("all fail");
         assert!(
-            matches!(err, LlmError::Status(s, _) if s.as_u16() == 500),
+            matches!(err, LlmError::Status(s, _, _) if s.as_u16() == 500),
             "expected last 500, got {err:?}"
         );
     }
@@ -2090,7 +2113,7 @@ mod tests {
             serde_json::json!({"error": {"code": 400, "message": "bad request"}}).to_string();
         let err = serde_json::from_str::<WireResponse>(&body).expect_err("no choices");
         match decode_or_api_error(&body, err) {
-            LlmError::Provider(msg) => assert!(msg.contains("bad request"), "{msg}"),
+            LlmError::Provider(msg) => assert!(msg.to_string().contains("bad request"), "{msg}"),
             other => panic!("expected Provider, got {other:?}"),
         }
         // Genuine junk stays a Decode error (no body leak — Display is a serde offset).
@@ -2219,7 +2242,7 @@ mod tests {
             .await
             .expect_err("a 200 error envelope must fail, not decode-silently");
         assert!(
-            matches!(&err, LlmError::Provider(m) if m.contains("provider exploded")),
+            matches!(&err, LlmError::Provider(m) if m.to_string().contains("provider exploded")),
             "expected Provider with the embedded message, got {err:?}"
         );
     }
@@ -2459,7 +2482,7 @@ data: [DONE]\n\n";
             .await
             .expect_err("4xx → Err before any stream yielded");
         assert!(
-            matches!(err, LlmError::Status(s, _) if s.as_u16() == 429),
+            matches!(err, LlmError::Status(s, _, _) if s.as_u16() == 429),
             "expected Status(429), got {err:?}"
         );
     }
@@ -2676,7 +2699,7 @@ data: [DONE]\n\n";
         match second {
             Err(LlmError::Provider(msg)) => {
                 assert!(
-                    msg.contains("provider disconnected"),
+                    msg.to_string().contains("provider disconnected"),
                     "error message carries the upstream detail: {msg}"
                 );
             }

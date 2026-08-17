@@ -93,10 +93,9 @@ impl EmbedHttpClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            let err = LlmError::Status(
-                status,
-                crate::openrouter::parse_error_body(&text).to_string(),
-            );
+            // Not streaming, and no headers are in hand at this call form —
+            // no Retry-After to carry.
+            let err = LlmError::Status(status, crate::openrouter::parse_error_body(&text), None);
             tracing::warn!("embeddings: {err}");
             return Err(err);
         }
@@ -107,13 +106,18 @@ impl EmbedHttpClient {
 /// Parse an OpenRouter-compatible embeddings response: exactly one embedding
 /// per input, re-ordered by `index` when present, every vector 512-dim.
 fn parse_response(body: &str, expected: usize, model: &str) -> Result<Vec<Vec<f32>>, LlmError> {
-    let parsed: WireResponse = serde_json::from_str(body)
-        .map_err(|e| LlmError::Provider(format!("embeddings: bad response: {e}")))?;
+    let parsed: WireResponse = serde_json::from_str(body).map_err(|e| {
+        LlmError::Provider(crate::openrouter::ParsedErrorBody::message_only(&format!(
+            "embeddings: bad response: {e}"
+        )))
+    })?;
     if parsed.data.len() != expected {
-        return Err(LlmError::Provider(format!(
-            "embeddings: expected {expected} embeddings, got {}",
-            parsed.data.len()
-        )));
+        return Err(LlmError::Provider(
+            crate::openrouter::ParsedErrorBody::message_only(&format!(
+                "embeddings: expected {expected} embeddings, got {}",
+                parsed.data.len()
+            )),
+        ));
     }
     let mut data = parsed.data;
     // `index` is optional on the wire; when present on all rows, honour it —
@@ -124,22 +128,26 @@ fn parse_response(body: &str, expected: usize, model: &str) -> Result<Vec<Vec<f3
         data.sort_by_key(|d| d.index.unwrap_or(usize::MAX));
         for (i, d) in data.iter().enumerate() {
             if d.index != Some(i) {
-                return Err(LlmError::Provider(format!(
-                    "embeddings: model {model} returned indices that are not the \
-                     permutation 0..{expected} — refusing to associate vectors with \
-                     inputs"
-                )));
+                return Err(LlmError::Provider(
+                    crate::openrouter::ParsedErrorBody::message_only(&format!(
+                        "embeddings: model {model} returned indices that are not the \
+                         permutation 0..{expected} — refusing to associate vectors with \
+                         inputs"
+                    )),
+                ));
             }
         }
     }
     let out: Vec<Vec<f32>> = data.into_iter().map(|d| d.embedding).collect();
     for v in &out {
         if v.len() != EMBEDDING_DIM {
-            return Err(LlmError::Provider(format!(
-                "embeddings: model {model} returned a {}-dim embedding, expected \
-                 {EMBEDDING_DIM} (the pgvector schema is VECTOR({EMBEDDING_DIM}))",
-                v.len()
-            )));
+            return Err(LlmError::Provider(
+                crate::openrouter::ParsedErrorBody::message_only(&format!(
+                    "embeddings: model {model} returned a {}-dim embedding, expected \
+                     {EMBEDDING_DIM} (the pgvector schema is VECTOR({EMBEDDING_DIM}))",
+                    v.len()
+                )),
+            ));
         }
     }
     Ok(out)
@@ -407,9 +415,10 @@ mod tests {
             "m".into(),
         );
         let err = client.embed_one("x").await.unwrap_err();
-        let crate::error::LlmError::Status(_, msg) = err else {
+        let crate::error::LlmError::Status(_, body, _) = err else {
             panic!("expected Status, got {err:?}");
         };
+        let msg = body.to_string();
         assert!(msg.chars().count() <= 220);
         assert!(!msg.contains("SECRET"));
     }

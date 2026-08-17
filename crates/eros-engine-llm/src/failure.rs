@@ -116,9 +116,74 @@ impl std::fmt::Display for AttemptFailure {
     }
 }
 
+use crate::openrouter::STREAM_IDLE_TIMEOUT_MSG;
+use crate::LlmError;
+
+impl AttemptFailure {
+    /// The single place an `LlmError` is classified into a home. The `match` is
+    /// exhaustive on purpose: a new `LlmError` variant fails to compile here
+    /// until someone decides which layer owns it.
+    pub fn from_llm_error(task: &str, model: &str, e: &LlmError) -> Self {
+        let gateway = |kind: GatewayKind| {
+            AttemptFailure::Gateway(GatewayError {
+                task: task.to_string(),
+                model: Some(model.to_string()),
+                kind,
+                message: e.to_string(),
+            })
+        };
+        match e {
+            LlmError::Status(status, body, retry_after) => {
+                AttemptFailure::Upstream(UpstreamAttempt {
+                    task: task.to_string(),
+                    model: model.to_string(),
+                    http_status: status.as_u16(),
+                    provider_code: body.code.clone(),
+                    error_type: body.error_type.clone(),
+                    upstream_provider_code: body.provider_code.clone(),
+                    retry_after_s: *retry_after,
+                    message: body.message.clone(),
+                })
+            }
+            // A 200 body that carried an error envelope, or a stream that ended
+            // with finish_reason=error. The provider spoke; the status line just
+            // was not where it said so.
+            LlmError::Provider(body) => AttemptFailure::Upstream(UpstreamAttempt {
+                task: task.to_string(),
+                model: model.to_string(),
+                http_status: 200,
+                provider_code: body.code.clone(),
+                error_type: body.error_type.clone(),
+                upstream_provider_code: body.provider_code.clone(),
+                retry_after_s: None,
+                message: body.message.clone(),
+            }),
+            LlmError::Stream(msg) if msg.contains(STREAM_IDLE_TIMEOUT_MSG) => {
+                gateway(GatewayKind::IdleTimeout)
+            }
+            LlmError::Stream(_) | LlmError::Http(_) => gateway(GatewayKind::Transport),
+            LlmError::StreamParse(_) | LlmError::Decode(_) => gateway(GatewayKind::Decode),
+            LlmError::Config(_) | LlmError::TomlDecode(_) | LlmError::Io(_) => {
+                gateway(GatewayKind::Config)
+            }
+            // A garble is a content verdict: the call succeeded and was billed.
+            // It belongs to the table's coarse marker, not to either column —
+            // but this function must return something, so classify it as a
+            // decode-shaped gateway fact and let callers skip recording it.
+            LlmError::Garbled { .. } => gateway(GatewayKind::Decode),
+            LlmError::Chain { failures } => failures
+                .last()
+                .cloned()
+                .unwrap_or_else(|| gateway(GatewayKind::ChainExhausted)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openrouter::ParsedErrorBody;
+    use crate::LlmError;
 
     #[test]
     fn unknown_5xx_classifies_as_upstream_and_retryable() {
@@ -232,5 +297,104 @@ mod tests {
             message: "code=529: Overloaded".into(),
         });
         assert_eq!(f.to_string(), "code=529: Overloaded");
+    }
+
+    #[test]
+    fn status_error_becomes_an_upstream_attempt_with_every_field() {
+        let body = ParsedErrorBody {
+            code: Some("529".into()),
+            error_type: Some("overloaded".into()),
+            provider_code: Some("anthropic:overloaded_error".into()),
+            message: "code=529: Overloaded".into(),
+        };
+        let e = LlmError::Status(reqwest::StatusCode::from_u16(529).unwrap(), body, Some(30));
+        match AttemptFailure::from_llm_error("chat_companion", "x-ai/grok-4.20", &e) {
+            AttemptFailure::Upstream(a) => {
+                assert_eq!(a.task, "chat_companion");
+                assert_eq!(a.model, "x-ai/grok-4.20");
+                assert_eq!(a.http_status, 529);
+                assert_eq!(a.provider_code.as_deref(), Some("529"));
+                assert_eq!(a.error_type.as_deref(), Some("overloaded"));
+                assert_eq!(
+                    a.upstream_provider_code.as_deref(),
+                    Some("anthropic:overloaded_error")
+                );
+                assert_eq!(a.retry_after_s, Some(30));
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_stream_provider_error_is_upstream_at_http_200() {
+        // The provider spoke — just not in the status line. It belongs in
+        // llm_attempts, not gateway_errors.
+        let e = LlmError::Provider(ParsedErrorBody {
+            code: Some("\"upstream_error\"".into()),
+            message: "code=\"upstream_error\": provider blew up".into(),
+            ..Default::default()
+        });
+        match AttemptFailure::from_llm_error("chat_companion", "m", &e) {
+            AttemptFailure::Upstream(a) => {
+                assert_eq!(a.http_status, 200, "mid-stream error rides a 200");
+                assert_eq!(a.provider_code.as_deref(), Some("\"upstream_error\""));
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_and_decode_failures_are_gateway_not_upstream() {
+        let cases: Vec<(LlmError, GatewayKind)> = vec![
+            (
+                LlmError::Stream("connection reset by peer".into()),
+                GatewayKind::Transport,
+            ),
+            (
+                LlmError::StreamParse("not a delta envelope".into()),
+                GatewayKind::Decode,
+            ),
+            (
+                LlmError::Config("no models configured".into()),
+                GatewayKind::Config,
+            ),
+        ];
+        for (e, want) in cases {
+            match AttemptFailure::from_llm_error("chat_companion", "m", &e) {
+                AttemptFailure::Gateway(g) => assert_eq!(g.kind, want, "for {e}"),
+                other => panic!("expected Gateway for {e}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn idle_timeout_is_distinguished_from_a_plain_transport_drop() {
+        // Issue #188: folding these together made idle timeouts uncountable.
+        let e = LlmError::Stream(format!(
+            "{} after 30s",
+            crate::openrouter::STREAM_IDLE_TIMEOUT_MSG
+        ));
+        match AttemptFailure::from_llm_error("chat_companion", "m", &e) {
+            AttemptFailure::Gateway(g) => assert_eq!(g.kind, GatewayKind::IdleTimeout),
+            other => panic!("expected Gateway, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_after_header_parses_delay_seconds_and_ignores_junk() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("30"));
+        assert_eq!(crate::openrouter::retry_after_secs(&h), Some(30));
+
+        // HTTP-date form is legal but we do not resolve it against a clock.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(crate::openrouter::retry_after_secs(&h), None);
+
+        assert_eq!(crate::openrouter::retry_after_secs(&HeaderMap::new()), None);
     }
 }

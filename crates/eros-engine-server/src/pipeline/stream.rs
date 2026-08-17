@@ -4598,13 +4598,15 @@ mod tests {
 
     #[test]
     fn chunk_err_outcome_separates_error_frame_and_idle_timeout() {
+        use eros_engine_llm::openrouter::ParsedErrorBody;
         use eros_engine_llm::LlmError;
         // Provider error frames (a 200 SSE frame carrying `error`) are their
         // own failure mode, distinct from transport drops (spec §4.2).
         assert_eq!(
-            chunk_err_outcome(&LlmError::Provider(
-                "openrouter mid-stream error: code=Some(502): upstream".into()
-            )),
+            chunk_err_outcome(&LlmError::Provider(ParsedErrorBody {
+                message: "openrouter mid-stream error: code=Some(502): upstream".into(),
+                ..Default::default()
+            })),
             "error_frame"
         );
         // The byte-level idle watchdog's io::Error rides through

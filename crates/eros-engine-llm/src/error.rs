@@ -9,7 +9,13 @@ pub enum LlmError {
     Http(#[from] reqwest::Error),
 
     #[error("non-success status {0}: {1}")]
-    Status(reqwest::StatusCode, String),
+    Status(
+        reqwest::StatusCode,
+        crate::openrouter::ParsedErrorBody,
+        /// `Retry-After` in seconds, when the provider sent one. Recorded and
+        /// passed downstream; the engine never acts on it.
+        Option<u32>,
+    ),
 
     #[error("response decode error: {0}")]
     Decode(#[from] serde_json::Error),
@@ -24,7 +30,7 @@ pub enum LlmError {
     Config(String),
 
     #[error("provider error: {0}")]
-    Provider(String),
+    Provider(crate::openrouter::ParsedErrorBody),
 
     /// Wraps a mid-stream parse failure (`data:` line that did not decode as
     /// an OpenRouter-compatible delta envelope). The string is the raw
@@ -47,6 +53,12 @@ pub enum LlmError {
         model: String,
         raw: String,
         finish_reason: Option<String>,
+    },
+
+    /// Every candidate in the chain failed. Carries the whole walk.
+    #[error("openrouter: all {} candidates failed", failures.len())]
+    Chain {
+        failures: Vec<crate::failure::AttemptFailure>,
     },
 }
 

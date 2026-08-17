@@ -124,7 +124,11 @@ impl VoyageClient {
             .into_iter()
             .next()
             .map(|d| d.embedding)
-            .ok_or_else(|| LlmError::Provider("voyage: empty data array".into()))?;
+            .ok_or_else(|| {
+                LlmError::Provider(crate::openrouter::ParsedErrorBody::message_only(
+                    "voyage: empty data array",
+                ))
+            })?;
         check_dim(&embedding, &self.model)?;
         Ok(embedding)
     }
@@ -165,11 +169,13 @@ impl VoyageClient {
 /// Check that an embedding has the expected dimension.
 fn check_dim(embedding: &[f32], model: &str) -> Result<(), LlmError> {
     if embedding.len() != EMBEDDING_DIM {
-        return Err(LlmError::Provider(format!(
-            "voyage: model {model} returned a {}-dim embedding, expected {EMBEDDING_DIM} \
-             (the pgvector schema is VECTOR({EMBEDDING_DIM}))",
-            embedding.len()
-        )));
+        return Err(LlmError::Provider(
+            crate::openrouter::ParsedErrorBody::message_only(&format!(
+                "voyage: model {model} returned a {}-dim embedding, expected {EMBEDDING_DIM} \
+                 (the pgvector schema is VECTOR({EMBEDDING_DIM}))",
+                embedding.len()
+            )),
+        ));
     }
     Ok(())
 }
@@ -180,23 +186,27 @@ fn check_dim(embedding: &[f32], model: &str) -> Result<(), LlmError> {
 /// capped first — the same bounded-log guarantee the chat client upholds
 /// (issue #188).
 fn status_error(status: reqwest::StatusCode, body: &str) -> LlmError {
-    LlmError::Status(
-        status,
-        crate::openrouter::parse_error_body(body).to_string(),
-    )
+    // Not streaming, and no headers are in hand at this call form — no
+    // Retry-After to carry.
+    LlmError::Status(status, crate::openrouter::parse_error_body(body), None)
 }
 
 /// Parse a Voyage batch response body into ordered vectors, enforcing that
 /// the provider returned exactly one embedding per input. Checks that each
 /// embedding has the expected dimension.
 fn parse_embed_batch(body: &str, expected: usize, model: &str) -> Result<Vec<Vec<f32>>, LlmError> {
-    let parsed: EmbedResponse = serde_json::from_str(body)
-        .map_err(|e| LlmError::Provider(format!("voyage: bad response: {e}")))?;
+    let parsed: EmbedResponse = serde_json::from_str(body).map_err(|e| {
+        LlmError::Provider(crate::openrouter::ParsedErrorBody::message_only(&format!(
+            "voyage: bad response: {e}"
+        )))
+    })?;
     if parsed.data.len() != expected {
-        return Err(LlmError::Provider(format!(
-            "voyage: expected {expected} embeddings, got {}",
-            parsed.data.len()
-        )));
+        return Err(LlmError::Provider(
+            crate::openrouter::ParsedErrorBody::message_only(&format!(
+                "voyage: expected {expected} embeddings, got {}",
+                parsed.data.len()
+            )),
+        ));
     }
     let embeddings: Result<Vec<_>, _> = parsed
         .data
@@ -353,9 +363,10 @@ mod tests {
             "x".repeat(5000)
         );
         let e = status_error(reqwest::StatusCode::BAD_REQUEST, &huge);
-        let LlmError::Status(status, msg) = e else {
+        let LlmError::Status(status, body, _) = e else {
             panic!("expected Status, got {e:?}");
         };
+        let msg = body.to_string();
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
         assert!(
             msg.chars().count() <= 220,
@@ -372,9 +383,9 @@ mod tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "upstream exploded",
         );
-        let LlmError::Status(_, msg) = e else {
+        let LlmError::Status(_, body, _) = e else {
             panic!("expected Status, got {e:?}");
         };
-        assert_eq!(msg, "upstream exploded");
+        assert_eq!(body.to_string(), "upstream exploded");
     }
 }
