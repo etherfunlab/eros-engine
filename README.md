@@ -112,7 +112,7 @@ The server listens on `0.0.0.0:8080` by default, with Scalar API docs at `/docs`
 
 ## API surface
 
-The main flow is simple: start a persona session, then send turns to the SSE streaming endpoint. Voice runs on its own channel — start the session with `channel: "voice"` and use the voice turn endpoint, which carries a leaner prompt and a barge-in call; the two channels never write into each other's sessions. The engine also exposes history, session, profile, and optional affinity-debug routes. Authentication uses Supabase JWTs by default and can be replaced through `AuthValidator`. See the [API reference](docs/api-reference.md) for paths, payloads, and stream frames.
+The main flow is simple: start a persona session, then send turns to the SSE streaming endpoint. Voice runs on its own channel — start the session with `channel: "voice"` and use the voice turn endpoint, which carries a leaner prompt and a barge-in call; the two channels never write into each other's sessions. The engine also exposes history, session, profile, and affinity routes. Authentication uses Supabase JWTs by default and can be replaced through `AuthValidator`. See the [API reference](docs/api-reference.md) for paths, payloads, and stream frames.
 
 ## Configuration
 

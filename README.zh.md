@@ -112,7 +112,7 @@ cargo run -p eros-engine-server -- serve
 
 ## API 一览
 
-核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。引擎还提供历史记录、会话、画像及可选的亲密度调试路由。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
+核心流程很简单：创建人设会话，然后向 SSE 流式端点发送对话。引擎还提供历史记录、会话、画像及好感度路由。默认使用 Supabase JWT 鉴权，也可通过 `AuthValidator` 替换。具体路径、payload 与流式帧详见 [API 参考](docs/api-reference.zh.md)。
 
 ## 配置
 

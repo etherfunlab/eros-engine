@@ -13,7 +13,7 @@
   (storage and read surface only — the 4.0 write pipeline, judge contract and
   endpoint derivation are untouched). Retires the debug surface introduced in
   [2026-05-20-affinity-event-delta-design.md](2026-05-20-affinity-event-delta-design.md)
-  §5 and the gating decision in
+  §3 and the gating decision in
   [2026-05-20-history-latency-cuts-design.md](2026-05-20-history-latency-cuts-design.md)
   §3.5.
 
@@ -143,9 +143,18 @@ once the thresholds move. Live state remains single-sourced — the authority fo
 "where is this relationship now" is `companion_affinity` and nothing else.
 
 `record_ghost` writes both columns too (no axis moves, so `before == after`);
-leaving them NULL there would put a hole back in the chain. Pre-migration rows
-stay NULL and are not backfilled — the values are not recoverable, and
-fabricating them would defeat the point of the columns.
+leaving them NULL there would put a hole back in the chain. It snapshots the
+row it just wrote (`UPDATE … RETURNING *`), **never the caller's `Affinity`** —
+stream callers decay and refresh their copy in memory at turn start without
+writing those axes back, so recording that copy would put values in the audit
+row that never existed in the table and make the relationship appear to rebound
+on the following turn. Pre-migration rows stay NULL and are not backfilled — the
+values are not recoverable, and fabricating them would defeat the point of the
+columns.
+
+A known limitation this does not fix: `record_ghost` resets `updated_at` without
+materialising the decay that elapsed, so a ghosted turn forgives the absence.
+That is 4.0 behaviour and changing it is a scoring decision, not a storage one.
 
 ### 3.3 Legacy column dropped
 
@@ -158,7 +167,7 @@ The engine already does not read it. `AffinitySnapshot` derives its
 rather than from the column, and `pipeline/voice.rs` documents explicitly that
 the relationship line must come from the bond/chemistry tiers and "never from
 the cached `relationship_label`". Only the write in `persist_with_event` keeps
-it alive. See §7 for the deployment ordering this drop requires.
+it alive. See §8 for the deployment ordering this drop requires.
 
 ## 4. `eros-engine-core`
 
@@ -181,7 +190,8 @@ it alive. See §7 for the deployment ordering this drop requires.
   and derives the tier through §4; reading back its own projection would be a
   round-trip for nothing and would expose it to rows written by an older engine.
   The tier columns exist for SQL consumers that cannot call Rust.
-- `to_domain` / `label_to_str` / `label_from_str`: removed with the enum.
+- `label_to_str` / `label_from_str`: removed with the enum. `to_domain` stays —
+  it never touched the label beyond mapping that one field.
 - `persist_with_event`: drop the label computation and the
   `relationship_label = $10` bind; add `bond_tier` / `chem_tier` to the UPDATE;
   build `state_before` from `before_affinity` and `state_after` from `current`
@@ -305,28 +315,45 @@ which is the more likely source of a real bug.
 ## 8. Deployment ordering — mandatory
 
 `DROP COLUMN relationship_label` breaks every reader of that column the instant
-the migration runs. Downstream SQL that selects it (list views, plaza queries,
-privileged direct reads) fails immediately and for every user, with no gradual
-rollout available.
+the migration runs. Downstream SQL that selects it (list views, aggregate
+queries, privileged direct reads) fails immediately and for every user, with no
+gradual rollout available.
 
-1. Ship the downstream change first: stop selecting `relationship_label`, read
-   `bond_tier` / `chem_tier` or call the new endpoint, delete any local copy of
-   the tier thresholds. Deploy it.
-2. Confirm no readers remain.
-3. Only then deploy the engine, which runs migration 0049.
+The replacements land in the *same* migration, so this cannot be done in two
+deploys — a downstream change that drops the old column and adopts the new ones
+at once is broken whichever side it ships on. Three deploys:
 
-`docs/migrating/affinity-4.1.md` is the downstream-facing instruction set for
-step 1.
+1. **Downstream, before the engine.** Stop selecting `relationship_label` and
+   stop rendering it. Nothing new is adopted here: `bond_tier` / `chem_tier` and
+   the value endpoint do not exist yet. Whatever local tier derivation the
+   client already runs off `bond` / `chemistry` keeps working and stays for now.
+2. **The engine.** Migration 0049 runs: tier columns and event state columns
+   added, `relationship_label` dropped.
+3. **Downstream, after the engine.** Adopt `bond_tier` / `chem_tier`, switch to
+   `GET /bff/v1/comp/affinity/{sid}`, consume `state_after`, and delete the
+   local threshold copy.
+
+Both inversions are outages: doing step 3's work in step 1 selects columns that
+do not exist yet; doing step 1's work in step 3 leaves a reader on a dropped
+column.
+
+`docs/migrating/affinity-4.1.md` is the downstream-facing instruction set.
 
 ## 9. Testing
 
 - **Threshold agreement.** Persist turns landing on `0.0`, `0.149999`, `0.15`,
   `0.349999`, `0.35`, `0.619999`, `0.62`, `0.899999`, `0.90`, `1.0` and assert
-  the stored `bond_tier` equals `Affinity::bond_tier()` at each. This is the
-  test that keeps the ladder single-sourced; it fails the moment a threshold is
-  changed in one place only.
-- **Backfill.** Rows seeded before the migration land on the same tiers as rows
-  written after it.
+  the stored `bond_tier` equals `Affinity::bond_tier()` at each, with the two
+  lines on different scores so a bind-order mix-up cannot pass. This pins the
+  post-delta capture and the i16 round-trip; it does NOT prove single-sourcing,
+  since both sides call the same `tier_index`.
+- **Backfill agreement.** The migration's inlined `CASE` is the one place the
+  thresholds genuinely exist twice. Run that expression in Postgres over the
+  same boundary set and demand it equal `tier_index`. This is the test that
+  fails when a threshold moves in Rust alone.
+- **Absence gap + ghost provenance.** Backdate the row, decay a copy in memory
+  the way the stream path does, and assert `record_ghost` recorded the row's
+  values and not the copy's. This is the regression guard for the trap in §3.2.
 - **Replay.** For a multi-turn session: every event satisfies
   `state_after − state_before == effective_deltas` per axis; adjacent pairs
   written with no elapsed gap satisfy

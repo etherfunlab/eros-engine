@@ -1,6 +1,8 @@
 # Migrating to Affinity 4.1
 
-**Applies to:** clients of `eros-engine` upgrading from 1.3.x to 1.4.0.
+**Applies to:** clients of `eros-engine` upgrading to the release that carries
+store migration `0049` (the version number is set at release time; match on the
+migration, not on a number quoted here).
 **Design:** [`docs/superpowers/specs/2026-08-17-affinity-41-design.md`](../superpowers/specs/2026-08-17-affinity-41-design.md)
 
 Affinity 4.1 changes no scoring math. It changes where the relationship tier
@@ -11,8 +13,9 @@ absolute affinity value.
 `EXPOSE_AFFINITY_DEBUG` starts returning 404, and any SQL that selects
 `engine.companion_affinity.relationship_label` fails outright.
 
-> **Read §5 before you deploy anything.** One of these steps must land on your
-> side *before* the engine upgrade, not after.
+> **Read §5 before you deploy anything.** This upgrade takes **three deploys**
+> in a fixed order — one on your side before the engine, the engine, then one on
+> your side after. Getting the order wrong is an outage in either direction.
 
 ---
 
@@ -78,7 +81,8 @@ columns for display.
 
 The tier boundaries (`0.15 / 0.35 / 0.62 / 0.90` over a 0–1 line score) are
 owned by `eros_engine_core::affinity::tier_index`. If your client carries its
-own copy to name tiers, delete it.
+own copy to name tiers, delete it — in **deploy 3**, once the replacements below
+exist (§5).
 
 Three ways to get the tier, all authoritative:
 
@@ -134,6 +138,14 @@ use the deltas only for animating the change.
 a turn and diverges as time passes. Use `state_after` for the turn you just
 received; use §2 whenever you are re-establishing state after a gap.
 
+**`label_changes` and `state_after` can disagree, and `state_after` is the one
+to believe.** `label_changes` reports only what *this turn's delta* moved: it is
+measured after absence decay has already been applied, so a tier the user lost
+purely by staying away shows up as a changed `state_after.bond_tier` with no
+corresponding entry in `label_changes`. Drive your displayed tier from
+`state_after`; use `label_changes` for "a thing just happened" animation, and
+expect it to be silent on decay-driven moves.
+
 `effective_deltas_computed` keeps its name despite it being a poor one — it is a
 published field and renaming it would cost you work for no benefit.
 
@@ -152,16 +164,29 @@ published field and renaming it would cost you work for no benefit.
 it was derived on read from the two line scores, never from the column. Replace
 it with the two tiers, which say strictly more.
 
-> **This is the ordering constraint.** `DROP COLUMN` takes effect the moment the
-> engine's migration runs, and every SQL statement still selecting that column
-> fails immediately, for every user, with no gradual rollout.
+> **This is the ordering constraint, and it needs three deploys, not two.**
+> `DROP COLUMN` takes effect the moment the engine's migration runs, and every
+> SQL statement still selecting that column fails immediately, for every user,
+> with no gradual rollout. But `bond_tier` / `chem_tier` are *created* by that
+> same migration — so you cannot switch to them in the same breath as you drop
+> the old column.
 >
-> 1. Ship your change first: stop selecting `relationship_label`, switch views
->    and list queries to `bond_tier` / `chem_tier`. Deploy it.
-> 2. Confirm no readers remain.
-> 3. Then deploy the engine.
+> **Deploy 1 (yours, before the engine).** Stop selecting `relationship_label`
+> and stop rendering it. Do **not** reach for `bond_tier` / `chem_tier` or the
+> new endpoint yet — neither exists until the engine ships. Keep whatever local
+> tier derivation you already have; it runs off `bond` / `chemistry`, which are
+> already there. This deploy only removes a reader.
 >
-> Reversing these two steps takes down whatever surface reads that column.
+> **Deploy 2 (the engine).** Migration 0049 adds the tier columns and the event
+> state columns, and drops `relationship_label`.
+>
+> **Deploy 3 (yours, after the engine).** Now adopt `bond_tier` / `chem_tier`,
+> switch to `GET /bff/v1/comp/affinity/{session_id}`, consume `state_after`,
+> and delete your local copy of the thresholds.
+>
+> Doing deploy 1's work in deploy 3's order takes down whatever surface reads
+> that column; doing deploy 3's work in deploy 1's order takes down whatever
+> surface reads the columns that do not exist yet. Both directions are outages.
 
 ### `engine.companion_affinity_events`
 
@@ -183,16 +208,28 @@ purpose.
 
 ## 6. Checklist
 
-- [ ] Remove `EXPOSE_AFFINITY_DEBUG` from deployment config.
+Grouped by deploy. The grouping is the point — see §5.
+
+**Deploy 1, before the engine ships:**
+
+- [ ] Remove every `relationship_label` reference from SQL, views and RPCs.
+- [ ] Stop rendering the legacy label. Keep your existing tier derivation off
+      `bond` / `chemistry` for now; it still works and its replacement does not
+      exist yet.
+- [ ] Remove `EXPOSE_AFFINITY_DEBUG` from deployment config (harmless either
+      way — the engine ignores it once upgraded).
+
+**Deploy 2: the engine.** Migration 0049 runs here.
+
+**Deploy 3, after the engine is live:**
+
 - [ ] Replace `GET /comp/affinity/{sid}` calls with
       `GET /bff/v1/comp/affinity/{sid}`; handle `affinity: null`.
 - [ ] Replace any privileged direct read of the affinity axes for display with
       that endpoint — it is the only path that refreshes the derived values.
-- [ ] Delete the local copy of the tier thresholds; read `bond_tier` /
-      `chem_tier` or the label keys.
+- [ ] Switch to `bond_tier` / `chem_tier` (or the label keys) and delete the
+      local copy of the tier thresholds.
 - [ ] Consume `state_after` from the event endpoint instead of accumulating
       deltas.
-- [ ] **Remove every `relationship_label` reference from SQL and deploy that
-      before the engine upgrade.**
 - [ ] Replace `GET /comp/affinity/{sid}/event` usage with a direct query against
       `engine.companion_affinity_events`.

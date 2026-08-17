@@ -45,8 +45,7 @@ impl Modify for SecurityAddon {
         (name = "health", description = "Liveness probe"),
         (name = "companion", description = "Chat sessions, messages, affinity, profile"),
         (name = "bff-companion", description = "Frontend-shaped mirror of /comp/* for first-party clients; \
-                                                shape may diverge from canonical without notice"),
-        (name = "debug", description = "Env-gated introspection (affinity vector exposure)")
+                                                shape may diverge from canonical without notice")
     ),
     modifiers(&SecurityAddon)
 )]

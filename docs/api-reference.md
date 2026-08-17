@@ -890,7 +890,7 @@ Query parameters (both optional):
       "chemistry": 0.006
     },
     "label_changes": {
-      "bond": { "from": "acquaintance", "to": "friend" }
+      "bond": { "from": "friend", "to": "close_friend" }
     },
     "state_after": {
       "warmth": 0.31, "trust": 0.44, "intrigue": 0.40,
@@ -995,6 +995,5 @@ error type. The table below covers the plain shape:
 - `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)
 - `crates/eros-engine-server/src/routes/bff/companion.rs` — BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF `/bff/v1/comp/affinity/*`
-- `crates/eros-engine-server/src/routes/debug.rs` — affinity debug routes (vector + event log)
 - `crates/eros-engine-server/src/routes/health.rs` — `/healthz`
 - `crates/eros-engine-server/src/openapi.rs` — Scalar UI spec metadata

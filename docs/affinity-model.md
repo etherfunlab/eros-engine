@@ -501,8 +501,9 @@ derivation delta), the event carries:
 - `label_changes` — engine-authoritative tier transition for this turn;
   `null` (or absent) when no tier moved.
 
-Both fields are also mirrored on debug
-`GET /comp/affinity/{session_id}/event` entries.
+Both fields are stored on the event row, so a direct query against
+`engine.companion_affinity_events` sees them alongside `state_before` /
+`state_after`.
 
 ## Source
 
@@ -511,6 +512,5 @@ Both fields are also mirrored on debug
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM evaluation, grade/level parsing
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude directive + eval prompt
 - `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot` (composite scores + labels)
-- `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF event surface
-- `crates/eros-engine-server/src/routes/debug.rs` — debug event log
+- `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF affinity surface (value + event)
 - Design spec: `docs/superpowers/specs/2026-08-16-affinity-40-design.md`

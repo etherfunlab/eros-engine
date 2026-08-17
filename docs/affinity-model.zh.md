@@ -403,7 +403,8 @@ label_changes = {
   （`companion_affinity_events.effective_line_deltas`）。旧行上为 `null`/缺省。
 - `label_changes` —— 引擎权威的本轮档位迁移；无档位移动时为 `null`（或缺省）。
 
-两个字段同样镜像在 debug `GET /comp/affinity/{session_id}/event` 条目上。
+两个字段都落在事件行上，所以直查 `engine.companion_affinity_events` 时会与
+`state_before` / `state_after` 一并看到。
 
 ## 源码
 
@@ -413,5 +414,4 @@ label_changes = {
 - `crates/eros-engine-server/src/prompt.rs` —— 好感度 → 态度指令 + 评估提示词
 - `crates/eros-engine-server/src/routes/dto.rs` —— `AffinitySnapshot`（合成分 + 标签）
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` —— BFF 事件表面
-- `crates/eros-engine-server/src/routes/debug.rs` —— debug 事件日志
 - 设计 spec：`docs/superpowers/specs/2026-08-16-affinity-40-design.md`

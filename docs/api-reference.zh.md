@@ -785,7 +785,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
       "chemistry": 0.006
     },
     "label_changes": {
-      "bond": { "from": "acquaintance", "to": "friend" }
+      "bond": { "from": "friend", "to": "close_friend" }
     },
     "state_after": {
       "warmth": 0.31, "trust": 0.44, "intrigue": 0.40,
@@ -808,7 +808,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
 - `label_changes` —— 引擎权威的档位变化（本轮无档位跨越时为 `null` / 缺省）。前端无需自行计算变化。
 - `state_after` —— 该轮结束时的绝对状态，读自事件行的存储列（migration `0049`
   之前写入的行没有这个字段）。它取代客户端的增量累加：每轮直接采用这个权威绝对
-  值，而不是把 delta 加到本地running total 上。它是**写入时**的快照——隔了一段
+  值，而不是把 delta 加到本地 running total 上。它是**写入时**的快照——隔了一段
   时间之后只有 `GET /bff/v1/comp/affinity/{session_id}` 是对的，那条路由会在读
   的时候重算衍生端点。
 
@@ -878,6 +878,5 @@ session 403）。
 - `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`——BFF `/bff/v1/comp/affinity/*`
-- `crates/eros-engine-server/src/routes/debug.rs`——好感度 debug 路由（向量 + 事件日志）
 - `crates/eros-engine-server/src/routes/health.rs`——`/healthz`
 - `crates/eros-engine-server/src/openapi.rs`——Scalar UI spec 元数据

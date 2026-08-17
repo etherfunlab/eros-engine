@@ -163,10 +163,10 @@ async fn bff_get_history(
 /// Cold-mount bundle: resolves (or creates) the session and returns its slim
 /// history in one round-trip (collapses the FE's start + history calls).
 ///
-/// Affinity is intentionally NOT bundled here: the FE reads affinity on its
-/// own (full values via its DB middleware; per-turn deltas via
-/// `/bff/v1/comp/affinity/{sid}/event`). This keeps bootstrap independent of
-/// `EXPOSE_AFFINITY_DEBUG` — turning that gate off does not change this shape.
+/// Affinity is intentionally NOT bundled here: a client reads it from the two
+/// dedicated routes (`/bff/v1/comp/affinity/{sid}` for the absolute value,
+/// `.../event` for the per-turn delta), so a cold mount that does not need a
+/// relationship pays nothing for one.
 #[utoipa::path(
     post,
     path = "/bff/v1/comp/chat/start",
@@ -578,9 +578,9 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn bff_start_does_not_bundle_affinity_even_with_debug_open(pool: PgPool) {
+    async fn bff_start_does_not_bundle_affinity(pool: PgPool) {
         // Bootstrap is decoupled from affinity: even with a pre-seeded affinity
-        // row AND EXPOSE_AFFINITY_DEBUG on (test default), the start response
+        // row present, the start response
         // carries no `affinity` field. The FE reads affinity separately.
         let user_id = Uuid::new_v4();
         let genome_id = seed_genome(&pool, "Aria").await;
@@ -597,7 +597,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = test_state(pool); // expose_affinity_debug=true by default in tests
+        let state = test_state(pool);
         let mut app = build_router(state);
         let token = mint_test_jwt(user_id);
 

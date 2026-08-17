@@ -229,7 +229,8 @@ impl BondLabel {
     }
 
     /// Name a tier index. Out-of-range clamps rather than panicking: the input
-    /// can come from a stored column written by an older engine.
+    /// can come from a stored column written by a NEWER engine, one whose
+    /// ladder has more rungs than this build knows about.
     pub fn from_tier(tier: u8) -> Self {
         match tier.clamp(1, 5) {
             1 => BondLabel::Acquaintance,

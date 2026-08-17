@@ -144,7 +144,7 @@
           "bff-companion"
         ],
         "summary": "Cold-mount bundle: resolves (or creates) the session and returns its slim\nhistory in one round-trip (collapses the FE's start + history calls).",
-        "description": "Affinity is intentionally NOT bundled here: the FE reads affinity on its\nown (full values via its DB middleware; per-turn deltas via\n`/bff/v1/comp/affinity/{sid}/event`). This keeps bootstrap independent of\n`EXPOSE_AFFINITY_DEBUG` — turning that gate off does not change this shape.",
+        "description": "Affinity is intentionally NOT bundled here: a client reads it from the two\ndedicated routes (`/bff/v1/comp/affinity/{sid}` for the absolute value,\n`.../event` for the per-turn delta), so a cold mount that does not need a\nrelationship pays nothing for one.",
         "operationId": "bff_start_chat",
         "requestBody": {
           "content": {
@@ -2435,10 +2435,6 @@
     {
       "name": "bff-companion",
       "description": "Frontend-shaped mirror of /comp/* for first-party clients; shape may diverge from canonical without notice"
-    },
-    {
-      "name": "debug",
-      "description": "Env-gated introspection (affinity vector exposure)"
     }
   ]
 }

@@ -181,7 +181,7 @@ crates/
         ├── auth/             # AuthValidator trait + Supabase 實現 + 中間件
         ├── pipeline/         # stream（run_stream）/ handlers / post_process / dreaming / …
         ├── prompt.rs         # system prompt 構造（affinity → 行為指令）
-        ├── routes/           # health / companion / companion_stream / voice / persona / world_town / bff / dto / debug / mod
+        ├── routes/           # health / companion / companion_stream / voice / persona / world_town / bff / dto / mod
         └── openapi.rs        # utoipa ApiDoc 元數據
 ```
 
