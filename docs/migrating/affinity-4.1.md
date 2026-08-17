@@ -120,7 +120,9 @@ are exactly five tiers" as a range check.
       "intimacy": 0.1901, "patience": 0.2740, "tension": 0.1703,
       "bond": 0.4213, "chemistry": 0.1802,
       "bond_tier": 3, "chem_tier": 2,
-      "warmth_grade": 2, "patience_grade": 2
+      "warmth_grade": 2, "patience_grade": 2,
+      "ghost_streak": 0, "total_ghosts": 2,
+      "updated_at": "2026-08-17T14:02:11.412Z"
     },
     "created_at": "2026-08-17T14:02:11Z"
   }

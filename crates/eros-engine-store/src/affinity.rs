@@ -79,6 +79,13 @@ pub fn to_domain(row: AffinityRow) -> Affinity {
 /// `chemistry`, both tiers) alongside the axes on purpose: an audit row is
 /// immutable and must record what the tier WAS under the thresholds in force at
 /// the time, which a later re-derivation cannot reproduce once they move.
+///
+/// `updated_at` and the ghost counters are in here for the same reason. A ghost
+/// moves no axis, so without them its two snapshots would be identical and
+/// would read as "nothing happened" — while the operation has in fact reset the
+/// decay clock, which silently forgives however much absence had accrued. An
+/// audit row that asserts no change across a real change is worse than one that
+/// says nothing, so the fields that did move are recorded.
 fn state_snapshot(a: &Affinity) -> serde_json::Value {
     serde_json::json!({
         "warmth": a.warmth,
@@ -93,6 +100,9 @@ fn state_snapshot(a: &Affinity) -> serde_json::Value {
         "chem_tier": a.chem_tier(),
         "warmth_grade": a.warmth_grade,
         "patience_grade": a.patience_grade,
+        "ghost_streak": a.ghost_streak,
+        "total_ghosts": a.total_ghosts,
+        "updated_at": a.updated_at,
     })
 }
 
@@ -377,14 +387,15 @@ impl<'a> AffinityRepo<'a> {
 
         // The tier columns are the engine's own result projected for SQL
         // consumers — written here, never read back (see `AffinityRow`).
-        sqlx::query(
+        let (returned_updated_at,): (chrono::DateTime<Utc>,) = sqlx::query_as(
             "UPDATE engine.companion_affinity \
              SET warmth = $2, trust = $3, intrigue = $4, intimacy = $5, \
                  patience = $6, tension = $7, \
                  warmth_grade = $8, patience_grade = $9, \
                  bond_tier = $10, chem_tier = $11, \
                  pending_deltas = $12, updated_at = now() \
-             WHERE id = $1",
+             WHERE id = $1 \
+             RETURNING updated_at",
         )
         .bind(current.id)
         .bind(current.warmth)
@@ -398,8 +409,12 @@ impl<'a> AffinityRepo<'a> {
         .bind(i16::from(current.bond_tier()))
         .bind(i16::from(current.chem_tier()))
         .bind(serde_json::to_value(outcome.pending).ok())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        // The row's own `now()`, not `apply_deltas`' Rust-side one: the
+        // snapshot's `updated_at` is the decay baseline a replay measures the
+        // next gap from, so it has to be the value the table actually holds.
+        current.updated_at = returned_updated_at;
 
         // The audit trail keeps the judge's verdict verbatim and the gate's
         // new balance next to whatever context the caller supplied.
@@ -500,40 +515,46 @@ impl<'a> AffinityRepo<'a> {
     }
 
     /// Increment ghost counters and stamp `last_ghost_at`. No deltas applied.
+    ///
+    /// Row-locked like [`Self::persist_with_event`], and for the same two
+    /// reasons. First, the counters are read-modify-write: incrementing from
+    /// the caller's possibly-stale in-memory value loses one of two concurrent
+    /// ghosts, so the increment happens in SQL against the locked row. Second,
+    /// callers hand us an `Affinity` they have already decayed and refreshed
+    /// IN MEMORY (the stream path does exactly that at turn start) without
+    /// writing those axes back — snapshotting that copy would put values in the
+    /// audit row that never existed in the table, and the next turn, reading
+    /// the row under lock, would show the relationship jumping back up with no
+    /// event to explain it. Both snapshots come off the row.
     pub async fn record_ghost(&self, affinity: &mut Affinity) -> Result<(), sqlx::Error> {
-        affinity.ghost_streak += 1;
-        affinity.total_ghosts += 1;
-        affinity.last_ghost_at = Some(Utc::now());
+        let mut tx = self.pool.begin().await?;
 
-        // RETURNING, not the caller's struct: callers hand us an `Affinity`
-        // they have already decayed and refreshed IN MEMORY (the stream path
-        // does exactly that at turn start) without writing those axes back,
-        // and this UPDATE resets `updated_at` besides. Snapshotting the
-        // caller's copy would put values in the audit row that never existed
-        // in the table, and the next turn — reading the row under lock —
-        // would show the relationship jumping back up with no event to
-        // explain it. The row is the only thing a replay can be checked
-        // against, so the row is what gets recorded.
-        let persisted = sqlx::query_as::<_, AffinityRow>(
+        let before = sqlx::query_as::<_, AffinityRow>(
+            "SELECT * FROM engine.companion_affinity WHERE id = $1 FOR UPDATE",
+        )
+        .bind(affinity.id)
+        .fetch_one(&mut *tx)
+        .await?
+        .into_domain();
+
+        let after = sqlx::query_as::<_, AffinityRow>(
             "UPDATE engine.companion_affinity \
-             SET ghost_streak = $2, total_ghosts = $3, \
-                 last_ghost_at = $4, updated_at = now() \
+             SET ghost_streak = ghost_streak + 1, total_ghosts = total_ghosts + 1, \
+                 last_ghost_at = now(), updated_at = now() \
              WHERE id = $1 \
              RETURNING *",
         )
         .bind(affinity.id)
-        .bind(affinity.ghost_streak)
-        .bind(affinity.total_ghosts)
-        .bind(affinity.last_ghost_at)
-        .fetch_one(self.pool)
+        .fetch_one(&mut *tx)
         .await?
         .into_domain();
 
         let zero = serde_json::to_value(AffinityDeltas::default()).unwrap_or_default();
         let zero_line = serde_json::json!({ "bond": 0.0, "chemistry": 0.0 });
-        // No axis moves on a ghost, so before == after — but both are written
-        // rather than left NULL, or the replay chain gains a hole here.
-        let state = state_snapshot(&persisted);
+        // No axis moves, so the two snapshots agree on every axis — they differ
+        // on the counters and on `updated_at`, which is the point: the reset
+        // decay clock is the one thing a ghost actually changes about future
+        // state, and it must not be invisible in the log.
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, context, \
@@ -543,11 +564,18 @@ impl<'a> AffinityRepo<'a> {
         .bind(affinity.id)
         .bind(zero)
         .bind(zero_line)
-        .bind(state.clone())
-        .bind(state)
-        .execute(self.pool)
+        .bind(state_snapshot(&before))
+        .bind(state_snapshot(&after))
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
+
+        // Reflect the persisted state back to the caller, same contract as
+        // `persist_with_event`. Leaving the caller holding decayed axes and a
+        // stale `updated_at` while the row holds neither is how a later
+        // `persist_with_event` on the same struct would double-count decay.
+        *affinity = after;
         Ok(())
     }
 }
@@ -1841,8 +1869,29 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(before, after, "a ghost moves no axis");
-        let snap_intrigue = after.get("intrigue").unwrap().as_f64().unwrap();
+        let axis = |v: &serde_json::Value, k: &str| v.get(k).unwrap().as_f64().unwrap();
+        for k in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            assert_eq!(
+                axis(&before, k),
+                axis(&after, k),
+                "a ghost moves no axis ({k})"
+            );
+        }
+        // …but it DOES reset the decay clock, and that must not be invisible:
+        // two identical snapshots would assert "nothing happened" across the
+        // one thing a ghost actually changes about future state.
+        assert_ne!(
+            before.get("updated_at"),
+            after.get("updated_at"),
+            "the reset decay clock must be visible in the log"
+        );
+        assert_eq!(
+            before.get("ghost_streak").unwrap().as_i64().unwrap() + 1,
+            after.get("ghost_streak").unwrap().as_i64().unwrap()
+        );
+        let snap_intrigue = axis(&after, "intrigue");
         assert!(
             (snap_intrigue - row_intrigue).abs() < 1e-9,
             "ghost snapshot must record the row ({row_intrigue}), \
@@ -2258,7 +2307,12 @@ mod tests {
             .unwrap();
         // No axis moves, but both are written — a NULL here would put a hole
         // back in the chain.
-        assert!(before.is_some() && after.is_some());
-        assert_eq!(before, after);
+        let (before, after) = (before.expect("state_before"), after.expect("state_after"));
+        for k in [
+            "warmth", "trust", "intrigue", "intimacy", "patience", "tension",
+        ] {
+            assert_eq!(before.get(k), after.get(k), "a ghost moves no axis ({k})");
+        }
+        assert_ne!(before.get("total_ghosts"), after.get("total_ghosts"));
     }
 }

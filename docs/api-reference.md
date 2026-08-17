@@ -897,7 +897,9 @@ Query parameters (both optional):
       "intimacy": 0.19, "patience": 0.27, "tension": 0.17,
       "bond": 0.42, "chemistry": 0.18,
       "bond_tier": 3, "chem_tier": 2,
-      "warmth_grade": 2, "patience_grade": 2
+      "warmth_grade": 2, "patience_grade": 2,
+      "ghost_streak": 0, "total_ghosts": 2,
+      "updated_at": "2026-08-17T14:02:11.412Z"
     },
     "created_at": "…"
   }

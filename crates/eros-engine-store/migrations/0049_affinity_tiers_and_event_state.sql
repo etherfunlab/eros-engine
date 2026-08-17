@@ -38,7 +38,13 @@ UPDATE engine.companion_affinity SET
 -- ── Replayable event audit ──────────────────────────────────────────────────
 -- Same shape in both:
 --   {warmth,trust,intrigue,intimacy,patience,tension, bond,chemistry,
---    bond_tier,chem_tier, warmth_grade,patience_grade}
+--    bond_tier,chem_tier, warmth_grade,patience_grade,
+--    ghost_streak,total_ghosts,updated_at}
+--
+-- The last three are what keep a ghost row honest: a ghost moves no axis, so
+-- without them its two snapshots would be identical and would read as "nothing
+-- happened" — while the operation has reset the decay clock and forgiven
+-- however much absence had accrued.
 --
 -- Closes the two holes that made the trail unreplayable: events carried no
 -- absolute state at all, and the absence effect applied at the head of

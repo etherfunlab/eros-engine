@@ -123,7 +123,9 @@ Same shape in both:
   "patience": 0.27, "tension": 0.17,
   "bond": 0.42, "chemistry": 0.18,
   "bond_tier": 3, "chem_tier": 2,
-  "warmth_grade": 2, "patience_grade": 2 }
+  "warmth_grade": 2, "patience_grade": 2,
+  "ghost_streak": 0, "total_ghosts": 2,
+  "updated_at": "2026-08-17T14:02:11.412Z" }
 ```
 
 Each row becomes self-contained, and that closes both replay holes:
@@ -152,9 +154,27 @@ on the following turn. Pre-migration rows stay NULL and are not backfilled — t
 values are not recoverable, and fabricating them would defeat the point of the
 columns.
 
-A known limitation this does not fix: `record_ghost` resets `updated_at` without
-materialising the decay that elapsed, so a ghosted turn forgives the absence.
-That is 4.0 behaviour and changing it is a scoring decision, not a storage one.
+`updated_at` and the ghost counters are in the snapshot for a reason that only
+shows up on the ghost path. A ghost moves no axis, so without them its two
+snapshots would be byte-identical and would read as "nothing happened" — while
+the operation has in fact reset the decay clock, silently forgiving however much
+absence had accrued. An audit row that asserts no change across a real change is
+worse than one that says nothing. `updated_at` is taken from the row (`RETURNING`)
+rather than from `apply_deltas`' Rust-side `now()`, since it is the baseline a
+replay measures the next gap from.
+
+The clock reset itself is left alone: `record_ghost` still does not materialise
+the elapsed decay, so a ghosted turn forgives the absence. That is 4.0 behaviour
+and changing it is a scoring decision, not a storage one — but it is now visible
+in the log instead of hidden.
+
+`record_ghost` also becomes row-locked (`SELECT … FOR UPDATE`, then `UPDATE …
+RETURNING *`, in one transaction) and increments the counters in SQL rather than
+from the caller's in-memory value, which closes a lost-update race between two
+concurrent ghosts. It writes the persisted row back to the caller on the way out,
+the same contract `persist_with_event` already had — a caller left holding
+decayed axes and a stale `updated_at` is how a later `persist_with_event` on the
+same struct would double-count decay.
 
 ### 3.3 Legacy column dropped
 
@@ -371,7 +391,24 @@ column.
 - Tests referencing `Config::expose_affinity_debug` are deleted, not adapted.
 - OpenAPI snapshot regenerated.
 
-## 10. Non-goals
+## 10. Breaking changes to the published crates
+
+`eros-engine-core` and `eros-engine-store` are published libraries, and this
+change breaks their source API in three ways. All are deliberate; the release is
+breaking regardless (§ header).
+
+- `RelationshipLabel`, `Affinity::relationship_label` and
+  `Affinity::legacy_relationship_label()` are removed outright. No deprecation
+  shim: the enum's last consumer disappears here, and a type kept only to parse a
+  column that no longer exists is a tombstone.
+- `AffinityRow::relationship_label` and `StoryAffinity::relationship_label` are
+  removed — both mirror dropped columns.
+- `AffinityEventRow` gains `state_before` / `state_after`. Adding public fields
+  breaks any downstream literal construction of the struct. It is populated by
+  sqlx in every in-workspace use, but the break is real and is listed here rather
+  than discovered at upgrade time.
+
+## 11. Non-goals
 
 - **The 4.0 scoring math is untouched.** No threshold, unit, decay rate or
   penalty parameter moves in this change. Tier labels churn only where the
