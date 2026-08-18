@@ -1123,6 +1123,47 @@ the judge level, the counterpart line and the elapsed gap, with the stored
 columns holding only a write-time cache. A direct `SELECT` returns a
 relationship that reads warmer the longer the user has been away.
 
+### `GET /bff/v1/comp/affinities/{user_id}`
+
+Every companion's current affinity for one user, in one round trip — the list
+form of the route above, for a client rendering one row per companion. The
+`{user_id}` path parameter MUST match the JWT's user_id; mismatch returns 403.
+
+| Query param | Default | Notes |
+|-------------|---------|-------|
+| `limit` | 50 | Clamped to 1..=200, never rejected. |
+| `cursor` | — | Opaque, taken verbatim from the previous page's `next_cursor`. Malformed ⇒ 400. |
+
+```json
+{
+  "user_id": "…",
+  "items": [
+    {
+      "session_id": "…",
+      "genome_id": "…",
+      "affinity": { "…": "identical to the single-session shape above" }
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- **Every row gets the same read-time refresh** as the single-session route. A
+  row that skipped it would be no better than the stored columns.
+- `genome_id` is the companion the relationship is with — a list keyed by
+  companion joins on it without a second round trip.
+- Ordered `updated_at DESC, session_id DESC`, so page one holds the rows a list
+  actually shows first. The cursor is a keyset on that pair; `session_id`
+  breaks timestamp ties, which is what keeps a page boundary landing on a tie
+  from skipping a row or serving it twice.
+- `next_cursor` is `null` on the last page — walk until it is.
+- **A session with no affinity row is absent**, not present with
+  `affinity: null`. The list is driven by the relationships themselves, so
+  "missing from the response" means "no relationship yet" — the state the
+  single-session route reports as `affinity: null`.
+- No per-session 403/404: the response only ever contains rows the caller owns,
+  so a foreign or unknown session is simply absent.
+
 ## Error responses
 
 Most errors are JSON with `{"error": "<code>", "message": "<human-readable>"}`.

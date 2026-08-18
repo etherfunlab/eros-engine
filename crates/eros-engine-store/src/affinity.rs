@@ -74,6 +74,23 @@ pub fn to_domain(row: AffinityRow) -> Affinity {
     row.into_domain()
 }
 
+/// `companion_affinity` joined to its instance's genome, as read by
+/// [`AffinityRepo::list_for_user`].
+#[derive(Debug, sqlx::FromRow)]
+struct UserAffinityRow {
+    #[sqlx(flatten)]
+    affinity: AffinityRow,
+    genome_id: Uuid,
+}
+
+/// One entry of a user's affinity list: the relationship plus the companion it
+/// is with. The genome, not the instance, is what a client list is keyed on.
+#[derive(Debug, Clone)]
+pub struct UserAffinity {
+    pub affinity: Affinity,
+    pub genome_id: Uuid,
+}
+
 /// Point-in-time snapshot written to `companion_affinity_events.state_before` /
 /// `state_after` (migration 0049). Carries the derived values (`bond`,
 /// `chemistry`, both tiers) alongside the axes on purpose: an audit row is
@@ -162,6 +179,56 @@ impl<'a> AffinityRepo<'a> {
         .fetch_optional(self.pool)
         .await?;
         Ok(row.map(AffinityRow::into_domain))
+    }
+
+    /// One page of a user's affinity rows, newest-updated first, for a client
+    /// refreshing every companion's value in one round trip (issue #274).
+    ///
+    /// Driven by `companion_affinity`, not by `chat_sessions`: the row IS the
+    /// relationship, and a session without one has nothing to report. Only the
+    /// text pipeline writes these, so a voice-channel session never appears —
+    /// no channel filter needed to keep them out.
+    ///
+    /// `after` is the keyset position `(updated_at, session_id)` of the last
+    /// row the caller already has; rows strictly before it in the sort order
+    /// are returned. Rides `idx_affinity_user_updated` (migration 0051).
+    ///
+    /// The returned values are still write-time — the caller must apply
+    /// `apply_time_decay()` + `refresh_endpoints()` before serving them, same
+    /// as the single-session read.
+    pub async fn list_for_user(
+        &self,
+        user_id: Uuid,
+        after: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<UserAffinity>, sqlx::Error> {
+        let (after_ts, after_sid) = match after {
+            Some((ts, sid)) => (Some(ts), Some(sid)),
+            None => (None, None),
+        };
+        let rows = sqlx::query_as::<_, UserAffinityRow>(
+            "SELECT ca.*, pi.genome_id \
+             FROM engine.companion_affinity ca \
+             JOIN engine.persona_instances pi ON pi.id = ca.instance_id \
+             WHERE ca.user_id = $1 \
+               AND ($2::timestamptz IS NULL \
+                    OR (ca.updated_at, ca.session_id) < ($2::timestamptz, $3::uuid)) \
+             ORDER BY ca.updated_at DESC, ca.session_id DESC \
+             LIMIT $4",
+        )
+        .bind(user_id)
+        .bind(after_ts)
+        .bind(after_sid)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UserAffinity {
+                genome_id: r.genome_id,
+                affinity: r.affinity.into_domain(),
+            })
+            .collect())
     }
 
     /// Load existing or insert a fresh row with default values.

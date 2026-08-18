@@ -221,10 +221,166 @@ async fn bff_get_affinity_value(
     }))
 }
 
+// ─── User-scoped list ───────────────────────────────────────────────
+
+/// Page size default / ceiling. Nothing in the engine caps how many companions
+/// a user may talk to, so the page size is the only bound on the response.
+/// 200 is a typo guard, not a business gate — raise it by changing the number.
+const LIST_DEFAULT_LIMIT: i64 = 50;
+const LIST_MAX_LIMIT: i64 = 200;
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct BffAffinityListQuery {
+    /// Page size. Default 50, server-capped at 200.
+    pub limit: Option<i64>,
+    /// Opaque position taken verbatim from the previous page's `next_cursor`.
+    /// Absent ⇒ first page. Malformed ⇒ 400 (never a silent first page: that
+    /// would restart a scroll at the top and look like duplicated rows).
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BffAffinityListItem {
+    pub session_id: Uuid,
+    /// Companion this relationship is with. A client list keyed by companion
+    /// joins on this without a second round trip to resolve the session.
+    pub genome_id: Uuid,
+    /// Never null here: the list is driven by the affinity rows themselves, so
+    /// a session that has not had its first turn is absent rather than present
+    /// with an empty value. Treat "missing from the response" as "no
+    /// relationship yet" — the same state the single-session endpoint reports
+    /// as `affinity: null`.
+    pub affinity: AffinitySnapshot,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BffAffinityListResponse {
+    pub user_id: Uuid,
+    pub items: Vec<BffAffinityListItem>,
+    /// Pass as `cursor` to fetch the next page. Null on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Requested page size → the size actually served. Clamped, never rejected: a
+/// client that asks for more than the ceiling wants "as many as you'll give
+/// me", and a 400 there would break a list for no reader's benefit.
+fn page_limit(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT)
+}
+
+/// The keyset position, opaque on the wire. Encoded rather than exposed as two
+/// query params so the sort key stays an implementation detail — a client that
+/// reconstructs it by hand would pin the ordering.
+fn encode_cursor(updated_at: DateTime<Utc>, session_id: Uuid) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!("{}|{session_id}", updated_at.to_rfc3339()))
+}
+
+fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), AppError> {
+    use base64::Engine as _;
+    let bad = || AppError::BadRequest("malformed cursor".into());
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| bad())?;
+    let text = String::from_utf8(decoded).map_err(|_| bad())?;
+    let (ts, sid) = text.split_once('|').ok_or_else(bad)?;
+    let ts = DateTime::parse_from_rfc3339(ts)
+        .map_err(|_| bad())?
+        .with_timezone(&Utc);
+    Ok((ts, sid.parse().map_err(|_| bad())?))
+}
+
+/// Every companion's current affinity for one user, in one round trip —
+/// newest-updated first, keyset-paginated. The `{user_id}` path parameter MUST
+/// match the JWT's user_id; mismatch returns 403.
+///
+/// Exists because the single-session endpoint is the only authoritative read of
+/// an absolute value, and a list view rendering one row per companion could
+/// otherwise only call it N times or fall back to the write-time columns —
+/// which read systematically warm after an absence, since absence decay only
+/// moves the stored scores down. Every row here gets the same read-time refresh
+/// as the single-session endpoint; a row that skipped it would be no better
+/// than the column it replaces.
+///
+/// Ordering is `updated_at DESC, session_id DESC`, which puts the rows a list
+/// actually shows first on page one. No 403/404 for an individual session: the
+/// response only ever contains rows the caller owns, so a foreign session is
+/// absent rather than reported.
+#[utoipa::path(
+    get,
+    path = "/bff/v1/comp/affinities/{user_id}",
+    tag = "bff-companion",
+    params(
+        ("user_id" = Uuid, Path, description = "Owner user id (must equal JWT sub)"),
+        BffAffinityListQuery
+    ),
+    responses(
+        (status = 200, body = BffAffinityListResponse),
+        (status = 400, description = "malformed cursor"),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "user_id does not match JWT")
+    ),
+    security(("bearer" = []))
+)]
+async fn bff_list_affinities(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<BffAffinityListQuery>,
+    Extension(AuthUser(jwt_user)): Extension<AuthUser>,
+) -> Result<Json<BffAffinityListResponse>, AppError> {
+    if user_id != jwt_user {
+        return Err(AppError::Forbidden("not your data".into()));
+    }
+    let limit = page_limit(query.limit);
+    let after = query.cursor.as_deref().map(decode_cursor).transpose()?;
+
+    // Read one past the page: whether that row exists is what tells a full page
+    // apart from a last page, without a second COUNT.
+    let mut rows = AffinityRepo { pool: &state.pool }
+        .list_for_user(user_id, after, limit + 1)
+        .await?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+
+    // From the stored values, before the read-time refresh — the keyset is on
+    // the DB columns, and the refresh is in-memory only.
+    let next_cursor = has_more
+        .then(|| {
+            rows.last()
+                .map(|r| encode_cursor(r.affinity.updated_at, r.affinity.session_id))
+        })
+        .flatten();
+
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let mut a = r.affinity;
+            let session_id = a.session_id;
+            a.apply_time_decay();
+            a.refresh_endpoints(&state.config.affinity_tuning);
+            BffAffinityListItem {
+                session_id,
+                genome_id: r.genome_id,
+                affinity: AffinitySnapshot::from(a),
+            }
+        })
+        .collect();
+
+    Ok(Json(BffAffinityListResponse {
+        user_id,
+        items,
+        next_cursor,
+    }))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(bff_get_affinity_delta))
         .routes(routes!(bff_get_affinity_value))
+        .routes(routes!(bff_list_affinities))
 }
 
 #[cfg(test)]
@@ -772,5 +928,267 @@ mod tests {
         assert!(a["intrigue"].as_f64().unwrap().abs() < 1e-9);
         assert_eq!(a["bond_tier"], 1);
         assert_eq!(a["chem_tier"], 1);
+    }
+
+    // ─── User-scoped list ───────────────────────────────────────────
+
+    fn list_req(token: &str, user_id: Uuid, query: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(format!("/bff/v1/comp/affinities/{user_id}{query}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// One companion for `user_id`, its affinity row stamped `mins_ago` minutes
+    /// back so list order is deterministic. Returns `(session_id, genome_id)`.
+    async fn seed_companion(
+        pool: &PgPool,
+        user_id: Uuid,
+        name: &str,
+        mins_ago: i32,
+    ) -> (Uuid, Uuid) {
+        let genome_id = seed_genome(pool, name).await;
+        let instance_id = seed_instance(pool, genome_id, user_id).await;
+        let session_id = seed_session(pool, user_id, instance_id).await;
+        seed_affinity(pool, session_id, user_id, instance_id).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET updated_at = now() - make_interval(mins => $2) WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .bind(mins_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+        (session_id, genome_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_returns_every_companion_newest_first(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (s_old, _g_old) = seed_companion(&pool, user_id, "Aria", 300).await;
+        let (s_mid, _g_mid) = seed_companion(&pool, user_id, "Solace", 120).await;
+        let (s_new, g_new) = seed_companion(&pool, user_id, "Vesper", 5).await;
+        // A stranger's relationship must not leak into the caller's list.
+        seed_companion(&pool, Uuid::new_v4(), "Nyx", 1).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, list_req(&token, user_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["user_id"], user_id.to_string());
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "body={body}");
+        assert_eq!(items[0]["session_id"], s_new.to_string());
+        assert_eq!(items[0]["genome_id"], g_new.to_string());
+        assert_eq!(items[1]["session_id"], s_mid.to_string());
+        assert_eq!(items[2]["session_id"], s_old.to_string());
+        // Same snapshot shape as the single-session endpoint.
+        assert_eq!(items[0]["affinity"]["bond_tier"], 1);
+        assert_eq!(items[0]["affinity"]["bond_label"], "acquaintance");
+        assert!(body["next_cursor"].is_null(), "single page → no cursor");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_omits_sessions_without_an_affinity_row(pool: PgPool) {
+        // A session that has not had its first turn has no relationship to
+        // report — it is absent, not present-and-empty.
+        let user_id = Uuid::new_v4();
+        let (with_row, _g) = seed_companion(&pool, user_id, "Aria", 10).await;
+        let genome_id = seed_genome(&pool, "Solace").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        seed_session(&pool, user_id, instance_id).await; // no affinity row
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, list_req(&token, user_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "body={body}");
+        assert_eq!(items[0]["session_id"], with_row.to_string());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_refreshes_endpoints_at_read(pool: PgPool) {
+        // The whole point over reading the columns: a row untouched for 30 days
+        // must be served cooler than it is stored, on the list too.
+        let user_id = Uuid::new_v4();
+        let (session_id, _g) = seed_companion(&pool, user_id, "Aria", 0).await;
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+             SET warmth = 0.9, warmth_grade = 3, intimacy = 0.5, tension = 0.5, \
+                 updated_at = now() - interval '30 days' WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stored: f64 = sqlx::query_scalar(
+            "SELECT warmth FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, list_req(&token, user_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let served = body["items"][0]["affinity"]["warmth"].as_f64().unwrap();
+        assert!(
+            served < stored,
+            "a 30-day absence must cool warmth at read: served {served} vs stored {stored}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_pages_through_the_cursor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (s_old, _a) = seed_companion(&pool, user_id, "Aria", 300).await;
+        let (s_mid, _b) = seed_companion(&pool, user_id, "Solace", 120).await;
+        let (s_new, _c) = seed_companion(&pool, user_id, "Vesper", 5).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, page1) = send_request(&mut app, list_req(&token, user_id, "?limit=2")).await;
+        assert_eq!(status, StatusCode::OK, "body={page1}");
+        let items = page1["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["session_id"], s_new.to_string());
+        assert_eq!(items[1]["session_id"], s_mid.to_string());
+        let cursor = page1["next_cursor"].as_str().expect("more rows → cursor");
+
+        let (status, page2) = send_request(
+            &mut app,
+            list_req(&token, user_id, &format!("?limit=2&cursor={cursor}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={page2}");
+        let items = page2["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "body={page2}");
+        assert_eq!(items[0]["session_id"], s_old.to_string());
+        assert!(
+            page2["next_cursor"].is_null(),
+            "last page must end the walk: {page2}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_paging_survives_identical_updated_at(pool: PgPool) {
+        // Timestamps tie in practice (a batch write, a coarse clock). Without
+        // the session_id tiebreak in both the sort and the cursor, a page
+        // boundary landing on a tie skips a row or serves it twice.
+        let user_id = Uuid::new_v4();
+        for name in ["Aria", "Solace", "Vesper"] {
+            seed_companion(&pool, user_id, name, 60).await;
+        }
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET updated_at = timestamptz '2026-01-01 00:00:00Z' \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut query = "?limit=1".to_string();
+        for _ in 0..3 {
+            let (status, body) = send_request(&mut app, list_req(&token, user_id, &query)).await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            let items = body["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1, "body={body}");
+            seen.push(items[0]["session_id"].as_str().unwrap().to_string());
+            match body["next_cursor"].as_str() {
+                Some(c) => query = format!("?limit=1&cursor={c}"),
+                None => break,
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "every tied row must be served exactly once");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_empty_for_a_user_with_no_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, list_req(&token, user_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_403_for_another_users_id(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        seed_companion(&pool, owner, "Aria", 10).await;
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(intruder);
+        let (status, _b) = send_request(&mut app, list_req(&token, owner, "")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_400_on_malformed_cursor(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        seed_companion(&pool, user_id, "Aria", 10).await;
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, _b) =
+            send_request(&mut app, list_req(&token, user_id, "?cursor=not-a-cursor")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_list_401_without_bearer(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let r = Request::builder()
+            .uri(format!("/bff/v1/comp/affinities/{user_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _b) = send_request(&mut app, r).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn page_limit_clamps_both_ends() {
+        use super::{page_limit, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT};
+        assert_eq!(page_limit(None), LIST_DEFAULT_LIMIT);
+        assert_eq!(page_limit(Some(10)), 10);
+        assert_eq!(page_limit(Some(9_999)), LIST_MAX_LIMIT);
+        assert_eq!(page_limit(Some(0)), 1);
+        assert_eq!(page_limit(Some(-5)), 1);
+    }
+
+    #[test]
+    fn cursor_round_trips() {
+        use super::{decode_cursor, encode_cursor};
+        let sid = Uuid::new_v4();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-08-18T04:05:06.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (got_ts, got_sid) = decode_cursor(&encode_cursor(ts, sid)).unwrap();
+        assert_eq!(got_ts, ts);
+        assert_eq!(got_sid, sid);
     }
 }

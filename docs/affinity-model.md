@@ -434,8 +434,9 @@ label_changes = {
 
 ### `AffinitySnapshot`
 
-Returned by `GET /bff/v1/comp/affinity/{session_id}`, refreshed at read time
-(`apply_time_decay` + `refresh_endpoints`). The snapshot includes:
+Returned by `GET /bff/v1/comp/affinity/{session_id}`, and per item by
+`GET /bff/v1/comp/affinities/{user_id}` (the user-scoped list), refreshed at
+read time (`apply_time_decay` + `refresh_endpoints`). The snapshot includes:
 
 ```json
 {

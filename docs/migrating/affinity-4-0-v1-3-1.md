@@ -95,6 +95,12 @@ Three ways to get the tier, all authoritative:
   after a long absence a stored tier can sit one step above where the endpoint
   would put it. Acceptable for a list; call §2 wherever the number is the point.
 
+  Since **v1.4.0** a list no longer has to accept that skew:
+  `GET /bff/v1/comp/affinities/{user_id}` returns every companion's refreshed
+  value in one paginated round trip, so the list and the detail view can read
+  the same authoritative numbers without N requests. The columns stay for SQL
+  that cannot call the API.
+
 The tier ladder is extensible by formula: a future release can add a tier
 without changing the shape of the table or the endpoints. Do not encode "there
 are exactly five tiers" as a range check.

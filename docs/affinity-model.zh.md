@@ -363,7 +363,8 @@ label_changes = {
 
 ### `AffinitySnapshot`
 
-由 `GET /bff/v1/comp/affinity/{session_id}` 返回，读取时会重新刷新
+由 `GET /bff/v1/comp/affinity/{session_id}` 返回，也是用户级列表
+`GET /bff/v1/comp/affinities/{user_id}` 每一项的形状；读取时会重新刷新
 （`apply_time_decay` + `refresh_endpoints`）：
 
 ```json
