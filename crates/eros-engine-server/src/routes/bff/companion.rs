@@ -43,6 +43,14 @@ pub struct BffHistoryEntry {
     /// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §3.4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tips_amount_usd: Option<f64>,
+    /// When this message reached the party it was addressed to — set by
+    /// `POST /comp/chat/{session_id}/read` on an `assistant` row, and by the
+    /// engine itself on a `user` row (the moment the turn handed the message to
+    /// its first model). Omitted while unread; permanently omitted on tips and
+    /// voice rows, which have no reader. Absence means "no receipt", not "not
+    /// yet read".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
     /// Conversation-flavor marker: `"product_qa"` = out-of-character product
     /// answer (excluded from companion context). Omitted for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +157,7 @@ async fn bff_get_history(
             sent_at: r.sent_at,
             tips_amount_usd: r.tips_amount_usd,
             channel: r.channel,
+            read_at: r.read_at,
         })
         .collect();
     let total = messages.len();
@@ -206,6 +215,7 @@ async fn bff_start_chat(
                 sent_at: r.sent_at,
                 tips_amount_usd: r.tips_amount_usd,
                 channel: r.channel,
+                read_at: r.read_at,
             })
             .collect()
     };
@@ -813,5 +823,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_carries_read_at_only_on_stamped_rows(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at, read_at) \
+             VALUES ($1, 'user', 'hello', now() - interval '2 seconds', NULL), \
+                    ($1, 'assistant', 'hey', now() - interval '1 second', now())",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut app = build_router(test_state(pool));
+        let token = mint_test_jwt(user_id);
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        let stamped = messages.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert!(
+            stamped["read_at"].is_string(),
+            "a stamped row carries read_at; got {stamped}"
+        );
+        let unread = messages.iter().find(|m| m["role"] == "user").unwrap();
+        assert!(
+            unread.get("read_at").is_none(),
+            "an unread row omits the key rather than sending null; got {unread}"
+        );
     }
 }

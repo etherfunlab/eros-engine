@@ -468,8 +468,8 @@ Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
 {
   "session_id": "…",
   "messages": [
-    { "role": "assistant", "content": "Bishop.", "sent_at": "…" },
-    { "role": "user",      "content": "hi…",     "sent_at": "…" },
+    { "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" },
+    { "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
     { "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
   ],
   "total": 3
@@ -481,7 +481,40 @@ turn (sent via `tips_amount_usd` on the stream route, above). Each entry also
 carries an optional `channel` field — `"product_qa"` marks an
 out-of-character product answer (excluded from companion context/memory,
 same as its live-stream `action_type`); the field is omitted for normal
-turns.
+turns. `read_at` is a read receipt and is **omitted entirely while unread** —
+see the route below.
+
+### `POST /comp/chat/{session_id}/read`
+
+Mark every message in the session the user did not author as read. Same auth,
+ownership check and 404-on-archived behaviour as the history route above.
+
+```json
+{
+  "session_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "marked": 7
+}
+```
+
+Write-only: the engine records a timestamp and stops there. It does not count
+unread messages, does not notify, and does not decide what "read" looks like —
+a client reads `read_at` off the history entries and renders whatever it wants.
+
+`marked` counts the rows *this* call stamped, so a repeat call returns `200`
+with `0` and an existing stamp is never pushed forward. Call it on every mount
+without inventing an event.
+
+Two roles are out of reach here, and they are the two the user writes. A `user`
+row carries the engine's own stamp — set the instant the turn handed the message
+to its first model — which is the other half of a delivery receipt; a
+`gift_user` tip is never stamped by anyone, because nobody reads a tip on the
+user's behalf. Voice rows are never stamped either.
+
+**Read `read_at: absent` as "no receipt", never as "not yet read."** Tips, voice
+rows, and — on a deployment running without the PDE judge — every `user` row
+stay unstamped permanently.
+
+See [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md).
 
 ## Voice
 
@@ -1015,8 +1048,9 @@ Slim history projection for the chat screen: `id` / `client_msg_id` /
 `role` / `content` / `sent_at` (no `extracted_facts`), plus `tips_amount_usd`
 on tip rows (present only when `role = gift_user`; omitted otherwise), and an
 optional `channel` field — `"product_qa"` marks an out-of-character product
-answer (excluded from companion context/memory); omitted for normal turns.
-`id` is the
+answer (excluded from companion context/memory); omitted for normal turns —
+and `read_at`, the read receipt described under `POST /comp/chat/{session_id}/read`
+(omitted while unread). `id` is the
 `chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
 sent during streaming (`null` for rows that never carried one, e.g.
 assistant turns). Same auth, ownership check, and
@@ -1029,8 +1063,8 @@ round-trip.
 {
   "session_id": "…",
   "messages": [
-    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…", "read_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…", "read_at": "…" },
     { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" }
   ],
   "total": 3

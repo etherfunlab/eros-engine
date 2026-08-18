@@ -406,8 +406,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 {
   "session_id": "…",
   "messages": [
-    { "role": "assistant", "content": "Bishop。", "sent_at": "…" },
-    { "role": "user",      "content": "嗨…",     "sent_at": "…" },
+    { "role": "assistant", "content": "Bishop。", "sent_at": "…", "read_at": "…" },
+    { "role": "user",      "content": "嗨…",     "sent_at": "…", "read_at": "…" },
     { "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
   ],
   "total": 3
@@ -417,7 +417,35 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 `role` ∈ `user | assistant | gift_user | system_error`。`gift_user` 是打赏轮
 （通过上面 stream 路由的 `tips_amount_usd` 发起）。每条记录还带一个可选的
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
-外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。
+外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。`read_at` 是已读
+回执，**未读时整个键都不出现** —— 见下面这条路由。
+
+### `POST /comp/chat/{session_id}/read`
+
+把这个 session 里所有不是用户自己写的消息标记为已读。鉴权、归属校验、归档
+session 返回 404 的行为，与上面的 history 路由完全一致。
+
+```json
+{
+  "session_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "marked": 7
+}
+```
+
+只写不判：engine 落一个时间戳就到此为止。它不算未读数、不推送、也不定义已读该
+长什么样 —— 客户端从 history 记录里读 `read_at`，自己决定怎么渲染。
+
+`marked` 只算**这一次调用**打上的行数，所以重复调用返回 `200` 加 `0`，已有的时
+间戳不会被往后推。每次挂载都调一次也不会造出假事件。
+
+有两个 role 在这里够不到，正好是用户自己写的那两个。`user` 行带的是 engine 自己
+的打点 —— 在这一轮把消息交给第一个模型的那一刻写入 —— 那是送达回执的另一半；
+`gift_user` 打赏行谁都不打，因为没有人代替用户去读一笔打赏。语音行同样永远不打。
+
+**`read_at` 不出现要读作「没有回执」，不是「还没读」。** 打赏行、语音行，以及在
+没配 PDE 判官的部署上的每一条 `user` 行，都是永久不打点的。
+
+详见 [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md)。
 
 ## 语音
 
@@ -886,8 +914,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   "persona_name": "Aria",
   "is_new": false,
   "history": [
-    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…" },
-    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…" }
+    { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "hello",   "sent_at": "…", "read_at": "…" },
+    { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "hi back", "sent_at": "…", "read_at": "…" }
   ]
 }
 ```
@@ -901,7 +929,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `sent_at`（不含 `extracted_facts`），打赏行另带 `tips_amount_usd`（仅在
 `role = gift_user` 时出现，否则省略），以及可选的 `channel` 字段——
 `"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之外）；普通轮次
-省略该字段。`id` 是 `chat_messages` 行的主鍵（UUID）；
+省略该字段。还有 `read_at`，即 `POST /comp/chat/{session_id}/read` 那节说的
+已读回执，未读时省略。`id` 是 `chat_messages` 行的主鍵（UUID）；
 `client_msg_id` 是前端串流時帶上的 id（沒帶的行為 `null`，例如 assistant 回合）。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
