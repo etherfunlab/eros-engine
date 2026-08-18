@@ -2536,9 +2536,9 @@ struct VisionRun {
     /// Same-shape carry-forward as `ComposeRun::last_model` et al.: the last
     /// CONTENT-level failure's response identity (`empty` / `unparseable` /
     /// any `image_vision_invalidity` reason) — the provider answered and was
-    /// billed, but the describe itself was unusable. `None` on a pure
-    /// transport failure (`model_error` / `timeout`), where nothing ever
-    /// answered.
+    /// billed, but the describe itself was unusable. `None` on a provider
+    /// status, transport break or timeout (`upstream_error` / `gateway_error`),
+    /// where nothing ever answered.
     last_model: Option<String>,
     last_generation_id: Option<String>,
     last_usage: Option<serde_json::Value>,

@@ -212,10 +212,23 @@ fn compose_chain_exhausted(
         (status = 422, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 429, body = crate::routes::companion_stream::StreamPreErrorBody),
         (status = 501, body = crate::routes::companion_stream::StreamPreErrorBody),
+        // The composer chain's own failures answer with the PROVIDER's status, verbatim,
+        // so they are not confined to one class: a 429 is as reachable as a 529. Two
+        // range entries rather than a single `502`, because neither range alone is
+        // true. The explicit 4xx entries above stay authoritative for the statuses they
+        // name (403/422/429 pre-stream errors) — a specific key outranks a range.
+        (status = "4XX", description = "Composer chain exhausted before any output, where the \
+            provider itself answered with a 4xx — the status is returned **verbatim**. \
+            `429 Too Many Requests` (provider rate limit) is the one a caller will actually \
+            see; note that this endpoint also returns 429 for its own per-user in-flight cap, \
+            and the two are told apart by the body (`\"error\": \"upstream\"` vs the \
+            `code`/`message`/`user_message` pre-stream shape). Body and semantics: see the 5XX \
+            entry."),
         (status = "5XX", description = "Composer chain exhausted before any output. **Not \
-            always 502**: the provider's own status passes through verbatim (529, 503, …), and \
-            a failure with no upstream status of its own maps by kind — a gateway timeout to \
-            504, everything else to 502. Body: \
+            always 502**: the provider's own status passes through verbatim — 502, 503 and 529 \
+            are the ones seen in practice, and an unrecognised code is forwarded unmodified \
+            rather than remapped. A failure with no upstream status of its own maps by kind: a \
+            gateway timeout to 504, everything else to 502. Body: \
             `{\"error\": \"upstream\", \"message\": \"upstream failure: code=529: Overloaded\", \
             \"upstream_status\": 529, \"provider_code\": \"529\", \"error_type\": \"overloaded\", \
             \"retryable\": true}`; the gateway arm carries `gateway_kind` (`open_timeout` | \
@@ -338,14 +351,16 @@ pub async fn compose_image(
     let (compose_attempts, compose_gateways) = split_failures(&run.failures);
 
     let Some(outcome) = run.outcome else {
-        // 502 here, unlike the chat path's portrait fallback (spec
+        // An HTTP error here, unlike the chat path's portrait fallback (spec
         // 2026-08-03 §3.6) — nothing was assembled, so composed_prompt stays
-        // NULL. The only place in the design where that's true. `model` /
-        // `generation_id` / `usage` still record the last attempted model's
-        // response on a CONTENT-level failure (`empty` / `empty_prompt`) —
-        // that call answered and was billed even though its result was
-        // unusable. They stay NULL on a pure transport failure
-        // (`model_error` / `timeout`), where nothing ever answered.
+        // NULL. The only place in the design where that's true. The status is
+        // the provider's own, verbatim (`compose_chain_exhausted` below), not a
+        // synthesised 502. `model` / `generation_id` / `usage` still record the
+        // last attempted model's response on a CONTENT-level failure (`empty` /
+        // `empty_prompt`) — that call answered and was billed even though its
+        // result was unusable. They stay NULL on a provider status, transport
+        // break or timeout (`upstream_error` / `gateway_error`), where nothing
+        // ever answered.
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {

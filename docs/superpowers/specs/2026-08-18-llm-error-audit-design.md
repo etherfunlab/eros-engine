@@ -466,8 +466,20 @@ So its `llm_attempts` / `gateway_errors` are written to `companion_affinity_even
 engine-side debugging only, and never surface on the wire. Do not "fix" this by deferring the
 `final` frame or by adding a post-turn event — the exclusion is the design.
 
-Vision (`chat_vision`) is likewise absent: it runs on the image-upload request, which has its
-own response, not on the chat turn.
+**Vision (`chat_vision`) is likewise absent**, but for a different reason than an earlier
+draft of this spec claimed. There is no image-upload request: `image_url` is a body field on
+`POST /comp/chat/{session_id}/message/stream`, and `run_vision` executes *inside* the chat
+turn's generator, ahead of the input filter. The describe is a **fail-open pre-stage** — an
+exhausted chain does not fail the turn, it keeps it text-only and a placeholder covers the
+undescribed image, so the consumer still receives a normal reply. Its `llm_attempts` /
+`gateway_errors` land in `chat_vision_events` for engine-side debugging and are never folded
+into the turn's accumulated list.
+
+> **Open follow-up, deliberately not settled here.** Unlike affinity eval, a failed describe
+> means the companion never saw the user's photo, and whether the consumer should be told
+> that is a genuine product question — one this spec's original (incorrect) reasoning
+> concealed rather than answered. **The exclusion holds as implemented**; revisiting it is a
+> separate decision with its own design pass, not a late amendment to this one.
 
 ### 6.2 SSE `error` frame
 
@@ -546,8 +558,14 @@ are retired with the other two, so `chat_images_events.last_failure` reads the s
 endpoint wrote the row.
 
 `eval_skip_reason` gets no pointer values, because its contract is "why no call was made",
-and a failed call is not a skip. Its seven remaining values are all genuine intentional
-skips. The invariant it upholds is restated: **a `companion_affinity_events` row with a NULL
+and a failed call is not a skip. **Four values remain reachable in a persisted row**, and all
+four are genuine intentional skips: `proactive`, `short_user_msg`, `empty_assistant` (from
+`eval_skip_reason`, `post_process.rs`) and `eval_no_generation_id` (from `meta_skip_reason` —
+a *successful* eval whose response carried no join key). `eval_skip_reason`'s two other arms,
+`ghost` and `product_qa`, exist only for `match` exhaustiveness and are never persisted: a
+Ghost turn takes the `record_ghost` path, which ignores `context` entirely, and a
+`product_qa` turn is filtered out by `persist_affinity` before the helper is called. The
+invariant it upholds is restated: **a `companion_affinity_events` row with a NULL
 `generation_id` is always explained — by an `eval_skip_reason` (no call attempted) or by a
 non-empty `llm_attempts` / `gateway_errors` (a call attempted and failed).**
 
@@ -666,7 +684,7 @@ uniform across tables.
 
 | Site | Today | After |
 | --- | --- | --- |
-| `context.eval_skip_reason` | 9 values | `eval_error`/`eval_timeout` retired, **no** pointer values added. The remaining 7 are genuine intentional skips |
+| `context.eval_skip_reason` | 6 values reachable in a row | `eval_error`/`eval_timeout` retired, **no** pointer values added. The remaining 4 — `proactive`, `short_user_msg`, `empty_assistant`, `eval_no_generation_id` — are genuine intentional skips (§7) |
 | `model` / `generation_id` NULL | Always paired with a skip reason | Invariant restated: a NULL `generation_id` is explained by a skip reason **or** by a non-empty `llm_attempts` / `gateway_errors` |
 | — | — | **new** `llm_attempts`, `gateway_errors` |
 
