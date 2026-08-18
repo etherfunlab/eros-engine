@@ -202,26 +202,45 @@ impl<'a> AffinityRepo<'a> {
         after: Option<(DateTime<Utc>, Uuid)>,
         limit: i64,
     ) -> Result<Vec<UserAffinity>, sqlx::Error> {
-        let (after_ts, after_sid) = match after {
-            Some((ts, sid)) => (Some(ts), Some(sid)),
-            None => (None, None),
+        // Two statements, not one with a `$2 IS NULL OR …` guard. Under a
+        // generic plan Postgres cannot turn an OR-wrapped row comparison into
+        // an index bound: it seeks on `user_id` alone and filters the rest of
+        // that user's rows away one by one, which is the offset-scan cost this
+        // index exists to avoid. Unconditional, it becomes an index range
+        // condition. Verified with EXPLAIN under `force_generic_plan`.
+        let rows = match after {
+            Some((ts, sid)) => {
+                sqlx::query_as::<_, UserAffinityRow>(
+                    "SELECT ca.*, pi.genome_id \
+                     FROM engine.companion_affinity ca \
+                     JOIN engine.persona_instances pi ON pi.id = ca.instance_id \
+                     WHERE ca.user_id = $1 \
+                       AND (ca.updated_at, ca.session_id) < ($2::timestamptz, $3::uuid) \
+                     ORDER BY ca.updated_at DESC, ca.session_id DESC \
+                     LIMIT $4",
+                )
+                .bind(user_id)
+                .bind(ts)
+                .bind(sid)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, UserAffinityRow>(
+                    "SELECT ca.*, pi.genome_id \
+                     FROM engine.companion_affinity ca \
+                     JOIN engine.persona_instances pi ON pi.id = ca.instance_id \
+                     WHERE ca.user_id = $1 \
+                     ORDER BY ca.updated_at DESC, ca.session_id DESC \
+                     LIMIT $2",
+                )
+                .bind(user_id)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
         };
-        let rows = sqlx::query_as::<_, UserAffinityRow>(
-            "SELECT ca.*, pi.genome_id \
-             FROM engine.companion_affinity ca \
-             JOIN engine.persona_instances pi ON pi.id = ca.instance_id \
-             WHERE ca.user_id = $1 \
-               AND ($2::timestamptz IS NULL \
-                    OR (ca.updated_at, ca.session_id) < ($2::timestamptz, $3::uuid)) \
-             ORDER BY ca.updated_at DESC, ca.session_id DESC \
-             LIMIT $4",
-        )
-        .bind(user_id)
-        .bind(after_ts)
-        .bind(after_sid)
-        .bind(limit)
-        .fetch_all(self.pool)
-        .await?;
         Ok(rows
             .into_iter()
             .map(|r| UserAffinity {
