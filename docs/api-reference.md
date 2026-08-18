@@ -878,6 +878,31 @@ The flat, typed `character_insights` row for one relationship (`persona_instance
 
 `updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Results are database-only: nothing here is read back into any chat prompt.
 
+### `DELETE /comp/instance/{instance_id}/sessions`
+
+Soft-delete every session this user holds with one persona instance. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown instance is 404 — unlike the profile route above, a dormant (`status <> 'active'`) instance is accepted, because a client may clear the conversations of a relationship it has already marked over.
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "archived_sessions": 2
+}
+```
+
+`archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
+
+**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, and `character_insights` — the state that would otherwise carry into the next conversation. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `chat_vision_events`, `chat_images_events`, `llm_attempt_audit`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
+
+Afterwards the sessions are invisible everywhere: history, affinity, the session list, the chat and voice turn routes all return 404 or omit them, and `POST /comp/chat/start` creates a new session rather than resuming an archived one.
+
+There is no restore endpoint by design. Reviving one session is an operator action:
+
+```sql
+UPDATE engine.chat_sessions SET archived = false WHERE id = '<session-uuid>';
+```
+
+The transcript comes back; the relationship state does not. See [2026-08-18-session-soft-delete-design.md](superpowers/specs/2026-08-18-session-soft-delete-design.md).
+
 > **Tips replaced gift events.** The standalone gift routes
 > (`POST /comp/chat/{session_id}/event/gift`, `GET /comp/chat/{session_id}/gifts`)
 > were removed. A tip is now part of a normal stream turn — set

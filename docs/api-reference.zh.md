@@ -771,6 +771,31 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。结果只落库：这里的任何内容都不会被读回任何 chat prompt。
 
+### `DELETE /comp/instance/{instance_id}/sessions`
+
+软删除这个用户与某个 persona instance 之间的全部 session。该 instance 的 `owner_uid` **必须**等于 JWT 的 user_id；否则 403。未知 instance 返回 404 —— 与上面的画像路由不同，已休眠（`status <> 'active'`）的 instance 是接受的：客户端可能先标记关系结束、再来清对话。
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "archived_sessions": 2
+}
+```
+
+`archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
+
+**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights` —— 这些留着会渗进下一段对话。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`chat_vision_events`、`chat_images_events`、`llm_attempt_audit`）终于指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
+
+调用之后这些 session 在各处都不可见：history、affinity、session 列表、chat 与语音 turn 路由要么 404 要么直接不返回，`POST /comp/chat/start` 会新建 session 而不是恢复已归档的那个。
+
+刻意不提供恢复端点。复活单个 session 是运维动作：
+
+```sql
+UPDATE engine.chat_sessions SET archived = false WHERE id = '<session-uuid>';
+```
+
+聊天记录回来，关系状态不回来。详见 [2026-08-18-session-soft-delete-design.md](superpowers/specs/2026-08-18-session-soft-delete-design.md)。
+
 > **打赏取代了礼物事件。** 独立的礼物路由
 > （`POST /comp/chat/{session_id}/event/gift`、`GET /comp/chat/{session_id}/gifts`）
 > 已移除。打赏现在是普通 stream 轮的一部分 —— 在

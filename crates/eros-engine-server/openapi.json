@@ -640,6 +640,54 @@
         ]
       }
     },
+    "/comp/instance/{instance_id}/sessions": {
+      "delete": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Soft-delete every session this user holds with one persona instance.",
+        "description": "The conversation stops being visible and stops being resumable, and the\nrelationship state — affinity, relationship-layer memories, character\ninsights — is deleted so the next conversation starts genuinely cold. The\ntranscript in `chat_messages` is NOT deleted: it is evidence, and the audit\ntables that reference a session by id finally point at something readable.\n\nKeyed by instance because the instance is the unit of a relationship;\narchiving one session and leaving its siblings resumable would not give the\ncaller the fresh start it asked for. Every channel goes, voice included.\n\nIdempotent: a second call returns 200 with `archived_sessions: 0`.\n\nThere is no restore endpoint by design. Reviving a session is an operator\naction and `UPDATE engine.chat_sessions SET archived = false WHERE id = …`\nis the whole of it; the relationship state stays gone.",
+        "operationId": "archive_instance_sessions",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveSessionsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/user/{user_id}/profile": {
       "get": {
         "tags": [
@@ -1299,6 +1347,24 @@
           "warmth": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "ArchiveSessionsResponse": {
+        "type": "object",
+        "required": [
+          "instance_id",
+          "archived_sessions"
+        ],
+        "properties": {
+          "archived_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sessions flipped by THIS call. A repeat call reports 0."
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
