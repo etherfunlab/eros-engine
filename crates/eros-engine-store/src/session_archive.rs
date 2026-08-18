@@ -35,10 +35,10 @@ impl<'a> SessionArchiveRepo<'a> {
     ///
     /// `companion_affinity_events` goes with its parent through the existing
     /// ON DELETE CASCADE — accepted, not worked around. The audit tables an
-    /// operator needs (`companion_decision_events`, `llm_attempt_audit`,
+    /// operator needs (`companion_decision_events`, `character_insights_events`,
     /// `chat_vision_events`, `chat_images_events`) hold `session_id` without a
     /// foreign key and are untouched; with the transcript now surviving too,
-    /// those records finally point at something readable.
+    /// those records still point at something readable.
     ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
@@ -310,6 +310,68 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!archived, "another user's session must stay visible");
+    }
+
+    /// The other half of the predicate: `(user_id, instance_id)`, not
+    /// `user_id` alone. Without `AND instance_id = $2` on the
+    /// `companion_memories` delete, archiving one relationship would erase
+    /// every relationship-layer memory the user holds with every companion —
+    /// and `leaves_another_users_sessions_alone` above would not catch it,
+    /// since that test only varies `user_id`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn leaves_the_same_users_other_instance_alone(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_a = seed_persona_instance(&pool, user_id).await;
+        let instance_b = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_a).await;
+        let session_b = seed_relationship(&pool, user_id, instance_b).await;
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_a)
+            .await
+            .unwrap();
+
+        let archived: bool =
+            sqlx::query_scalar("SELECT archived FROM engine.chat_sessions WHERE id = $1")
+                .bind(session_b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !archived,
+            "the other instance's session must stay unarchived"
+        );
+
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.companion_memories WHERE instance_id = $1",
+                instance_b,
+            )
+            .await,
+            1,
+            "the other instance's relationship-layer memory must survive"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.companion_affinity WHERE instance_id = $1",
+                instance_b,
+            )
+            .await,
+            1,
+            "the other instance's affinity row must survive"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM engine.character_insights WHERE instance_id = $1",
+                instance_b,
+            )
+            .await,
+            1,
+            "the other instance's character insight row must survive"
+        );
     }
 
     /// The API-facing choke point. Every entry-point guard resolves a session

@@ -70,6 +70,20 @@ pub async fn run(
     plan: ActionPlan,
     produced: Vec<ProducedMessage>,
 ) {
+    // The archive endpoint can land between the turn and this detached task. An
+    // archived session resolves to None (migration 0052), and continuing would
+    // rewrite the three tables that endpoint just deleted — putting a
+    // companion_affinity row back, pointing at a session every read route now 404s.
+    let session_still_live = ChatRepo { pool: &state.pool }
+        .get_session(session_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !session_still_live {
+        return;
+    }
+
     let user_msg = match &event {
         Event::UserMessage { content, .. } => content.clone(),
         _ => String::new(),
@@ -2876,5 +2890,112 @@ mod tests {
             "a failed load must abort before structuring; got {stages:?}"
         );
         assert_eq!(stages[0].0, "extraction");
+    }
+
+    /// Pins the Fix 2 guard: the archive endpoint can land between a turn and
+    /// this detached task, and `run` must notice before doing any work. The
+    /// state built by `test_state` has no wiremock behind it — `write_turn`'s
+    /// embedding call and the affinity evaluator both point at real hosts —
+    /// so if the guard were missing, or placed after the point where any of
+    /// those calls fire, this test would hang or fail on a real network
+    /// attempt instead of completing. A non-empty user message and produced
+    /// text are used deliberately, so every future inside `run` has
+    /// something to act on if the guard does not stop it first.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_is_a_noop_on_an_archived_session(pool: sqlx::PgPool) {
+        use eros_engine_store::session_archive::SessionArchiveRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let event = Event::UserMessage {
+            content: "还记得我们上次聊到的事吗".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            history_anchor: Default::default(),
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_tone: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: "记得呀".into(),
+            action: ActionType::ReplyText,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            event,
+            plan,
+            produced,
+        )
+        .await;
+
+        let affinity: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_affinity WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            affinity, 0,
+            "the guard must stop persist_affinity from recreating the row"
+        );
+
+        let memories: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_memories WHERE user_id = $1 AND instance_id = $2",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            memories, 0,
+            "the guard must stop write_turn from regrowing relationship memory"
+        );
+
+        let insights: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            insights, 0,
+            "the guard must stop character insight extraction from writing a row"
+        );
     }
 }
