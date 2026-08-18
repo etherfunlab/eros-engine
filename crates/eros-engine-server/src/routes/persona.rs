@@ -25,7 +25,7 @@ use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
     compose_inputs_json, compose_user_payload, parse_compose_reply, record_compose_event,
-    run_image_prompt_compose, StreamErrorCode, FILTER_TIMEOUT,
+    run_image_prompt_compose, stream_error_code_for, StreamErrorCode, FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -639,8 +639,12 @@ async fn compose_stream(
         yield ComposeFrame::Delta { content: first };
         // `failure` is Some once this attempt can no longer produce a `done`.
         // There is no chain left to walk mid-stream, so it becomes an in-band
-        // error frame instead of a status code.
+        // error frame instead of a status code. `failure_kind` carries the
+        // same fact as a typed `AttemptFailure` alongside it, purely so the
+        // wire error's `code` / `retryable` can be derived rather than
+        // hardcoded — `message` keeps its own hand-written text.
         let mut failure: Option<String> = None;
+        let mut failure_kind: Option<eros_engine_llm::failure::AttemptFailure> = None;
         loop {
             match tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut delta_stream)).await {
                 Ok(Some(Ok(chunk))) => {
@@ -662,6 +666,11 @@ async fn compose_stream(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(error = %e, "compose endpoint: stream died mid-flight");
+                    failure_kind = Some(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                        "chat_image_prompt_compose",
+                        served_model.as_deref().unwrap_or(attempted_model.as_str()),
+                        &e,
+                    ));
                     failure = Some(format!("composer stream failed: {e}"));
                     break;
                 }
@@ -672,6 +681,14 @@ async fn compose_stream(
                     // guard held by this stream — would live until the client
                     // gave up. Mirrors the chat path's STREAM_TOTAL_TIMEOUT.
                     tracing::warn!("compose endpoint: total timeout while streaming");
+                    failure_kind = Some(eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: "chat_image_prompt_compose".into(),
+                            model: Some(attempted_model.clone()),
+                            kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                            message: "composer stream timed out".into(),
+                        },
+                    ));
                     failure = Some("composer stream timed out".into());
                     break;
                 }
@@ -725,9 +742,20 @@ async fn compose_stream(
                     },
                 )
                 .await;
+                let (code, retryable) = failure_kind
+                    .as_ref()
+                    .map(|f| {
+                        (
+                            stream_error_code_for(f),
+                            eros_engine_llm::failure::is_retryable_status(
+                                eros_engine_llm::failure::response_status_for(f),
+                            ),
+                        )
+                    })
+                    .unwrap_or((StreamErrorCode::UpstreamUnavailable, true));
                 yield ComposeFrame::Error {
-                    code: StreamErrorCode::UpstreamUnavailable,
-                    retryable: true,
+                    code,
+                    retryable,
                     message,
                     user_message: "服务出现问题，请稍后再试".into(),
                 };
@@ -767,9 +795,28 @@ async fn compose_stream(
                     },
                 )
                 .await;
+                // The provider answered (200 OK) but produced nothing the
+                // composer's own contract can use — a decode-shaped gateway
+                // fact (same classification `AttemptFailure::from_llm_error`
+                // gives a byte-BPE garble), not a transport/status failure.
+                let no_usable_prompt = eros_engine_llm::failure::AttemptFailure::Gateway(
+                    eros_engine_llm::failure::GatewayError {
+                        task: "chat_image_prompt_compose".into(),
+                        model: Some(
+                            served_model
+                                .as_deref()
+                                .unwrap_or(attempted_model.as_str())
+                                .to_string(),
+                        ),
+                        kind: eros_engine_llm::failure::GatewayKind::Decode,
+                        message: "composer returned no usable prompt".into(),
+                    },
+                );
                 yield ComposeFrame::Error {
-                    code: StreamErrorCode::UpstreamUnavailable,
-                    retryable: true,
+                    code: stream_error_code_for(&no_usable_prompt),
+                    retryable: eros_engine_llm::failure::is_retryable_status(
+                        eros_engine_llm::failure::response_status_for(&no_usable_prompt),
+                    ),
                     message: "composer returned no usable prompt".into(),
                     user_message: "服务出现问题，请稍后再试".into(),
                 };

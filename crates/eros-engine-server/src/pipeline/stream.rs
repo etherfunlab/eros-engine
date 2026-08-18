@@ -13,12 +13,11 @@ use ulid::Ulid;
 
 /// Stream-level error code enum. Renders to the spec's lowercase string.
 ///
-/// `RateLimited` and `Timeout` are spec-defined codes (§1.5) reserved for
-/// the per-stream rate-limit and 120s hard-timeout enforcement that the
-/// 0.2 generator does not yet implement (open §1.9 follow-up).
+/// `RateLimited` and `Timeout` are spec-defined codes (§1.5). Both are now
+/// derived from the failure in hand by [`stream_error_code_for`] rather than
+/// hardcoded, so every construction site can reach them.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
 pub enum StreamErrorCode {
     UpstreamUnavailable,
     RateLimited,
@@ -88,12 +87,29 @@ pub enum ProtocolFrame {
         tier: Option<String>,
         retries_chat: u32,
         retries_filter: u32,
+        /// Upstream attempts that failed this turn (chat model chain, output
+        /// filter, input filter), even on a turn that recovered or served a
+        /// pseudo-ghost — the non-fatal channel (spec §6.1). Affinity eval and
+        /// vision are deliberately excluded; see `docs/superpowers/specs/
+        /// 2026-08-18-llm-error-audit-design.md` §6.1.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        llm_attempts: Vec<eros_engine_llm::failure::UpstreamAttempt>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gateway_errors: Vec<eros_engine_llm::failure::GatewayError>,
     },
     Error {
         code: StreamErrorCode,
         retryable: bool,
         message: String,
         user_message: String,
+        /// The upstream's own HTTP status, verbatim, when the failure this
+        /// error reports was an [`eros_engine_llm::failure::AttemptFailure::Upstream`].
+        /// `None` for a gateway-layer failure (no status the provider
+        /// actually returned) or when no failure is in hand at all.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        upstream_status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_code: Option<String>,
     },
     /// Delegated image turn: the engine composed the prompt and hands drawing to
     /// the consumer. The engine never draws — this frame is the engine's only
@@ -249,6 +265,12 @@ pub struct BurstOutcome {
     /// True when this burst ended as an empty-reply ghost fallback. The caller
     /// skips affinity side-effects (the ghost_streak reset) when set.
     pub ghost_fallback: bool,
+    /// The chat-chain (+ output-filter, when it ran) failures behind however
+    /// this burst concluded — set at every non-fatal exit (served, ghost
+    /// fallback, pseudo-ghost, garble-repaired) so the caller's `final` frame
+    /// can carry them. Left empty on a fatal `ProtocolFrame::Error` exit,
+    /// where the caller returns without reading `outcome` at all.
+    pub failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
@@ -295,6 +317,8 @@ fn drive_chat_burst(
                 retryable: false,
                 message: "no models configured".into(),
                 user_message: "服务出现问题，请稍后再试".into(),
+                upstream_status: None,
+                provider_code: None,
             };
             return;
         }
@@ -717,6 +741,11 @@ fn drive_chat_burst(
                     // ever sees this ghost's empty full_text, never a partial
                     // truncated attempt from earlier in the chain.
                     o.produced.retain(|m| m.message_id == msg_uuid);
+                    // Earlier candidates in this chain may have failed for real
+                    // (transport/status) before landing on this accepted-empty
+                    // ghost — the `final` frame is the non-fatal channel that
+                    // surfaces them even though the turn itself served fine.
+                    o.failures = chain_failures.clone();
                     return;
                 }
                 // (A non-last empty completion is now marked `truncated` above,
@@ -738,6 +767,9 @@ fn drive_chat_burst(
                     if regex_ghost {
                         o.ghost_fallback = true;
                     }
+                    // A turn that recovered still reports what earlier candidates
+                    // said (spec §6.1's non-fatal channel).
+                    o.failures = chain_failures.clone();
                     return;
                 }
                 if idx + 1 == chain.len() {
@@ -750,7 +782,7 @@ fn drive_chat_burst(
                         // the last (failed) bubble the client saw with that repaired
                         // text (issue #84, P1) — even if the FINAL attempt failed
                         // differently (e.g. transport), so the salvage isn't lost.
-                        let (frames, produced) = build_garble_repaired_replacement(
+                        let (frames, produced, failures) = build_garble_repaired_replacement(
                             &state.pool,
                             session_id,
                             user_message_id,
@@ -773,6 +805,7 @@ fn drive_chat_burst(
                             let mut o = outcome.lock().unwrap();
                             o.produced.clear();
                             o.produced.push(produced);
+                            o.failures = failures;
                         }
                         for f in frames { yield f; }
                         return;
@@ -799,7 +832,7 @@ fn drive_chat_burst(
                     )
                     .await
                     {
-                        Some((frames, produced)) => {
+                        Some((frames, produced, failures)) => {
                             // Replace any truncated-attempt entries already in
                             // outcome.produced with just the pseudo-ghost — so
                             // post_process (memory / affinity / insight) runs on
@@ -811,15 +844,26 @@ fn drive_chat_burst(
                                 let mut o = outcome.lock().unwrap();
                                 o.produced.clear();
                                 o.produced.push(produced);
+                                // The pseudo-ghost looks like an ordinary short
+                                // reply to the end user; the failures behind it
+                                // ride the non-fatal `final` channel instead.
+                                o.failures = failures;
                             }
                             for f in frames { yield f; }
                         }
                         None => {
+                            // No fallback phrase configured — this IS the fatal
+                            // channel, so derive from the chain's own last
+                            // attempt rather than hardcoding.
+                            let (code, retryable, upstream_status, provider_code) =
+                                error_frame_fields_from_last(&chain_failures);
                             yield ProtocolFrame::Error {
-                                code: StreamErrorCode::UpstreamUnavailable,
-                                retryable: true,
+                                code,
+                                retryable,
                                 message: "all fallback models truncated".into(),
                                 user_message: "AI 服务暂时不可用，稍后再试".into(),
+                                upstream_status,
+                                provider_code,
                             };
                         }
                     }
@@ -1052,6 +1096,10 @@ fn drive_chat_burst(
                                 full_text: String::new(),
                                 action: plan_action,
                             });
+                        // Earlier candidates may have failed for real before
+                        // landing on this accepted-empty ghost — the `final`
+                        // frame is the non-fatal channel that surfaces them.
+                        o.failures = chain_failures.clone();
                     }
                     yield ProtocolFrame::Meta {
                         message_id: ulid_string(msg_ulid),
@@ -1102,7 +1150,7 @@ fn drive_chat_burst(
                     )
                     .await
                     {
-                        Some((frames, produced)) => {
+                        Some((frames, produced, failures)) => {
                             // Replace any truncated-attempt entries already in
                             // outcome.produced with just the pseudo-ghost — so
                             // post_process (memory / affinity / insight) runs on
@@ -1114,15 +1162,23 @@ fn drive_chat_burst(
                                 let mut o = outcome.lock().unwrap();
                                 o.produced.clear();
                                 o.produced.push(produced);
+                                o.failures = failures;
                             }
                             for f in frames { yield f; }
                         }
                         None => {
+                            // No fallback phrase configured — the fatal
+                            // channel, so derive from the chain's own last
+                            // attempt rather than hardcoding.
+                            let (code, retryable, upstream_status, provider_code) =
+                                error_frame_fields_from_last(&chain_failures);
                             yield ProtocolFrame::Error {
-                                code: StreamErrorCode::UpstreamUnavailable,
-                                retryable: true,
+                                code,
+                                retryable,
                                 message: "all fallback models truncated".into(),
                                 user_message: "AI 服务暂时不可用，稍后再试".into(),
+                                upstream_status,
+                                provider_code,
                             };
                         }
                     }
@@ -1318,8 +1374,16 @@ fn drive_chat_burst(
 
             let mut wire_usage = usage_full;
             filter_usage_keys(&mut wire_usage, &state.config.openrouter_usage_hidden_keys);
-            if is_ghost {
-                outcome.lock().unwrap().ghost_fallback = true;
+            {
+                let mut o = outcome.lock().unwrap();
+                if is_ghost {
+                    o.ghost_fallback = true;
+                }
+                // A turn that recovered still reports what the chat chain and
+                // the output filter chain said (spec §6.1's non-fatal channel);
+                // `chain_failures` already carries the filter chain's own
+                // failures via the `extend` calls above.
+                o.failures = chain_failures.clone();
             }
             yield ProtocolFrame::Done {
                 message_id: ulid_string(msg_ulid),
@@ -1570,6 +1634,89 @@ pub(crate) fn split_failures(
         j(ups.is_empty(), serde_json::json!(ups)),
         j(gws.is_empty(), serde_json::json!(gws)),
     )
+}
+
+/// Split one accumulated failure list into the two TYPED vectors the `final`
+/// frame carries. Sibling of `split_failures`, for the wire instead of the
+/// database — takes the same already-typed accumulator directly, no JSON
+/// round-trip.
+fn split_failures_typed(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+) -> (
+    Vec<eros_engine_llm::failure::UpstreamAttempt>,
+    Vec<eros_engine_llm::failure::GatewayError>,
+) {
+    use eros_engine_llm::failure::AttemptFailure;
+    let mut ups = Vec::new();
+    let mut gws = Vec::new();
+    for f in failures {
+        match f {
+            AttemptFailure::Upstream(a) => ups.push(a.clone()),
+            AttemptFailure::Gateway(g) => gws.push(g.clone()),
+        }
+    }
+    (ups, gws)
+}
+
+/// Derive the wire code from the failure rather than hardcoding it. Both
+/// `RateLimited` and `Timeout` were declared and never constructed; this is
+/// what finally reaches them.
+pub(crate) fn stream_error_code_for(
+    f: &eros_engine_llm::failure::AttemptFailure,
+) -> StreamErrorCode {
+    use eros_engine_llm::failure::{AttemptFailure, GatewayKind};
+    match f {
+        AttemptFailure::Upstream(a) if a.http_status == 429 => StreamErrorCode::RateLimited,
+        AttemptFailure::Upstream(_) => StreamErrorCode::UpstreamUnavailable,
+        AttemptFailure::Gateway(g) => match g.kind {
+            GatewayKind::OpenTimeout | GatewayKind::TotalTimeout | GatewayKind::IdleTimeout => {
+                StreamErrorCode::Timeout
+            }
+            GatewayKind::Config => StreamErrorCode::Internal,
+            _ => StreamErrorCode::UpstreamUnavailable,
+        },
+    }
+}
+
+/// The error frame's `upstream_status` / `provider_code` pair. Only an
+/// `Upstream` failure carries either — a `Gateway` failure has no HTTP status
+/// the provider actually returned, so both are `None` there (spec §6.3: "When
+/// the failure has no status... a timeout maps to 504 and everything else to
+/// 502", which is an internal routing detail, not something the wire echoes
+/// as an `upstream_status`).
+pub(crate) fn upstream_status_and_code_for(
+    f: &eros_engine_llm::failure::AttemptFailure,
+) -> (Option<u16>, Option<String>) {
+    match f {
+        eros_engine_llm::failure::AttemptFailure::Upstream(a) => {
+            (Some(a.http_status), a.provider_code.clone())
+        }
+        eros_engine_llm::failure::AttemptFailure::Gateway(_) => (None, None),
+    }
+}
+
+/// The four failure-dependent `error` frame fields, derived from the LAST
+/// entry of an accumulated failure list — used at every chain-exhaustion
+/// site so a genuinely-empty accumulator (no failure in hand) still falls
+/// back to the pre-Task-8 literals rather than panicking.
+fn error_frame_fields_from_last(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+) -> (StreamErrorCode, bool, Option<u16>, Option<String>) {
+    match failures.last() {
+        Some(f) => {
+            let (upstream_status, provider_code) = upstream_status_and_code_for(f);
+            let retryable = eros_engine_llm::failure::is_retryable_status(
+                eros_engine_llm::failure::response_status_for(f),
+            );
+            (
+                stream_error_code_for(f),
+                retryable,
+                upstream_status,
+                provider_code,
+            )
+        }
+        None => (StreamErrorCode::UpstreamUnavailable, true, None, None),
+    }
 }
 
 /// Run the output-filter LLM over `original`, walking the (already
@@ -3335,6 +3482,7 @@ async fn build_stream_failure_pseudo_ghost(
 ) -> Option<(
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
+    Vec<eros_engine_llm::failure::AttemptFailure>,
 )> {
     let repo = ErrorHandlingRepo { pool };
     let phrase = match repo.pick_chat_stream_fallback_phrase().await {
@@ -3443,7 +3591,7 @@ async fn build_stream_failure_pseudo_ghost(
         full_text: phrase,
         action: plan_action,
     };
-    Some((frames, produced))
+    Some((frames, produced, failures))
 }
 
 /// Emit a replacement bubble carrying the REPAIRED text after the chain ended on
@@ -3476,6 +3624,7 @@ async fn build_garble_repaired_replacement(
 ) -> (
     Vec<ProtocolFrame>,
     crate::pipeline::post_process::ProducedMessage,
+    Vec<eros_engine_llm::failure::AttemptFailure>,
 ) {
     let msg_ulid = Ulid::new();
     let msg_uuid: Uuid = msg_ulid.into();
@@ -3563,7 +3712,7 @@ async fn build_garble_repaired_replacement(
         full_text: repaired,
         action: plan_action,
     };
-    (frames, produced)
+    (frames, produced, failures)
 }
 
 /// All persisted bits needed to drive a streaming burst.
@@ -3618,6 +3767,8 @@ pub fn run_stream(
                         retryable: false,
                         message: "persona instance not found".into(),
                         user_message: "服务出现问题，请稍后再试".into(),
+                        upstream_status: None,
+                        provider_code: None,
                     };
                     return;
                 }
@@ -3639,6 +3790,8 @@ pub fn run_stream(
                     retryable: false,
                     message: format!("affinity load failed: {e}"),
                     user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
                 };
                 return;
             }
@@ -3654,6 +3807,8 @@ pub fn run_stream(
                     retryable: false,
                     message: format!("signals failed: {e}"),
                     user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
                 };
                 return;
             }
@@ -3883,7 +4038,11 @@ pub fn run_stream(
                     generation_id: None,
                     ghost_fallback: false,
                 };
-                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
+                // The judge itself is not yet wired into the typed failure
+                // accumulator (spec §6.1 names it, but that migration is a
+                // later task) — nothing else ran this turn either way.
+                let final_frame =
+                    build_final_frame(false, None, user_msg.tier.clone(), 0, 0, vec![], vec![]);
                 yield final_frame;
             }
             ActionType::ProductQa => {
@@ -4115,12 +4274,18 @@ pub fn run_stream(
                             // 409 until a row exists.) No row means nowhere to write
                             // the accumulated failures — they stay in the logs, as
                             // they did before. Manufacturing a row here just to hold
-                            // them would change replay/idempotency semantics.
+                            // them would change replay/idempotency semantics. This
+                            // Error frame is now the ONLY place those codes can
+                            // surface, so derive rather than hardcode.
+                            let (code, retryable, upstream_status, provider_code) =
+                                error_frame_fields_from_last(&chain_failures);
                             yield ProtocolFrame::Error {
-                                code: StreamErrorCode::UpstreamUnavailable,
-                                retryable: true,
+                                code,
+                                retryable,
                                 message: "product_qa generation failed on all candidates".into(),
                                 user_message: "服务暂时不可用，请稍后再试".into(),
+                                upstream_status,
+                                provider_code,
                             };
                             return;
                         }
@@ -4171,7 +4336,19 @@ pub fn run_stream(
                     generation_id: last_gen_id,
                     ghost_fallback: false,
                 };
-                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
+                // product_qa is part of the chat model chain (spec §3, same
+                // `chat_messages` table, distinguished only by `task`) — a
+                // served answer still reports what an earlier candidate said.
+                let (pqa_attempts, pqa_gateways) = split_failures_typed(&chain_failures);
+                let final_frame = build_final_frame(
+                    false,
+                    None,
+                    user_msg.tier.clone(),
+                    0,
+                    0,
+                    pqa_attempts,
+                    pqa_gateways,
+                );
                 yield final_frame;
             }
             ActionType::ReplyText | ActionType::ReplyImage | ActionType::ReplyTextImage => {
@@ -4282,8 +4459,18 @@ pub fn run_stream(
                     {
                         tracing::warn!("stream: ghost streak reset failed: {e}");
                     }
-                    let final_frame =
-                        build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
+                    // Image prompt compose is not yet wired into the typed
+                    // failure accumulator (spec §6.1 names it, but that
+                    // migration is a later task).
+                    let final_frame = build_final_frame(
+                        false,
+                        None,
+                        user_msg.tier.clone(),
+                        0,
+                        0,
+                        vec![],
+                        vec![],
+                    );
                     yield final_frame;
 
                     let state_bg = (*state).clone();
@@ -4449,6 +4636,11 @@ pub fn run_stream(
                 // on the SAME text as the chat model is what stops the picture
                 // drifting from the reply.
                 let mut effective_user_msg = user_msg.content.clone();
+                // Hoisted above the `if let` below so the `final` frame (built
+                // after drive_chat_burst, further down) can still see it — the
+                // input filter is one of spec §6.1's non-fatal chains.
+                let mut input_filter_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
+                    Vec::new();
                 if user_msg.tips_amount_usd.is_none() {
                     // Per-turn probability gate: `input_filter = 0.8` ⇒ fire on
                     // ~80% of turns; `true` ⇒ probability 1.0 ⇒ always (gen::<f64>()
@@ -4482,6 +4674,7 @@ pub fn run_stream(
                         // `set_user_input_rewrite` (fires only on success)
                         // leaves behind. Must never fail the turn.
                         let (ia, ig) = split_failures(&in_failures);
+                        input_filter_failures = in_failures;
                         if ia.is_some() || ig.is_some() {
                             if let Err(e) = chat_repo
                                 .set_user_llm_failures(user_msg.user_message_id, ia, ig)
@@ -4574,6 +4767,8 @@ pub fn run_stream(
                             retryable: false,
                             message: format!("build_reply_request failed: {e}"),
                             user_message: "服务出现问题，请稍后再试".into(),
+                            upstream_status: None,
+                            provider_code: None,
                         };
                         return;
                     }
@@ -4652,9 +4847,16 @@ pub fn run_stream(
                         yield frame;
                     }
                 }
-                let (produced, did_filter, retries_chat, retries_filter, ghost_fallback) = {
+                let (produced, did_filter, retries_chat, retries_filter, ghost_fallback, burst_failures) = {
                     let g = outcome.lock().unwrap();
-                    (g.produced.clone(), g.filtered, g.retries_chat, g.retries_filter, g.ghost_fallback)
+                    (
+                        g.produced.clone(),
+                        g.filtered,
+                        g.retries_chat,
+                        g.retries_filter,
+                        g.ghost_fallback,
+                        g.failures.clone(),
+                    )
                 };
 
                 // Reset ghost streak (mirrors sync pipeline policy). A ghost
@@ -4753,12 +4955,19 @@ pub fn run_stream(
                     }
                 }
 
+                // Chronological order: the input filter runs before
+                // drive_chat_burst, so its failures (if any) lead the list.
+                let mut turn_failures = input_filter_failures;
+                turn_failures.extend(burst_failures);
+                let (turn_attempts, turn_gateways) = split_failures_typed(&turn_failures);
                 let final_frame = build_final_frame(
                     did_filter,
                     prompt_injected.clone(),
                     user_msg.tier.clone(),
                     retries_chat,
                     retries_filter,
+                    turn_attempts,
+                    turn_gateways,
                 );
                 yield final_frame;
 
@@ -4801,8 +5010,9 @@ pub fn run_stream(
                 });
             }
             _ => {
-                // Proactive and any future variants: Final-only.
-                let final_frame = build_final_frame(false, None, user_msg.tier.clone(), 0, 0);
+                // Proactive and any future variants: Final-only, no chain ran.
+                let final_frame =
+                    build_final_frame(false, None, user_msg.tier.clone(), 0, 0, vec![], vec![]);
                 yield final_frame;
             }
         }
@@ -4811,12 +5021,20 @@ pub fn run_stream(
 
 /// Build the spec's `final` frame. Assembled purely from turn-local values
 /// since the lead/CTA teardown (spec 2026-08-11) — no DB reads.
+///
+/// `llm_attempts` / `gateway_errors` are the typed, already-split failure
+/// lists for whichever chains ran this turn (spec §6.1) — empty when nothing
+/// failed, or when this turn's action never runs a chain that is wired into
+/// the typed accumulator yet (image-only reply, ghost, proactive, replay).
+#[allow(clippy::too_many_arguments)]
 fn build_final_frame(
     filtered: bool,
     prompt_injected: Option<Vec<String>>,
     tier: Option<String>,
     retries_chat: u32,
     retries_filter: u32,
+    llm_attempts: Vec<eros_engine_llm::failure::UpstreamAttempt>,
+    gateway_errors: Vec<eros_engine_llm::failure::GatewayError>,
 ) -> ProtocolFrame {
     ProtocolFrame::Final {
         filtered,
@@ -4824,6 +5042,8 @@ fn build_final_frame(
         tier,
         retries_chat,
         retries_filter,
+        llm_attempts,
+        gateway_errors,
     }
 }
 
@@ -4930,16 +5150,22 @@ pub fn replay_stream(
                 .iter()
                 .any(|r| r.channel.as_deref() == Some("product_qa"));
             if !rows.is_empty() && !product_qa_chain && rows.iter().all(|r| r.truncated) {
+                // `ChatMessage` does not carry the persisted `llm_attempts` /
+                // `gateway_errors` columns back out (they were never selected
+                // for replay), so there is no typed failure in hand here —
+                // same treatment as the other "no failure to report" sites.
                 yield ProtocolFrame::Error {
                     code: StreamErrorCode::UpstreamUnavailable,
                     retryable: true,
                     message: "all fallback models truncated (replayed)".into(),
                     user_message: "AI 服务暂时不可用，稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
                 };
                 return;
             }
         }
-        let final_frame = build_final_frame(false, None, None, 0, 0);
+        let final_frame = build_final_frame(false, None, None, 0, 0, vec![], vec![]);
         yield final_frame;
     }
 }
@@ -5285,6 +5511,8 @@ mod tests {
             tier: Some("gold".into()),
             retries_chat: 1,
             retries_filter: 0,
+            llm_attempts: vec![],
+            gateway_errors: vec![],
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "final");
@@ -5300,6 +5528,8 @@ mod tests {
             tier: None,
             retries_chat: 0,
             retries_filter: 0,
+            llm_attempts: vec![],
+            gateway_errors: vec![],
         };
         let v2: serde_json::Value = serde_json::to_value(&f2).unwrap();
         assert!(v2["prompt_injected"].is_null());
@@ -5314,11 +5544,125 @@ mod tests {
             retryable: true,
             message: "internal".into(),
             user_message: "AI 服务暂时不可用，稍后再试".into(),
+            upstream_status: None,
+            provider_code: None,
         };
         let v: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], "error");
         assert_eq!(v["code"], "upstream_unavailable");
         assert_eq!(v["retryable"], true);
+    }
+
+    #[test]
+    fn stream_error_code_is_derived_not_hardcoded() {
+        use eros_engine_llm::failure::{
+            AttemptFailure, GatewayError, GatewayKind, UpstreamAttempt,
+        };
+        let up = |status| {
+            AttemptFailure::Upstream(UpstreamAttempt {
+                task: "chat_companion".into(),
+                model: "m".into(),
+                http_status: status,
+                provider_code: None,
+                error_type: None,
+                upstream_provider_code: None,
+                retry_after_s: None,
+                message: "x".into(),
+            })
+        };
+        // RateLimited and Timeout have never been constructed anywhere until now.
+        assert_eq!(
+            stream_error_code_for(&up(429)),
+            StreamErrorCode::RateLimited
+        );
+        assert_eq!(
+            stream_error_code_for(&up(529)),
+            StreamErrorCode::UpstreamUnavailable
+        );
+        assert_eq!(
+            stream_error_code_for(&up(570)),
+            StreamErrorCode::UpstreamUnavailable,
+            "an unknown 5xx still reads as upstream"
+        );
+        let gw = |kind| {
+            AttemptFailure::Gateway(GatewayError {
+                task: "chat_companion".into(),
+                model: None,
+                kind,
+                message: "x".into(),
+            })
+        };
+        assert_eq!(
+            stream_error_code_for(&gw(GatewayKind::OpenTimeout)),
+            StreamErrorCode::Timeout
+        );
+        assert_eq!(
+            stream_error_code_for(&gw(GatewayKind::Transport)),
+            StreamErrorCode::UpstreamUnavailable
+        );
+    }
+
+    #[test]
+    fn final_frame_omits_both_lists_when_nothing_failed() {
+        let f = ProtocolFrame::Final {
+            filtered: false,
+            prompt_injected: None,
+            tier: None,
+            retries_chat: 0,
+            retries_filter: 0,
+            llm_attempts: vec![],
+            gateway_errors: vec![],
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("llm_attempts"), "{v}");
+        assert!(!obj.contains_key("gateway_errors"), "{v}");
+    }
+
+    #[test]
+    fn final_frame_carries_the_failures_of_a_pseudo_ghost_turn() {
+        use eros_engine_llm::failure::{GatewayError, GatewayKind, UpstreamAttempt};
+        let f = ProtocolFrame::Final {
+            filtered: false,
+            prompt_injected: None,
+            tier: None,
+            retries_chat: 2,
+            retries_filter: 0,
+            llm_attempts: vec![UpstreamAttempt {
+                task: "chat_companion".into(),
+                model: "a/m".into(),
+                http_status: 529,
+                provider_code: Some("529".into()),
+                error_type: None,
+                upstream_provider_code: None,
+                retry_after_s: None,
+                message: "code=529: Overloaded".into(),
+            }],
+            gateway_errors: vec![GatewayError {
+                task: "chat_companion".into(),
+                model: None,
+                kind: GatewayKind::ChainExhausted,
+                message: "all 2 candidates failed".into(),
+            }],
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["llm_attempts"][0]["http_status"], 529);
+        assert_eq!(v["gateway_errors"][0]["kind"], "chain_exhausted");
+    }
+
+    #[test]
+    fn error_frame_exposes_the_upstream_status() {
+        let f = ProtocolFrame::Error {
+            code: StreamErrorCode::UpstreamUnavailable,
+            retryable: true,
+            message: "all fallback models failed".into(),
+            user_message: "AI 服务暂时不可用，稍后再试".into(),
+            upstream_status: Some(529),
+            provider_code: Some("529".into()),
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["upstream_status"], 529);
+        assert_eq!(v["provider_code"], "529");
     }
 
     #[test]

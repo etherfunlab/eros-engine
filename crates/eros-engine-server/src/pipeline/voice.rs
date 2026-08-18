@@ -24,7 +24,8 @@ use eros_engine_store::persona::PersonaRepo;
 use crate::memory_hygiene::prune_recalled;
 use crate::pipeline::handlers::{human_insights_to_bullets, recall_memory, RecallTier};
 use crate::pipeline::stream::{
-    ulid_string, ProtocolFrame, StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
+    stream_error_code_for, ulid_string, upstream_status_and_code_for, ProtocolFrame,
+    StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
 use crate::prompt::render_recall_sections;
 use crate::state::AppState;
@@ -545,6 +546,8 @@ pub fn run_voice_turn(
                     retryable: false,
                     message: "persona instance not found".into(),
                     user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
                 };
                 return;
             }
@@ -561,6 +564,8 @@ pub fn run_voice_turn(
                     retryable: true,
                     message: "history read failed".into(),
                     user_message: "服务出现问题，请稍后再试".into(),
+                    upstream_status: None,
+                    provider_code: None,
                 };
                 return;
             }
@@ -694,6 +699,12 @@ pub fn run_voice_turn(
             ..Default::default()
         };
 
+        // Every genuine transport/status failure this chain walked over —
+        // mirrors the text pipeline's `chain_failures` (stream.rs), kept
+        // local to this function purely so the empty-chain Error frame below
+        // can derive its `code` / `retryable` / `upstream_status` /
+        // `provider_code` instead of hardcoding them.
+        let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
         'candidates: for model_id in candidates {
             // Per-attempt metadata: reset so an abandoned candidate's usage / gen_id /
             // model / truncated never leaks onto a later fallback's reply.
@@ -711,6 +722,11 @@ pub fn run_voice_turn(
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(model = %model_id, error = %e, "voice: open stream failed");
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                        "chat_voice",
+                        &model_id,
+                        &e,
+                    ));
                     if acc.is_empty() { continue 'candidates; }
                     truncated = true;
                     break 'candidates;
@@ -721,6 +737,17 @@ pub fn run_voice_turn(
                         "voice: open timeout ({}s)",
                         STREAM_OPEN_TIMEOUT.as_secs()
                     );
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: "chat_voice".into(),
+                            model: Some(model_id.clone()),
+                            kind: eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                            message: format!(
+                                "voice open timeout after {}s",
+                                STREAM_OPEN_TIMEOUT.as_secs()
+                            ),
+                        },
+                    ));
                     if acc.is_empty() { continue 'candidates; }
                     truncated = true;
                     break 'candidates;
@@ -744,6 +771,17 @@ pub fn run_voice_turn(
                             "voice: total timeout ({}s)",
                             STREAM_TOTAL_TIMEOUT.as_secs()
                         );
+                        chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                            eros_engine_llm::failure::GatewayError {
+                                task: "chat_voice".into(),
+                                model: Some(model_id.clone()),
+                                kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                                message: format!(
+                                    "voice total timeout after {}s",
+                                    STREAM_TOTAL_TIMEOUT.as_secs()
+                                ),
+                            },
+                        ));
                         if acc.is_empty() { continue 'candidates; }
                         truncated = true;
                         break 'candidates;
@@ -771,6 +809,11 @@ pub fn run_voice_turn(
                     }
                     Some(Err(e)) => {
                         tracing::warn!(model = %model_id, error = %e, "voice: mid-stream error");
+                        chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                            "chat_voice",
+                            &model_id,
+                            &e,
+                        ));
                         if acc.is_empty() { continue 'candidates; }
                         truncated = true;
                         break 'candidates;
@@ -792,11 +835,28 @@ pub fn run_voice_turn(
         // only metadata (id/model) and then errored or ended without content
         // — is an upstream failure. Never emit an empty `done`.
         if acc.is_empty() {
+            let (code, retryable) = chain_failures
+                .last()
+                .map(|f| {
+                    (
+                        stream_error_code_for(f),
+                        eros_engine_llm::failure::is_retryable_status(
+                            eros_engine_llm::failure::response_status_for(f),
+                        ),
+                    )
+                })
+                .unwrap_or((StreamErrorCode::UpstreamUnavailable, true));
+            let (upstream_status, provider_code) = chain_failures
+                .last()
+                .map(upstream_status_and_code_for)
+                .unwrap_or((None, None));
             yield ProtocolFrame::Error {
-                code: StreamErrorCode::UpstreamUnavailable,
-                retryable: true,
+                code,
+                retryable,
                 message: "voice generation failed on all candidates".into(),
                 user_message: "对方暂时说不出话，请稍后再试".into(),
+                upstream_status,
+                provider_code,
             };
             return;
         }
