@@ -176,6 +176,17 @@ impl<'a> PersonaRepo<'a> {
         .await
     }
 
+    /// The instance's owner, whatever its `status`. Deliberately unlike
+    /// `load_instance_gate`, which filters `status = 'active'`: a client may
+    /// archive the conversations of a relationship it has already marked
+    /// dormant, and that call must not 404 on a technicality.
+    pub async fn instance_owner(&self, instance_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT owner_uid FROM engine.persona_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_optional(self.pool)
+            .await
+    }
+
     /// Upsert a persona genome by `name`. New row → INSERT, returns
     /// `(uuid, true)`. Existing row → UPDATE in place (id stable, content
     /// refreshed), returns `(uuid, false)`. Used by `seed-personas` so

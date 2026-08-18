@@ -143,6 +143,13 @@ pub struct ListSessionsResponse {
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ArchiveSessionsResponse {
+    pub instance_id: Uuid,
+    /// Sessions flipped by THIS call. A repeat call reports 0.
+    pub archived_sessions: i64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
     pub city: Option<String>,
@@ -839,6 +846,62 @@ async fn get_character_profile(
     Ok(Json(CharacterProfileResponse::from_row(instance_id, row)))
 }
 
+/// Soft-delete every session this user holds with one persona instance.
+///
+/// The conversation stops being visible and stops being resumable, and the
+/// relationship state — affinity, relationship-layer memories, character
+/// insights — is deleted so the next conversation starts genuinely cold. The
+/// transcript in `chat_messages` is NOT deleted: it is evidence, and the audit
+/// tables that reference a session by id finally point at something readable.
+///
+/// Keyed by instance because the instance is the unit of a relationship;
+/// archiving one session and leaving its siblings resumable would not give the
+/// caller the fresh start it asked for. Every channel goes, voice included.
+///
+/// Idempotent: a second call returns 200 with `archived_sessions: 0`.
+///
+/// There is no restore endpoint by design. Reviving a session is an operator
+/// action and `UPDATE engine.chat_sessions SET archived = false WHERE id = …`
+/// is the whole of it; the relationship state stays gone.
+#[utoipa::path(
+    delete,
+    path = "/comp/instance/{instance_id}/sessions",
+    tag = "companion",
+    params(("instance_id" = Uuid, Path, description = "Persona instance id owned by the JWT user")),
+    responses(
+        (status = 200, body = ArchiveSessionsResponse),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "instance is not owned by the JWT user"),
+        (status = 404, description = "no such instance")
+    ),
+    security(("bearer" = []))
+)]
+async fn archive_instance_sessions(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    Extension(AuthUser(jwt_user)): Extension<AuthUser>,
+) -> Result<Json<ArchiveSessionsResponse>, AppError> {
+    // Ownership is read through the instance, not compared against the path —
+    // same shape as `get_character_profile`. Unlike that route this ignores
+    // `status`: see `PersonaRepo::instance_owner`.
+    let owner = PersonaRepo { pool: &state.pool }
+        .instance_owner(instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such instance".into()))?;
+    if owner != jwt_user {
+        return Err(AppError::Forbidden("not your data".into()));
+    }
+
+    let archived = eros_engine_store::session_archive::SessionArchiveRepo { pool: &state.pool }
+        .archive_relationship(jwt_user, instance_id)
+        .await?;
+
+    Ok(Json(ArchiveSessionsResponse {
+        instance_id,
+        archived_sessions: archived as i64,
+    }))
+}
+
 // ─── Router ─────────────────────────────────────────────────────────
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -848,6 +911,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
         .routes(routes!(get_character_profile))
+        .routes(routes!(archive_instance_sessions))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1971,5 +2035,150 @@ mod tests {
         assert!(body["location"].is_null());
         assert_eq!(body["likes"], serde_json::json!([]));
         assert!(body["updated_at"].is_null(), "no row yet ⇒ null stamp");
+    }
+
+    fn archive_request(instance_id: Uuid, jwt: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/comp/instance/{instance_id}/sessions"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn archive_sessions_hides_history_and_is_idempotent(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(&mut router, archive_request(instance_id, &jwt)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["archived_sessions"], 1);
+        assert_eq!(body["instance_id"], instance_id.to_string());
+
+        // Every read surface now behaves as if the session never existed.
+        let (status, _) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "archived history is 404");
+
+        let (status, _) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/bff/v1/comp/affinity/{session_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "archived affinity is 404");
+
+        let (_, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{user_id}/sessions"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 0);
+
+        // Repeat call: nothing left to flip, still 200.
+        let (status, body) = send_request(&mut router, archive_request(instance_id, &jwt)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["archived_sessions"], 0);
+    }
+
+    /// The point of deleting the relationship state: the user comes back to a
+    /// new session, not a resurrected one.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_start_after_archive_returns_a_new_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let old_session = seed_session(&pool, user_id, instance_id).await;
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        send_request(&mut router, archive_request(instance_id, &jwt)).await;
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .method("POST")
+                .uri("/comp/chat/start")
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "instance_id": instance_id.to_string() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            body["session_id"].as_str().unwrap(),
+            old_session.to_string(),
+            "must not resume the archived session"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn archive_sessions_rejects_a_foreign_or_unknown_instance(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, _) = send_request(
+            &mut router,
+            archive_request(instance_id, &mint_test_jwt(intruder)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = send_request(
+            &mut router,
+            archive_request(Uuid::new_v4(), &mint_test_jwt(owner)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A client may archive the conversations of a relationship it has already
+    /// marked dormant, so ownership is read WITHOUT the status filter that
+    /// load_instance_gate applies.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn archive_sessions_works_on_a_dormant_instance(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        seed_session(&pool, user_id, instance_id).await;
+        sqlx::query("UPDATE engine.persona_instances SET status = 'archived' WHERE id = $1")
+            .bind(instance_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut router = build_router(test_state(pool.clone()));
+        let (status, body) = send_request(
+            &mut router,
+            archive_request(instance_id, &mint_test_jwt(user_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["archived_sessions"], 1);
     }
 }
