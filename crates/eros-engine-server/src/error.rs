@@ -22,13 +22,13 @@ pub enum AppError {
     BadRequest(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
-    /// Upstream provider failure surfaced as-is (502). Used by the standalone
-    /// compose endpoint, whose caller needs "the provider failed my call"
-    /// distinguishable from "the engine broke" (500). Scoped to that endpoint:
+    /// A provider failure surfaced with the provider's own status. Used by the
+    /// standalone compose endpoint, whose caller needs "the provider failed my
+    /// call" distinguishable from "the engine broke". Scoped to that endpoint:
     /// the chat path's provider failures keep their own handling (fallback
     /// chain, pseudo-ghost) and must not be rerouted here.
     #[error("upstream failure: {0}")]
-    Upstream(String),
+    Upstream(Box<eros_engine_llm::failure::AttemptFailure>),
     // Reserved for handler-level 500s; constructed nowhere right now (its only
     // user, the legacy event_gift route, was removed). Still mapped to a 500 via
     // the `_` arm in IntoResponse.
@@ -72,12 +72,51 @@ impl IntoResponse for AppError {
             }
             return (e.status, Json(serde_json::Value::Object(body))).into_response();
         }
+        if let AppError::Upstream(f) = &self {
+            use eros_engine_llm::failure::{
+                is_retryable_status, response_status_for, AttemptFailure,
+            };
+            // The provider's own status passes through verbatim (`from_u16`
+            // accepts 100-999); a failure with no status of its own maps by
+            // kind — a gateway timeout to 504, everything else to 502.
+            let raw_status = response_status_for(f);
+            let status = StatusCode::from_u16(raw_status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut body = serde_json::Map::new();
+            body.insert("error".into(), json!("upstream"));
+            body.insert("message".into(), json!(self.to_string()));
+            let retry_after = match f.as_ref() {
+                AttemptFailure::Upstream(a) => {
+                    body.insert("upstream_status".into(), json!(a.http_status));
+                    if let Some(c) = &a.provider_code {
+                        body.insert("provider_code".into(), json!(c));
+                    }
+                    if let Some(t) = &a.error_type {
+                        body.insert("error_type".into(), json!(t));
+                    }
+                    a.retry_after_s
+                }
+                AttemptFailure::Gateway(g) => {
+                    body.insert("gateway_kind".into(), json!(g.kind));
+                    None
+                }
+            };
+            // Derived from the same status, not hardcoded per-variant — the
+            // gateway arm and the upstream arm agree by construction.
+            body.insert("retryable".into(), json!(is_retryable_status(raw_status)));
+            let mut resp = (status, Json(serde_json::Value::Object(body))).into_response();
+            if let Some(secs) = retry_after {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, v);
+                }
+            }
+            return resp;
+        }
         let (status, code) = match &self {
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
-            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         (
@@ -111,12 +150,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_error_renders_502_with_error_body() {
-        let resp = AppError::Upstream("composer chain exhausted".into()).into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    async fn upstream_error_passes_the_provider_status_through_verbatim() {
+        use eros_engine_llm::failure::{AttemptFailure, UpstreamAttempt};
+        let resp = AppError::Upstream(Box::new(AttemptFailure::Upstream(UpstreamAttempt {
+            task: "chat_image_prompt_compose".into(),
+            model: "some/model".into(),
+            http_status: 529,
+            provider_code: Some("529".into()),
+            error_type: Some("overloaded".into()),
+            upstream_provider_code: None,
+            retry_after_s: Some(30),
+            message: "code=529: Overloaded".into(),
+        })))
+        .into_response();
+
+        assert_eq!(resp.status().as_u16(), 529, "not flattened to 502");
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            "30",
+            "Retry-After is forwarded verbatim"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"], "upstream");
-        assert_eq!(v["message"], "upstream failure: composer chain exhausted");
+        assert_eq!(v["upstream_status"], 529);
+        assert_eq!(v["provider_code"], "529");
+    }
+
+    #[tokio::test]
+    async fn gateway_timeout_renders_504_and_transport_renders_502() {
+        use eros_engine_llm::failure::{AttemptFailure, GatewayError, GatewayKind};
+        let mk = |kind| {
+            AppError::Upstream(Box::new(AttemptFailure::Gateway(GatewayError {
+                task: "chat_image_prompt_compose".into(),
+                model: Some("m".into()),
+                kind,
+                message: "x".into(),
+            })))
+            .into_response()
+        };
+        assert_eq!(mk(GatewayKind::TotalTimeout).status().as_u16(), 504);
+        assert_eq!(mk(GatewayKind::Transport).status().as_u16(), 502);
     }
 }

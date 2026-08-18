@@ -329,7 +329,24 @@ pub async fn compose_image(
             },
         )
         .await;
-        return Err(AppError::Upstream("image composer chain exhausted".into()));
+        // `run_image_prompt_compose` only hands back a `&'static str` reason
+        // tag today, not a typed `AttemptFailure` per attempt — folding that
+        // in is Task 10's job. `ChainExhausted` carries no `model` by
+        // convention; the tag still rides the message so the real reason
+        // isn't lost.
+        return Err(AppError::Upstream(Box::new(
+            eros_engine_llm::failure::AttemptFailure::Gateway(
+                eros_engine_llm::failure::GatewayError {
+                    task: "chat_image_prompt_compose".into(),
+                    model: None,
+                    kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+                    message: format!(
+                        "image composer chain exhausted: {}",
+                        run.last_failure.unwrap_or("no attempts")
+                    ),
+                },
+            ),
+        )));
     };
 
     let composed_prompt = compose_image_prompt(style_key, &persona, &outcome.prompt);
@@ -629,7 +646,18 @@ async fn compose_stream(
             },
         )
         .await;
-        return Err(AppError::Upstream("image composer chain exhausted".into()));
+        // Same gap as the non-stream arm above: no candidate ever opened, so
+        // there is no typed `AttemptFailure` to carry, only this reason tag.
+        return Err(AppError::Upstream(Box::new(
+            eros_engine_llm::failure::AttemptFailure::Gateway(
+                eros_engine_llm::failure::GatewayError {
+                    task: "chat_image_prompt_compose".into(),
+                    model: None,
+                    kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+                    message: format!("image composer chain exhausted: {last_failure}"),
+                },
+            ),
+        )));
     };
 
     let frames = async_stream::stream! {
