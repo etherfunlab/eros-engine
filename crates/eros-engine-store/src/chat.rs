@@ -75,9 +75,10 @@ pub struct ChatMessage {
     pub metadata: Option<serde_json::Value>,
     /// Read receipt (migration 0053): when this message reached the party it
     /// was addressed to. On a companion-authored row, set by the read endpoint
-    /// — the human read it. On a text `role='user'` row, set by the engine at
-    /// the PDE judge dispatch — the model read it. NULL means no receipt, which
-    /// is permanent for tips and for voice rows.
+    /// — the human read it. On a text `role='user'` row, set by the engine when
+    /// it hands the message to the PDE judge: "delivered to a model", not the
+    /// model's acknowledgement. NULL means no receipt, which is permanent for
+    /// tips and for `user` rows on the voice channel.
     #[serde(default)]
     pub read_at: Option<DateTime<Utc>>,
 }
@@ -794,8 +795,13 @@ impl<'a> ChatRepo<'a> {
     }
 
     /// Stamp the turn's `role='user'` row at the instant it is handed to the
-    /// PDE judge — the first generative model to see it (migration 0053).
-    /// Called only from the text pipeline; voice never stamps.
+    /// PDE judge — the first generative model it is sent to (migration 0053).
+    /// Called only from the text pipeline; voice never stamps its user rows.
+    ///
+    /// Dispatch, not confirmed receipt. A judge call that fails on transport
+    /// afterwards leaves the stamp standing: what is recorded is that the
+    /// engine handed the message over, which is the half of the exchange it can
+    /// witness.
     ///
     /// Narrower than the complement of `mark_session_read`: a tip turn's
     /// driving row is `role='gift_user'` and stays NULL, because nobody reads a

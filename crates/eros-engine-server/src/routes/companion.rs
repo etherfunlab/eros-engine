@@ -120,10 +120,11 @@ pub struct ChatHistoryEntry {
     /// When this message reached the party it was addressed to. On an
     /// `assistant` row: when the client called `POST /comp/chat/{id}/read` —
     /// the human read it. On a `user` row: when the engine handed the message
-    /// to the first model of the turn. **Omitted while unread**, so a client
-    /// tests for the key's presence; there is no `null` form. Omitted forever
-    /// on tips and on voice rows, which have no reader — treat absence as "no
-    /// receipt", never as "not yet read".
+    /// to the first model of the turn ("delivered to a model", not that
+    /// model's acknowledgement). **Omitted while unread**, so a client tests
+    /// for the key's presence; there is no `null` form. Omitted forever on
+    /// tips and on voice `user` rows, which have no reader — treat absence as
+    /// "no receipt", never as "not yet read".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
 }
@@ -936,9 +937,10 @@ async fn archive_instance_sessions(
 /// moment the turn handed the message to its first model), and `gift_user`
 /// tips, which nobody reads on the user's behalf.
 ///
-/// Voice sessions are accepted — their assistant rows are messages addressed
-/// to the human like any other. The `409 wrong_channel` gate on the send routes
-/// exists because those write channel-specific rows; this one does not.
+/// Voice sessions are accepted, and so are their assistant rows — those are
+/// messages addressed to the human like any other, and only the ENGINE's writer
+/// is text-only. The `409 wrong_channel` gate on the send routes exists because
+/// those write channel-specific rows; this one does not.
 ///
 /// Idempotent: an existing stamp is never pushed forward, so `marked` counts
 /// real transitions and a second call returns 200 with `marked: 0`.

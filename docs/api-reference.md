@@ -506,13 +506,17 @@ without inventing an event.
 
 Two roles are out of reach here, and they are the two the user writes. A `user`
 row carries the engine's own stamp — set the instant the turn handed the message
-to its first model — which is the other half of a delivery receipt; a
-`gift_user` tip is never stamped by anyone, because nobody reads a tip on the
-user's behalf. Voice rows are never stamped either.
+to its first model, which is the *delivered* tick and not that model's
+acknowledgement; a `gift_user` tip is never stamped by anyone, because nobody
+reads a tip on the user's behalf.
+
+Voice sessions are accepted, and their `assistant` rows are stamped like any
+other — only the engine's own writer is text-only, so it is voice **`user`**
+rows that stay unstamped.
 
 **Read `read_at: absent` as "no receipt", never as "not yet read."** Tips, voice
-rows, and — on a deployment running without the PDE judge — every `user` row
-stay unstamped permanently.
+`user` rows, and — on a deployment running without the PDE judge — every `user`
+row stay unstamped permanently.
 
 See [2026-08-19-chat-message-read-at-design.md](superpowers/specs/2026-08-19-chat-message-read-at-design.md).
 

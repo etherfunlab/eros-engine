@@ -14,21 +14,32 @@
 --                  'system_error' is already legal in the CHECK above and has
 --                  no producer yet.
 --
---   'user',        The engine, in run_stream, at the instant the turn hands
---   text channel   the message to the PDE judge — the first generative model
---                  to see it. Fire-and-forget, off the turn's latency path.
+--   'user',        The engine, in run_stream, at the instant the turn HANDS the
+--   text channel   message to the PDE judge — the first generative model it is
+--                  sent to. Fire-and-forget, off the turn's latency path.
+--
+--                  Dispatch, not confirmed receipt: this is the "delivered"
+--                  tick, not the recipient's acknowledgement. A judge call that
+--                  then fails on transport leaves the stamp standing, and that
+--                  is correct — the fact recorded is that the engine handed the
+--                  message over, which is the only half of the exchange the
+--                  engine can honestly witness.
 --
 -- Rows with NO reader stay NULL from both writers, on purpose:
 --
 --   'gift_user'    A tip. Nobody reads a tip on the user's behalf, so there is
 --                  no receipt to record. Filling this in would be filling the
 --                  column because it exists.
---   voice rows     A voice turn runs run_voice_turn, which never stamps. Its
---                  pre-flight is a different shape (recall and its embedding
---                  run BEFORE the model there), so a voice read_at - sent_at
+--   'user' rows    A voice turn runs run_voice_turn, which never stamps. Its
+--   on the voice   pre-flight is a different shape (recall and its embedding
+--   channel        run BEFORE the model there), so a voice read_at - sent_at
 --                  would not measure what a text one measures. Two channels
 --                  writing incomparable numbers into one column is worse than
 --                  one channel writing none. Do not "backfill" voice.
+--
+--                  Voice ASSISTANT rows are NOT excluded: they are messages
+--                  addressed to the human like any other, and the endpoint
+--                  stamps them. Only the engine's writer is text-only.
 --
 -- A deployment with no [tasks.pde_decision].filter_prompt configured never
 -- stamps user rows either — the judge is the only call site. Accepted: covering

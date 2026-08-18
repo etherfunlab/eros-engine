@@ -17194,9 +17194,25 @@ data: [DONE]\n\n"
         .collect()
         .await;
 
+        // Without this the test would pass on merely entering the judge's match
+        // arm — the stamp fires there whether or not a request ever went out.
+        // Matched on the judge's own model, because the chat burst hits the
+        // same mocked endpoint and would otherwise satisfy a bare "any request
+        // arrived" check.
+        let judged = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge"));
+        assert!(
+            judged,
+            "the stamp must accompany an actual judge dispatch, not just the code path"
+        );
+
         // The stamp is spawned, not awaited, so the turn can outrun the write.
         let mut read_at: Option<chrono::DateTime<chrono::Utc>> = None;
-        for _ in 0..40 {
+        for _ in 0..100 {
             read_at = sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = $1")
                 .bind(user_message_id)
                 .fetch_one(&pool)

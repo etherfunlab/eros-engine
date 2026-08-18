@@ -72,10 +72,13 @@ can stay on its page without touching any index entry.
 
 | Row | Reader | Writer |
 |---|---|---|
-| `assistant` (and any future companion-authored role) | the human | `POST /comp/chat/{session_id}/read` |
+| `assistant` (and any future companion-authored role), **either channel** | the human | `POST /comp/chat/{session_id}/read` |
 | `user`, text channel | the model | the engine, inside the turn |
 | `user`, voice channel | — | nobody; stays NULL |
 | `gift_user` | — | nobody; stays NULL |
+
+Only the *engine's* writer is text-only. A voice `assistant` row is a message
+addressed to the human exactly like a text one, and the endpoint stamps it.
 
 `gift_user` is a tip the user sent. Nobody reads a tip on the user's behalf, so
 there is no receipt to record and the row keeps `read_at` NULL from both sides.
@@ -147,6 +150,15 @@ Dispatched with `tokio::spawn` and never awaited. It runs while the turn is
 already blocked on the judge's LLM call, so it costs the turn nothing and sits
 outside its failure surface entirely: a pool hiccup produces a log line and a
 missing timestamp, never a degraded reply.
+
+**Dispatch, not confirmed receipt.** The stamp lands before the judge's call
+returns, so a judge that then fails on transport leaves it standing. That is the
+intended reading: this is the *delivered* tick, and handing the message over is
+the only half of the exchange the engine can witness. Waiting for the judge's
+response instead would fold the judge's own latency into the gap of §5.3 and
+change what the number means. The narrow case where nothing reads the message at
+all — judge transport failure *and* the rule-engine fallback returning `ghost` —
+is accepted at that reading.
 
 The `role = 'user'` guard and the endpoint's `role NOT IN (…)` keep the two
 writers off each other's rows even though nothing else coordinates them.

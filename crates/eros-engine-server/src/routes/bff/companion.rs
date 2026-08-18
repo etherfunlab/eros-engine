@@ -46,9 +46,9 @@ pub struct BffHistoryEntry {
     /// When this message reached the party it was addressed to — set by
     /// `POST /comp/chat/{session_id}/read` on an `assistant` row, and by the
     /// engine itself on a `user` row (the moment the turn handed the message to
-    /// its first model). Omitted while unread; permanently omitted on tips and
-    /// voice rows, which have no reader. Absence means "no receipt", not "not
-    /// yet read".
+    /// its first model; delivery, not that model's acknowledgement). Omitted
+    /// while unread; permanently omitted on tips and voice `user` rows, which
+    /// have no reader. Absence means "no receipt", not "not yet read".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
     /// Conversation-flavor marker: `"product_qa"` = out-of-character product
