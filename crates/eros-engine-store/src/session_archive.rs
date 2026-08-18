@@ -48,6 +48,14 @@ impl<'a> SessionArchiveRepo<'a> {
     /// gets the same treatment as `character_insights` above without taking
     /// the rest of the row's life facts with it.
     ///
+    /// The `character_insights` delete and the `persona_story_insights` update
+    /// are both keyed on `instance_id` alone, unlike the two `user_id +
+    /// instance_id` deletes above them. That's safe: `persona_instances.owner_uid`
+    /// is never updated anywhere in this workspace (only ever set once, at
+    /// INSERT), so the instance identifies its owner for the entire life of the
+    /// row and there is no window in which `instance_id` alone could resolve to
+    /// the wrong relationship.
+    ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
     pub async fn archive_relationship(

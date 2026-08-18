@@ -249,7 +249,14 @@ that currently hard-deletes sessions replaces that with a call to this endpoint.
 Migrations run through an explicit `migrate` subcommand, not at boot, so
 deploy order is a real constraint: migration `0052` must be applied before the
 new binary serves traffic, because the read filter references a column
-(`archived`) that does not exist until then.
+(`archived`) that does not exist until then — and the order isn't merely a
+preference, it's the only direction that works: migration-first is safe
+because `ChatSession` derives `sqlx::FromRow`, whose generated code fetches
+each declared field by column name and simply never looks up one it doesn't
+know about, so the previous binary's `SELECT *` against the post-migration
+table decodes fine; binary-first is not safe, because the new binary's read
+filter (`AND NOT archived`) names a column the table doesn't have yet and
+every session read fails until the migration runs.
 
 ## 9. Not doing
 
@@ -264,12 +271,26 @@ new binary serves traffic, because the read filter references a column
 - **A `status` enum on `chat_sessions`.** There is one distinction to draw.
 - **Touching `human_insights`.** User-level, cross-persona, same reasoning as the
   profile memory layer.
-- **Closing the `post_process` race entirely.** The guard added at the top of
+- **Closing the `post_process` race entirely.** The guard at the top of
   `post_process::run` closes the window between an archive and a *new*
-  detached task; a turn's post-processing that is already past that check when
-  the archive commits can still land its write afterward. The residual window
-  is one statement wide. Closing it fully would mean taking a lock across the
-  whole post-turn pipeline, which costs more than the defect it would prevent.
+  detached task, but the model and embedding calls that follow it — the
+  affinity evaluator, the two-stage character-insight chain, the memory
+  embedding calls — can each run long enough for the archive to commit while
+  the task is inside them. So the check runs a second time, immediately
+  before each of the three writes those calls feed
+  (`companion_affinity`, `companion_memories`, `character_insights`), right
+  after its own model call returns. That narrows the window from the whole
+  model-call phase down to the gap between the recheck and the write it
+  guards — it does not close it. Closing it fully would mean taking a lock
+  across the whole post-turn pipeline, which costs more than the defect it
+  would prevent.
+
+  Separately: an in-flight chat or voice turn that resolved its session
+  *before* the archive committed can still append to `chat_messages` and bump
+  `last_active_at` on the now-archived row after the archive lands. That is
+  harmless by construction — the transcript is preserved by design regardless,
+  and `last_active_at` on a row no read route can return changes nothing a
+  reader can see.
 - **Touching `persona_story_events`, `persona_story_memories`, or the scalar
   columns on `persona_story_insights`.** §5 clears `digest` because it is this
   relationship's record; the rest of that row and both of those tables are the
