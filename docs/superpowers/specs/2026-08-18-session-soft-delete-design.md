@@ -169,7 +169,7 @@ a single predicate turns all of these into `404`:
 | `POST /comp/chat/{sid}/message/stream` | direct call |
 | `POST /comp/voice/{sid}/turn/stream` | direct call |
 
-**Five queries do their own session lookup and need the predicate added:**
+**Six queries do their own session lookup and need the predicate added:**
 
 1. `resume_latest_session` — the critical one. Without it the next
    `chat/start` reanimates the archived session and the user gets their deleted
@@ -179,6 +179,12 @@ a single predicate turns all of these into `404`:
 4. `latest_sibling_voice_session`
 5. `story.rs` — the three joins onto `chat_sessions` that feed world stories,
    so archived material stops being harvested.
+6. The dreaming sweeper's claim query in `pipeline/dreaming.rs`. Second in
+   importance only to resume, and for the same reason: it selects idle sessions
+   with `classified_at IS NULL`, extracts memories from them, and writes the
+   result into `companion_memories` and `human_insights`. An archived session
+   left claimable would spend a model call regrowing exactly the memory rows
+   this endpoint just deleted.
 
 **`bff_list_affinities` needs no change.** It is driven by
 `companion_affinity`, whose rows this endpoint deletes; an absent row is an
@@ -192,6 +198,8 @@ absent list entry.
 - `chat/start` after archiving returns a **new** session id, not the archived one.
 - History, affinity and stream routes return `404` for an archived session.
 - Voice-channel sessions are archived alongside text ones.
+- The dreaming sweeper's claim query skips archived sessions, so no memory row
+  regrows after an archive.
 - Another user's instance → `403`; unknown instance → `404`; repeat call →
   `200` with `archived_sessions: 0`.
 - `UPDATE … SET archived = false` makes history readable again.
