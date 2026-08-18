@@ -1056,6 +1056,11 @@ impl<'a> ChatRepo<'a> {
     /// conflicting write's own `usage` is NULL (e.g. upstream never sent a
     /// usage payload), so a race never downgrades known usage to unknown.
     ///
+    /// `llm_attempts` / `gateway_errors` follow `model` and `generation_id`:
+    /// they describe the same call, so whichever generator wrote last owns all
+    /// five together. The interrupt endpoint never lists these columns at all,
+    /// so an interrupt landing second cannot blank a generator's audit.
+    ///
     /// The insert is additionally **skipped entirely** when the user row is
     /// already marked `voice_interrupt` and no assistant reply exists yet —
     /// that combination means the client reported nothing was heard, and the
@@ -1079,6 +1084,8 @@ impl<'a> ChatRepo<'a> {
         generation_id: Option<&str>,
         truncated: bool,
         metadata: Option<&serde_json::Value>,
+        llm_attempts: Option<&serde_json::Value>,
+        gateway_errors: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // Same row `upsert_voice_interrupt` locks first (via its user-row
@@ -1091,8 +1098,10 @@ impl<'a> ChatRepo<'a> {
         sqlx::query(
             "INSERT INTO engine.chat_messages AS m \
              (id, session_id, role, content, user_message_id, truncated, model, usage, \
-              generation_id, assistant_action_type, channel, metadata) \
-             SELECT $1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9 \
+              generation_id, assistant_action_type, channel, metadata, \
+              llm_attempts, gateway_errors) \
+             SELECT $1, $2, 'assistant', $3, $4, $5, $6, $7, $8, 'reply', 'voice', $9, \
+                    $10, $11 \
              WHERE NOT ( \
                  COALESCE((SELECT u.metadata->>'voice_interrupt' \
                              FROM engine.chat_messages u WHERE u.id = $4), 'false')::bool \
@@ -1108,7 +1117,9 @@ impl<'a> ChatRepo<'a> {
                                              THEN m.truncated ELSE EXCLUDED.truncated END, \
                            model = EXCLUDED.model, \
                            usage = COALESCE(EXCLUDED.usage, m.usage), \
-                           generation_id = EXCLUDED.generation_id",
+                           generation_id = EXCLUDED.generation_id, \
+                           llm_attempts = EXCLUDED.llm_attempts, \
+                           gateway_errors = EXCLUDED.gateway_errors",
         )
         .bind(id)
         .bind(session_id)
@@ -1119,6 +1130,8 @@ impl<'a> ChatRepo<'a> {
         .bind(usage)
         .bind(generation_id)
         .bind(metadata)
+        .bind(llm_attempts)
+        .bind(gateway_errors)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
@@ -3417,6 +3430,8 @@ mod tests {
             Some("gen-1"),
             false,
             Some(&serde_json::json!({"affinity_scope": "both"})),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -3651,6 +3666,8 @@ mod tests {
             Some("gen-1"),
             false,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -3714,6 +3731,8 @@ mod tests {
             Some("gen-0"),
             true,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -3732,6 +3751,8 @@ mod tests {
             Some(&usage),
             Some("gen-1"),
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -3810,6 +3831,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -4530,6 +4553,8 @@ mod tests {
             Some("gen-late"),
             false,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4564,6 +4589,8 @@ mod tests {
             Some("gen-9"),
             false,
             Some(&scope),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4617,6 +4644,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4658,6 +4687,8 @@ mod tests {
             Some("gen-a"),
             false,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4673,6 +4704,8 @@ mod tests {
             None,
             Some("gen-b"),
             false,
+            None,
+            None,
             None,
         )
         .await

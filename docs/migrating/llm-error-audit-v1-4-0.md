@@ -299,6 +299,12 @@ failure precedes model selection (a config error) and on the chain-scoped
 The three timeouts stay distinct on purpose: folding them together once made idle
 timeouts invisible.
 
+**`decode` does not cover a byte-BPE garble**, despite the name. That call
+succeeded and was billed — it is a content verdict, so the row's coarse marker
+owns it (`garbled`, or `fallback_reason = "garble_repaired"`) and neither column
+gets an entry. A chain that garbled once and then recovered writes nothing at
+all; do not read an empty `gateway_errors` as "no garble happened".
+
 ### The `task` discriminator
 
 `engine.chat_messages` hosts three call sites in one pair of columns. They are
@@ -343,6 +349,16 @@ detail is in that column".
 What survives in each vocabulary is exactly the content-level verdicts: `served`,
 `length`, `content_filter`, `empty`, `garbled`, `refusal_pattern`, `too_short`,
 `unparseable`, `empty_prompt`, `blank_description`, `parse_error`.
+
+**Which pointer value you get is decided by the whole operation.** For the
+markers that describe one operation — `chat_vision_events.last_failure`,
+`chat_images_events.last_failure`, `companion_decision_events.status` — the value
+is `upstream_error` if the operation produced *any* `llm_attempts` entry, and
+`gateway_error` only when it produced none. A chain that took a `529` and then
+timed out reads `upstream_error`, not `gateway_error`: "did a provider misbehave
+during this turn" is what the coarse value is for, and the per-hop order is in
+the columns. `filter_attempts[].reason` and `stream_metrics.outcome` are the
+per-attempt exceptions — each entry there describes exactly one attempt.
 
 **`stream_open_failed` and `stream_died_midway`** are specific to the standalone
 compose endpoint's streaming mode. Each covered a provider status *and* a local
@@ -445,7 +461,8 @@ that guarded it before, precisely so log-based alerting does not move.
 
 **Affinity eval failures.** They are written to
 `companion_affinity_events.llm_attempts` / `.gateway_errors` for engine-side
-debugging and never appear in the `final` frame. Two reasons, and neither is
+debugging — including hops a fallback recovered from, so a row with a populated
+audit trio can still carry a `529` — and never appear in the `final` frame. Two reasons, and neither is
 timing: the eval is already fail-open, so the only consequence is that this one
 turn contributes no affinity delta while the rule-based deltas still land; and
 turns legitimately contribute no delta for entirely ordinary reasons

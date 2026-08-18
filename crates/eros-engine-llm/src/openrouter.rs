@@ -847,9 +847,14 @@ impl OpenRouterClient {
                                 Some((model.clone(), raw.clone(), finish_reason.clone()));
                         }
                     }
-                    failures.push(crate::failure::AttemptFailure::from_llm_error(
-                        task, model, &e,
-                    ));
+                    // A garble is a content verdict — the call succeeded and
+                    // was billed — so it belongs to the caller's coarse marker
+                    // and to NEITHER column (spec §2).
+                    if crate::failure::AttemptFailure::should_record(&e) {
+                        failures.push(crate::failure::AttemptFailure::from_llm_error(
+                            task, model, &e,
+                        ));
+                    }
                     let remaining = candidates.len() - i - 1;
                     let msg = if remaining == 0 {
                         "openrouter: all candidates exhausted"
@@ -1016,28 +1021,13 @@ impl OpenRouterClient {
             let finish_reason = first_choice.and_then(|c| c.finish_reason);
             if crate::byte_bpe::looks_byte_garbled(&raw) {
                 tracing::error!(model = %model, "openrouter: vision byte-BPE garbled; advancing candidate chain");
+                // Nothing is pushed: a garble is a content verdict, the call
+                // succeeded and was billed, and neither column owns it
+                // (spec §2 — the rule is `AttemptFailure::should_record`).
                 // Retain only a COMPLETE garble for last-resort salvage; a
-                // length-truncated garble is incomplete, so route it to
-                // `failures` (the caller fails open) rather than salvaging
-                // partial JSON.
-                if finish_reason.as_deref() == Some("length") {
-                    let e = LlmError::Garbled {
-                        model: model.to_string(),
-                        raw,
-                        finish_reason,
-                    };
-                    failures.push(crate::failure::AttemptFailure::from_llm_error(
-                        task, model, &e,
-                    ));
-                } else {
-                    let e = LlmError::Garbled {
-                        model: model.to_string(),
-                        raw: raw.clone(),
-                        finish_reason: finish_reason.clone(),
-                    };
-                    failures.push(crate::failure::AttemptFailure::from_llm_error(
-                        task, model, &e,
-                    ));
+                // length-truncated garble is incomplete, so repairing it would
+                // hand partial JSON to the caller as if it were whole.
+                if finish_reason.as_deref() != Some("length") {
                     last_garbled = Some((model.to_string(), raw, finish_reason));
                 }
                 continue;
@@ -3412,6 +3402,15 @@ data: [DONE]\n\n";
         assert_eq!(resp.reply, "hi there");
         // The served model field comes from the fallback wire response.
         assert_eq!(resp.model.as_deref(), Some("f1"));
+        // Spec §2: the garbled hop's call SUCCEEDED and was billed, so it is a
+        // content verdict owned by the caller's coarse marker. It must not
+        // appear in either column — least of all as a `decode` gateway error,
+        // which would say our path to the provider broke when it did not.
+        assert!(
+            resp.failures.is_empty(),
+            "a garble belongs to neither column: {:?}",
+            resp.failures
+        );
     }
 
     #[tokio::test]
@@ -3590,16 +3589,14 @@ data: [DONE]\n\n";
             .await
             .expect_err("length-truncated garble must NOT be salvaged");
         match err {
-            LlmError::Chain { failures } => match failures.last() {
-                Some(crate::failure::AttemptFailure::Gateway(g)) => {
-                    assert_eq!(
-                        g.kind,
-                        crate::failure::GatewayKind::Decode,
-                        "expected the garble to surface as a failure (caller fails open), got {g:?}"
-                    )
-                }
-                other => panic!("expected Gateway, got {other:?}"),
-            },
+            // The chain still dies — the caller fails open on the `Err`. What
+            // the garble does NOT do is land in a column: the call succeeded
+            // and was billed, so it is a content verdict owned by the caller's
+            // coarse marker (spec §2, `AttemptFailure::should_record`).
+            LlmError::Chain { failures } => assert!(
+                failures.is_empty(),
+                "a garble belongs to neither column: {failures:?}"
+            ),
             other => panic!("expected Chain, got {other:?}"),
         }
     }
@@ -3769,7 +3766,7 @@ data: [DONE]\n\n";
         // Mirrors execute_returns_repaired_garble_even_when_later_candidate_fails:
         // primary "vp" returns recoverable garble, fallback "vf1" then fails with a
         // non-garble status error. The salvage must still return vp's repaired text
-        // AND report both hops in `failures` — this exercises the
+        // AND report vf1's hop in `failures` — this exercises the
         // `failures: failures.clone()` on execute_vision's salvage return, which
         // was previously verified only by reading the code.
         let server = MockServer::start().await;
@@ -3810,11 +3807,19 @@ data: [DONE]\n\n";
             .expect("earlier garble salvaged despite later non-garble failure");
         assert_eq!(resp.reply, "Hi there\nbye");
         assert_eq!(resp.model.as_deref(), Some("vp"));
+        // vf1's 500 rides the salvage return; vp's garble does NOT — the call
+        // succeeded and was billed, so it is a content verdict and belongs to
+        // neither column (spec §2).
         assert_eq!(
             resp.failures.len(),
-            2,
-            "salvage still failed on the way there — both hops must be reported"
+            1,
+            "only the non-garble hop is recordable: {:?}",
+            resp.failures
         );
+        match &resp.failures[0] {
+            crate::failure::AttemptFailure::Upstream(a) => assert_eq!(a.http_status, 500),
+            other => panic!("expected the 500 hop, got {other:?}"),
+        }
     }
 
     #[tokio::test]

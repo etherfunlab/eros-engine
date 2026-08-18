@@ -1621,6 +1621,39 @@ pub(crate) fn failure_pointer(f: &eros_engine_llm::failure::AttemptFailure) -> &
     }
 }
 
+/// Did this operation produce any `llm_attempts` entry? The §2.2 labelling
+/// rule in one predicate, so the two shapes below cannot drift apart.
+pub(crate) fn operation_hit_upstream(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+) -> bool {
+    failures
+        .iter()
+        .any(|f| matches!(f, eros_engine_llm::failure::AttemptFailure::Upstream(_)))
+}
+
+/// The pointer value an **operation-scoped** coarse marker records — read off
+/// the whole accumulated list, not the latest hop.
+///
+/// Spec §2.2: if the operation produced any `llm_attempts` entry the marker
+/// reads `upstream_error`, otherwise `gateway_error`. Upstream wins, because
+/// "did a provider misbehave during this turn" is the question the coarse
+/// value exists to answer at a glance; the per-hop truth is one column away.
+/// Applying `failure_pointer` per attempt instead would let a trailing
+/// timeout erase a leading `529`.
+///
+/// Per-attempt markers — `filter_attempts[].reason`, `stream_metrics.outcome`
+/// — keep using `failure_pointer`: each of those describes one attempt, not
+/// the operation.
+pub(crate) fn operation_failure_pointer(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+) -> &'static str {
+    if operation_hit_upstream(failures) {
+        "upstream_error"
+    } else {
+        "gateway_error"
+    }
+}
+
 /// The gateway record for a local `FILTER_TIMEOUT` expiry. No `LlmError` ever
 /// existed to classify — the future was dropped before the client could
 /// produce one — so it is built by hand. `FILTER_TIMEOUT` wraps a whole
@@ -1639,21 +1672,7 @@ fn filter_timeout_failure(task: &str, model: &str) -> eros_engine_llm::failure::
 pub(crate) fn split_failures(
     failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
-    use eros_engine_llm::failure::AttemptFailure;
-    let ups: Vec<_> = failures
-        .iter()
-        .filter_map(|f| match f {
-            AttemptFailure::Upstream(a) => Some(a),
-            AttemptFailure::Gateway(_) => None,
-        })
-        .collect();
-    let gws: Vec<_> = failures
-        .iter()
-        .filter_map(|f| match f {
-            AttemptFailure::Gateway(g) => Some(g),
-            AttemptFailure::Upstream(_) => None,
-        })
-        .collect();
+    let (ups, gws) = split_failures_typed(failures);
     let j = |empty: bool, v: serde_json::Value| if empty { None } else { Some(v) };
     (
         j(ups.is_empty(), serde_json::json!(ups)),
@@ -1662,9 +1681,10 @@ pub(crate) fn split_failures(
 }
 
 /// Split one accumulated failure list into the two TYPED vectors the `final`
-/// frame carries. Sibling of `split_failures`, for the wire instead of the
-/// database — takes the same already-typed accumulator directly, no JSON
-/// round-trip.
+/// frame carries. The one place the two columns are separated: `split_failures`
+/// serialises this function's output for the database, so there is a single
+/// `match` and the wire and the row can never disagree about which side a
+/// failure lands on.
 fn split_failures_typed(
     failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> (
@@ -1724,7 +1744,7 @@ pub(crate) fn upstream_status_and_code_for(
 /// entry of an accumulated failure list — used at every chain-exhaustion
 /// site so a genuinely-empty accumulator (no failure in hand) still falls
 /// back to the pre-Task-8 literals rather than panicking.
-fn error_frame_fields_from_last(
+pub(crate) fn error_frame_fields_from_last(
     failures: &[eros_engine_llm::failure::AttemptFailure],
 ) -> (StreamErrorCode, bool, Option<u16>, Option<String>) {
     match failures.last() {
@@ -1998,12 +2018,15 @@ impl PdeStatus {
         }
     }
 
-    /// Which pointer status a typed failure implies. Classified from the
-    /// failure, never from the arm that produced it.
-    fn for_failure(f: &eros_engine_llm::failure::AttemptFailure) -> Self {
-        match f {
-            eros_engine_llm::failure::AttemptFailure::Upstream(_) => PdeStatus::UpstreamError,
-            eros_engine_llm::failure::AttemptFailure::Gateway(_) => PdeStatus::GatewayError,
+    /// Which pointer status the run's accumulated failures imply. `status` is
+    /// operation-scoped — one row per judge run — so it follows spec §2.2's
+    /// rule: any `llm_attempts` entry ⇒ `upstream_error`, upstream wins.
+    /// Classified from the failures, never from the arm that produced them.
+    fn for_operation(failures: &[eros_engine_llm::failure::AttemptFailure]) -> Self {
+        if operation_hit_upstream(failures) {
+            PdeStatus::UpstreamError
+        } else {
+            PdeStatus::GatewayError
         }
     }
 }
@@ -2112,19 +2135,18 @@ async fn run_pde_decision(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "pde: model error; next");
-                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
                     "pde_decision",
                     model_id,
                     &e,
-                );
-                last = PdeStatus::for_failure(&f);
-                failures.push(f);
+                ));
+                last = PdeStatus::for_operation(&failures);
                 continue;
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "pde: timeout; next");
-                last = PdeStatus::GatewayError;
                 failures.push(filter_timeout_failure("pde_decision", model_id));
+                last = PdeStatus::for_operation(&failures);
                 continue;
             }
         };
@@ -2595,13 +2617,12 @@ async fn run_vision(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "chat_vision: model error; next");
-                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
                     "chat_vision",
                     model_id,
                     &e,
-                );
-                last_failure = Some(failure_pointer(&f));
-                failures.push(f);
+                ));
+                last_failure = Some(operation_failure_pointer(&failures));
                 // Transport failure: nothing came back, so any identity
                 // captured by an EARLIER content-level failure this chain
                 // walk must not survive to describe THIS attempt's outcome.
@@ -2612,8 +2633,8 @@ async fn run_vision(
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "chat_vision: timeout; next");
-                last_failure = Some("gateway_error");
                 failures.push(filter_timeout_failure("chat_vision", model_id));
+                last_failure = Some(operation_failure_pointer(&failures));
                 last_model = None;
                 last_generation_id = None;
                 last_usage = None;
@@ -3162,13 +3183,12 @@ pub(crate) async fn run_image_prompt_compose(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
-                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
                     "chat_image_prompt_compose",
                     model_id,
                     &e,
-                );
-                last_failure = Some(failure_pointer(&f));
-                failures.push(f);
+                ));
+                last_failure = Some(operation_failure_pointer(&failures));
                 // Transport failure: nothing came back, so any identity
                 // captured by an EARLIER content-level failure this chain
                 // walk must not survive to describe THIS attempt's outcome.
@@ -3179,11 +3199,11 @@ pub(crate) async fn run_image_prompt_compose(
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "image-compose: timeout; next");
-                last_failure = Some("gateway_error");
                 failures.push(filter_timeout_failure(
                     "chat_image_prompt_compose",
                     model_id,
                 ));
+                last_failure = Some(operation_failure_pointer(&failures));
                 last_model = None;
                 last_generation_id = None;
                 last_usage = None;
@@ -4317,14 +4337,6 @@ pub fn run_stream(
                 if acc.is_empty() {
                     // `acc` can only still be empty when every candidate hit a
                     // `continue 'candidates` — i.e. the whole chain is spent.
-                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
-                        eros_engine_llm::failure::GatewayError {
-                            task: PRODUCT_QA_TASK.to_string(),
-                            model: None,
-                            kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
-                            message: format!("all {candidate_count} candidates failed"),
-                        },
-                    ));
                     let phrase = ErrorHandlingRepo { pool: &state.pool }
                         .pick_chat_stream_fallback_phrase()
                         .await
@@ -4332,6 +4344,26 @@ pub fn run_stream(
                         .flatten();
                     match phrase {
                         Some(text) => {
+                            // The chain-scoped verdict is appended HERE, on the
+                            // arm that persists a row — never before the Error
+                            // frame below reads `.last()`, which is why the
+                            // companion path appends it inside
+                            // `build_stream_failure_pseudo_ghost`. Order is the
+                            // whole fix: a marker in front of the real failure
+                            // erases the provider's status from the frame.
+                            chain_failures.push(
+                                eros_engine_llm::failure::AttemptFailure::Gateway(
+                                    eros_engine_llm::failure::GatewayError {
+                                        task: PRODUCT_QA_TASK.to_string(),
+                                        model: None,
+                                        kind:
+                                            eros_engine_llm::failure::GatewayKind::ChainExhausted,
+                                        message: format!(
+                                            "all {candidate_count} candidates failed"
+                                        ),
+                                    },
+                                ),
+                            );
                             acc = text.clone();
                             truncated = false;
                             // A final candidate can reach here having streamed
@@ -4401,7 +4433,7 @@ pub fn run_stream(
                     tracing::warn!("stream: product_qa persist failed: {e}");
                 }
                 super::log_openrouter_usage(
-                    "chat_product_qa",
+                    PRODUCT_QA_TASK,
                     Some(user_msg.session_id),
                     &eros_engine_llm::openrouter::ChatResponse {
                         reply: String::new(), // usage log only — never echo content
@@ -5355,6 +5387,55 @@ mod tests {
         // An empty side is NULL, never `[]` — one way to say "nothing to record".
         let (a, g) = split_failures(&[]);
         assert!(a.is_none() && g.is_none());
+    }
+
+    #[test]
+    fn an_operation_marker_lets_upstream_win_over_a_later_gateway_failure() {
+        use eros_engine_llm::failure::{
+            AttemptFailure, GatewayError, GatewayKind, UpstreamAttempt,
+        };
+        let up = AttemptFailure::Upstream(UpstreamAttempt {
+            task: "chat_vision".into(),
+            model: "a/m".into(),
+            http_status: 529,
+            provider_code: None,
+            error_type: None,
+            upstream_provider_code: None,
+            retry_after_s: None,
+            message: "overloaded".into(),
+        });
+        let gw = AttemptFailure::Gateway(GatewayError {
+            task: "chat_vision".into(),
+            model: Some("b/m".into()),
+            kind: GatewayKind::TotalTimeout,
+            message: "timeout".into(),
+        });
+
+        // Spec §2.2: any llm_attempts entry ⇒ upstream_error, whichever hop
+        // failed LAST. Per-attempt labelling would report `gateway_error` here
+        // and hide the 529 from every dashboard reading the coarse value.
+        assert_eq!(
+            operation_failure_pointer(&[up.clone(), gw.clone()]),
+            "upstream_error"
+        );
+        assert_eq!(
+            operation_failure_pointer(&[gw.clone(), up.clone()]),
+            "upstream_error"
+        );
+        assert_eq!(operation_failure_pointer(&[gw.clone()]), "gateway_error");
+        // Nothing recorded ⇒ the gateway default, matching the pre-walk seed
+        // the compose endpoint starts from.
+        assert_eq!(operation_failure_pointer(&[]), "gateway_error");
+
+        // `companion_decision_events.status` is the same rule in its own type.
+        assert_eq!(
+            PdeStatus::for_operation(&[up.clone(), gw.clone()]).as_str(),
+            "upstream_error"
+        );
+        assert_eq!(PdeStatus::for_operation(&[gw]).as_str(), "gateway_error");
+
+        // The per-attempt users are untouched: each describes ONE attempt.
+        assert_eq!(failure_pointer(&up), "upstream_error");
     }
 
     #[test]
@@ -11983,6 +12064,144 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Spec §2.2's labelling rule, end to end on an operation-scoped marker:
+    /// the primary answers `523` and the fallback then fails at the gateway
+    /// layer. `last_failure` describes the whole describe operation, not its
+    /// last hop, so it must read `upstream_error` — a provider DID misbehave
+    /// this turn, which is the question the coarse value exists to answer.
+    ///
+    /// `523` is used by no other test in the suite.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_vision_chain_that_ends_on_a_gateway_failure_still_reads_upstream(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Primary: the provider spoke — an llm_attempts entry.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("vis/up"))
+            .respond_with(
+                ResponseTemplate::new(523)
+                    .set_body_string(r#"{"error":{"code":523,"message":"origin unreachable"}}"#),
+            )
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        // Fallback: a 200 carrying a body that is neither a completion nor an
+        // error envelope — the provider said nothing usable, so it decodes to
+        // a gateway_errors entry and lands LAST in the walk.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("vis/gw"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"id\":\"g\",\"model\":\"deepseek/y\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/y"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/y\"\n\
+                 [tasks.chat_vision]\nmodel=\"vis/up\"\nfallback=[\"vis/gw\"]\nfilter_prompt=\"DESCRIBE\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let seed_meta = serde_json::json!({ "image_url": "https://x/523.png" });
+        let chat_repo = ChatRepo { pool: &pool };
+        let message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "",
+                "01J9999999999999999999999H",
+                "user",
+                Some(&seed_meta),
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: Some("https://x/523.png".into()),
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (last_failure, attempts, gateways): (
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT last_failure, llm_attempts, gateway_errors \
+             FROM engine.chat_vision_events WHERE message_id = $1",
+        )
+        .bind(message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            attempts.expect("the 523 hop")[0]["http_status"],
+            523,
+            "the provider's own status still rides its own column"
+        );
+        assert_eq!(
+            gateways.expect("the decode hop")[0]["kind"],
+            "decode",
+            "the second hop is a gateway fact and stays one"
+        );
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("upstream_error"),
+            "the marker is operation-scoped: a later gateway hop must not erase \
+             the fact that a provider misbehaved this turn (spec §2.2)"
+        );
+    }
+
     // ── Live-judge PDE E2E (spec §12) ────────────────────────────────────────
     // These two tests exercise the opt-in LLM Persona Decision Engine wired into
     // `run_stream`: the judge runs (NON-streaming `execute()`) BEFORE the chat
@@ -12876,6 +13095,162 @@ data: [DONE]\n\n";
             generation_id, None,
             "the fallback row must not carry the exhausted candidate's generation_id"
         );
+    }
+
+    /// The product_qa path with NO `error_handling_config` phrase configured
+    /// writes no row at all — the Error frame is the only place the codes that
+    /// killed the turn can surface. It therefore has to carry them: the frame
+    /// is derived from the chain's real last failure, never from the
+    /// chain-scoped `chain_exhausted` marker, which knows no status and would
+    /// flatten every death to `upstream_unavailable`.
+    ///
+    /// `429` is the sharpest probe available: only a real upstream failure can
+    /// produce `rate_limited`, so a marker-derived frame fails this loudly.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn product_qa_error_frame_carries_the_providers_status(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Primary executor: a plain 5xx.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-a"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        // Last executor: the failure the frame must describe.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("qa/exec-b"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string(r#"{"error":{"code":429,"message":"rate limited"}}"#),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        // No phrase ⇒ the fatal Error-frame arm, the one path that persists
+        // nothing and so is the only record of the failure.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = '[]'::jsonb \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "这个产品能用几年",
+                "01JPDEQAERRORFRAME00000001",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "这个产品能用几年".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let (code, retryable, upstream_status, provider_code) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Error {
+                    code,
+                    retryable,
+                    upstream_status,
+                    provider_code,
+                    ..
+                } => Some((*code, *retryable, *upstream_status, provider_code.clone())),
+                _ => None,
+            })
+            .expect("no phrase configured ⇒ an Error frame");
+
+        assert_eq!(
+            upstream_status,
+            Some(429),
+            "the provider's own status, not the chain_exhausted marker's silence"
+        );
+        assert_eq!(provider_code.as_deref(), Some("429"));
+        assert_eq!(
+            code,
+            StreamErrorCode::RateLimited,
+            "derived from the real failure; the marker would flatten this to \
+             upstream_unavailable"
+        );
+        assert!(retryable);
+
+        // The compensation the controller accepted this path on: no row is
+        // written, so the frame has to be the whole record.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "the no-phrase arm persists nothing");
     }
 
     /// `chat_product_qa` is the third `chat_messages` call site in the spec's §3

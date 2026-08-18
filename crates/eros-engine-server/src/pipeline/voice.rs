@@ -24,8 +24,8 @@ use eros_engine_store::persona::PersonaRepo;
 use crate::memory_hygiene::prune_recalled;
 use crate::pipeline::handlers::{human_insights_to_bullets, recall_memory, RecallTier};
 use crate::pipeline::stream::{
-    stream_error_code_for, ulid_string, upstream_status_and_code_for, ProtocolFrame,
-    StreamErrorCode, STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
+    error_frame_fields_from_last, split_failures, ulid_string, ProtocolFrame, StreamErrorCode,
+    STREAM_OPEN_TIMEOUT, STREAM_TOTAL_TIMEOUT,
 };
 use crate::prompt::render_recall_sections;
 use crate::state::AppState;
@@ -700,10 +700,12 @@ pub fn run_voice_turn(
         };
 
         // Every genuine transport/status failure this chain walked over —
-        // mirrors the text pipeline's `chain_failures` (stream.rs), kept
-        // local to this function purely so the empty-chain Error frame below
-        // can derive its `code` / `retryable` / `upstream_status` /
-        // `provider_code` instead of hardcoding them.
+        // mirrors the text pipeline's `chain_failures` (stream.rs). It feeds
+        // the empty-chain Error frame's `code` / `retryable` /
+        // `upstream_status` / `provider_code`, and — spec §3 lists
+        // `chat_voice` as a `chat_messages` call site — the persisted row's
+        // two audit columns, so a chain that RECOVERED still reports what the
+        // earlier candidate said.
         let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
         'candidates: for model_id in candidates {
             // Per-attempt metadata: reset so an abandoned candidate's usage / gen_id /
@@ -835,21 +837,8 @@ pub fn run_voice_turn(
         // only metadata (id/model) and then errored or ended without content
         // — is an upstream failure. Never emit an empty `done`.
         if acc.is_empty() {
-            let (code, retryable) = chain_failures
-                .last()
-                .map(|f| {
-                    (
-                        stream_error_code_for(f),
-                        eros_engine_llm::failure::is_retryable_status(
-                            eros_engine_llm::failure::response_status_for(f),
-                        ),
-                    )
-                })
-                .unwrap_or((StreamErrorCode::UpstreamUnavailable, true));
-            let (upstream_status, provider_code) = chain_failures
-                .last()
-                .map(upstream_status_and_code_for)
-                .unwrap_or((None, None));
+            let (code, retryable, upstream_status, provider_code) =
+                error_frame_fields_from_last(&chain_failures);
             yield ProtocolFrame::Error {
                 code,
                 retryable,
@@ -872,6 +861,7 @@ pub fn run_voice_turn(
             "affinity_scope": turn.affinity_scope,
             "memory_scope": turn.memory_scope,
         });
+        let (voice_attempts, voice_gateways) = split_failures(&chain_failures);
         if !acc.is_empty() {
             if let Err(e) = chat_repo
                 .insert_voice_assistant_message(
@@ -884,6 +874,8 @@ pub fn run_voice_turn(
                     last_gen_id.as_deref(),
                     truncated,
                     Some(&scope_metadata),
+                    voice_attempts.as_ref(),
+                    voice_gateways.as_ref(),
                 )
                 .await
             {
@@ -2563,6 +2555,142 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(content, "recovered");
+    }
+
+    /// Spec §3 lists `chat_voice` as a `chat_messages` call site, and the
+    /// migration guide tells consumers voice failures land there under
+    /// `task: "chat_voice"`. The voice stream has no `final` frame, so the row
+    /// is the ONLY home a recovered voice hop has.
+    ///
+    /// `524` is used by no other test in the suite; a `.bind()` swap between
+    /// the two columns would put it on the gateway side and fail here.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_voice_turn_persists_the_hop_the_fallback_recovered_from(pool: sqlx::PgPool) {
+        use eros_engine_llm::model_config::ModelConfig;
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Primary: the provider spoke. An llm_attempts entry, and the chain
+        // then RECOVERS — nothing in the engine broke, so gateway_errors must
+        // stay empty (spec §2.2's recovered-turn contrast).
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("voice-down"))
+            .respond_with(
+                ResponseTemplate::new(524)
+                    .set_body_string(r#"{"error":{"code":524,"message":"a timeout occurred"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        let ok_body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}],\"id\":\"gen-voice\",\"model\":\"voice-up\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("voice-up"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(ok_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('V', 'You are V.', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let repo = ChatRepo { pool: &pool };
+        let umid = match repo
+            .insert_voice_user_message(session_id, "hello", "01J9000000000000000000VOIC7", None)
+            .await
+            .unwrap()
+        {
+            eros_engine_store::chat::VoiceUserInsert::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_voice]\nmodel = \"voice-down\"\nfallback = [\"voice-up\"]\nmax_tokens = 100\nrecall = false\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let resolved = state.model_config.resolve_voice().unwrap();
+        let frames: Vec<ProtocolFrame> = run_voice_turn(
+            Arc::new(state),
+            VoiceTurn {
+                session_id,
+                instance_id,
+                user_id,
+                user_message_id: umid,
+                content: "hello".into(),
+                affinity_scope: AffinityScope::full(),
+                memory_scope: MemoryScope::default(),
+                session_metadata: serde_json::json!({}),
+            },
+            resolved,
+        )
+        .collect()
+        .await;
+
+        let text: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "recovered", "the turn is served normally: {frames:?}");
+
+        let (content, attempts, gateways): (
+            String,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT content, llm_attempts, gateway_errors FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(content, "recovered");
+        let attempts = attempts.expect("the 524 hop must reach the row");
+        assert_eq!(attempts[0]["http_status"], 524);
+        assert_eq!(attempts[0]["task"], "chat_voice");
+        assert_eq!(attempts[0]["model"], "voice-down");
+        assert!(
+            gateways.is_none(),
+            "the chain did its job — nothing in the engine broke: {gateways:?}"
+        );
     }
 
     // ─── bootstrap snapshot, end to end ─────────────────────────────────

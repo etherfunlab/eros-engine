@@ -24,9 +24,9 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
-    compose_inputs_json, compose_user_payload, failure_pointer, parse_compose_reply,
-    record_compose_event, run_image_prompt_compose, split_failures, stream_error_code_for,
-    StreamErrorCode, FILTER_TIMEOUT,
+    compose_inputs_json, compose_user_payload, error_frame_fields_from_last,
+    operation_failure_pointer, parse_compose_reply, record_compose_event, run_image_prompt_compose,
+    split_failures, stream_error_code_for, StreamErrorCode, FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -555,13 +555,12 @@ async fn compose_stream(
             Ok(Ok(ds)) => ds,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
-                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
                     "chat_image_prompt_compose",
                     &model_id,
                     &e,
-                );
-                last_failure = failure_pointer(&f);
-                chain_failures.push(f);
+                ));
+                last_failure = operation_failure_pointer(&chain_failures);
                 // Nothing came back at all: clear (Fix 1's rule).
                 last_model = None;
                 last_generation_id = None;
@@ -581,7 +580,7 @@ async fn compose_stream(
                         ),
                     },
                 ));
-                last_failure = "gateway_error";
+                last_failure = operation_failure_pointer(&chain_failures);
                 last_model = None;
                 last_generation_id = None;
                 last_usage = None;
@@ -614,11 +613,11 @@ async fn compose_stream(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream died before first token; next");
-                    let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
                         "chat_image_prompt_compose",
                         &model_id,
                         &e,
-                    );
+                    ));
                     // A break is a break whether or not a metadata chunk landed
                     // first, so the marker is the same pointer value either way.
                     // What DID land is recorded where it belongs: if this attempt
@@ -626,8 +625,7 @@ async fn compose_stream(
                     // answered and may have been billed, so that evidence is
                     // retained; with no evidence there is nothing to attribute
                     // and the three columns stay NULL (Fix 1's rule).
-                    last_failure = failure_pointer(&f);
-                    chain_failures.push(f);
+                    last_failure = operation_failure_pointer(&chain_failures);
                     if served_model.is_some() || generation_id.is_some() || usage.is_some() {
                         last_model = served_model.clone().or_else(|| Some(model_id.clone()));
                         last_generation_id = generation_id.clone();
@@ -668,7 +666,7 @@ async fn compose_stream(
                         },
                     ));
                     // No completed response ⇒ transport failure, clear.
-                    last_failure = "gateway_error";
+                    last_failure = operation_failure_pointer(&chain_failures);
                     last_model = None;
                     last_generation_id = None;
                     last_usage = None;
@@ -833,12 +831,10 @@ async fn compose_stream(
                 // `stream_died_midway` is retired with `stream_open_failed`:
                 // both arms that set `failure` also classify a real failure
                 // into `failure_kind`, so the marker points at the column that
-                // holds it. (The `unwrap_or` mirrors the `code`/`retryable`
-                // derivation just below — the two cannot disagree.)
-                let died_marker = failure_kind
-                    .as_ref()
-                    .map(failure_pointer)
-                    .unwrap_or("gateway_error");
+                // holds it. The marker is OPERATION-scoped (one row per compose
+                // request), so it reads the whole walk per spec §2.2 — a
+                // pre-open `529` outranks this attempt's mid-flight timeout.
+                let died_marker = operation_failure_pointer(&all_failures);
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
@@ -862,17 +858,11 @@ async fn compose_stream(
                     },
                 )
                 .await;
-                let (code, retryable) = failure_kind
-                    .as_ref()
-                    .map(|f| {
-                        (
-                            stream_error_code_for(f),
-                            eros_engine_llm::failure::is_retryable_status(
-                                eros_engine_llm::failure::response_status_for(f),
-                            ),
-                        )
-                    })
-                    .unwrap_or((StreamErrorCode::UpstreamUnavailable, true));
+                // `ComposeFrame::Error` carries no upstream_status /
+                // provider_code (they ride the pre-stream HTTP error instead),
+                // so the last two derived fields are dropped here.
+                let (code, retryable, _, _) =
+                    error_frame_fields_from_last(failure_kind.as_slice());
                 yield ComposeFrame::Error {
                     code,
                     retryable,

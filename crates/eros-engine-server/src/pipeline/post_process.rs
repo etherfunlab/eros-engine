@@ -704,7 +704,10 @@ type AffinityEvalOutcome = (
 /// Run the haiku affinity evaluator for one Reply turn. Returns the signed
 /// judge grades, the snapped absolute patience read (`None` when the model
 /// omitted it), the model's reason, and — last — every failed attempt, for the
-/// event row's two audit columns. Any failure (LLM error, non-JSON, malformed
+/// event row's two audit columns. That list is populated on SUCCESS too: this
+/// is the one call site that hands `execute` the whole `[primary] + fallback`
+/// chain, so a primary that returned `529` before the fallback answered is
+/// recorded here or nowhere. Any failure (LLM error, non-JSON, malformed
 /// grades) yields all-zero grades + no patience read + empty reason so the rule
 /// deltas still persist and the affinity write never fails because the
 /// evaluator failed.
@@ -741,7 +744,7 @@ async fn evaluate_affinity(
         ..Default::default()
     };
 
-    let (raw, meta) =
+    let (raw, meta, recovered) =
         match tokio::time::timeout(AFFINITY_EVAL_TIMEOUT, state.openrouter.execute(req)).await {
             Ok(Ok(resp)) => {
                 super::log_openrouter_usage(AFFINITY_TASK, Some(session_id), &resp);
@@ -750,7 +753,12 @@ async fn evaluate_affinity(
                     model: resp.model.clone(),
                     usage: resp.usage.clone(),
                 };
-                (resp.reply, Some(meta))
+                // Spec §5.4: `failures` is populated on success too. This is
+                // the ONLY call site that hands `execute` a real
+                // `[primary] + fallback` chain, so it is the only place a hop
+                // a fallback recovered from can be recorded at all — drop it
+                // here and a 529-then-success turn persists nothing.
+                (resp.reply, Some(meta), resp.failures)
             }
             Ok(Err(e)) => {
                 tracing::warn!("affinity eval LLM call failed: {e}");
@@ -810,7 +818,7 @@ async fn evaluate_affinity(
     // Eval ran, but a salvaged response can still lack a generation_id — mark it
     // so a NULL audit join key is never left unexplained.
     let skip = meta.as_ref().and_then(meta_skip_reason);
-    (grades, levels, reason, meta, skip, Vec::new())
+    (grades, levels, reason, meta, skip, recovered)
 }
 
 const INSIGHT_TASK: &str = "insight_extraction";
@@ -2354,6 +2362,145 @@ mod tests {
         let attempts = attempts.expect("the 526 explains the NULL generation_id");
         assert_eq!(attempts[0]["http_status"], 526);
         assert_eq!(attempts[0]["task"], AFFINITY_TASK);
+    }
+
+    /// Spec §1 goal 1 and §5.4: hops a fallback RECOVERED from are persisted
+    /// too. Affinity eval is the only call site that hands `execute` a real
+    /// `[primary] + fallback` chain, so it is the only place that promise can
+    /// be kept — drop `ChatResponse.failures` on the success path and a
+    /// 529-then-served eval leaves no trace anywhere in the tree.
+    ///
+    /// The eval SUCCEEDS here, so the row's audit trio is populated and there
+    /// is no skip reason: the two columns are pure recovered-hop evidence,
+    /// which is exactly the case a failure-only implementation misses.
+    ///
+    /// `521` is used by no other test in the suite.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn recovered_affinity_eval_records_the_hop_the_fallback_survived(pool: sqlx::PgPool) {
+        use eros_engine_store::affinity::AffinityRepo;
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("aff/primary"))
+            .respond_with(
+                ResponseTemplate::new(521)
+                    .set_body_string(r#"{"error":{"code":521,"message":"web server is down"}}"#),
+            )
+            .mount(&server)
+            .await;
+        let eval = r#"{"warmth":3,"trust":{"grade":1,"direction":"up"},"intimacy":{"grade":1,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":2,"reason":"稳"}"#;
+        Mock::given(body_string_contains("aff/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "gen-aff-ok",
+                "model": "aff/fallback",
+                "choices": [{"message": {"content": eval}}],
+            })))
+            .mount(&server)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        AffinityRepo { pool: &pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.affinity_evaluation]\nmodel=\"aff/primary\"\nfallback=[\"aff/fallback\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", server.uri()),
+            ),
+        );
+
+        let event = Event::UserMessage {
+            content: "我今天过得还不错，你呢".into(),
+            message_id: Uuid::new_v4(),
+            prompt_traits: Vec::new(),
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            tips_amount_usd: None,
+            history_anchor: Default::default(),
+        };
+        let plan = ActionPlan {
+            action_type: ActionType::ReplyImage,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_tone: None,
+            image_caption: Some("在天台看夕阳".into()),
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+        };
+        let produced = vec![ProducedMessage {
+            message_id: Uuid::new_v4(),
+            full_text: String::new(),
+            action: ActionType::ReplyImage,
+        }];
+
+        run(
+            state,
+            session_id,
+            user_id,
+            instance_id,
+            event,
+            plan,
+            produced,
+        )
+        .await;
+
+        let (context, attempts, gateways, generation_id): (
+            serde_json::Value,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT e.context, e.llm_attempts, e.gateway_errors, e.generation_id \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 ORDER BY e.created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            generation_id.as_deref(),
+            Some("gen-aff-ok"),
+            "the fallback served — this is a SUCCESSFUL eval"
+        );
+        assert!(
+            context.get("eval_skip_reason").is_none(),
+            "nothing was skipped: {context}"
+        );
+        let attempts = attempts.expect("the recovered 521 hop must be persisted");
+        assert_eq!(attempts[0]["http_status"], 521);
+        assert_eq!(attempts[0]["task"], AFFINITY_TASK);
+        assert_eq!(attempts[0]["model"], "aff/primary");
+        assert!(
+            gateways.is_none(),
+            "the provider spoke and the chain did its job: {gateways:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

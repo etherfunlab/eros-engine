@@ -211,6 +211,18 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 `gateway_error`，它们只说明「有尝试失败了，细节在那一列」。被它们取代的
 传输层标签一律退役；完整的新旧对照表在 migration 指南里。
 
+**标记读哪一个，由整次操作决定，不看最后一跳。** 以操作为单位的标记——
+两张事件表的 `last_failure`、`companion_decision_events.status`——只要这次操作
+产生过**任何**一条 `llm_attempts`，就记 `upstream_error`，否则记 `gateway_error`。
+上游优先：粗粒度值存在的意义就是一眼回答「这一轮有没有 provider 出问题」，
+而先吃了 `529`、随后才超时的链路，仍然是 provider 出过问题的一轮。逐跳的真相
+就在隔壁一列。`filter_attempts[].reason` 是例外，它每条描述的正好是一次尝试——
+那个数组本来就一跳一行。
+
+**byte-BPE 乱码不是 `decode` 网关错误**，尽管这个名字很诱人。调用成功了，
+也计费了，所以它是内容裁决：归粗粒度标记管（`garbled`，或
+`fallback_reason = "garble_repaired"`），两列都不为它写条目。
+
 ### `llm_attempts` 元素
 
 ```jsonc

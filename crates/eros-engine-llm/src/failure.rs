@@ -168,14 +168,26 @@ impl AttemptFailure {
             }
             // A garble is a content verdict: the call succeeded and was billed.
             // It belongs to the table's coarse marker, not to either column —
-            // but this function must return something, so classify it as a
-            // decode-shaped gateway fact and let callers skip recording it.
+            // but this `match` is exhaustive, so it must still return
+            // something. `should_record` is what keeps it out of the columns.
             LlmError::Garbled { .. } => gateway(GatewayKind::Decode),
             LlmError::Chain { failures } => failures
                 .last()
                 .cloned()
                 .unwrap_or_else(|| gateway(GatewayKind::ChainExhausted)),
         }
+    }
+
+    /// Whether an `LlmError` belongs in either audit column at all.
+    ///
+    /// One variant does not. A byte-BPE garble is a **content verdict**
+    /// (spec §2): the call succeeded and was billed, so the table's coarse
+    /// marker owns it and neither column may carry it. `from_llm_error` still
+    /// has to classify it — the `match` is exhaustive on purpose — so this is
+    /// the guard every chain walk applies before pushing, and the one place
+    /// the rule is written down.
+    pub fn should_record(e: &LlmError) -> bool {
+        !matches!(e, LlmError::Garbled { .. })
     }
 }
 
@@ -377,6 +389,43 @@ mod tests {
         match AttemptFailure::from_llm_error("chat_companion", "m", &e) {
             AttemptFailure::Gateway(g) => assert_eq!(g.kind, GatewayKind::IdleTimeout),
             other => panic!("expected Gateway, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_garble_is_recordable_by_nobody_but_still_classifies() {
+        // Spec §2: the call succeeded and was billed, so it is a content
+        // verdict and belongs to the table's coarse marker, not to either
+        // column. `from_llm_error` must still answer (the match is
+        // exhaustive); `should_record` is what keeps it out.
+        let e = LlmError::Garbled {
+            model: "m".into(),
+            raw: "HiĠthere".into(),
+            finish_reason: None,
+        };
+        assert!(!AttemptFailure::should_record(&e));
+        assert!(matches!(
+            AttemptFailure::from_llm_error("chat_companion", "m", &e),
+            AttemptFailure::Gateway(_)
+        ));
+    }
+
+    #[test]
+    fn every_other_error_is_recordable() {
+        let cases = [
+            LlmError::Stream("reset".into()),
+            LlmError::StreamParse("junk".into()),
+            LlmError::Config("no models".into()),
+            LlmError::Provider(ParsedErrorBody::default()),
+            LlmError::Status(
+                reqwest::StatusCode::from_u16(529).unwrap(),
+                ParsedErrorBody::default(),
+                None,
+            ),
+            LlmError::Chain { failures: vec![] },
+        ];
+        for e in cases {
+            assert!(AttemptFailure::should_record(&e), "{e} must be recorded");
         }
     }
 

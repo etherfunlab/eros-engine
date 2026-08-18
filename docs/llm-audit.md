@@ -238,6 +238,22 @@ Every coarse vocabulary gained the same two **pointer values** —
 detail is in that column". The transport-shaped labels they replace are
 retired; the full before/after table is in the migration guide.
 
+**Which of the two a marker reads is decided by the whole operation, not by
+its last hop.** Where the marker is operation-scoped — `last_failure` on both
+event tables, `companion_decision_events.status` — it reads `upstream_error`
+if the operation produced *any* `llm_attempts` entry, and `gateway_error`
+otherwise. Upstream wins: "did a provider misbehave during this turn" is the
+question the coarse value exists to answer at a glance, and a chain that took
+a `529` and then timed out is still a turn where a provider misbehaved. The
+per-hop truth is one column away. `filter_attempts[].reason` is the exception
+and describes exactly one attempt each, because that array already has a row
+per hop.
+
+A **byte-BPE garble is not a `decode` gateway error**, tempting though the
+name is. The call succeeded and was billed, so it is a content verdict: the
+coarse marker owns it (`garbled`, or `fallback_reason = "garble_repaired"`)
+and neither column carries an entry for it.
+
 ### `llm_attempts` element
 
 ```jsonc
