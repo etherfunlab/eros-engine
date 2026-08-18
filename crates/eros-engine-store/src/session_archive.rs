@@ -40,6 +40,14 @@ impl<'a> SessionArchiveRepo<'a> {
     /// foreign key and are untouched; with the transcript now surviving too,
     /// those records still point at something readable.
     ///
+    /// `persona_story_insights.digest` is cleared, not the row: the row's
+    /// other columns (`occupation`, `city`, `life_rhythm`, ...) are the
+    /// persona's own typed life base, live only in this one row, and deleting
+    /// it would take them with it. `digest` is the one column that is instead
+    /// conversation-derived and re-injected into every later reply, so it
+    /// gets the same treatment as `character_insights` above without taking
+    /// the rest of the row's life facts with it.
+    ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
     pub async fn archive_relationship(
@@ -78,6 +86,20 @@ impl<'a> SessionArchiveRepo<'a> {
         .await?;
 
         sqlx::query("DELETE FROM engine.character_insights WHERE instance_id = $1")
+            .bind(instance_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // UPDATE, not DELETE: this row also carries the persona's own typed
+        // life base (occupation, city, ...), which lives only here — deleting
+        // the row would take those with it. Only `digest` is this
+        // relationship's record: it is conversation-derived and injected into
+        // every subsequent reply, the same property that justifies deleting
+        // character_insights above. Clearing it is enough on its own:
+        // fetch_stories_context returns early on a blank digest before it
+        // ever reads persona_story_memories, so the episode recall built up
+        // during this relationship stops being injected too.
+        sqlx::query("UPDATE engine.persona_story_insights SET digest = '' WHERE instance_id = $1")
             .bind(instance_id)
             .execute(&mut *tx)
             .await?;
@@ -443,6 +465,93 @@ mod tests {
             !is_archived,
             "create_or_resume must produce a fresh, unarchived session"
         );
+    }
+
+    /// The story digest is instance-keyed and injected into every subsequent
+    /// reply, so it survives the archive the same way `character_insights`
+    /// used to — clearing it is the fifth statement. `persona_story_events`
+    /// and `persona_story_memories` are the persona's own life, not this
+    /// relationship's record, so they must survive; that pair is the
+    /// assertion that catches someone later "tidying" the UPDATE into a
+    /// DELETE.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn clears_the_story_digest_but_keeps_the_persona_life(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.persona_story_insights \
+                 (instance_id, owner_uid, occupation, digest) \
+             VALUES ($1, $2, 'barista', 'opened a coffee shop this week')",
+        )
+        .bind(instance_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let event_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_story_events \
+                 (owner_uid, instance_id, category, content, story_date) \
+             VALUES ($1, $2, 'life', 'the espresso machine broke on opening day', CURRENT_DATE) \
+             RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let zeros = format!("[{}]", vec!["0"; 512].join(","));
+        sqlx::query(
+            "INSERT INTO engine.persona_story_memories \
+                 (owner_uid, instance_id, event_id, content, embedding, story_date) \
+             VALUES ($1, $2, $3, 'the espresso machine broke on opening day', $4::vector, CURRENT_DATE)",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(event_id)
+        .bind(&zeros)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let (digest, occupation): (String, Option<String>) = sqlx::query_as(
+            "SELECT digest, occupation FROM engine.persona_story_insights \
+             WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(digest, "", "story digest must be cleared");
+        assert_eq!(
+            occupation.as_deref(),
+            Some("barista"),
+            "retained scalar insight columns must survive"
+        );
+
+        let events = count(
+            &pool,
+            "SELECT count(*) FROM engine.persona_story_events WHERE instance_id = $1",
+            instance_id,
+        )
+        .await;
+        assert_eq!(events, 1, "the persona's life-progression log must survive");
+
+        let memories = count(
+            &pool,
+            "SELECT count(*) FROM engine.persona_story_memories WHERE instance_id = $1",
+            instance_id,
+        )
+        .await;
+        assert_eq!(memories, 1, "the story recall mirror must survive");
     }
 
     /// The session list is a read surface like any other.

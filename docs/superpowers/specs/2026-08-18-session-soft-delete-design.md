@@ -105,7 +105,7 @@ mark.
 
 ## 5. The archive action
 
-One transaction, four statements:
+One transaction, five statements:
 
 ```sql
 UPDATE engine.chat_sessions SET archived = true
@@ -118,6 +118,8 @@ DELETE FROM engine.companion_affinity
  WHERE user_id = $1 AND instance_id = $2;
 
 DELETE FROM engine.character_insights WHERE instance_id = $2;
+
+UPDATE engine.persona_story_insights SET digest = '' WHERE instance_id = $2;
 ```
 
 **Sessions on every channel are archived**, voice included. The unit is the
@@ -155,6 +157,27 @@ the hard delete and carries the persona's memory of the relationship — where t
 user lives, what they do, the current situation between them — straight into the
 next conversation. Leaving it contradicts the reason affinity and memories are
 deleted at all.
+
+**`persona_story_insights.digest` is cleared, not the row.** It is
+instance-keyed and conversation-derived, and it is injected into the prompt of
+every subsequent reply — the same description that justifies deleting
+`character_insights` above, so leaving it means a "fresh start" still carries a
+narrative shaped by the conversation the user just cleared. The row itself is
+not deleted: with `digest` excepted, its columns (`city`, `occupation`,
+`life_rhythm`, and the rest) are the persona's own typed life base and live
+only in this one row — erasing them because one user cleared one chat would be
+its own bug. (`persona_story_events` and `persona_story_memories` FK to
+`persona_instances` directly, not to this row, so they are unaffected by the
+UPDATE-vs-DELETE choice either way; they are excluded from this cut for the
+same reason as the surviving columns — they are the persona's own life, not
+this relationship's record.) Clearing `digest` alone is sufficient:
+`fetch_stories_context` returns early on a blank
+digest before it ever calls `search_story_memories`, so the episode recall
+stops being injected along with it, without a second statement against
+`persona_story_memories`. It also does not silently regrow — `claim_due`'s
+`EXISTS` already carries `AND NOT cs.archived`, so the story director will not
+revisit this instance until the user starts a genuinely new conversation, at
+which point regenerating from new material is correct.
 
 **`persona_instances.status` is not touched.** The user still owns the persona
 and can start a new conversation immediately; `chat/start` will create a fresh
@@ -203,6 +226,9 @@ absent list entry.
 - Archiving leaves `chat_messages` row count unchanged; `companion_affinity`,
   relationship-layer `companion_memories` and `character_insights` go to zero.
 - Profile-layer memories (`instance_id IS NULL`) survive.
+- Archiving clears `persona_story_insights.digest` to `''` but leaves the row,
+  a retained scalar column, and its `persona_story_events` /
+  `persona_story_memories` rows untouched.
 - `chat/start` after archiving returns a **new** session id, not the archived one.
 - History, affinity and stream routes return `404` for an archived session.
 - Voice-channel sessions are archived alongside text ones.
@@ -244,8 +270,8 @@ new binary serves traffic, because the read filter references a column
   the archive commits can still land its write afterward. The residual window
   is one statement wide. Closing it fully would mean taking a lock across the
   whole post-turn pipeline, which costs more than the defect it would prevent.
-- **Clearing the `persona_story_*` layer.** The story digest is instance-keyed
-  and injected into every subsequent reply, so it survives the archive and
-  carries a narrative shaped by the deleted conversation into the fresh
-  session. Whether to clear it is a real design question, deliberately left
-  open here rather than overlooked.
+- **Touching `persona_story_events`, `persona_story_memories`, or the scalar
+  columns on `persona_story_insights`.** §5 clears `digest` because it is this
+  relationship's record; the rest of that row and both of those tables are the
+  persona's own life narrative, not a per-relationship record, and erasing a
+  persona's life because one user cleared one chat would be its own bug.
