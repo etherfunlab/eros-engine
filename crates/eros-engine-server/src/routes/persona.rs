@@ -24,9 +24,9 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
-    compose_inputs_json, compose_user_payload, parse_compose_reply, record_compose_event,
-    run_image_prompt_compose, split_failures, stream_error_code_for, StreamErrorCode,
-    FILTER_TIMEOUT,
+    compose_inputs_json, compose_user_payload, failure_pointer, parse_compose_reply,
+    record_compose_event, run_image_prompt_compose, split_failures, stream_error_code_for,
+    StreamErrorCode, FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -486,28 +486,35 @@ async fn compose_stream(
     // exhausted — the audit row's `attempts`, mirroring the counter
     // `run_image_prompt_compose` keeps for the non-stream chain walk.
     let mut attempts: i16 = 0;
-    // Last-attempt identity + failure reason, overwritten on every iteration
-    // so only the FINAL candidate's evidence can reach the audit row if the
-    // whole chain never opens. Mirrors `run_image_prompt_compose`'s
-    // `last_model` / `last_generation_id` / `last_usage` (Fix 1's rule
-    // applies here too): cleared whenever nothing came back from THIS
-    // attempt (open failed, open timed out, died with no captured evidence,
-    // or timed out before a first token) so a stale earlier attempt's
-    // billing identity can never be attributed to a later transport
-    // failure; retained only when the evidence shows the provider actually
-    // answered — the stream completed with no content (`empty`), or it died
-    // mid-flight after already emitting model/generation_id/usage
-    // (`stream_died_midway`).
+    // Last-attempt identity, overwritten on every iteration so only the FINAL
+    // candidate's evidence can reach the audit row if the whole chain never
+    // opens. Mirrors `run_image_prompt_compose`'s `last_model` /
+    // `last_generation_id` / `last_usage` (Fix 1's rule applies here too):
+    // cleared whenever nothing came back from THIS attempt (open failed, open
+    // timed out, died with no captured evidence, or timed out before a first
+    // token) so a stale earlier attempt's billing identity can never be
+    // attributed to a later transport failure; retained only when the evidence
+    // shows the provider actually answered — the stream completed with no
+    // content (`empty`), or it broke after already emitting
+    // model/generation_id/usage. That "did the provider answer?" distinction
+    // now lives ENTIRELY in these three columns; `last_failure` no longer
+    // doubles as a second, coarser copy of it.
     let mut last_model: Option<String> = None;
     let mut last_generation_id: Option<String> = None;
     let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
-    let mut last_failure: &'static str = "stream_open_failed";
+    // `stream_open_failed` / `stream_died_midway` are retired: one label each
+    // covering a provider status AND a local timeout, exactly the class spec §7
+    // retires. Both become the pointer value derived from the classified
+    // failure, so `chat_images_events.last_failure` reads the same whichever
+    // endpoint wrote the row. `empty` / `empty_prompt` stay — those are
+    // completions, not breaks.
+    let mut last_failure: &'static str = "gateway_error";
     // The pre-open walk's typed failures, mirroring `run_image_prompt_compose`'s
-    // own accumulator: they fill the audit row's two columns and decide the
-    // status a fully-failed chain returns. `empty` pushes nothing — the stream
-    // completed, so the call succeeded and was billed; every other arm carries
-    // a real failure, classified from what actually broke rather than from
-    // which arm it landed in.
+    // own accumulator: they fill the audit row's two columns, decide the status
+    // a fully-failed chain returns, and now decide `last_failure` too. `empty`
+    // pushes nothing — the stream completed, so the call succeeded and was
+    // billed; every other arm carries a real failure, classified from what
+    // actually broke rather than from which arm it landed in.
     let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in chain {
         attempts += 1;
@@ -524,13 +531,14 @@ async fn compose_stream(
             Ok(Ok(ds)) => ds,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
-                chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
                     "chat_image_prompt_compose",
                     &model_id,
                     &e,
-                ));
+                );
+                last_failure = failure_pointer(&f);
+                chain_failures.push(f);
                 // Nothing came back at all: clear (Fix 1's rule).
-                last_failure = "stream_open_failed";
                 last_model = None;
                 last_generation_id = None;
                 last_usage = None;
@@ -549,7 +557,7 @@ async fn compose_stream(
                         ),
                     },
                 ));
-                last_failure = "stream_open_failed";
+                last_failure = "gateway_error";
                 last_model = None;
                 last_generation_id = None;
                 last_usage = None;
@@ -582,26 +590,25 @@ async fn compose_stream(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream died before first token; next");
-                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    let f = eros_engine_llm::failure::AttemptFailure::from_llm_error(
                         "chat_image_prompt_compose",
                         &model_id,
                         &e,
-                    ));
-                    // Died before any content — but if this attempt already
-                    // captured model/generation_id/usage from an earlier
-                    // metadata chunk, the provider did answer and may have
-                    // been billed: retain that evidence and call it
-                    // `stream_died_midway`, the SSE analogue of the
-                    // non-stream mode's content-level failures. No evidence
-                    // at all ⇒ pure transport failure, same as an open
-                    // failure.
+                    );
+                    // A break is a break whether or not a metadata chunk landed
+                    // first, so the marker is the same pointer value either way.
+                    // What DID land is recorded where it belongs: if this attempt
+                    // already captured model/generation_id/usage, the provider
+                    // answered and may have been billed, so that evidence is
+                    // retained; with no evidence there is nothing to attribute
+                    // and the three columns stay NULL (Fix 1's rule).
+                    last_failure = failure_pointer(&f);
+                    chain_failures.push(f);
                     if served_model.is_some() || generation_id.is_some() || usage.is_some() {
-                        last_failure = "stream_died_midway";
                         last_model = served_model.clone().or_else(|| Some(model_id.clone()));
                         last_generation_id = generation_id.clone();
                         last_usage = usage.clone();
                     } else {
-                        last_failure = "stream_open_failed";
                         last_model = None;
                         last_generation_id = None;
                         last_usage = None;
@@ -637,7 +644,7 @@ async fn compose_stream(
                         },
                     ));
                     // No completed response ⇒ transport failure, clear.
-                    last_failure = "stream_open_failed";
+                    last_failure = "gateway_error";
                     last_model = None;
                     last_generation_id = None;
                     last_usage = None;
@@ -672,10 +679,10 @@ async fn compose_stream(
         // so composed_prompt stays NULL, same as the non-stream exhausted
         // arm. `model` / `generation_id` / `usage` come from the LAST
         // attempt's hoisted evidence, not a hardcoded NULL: a candidate that
-        // streamed metadata and then ended with no content (`empty`), or
-        // died mid-flight after already emitting some of that metadata
-        // (`stream_died_midway`), did get a response from the provider even
-        // though it never opened — see the per-arm decisions above.
+        // streamed metadata and then ended with no content (`empty`), or broke
+        // after already emitting some of that metadata, did get a response from
+        // the provider even though it never opened — see the per-arm decisions
+        // above.
         let (exhausted_attempts, exhausted_gateways) = split_failures(&chain_failures);
         record_compose_event(
             &state.pool,
@@ -798,6 +805,16 @@ async fn compose_stream(
                 // an accumulated-but-billed call reconcilable against the
                 // OpenRouter log instead of just a token count with nothing
                 // to point it at.
+                //
+                // `stream_died_midway` is retired with `stream_open_failed`:
+                // both arms that set `failure` also classify a real failure
+                // into `failure_kind`, so the marker points at the column that
+                // holds it. (The `unwrap_or` mirrors the `code`/`retryable`
+                // derivation just below — the two cannot disagree.)
+                let died_marker = failure_kind
+                    .as_ref()
+                    .map(failure_pointer)
+                    .unwrap_or("gateway_error");
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
@@ -817,7 +834,7 @@ async fn compose_stream(
                         usage: usage.as_ref().and_then(|u| serde_json::to_value(u).ok()),
                         generation_id: generation_id.as_deref(),
                         attempts,
-                        last_failure: Some("stream_died_midway"),
+                        last_failure: Some(died_marker),
                     },
                 )
                 .await;
@@ -1344,7 +1361,13 @@ mod tests {
             "the mock's own 500 passes through; only a failure with no status becomes 502"
         );
         let v = body_json(resp).await;
+        // `error: "upstream"` and an `upstream_status` key are BOTH emitted only
+        // by `AppError::Upstream`'s own branch — the generic `_ =>` arm renders
+        // `error: "internal"` and no such key. Together they prove the 500 is
+        // the provider's status passing through, not the engine falling back to
+        // a generic 500 and losing the "the provider failed my call" signal.
         assert_eq!(v["error"], "upstream");
+        assert_eq!(v["upstream_status"], 500);
 
         // The error row is written before the status is returned: the
         // exhausted row exists even though the caller never got a subject.
@@ -1694,6 +1717,107 @@ mod tests {
         assert_eq!(reqs.len(), 2, "both chain candidates were tried");
     }
 
+    /// A RECOVERED chain still reports the hop it lost — the same rule the chat
+    /// chain follows on `chat_messages`. The primary dies at open with a
+    /// provider status, the fallback serves, and the row is `status = "ok"` with
+    /// a non-empty `llm_attempts` naming the candidate that failed. Without
+    /// this, a chain that silently burned its primary on every request would be
+    /// indistinguishable from one that never fell back at all.
+    ///
+    /// The sibling above (`..._advances_chain_when_candidate_yields_no_content`)
+    /// pins the other half: a primary lost to a CONTENT verdict adds no entry,
+    /// because that call succeeded and was billed.
+    ///
+    /// `511` is used by no other test in this suite.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn compose_stream_ok_row_still_records_the_failed_candidate(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_instance(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        // Primary: dies at open with a provider status — a real transport-layer
+        // hop loss, not a content verdict.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"composer\""))
+            .respond_with(
+                ResponseTemplate::new(511)
+                    .set_body_string(r#"{"error":{"code":511,"message":"composer gone"}}"#),
+            )
+            .mount(&mock)
+            .await;
+        // Fallback: serves a usable compose reply.
+        let chunk = json!({
+            "choices": [{"delta": {"content": r#"{"prompt":"FALLBACK SUBJECT"}"#}}],
+            "id": "gen-fallback",
+            "model": "served/fallback-model",
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"backup\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = Arc::new(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfallback = [\"backup\"]\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let jwt = mint_jwt(user_id);
+        let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = sse_frames(resp).await;
+        let done = frames
+            .iter()
+            .find(|f| f["type"] == "done")
+            .expect("the fallback served a done frame");
+        assert_eq!(done["subject"], "FALLBACK SUBJECT");
+
+        let (status, last_failure, attempts, llm_attempts, gateways): (
+            String,
+            Option<String>,
+            i16,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, last_failure, attempts, llm_attempts, gateway_errors \
+             FROM engine.chat_images_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a compose event row");
+
+        assert_eq!(status, "ok", "the fallback served — the turn succeeded");
+        assert_eq!(
+            last_failure, None,
+            "last_failure is the FINAL attempt's verdict, and the final attempt \
+             succeeded; the lost hop lives in llm_attempts"
+        );
+        assert_eq!(attempts, 2, "both candidates were called");
+        let llm_attempts = llm_attempts.expect("the burned primary must be recorded on an ok row");
+        assert_eq!(llm_attempts[0]["http_status"], 511);
+        assert_eq!(llm_attempts[0]["model"], "composer");
+        assert_eq!(llm_attempts[0]["task"], "chat_image_prompt_compose");
+        assert!(
+            gateways.is_none(),
+            "the provider answered — nothing on the gateway side: {gateways:?}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_stream_passes_the_upstream_status_when_the_chain_exhausts(pool: PgPool) {
         // The chain is walked while OPENING the stream, before the SSE response
@@ -1718,7 +1842,11 @@ mod tests {
             "the mock's own 500 passes through, same as the non-stream twin"
         );
         let v = body_json(resp).await;
+        // Same discriminator as the non-stream twin: `upstream_status` is
+        // written only by `AppError::Upstream`'s own branch, so its presence
+        // rules out a fall-through to the generic `_ => 500` arm.
         assert_eq!(v["error"], "upstream");
+        assert_eq!(v["upstream_status"], 500);
 
         // Written before the status returns, same as the non-stream twin — but
         // labelled for the arm that never even opened a candidate.
@@ -1739,7 +1867,12 @@ mod tests {
         assert_eq!(status, "exhausted");
         assert_eq!(composed, None);
         assert_eq!(attempts, 1, "the sole configured model, no fallback");
-        assert_eq!(last_failure.as_deref(), Some("stream_open_failed"));
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("upstream_error"),
+            "stream_open_failed is retired: it covered a provider status and a \
+             local timeout with one label"
+        );
     }
 
     /// codex Fix 2: a candidate that streams metadata (model/id/usage) and
@@ -1750,14 +1883,15 @@ mod tests {
     /// and the endpoint still returns a pre-stream 502 — but the audit row
     /// must record `last_failure = "empty"` (the SSE analogue of the
     /// non-stream mode's content-level `empty` arm) with the metadata this
-    /// attempt captured, NOT the old hardcoded `stream_open_failed` / NULL
-    /// that a genuine transport failure gets (pinned by
+    /// attempt captured, NOT the pointer value + NULL trio a genuine transport
+    /// failure gets (pinned by
     /// `compose_stream_passes_the_upstream_status_when_the_chain_exhausts` just
-    /// above, left untouched).
+    /// above).
     ///
-    /// It is also the one exhausted arm that stays a 502: the stream completed,
-    /// so no attempt failed at the transport or provider layer and there is no
-    /// upstream status to forward — only the chain-scoped verdict.
+    /// It is also the one exhausted arm that stays a 502, and the one that
+    /// still writes a non-pointer `last_failure`: the stream completed, so no
+    /// attempt failed at the transport or provider layer, there is no upstream
+    /// status to forward, and nothing lands in either failure column.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_stream_502_with_metadata_but_no_content_records_empty(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -1998,15 +2132,20 @@ mod tests {
             attempts, 1,
             "the candidate that opened counts as one attempt"
         );
-        assert_eq!(last_failure.as_deref(), Some("stream_died_midway"));
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("upstream_error"),
+            "stream_died_midway is retired: a break is a break, and this one \
+             carried a provider error envelope on a 200"
+        );
     }
 
     /// The candidate opens on a whitespace-only first chunk (it passes the
     /// `!c.is_empty()` open gate) and the stream then ends with nothing more
     /// — no transport failure, but the accumulated reply trims to empty
-    /// before parsing even runs. Distinct from `stream_died_midway`: the
-    /// chain walk itself succeeded, the composer's own output just carried
-    /// nothing.
+    /// before parsing even runs. Distinct from a mid-stream break: the chain
+    /// walk itself succeeded, the composer's own output just carried nothing,
+    /// so this keeps a content verdict where a break gets a pointer value.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_stream_records_exhausted_event_when_reply_is_blank(pool: PgPool) {
         let user_id = Uuid::new_v4();
