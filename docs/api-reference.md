@@ -891,7 +891,7 @@ Soft-delete every session this user holds with one persona instance. The instanc
 
 `archived_sessions` counts the sessions flipped by *this* call, so a repeat call returns `200` with `0`. Every channel is archived, voice included — the unit is the relationship, not one client's view of it.
 
-**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, and `character_insights` — the state that would otherwise carry into the next conversation. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `chat_vision_events`, `chat_images_events`, `llm_attempt_audit`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
+**What is deleted:** `companion_affinity` (and its events, by cascade), the relationship layer of `companion_memories`, and `character_insights` — the state that would otherwise carry into the next conversation. **What is not:** `chat_messages`. The transcript stays, so the audit tables that reference a session by id (`companion_decision_events`, `character_insights_events`, `chat_vision_events`, `chat_images_events`) still point at something readable. The profile layer of `companion_memories` (`instance_id IS NULL`) also stays — those are cross-persona facts about the user.
 
 Afterwards the sessions are invisible everywhere: history, affinity, the session list, the chat and voice turn routes all return 404 or omit them, and `POST /comp/chat/start` creates a new session rather than resuming an archived one.
 

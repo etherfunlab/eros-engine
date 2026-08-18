@@ -784,7 +784,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `archived_sessions` 只算**这一次调用**翻掉的 session 数，所以重复调用返回 `200` 加 `0`。所有 channel 一起归档，语音也在内 —— 单位是这段关系，不是某一个客户端看到的那部分。
 
-**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights` —— 这些留着会渗进下一段对话。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`chat_vision_events`、`chat_images_events`、`llm_attempt_audit`）终于指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
+**会删掉的：** `companion_affinity`（连同它的 events，走 cascade）、`companion_memories` 的关系层、`character_insights` —— 这些留着会渗进下一段对话。**不会删的：** `chat_messages`。聊天记录留着，所以那些按 session id 引用的审计表（`companion_decision_events`、`character_insights_events`、`chat_vision_events`、`chat_images_events`）仍然指得到可读的东西。`companion_memories` 的画像层（`instance_id IS NULL`）也留着 —— 那是关于这个用户的跨角色事实。
 
 调用之后这些 session 在各处都不可见：history、affinity、session 列表、chat 与语音 turn 路由要么 404 要么直接不返回，`POST /comp/chat/start` 会新建 session 而不是恢复已归档的那个。
 

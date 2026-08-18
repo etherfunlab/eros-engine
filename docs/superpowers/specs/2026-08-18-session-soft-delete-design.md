@@ -136,11 +136,19 @@ this design fixes by construction.
 **`companion_affinity_events` goes with its parent** through the existing
 `ON DELETE CASCADE`. Accepted, not worked around: those events are the ledger of
 a relationship that no longer exists. The audit surface an operator needs —
-`companion_decision_events`, `llm_attempt_audit`, `chat_vision_events`,
+`companion_decision_events`, `character_insights_events`, `chat_vision_events`,
 `chat_images_events` — holds `session_id` without a foreign key and is untouched
 by any of this. Combined with the transcript now surviving, an operator
 inspecting an image-generation record can finally read the conversation around
 it. That is the point of the change.
+
+Since migration `0050`, `companion_affinity_events` also carries the
+`llm_attempts` / `gateway_errors` columns, so the cascade takes the
+affinity-eval slice of the per-attempt LLM failure audit with it — every failed
+attempt record for that relationship's affinity evals is gone along with the
+row it hung off. Accepted for the same reason the events themselves are: the
+attempts belong to a relationship that no longer exists. The chat-turn slice of
+that audit survives on `chat_messages`, which is never deleted.
 
 **`character_insights` is deleted.** It is instance-keyed, so today it survives
 the hard delete and carries the persona's memory of the relationship — where the
@@ -212,6 +220,11 @@ SQL function, say, to build a chat list — must add `AND NOT archived` to those
 reads. The engine cannot enforce visibility on a query it never sees. Any client
 that currently hard-deletes sessions replaces that with a call to this endpoint.
 
+Migrations run through an explicit `migrate` subcommand, not at boot, so
+deploy order is a real constraint: migration `0052` must be applied before the
+new binary serves traffic, because the read filter references a column
+(`archived`) that does not exist until then.
+
 ## 9. Not doing
 
 - **A restore endpoint.** §3 covers why.
@@ -225,3 +238,14 @@ that currently hard-deletes sessions replaces that with a call to this endpoint.
 - **A `status` enum on `chat_sessions`.** There is one distinction to draw.
 - **Touching `human_insights`.** User-level, cross-persona, same reasoning as the
   profile memory layer.
+- **Closing the `post_process` race entirely.** The guard added at the top of
+  `post_process::run` closes the window between an archive and a *new*
+  detached task; a turn's post-processing that is already past that check when
+  the archive commits can still land its write afterward. The residual window
+  is one statement wide. Closing it fully would mean taking a lock across the
+  whole post-turn pipeline, which costs more than the defect it would prevent.
+- **Clearing the `persona_story_*` layer.** The story digest is instance-keyed
+  and injected into every subsequent reply, so it survives the archive and
+  carries a narrative shaped by the deleted conversation into the fresh
+  session. Whether to clear it is a real design question, deliberately left
+  open here rather than overlooked.
