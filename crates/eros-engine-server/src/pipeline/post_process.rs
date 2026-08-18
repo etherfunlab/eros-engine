@@ -19,7 +19,6 @@
 use uuid::Uuid;
 
 use eros_engine_core::types::{ActionPlan, ActionType, Event};
-use eros_engine_llm::embedding::EmbeddingRouter;
 use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_store::affinity::AffinityRepo;
@@ -60,6 +59,25 @@ fn client_id_from_event(event: &Event) -> Option<String> {
     super::handlers::audit_from_event(event).and_then(|a| a.user.clone())
 }
 
+/// True when the session is still live. `get_session` filters `NOT archived`
+/// (migration 0052), so an archived session — or a read that errors, or an id
+/// that never existed — reads back as "not live" here; all three fail closed
+/// rather than risk a write landing for a session the caller can no longer see.
+///
+/// Called twice per turn: once at the top of `run`, which skips the LLM and
+/// embedding calls entirely once a session is already archived when the task
+/// starts; and again immediately before each of the three writes those calls
+/// feed, which narrows (but — see spec §9 — does not close) the window where
+/// the archive endpoint commits *during* those calls.
+async fn session_still_live(state: &AppState, session_id: Uuid) -> bool {
+    ChatRepo { pool: &state.pool }
+        .get_session(session_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// Spawned by `pipeline::run`. Owned `state` so the future is `'static`.
 pub async fn run(
     state: AppState,
@@ -70,17 +88,9 @@ pub async fn run(
     plan: ActionPlan,
     produced: Vec<ProducedMessage>,
 ) {
-    // The archive endpoint can land between the turn and this detached task. An
-    // archived session resolves to None (migration 0052), and continuing would
-    // rewrite the three tables that endpoint just deleted — putting a
-    // companion_affinity row back, pointing at a session every read route now 404s.
-    let session_still_live = ChatRepo { pool: &state.pool }
-        .get_session(session_id)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    if !session_still_live {
+    // The archive endpoint can land between the turn and this detached task —
+    // this is the entry half of the check documented on `session_still_live`.
+    if !session_still_live(&state, session_id).await {
         return;
     }
 
@@ -258,6 +268,15 @@ async fn persist_affinity(
     levels: eros_engine_core::affinity::EndpointLevelReads,
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
 ) {
+    // Recheck: the affinity evaluator's LLM call (or a sibling post_process
+    // future) may have run long enough for the archive endpoint to commit
+    // while this task was inside it. Without this, `load_or_create` below
+    // would put a `companion_affinity` row right back for a session every
+    // read route now 404s.
+    if !session_still_live(state, session_id).await {
+        return;
+    }
+
     let repo = AffinityRepo { pool: &state.pool };
 
     // Demo sessions get boosted positive raw scores so meters move within the
@@ -368,7 +387,7 @@ async fn write_turn(
     let rel_content = relationship_memory_content(user_msg);
     if let Err(e) = embed_and_upsert(
         &repo,
-        &state.embed,
+        state,
         MemoryLayer::Relationship,
         session_id,
         user_id,
@@ -384,7 +403,7 @@ async fn write_turn(
     if !user_msg.trim().is_empty() {
         if let Err(e) = embed_and_upsert(
             &repo,
-            &state.embed,
+            state,
             MemoryLayer::Profile,
             session_id,
             user_id,
@@ -400,7 +419,7 @@ async fn write_turn(
 
 async fn embed_and_upsert(
     repo: &MemoryRepo<'_>,
-    embed: &EmbeddingRouter,
+    state: &AppState,
     layer: MemoryLayer,
     session_id: Uuid,
     user_id: Uuid,
@@ -410,10 +429,19 @@ async fn embed_and_upsert(
     if content.trim().is_empty() {
         return Ok(());
     }
-    let embedding = embed
+    let embedding = state
+        .embed
         .embed_document(content)
         .await
         .map_err(|e| format!("embed failed: {e}"))?;
+    // Recheck: the embedding call above may have run long enough for the
+    // archive endpoint to commit while this task was inside it. Without this,
+    // the upsert below would put a `companion_memories` row right back for a
+    // session the archive just deleted it from. A silent no-op, not a
+    // failure — same as the entry guard.
+    if !session_still_live(state, session_id).await {
+        return Ok(());
+    }
     // category=None: this writer dumps raw turns. The classifier extraction
     // step (future) will write its own rows with category populated.
     repo.upsert(
@@ -1210,6 +1238,15 @@ async fn extract_character_insights(
         .await;
     }
     if structured.as_object().is_none_or(|o| o.is_empty()) {
+        return;
+    }
+
+    // Recheck: the two character-chain LLM calls above (extraction, then
+    // structuring) may together have run long enough for the archive endpoint
+    // to commit while this task was inside them. Without this, the apply
+    // below would put a `character_insights` row right back for an instance
+    // the archive just deleted it from.
+    if !session_still_live(state, session_id).await {
         return;
     }
 
@@ -2714,7 +2751,19 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let instance_id = seed_persona_instance(&pool, uuid::Uuid::new_v4()).await;
+        let user_id = uuid::Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        // A real, unarchived session — extract_character_insights' pre-write
+        // recheck (Fix 1) reads session liveness through it, same as the
+        // production caller always passes one from the live pipeline.
+        let session_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let mut state = crate::routes::companion::test_state(pool.clone());
         // Two DISTINCT blocks with two DISTINCT, non-prefix model ids (neither
         // is a substring of the other), so the audit rows AND the mock match
@@ -2737,7 +2786,7 @@ mod tests {
 
         extract_character_insights(
             &state,
-            uuid::Uuid::new_v4(),
+            session_id,
             instance_id,
             uuid::Uuid::new_v4(),
             "你今天在忙什么",
@@ -2892,18 +2941,26 @@ mod tests {
         assert_eq!(stages[0].0, "extraction");
     }
 
-    /// Pins the Fix 2 guard: the archive endpoint can land between a turn and
-    /// this detached task, and `run` must notice before doing any work. The
-    /// state built by `test_state` has no wiremock behind it — `write_turn`'s
-    /// embedding call and the affinity evaluator both point at real hosts —
-    /// so if the guard were missing, or placed after the point where any of
-    /// those calls fire, this test would hang or fail on a real network
-    /// attempt instead of completing. A non-empty user message and produced
-    /// text are used deliberately, so every future inside `run` has
-    /// something to act on if the guard does not stop it first.
+    /// Pins the entry guard: the archive endpoint can land between a turn and
+    /// this detached task, and `run` must notice before doing any work.
+    ///
+    /// Proves it by wiring `state.openrouter` and `state.embed` to a single
+    /// wiremock server carrying one `expect(0)` mock — verified when `mock`
+    /// drops at the end of this test, which panics the test if even one model
+    /// or embedding call went out. That is a stronger claim than the table
+    /// assertions below can make on their own: if the guard were missing, or
+    /// moved below the model/embedding calls, `run`'s fail-open error
+    /// handling would absorb the resulting request errors and still leave the
+    /// three tables empty, so the old version of this test — table counts
+    /// only — would keep passing even though the guard had stopped guarding
+    /// anything. A non-empty user message and produced text are used
+    /// deliberately, so every future inside `run` has something to act on if
+    /// the guard does not stop it first.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn run_is_a_noop_on_an_archived_session(pool: sqlx::PgPool) {
         use eros_engine_store::session_archive::SessionArchiveRepo;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
@@ -2921,7 +2978,37 @@ mod tests {
             .await
             .unwrap();
 
-        let state = crate::routes::companion::test_state(pool.clone());
+        // One server, one catch-all mock, zero allowed hits — backs BOTH
+        // clients so a call from any of `run`'s four futures (the affinity
+        // evaluator, the two insight chains, or the memory embed) is caught
+        // the same way.
+        let mock = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            mock.uri()
+        ))
+        .expect("embedding provider config parses");
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .expect("mock embedding router builds"),
+        );
+
         let event = Event::UserMessage {
             content: "还记得我们上次聊到的事吗".into(),
             message_id: Uuid::new_v4(),
@@ -2996,6 +3083,231 @@ mod tests {
         assert_eq!(
             insights, 0,
             "the guard must stop character insight extraction from writing a row"
+        );
+    }
+
+    // ─── Fix 1's pre-write recheck ──────────────────────────────────
+    //
+    // The three tests below call `persist_affinity` / `write_turn` /
+    // `extract_character_insights` DIRECTLY rather than through `run`, so
+    // `run`'s entry guard never executes at all — it is the recheck inside
+    // each of these functions, and only that recheck, that can make the
+    // assertions below pass. This is the distinction the entry-guard test
+    // above cannot make on its own: there, the session is already archived
+    // before `run` is even called, so the entry guard alone accounts for
+    // every empty table and the recheck code paths are never reached.
+
+    /// Pins `persist_affinity`'s recheck. No `run`, no entry guard in the call
+    /// path — this proves the function's own gate, not the one at the top of
+    /// `run`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn persist_affinity_recheck_stops_the_write_on_an_archived_session(pool: sqlx::PgPool) {
+        use eros_engine_store::session_archive::SessionArchiveRepo;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        persist_affinity(
+            &state,
+            session_id,
+            user_id,
+            instance_id,
+            ActionType::ReplyText,
+            eros_engine_core::affinity::AxisGrades::default(),
+            eros_engine_core::affinity::AffinityDeltas::default(),
+            serde_json::json!({}),
+            None,
+            eros_engine_core::affinity::EndpointLevelReads::default(),
+            &[],
+        )
+        .await;
+
+        let affinity: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_affinity WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            affinity, 0,
+            "persist_affinity's own recheck must stop load_or_create from recreating the row"
+        );
+    }
+
+    /// Pins `embed_and_upsert`'s recheck (called from `write_turn`). The
+    /// embed call is served a real response — if it errored instead, the
+    /// write would be skipped for the wrong reason (a transport error, not
+    /// the recheck), which is exactly the "passes anyway" failure mode Fix 2
+    /// called out. No `run`, no entry guard in the call path.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn write_turn_recheck_stops_the_write_on_an_archived_session(pool: sqlx::PgPool) {
+        use eros_engine_store::session_archive::SessionArchiveRepo;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let embed_server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": vec![0.1_f32; 512] } ]
+            })))
+            .mount(&embed_server)
+            .await;
+        let embed_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+            "[providers.mockembed]\nembeddings = \"{}/v1/embeddings\"\n\
+             [tasks.embedding]\nmodel = \"mock-embed@mockembed\"\n",
+            embed_server.uri()
+        ))
+        .expect("embedding provider config parses");
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.embed = std::sync::Arc::new(
+            eros_engine_llm::embedding::EmbeddingRouter::from_config_with(&embed_cfg, |k| {
+                (k == "MOCKEMBED_API_KEY").then(|| "test-key".to_string())
+            })
+            .expect("mock embedding router builds"),
+        );
+
+        write_turn(
+            &state,
+            session_id,
+            user_id,
+            instance_id,
+            "还记得我们上次聊到的事吗",
+        )
+        .await;
+
+        let memories: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.companion_memories WHERE user_id = $1 AND instance_id = $2",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            memories, 0,
+            "write_turn's own recheck must stop the embed response from being upserted"
+        );
+    }
+
+    /// Pins `extract_character_insights`'s recheck. Both chain stages are
+    /// served real responses, same reasoning as the memory test above: the
+    /// write must be skipped because of the recheck, not because a call
+    /// failed first. No `run`, no entry guard in the call path.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn character_insights_recheck_stops_the_write_on_an_archived_session(pool: sqlx::PgPool) {
+        use eros_engine_store::session_archive::SessionArchiveRepo;
+        use wiremock::matchers::{body_string_contains, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let facts_body = serde_json::json!({
+            "id": "gen-ch-facts", "model": "ch/stage-one",
+            "usage": {"total_tokens": 2},
+            "choices": [{"message": {"content":
+                "{\"facts\":[\"角色说她今天在公司加班到十点\"],\"details\":[]}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("char-facts-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
+            .mount(&mock)
+            .await;
+        let struct_body = serde_json::json!({
+            "id": "gen-ch-struct", "model": "ch/stage-two",
+            "usage": {"total_tokens": 3},
+            "choices": [{"message": {"content": "{\"location\":\"公司\"}"}}],
+        });
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("character_insights schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.character_insight_extraction]\nmodel=\"ch/stage-one\"\n\
+                 filter_prompt=\"char-facts-sentinel\"\n\n\
+                 [tasks.character_insight_structuring]\nmodel=\"ch/stage-two\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        extract_character_insights(
+            &state,
+            session_id,
+            instance_id,
+            Uuid::new_v4(),
+            "你今天在忙什么",
+            "还在公司，加班到十点",
+            None,
+        )
+        .await;
+
+        let profiles: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.character_insights WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            profiles, 0,
+            "extract_character_insights' own recheck must stop apply_extraction from writing the profile"
         );
     }
 }
