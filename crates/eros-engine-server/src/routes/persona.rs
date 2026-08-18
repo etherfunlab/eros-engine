@@ -25,7 +25,8 @@ use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
     compose_inputs_json, compose_user_payload, parse_compose_reply, record_compose_event,
-    run_image_prompt_compose, stream_error_code_for, StreamErrorCode, FILTER_TIMEOUT,
+    run_image_prompt_compose, split_failures, stream_error_code_for, StreamErrorCode,
+    FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -165,6 +166,34 @@ fn validate(req: &ComposeRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+/// The error a composer chain that never produced a prompt returns. Both modes
+/// reach it the same way — no candidate ever yielded a usable subject — and
+/// both hand it the same evidence, so they share one construction.
+///
+/// The LAST typed failure wins: `AppError::Upstream` forwards its status
+/// verbatim, so a chain killed by a `529` answers `529` instead of a synthesised
+/// `502`. A chain that only ever hit CONTENT verdicts (`empty`, `empty_prompt`)
+/// has no typed failure at all — those calls succeeded and were billed — so it
+/// falls back to the chain-scoped `ChainExhausted`, with the coarse tag folded
+/// into the message.
+fn compose_chain_exhausted(
+    failures: &[eros_engine_llm::failure::AttemptFailure],
+    last_failure: Option<&str>,
+) -> AppError {
+    let f = failures.last().cloned().unwrap_or_else(|| {
+        eros_engine_llm::failure::AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
+            task: "chat_image_prompt_compose".into(),
+            model: None,
+            kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
+            message: format!(
+                "image composer chain exhausted: {}",
+                last_failure.unwrap_or("no attempts")
+            ),
+        })
+    });
+    AppError::Upstream(Box::new(f))
+}
+
 #[utoipa::path(
     post,
     path = "/persona/{instance_id}/image/compose",
@@ -297,6 +326,8 @@ pub async fn compose_image(
         req.aspect_ratio.as_deref(),
     );
 
+    let (compose_attempts, compose_gateways) = split_failures(&run.failures);
+
     let Some(outcome) = run.outcome else {
         // 502 here, unlike the chat path's portrait fallback (spec
         // 2026-08-03 §3.6) — nothing was assembled, so composed_prompt stays
@@ -309,8 +340,8 @@ pub async fn compose_image(
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
-                llm_attempts: None,
-                gateway_errors: None,
+                llm_attempts: compose_attempts,
+                gateway_errors: compose_gateways,
                 source: "compose_endpoint",
                 user_id,
                 instance_id: Some(instance_id),
@@ -329,32 +360,15 @@ pub async fn compose_image(
             },
         )
         .await;
-        // `run_image_prompt_compose` only hands back a `&'static str` reason
-        // tag today, not a typed `AttemptFailure` per attempt — folding that
-        // in is Task 10's job. `ChainExhausted` carries no `model` by
-        // convention; the tag still rides the message so the real reason
-        // isn't lost.
-        return Err(AppError::Upstream(Box::new(
-            eros_engine_llm::failure::AttemptFailure::Gateway(
-                eros_engine_llm::failure::GatewayError {
-                    task: "chat_image_prompt_compose".into(),
-                    model: None,
-                    kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
-                    message: format!(
-                        "image composer chain exhausted: {}",
-                        run.last_failure.unwrap_or("no attempts")
-                    ),
-                },
-            ),
-        )));
+        return Err(compose_chain_exhausted(&run.failures, run.last_failure));
     };
 
     let composed_prompt = compose_image_prompt(style_key, &persona, &outcome.prompt);
     record_compose_event(
         &state.pool,
         ImageComposeEventInsert {
-            llm_attempts: None,
-            gateway_errors: None,
+            llm_attempts: compose_attempts,
+            gateway_errors: compose_gateways,
             source: "compose_endpoint",
             user_id,
             instance_id: Some(instance_id),
@@ -488,6 +502,13 @@ async fn compose_stream(
     let mut last_generation_id: Option<String> = None;
     let mut last_usage: Option<eros_engine_llm::openrouter::UsageBlock> = None;
     let mut last_failure: &'static str = "stream_open_failed";
+    // The pre-open walk's typed failures, mirroring `run_image_prompt_compose`'s
+    // own accumulator: they fill the audit row's two columns and decide the
+    // status a fully-failed chain returns. `empty` pushes nothing — the stream
+    // completed, so the call succeeded and was billed; every other arm carries
+    // a real failure, classified from what actually broke rather than from
+    // which arm it landed in.
+    let mut chain_failures: Vec<eros_engine_llm::failure::AttemptFailure> = Vec::new();
     for model_id in chain {
         attempts += 1;
         // One budget per candidate, covering both the open and the whole
@@ -503,6 +524,11 @@ async fn compose_stream(
             Ok(Ok(ds)) => ds,
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream open failed; next");
+                chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                    "chat_image_prompt_compose",
+                    &model_id,
+                    &e,
+                ));
                 // Nothing came back at all: clear (Fix 1's rule).
                 last_failure = "stream_open_failed";
                 last_model = None;
@@ -512,6 +538,17 @@ async fn compose_stream(
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "compose endpoint: stream open timeout; next");
+                chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                    eros_engine_llm::failure::GatewayError {
+                        task: "chat_image_prompt_compose".into(),
+                        model: Some(model_id.clone()),
+                        kind: eros_engine_llm::failure::GatewayKind::OpenTimeout,
+                        message: format!(
+                            "compose stream open timeout after {}s",
+                            FILTER_TIMEOUT.as_secs()
+                        ),
+                    },
+                ));
                 last_failure = "stream_open_failed";
                 last_model = None;
                 last_generation_id = None;
@@ -545,6 +582,11 @@ async fn compose_stream(
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(model = %model_id, error = %e, "compose endpoint: stream died before first token; next");
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
+                        "chat_image_prompt_compose",
+                        &model_id,
+                        &e,
+                    ));
                     // Died before any content — but if this attempt already
                     // captured model/generation_id/usage from an earlier
                     // metadata chunk, the provider did answer and may have
@@ -581,6 +623,19 @@ async fn compose_stream(
                 }
                 Err(_) => {
                     tracing::warn!(model = %model_id, "compose endpoint: timeout before first token; next");
+                    // The candidate's whole budget covers the open AND the
+                    // wait for a first token, so an expiry here is TotalTimeout.
+                    chain_failures.push(eros_engine_llm::failure::AttemptFailure::Gateway(
+                        eros_engine_llm::failure::GatewayError {
+                            task: "chat_image_prompt_compose".into(),
+                            model: Some(model_id.clone()),
+                            kind: eros_engine_llm::failure::GatewayKind::TotalTimeout,
+                            message: format!(
+                                "compose stream timeout after {}s",
+                                FILTER_TIMEOUT.as_secs()
+                            ),
+                        },
+                    ));
                     // No completed response ⇒ transport failure, clear.
                     last_failure = "stream_open_failed";
                     last_model = None;
@@ -621,11 +676,12 @@ async fn compose_stream(
         // died mid-flight after already emitting some of that metadata
         // (`stream_died_midway`), did get a response from the provider even
         // though it never opened — see the per-arm decisions above.
+        let (exhausted_attempts, exhausted_gateways) = split_failures(&chain_failures);
         record_compose_event(
             &state.pool,
             ImageComposeEventInsert {
-                llm_attempts: None,
-                gateway_errors: None,
+                llm_attempts: exhausted_attempts,
+                gateway_errors: exhausted_gateways,
                 source: "compose_endpoint_stream",
                 user_id,
                 instance_id: Some(instance_id),
@@ -646,18 +702,7 @@ async fn compose_stream(
             },
         )
         .await;
-        // Same gap as the non-stream arm above: no candidate ever opened, so
-        // there is no typed `AttemptFailure` to carry, only this reason tag.
-        return Err(AppError::Upstream(Box::new(
-            eros_engine_llm::failure::AttemptFailure::Gateway(
-                eros_engine_llm::failure::GatewayError {
-                    task: "chat_image_prompt_compose".into(),
-                    model: None,
-                    kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
-                    message: format!("image composer chain exhausted: {last_failure}"),
-                },
-            ),
-        )));
+        return Err(compose_chain_exhausted(&chain_failures, Some(last_failure)));
     };
 
     let frames = async_stream::stream! {
@@ -739,6 +784,12 @@ async fn compose_stream(
             },
         );
         let (subject, caption) = parse_compose_reply(acc.trim());
+        // Whatever this request's chain lost: the candidates that failed before
+        // one opened, plus this one's own death if it died. Whichever arm below
+        // fires owns the split — they are mutually exclusive.
+        let mut all_failures = chain_failures;
+        all_failures.extend(failure_kind.iter().cloned());
+        let (stream_attempts, stream_gateways) = split_failures(&all_failures);
         match failure {
             Some(message) => {
                 // Died after opening — a chunk carrying `usage` (and, same
@@ -750,8 +801,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
+                        llm_attempts: stream_attempts,
+                        gateway_errors: stream_gateways,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),
@@ -803,8 +854,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
+                        llm_attempts: stream_attempts,
+                        gateway_errors: stream_gateways,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),
@@ -855,8 +906,8 @@ async fn compose_stream(
                 record_compose_event(
                     &state.pool,
                     ImageComposeEventInsert {
-                        llm_attempts: None,
-                        gateway_errors: None,
+                        llm_attempts: stream_attempts,
+                        gateway_errors: stream_gateways,
                         source: "compose_endpoint_stream",
                         user_id,
                         instance_id: Some(instance_id),
@@ -1263,9 +1314,11 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn compose_502_when_chain_exhausted(pool: PgPool) {
+    async fn compose_passes_the_upstream_status_when_the_chain_exhausts(pool: PgPool) {
         // spec §3.6: no portrait fallback here — the fallback exists to keep a
         // chat turn moving, and this endpoint has no turn to protect.
+        // The status is the provider's own, forwarded verbatim (spec §6.2), so
+        // a chain killed by a 500 answers 500 — not a synthesised 502.
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let mock = MockServer::start().await;
@@ -1285,12 +1338,16 @@ mod tests {
             json!({"content": "在海边", "stream": false}),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the mock's own 500 passes through; only a failure with no status becomes 502"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["error"], "upstream");
 
-        // The 502 is written before it's returned: the exhausted row exists
-        // even though the caller never got a subject.
+        // The error row is written before the status is returned: the
+        // exhausted row exists even though the caller never got a subject.
         #[allow(clippy::type_complexity)]
         let (source, status, subject, composed, model, attempts, last_failure): (
             String,
@@ -1316,7 +1373,11 @@ mod tests {
         );
         assert_eq!(model, None);
         assert_eq!(attempts, 1, "the sole configured model, no fallback");
-        assert_eq!(last_failure.as_deref(), Some("model_error"));
+        assert_eq!(
+            last_failure.as_deref(),
+            Some("upstream_error"),
+            "model_error is retired; the coarse marker now points at the column"
+        );
     }
 
     /// The standalone endpoint is a first-class composer caller: its calls are
@@ -1634,9 +1695,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn compose_stream_502_when_chain_exhausted(pool: PgPool) {
+    async fn compose_stream_passes_the_upstream_status_when_the_chain_exhausts(pool: PgPool) {
         // The chain is walked while OPENING the stream, before the SSE response
-        // exists — total failure must be a real HTTP 502 even in stream mode.
+        // exists — total failure must be a real HTTP error even in stream mode,
+        // carrying the provider's own status (spec §6.2) rather than a 502.
         let user_id = Uuid::new_v4();
         let instance_id = seed_instance(&pool, user_id).await;
         let mock = MockServer::start().await;
@@ -1650,11 +1712,15 @@ mod tests {
         ));
         let jwt = mint_jwt(user_id);
         let resp = post_compose(&mut app, instance_id, &jwt, json!({"content": "在海边"})).await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the mock's own 500 passes through, same as the non-stream twin"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["error"], "upstream");
 
-        // Written before the 502 returns, same as the non-stream twin — but
+        // Written before the status returns, same as the non-stream twin — but
         // labelled for the arm that never even opened a candidate.
         let (source, status, composed, attempts, last_failure): (
             String,
@@ -1686,7 +1752,12 @@ mod tests {
     /// non-stream mode's content-level `empty` arm) with the metadata this
     /// attempt captured, NOT the old hardcoded `stream_open_failed` / NULL
     /// that a genuine transport failure gets (pinned by
-    /// `compose_stream_502_when_chain_exhausted` just above, left untouched).
+    /// `compose_stream_passes_the_upstream_status_when_the_chain_exhausts` just
+    /// above, left untouched).
+    ///
+    /// It is also the one exhausted arm that stays a 502: the stream completed,
+    /// so no attempt failed at the transport or provider layer and there is no
+    /// upstream status to forward — only the chain-scoped verdict.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn compose_stream_502_with_metadata_but_no_content_records_empty(pool: PgPool) {
         let user_id = Uuid::new_v4();
