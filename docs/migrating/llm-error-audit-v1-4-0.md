@@ -84,6 +84,34 @@ discriminator. A status check now needs to cover the whole retryable range, and
 an unrecognised code — a `570` a future provider invents — will reach you
 unmodified, because the engine classifies by range and not by an allow-list.
 
+**`429` and `403` now have two causes each — this is the passthrough's sharpest
+edge.** Before this release an upstream `429` was flattened to `502`, so a `429`
+from this endpoint could only mean the engine's own limit. Now both reach you as
+`429`.
+
+| Status | Engine's own meaning (**what your current handling was written for**) | Newly also means |
+| --- | --- | --- |
+| `429` | Per-user concurrent-stream cap (3, shared with chat and voice). Back off *your* concurrency. | The **provider** rate-limited us. Your concurrency is not the problem. |
+| `403` | The persona instance does not belong to the JWT user. Permanent; do not retry. | The **provider** refused on permission / guardrail / moderation grounds. |
+
+**The field that settles it is the top-level `error` key.** `"error":
+"upstream"` means the passthrough; the engine's own errors on this endpoint
+either carry a different `error` value (`not_found`) or the pre-stream
+`code` / `message` / `user_message` shape with no `error` key at all. The same
+test covers any status a future provider adds, so branch on the key once rather
+than adding a case per code.
+
+**`Retry-After` rides only the provider's `429`.** The engine never attaches it
+to its own — so a present `Retry-After` is itself a reliable second signal, and
+the delay it names is the *provider's* limit, not a statement about how many
+streams you may hold open. Backing your own concurrency off on it is the wrong
+response.
+
+No other status collides: the engine's remaining codes on this endpoint (`401`,
+`404`, `422`, `501`) are not among the ones a provider failure produces, and the
+`502` / `504` the gateway arm synthesises are inside the `"error": "upstream"`
+family already.
+
 ## 2. `stream_metrics` dashboards on the six transport outcomes go to zero
 
 The `stream_metrics` tracing event's `outcome` field loses its transport-shaped
@@ -441,8 +469,12 @@ stream.
 - [ ] Replace `status === 502` provider-failure checks with a check on the body's
       `"error": "upstream"` key, or widen the status handling to the full
       retryable range (§1).
-- [ ] Decide whether to honour the forwarded `Retry-After` header. The engine
-      does not (§1).
+- [ ] **Split your existing `429` and `403` handling on the `error` key** — each
+      now has a provider cause as well as the engine one your code was written
+      for, and backing your concurrency off on a provider rate limit is the
+      wrong response (§1).
+- [ ] Decide whether to honour the forwarded `Retry-After` header. It rides only
+      the provider's `429`, and the engine does not act on it (§1).
 - [ ] Repoint any `stream_metrics` dashboard off the six retired `outcome`
       labels onto `upstream_error` / `gateway_error`, and onto
       `gateway_errors[].kind` where the timeout distinction matters (§2).
