@@ -549,6 +549,54 @@
         ]
       }
     },
+    "/comp/chat/{session_id}/read": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Mark every message in the session the user did not author as read.",
+        "description": "Write-only. The engine records the timestamp and stops there: it does not\ncount unread messages, does not notify, and does not decide what \"read\"\nlooks like. A consumer reads `read_at` off the history entries and renders\nwhatever it wants.\n\nWhole-session, no body, no `up_to` watermark. A chat screen that rendered a\nbackscroll has shown the window; a partial-read vocabulary would make the\nengine store how far someone scrolled, which it has no way to be right\nabout.\n\nOut of reach here: `user` rows, which carry the engine's own stamp (the\nmoment the turn handed the message to its first model), and `gift_user`\ntips, which nobody reads on the user's behalf.\n\nVoice sessions are accepted, and so are their assistant rows — those are\nmessages addressed to the human like any other, and only the ENGINE's writer\nis text-only. The `409 wrong_channel` gate on the send routes exists because\nthose write channel-specific rows; this one does not.\n\nIdempotent: an existing stamp is never pushed forward, so `marked` counts\nreal transitions and a second call returns 200 with `marked: 0`.",
+        "operationId": "mark_session_read",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarkReadResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session not found"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/chat/{user_id}/sessions": {
       "get": {
         "tags": [
@@ -1546,6 +1594,14 @@
             "format": "uuid",
             "description": "Stable message id — the `engine.chat_messages` row primary key (UUID)."
           },
+          "read_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When this message reached the party it was addressed to — set by\n`POST /comp/chat/{session_id}/read` on an `assistant` row, and by the\nengine itself on a `user` row (the moment the turn handed the message to\nits first model; delivery, not that model's acknowledgement). Omitted\nwhile unread; permanently omitted on tips and voice `user` rows, which\nhave no reader. Absence means \"no receipt\", not \"not yet read\"."
+          },
           "role": {
             "type": "string",
             "description": "\"user\" | \"assistant\" | \"gift_user\" | \"system_error\""
@@ -1792,6 +1848,14 @@
           },
           "extracted_facts": {
             "type": "object"
+          },
+          "read_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When this message reached the party it was addressed to. On an\n`assistant` row: when the client called `POST /comp/chat/{id}/read` —\nthe human read it. On a `user` row: when the engine handed the message\nto the first model of the turn (\"delivered to a model\", not that\nmodel's acknowledgement). **Omitted while unread**, so a client tests\nfor the key's presence; there is no `null` form. Omitted forever on\ntips and on voice `user` rows, which have no reader — treat absence as\n\"no receipt\", never as \"not yet read\"."
           },
           "role": {
             "type": "string"
@@ -2131,6 +2195,24 @@
               "null"
             ],
             "description": "Free-form caller identifier (recommended: hash of internal user id).\n`chars ≤ 256`. Forwarded as OpenRouter wire `user`."
+          }
+        }
+      },
+      "MarkReadResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "marked"
+        ],
+        "properties": {
+          "marked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows this call actually stamped. `0` means everything was already read,\nso a client may call this on every mount without inventing an event."
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },

@@ -3991,6 +3991,24 @@ pub fn run_stream(
                         image_executor_available,
                         product_qa_recent.as_deref(),
                     );
+                    // Read receipt (migration 0053): the judge is the first
+                    // generative model to see this message, so this is the
+                    // instant the user's row was read. Spawned, never awaited —
+                    // it runs while the turn is already blocked on the judge, so
+                    // it costs nothing and a failure costs only the timestamp.
+                    // The only call site: a turn that skips the judge (tip, or
+                    // no [tasks.pde_decision] configured) leaves read_at NULL by
+                    // design (design §5.1).
+                    {
+                        let pool = state.pool.clone();
+                        let id = user_msg.user_message_id;
+                        tokio::spawn(async move {
+                            let repo = ChatRepo { pool: &pool };
+                            if let Err(e) = repo.mark_user_message_consumed(id).await {
+                                tracing::warn!("stream: read receipt for {id} failed: {e}");
+                            }
+                        });
+                    }
                     let run = run_pde_decision(&state.openrouter, p, &ctx).await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
@@ -6640,6 +6658,7 @@ mod tests {
             channel: None,
             pre_filter_content: None,
             metadata: None,
+            read_at: None,
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -6696,6 +6715,7 @@ mod tests {
             channel: None,
             pre_filter_content: None,
             metadata: Some(serde_json::json!({ "fallback_reason": reason })),
+            read_at: None,
         };
 
         let done_flag = |frames: &[ProtocolFrame]| -> bool {
@@ -6770,6 +6790,7 @@ mod tests {
             channel: channel.map(String::from),
             pre_filter_content: None,
             metadata: None,
+            read_at: None,
         };
 
         let rows = vec![
@@ -6841,6 +6862,7 @@ mod tests {
             channel: Some("product_qa".into()),
             pre_filter_content: None,
             metadata: None,
+            read_at: None,
         };
 
         let frames: Vec<ProtocolFrame> =
@@ -9565,6 +9587,7 @@ data: [DONE]\n\n";
             channel: None,
             pre_filter_content: None,
             metadata: None,
+            read_at: None,
         };
 
         let meta_model = |frames: &[ProtocolFrame]| -> Option<String> {
@@ -17084,5 +17107,123 @@ data: [DONE]\n\n"
             meta.get("model").is_none(),
             "delegated meta carries no model"
         );
+    }
+
+    /// Design §5: a text turn stamps its driving user row at the judge
+    /// dispatch. `test_state` runs `ModelConfig::default()`, whose `tasks` map
+    /// is empty, so `resolve_pde()` returns None there and the judge never
+    /// runs — this test configures its own.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_text_turn_stamps_its_user_row_when_the_judge_is_dispatched(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hey\"}}],\"id\":\"gen-r\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let user_message_id = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J4444444444444444444444A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        let sent_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT sent_at FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let _frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id,
+                session_id,
+                user_id,
+                instance_id,
+                content: "hi".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                history_anchor: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        // Without this the test would pass on merely entering the judge's match
+        // arm — the stamp fires there whether or not a request ever went out.
+        // Matched on the judge's own model, because the chat burst hits the
+        // same mocked endpoint and would otherwise satisfy a bare "any request
+        // arrived" check.
+        let judged = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("pde/judge"));
+        assert!(
+            judged,
+            "the stamp must accompany an actual judge dispatch, not just the code path"
+        );
+
+        // The stamp is spawned, not awaited, so the turn can outrun the write.
+        let mut read_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        for _ in 0..100 {
+            read_at = sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if read_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let read_at = read_at.expect("the turn handed the message to the judge, so it was read");
+        assert!(read_at >= sent_at, "read after the row was written");
     }
 }

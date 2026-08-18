@@ -73,6 +73,14 @@ pub struct ChatMessage {
     /// read `metadata.vision` when rendering model-facing user text.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Read receipt (migration 0053): when this message reached the party it
+    /// was addressed to. On a companion-authored row, set by the read endpoint
+    /// — the human read it. On a text `role='user'` row, set by the engine when
+    /// it hands the message to the PDE judge: "delivered to a model", not the
+    /// model's acknowledgement. NULL means no receipt, which is permanent for
+    /// tips and for `user` rows on the voice channel.
+    #[serde(default)]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 /// Projection-narrowed `ChatMessage` for BFF / UI-rendering paths that
@@ -97,6 +105,9 @@ pub struct ChatMessageSlim {
     /// answer (excluded from companion context). NULL for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// Read receipt (migration 0053). See `ChatMessage::read_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 pub struct ChatRepo<'a> {
@@ -340,7 +351,7 @@ impl<'a> ChatRepo<'a> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
                     (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
-                    channel \
+                    channel, read_at \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
@@ -751,6 +762,58 @@ impl<'a> ChatRepo<'a> {
         sqlx::query(
             "UPDATE engine.chat_messages SET channel = 'product_qa' \
              WHERE id = $1 AND role = 'user' AND channel IS NULL",
+        )
+        .bind(user_message_id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp every message in the session that the user did not author as read
+    /// (migration 0053). Returns the number of rows this call actually changed,
+    /// so a caller can tell a real transition from a repeat.
+    ///
+    /// The role predicate is negative on purpose: written as `role =
+    /// 'assistant'` it would skip `system_error` today and any companion role
+    /// added later. The two roles it excludes are exactly the two a user can
+    /// author — `user` belongs to `mark_user_message_consumed`, and a
+    /// `gift_user` tip has no reader at all.
+    ///
+    /// `read_at IS NULL` is the idempotency guard: an existing stamp is never
+    /// pushed forward, so a client calling this on every mount reports the
+    /// first read rather than the latest one.
+    pub async fn mark_session_read(&self, session_id: Uuid) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE engine.chat_messages SET read_at = now() \
+             WHERE session_id = $1 AND read_at IS NULL \
+               AND role NOT IN ('user', 'gift_user')",
+        )
+        .bind(session_id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Stamp the turn's `role='user'` row at the instant it is handed to the
+    /// PDE judge — the first generative model it is sent to (migration 0053).
+    /// Called only from the text pipeline; voice never stamps its user rows.
+    ///
+    /// Dispatch, not confirmed receipt. A judge call that fails on transport
+    /// afterwards leaves the stamp standing: what is recorded is that the
+    /// engine handed the message over, which is the half of the exchange it can
+    /// witness.
+    ///
+    /// Narrower than the complement of `mark_session_read`: a tip turn's
+    /// driving row is `role='gift_user'` and stays NULL, because nobody reads a
+    /// tip on the user's behalf. `read_at IS NULL` makes a replayed turn a
+    /// no-op.
+    pub async fn mark_user_message_consumed(
+        &self,
+        user_message_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_messages SET read_at = now() \
+             WHERE id = $1 AND role = 'user' AND read_at IS NULL",
         )
         .bind(user_message_id)
         .execute(self.pool)
@@ -4739,5 +4802,131 @@ mod tests {
                 "audit is always the generator's"
             );
         }
+    }
+
+    /// Writer 1 (design §4.1): the read endpoint stamps what the user did not
+    /// author, and only that.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_session_read_stamps_only_companion_authored_rows(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+        for role in ["user", "gift_user", "assistant", "system_error"] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, 'x')",
+            )
+            .bind(session_id)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let marked = repo.mark_session_read(session_id).await.unwrap();
+        assert_eq!(
+            marked, 2,
+            "assistant + system_error — the rows addressed to the human"
+        );
+
+        let unread: Vec<Option<DateTime<Utc>>> = sqlx::query_scalar(
+            "SELECT read_at FROM engine.chat_messages \
+             WHERE session_id = $1 AND role IN ('user', 'gift_user')",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unread.len(), 2);
+        assert!(
+            unread.iter().all(Option::is_none),
+            "'user' belongs to the engine's writer and a 'gift_user' tip has no reader"
+        );
+
+        let stamped = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, DateTime<Utc>>(
+                "SELECT read_at FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'assistant'",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let first = stamped(pool.clone()).await;
+
+        assert_eq!(
+            repo.mark_session_read(session_id).await.unwrap(),
+            0,
+            "marked counts real transitions, so a repeat call reports none"
+        );
+        assert_eq!(
+            stamped(pool.clone()).await,
+            first,
+            "a stamp records the first read, never the latest"
+        );
+    }
+
+    /// Writer 2 (design §5): the engine stamps the driving user row, and only
+    /// a `role='user'` one.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_user_message_consumed_stamps_a_user_row_once(pool: PgPool) {
+        let session_id = throwaway_session(&pool).await.id;
+        let repo = ChatRepo { pool: &pool };
+        let insert = |role: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_messages (session_id, role, content) \
+                     VALUES ($1, $2, 'x') RETURNING id",
+                )
+                .bind(session_id)
+                .bind(role)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let user_id = insert("user").await;
+        let gift_id = insert("gift_user").await;
+        let assistant_id = insert("assistant").await;
+
+        let sent_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT sent_at FROM engine.chat_messages WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        repo.mark_user_message_consumed(user_id).await.unwrap();
+        let read_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(read_at >= sent_at, "read after the row was written");
+
+        // A replayed turn must not walk the stamp forward.
+        repo.mark_user_message_consumed(user_id).await.unwrap();
+        let again: DateTime<Utc> =
+            sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(read_at, again, "replay is a no-op");
+
+        // Neither the endpoint's rows nor a tip are this writer's business.
+        repo.mark_user_message_consumed(gift_id).await.unwrap();
+        repo.mark_user_message_consumed(assistant_id).await.unwrap();
+        let untouched: Vec<Option<DateTime<Utc>>> =
+            sqlx::query_scalar("SELECT read_at FROM engine.chat_messages WHERE id = ANY($1)")
+                .bind(vec![gift_id, assistant_id])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            untouched.iter().all(Option::is_none),
+            "role='user' is the whole of this writer's scope"
+        );
     }
 }

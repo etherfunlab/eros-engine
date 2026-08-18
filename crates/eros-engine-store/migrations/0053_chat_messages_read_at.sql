@@ -1,0 +1,70 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+--
+-- Read receipts (docs/superpowers/specs/2026-08-19-chat-message-read-at-design.md).
+--
+-- One column, ONE concept: this message reached the party it was addressed to.
+-- Two writers, and the reader is decided by who wrote the row:
+--
+--   'assistant'    POST /comp/chat/{session_id}/read. The human read it. The
+--   (+ any future  engine never writes these; a downstream consumer decides
+--    companion     when a message counts as seen and how to render read vs
+--    role)         unread. The endpoint's predicate is stated as "not what the
+--                  user wrote" rather than role = 'assistant' precisely so a
+--                  companion role added later is covered the day it appears —
+--                  'system_error' is already legal in the CHECK above and has
+--                  no producer yet.
+--
+--   'user',        The engine, in run_stream, at the instant the turn HANDS the
+--   text channel   message to the PDE judge — the first generative model it is
+--                  sent to. Fire-and-forget, off the turn's latency path.
+--
+--                  Dispatch, not confirmed receipt: this is the "delivered"
+--                  tick, not the recipient's acknowledgement. A judge call that
+--                  then fails on transport leaves the stamp standing, and that
+--                  is correct — the fact recorded is that the engine handed the
+--                  message over, which is the only half of the exchange the
+--                  engine can honestly witness.
+--
+-- Rows with NO reader stay NULL from both writers, on purpose:
+--
+--   'gift_user'    A tip. Nobody reads a tip on the user's behalf, so there is
+--                  no receipt to record. Filling this in would be filling the
+--                  column because it exists.
+--   'user' rows    A voice turn runs run_voice_turn, which never stamps. Its
+--   on the voice   pre-flight is a different shape (recall and its embedding
+--   channel        run BEFORE the model there), so a voice read_at - sent_at
+--                  would not measure what a text one measures. Two channels
+--                  writing incomparable numbers into one column is worse than
+--                  one channel writing none. Do not "backfill" voice.
+--
+--                  Voice ASSISTANT rows are NOT excluded: they are messages
+--                  addressed to the human like any other, and the endpoint
+--                  stamps them. Only the engine's writer is text-only.
+--
+-- A deployment with no [tasks.pde_decision].filter_prompt configured never
+-- stamps user rows either — the judge is the only call site. Accepted: covering
+-- the judge-less path would mean four call sites plus a latch, four places to
+-- keep correct forever, for a receipt that is a nice-to-have there.
+--
+-- Consumers must read NULL as "no receipt", never as "not yet read".
+--
+-- read_at - sent_at on a text user row is the engine's pre-flight before the
+-- judge: affinity load, time decay, signals, and the 20-row transcript fetch.
+-- NOT embedding, recall, vision, the input filter, or any generation time —
+-- the judge deliberately runs ahead of all of those so a ghost verdict can
+-- short-circuit them (pipeline/stream.rs).
+--
+-- Not stamped at INSERT: sent_at is already now() from Postgres on that same
+-- statement, so a stamp there would be a verbatim copy and the row would carry
+-- one fact twice. Not stamped when the assistant row lands either: that value
+-- is assistant.sent_at, already in the table, and a ghost turn has no such row.
+--
+-- No index. The endpoint reaches its rows through idx_chat_messages_session and
+-- the engine reaches one row through the primary key; neither wants read_at
+-- indexed, and leaving it unindexed is also what keeps the engine's stamp a HOT
+-- update.
+--
+-- No backfill. Every row written before this migration predates the concept.
+
+ALTER TABLE engine.chat_messages
+    ADD COLUMN read_at TIMESTAMPTZ;

@@ -1666,6 +1666,7 @@ mod tests {
             channel: None,
             pre_filter_content: pre.map(|s| s.to_string()),
             metadata: None,
+            read_at: None,
         }
     }
 
@@ -1935,6 +1936,7 @@ mod tests {
             channel: None,
             pre_filter_content: None,
             metadata,
+            read_at: None,
         }
     }
 

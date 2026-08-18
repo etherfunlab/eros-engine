@@ -117,6 +117,24 @@ pub struct ChatHistoryEntry {
     /// answer (excluded from companion context). Omitted for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// When this message reached the party it was addressed to. On an
+    /// `assistant` row: when the client called `POST /comp/chat/{id}/read` —
+    /// the human read it. On a `user` row: when the engine handed the message
+    /// to the first model of the turn ("delivered to a model", not that
+    /// model's acknowledgement). **Omitted while unread**, so a client tests
+    /// for the key's presence; there is no `null` form. Omitted forever on
+    /// tips and on voice `user` rows, which have no reader — treat absence as
+    /// "no receipt", never as "not yet read".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct MarkReadResponse {
+    pub session_id: Uuid,
+    /// Rows this call actually stamped. `0` means everything was already read,
+    /// so a client may call this on every mount without inventing an event.
+    pub marked: i64,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -731,6 +749,7 @@ async fn get_history(
             // DTO (always null) to preserve the documented OSS API contract.
             extracted_facts: None,
             channel: m.channel,
+            read_at: m.read_at,
         })
         .collect();
     let total = entries.len();
@@ -902,6 +921,59 @@ async fn archive_instance_sessions(
     }))
 }
 
+/// Mark every message in the session the user did not author as read.
+///
+/// Write-only. The engine records the timestamp and stops there: it does not
+/// count unread messages, does not notify, and does not decide what "read"
+/// looks like. A consumer reads `read_at` off the history entries and renders
+/// whatever it wants.
+///
+/// Whole-session, no body, no `up_to` watermark. A chat screen that rendered a
+/// backscroll has shown the window; a partial-read vocabulary would make the
+/// engine store how far someone scrolled, which it has no way to be right
+/// about.
+///
+/// Out of reach here: `user` rows, which carry the engine's own stamp (the
+/// moment the turn handed the message to its first model), and `gift_user`
+/// tips, which nobody reads on the user's behalf.
+///
+/// Voice sessions are accepted, and so are their assistant rows — those are
+/// messages addressed to the human like any other, and only the ENGINE's writer
+/// is text-only. The `409 wrong_channel` gate on the send routes exists because
+/// those write channel-specific rows; this one does not.
+///
+/// Idempotent: an existing stamp is never pushed forward, so `marked` counts
+/// real transitions and a second call returns 200 with `marked: 0`.
+#[utoipa::path(
+    post,
+    path = "/comp/chat/{session_id}/read",
+    tag = "companion",
+    params(("session_id" = Uuid, Path, description = "Chat session id")),
+    responses(
+        (status = 200, body = MarkReadResponse),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "not your session"),
+        (status = 404, description = "session not found")
+    ),
+    security(("bearer" = []))
+)]
+async fn mark_session_read(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+) -> Result<Json<MarkReadResponse>, AppError> {
+    require_session_for_user(&state, session_id, user_id).await?;
+
+    let marked = ChatRepo { pool: &state.pool }
+        .mark_session_read(session_id)
+        .await?;
+
+    Ok(Json(MarkReadResponse {
+        session_id,
+        marked: marked as i64,
+    }))
+}
+
 // ─── Router ─────────────────────────────────────────────────────────
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -912,6 +984,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_profile))
         .routes(routes!(get_character_profile))
         .routes(routes!(archive_instance_sessions))
+        .routes(routes!(mark_session_read))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2180,5 +2253,101 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["archived_sessions"], 1);
+    }
+
+    fn mark_read_request(session_id: Uuid, jwt: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/read"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn mark_read_stamps_the_session_and_history_echoes_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        for role in ["user", "gift_user", "assistant"] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) VALUES ($1, $2, 'x')",
+            )
+            .bind(session_id)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(&mut router, mark_read_request(session_id, &jwt)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_id"], session_id.to_string());
+        assert_eq!(
+            body["marked"], 1,
+            "the assistant row — the other two the user wrote"
+        );
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        for m in messages {
+            let carries = m.as_object().unwrap().contains_key("read_at");
+            if m["role"] == "assistant" {
+                assert!(
+                    carries && m["read_at"].is_string(),
+                    "stamped row carries it: {m}"
+                );
+            } else {
+                assert!(
+                    !carries,
+                    "an unread row omits the key rather than sending null: {m}"
+                );
+            }
+        }
+
+        let (status, body) = send_request(&mut router, mark_read_request(session_id, &jwt)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["marked"], 0, "a repeat call reports no transitions");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn mark_read_rejects_a_foreign_unknown_or_archived_session(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, _) = send_request(
+            &mut router,
+            mark_read_request(session_id, &mint_test_jwt(Uuid::new_v4())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "not your session");
+
+        let jwt = mint_test_jwt(owner);
+        let (status, _) = send_request(&mut router, mark_read_request(Uuid::new_v4(), &jwt)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown session");
+
+        sqlx::query("UPDATE engine.chat_sessions SET archived = true WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _) = send_request(&mut router, mark_read_request(session_id, &jwt)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an archived session is gone");
     }
 }

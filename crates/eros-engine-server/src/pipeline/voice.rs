@@ -973,6 +973,7 @@ mod tests {
             client_msg_id: None,
             tips_amount_usd: None,
             channel: None,
+            read_at: None,
         }
     }
 
