@@ -116,7 +116,38 @@ Frame fields worth noting:
 
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
 - **`done`** — `truncated`, `usage` (after `OPENROUTER_USAGE_HIDDEN_KEYS` filtering; always present — `null` when not applicable), `generation_id` (OpenRouter id; always present — `null` when not applicable), and `ghost_fallback` (bool; omitted when `false`). `ghost_fallback: true` marks a reply that resolved empty and was delivered as a silent fallback — this is **not** an `action_type=ghost` turn, and it leaves the ghost counters untouched. The cause is recorded on the persisted row's `metadata.fallback_reason`. A turn that promises a photo (`action_type=reply_text_image`) is exempt: an empty text half is an image-only reply, not silence, so it reports `ghost_fallback: false`, carries no `fallback_reason`, and the trailing `image_request` still fires.
-- **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), and `retries_filter` (index of the filter-model attempt that served). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
+- **`final`** — turn summary: `filtered` (bool — was the reply output-filtered), `prompt_injected` (array of the trait tags that injected this turn, or `null`), `tier` (echo of the request `tier`, or `null`), `retries_chat` (zero-based index of the chat attempt that succeeded), `retries_filter` (index of the filter-model attempt that served), and — since v1.4.0 — `llm_attempts` / `gateway_errors` (both **omitted when empty**; see below). No profile/lead signal rides this frame — `lead_score`, `should_show_cta`, and `agent_training_level` were removed (companion_insights teardown, spec 2026-08-11); read profile state from `GET /comp/user/{user_id}/profile` instead.
+
+**`final.llm_attempts` / `final.gateway_errors` — the non-fatal failure
+channel.** Every LLM attempt that failed this turn, across the five chains
+whose failure changes what you received: the chat model chain, the input
+filter, the output filter, the PDE judge, and the image prompt composer. Both
+keys are omitted entirely when there were none, so a clean turn is byte-identical
+to what you receive today. The element shapes are documented in
+[llm-audit.md](llm-audit.md#failed-attempts-llm_attempts--gateway_errors) — the
+frame serialises the identical structures the audit columns hold.
+
+```text
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":1,"retries_filter":0,"llm_attempts":[{"task":"chat_companion","model":"x-ai/grok-4.20","http_status":529,"provider_code":"529","message":"code=529: Overloaded"}]}
+```
+
+> **Do not render these as an error.** A turn carrying them may have been served
+> perfectly normally — the example above is a turn whose primary model returned
+> `529` and whose fallback answered, which the user experienced as an ordinary
+> reply. They exist so a consumer can alert and account without the reader
+> seeing anything.
+
+Three cases carry them: a **recovered** turn (a later hop served — the reply is
+real and complete); a **pseudo-ghost** turn (the whole chain exhausted and a
+canned phrase was served as a normal reply, `metadata.fallback_reason =
+"stream_failure"` on the persisted row — to the end user this looks like an
+ordinary short reply, and this frame is the only signal that it is not); and a
+**garble-repaired** turn (`metadata.fallback_reason = "garble_repaired"`, the
+reply salvaged from a garbled hop). `chat_vision` and affinity-eval failures
+never ride this frame by design — both are fail-open and land in their own audit
+tables. A **replayed** turn emits `final` with both lists empty, the same way it
+recomputes `retries_chat` / `tier` / `prompt_injected` rather than reading them
+off the row; query `engine.chat_messages` for a replayed turn's failures.
 
 Concurrent active streams per user are capped at 3. The keep-alive heartbeat
 (`: ping`) is emitted every 15 s so reverse-proxies don't time out the
@@ -139,6 +170,33 @@ symmetric: neither endpoint will write into the other's sessions.
 Once the first SSE byte has been written, terminal failures arrive as an
 in-band `error` frame and the stream closes; the HTTP response has already
 committed `200 OK`.
+
+**`error` frame fields.** `code`, `retryable`, `message`, `user_message`, plus —
+since v1.4.0 — `upstream_status` and `provider_code`, both omitted when absent.
+
+```text
+data: {"type":"error","code":"rate_limited","retryable":true,"message":"…","user_message":"…","upstream_status":429,"provider_code":"429"}
+```
+
+`upstream_status` is the provider's own HTTP status, verbatim, and appears only
+when the provider actually answered. A gateway-layer failure (timeout, transport
+drop, decode failure) has no status the provider returned, so both fields are
+absent there. `provider_code` is the provider's own error code when its body
+carried one.
+
+`code` is derived from the failure rather than hardcoded, which brings two values
+alive that were declared and **never constructed** before v1.4.0:
+
+| Failure | `code` |
+|---|---|
+| Provider answered `429` | `rate_limited` **(new)** |
+| Provider answered any other status | `upstream_unavailable` |
+| Gateway `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **(new)** |
+| Gateway `config` (local misconfiguration) | `internal` |
+| Gateway `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+
+Add arms for `rate_limited` and `timeout`; both carry `retryable: true`, so a
+default arm that reports a permanent failure is now wrong.
 
 **Optional: tier selection.** The body may include a `tier` string —
 type `String`, regex `^[a-z0-9_]{1,32}$` (returns `400` if malformed).
@@ -712,7 +770,38 @@ Failure modes:
 | Instance not found | `404` |
 | Blank `content`, over-cap `scene`, bad `aspect_ratio` | `422` |
 | Over the per-user in-flight cap (shared with chat/voice, ≤3) | `429` |
-| Composer chain exhausted | `502` — `{"error":"upstream","message":…}` — or an in-band `error` frame if streaming has begun. **No portrait fallback here**: the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. |
+| Composer chain exhausted | **The provider's own status, verbatim** (see below) — or an in-band `error` frame if streaming has begun. **No portrait fallback here**: the fallback exists to keep a chat turn moving, and this endpoint has no turn to protect. |
+
+**Status passthrough (v1.4.0).** This endpoint used to render `502` whatever the
+upstream said. It now returns the provider's own status — `529`, `503`, `429`,
+or anything else it sent, including a code the engine has never seen. A failure
+with no status of its own (the gateway cases) is synthesised: **`504` for the
+three timeout kinds, `502` for everything else.** Detect a provider failure by
+the body's `"error": "upstream"` key, not by the status.
+
+```jsonc
+// the provider answered, with a status
+{"error":"upstream","message":"upstream failure: code=529: Overloaded",
+ "upstream_status":529,"provider_code":"529","error_type":"overloaded","retryable":true}
+
+// our path to the provider broke; no upstream status exists
+{"error":"upstream","message":"upstream failure: compose stream open timeout after 15s",
+ "gateway_kind":"open_timeout","retryable":true}
+```
+
+`error` and `message` are unchanged. `upstream_status` / `provider_code` /
+`error_type` appear on the upstream arm (the latter two only when the provider's
+body carried them); `gateway_kind` appears on the gateway arm — one of
+`open_timeout` | `total_timeout` | `idle_timeout` | `transport` | `decode` |
+`config` | `chain_exhausted`. `retryable` is always present and derived from the
+status by HTTP convention (every `5xx`, plus `408` and `429`). **`Retry-After` is
+forwarded verbatim** as a response header when the provider sent one — the engine
+records and passes it on, never acts on it.
+
+The streaming mode's in-band `error` frame keeps its four fields and does **not**
+gain `upstream_status` / `provider_code`: the composer chain is walked while
+opening the stream, so a total failure happens before the SSE response exists and
+comes back as the HTTP error above.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -1048,7 +1137,7 @@ error type. The table below covers the plain shape:
 | 403 | `forbidden` | Path-user vs JWT-user mismatch, or trying to read a session you don't own |
 | 404 | `not_found` | Unknown session / persona / message id |
 | 500 | `internal` | Anything else (DB error, LLM API error, etc.) |
-| 502 | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted) |
+| *the provider's own status* | `upstream` | The upstream provider failed the call (currently only the persona compose endpoint — its composer chain was exhausted). Since v1.4.0 this is **not always 502**: the provider's status passes through verbatim (`529`, `503`, `429`, …), and a gateway-layer failure with no upstream status maps to `504` for a timeout and `502` otherwise. The body carries `upstream_status` / `provider_code` / `error_type` or `gateway_kind`, plus `retryable` — see [the compose endpoint](#post-personainstance_idimagecompose). Branch on the `"error": "upstream"` key, not on the status. |
 
 ## Source
 

@@ -935,8 +935,8 @@
               }
             }
           },
-          "502": {
-            "description": "composer chain exhausted before any output — `{\"error\": \"upstream\", \"message\": …}`. No portrait fallback: this endpoint has no chat turn to protect."
+          "5XX": {
+            "description": "Composer chain exhausted before any output. **Not always 502**: the provider's own status passes through verbatim (529, 503, …), and a failure with no upstream status of its own maps by kind — a gateway timeout to 504, everything else to 502. Body: `{\"error\": \"upstream\", \"message\": \"upstream failure: code=529: Overloaded\", \"upstream_status\": 529, \"provider_code\": \"529\", \"error_type\": \"overloaded\", \"retryable\": true}`; the gateway arm carries `gateway_kind` (`open_timeout` | `total_timeout` | `idle_timeout` | `transport` | `decode` | `config` | `chain_exhausted`) in place of the three upstream keys. `retryable` is always present. `Retry-After` is forwarded verbatim when the provider sent one. Branch on the `error` key, not on the status. No portrait fallback: this endpoint has no chat turn to protect."
           }
         },
         "security": [

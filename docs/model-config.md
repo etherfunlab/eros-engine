@@ -676,8 +676,8 @@ and the same `filter_prompt` contract — a deployment's custom prompt needs no
 changes to serve both. Two behavioural differences on the endpoint side: the
 `[最近场景]` slot is filled from the request's `scene` field instead of the
 conversation history, and there is **no portrait fallback** — a fully failed
-chain is a `502` (the endpoint doubles as the composer's test surface, so it
-reports failure instead of masking it).
+chain is an HTTP error carrying the provider's own status (the endpoint doubles
+as the composer's test surface, so it reports failure instead of masking it).
 
 ```toml
 [tasks.chat_image_prompt_compose]

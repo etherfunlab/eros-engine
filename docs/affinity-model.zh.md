@@ -89,8 +89,9 @@ chemistry 给出老友形态（有耐心但冷静）——不需要提示词特�
 **逐回合 delta 照常输出。**`effective_deltas.warmth` / `.patience` 是派生值
 跨回合的 `after − before`，以衰减后快照为基准——缺席造成的落差不会记到回合头上。
 
-**跳过的回合保持档位。**评估被跳过或失败时（`eval_skip_reason`），存储档位
-保持不变，端点按当前线值与衰减重新派生。旧的规则 delta 回退（±0.02 消息长度
+**跳过的回合保持档位。**评估被跳过（`eval_skip_reason`）或失败时（自 v1.4.0
+起，改由非空的 `llm_attempts` / `gateway_errors` 说明——调用失败不算跳过），
+存储档位保持不变，端点按当前线值与衰减重新派生。旧的规则 delta 回退（±0.02 消息长度
 微调、超时 −0.05）已退役——停滞规则被衰减吸收。
 
 **Ghost 是独立路径。**Ghost 回合不进 `persist_with_event`，只更新

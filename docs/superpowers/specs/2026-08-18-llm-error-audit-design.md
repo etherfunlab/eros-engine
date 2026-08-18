@@ -529,13 +529,21 @@ Every coarse vocabulary gains the same two **pointer values** — `upstream_erro
 | --- | --- | --- |
 | `attempt_outcome` (tracing, `stream.rs:390`) | `open_error`, `open_timeout`, `total_timeout`, `idle_timeout`, `chunk_error`, `error_frame` | `upstream_error`, `gateway_error` |
 | `filter_attempts[].reason` (`chat_messages.metadata`) | `error`, `timeout` | `upstream_error`, `gateway_error` |
-| `last_failure` (`chat_vision_events`, `chat_images_events`) | `model_error`, `timeout` | `upstream_error`, `gateway_error` |
+| `last_failure` (`chat_vision_events`) | `model_error`, `timeout` | `upstream_error`, `gateway_error` |
+| `last_failure` (`chat_images_events`) | `model_error`, `timeout`, `stream_open_failed`, `stream_died_midway` | `upstream_error`, `gateway_error` |
 | `companion_decision_events.status` | `error`, `timeout` (stop writing; CHECK keeps them for historical rows) | `upstream_error`, `gateway_error` |
 | `context.eval_skip_reason` (`companion_affinity_events`) | `eval_error`, `eval_timeout` | nothing |
 
 What survives in each vocabulary is exactly the content-level verdicts: `served`, `length`,
 `content_filter`, `empty`, `garbled`, `refusal_pattern`, `too_short`, `unparseable`,
 `empty_prompt`, `blank_description`, `parse_error`.
+
+**`stream_open_failed` / `stream_died_midway` were found during implementation**, in the
+compose endpoint's streaming mode (`routes/persona.rs`) — a path the original audit did not
+reach. They belong to exactly the class this section retires: one label each covering a
+provider status *and* a local timeout, transport facts sitting in a content vocabulary. Both
+are retired with the other two, so `chat_images_events.last_failure` reads the same whichever
+endpoint wrote the row.
 
 `eval_skip_reason` gets no pointer values, because its contract is "why no call was made",
 and a failed call is not a skip. Its seven remaining values are all genuine intentional
@@ -642,7 +650,7 @@ uniform across tables.
 | --- | --- | --- |
 | `status` | `ok` \| `exhausted` \| `not_configured` | Unchanged |
 | `attempts` | SMALLINT count of hops | Unchanged. Counts every hop; the new columns hold only failed ones |
-| `last_failure` | `model_error`, `timeout`, `empty`, `unparseable`, `empty_prompt`, `content_filter`, `blank_description`, `refusal_pattern` | `model_error`/`timeout` retired → `upstream_error`/`gateway_error`; the six content verdicts unchanged |
+| `last_failure` | `model_error`, `timeout`, `empty`, `unparseable`, `empty_prompt`, `content_filter`, `blank_description`, `refusal_pattern`, plus `stream_open_failed`, `stream_died_midway` on `chat_images_events` only | `model_error`/`timeout` retired → `upstream_error`/`gateway_error`, and with them `stream_open_failed`/`stream_died_midway` (§7); the six content verdicts unchanged |
 | — | — | **new** `llm_attempts`, `gateway_errors` |
 
 ### 10.3 `engine.companion_decision_events`

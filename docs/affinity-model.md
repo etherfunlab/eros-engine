@@ -109,8 +109,9 @@ picks the band; the counterpart line picks the position inside it.
 the derivation's `after − before` across the turn, measured against the
 post-decay snapshot — the absence gap is never attributed to the turn.
 
-**Skipped turns hold.** When the eval is skipped or fails
-(`eval_skip_reason`), the stored levels hold and the endpoints are simply
+**Skipped turns hold.** When the eval is skipped (`eval_skip_reason`) or fails
+(since v1.4.0, a non-empty `llm_attempts` / `gateway_errors` — a failed call is
+not a skip), the stored levels hold and the endpoints are simply
 re-derived with the current lines and decay. The old rule-delta fallback
 (`±0.02` message-length nudges, stale `−0.05`) is retired — the stale rule is
 absorbed by decay.

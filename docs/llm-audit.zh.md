@@ -173,6 +173,141 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
 - **不解读。**引擎不会按 audit 字段分组、聚合、报警。Caller 自己接。
 
+## 失败的尝试：`llm_attempts` / `gateway_errors`
+
+自 **v1.4.0**（store migration `0050`）起，五张表都带同样两列可空 `JSONB`，
+记录每一次**失败的** LLM 尝试——包括被 fallback 救回来的那些，
+它们本来不会留下任何痕迹：
+
+| 表 | 承载的调用点 |
+|---|---|
+| `engine.chat_messages` | 对话模型链、输出过滤器、输入过滤器 |
+| `engine.chat_vision_events` | `chat_vision` describe |
+| `engine.chat_images_events` | 图片 prompt 合成器 |
+| `engine.companion_decision_events` | PDE 判官 |
+| `engine.companion_affinity_events` | 好感度评估 |
+
+五张表形状完全一致，全量错误视图一个 `UNION ALL` 就够。列是新增的、可空的，
+不回填、不建索引。**`NULL` 表示「没什么可记的」**——空数组永远不会写入，
+所以「没有失败」只有一种表达。设计见
+[LLM error audit spec](superpowers/specs/2026-08-18-llm-error-audit-design.md)；
+面向消费方的变化见
+[migrating/llm-error-audit-v1-4-0.md](migrating/llm-error-audit-v1-4-0.md)。
+
+### 三个归属，按「这个事实是谁说的」划分
+
+不按产出它的代码路径划分。每个事实只有一个归属，三者不重叠。
+
+| 归属 | 装什么 | 边界 |
+|---|---|---|
+| `llm_attempts` | **上游**说了什么 | 上游开口了：非 2xx 状态，或 `200` 响应体里带 error 信封 |
+| `gateway_errors` | 引擎**通往 provider 的那条路**在哪断的 | 上游没说出任何可用的话：超时、连接重置、TLS 失败、响应无法解析 |
+| 各表自己的粗粒度标记（`last_failure`、`status`、`fallback_reason`、`filter_attempts[].reason`） | 这一行的**业务裁决** | 调用**成功**并已计费：空回复、byte-BPE 乱码、拒答、长度截断 |
+
+`200 OK` 的流中途带 `{"error": {...}}`，或以 `finish_reason: "error"` 收尾，
+都算 `llm_attempts` 条目，`http_status: 200`——上游开口了，只是没在状态行上说。
+
+每个粗粒度词表都新增了同样两个**指针值**——`upstream_error` /
+`gateway_error`，它们只说明「有尝试失败了，细节在那一列」。被它们取代的
+传输层标签一律退役；完整的新旧对照表在 migration 指南里。
+
+### `llm_attempts` 元素
+
+```jsonc
+{
+  "task": "chat_companion",
+  "model": "x-ai/grok-4.20",
+  "http_status": 529,
+  "provider_code": "529",
+  "error_type": "overloaded",
+  "upstream_provider_code": "anthropic:overloaded_error",
+  "retry_after_s": 30,
+  "message": "code=529: Overloaded"
+}
+```
+
+`task` / `model` / `http_status` / `message` 恒存在；其余四个字段没有时直接
+省略，不写 null。`model` 保留配置里的完整 slug，含 `@provider` 后缀。
+
+`http_status` 是原始数字，**绝不是 enum**：OpenRouter 用 `529` 报过载，
+Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会不同。
+分类按 HTTP 惯例走（4xx 客户端、5xx 上游、408/429/5xx 可重试），
+所以没见过的 `570` 也能被合理处理。这里刻意**没有 `retryable` 字段**——
+有了状态码，消费方自己套惯例即可；这一列的契约是「上游说了什么」，
+引擎不在里头加自己的判断。
+
+`message` 沿用既有的脱敏保证：压成一行、有长度上限，并丢弃
+`metadata.flagged_input`——审核拒绝绝不能把用户的 prompt 原样回灌进审计行。
+
+### `gateway_errors` 元素
+
+```jsonc
+{
+  "task": "chat_companion",
+  "model": "x-ai/grok-4.20",
+  "kind": "open_timeout",
+  "message": "stream open timeout after 20s"
+}
+```
+
+`task` / `kind` / `message` 恒存在；`model` 在失败发生于选模型之前（配置错误）
+以及链级的 `chain_exhausted` 上省略。
+
+| `kind` | 范围 | 含义 |
+|---|---|---|
+| `open_timeout` | 单次尝试 | 连接 / 排队 / 等响应头超时 |
+| `total_timeout` | 单次尝试 | 单次尝试的整段生成超出上限 |
+| `idle_timeout` | 单次尝试 | 字节级空闲看门狗在流中途触发 |
+| `transport` | 单次尝试 | 连接重置、TLS 失败、SSE 响应体中断 |
+| `decode` | 单次尝试 | 响应到了但解析不了 |
+| `config` | 单次尝试 | 本地配置错误（空模型 slug、provider 解析不出来） |
+| `chain_exhausted` | 整条链 | 所有候选都失败了。不带 `model` |
+
+三种超时刻意分开：曾经把它们合成一个，结果空闲超时在看板上彻底看不见了。
+现在这个区分可以直接用 SQL 查，而不是只能翻日志。
+
+### `task` 判别符
+
+`engine.chat_messages` 用同一对列承载三个调用点，靠每个元素的 `task` 区分。
+它就是既有的 `[tasks.*]` 配置 key——同一套词表已经作为 `ChatRequest.task`
+走在协议上，也已经在为每个 task 解析模型——不是新造的判别符，而且比新造的
+更细：它能区分 `chat_companion`、`chat_voice` 和 `chat_product_qa`。
+
+| `task` | 表 | 行 |
+|---|---|---|
+| `chat_companion` / `chat_voice` / `chat_product_qa` | `chat_messages` | assistant |
+| `chat_output_filter` | `chat_messages` | assistant |
+| `chat_input_filter` | `chat_messages` | **user** |
+| `chat_vision` | `chat_vision_events` | — |
+| `chat_image_prompt_compose` | `chat_images_events` | — |
+| `pde_decision` | `companion_decision_events` | — |
+| `affinity_evaluation` | `companion_affinity_events` | — |
+
+输入过滤器是 v1.4.0 之前**完全没有任何失败记录**的那个调用点。它的失败落在
+`role='user'` 行上，与该行早就在记录的成功审计
+（`pre_filter_content` / `filter_model` / `filter_triggers` / `f_generation_id`）
+并排——所以要查它，去查 user 行，不是 assistant 行。
+
+### 两个计数陷阱
+
+**`chain_exhausted` 不等于这一轮什么都没送出去。** 伪 ghost 轮次会写它，
+乱码修复轮次也会写。后者里每个候选确实都失败了——这条记录没错——
+只是这一轮随后从一个乱码 hop 里抢救出了文本。要区分，请同时读
+`chat_messages.metadata.fallback_reason`：`stream_failure` 是罐头短语，
+`garble_repaired` 是抢救出来的文本。
+
+**一轮只贡献一份列表。** 累积的失败只写在**收尾**那一行上——正常回复、ghost、
+伪 ghost 或乱码修复行。被取代的截断气泡两列都是 `NULL`，即便它自己那次尝试
+就在收尾行的列表里。不要跨一轮的多行做求和。
+
+### 协议上的同一份形状
+
+`ProtocolFrame::Final` 用同样的 Rust 类型序列化出同样的结构——只有一个
+序列化器，不是两个。`final` 帧上的 `llm_attempts` / `gateway_errors`
+**不是致命错误**，见
+[api-reference.zh.md](api-reference.zh.md#post-compchatsession_idmessagestream)。
+好感度评估与 `chat_vision` 的失败只写进各自的表，按设计永不上协议。
+
 ## 角色画像（实验特性）
 
 `engine.character_insights_events` 是实验性角色画像链（v1.3.0，
@@ -227,11 +362,13 @@ prompt，或者独立端点 `POST /persona/{instance_id}/image/compose` 的任�
 | `caption` | `TEXT?` | 合成器没写 caption 时为 NULL，包括非 JSON 回退的情形——此时整段回复变成 `subject`。 |
 | `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行是 NULL——它失败时根本没拼装任何东西。 |
 | `variant` | `TEXT?` | 解析出的 `prompt_variant` key；`"raw"` 是普通 key，不是跳过标记。 |
-| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式的 `empty`/`empty_prompt`/`stream_died_midway`。流式模式下，「provider 到底有没有应答」这条判据在候选**开流之前**（即产出第一个内容块之前）也同样适用：peek 循环里，一个候选先流出了 metadata（model/generation_id/usage），之后却没有任何内容就结束，记 `empty`；先流出 metadata、之后在第一个内容块前就死掉，记 `stream_died_midway`——两者都会保留那份 metadata，跟开流之后才出现的同名分支一样。只有在任意路径上完全没有应答回来时才是 NULL：传输层失败（`model_error`/`timeout`），或者流式端点的 `stream_open_failed`——现在它专指候选**什么都没捕获到**的情形（开流本身失败/超时，或者在第一个内容块之前就死掉/超时、且从未收到过任何 metadata 块），又或者 `not_configured`（压根没发起调用）。 |
+| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实拿到过应答：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式下先流出 metadata（model/generation_id/usage）、之后才断掉的候选——那份证据会被保留，因为 provider 应答了，可能已经计费。只有在任意路径上完全没有应答回来时才是 NULL：什么都没捕获到就断掉或超时，或者 `not_configured`（压根没发起调用）。**自 v1.4.0 起，「provider 到底有没有应答」这条判据完全由这三列**（`model` / `generation_id` / `usage`）承担；`last_failure` 不再兼任它的粗粒度副本，这也正是当初用来编码它的两个标签（`stream_open_failed` / `stream_died_midway`）被取消的原因。 |
 | `usage` | `JSONB?` | 完整未过滤的 OpenRouter usage 块，`serde_json::to_value` 出来的——`OPENROUTER_USAGE_HIDDEN_KEYS` 只过滤 wire 上那份回显，从不影响这里。与 `model` 同步：`model` 有值的地方它才有值。 |
 | `generation_id` | `TEXT?` | 与 `model` 同步。 |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`not_configured` 时为 `0`。 |
-| `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。`stream_open_failed` / `stream_died_midway` 只出现在独立端点的流式模式；聊天路径和该端点的非流式模式共用同一套链路遍历逻辑，只会报另外四个值。**`empty` 在流式模式下也能出现**，不止链路遍历那两条路径——一个候选压根没开流（没有内容块），但确实先流出过一个 metadata 块，也记 `empty`，跟链路遍历里内容层面「空回复」那一支同名，因为两者说的是同一件事：provider 应答了，可能已经计费。 |
+| `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。前两个是**内容裁决**：调用成功了也计费了，只是产出不可用。后两个是**指针值**，指明下面两列中哪一列存着逐 hop 的细节；自 v1.4.0 起它们取代了 `model_error` / `timeout` 以及流式模式的 `stream_open_failed` / `stream_died_midway`——那四个标签里每一个都同时覆盖了 provider 状态和本地超时，所以一并退役，这一列现在无论由哪个端点写入读起来都一样（见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)）。**`empty` 在流式模式下也能出现**，不止链路遍历那两条路径——一个候选压根没开流（没有内容块），但流本身正常结束，也记 `empty`，跟链路遍历里内容层面「空回复」那一支同名，因为两者说的是同一件事：provider 应答了，可能已经计费。 |
+| `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop，`task = "chat_image_prompt_compose"`。一个都没有时为 NULL——见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)。 |
+| `gateway_errors` | `JSONB?` | 我们通往 provider 的路断掉的每一个 hop。一个都没有时为 NULL。 |
 | `created_at` | `TIMESTAMPTZ` | |
 
 `status` 刻意只有三个值：`exhausted` 表示「这次调用没产出可用的合成结果」，
@@ -288,11 +425,13 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`。 |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | 解析出的 describe 结果（`description` / `ocr_text` / `people` / `scene`）。成功时与 `chat_messages.metadata.vision` 重复——这份冗余的代价是可以接受的：不用 join `chat_messages` 建立分母，这张表就能直接回答「跑了多少次 describe、describe 的是什么、成功率多少」。 |
-| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用（`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`）。只有纯传输层失败（`model_error` / `timeout`，压根没有应答回来）或 `not_configured`（压根没发起调用）时才是 NULL。 |
+| `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实有应答，只是内容不可用（`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`）。只有压根没有应答回来时才是 NULL——provider 状态、传输断开或超时（`upstream_error` / `gateway_error`）——或者 `not_configured`（压根没发起调用）。 |
 | `usage` | `JSONB?` | 完整未过滤的 usage 块，规则同 `chat_images_events.usage`。 |
 | `generation_id` | `TEXT?` | |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`[tasks.chat_vision]` 未配置时为 `0`。 |
-| `last_failure` | `TEXT?` | `status = "ok"` 或 `"not_configured"` 时为 NULL。取值：`model_error` \| `timeout` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern`——最后三个直接复用 `image_vision_invalidity` 现成的 reason 字符串。 |
+| `last_failure` | `TEXT?` | `status = "ok"` 或 `"not_configured"` 时为 NULL。取值：`upstream_error` \| `gateway_error` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern`——最后三个直接复用 `image_vision_invalidity` 现成的 reason 字符串。前两个是 v1.4.0 取代 `model_error` / `timeout` 的**指针值**，指明下面两列中哪一列存着逐 hop 的细节（见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)）。 |
+| `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop，`task = "chat_vision"`。一个都没有时为 NULL。 |
+| `gateway_errors` | `JSONB?` | 我们通往 provider 的路断掉的每一个 hop。一个都没有时为 NULL。vision 的失败只审计在这里——它永远不会上聊天流的 `final` 帧：describe 是一个 fail-open 的前置阶段，整条链失败也只是让这一轮退成纯文本。 |
 | `created_at` | `TIMESTAMPTZ` | |
 
 **保留 `message_id`，故意打破与 `chat_images_events` 的对称。** 两张表的

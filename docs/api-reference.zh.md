@@ -108,7 +108,32 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
 - **`done`** —— `truncated`、`usage`（经 `OPENROUTER_USAGE_HIDDEN_KEYS` 过滤后；总是存在——不适用时为 `null`）、`generation_id`（OpenRouter id；总是存在——不适用时为 `null`），以及 `ghost_fallback`（bool；为 `false` 时整个字段省略）。`ghost_fallback: true` 标记一条最终解析为空、以静默回退形式交付的回复——它**不是** `action_type=ghost` 轮次，也不会动 ghost 计数。原因记录在落库行的 `metadata.fallback_reason` 上。承诺出图的轮次（`action_type=reply_text_image`）例外：文本半边为空是一条纯图片回复而不是沉默，因此它上报 `ghost_fallback: false`、不带 `fallback_reason`，尾随的 `image_request` 照常发出。
-- **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
+- **`final`** —— 本轮汇总：`filtered`（bool，回复是否被输出过滤）、`prompt_injected`（本轮注入的 trait tag 数组，无则为 `null`）、`tier`（回显请求的 `tier`，未传为 `null`）、`retries_chat`（命中的对话尝试下标，从 0 起）、`retries_filter`（实际服务的过滤模型尝试下标），以及自 v1.4.0 起的 `llm_attempts` / `gateway_errors`（**为空时整个字段省略**，见下）。这一帧不再带任何画像/lead 信号——`lead_score`、`should_show_cta`、`agent_training_level` 已随 companion_insights 拆除（spec 2026-08-11）移除；画像状态改从 `GET /comp/user/{user_id}/profile` 读取。
+
+**`final.llm_attempts` / `final.gateway_errors` —— 非致命的失败通道。**
+记录本轮所有失败的 LLM 尝试，覆盖五条「失败会改变你收到什么」的链：对话模型链、
+输入过滤器、输出过滤器、PDE 判官、图片 prompt 合成器。一个都没有时两个字段
+整个省略，所以干净的一轮与今天收到的逐字节一致。元素形状见
+[llm-audit.zh.md](llm-audit.zh.md#失败的尝试llm_attempts--gateway_errors)——
+这一帧序列化的就是审计列里那同一份结构。
+
+```text
+data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":1,"retries_filter":0,"llm_attempts":[{"task":"chat_companion","model":"x-ai/grok-4.20","http_status":529,"provider_code":"529","message":"code=529: Overloaded"}]}
+```
+
+> **不要把它们渲染成错误。** 带着这两个字段的一轮完全可能是正常送达的——
+> 上面这个例子就是主模型返回 `529`、fallback 接手答完的一轮，用户体验到的
+> 是一条普通回复。它们存在的意义是让消费方能报警、能对账，而读者什么都看不到。
+
+三种情形会带上它们：**恢复成功**的一轮（后续 hop 答了，回复真实且完整）；
+**伪 ghost** 轮次（整条链都失败，引擎把一句罐头短语当正常回复送出，落库行的
+`metadata.fallback_reason = "stream_failure"`——对终端用户来说这看起来就是一条
+普通的短回复，这一帧是唯一的提示）；以及**乱码修复**轮次
+（`metadata.fallback_reason = "garble_repaired"`，回复是从乱码 hop 里抢救出来的）。
+`chat_vision` 与好感度评估的失败按设计永不上这一帧——两者都是 fail-open，
+只落各自的审计表。**重放**的一轮发出的 `final` 两个列表都是空的，
+跟它重新计算 `retries_chat` / `tier` / `prompt_injected` 而不是回读那一行是同一个道理；
+要查重放轮次的失败，直接查 `engine.chat_messages`。
 
 每个用户最多 3 条并发活跃流。保活心跳（`: ping`）每 15 秒发一次，
 防止反向代理因空闲超时断开连接。
@@ -126,6 +151,32 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 
 一旦第一个 SSE 字节写出，终端错误以带内 `error` 帧的形式到达并关闭流；
 此时 HTTP 响应已提交 `200 OK`。
+
+**`error` 帧字段。** `code`、`retryable`、`message`、`user_message`，
+外加自 v1.4.0 起的 `upstream_status` 与 `provider_code`，两者没有时省略。
+
+```text
+data: {"type":"error","code":"rate_limited","retryable":true,"message":"…","user_message":"…","upstream_status":429,"provider_code":"429"}
+```
+
+`upstream_status` 是 provider 自己的 HTTP 状态码，原样透传，只在 provider
+确实应答过时才出现。网关层失败（超时、传输断开、解析失败）没有 provider
+真正返回过的状态码，所以那种情形两个字段都不出现。`provider_code` 是
+provider 响应体里带的错误码，有才出现。
+
+`code` 现在由失败本身推导，不再写死，这让两个「早就声明、但从未被构造过」的
+取值在 v1.4.0 第一次出现：
+
+| 失败 | `code` |
+|---|---|
+| provider 答了 `429` | `rate_limited` **（新）** |
+| provider 答了其它状态码 | `upstream_unavailable` |
+| 网关 `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **（新）** |
+| 网关 `config`（本地配置错误） | `internal` |
+| 网关 `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+
+请补上 `rate_limited` 和 `timeout` 两个分支；两者都带 `retryable: true`，
+所以默认分支若报「永久失败」，现在就是错的。
 
 **可选：tier 选择。** 请求体可附加 `tier` 字符串 ——
 类型 `String`，正则 `^[a-z0-9_]{1,32}$`（格式错返回 `400`）。
@@ -616,7 +667,35 @@ data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","mo
 | 实例不存在 | `404` |
 | `content` 空白、`scene` 超长、`aspect_ratio` 非法 | `422` |
 | 超出每用户并发上限（与聊天/语音共享，≤3） | `429` |
-| 合成器链条全部失败 | `502`——`{"error":"upstream","message":…}`——开流之后则为带内 `error` 帧。**这里没有肖像回退**：回退的存在是为了让聊天轮次继续走下去，而这个端点没有轮次要保护。 |
+| 合成器链条全部失败 | **provider 自己的状态码，原样透传**（见下）——开流之后则为带内 `error` 帧。**这里没有肖像回退**：回退的存在是为了让聊天轮次继续走下去，而这个端点没有轮次要保护。 |
+
+**状态码透传（v1.4.0）。** 这个端点以前无论上游说什么都返回 `502`。现在它
+返回 provider 自己的状态码——`529`、`503`、`429`，或者任何它发过来的、
+引擎从没见过的码。本身没有状态码的失败（网关那一类）会被合成一个：
+**三种超时是 `504`，其余是 `502`。** 判断是不是 provider 失败，请看响应体的
+`"error": "upstream"` 这个 key，不要看状态码。
+
+```jsonc
+// provider 应答了，带状态码
+{"error":"upstream","message":"upstream failure: code=529: Overloaded",
+ "upstream_status":529,"provider_code":"529","error_type":"overloaded","retryable":true}
+
+// 我们通往 provider 的路断了，没有上游状态码
+{"error":"upstream","message":"upstream failure: compose stream open timeout after 15s",
+ "gateway_kind":"open_timeout","retryable":true}
+```
+
+`error` 与 `message` 不变。`upstream_status` / `provider_code` / `error_type`
+出现在上游那一支（后两个还要看 provider 响应体里带没带）；`gateway_kind`
+出现在网关那一支，取值为 `open_timeout` | `total_timeout` | `idle_timeout` |
+`transport` | `decode` | `config` | `chain_exhausted`。`retryable` 恒存在，
+由状态码按 HTTP 惯例推导（所有 `5xx`，外加 `408` 和 `429`）。
+**`Retry-After` 在 provider 发了的时候原样透传**为响应头——引擎只记录和转发，
+从不据此行动。
+
+流式模式的带内 `error` 帧仍是四个字段，**不会**新增 `upstream_status` /
+`provider_code`：合成器链是在开流阶段遍历的，所以彻底失败发生在 SSE 响应
+存在之前，返回的是上面那个 HTTP 错误。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -927,7 +1006,7 @@ session 403）。
 | 403 | `forbidden` | 路徑 user 跟 JWT user 不匹配，或想讀別人的 session |
 | 404 | `not_found` | session / 人格 / 消息 id 不存在 |
 | 500 | `internal` | 其餘一切（DB 錯、LLM API 錯等） |
-| 502 | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败） |
+| *provider 自己的状态码* | `upstream` | 上游供应商调用失败（目前仅 persona compose 端点——合成器链条全部失败）。自 v1.4.0 起**不再固定是 502**：provider 的状态码原样透传（`529`、`503`、`429`……），没有上游状态码的网关层失败则超时映射为 `504`、其余为 `502`。响应体带 `upstream_status` / `provider_code` / `error_type` 或 `gateway_kind`，以及 `retryable`——见 [compose 端点](#post-personainstance_idimagecompose)。请按 `"error": "upstream"` 这个 key 判断，不要按状态码。 |
 
 ## 源码
 

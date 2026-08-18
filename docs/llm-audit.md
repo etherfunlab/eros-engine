@@ -196,6 +196,157 @@ as shown above.
 - **Interpret.** The engine does not group, aggregate, or alert on
   any audit field. Callers wire that themselves.
 
+## Failed attempts: `llm_attempts` / `gateway_errors`
+
+Since **v1.4.0** (store migration `0050`) five tables carry the same two
+nullable `JSONB` columns, recording every LLM attempt that **failed** —
+including attempts a fallback recovered from, which leave no other trace:
+
+| Table | Call sites it hosts |
+|---|---|
+| `engine.chat_messages` | the chat model chain, the output filter, the input filter |
+| `engine.chat_vision_events` | `chat_vision` describe |
+| `engine.chat_images_events` | image-prompt composer |
+| `engine.companion_decision_events` | PDE judge |
+| `engine.companion_affinity_events` | affinity eval |
+
+Identical shape on all five, so a fleet-wide error view is one `UNION ALL`.
+Additive, nullable, no backfill, no index. **`NULL` means "nothing to
+record"** — an empty array is never written, so there is exactly one way to
+say "no failure". Design:
+[LLM error audit spec](superpowers/specs/2026-08-18-llm-error-audit-design.md);
+consumer-facing changes:
+[migrating/llm-error-audit-v1-4-0.md](migrating/llm-error-audit-v1-4-0.md).
+
+### Three homes, split by who authored the fact
+
+Not by which code path produced it. Each fact has exactly one home, so the
+three never overlap.
+
+| Home | Holds | Boundary |
+|---|---|---|
+| `llm_attempts` | What the **upstream** said | The provider spoke: a non-2xx status, or a `200` body carrying an error envelope |
+| `gateway_errors` | Where the engine's **path to the provider** broke | The provider said nothing usable: timeout, connection reset, TLS error, unparseable body |
+| The table's own coarse marker (`last_failure`, `status`, `fallback_reason`, `filter_attempts[].reason`) | That row's **business verdict** | The call *succeeded* and was billed: empty completion, byte-BPE garble, refusal, length cut |
+
+A `200 OK` stream carrying `{"error": {...}}` mid-stream, or terminating with
+`finish_reason: "error"`, is an `llm_attempts` entry at `http_status: 200` —
+the provider spoke, just not in the status line.
+
+Every coarse vocabulary gained the same two **pointer values** —
+`upstream_error` / `gateway_error` — which say only "an attempt failed; the
+detail is in that column". The transport-shaped labels they replace are
+retired; the full before/after table is in the migration guide.
+
+### `llm_attempts` element
+
+```jsonc
+{
+  "task": "chat_companion",
+  "model": "x-ai/grok-4.20",
+  "http_status": 529,
+  "provider_code": "529",
+  "error_type": "overloaded",
+  "upstream_provider_code": "anthropic:overloaded_error",
+  "retry_after_s": 30,
+  "message": "code=529: Overloaded"
+}
+```
+
+`task` / `model` / `http_status` / `message` are always present; the other
+four are omitted when absent, never nulled. `model` keeps the full config
+slug including any `@provider` suffix.
+
+`http_status` is a raw number, **never an enum**: OpenRouter reports overload
+as `529` while Venice uses `429 MODEL_OVERLOADED` and `503 MODEL_AT_CAPACITY`,
+and the next provider will disagree differently. Classification is by HTTP
+convention (4xx client, 5xx upstream, 408/429/5xx retryable), so an
+unrecognised `570` behaves sensibly. There is deliberately **no `retryable`
+field** — with the status present the consumer applies the convention itself,
+and the engine does not editorialise inside a column whose contract is "what
+the upstream said".
+
+`message` reuses the existing scrubbing guarantees: flattened to one bounded
+line, and `metadata.flagged_input` dropped — a moderation rejection must never
+echo the user's prompt back into an audit row.
+
+### `gateway_errors` element
+
+```jsonc
+{
+  "task": "chat_companion",
+  "model": "x-ai/grok-4.20",
+  "kind": "open_timeout",
+  "message": "stream open timeout after 20s"
+}
+```
+
+`task` / `kind` / `message` are always present; `model` is omitted when the
+failure precedes model selection (a config error) and on the chain-scoped
+`chain_exhausted`.
+
+| `kind` | Scope | Meaning |
+|---|---|---|
+| `open_timeout` | attempt | Connect / queue / response-headers timeout |
+| `total_timeout` | attempt | One attempt's whole generation exceeded its cap |
+| `idle_timeout` | attempt | Byte-level idle watchdog fired mid-stream |
+| `transport` | attempt | Connection reset, TLS failure, SSE body interrupted |
+| `decode` | attempt | A response arrived but could not be parsed |
+| `config` | attempt | Local misconfiguration (empty model slug, unresolvable provider) |
+| `chain_exhausted` | chain | Every candidate failed. Carries no `model` |
+
+The three timeouts stay distinct: folding them together once made idle
+timeouts invisible. Here the distinction is SQL-queryable, not log-only.
+
+### The `task` discriminator
+
+`engine.chat_messages` hosts three call sites in one pair of columns; each
+element's `task` tells them apart. It is the existing `[tasks.*]` config key —
+the same vocabulary already carried on the wire as `ChatRequest.task` and
+already keying per-task model resolution — not a new discriminator, and
+strictly finer than one would have been: it separates `chat_companion` from
+`chat_voice` from `chat_product_qa`.
+
+| `task` | Table | Row |
+|---|---|---|
+| `chat_companion` / `chat_voice` / `chat_product_qa` | `chat_messages` | assistant |
+| `chat_output_filter` | `chat_messages` | assistant |
+| `chat_input_filter` | `chat_messages` | **user** |
+| `chat_vision` | `chat_vision_events` | — |
+| `chat_image_prompt_compose` | `chat_images_events` | — |
+| `pde_decision` | `companion_decision_events` | — |
+| `affinity_evaluation` | `companion_affinity_events` | — |
+
+The input filter is the one call site that had **no failure record of any
+kind** before v1.4.0. Its failures land on the `role='user'` row, beside the
+`pre_filter_content` / `filter_model` / `filter_triggers` / `f_generation_id`
+audit its *successes* already wrote there — so query the user row for them,
+not the assistant row.
+
+### Two counting traps
+
+**`chain_exhausted` does not mean the turn was served nothing.** It is written
+both on a pseudo-ghost turn and on a garble-repaired one. In the latter every
+candidate genuinely did fail — the entry is correct — and the turn was then
+served from a salvaged garbled hop. Read
+`chat_messages.metadata.fallback_reason` alongside it to tell `stream_failure`
+(canned phrase) from `garble_repaired` (salvaged text).
+
+**One turn contributes exactly one list.** The accumulated failures are written
+only on the row that **concludes** a turn — served, ghost, pseudo-ghost, or
+garble-repaired. A superseded truncated bubble carries `NULL` in both columns
+even though its own attempt sits in the concluding row's list. Do not sum
+across a turn's rows.
+
+### On the wire
+
+`ProtocolFrame::Final` carries the identical structures from the identical
+Rust types — one serializer, not two. `llm_attempts` / `gateway_errors` on the
+`final` frame are **non-fatal**: see
+[api-reference.md](api-reference.md#post-compchatsession_idmessagestream).
+Affinity-eval and `chat_vision` failures are written to their tables but never
+surface on the wire, by design.
+
 ## Character insights (experimental)
 
 `engine.character_insights_events` is the audit trail for the experimental
@@ -258,11 +409,13 @@ delegated image prompt, or the standalone `POST
 | `caption` | `TEXT?` | NULL when the composer produced none, including the non-JSON fallback reply, where the whole reply becomes `subject` instead. |
 | `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows, which fail without assembling anything. |
 | `variant` | `TEXT?` | The resolved `prompt_variant` key; `"raw"` is an ordinary key, not a skip. |
-| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` whenever the LAST attempt answered but its content was unusable: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and `empty`/`empty_prompt`/`stream_died_midway` on the standalone endpoint's streaming mode. On the streaming mode the same "did the provider answer?" test applies even BEFORE a candidate opens (produces its first content chunk): the pre-open peek loop labels a candidate that streamed metadata (model/generation_id/usage) and then ended with no content as `empty`, and one that streamed metadata and then died before any content as `stream_died_midway` — both retain that metadata, exactly like their post-open counterparts. NULL only when no response ever came back on any path: a transport failure (`model_error`/`timeout`), or the streaming endpoint's `stream_open_failed` — which now specifically means the candidate captured NOTHING at all (open itself failed/timed out, or it died/timed out before a first token with no metadata chunk ever landing) — or `not_configured` (no call was made at all). |
+| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` whenever the LAST attempt got a response back at all: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and on the standalone endpoint's streaming mode also a candidate that streamed metadata (model/generation_id/usage) and then broke — that evidence is retained because the provider answered and may have been billed. NULL when no response ever came back on any path: a break or timeout that captured nothing at all, or `not_configured` (no call was made). **Since v1.4.0 the "did the provider answer?" test lives ENTIRELY in this trio** (`model` / `generation_id` / `usage`); `last_failure` no longer doubles as a second, coarser copy of it, which is why the two labels that used to encode it (`stream_open_failed` / `stream_died_midway`) are gone. |
 | `usage` | `JSONB?` | Full unfiltered OpenRouter usage block, `serde_json::to_value`'d — `OPENROUTER_USAGE_HIDDEN_KEYS` filters the wire copy only, never this. Travels with `model`: populated exactly where `model` is. |
 | `generation_id` | `TEXT?` | Travels with `model`. |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` for `not_configured`. |
-| `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"` or `"not_configured"` (no attempt was made, so there is nothing to have failed). Values: `model_error` \| `timeout` \| `empty` \| `empty_prompt` \| `stream_open_failed` \| `stream_died_midway`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. `stream_open_failed` / `stream_died_midway` are specific to the standalone endpoint's streaming mode; the chat path and the endpoint's non-stream mode share one chain-walk and only ever report the other four. **`empty` is also reachable in streaming mode**, not just the chain-walk paths — a candidate that never opens (no content chunk) but DID stream a metadata chunk first reports `empty`, same label as the chain-walk's content-level blank-reply arm, because both mean the same thing: the provider answered and may have been billed. |
+| `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"` or `"not_configured"` (no attempt was made, so there is nothing to have failed). Values: `empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. The first two are **content verdicts**: the call succeeded and was billed, its output was just unusable. The last two are **pointer values** naming which of the two columns below holds the per-hop detail; since v1.4.0 they replace `model_error` / `timeout` and the streaming mode's `stream_open_failed` / `stream_died_midway` — each of those covered a provider status AND a local timeout under one label, so all four are retired and the column now reads the same whichever endpoint wrote the row (see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors)). **`empty` is also reachable in streaming mode**, not just the chain-walk paths — a candidate that never opens (no content chunk) but whose stream ends normally reports `empty`, same label as the chain-walk's content-level blank-reply arm, because both mean the same thing: the provider answered and may have been billed. |
+| `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure, `task = "chat_image_prompt_compose"`. NULL when there were none — see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors). |
+| `gateway_errors` | `JSONB?` | Every hop where our path to the provider broke. NULL when there were none. |
 | `created_at` | `TIMESTAMPTZ` | |
 
 `status` is deliberately three values: `exhausted` means "no usable compose
@@ -331,11 +484,13 @@ product_qa / image-only turns will overstate coverage.
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | The parsed describe (`description` / `ocr_text` / `people` / `scene`). Duplicates `chat_messages.metadata.vision` on success — the accepted price of this table answering "how many describes ran, on what, at what success rate" without joining `chat_messages` to establish a denominator. |
-| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` when the last attempt answered but its content was unusable (`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`). NULL only on a pure transport failure (`model_error` / `timeout`, where nothing ever answered) or `not_configured` (no call was made at all). |
+| `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` when the last attempt answered but its content was unusable (`empty` / `unparseable` / `content_filter` / `blank_description` / `refusal_pattern`). NULL only when nothing ever answered — a provider status, a transport break or a timeout (`upstream_error` / `gateway_error`) — or `not_configured` (no call was made at all). |
 | `usage` | `JSONB?` | Full unfiltered usage block, same rule as `chat_images_events.usage`. |
 | `generation_id` | `TEXT?` | |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` when `[tasks.chat_vision]` is not configured. |
-| `last_failure` | `TEXT?` | NULL when `status = "ok"` or `"not_configured"`. Values: `model_error` \| `timeout` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern` — the last three are `image_vision_invalidity`'s existing reason strings, reused verbatim. |
+| `last_failure` | `TEXT?` | NULL when `status = "ok"` or `"not_configured"`. Values: `upstream_error` \| `gateway_error` \| `empty` \| `unparseable` \| `content_filter` \| `blank_description` \| `refusal_pattern` — the last three are `image_vision_invalidity`'s existing reason strings, reused verbatim. The first two are the v1.4.0 **pointer values** that replaced `model_error` / `timeout`; they name which of the two columns below holds the per-hop detail (see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors)). |
+| `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure, `task = "chat_vision"`. NULL when there were none. |
+| `gateway_errors` | `JSONB?` | Every hop where our path to the provider broke. NULL when there were none. Vision failures are audited here only — they never ride the chat stream's `final` frame: the describe is a fail-open pre-stage, and an exhausted chain simply keeps the turn text-only. |
 | `created_at` | `TIMESTAMPTZ` | |
 
 **Keeps `message_id`, deliberately breaking symmetry with

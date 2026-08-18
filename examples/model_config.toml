@@ -331,7 +331,8 @@ model_name_display_override = true
 # This task serves TWO callers with the same five-slot payload and the same
 # filter_prompt contract: the chat stream's image turns, and the standalone
 # POST /persona/{instance_id}/image/compose endpoint (which also requires this
-# block — 501 without it, and 502 instead of the portrait fallback on failure).
+# block — 501 without it, and on failure an HTTP error carrying the provider's
+# own status instead of the portrait fallback).
 #[tasks.chat_image_prompt_compose]
 #model        = "x-ai/grok-4"
 #fallback     = ["google/gemini-3.1-flash-lite"]
