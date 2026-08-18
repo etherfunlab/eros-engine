@@ -170,6 +170,7 @@ impl<'a> StoryRepo<'a> {
                        SELECT 1 FROM engine.chat_sessions cs \
                        WHERE cs.user_id = psi.owner_uid \
                          AND cs.instance_id = psi.instance_id \
+                         AND NOT cs.archived \
                          AND cs.last_active_at > $3) \
                  ORDER BY psi.last_run_at ASC NULLS FIRST \
                  LIMIT $4 \
@@ -304,7 +305,7 @@ impl<'a> StoryRepo<'a> {
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT cm.session_id, cm.role, cm.content \
              FROM engine.chat_messages cm \
-             JOIN engine.chat_sessions cs ON cs.id = cm.session_id \
+             JOIN engine.chat_sessions cs ON cs.id = cm.session_id AND NOT cs.archived \
              WHERE cs.user_id = $1 AND cs.instance_id = $2 \
                AND cm.sent_at > now() - make_interval(days => $3) \
                AND cm.truncated = FALSE \
@@ -353,7 +354,7 @@ impl<'a> StoryRepo<'a> {
             "SELECT ca.warmth, ca.trust, ca.intrigue, ca.intimacy, ca.patience, ca.tension, \
                     ca.bond, ca.chemistry \
              FROM engine.companion_affinity ca \
-             JOIN engine.chat_sessions cs ON cs.id = ca.session_id \
+             JOIN engine.chat_sessions cs ON cs.id = ca.session_id AND NOT cs.archived \
              WHERE ca.user_id = $1 AND ca.instance_id = $2 \
              ORDER BY cs.last_active_at DESC LIMIT 1",
         )

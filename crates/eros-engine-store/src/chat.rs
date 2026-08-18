@@ -139,12 +139,16 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
-    /// Look up a session by id.
+    /// Look up a session by id. Archived sessions do not resolve — soft-delete
+    /// makes a session non-existent to the API, and every entry-point guard
+    /// reaches its session through here.
     pub async fn get_session(&self, session_id: Uuid) -> Result<Option<ChatSession>, sqlx::Error> {
-        sqlx::query_as::<_, ChatSession>("SELECT * FROM engine.chat_sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(self.pool)
-            .await
+        sqlx::query_as::<_, ChatSession>(
+            "SELECT * FROM engine.chat_sessions WHERE id = $1 AND NOT archived",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
     }
 
     /// Resume the most recent session for a user×instance pair, or create a new one.
@@ -159,7 +163,7 @@ impl<'a> ChatRepo<'a> {
     ) -> Result<ChatSession, sqlx::Error> {
         if let Some(existing) = sqlx::query_as::<_, ChatSession>(
             "SELECT * FROM engine.chat_sessions \
-             WHERE user_id = $1 AND instance_id = $2 \
+             WHERE user_id = $1 AND instance_id = $2 AND NOT archived \
              ORDER BY last_active_at DESC LIMIT 1",
         )
         .bind(user_id)
@@ -192,7 +196,7 @@ impl<'a> ChatRepo<'a> {
             "UPDATE engine.chat_sessions SET last_active_at = now() \
              WHERE id = ( \
                  SELECT id FROM engine.chat_sessions \
-                 WHERE user_id = $1 AND instance_id = $2 AND channel = $3 \
+                 WHERE user_id = $1 AND instance_id = $2 AND channel = $3 AND NOT archived \
                  ORDER BY last_active_at DESC \
                  LIMIT 1 \
              ) \
@@ -355,7 +359,7 @@ impl<'a> ChatRepo<'a> {
     pub async fn list_sessions(&self, user_id: Uuid) -> Result<Vec<ChatSession>, sqlx::Error> {
         sqlx::query_as::<_, ChatSession>(
             "SELECT * FROM engine.chat_sessions \
-             WHERE user_id = $1 \
+             WHERE user_id = $1 AND NOT archived \
              ORDER BY last_active_at DESC",
         )
         .bind(user_id)
@@ -1200,6 +1204,7 @@ impl<'a> ChatRepo<'a> {
         sqlx::query_as::<_, ChatSession>(
             "SELECT * FROM engine.chat_sessions \
              WHERE user_id = $1 AND instance_id = $2 AND channel = 'voice' AND id <> $3 \
+               AND NOT archived \
              ORDER BY last_active_at DESC LIMIT 1",
         )
         .bind(user_id)

@@ -90,6 +90,7 @@ impl<'a> SessionArchiveRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::SessionArchiveRepo;
+    use crate::chat::ChatRepo;
     use crate::testutil::seed_persona_instance;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -309,5 +310,97 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!archived, "another user's session must stay visible");
+    }
+
+    /// The API-facing choke point. Every entry-point guard resolves a session
+    /// through get_session, so this one predicate is what turns history,
+    /// affinity, chat stream and voice turn into 404 for an archived session.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_session_hides_archived_sessions(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = seed_relationship(&pool, user_id, instance_id).await;
+        let chat = ChatRepo { pool: &pool };
+
+        assert!(chat.get_session(session_id).await.unwrap().is_some());
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        assert!(
+            chat.get_session(session_id).await.unwrap().is_none(),
+            "archived session must not resolve"
+        );
+
+        // Revival is an operator UPDATE, and it is the whole restore story.
+        sqlx::query("UPDATE engine.chat_sessions SET archived = false WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            chat.get_session(session_id).await.unwrap().is_some(),
+            "un-archiving must bring the session back"
+        );
+    }
+
+    /// The critical one: without this predicate the next chat/start reanimates
+    /// the archived session and the user gets their deleted conversation back
+    /// with a blank relationship.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn resume_never_returns_an_archived_session(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_id).await;
+        let chat = ChatRepo { pool: &pool };
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        assert!(
+            chat.resume_latest_session(user_id, instance_id, "text")
+                .await
+                .unwrap()
+                .is_none(),
+            "resume must fall through to creating a new session"
+        );
+        // `ChatSession` carries no `archived` field and none should be added —
+        // nothing in Rust reads it — so assert against the column directly.
+        let resumed = chat.create_or_resume(user_id, instance_id).await.unwrap();
+        let is_archived: bool =
+            sqlx::query_scalar("SELECT archived FROM engine.chat_sessions WHERE id = $1")
+                .bind(resumed.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !is_archived,
+            "create_or_resume must produce a fresh, unarchived session"
+        );
+    }
+
+    /// The session list is a read surface like any other.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_sessions_hides_archived_sessions(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_id).await;
+        let chat = ChatRepo { pool: &pool };
+
+        assert_eq!(chat.list_sessions(user_id).await.unwrap().len(), 1);
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        assert!(
+            chat.list_sessions(user_id).await.unwrap().is_empty(),
+            "archived sessions must not appear in the list"
+        );
     }
 }

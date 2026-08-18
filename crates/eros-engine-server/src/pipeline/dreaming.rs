@@ -123,6 +123,7 @@ async fn scan_and_classify(
          WHERE id IN ( \
              SELECT id FROM engine.chat_sessions \
              WHERE classified_at IS NULL \
+               AND NOT archived \
                AND last_active_at < $1 \
                AND (classification_claimed_at IS NULL \
                     OR classification_claimed_at < $2) \
@@ -421,6 +422,55 @@ fn collapse_spaces(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::routes::companion::testutil::seed_persona_instance;
+
+    /// An archived session must never be claimed. The sweep writes its
+    /// extraction into companion_memories and human_insights, so a claimable
+    /// archived session would spend a model call regrowing exactly the rows
+    /// the archive endpoint just deleted.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sweeper_skips_archived_sessions(pool: sqlx::PgPool) {
+        let state = crate::routes::companion::test_state(pool.clone());
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+
+        // Idle for two hours and never classified — eligible on every count
+        // except `archived`.
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id, last_active_at, archived) \
+             VALUES ($1, $2, now() - interval '2 hours', true) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) VALUES \
+             ($1,'user','我住在上海'), ($1,'assistant','上海不错')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let processed = scan_and_classify(
+            &state,
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .expect("sweep ok");
+        assert_eq!(processed, 0, "archived session must not be swept");
+
+        let claimed_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT classification_claimed_at FROM engine.chat_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(claimed_at.is_none(), "archived session must not be claimed");
+    }
 
     #[test]
     fn parse_memory_candidates_handles_clean_json() {
