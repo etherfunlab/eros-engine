@@ -278,6 +278,10 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 三种超时刻意分开：曾经把它们合成一个，结果空闲超时在看板上彻底看不见了。
 现在这个区分可以直接用 SQL 查，而不是只能翻日志。
 
+`message` 不会带上 provider 的原始载荷。唯一有这个风险的是 `decode`：解析失败的
+`data:` 帧是 provider 的原始输出，可能含有回复正文，所以帧本身只留在日志里，
+落库的 message 只说明哪里坏了。需要看字节就去翻日志。
+
 ### `task` 判别符
 
 `engine.chat_messages` 用同一对列承载三个调用点，靠每个元素的 `task` 区分。

@@ -779,6 +779,12 @@ with no status of its own (the gateway cases) is synthesised: **`504` for the
 three timeout kinds, `502` for everything else.** Detect a provider failure by
 the body's `"error": "upstream"` key, not by the status.
 
+Passthrough has one bound, and it is a range rather than an allow-list: a status
+**below `400` is never forwarded**. A provider that answers `200` with an error
+envelope in the body has spoken, but not in the status line, and forwarding that
+`200` would tell you the call succeeded. Those answer `502`. The real value is
+still on `upstream_status`, which is why you branch on the body.
+
 ```jsonc
 // the provider answered, with a status
 {"error":"upstream","message":"upstream failure: code=529: Overloaded",

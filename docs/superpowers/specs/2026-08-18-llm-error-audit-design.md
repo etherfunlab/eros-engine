@@ -512,6 +512,12 @@ AppError::Upstream(Box<UpstreamAttempt>)   // was Upstream(String)
 100–999, so 529 goes out as 529. When the failure has no status (an `gateway_errors` case),
 a timeout maps to 504 and everything else to 502.
 
+`response_status_for` bounds the passthrough at `>= 400`, by range and not by allow-list.
+A `Provider` failure records `http_status: 200` — true to what the provider answered —
+and forwarding a 2xx/3xx would report the failure as a success. Those synthesise 502; the
+recorded value is untouched, since `llm_attempts` owns the fact and the status line owns
+the verdict.
+
 `Retry-After` is forwarded verbatim when the upstream sent one.
 
 ```json

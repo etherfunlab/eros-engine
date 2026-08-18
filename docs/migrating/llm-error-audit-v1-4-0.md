@@ -32,6 +32,13 @@ provider failure as an HTTP error rather than absorbing it. It used to render
 verbatim** — `StatusCode::from_u16` accepts 100–999, so a `529` goes out as
 `529`.
 
+One bound, expressed as a range and not an allow-list: a status **below `400`
+is not forwarded** and becomes `502`. This is not hypothetical — a provider that
+answers `200` and puts the error in the body is recorded with
+`upstream_status: 200`, and forwarding that would tell a client branching on
+`res.ok` that the call succeeded. The recorded value is unchanged; only the
+response status is synthesised.
+
 A failure with no status of its own (a timeout, a transport drop, a decode
 failure — the `gateway_errors` cases) still gets a synthesised one: **`504` for
 the three timeout kinds, `502` for everything else.**

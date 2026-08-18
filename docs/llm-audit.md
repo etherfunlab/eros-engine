@@ -314,6 +314,11 @@ failure precedes model selection (a config error) and on the chain-scoped
 The three timeouts stay distinct: folding them together once made idle
 timeouts invisible. Here the distinction is SQL-queryable, not log-only.
 
+`message` never carries a provider payload. `decode` is the one kind that could:
+a `data:` frame that fails to parse is raw provider output and may hold reply
+text, so the frame stays in the log line and the recorded message names only
+what broke. Read the log when you need the bytes.
+
 ### The `task` discriminator
 
 `engine.chat_messages` hosts three call sites in one pair of columns; each

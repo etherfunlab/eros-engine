@@ -675,6 +675,11 @@ data: {"type":"done","composed_prompt":"…","subject":"…","caption":"…","mo
 **三种超时是 `504`，其余是 `502`。** 判断是不是 provider 失败，请看响应体的
 `"error": "upstream"` 这个 key，不要看状态码。
 
+透传只有一条边界，而且是范围判断、不是白名单：**低于 `400` 的状态码一律不透传**。
+provider 用 `200` 配一个错误信封应答时，它确实说话了，只是没说在状态行上；把这个
+`200` 转出去等于告诉你调用成功了。这类失败返回 `502`。真实的值仍然在
+`upstream_status` 上——这正是要按响应体判断的原因。
+
 ```jsonc
 // provider 应答了，带状态码
 {"error":"upstream","message":"upstream failure: code=529: Overloaded",

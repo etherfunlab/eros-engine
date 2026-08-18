@@ -95,9 +95,18 @@ pub fn is_retryable_status(status: u16) -> bool {
 /// The status the engine returns downstream for this failure. An upstream
 /// status passes through verbatim; a gateway timeout becomes `504`; everything
 /// else becomes `502`.
+///
+/// Verbatim has one bound, and it is not an allow-list. A status below `400`
+/// is not an error status at all, so forwarding it would tell the consumer the
+/// call SUCCEEDED — `LlmError::Provider` is exactly that case, a `200` body
+/// that carried an error envelope. Those become `502`; the real value is still
+/// on the `upstream_status` body field and in `llm_attempts`, which is where
+/// the fact belongs. Anything `>= 400` still passes through untouched,
+/// including codes we have never seen.
 pub fn response_status_for(f: &AttemptFailure) -> u16 {
     match f {
-        AttemptFailure::Upstream(a) => a.http_status,
+        AttemptFailure::Upstream(a) if a.http_status >= 400 => a.http_status,
+        AttemptFailure::Upstream(_) => 502,
         AttemptFailure::Gateway(g) => match g.kind {
             GatewayKind::OpenTimeout | GatewayKind::TotalTimeout | GatewayKind::IdleTimeout => 504,
             _ => 502,
@@ -162,7 +171,19 @@ impl AttemptFailure {
                 gateway(GatewayKind::IdleTimeout)
             }
             LlmError::Stream(_) | LlmError::Http(_) => gateway(GatewayKind::Transport),
-            LlmError::StreamParse(_) | LlmError::Decode(_) => gateway(GatewayKind::Decode),
+            // `StreamParse` carries up to 256 raw bytes of the `data:` frame
+            // that failed to decode. That frame is provider output: it can hold
+            // generated reply text, and on an echoing provider, the user's own
+            // prompt. It was only ever a log line before; a column and an HTTP
+            // error body are a different blast radius, so the payload stays in
+            // the log and the recorded message says only what broke.
+            LlmError::StreamParse(_) => AttemptFailure::Gateway(GatewayError {
+                task: task.to_string(),
+                model: Some(model.to_string()),
+                kind: GatewayKind::Decode,
+                message: "openrouter stream parse error: undecodable delta envelope".to_string(),
+            }),
+            LlmError::Decode(_) => gateway(GatewayKind::Decode),
             LlmError::Config(_) | LlmError::TomlDecode(_) | LlmError::Io(_) => {
                 gateway(GatewayKind::Config)
             }
@@ -236,6 +257,46 @@ mod tests {
             message: "code=529: Overloaded".into(),
         });
         assert_eq!(response_status_for(&f), 529);
+    }
+
+    #[test]
+    fn a_non_error_upstream_status_never_reaches_the_wire() {
+        // Codex review: `LlmError::Provider` records `http_status: 200` because
+        // that is what the provider actually answered. Forwarding it verbatim
+        // would hand the consumer a `200` whose body is an error — every client
+        // that branches on `res.ok` would read the failure as a success.
+        for status in [100u16, 200, 204, 302, 399] {
+            let f = AttemptFailure::Upstream(UpstreamAttempt {
+                task: "chat_image_prompt_compose".into(),
+                model: "x-ai/grok-4.20".into(),
+                http_status: status,
+                provider_code: Some("upstream_error".into()),
+                error_type: None,
+                upstream_provider_code: None,
+                retry_after_s: None,
+                message: "provider blew up".into(),
+            });
+            assert_eq!(
+                response_status_for(&f),
+                502,
+                "{status} is not an error status and must not pass through"
+            );
+        }
+        // The bound is a range, not an allow-list: 400 and an unheard-of 599
+        // both still pass through untouched.
+        for status in [400u16, 418, 429, 529, 599] {
+            let f = AttemptFailure::Upstream(UpstreamAttempt {
+                task: "chat_companion".into(),
+                model: "m".into(),
+                http_status: status,
+                provider_code: None,
+                error_type: None,
+                upstream_provider_code: None,
+                retry_after_s: None,
+                message: "x".into(),
+            });
+            assert_eq!(response_status_for(&f), status);
+        }
     }
 
     #[test]
@@ -352,6 +413,31 @@ mod tests {
                 assert_eq!(a.provider_code.as_deref(), Some("\"upstream_error\""));
             }
             other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_parse_records_no_provider_payload() {
+        // Codex review: the variant carries up to 256 raw bytes of the `data:`
+        // frame. That is provider output — reply text, and on an echoing
+        // provider the user's own prompt. It may reach a log, never a column
+        // and never an HTTP body.
+        let secret = "sk-or-v1-deadbeef and the user said something private";
+        let e = LlmError::StreamParse(format!("{{\"choices\":[{{\"x\":\"{secret}\"}}]}}"));
+        assert!(
+            e.to_string().contains(secret),
+            "the log line still carries the payload"
+        );
+        match AttemptFailure::from_llm_error("chat_companion", "m", &e) {
+            AttemptFailure::Gateway(g) => {
+                assert_eq!(g.kind, GatewayKind::Decode);
+                assert!(
+                    !g.message.contains(secret),
+                    "recorded message leaked the payload: {}",
+                    g.message
+                );
+            }
+            other => panic!("expected Gateway, got {other:?}"),
         }
     }
 
