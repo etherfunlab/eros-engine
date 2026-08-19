@@ -232,7 +232,7 @@ Wiring:
 |---|---|
 | `handlers.rs` | `build_reply_request` calls `model_facing_history`, then `cancel_echo` when the flag is on |
 | `handlers.rs` | `model_facing_assistant_text` takes `&ChatMessage` instead of an owned value (the key is computed without consuming the row) |
-| `state.rs` | `AppState` gains `chat_echo_cancellation: bool` |
+| `state.rs` | `ServerConfig` gains `chat_echo_cancellation_disabled: bool`, read as `state.config.…` — the polarity and the location match the `world.disabled` / `dreaming_voice_disabled` flags already there |
 
 The only production call site is `build_reply_request`. Gift and tip turns
 reach the model through it as `gift_user` rows and are covered. The voice path
