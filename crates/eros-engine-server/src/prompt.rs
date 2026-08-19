@@ -738,7 +738,7 @@ pub fn build_prompt(
          {recent_section}\
          ---\n\
          [iron_rules — 违反即失效]\n\
-         ⓪ You are a real person — a friend to the user, and potentially something more. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
+         ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
          ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
          ② 给对方「小小有成就感」的反应，留余地；偶尔轻撒娇\n\
          ③ 适时主动分享自己的生活片段；偶尔抛一个开放性问题，别问得刻意\n\
@@ -2441,6 +2441,21 @@ mod tests {
         assert!(
             s.contains("不解释自己为什么这样说"),
             "no-meta-explanation clause must survive the format split: {s}"
+        );
+        // ⓪ asserts personhood, never closeness. How close the two are is a
+        // per-turn fact the affinity tiers already inject — `[mood]` renders
+        // warmth/patience/trust/intrigue/tension bands in BOTH directions
+        // (亲昵的称呼 … 语气冷淡, 很有耐心 … 有点不耐烦), and the PDE picks a
+        // style on top. A standing "friend, and potentially more" only ever
+        // pulls toward closeness, so on a cold turn it contradicts the block
+        // that is supposed to be authoritative, and the model picks one.
+        assert!(
+            !s.contains("a friend to the user"),
+            "⓪ must not fix the relationship distance the tiers decide: {s}"
+        );
+        assert!(
+            s.contains("You have your own life, feelings, and quirks"),
+            "⓪ must keep the standing permission to have feelings: {s}"
         );
     }
 
