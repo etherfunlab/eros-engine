@@ -716,7 +716,7 @@ filter_prompt = """
 `recent_turn_pairs_before_message` / `recent_assistant_contents`）、对话信号
 （`compute_signals_for_session`）、判断器自己共用的伴侣 transcript
 （`build_input_filter_transcript`），以及伴侣的实时消息窗口
-（`assemble_chat_request`），都会过滤掉 `channel IS NOT NULL` 的行。
+（`model_facing_history`），都会过滤掉 `channel IS NOT NULL` 的行。
 dreaming sweeper 也会排除它，但不是靠一刀切的非 NULL 过滤——它默认也会读
 `'voice'` 的行（见 [memory-layers.zh.md](memory-layers.zh.md#语音轮次)），
 所以只有 `product_qa` 会被排除在外——同时这一行在实时 SSE 流、断线重放和

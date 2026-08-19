@@ -2099,7 +2099,10 @@ mod tests {
         };
         let a = dup();
         let b = dup();
-        let current = uuid::Uuid::new_v4();
+        // The exemption id is row `b`'s — a real row in the input. This pins the
+        // parameter order: swap `current_id` and `session_id` at the call site
+        // and `b` no longer survives.
+        let current = b.id;
         let session = uuid::Uuid::new_v4();
         let input = vec![a, b];
 
@@ -2107,9 +2110,14 @@ mod tests {
         let untouched = apply_echo_cancellation(input.clone(), current, true, session);
         assert_eq!(untouched, input);
 
-        // disabled=false ⇒ both copies gone (neither is the current turn).
+        // disabled=false ⇒ the duplicate group collapses to the exempt row only.
         let cancelled = apply_echo_cancellation(input, current, false, session);
-        assert!(cancelled.is_empty());
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "only the current turn survives: {cancelled:?}"
+        );
+        assert_eq!(cancelled[0].id, current);
     }
 
     #[test]

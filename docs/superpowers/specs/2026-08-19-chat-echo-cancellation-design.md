@@ -293,6 +293,14 @@ form; assertions are not weakened.
 ## 9. Non-goals
 
 - **The voice path.** Its own window, its own assembly, unchanged.
+- **The `[recent_conversation]` block.** The system prompt separately renders
+  the last 3 turn pairs from their own query, and that block is not
+  deduplicated. When both copies of a duplicated string fall inside those 3
+  pairs, the model still sees both — in the system prompt rather than in the
+  message list. This is a strict improvement on the previous behaviour (that
+  shape put 4 copies in context; it now puts 2, never more), not a regression.
+  Closing it means deduplicating across two separately-queried prompt regions
+  on the latency path, which is its own design decision and gets its own spec.
 - **A minimum-length threshold.** Measured: adding an 8-character floor leaves
   the assistant-side impact bit-for-bit unchanged (226 turns either way), so
   the knob only exempts short user interjections. Rejected as a knob that buys

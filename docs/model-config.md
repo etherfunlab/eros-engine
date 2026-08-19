@@ -888,7 +888,7 @@ brain: short-term recall (`recent_turn_pairs` / `recent_turn_pairs_before_messag
 / `recent_assistant_contents`), conversation signals
 (`compute_signals_for_session`), the judge's own shared companion transcript
 (`build_input_filter_transcript`), and the companion's live message window
-(`assemble_chat_request`) all filter `channel IS NOT NULL` rows out. The
+(`model_facing_history`) all filter `channel IS NOT NULL` rows out. The
 dreaming sweeper excludes it too, but not via a blanket non-NULL filter — by
 default it also reads `'voice'` rows (see
 [memory-layers.md](memory-layers.md#voice-turns)), so only `product_qa`
