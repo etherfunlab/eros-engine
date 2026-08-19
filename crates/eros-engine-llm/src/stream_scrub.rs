@@ -451,10 +451,10 @@ mod tests {
     fn scrubbed_stream_equals_whole_text_apply_for_every_split() {
         let rules = production_rules();
         let cases = [
-            "你好呀[你给对方发送了一张照片：海边]今天如何",
+            "你好呀[你的照片：海边]今天如何",
             "嗯......其实我在想你",
             "（轻轻靠近）说吧",
-            "[你给对方发送了一张照片：自拍]",
+            "[你的照片：自拍]",
             "多个[a]中间[b]结尾",
             "[bracket]嗯...紧接着说", // order: span strips bracket, then head sees 嗯
             "no artifacts here at all",
@@ -478,7 +478,7 @@ mod tests {
     fn artifact_only_reply_streams_to_empty() {
         let rules = production_rules();
         let mut s = StreamScrubber::new(&rules, "m");
-        let mut got = s.push("[你给对方发送了一张照片：自拍]");
+        let mut got = s.push("[你的照片：自拍]");
         got.push_str(&s.finish());
         assert_eq!(got, "", "an artifact-only reply must emit nothing");
     }
@@ -489,7 +489,7 @@ mod tests {
         // empty at the persist layer; the scrubber keeps real body text.
         let rules = production_rules();
         let mut s = StreamScrubber::new(&rules, "m");
-        let mut got = s.push("正文[你给对方发送了一张照片：床上]");
+        let mut got = s.push("正文[你的照片：床上]");
         got.push_str(&s.finish());
         assert_eq!(got, "正文");
     }

@@ -751,7 +751,7 @@ pub struct RegexStripOutcome {
 
 /// Apply every rule whose `models` contains `model_id`, in declaration order.
 /// Pure & deterministic. No fail-safe: a reply that is *entirely* an artifact
-/// (e.g. a bare `[你给对方发送了一张照片：…]`, or one wrapped in incidental
+/// (e.g. a bare `[你的照片：…]`, or one wrapped in incidental
 /// whitespace) strips to an empty string, and the match is still reported. The
 /// caller persists the audit (raw on `pre_filter_content`) and emits no content
 /// bubble — downstream decides how to render an empty/NULL reply (the web
@@ -5913,16 +5913,8 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
 
     #[test]
     fn apply_output_regex_strips_targeted_model() {
-        let rules = compiled(&[(
-            "euryale",
-            r#"\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$"#,
-            "",
-        )]);
-        let out = apply_output_regex(
-            &rules,
-            "euryale",
-            "晚安宝贝[你给对方发送了一张照片：海边自拍]",
-        );
+        let rules = compiled(&[("euryale", r#"\s*\[你的照片[：:][^\]]*\]\s*$"#, "")]);
+        let out = apply_output_regex(&rules, "euryale", "晚安宝贝[你的照片：海边自拍]");
         assert_eq!(out.cleaned, "晚安宝贝");
         assert_eq!(out.matched_rules, vec![0]);
     }
@@ -5959,7 +5951,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // client receives no content bubble (downstream decides how to render
         // an empty/NULL reply).
         let rules = compiled(&[("m", r#"\[[^\]]*\]"#, "")]); // drop any [...]
-        let out = apply_output_regex(&rules, "m", "[你给对方发送了一张照片：x]");
+        let out = apply_output_regex(&rules, "m", "[你的照片：x]");
         assert_eq!(
             out.cleaned, "",
             "artifact-only reply strips to empty (no fail-safe)"
@@ -5979,7 +5971,7 @@ output_regex = [ { models = ["x/y"], pattern = '[' } ]
         // must still collapse to "" so the caller suppresses the bubble — the
         // stream layer only checks `is_empty()`, not `trim().is_empty()`.
         let rules = compiled(&[("m", r#"\[[^\]]*\]"#, "")]); // drop any [...]
-        let out = apply_output_regex(&rules, "m", "\n\n[你给对方发送了一张照片：x]\n");
+        let out = apply_output_regex(&rules, "m", "\n\n[你的照片：x]\n");
         assert_eq!(
             out.cleaned, "",
             "a whitespace-only strip result collapses to empty"

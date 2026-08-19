@@ -171,7 +171,7 @@ model_name_display_override = true
 # output_regex = [
 #   # Strip L3.3-Euryale's self-narrated photo line on reply_text_image turns.
 #   { models = ["sao10k/l3.3-euryale-70b"],
-#     pattern = '\s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$' },
+#     pattern = '\s*\[你的照片[：:][^\]]*\]\s*$' },
 #   # { models = ["x/y"], pattern = '...', replacement = "…" },  # replacement default "" = delete
 # ]
 

@@ -7109,7 +7109,7 @@ data: [DONE]\n\n";
 
         let mock = MockServer::start().await;
         // Reply is entirely a bracketed artifact.
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片]\"}}],\"id\":\"gen-a\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你的照片]\"}}],\"id\":\"gen-a\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -9087,7 +9087,7 @@ data: [DONE]\n\n";
 
     /// The OTHER half of the `promises_image()` exemption, and the shape this
     /// actually takes in production: the model DOES return text, but the whole
-    /// reply is one bracketed artifact (`[你给对方发送了一张照片]`), so
+    /// reply is one bracketed artifact (`[你的照片]`), so
     /// `apply_output_regex` strips it to empty and the turn lands on the
     /// regex-strip-to-empty branch — not the empty-completion branch the
     /// sibling test above covers. Since `output_regex` stopped forcing
@@ -9108,7 +9108,7 @@ data: [DONE]\n\n";
         let mock = MockServer::start().await;
         // A reply that is ENTIRELY a bracketed artifact: non-empty completion,
         // stripped to "" by the rule below.
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片]\"}}],\
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你的照片]\"}}],\
                     \"id\":\"gen-rs\",\"model\":\"primary\"}\n\ndata: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"primary\""))
@@ -15788,7 +15788,7 @@ data: [DONE]\n\n";
         let chat_body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"呀\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片：海边]\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[你的照片：海边]\"}}],\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"今天如何\"}}],",
             "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":6,\"total_tokens\":8},",
             "\"id\":\"gen-s\",\"model\":\"mock/euryale\"}\n\n",
@@ -15940,7 +15940,7 @@ data: [DONE]\n\n";
         );
         assert_eq!(
             pre_filter.as_deref(),
-            Some("你好呀[你给对方发送了一张照片：海边]今天如何"),
+            Some("你好呀[你的照片：海边]今天如何"),
             "pre_filter_content is the raw original",
         );
         assert_eq!(filter_model.as_deref(), Some("<regex>"));
@@ -15976,7 +15976,7 @@ data: [DONE]\n\n";
 
         // ── 1. Mock OpenRouter: returns the artifact-carrying reply ─────────────
         let mock = MockServer::start().await;
-        let raw_reply = "晚安宝贝[你给对方发送了一张照片：海边自拍]";
+        let raw_reply = "晚安宝贝[你的照片：海边自拍]";
         let chat_body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{raw_reply}\"}}}}],\
 \"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":8,\"total_tokens\":10}},\
@@ -15997,13 +15997,13 @@ data: [DONE]\n\n"
         let (_g, _instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
 
         // ── 3. Build AppState with output_regex that MATCHES the artifact ───────
-        //      Pattern: \s*\[你给对方发送了一张照片[：:][^\]]*\]\s*$  replacement "".
+        //      Pattern: \s*\[你的照片[：:][^\]]*\]\s*$  replacement "".
         let mut state = crate::routes::companion::test_state(pool.clone());
         let regex_cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(
             "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
              [[tasks.chat_companion.output_regex]]\n\
              models=[\"mock/euryale\"]\n\
-             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+             pattern=\"\\\\s*\\\\[你的照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
         )
         .unwrap();
         state.output_regex = std::sync::Arc::new(
@@ -16150,7 +16150,7 @@ data: [DONE]\n\n"
         );
         assert_eq!(
             pre_filter.as_deref(),
-            Some("晚安宝贝[你给对方发送了一张照片：海边自拍]"),
+            Some("晚安宝贝[你的照片：海边自拍]"),
             "pre_filter_content must be the raw original; got {pre_filter:?}",
         );
         assert_eq!(
@@ -16204,7 +16204,7 @@ data: [DONE]\n\n";
             "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
              [[tasks.chat_companion.output_regex]]\n\
              models=[\"mock/euryale\"]\n\
-             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+             pattern=\"\\\\s*\\\\[你的照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
         )
         .unwrap();
         state.output_regex = std::sync::Arc::new(
@@ -16366,7 +16366,7 @@ data: [DONE]\n\n";
 
         // ── 1. Mock OpenRouter: reply is ONLY the bracket artifact ─────────────
         let mock = MockServer::start().await;
-        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你给对方发送了一张照片：海边自拍]\"}}],\
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"[你的照片：海边自拍]\"}}],\
 \"usage\":{\"prompt_tokens\":2,\"completion_tokens\":8,\"total_tokens\":10},\
 \"id\":\"gen-bo\",\"model\":\"mock/cydonia\"}\n\n\
 data: [DONE]\n\n";
@@ -16513,7 +16513,7 @@ data: [DONE]\n\n";
         );
         assert_eq!(
             pre_filter.as_deref(),
-            Some("[你给对方发送了一张照片：海边自拍]"),
+            Some("[你的照片：海边自拍]"),
             "pre_filter_content must hold the raw artifact; got {pre_filter:?}",
         );
         assert_eq!(
@@ -16541,9 +16541,9 @@ data: [DONE]\n\n";
         use wiremock::matchers::{body_string_contains, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let raw_reply = "晚安宝贝[你给对方发送了一张照片：海边自拍]";
+        let raw_reply = "晚安宝贝[你的照片：海边自拍]";
         let cleaned_reply = "晚安宝贝";
-        let artifact = "你给对方发送了一张照片"; // the bracket payload, never in cleaned
+        let artifact = "你的照片"; // the bracket payload, never in cleaned
 
         // ── 1. Dual mock: chat model (SSE) + filter model (JSON). ──────────────
         let mock = MockServer::start().await;
@@ -16588,7 +16588,7 @@ data: [DONE]\n\n"
             "[tasks.chat_companion]\nmodel=\"mock/euryale\"\n\
              [[tasks.chat_companion.output_regex]]\n\
              models=[\"mock/euryale\"]\n\
-             pattern=\"\\\\s*\\\\[你给对方发送了一张照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
+             pattern=\"\\\\s*\\\\[你的照片[：:][^\\\\]]*\\\\]\\\\s*$\"\n",
         )
         .unwrap();
         state.output_regex = std::sync::Arc::new(
@@ -16791,7 +16791,7 @@ data: [DONE]\n\n"
         use wiremock::matchers::{body_string_contains, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let raw_reply = "[你给对方发送了一张照片：海边自拍]"; // artifact-only
+        let raw_reply = "[你的照片：海边自拍]"; // artifact-only
 
         // ── 1. Dual mock: chat model (SSE, artifact-only) + filter model (JSON). ─
         let mock = MockServer::start().await;

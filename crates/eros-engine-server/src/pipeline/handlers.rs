@@ -127,9 +127,11 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 }
 
 /// Model-facing text for an assistant history row: the stored `content`, with a
-/// `[你给对方发送了一张照片：{caption}]` marker appended when `metadata.image` is
-/// present. Used by `model_facing_history` so the model knows it previously
-/// sent an image in that turn.
+/// `[你的照片：{caption}]` marker appended when `metadata.image` is present.
+/// Used by `model_facing_history` so the model knows it previously sent an
+/// image in that turn. The marker is a possessive noun phrase, not a sentence
+/// about sending: a verb here reads as an example of the persona doing it, and
+/// models take it as one.
 pub(crate) fn model_facing_assistant_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
     let mut text = msg.content.clone();
     if let Some(img) = msg.metadata.as_ref().and_then(|md| md.get("image")) {
@@ -143,8 +145,8 @@ pub(crate) fn model_facing_assistant_text(msg: &eros_engine_store::chat::ChatMes
         // long English prompt text into a Chinese roleplay history, which
         // models then echoed. No caption ⇒ bare marker, no fallback.
         let marker = match caption {
-            Some(c) => format!("[你给对方发送了一张照片：{c}]"),
-            None => "[你给对方发送了一张照片]".to_string(),
+            Some(c) => format!("[你的照片：{c}]"),
+            None => "[你的照片]".to_string(),
         };
         if text.trim().is_empty() {
             text = marker;
@@ -2010,12 +2012,12 @@ mod tests {
         );
         let out = model_facing_assistant_text(&row);
         assert!(out.contains("这是我的回复"));
-        assert!(out.contains("[你给对方发送了一张照片：在咖啡店笑着]"));
+        assert!(out.contains("[你的照片：在咖啡店笑着]"));
         assert!(
             !out.contains("Photorealistic"),
             "the image prompt must never reach the chat model's history: {out}"
         );
-        assert!(out.contains("这是我的回复\n\n[你给对方发送了一张照片：在咖啡店笑着]"));
+        assert!(out.contains("这是我的回复\n\n[你的照片：在咖啡店笑着]"));
     }
 
     #[test]
@@ -2025,7 +2027,7 @@ mod tests {
             Some(serde_json::json!({ "image": { "prompt": "a long english image prompt" } })),
         );
         let out = model_facing_assistant_text(&row);
-        assert_eq!(out, "[你给对方发送了一张照片]");
+        assert_eq!(out, "[你的照片]");
     }
 
     #[test]
@@ -2045,10 +2047,7 @@ mod tests {
             "普通回复",
             Some(serde_json::json!({ "image": { "url": "https://x/y.png" } })),
         );
-        assert_eq!(
-            model_facing_assistant_text(&row),
-            "普通回复\n\n[你给对方发送了一张照片]"
-        );
+        assert_eq!(model_facing_assistant_text(&row), "普通回复\n\n[你的照片]");
     }
 
     #[test]
