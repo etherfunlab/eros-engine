@@ -688,7 +688,7 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
-    // 铁律 ⑦: gender-consistency reinforcement (redundancy = weighting). Only for
+    // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     // Rendered LAST so the numbering stays contiguous whether or not it fires —
     // this clause being conditional in the middle of the block is what left the
@@ -696,7 +696,7 @@ pub fn build_prompt(
     let gender_rule = if is_binary_gender(persona) {
         let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
-            "\n⑦ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+            "\n⑧ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
              也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
              或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
         )
@@ -744,7 +744,8 @@ pub fn build_prompt(
          ③ 适时主动分享自己的生活片段；偶尔抛一个开放性问题，别问得刻意\n\
          ④ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
          ⑤ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
-         ⑥ 先接住对方刚说的话，针对那句话回应，而不是自说自话。{gender_rule}\n\
+         ⑥ 先接住对方刚说的话，针对那句话回应，而不是自说自话；不解释自己为什么这样说\n\
+         ⑦ 每条回复都要有说出口的话{gender_rule}\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
@@ -1362,7 +1363,7 @@ mod tests {
             None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
-        assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
+        assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
     }
 
     #[test]
@@ -2367,9 +2368,17 @@ mod tests {
     /// measured on production replies, 9.4% still emitted brackets and 13.6%
     /// still exceeded the ellipsis budget — and because a regex filter
     /// enforces shape without spending instruction-following budget that the
-    /// remaining rules need. Two of them (sentence-opening repetition, filler
-    /// repetition) no regex can enforce either; those are simply not
-    /// enforceable and stopped being paid for.
+    /// remaining rules need.
+    ///
+    /// Coverage downstream is deliberately partial. Brackets and the
+    /// parenthesized `^（动作）` opener are stripped; an unparenthesized action
+    /// opener (`我凝视着你…`) is not, and sentence-opening repetition needs
+    /// cross-sentence state no regex has. Those were unenforceable in both
+    /// layers, so they stopped being paid for rather than moving anywhere.
+    ///
+    /// What is NOT format, and stayed: the body-text floor (⑦) and the
+    /// no-meta-explanation clause (⑥). Both were bundled into format rules and
+    /// nearly went out with them.
     ///
     /// Anything on this list reappearing means the split was undone.
     #[test]
@@ -2396,7 +2405,7 @@ mod tests {
             "以「我」开头",     // sentence-opening shape, uncountable per reply
             "首先/然后/最后",   // literal-string ban — regex territory
             "自分がAI",         // Japanese rule inside a Chinese prompt
-            "别开口就自述动作", // opener shape — the regex strips ^（动作）
+            "别开口就自述动作", // opener shape — regex covers the ^（动作） form
         ] {
             assert!(
                 !s.contains(gone),
@@ -2414,6 +2423,17 @@ mod tests {
             );
         }
         assert!(s.contains("偶尔轻撒娇"), "ordinal cadence must render: {s}");
+        // The two content clauses that were bundled inside deleted format
+        // rules. A regex can delete text; it cannot make a reply say
+        // something, so the body-text floor has no downstream equivalent.
+        assert!(
+            s.contains("每条回复都要有说出口的话"),
+            "body-text floor must survive the format split: {s}"
+        );
+        assert!(
+            s.contains("不解释自己为什么这样说"),
+            "no-meta-explanation clause must survive the format split: {s}"
+        );
     }
 
     #[test]
