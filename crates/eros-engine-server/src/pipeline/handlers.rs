@@ -117,7 +117,7 @@ pub(in crate::pipeline) fn audit_from_event(event: &Event) -> Option<&LlmAudit> 
 /// Effective model-facing text for a user-side history row: the input-filter
 /// rewrite (`pre_filter_content`) when present and non-blank, else the original
 /// `content`. Assistant rows must NOT use this (their `pre_filter_content` is
-/// the pre-OUTPUT-filter original); `assemble_chat_request` routes assistant
+/// the pre-OUTPUT-filter original); `model_facing_history` routes assistant
 /// rows to `content` directly.
 pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) -> &str {
     match msg.pre_filter_content.as_deref() {
@@ -128,7 +128,7 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 
 /// Model-facing text for an assistant history row: the stored `content`, with a
 /// `[你给对方发送了一张照片：{caption}]` marker appended when `metadata.image` is
-/// present. Used by `assemble_chat_request` so the model knows it previously
+/// present. Used by `model_facing_history` so the model knows it previously
 /// sent an image in that turn.
 pub(crate) fn model_facing_assistant_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
     let mut text = msg.content.clone();
@@ -262,11 +262,41 @@ pub(crate) fn model_facing_history(
             _ => continue,
         };
         out.push(crate::repetition::Injected {
+            id: msg.id,
             role: role.to_string(),
             text,
         });
     }
     out
+}
+
+/// Apply echo cancellation to a turn's injected history unless the operator
+/// disabled it, logging one line when anything was dropped. `session_id` is
+/// carried for that log line only.
+///
+/// No content and no content hash is logged: production sessions are real
+/// conversations.
+fn apply_echo_cancellation(
+    injected: Vec<crate::repetition::Injected>,
+    current_id: Uuid,
+    disabled: bool,
+    session_id: Uuid,
+) -> Vec<crate::repetition::Injected> {
+    if disabled {
+        return injected;
+    }
+    let (kept, stats) = crate::repetition::cancel_echo(injected, current_id);
+    if stats.dropped > 0 {
+        tracing::info!(
+            dropped = stats.dropped,
+            kept = stats.kept,
+            groups = stats.groups,
+            max_occ = stats.max_occ,
+            session_id = %session_id,
+            "echo cancellation: duplicate history messages dropped"
+        );
+    }
+    kept
 }
 
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
@@ -844,12 +874,18 @@ pub(super) async fn build_reply_request(
         system_prompt.push_str(&crate::prompt::tips_reaction_context(*amount, tp));
     }
 
+    let injected_history = apply_echo_cancellation(
+        model_facing_history(history),
+        user_message_id,
+        state.config.chat_echo_cancellation_disabled,
+        session_id,
+    );
     let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
     Ok((
         assemble_chat_request(
             resolved,
             system_prompt,
-            model_facing_history(history),
+            injected_history,
             audit_from_event(&input.event),
         ),
         injected_tags,
@@ -2052,6 +2088,51 @@ mod tests {
         let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["(打赏 $5)", "普通消息"]);
         assert!(out.iter().all(|m| m.role == "user"));
+    }
+
+    #[test]
+    fn apply_echo_cancellation_respects_the_operator_flag() {
+        let dup = || crate::repetition::Injected {
+            id: uuid::Uuid::new_v4(),
+            role: "assistant".into(),
+            text: "同一句话".into(),
+        };
+        let a = dup();
+        let b = dup();
+        let current = uuid::Uuid::new_v4();
+        let session = uuid::Uuid::new_v4();
+        let input = vec![a, b];
+
+        // disabled=true ⇒ byte-for-byte what we had before this change.
+        let untouched = apply_echo_cancellation(input.clone(), current, true, session);
+        assert_eq!(untouched, input);
+
+        // disabled=false ⇒ both copies gone (neither is the current turn).
+        let cancelled = apply_echo_cancellation(input, current, false, session);
+        assert!(cancelled.is_empty());
+    }
+
+    #[test]
+    fn distinct_photos_both_survive_cancellation() {
+        // Same prose, different captions ⇒ different keys ⇒ neither is a
+        // duplicate. A key built from `content` instead of the model-facing
+        // string would delete one of the two photos.
+        let mut a = user_row("给你看~", None);
+        a.role = "assistant".into();
+        a.metadata = Some(serde_json::json!({ "image": { "caption": "海边的黄昏" } }));
+        let mut b = user_row("给你看~", None);
+        b.role = "assistant".into();
+        b.metadata = Some(serde_json::json!({ "image": { "caption": "厨房里的猫" } }));
+        let current = user_row("嗯", None);
+        let current_id = current.id;
+
+        let kept = apply_echo_cancellation(
+            model_facing_history(vec![a, b, current]),
+            current_id,
+            false,
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(kept.len(), 3, "no row may be dropped: {kept:?}");
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`

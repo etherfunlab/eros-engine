@@ -312,6 +312,12 @@ pub struct ServerConfig {
     /// `Some`, each reply turn writes one human-readable file here. Contains
     /// raw chat content — operator-only; point it at a volume you control.
     pub prompt_log_dir: Option<std::path::PathBuf>,
+    /// Operator opt-out for echo cancellation on the text turn
+    /// (`CHAT_ECHO_CANCELLATION_DISABLED`). Default `false`: byte-identical
+    /// duplicates are dropped from the history a turn injects, so the engine
+    /// does not feed model repetition back into its own context. A permanent
+    /// flag, not a rollout switch.
+    pub chat_echo_cancellation_disabled: bool,
     /// World memories subsystem configuration.
     pub world: WorldConfig,
 }
@@ -362,6 +368,11 @@ impl ServerConfig {
             ),
             snapshot,
             prompt_log_dir: parse_prompt_log_dir(std::env::var("PROMPT_LOG_DIR").ok().as_deref()),
+            chat_echo_cancellation_disabled: parse_bool_flag(
+                std::env::var("CHAT_ECHO_CANCELLATION_DISABLED")
+                    .ok()
+                    .as_deref(),
+            ),
             world: parse_world_config(
                 std::env::var("WORLD_DISABLED").ok().as_deref(),
                 std::env::var("WORLD_PROMPT_DISABLED").ok().as_deref(),
