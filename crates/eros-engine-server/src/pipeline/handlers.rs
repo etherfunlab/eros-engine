@@ -2099,9 +2099,12 @@ mod tests {
         };
         let a = dup();
         let b = dup();
-        // The exemption id is row `b`'s — a real row in the input. This pins the
-        // parameter order: swap `current_id` and `session_id` at the call site
-        // and `b` no longer survives.
+        // The exemption id is row `b`'s — a real row in the input, so the
+        // assertions below go red the moment the exemption stops working. What
+        // that pins is THIS function's parameter semantics: feed `session_id`
+        // to `cancel_echo` instead of `current_id` and `b` no longer survives.
+        // It does not pin the production call site — `build_reply_request` has
+        // no test coverage, so a swap made only there is caught by review.
         let current = b.id;
         let session = uuid::Uuid::new_v4();
         let input = vec![a, b];
