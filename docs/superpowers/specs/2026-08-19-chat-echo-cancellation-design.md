@@ -103,14 +103,21 @@ Applying the rule in §4 retroactively to all 5,051 user turns: **675 turns
 The production numbers match what the literature says is a property of the
 model class rather than of any particular model.
 
+*Learning to Break the Loop: Analyzing and Mitigating Repetitions for Neural
+Text Generation* (NeurIPS 2022, [arXiv:2206.02369](https://arxiv.org/abs/2206.02369))
+identifies the **self-reinforcement effect**: the more times a sentence is
+repeated in the context, the higher the probability of continuing to generate
+that sentence. Sentences with a higher initial probability have a stronger
+effect, which is why a given model's own pet phrase is the one that catches
+first.
+
 *Repetition In Repetition Out: Towards Understanding Neural Text Degeneration
-from the Data Perspective* (NeurIPS 2023, [arXiv:2310.10226](https://arxiv.org/html/2310.10226))
-evaluates encoder-decoder Transformers, decoder-only Transformers, and LSTMs.
-All models trained by MLE exhibit severe repetition, with no clear indication
-that any architecture suffers less. The same work identifies the
-**self-reinforcement effect**: sentence-level repetition is self-reinforcing —
-the more times a sentence appears in the context, the higher the probability of
-emitting it again.
+from the Data Perspective* (NeurIPS 2023, [arXiv:2310.10226](https://arxiv.org/abs/2310.10226))
+traces that effect and the competing explanations — high-inflow words, the
+likelihood objective — back to a single cause: repetition in the training data.
+Penalizing it stays critical at larger model sizes and after instruction
+tuning, which is what makes this a property of the model class rather than
+something a model swap fixes.
 
 The mechanism is the ordinary autoregressive one ([Raschka, *Why LLMs get stuck
 in repetition loops*](https://sebastianraschka.com/faq/docs/repetition-loops-generation.html)):
