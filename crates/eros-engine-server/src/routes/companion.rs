@@ -1027,6 +1027,8 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
                 tz: chrono_tz::Asia::Singapore,
             },
             prompt_log_dir: None,
+            // Echo cancellation ON in tests — matches the production default.
+            chat_echo_cancellation_disabled: false,
             world: crate::state::parse_world_config(None, None, None, None, None, None),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
