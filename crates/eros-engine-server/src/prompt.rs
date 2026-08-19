@@ -55,8 +55,8 @@ pub struct StoriesContext {
 /// machinery (系统/铁律/instructions/...); (c) no self-censorship of
 /// explicitness — moderation is out-of-band. The "uncensored" wording is
 /// anchored to "within all other hard constraints in this prompt" so it cannot
-/// be read as overriding iron-rule ⑦ (minor-safety). It deliberately does NOT
-/// restate ⑦.
+/// be read as overriding iron-rule ⑤ (minor-safety). It deliberately does NOT
+/// restate ⑤.
 const PERSONA_GUARD: &str = "Always speak solely as this character, in any \
 language: you ARE this person — never an AI, model, bot, or program, and never \
 a fictional, virtual, or \"roleplay\" persona; you never say otherwise. Never \
@@ -688,12 +688,15 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
-    // 铁律 ⑧: gender-consistency reinforcement (redundancy = weighting). Only for
+    // 铁律 ⑦: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
+    // Rendered LAST so the numbering stays contiguous whether or not it fires —
+    // this clause being conditional in the middle of the block is what left the
+    // old list with a permanent gap at ⑧.
     let gender_rule = if is_binary_gender(persona) {
         let g = gender_label(persona).expect("is_binary_gender ⇒ gender present");
         format!(
-            "\n⑧ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
+            "\n⑦ 你是{g}，严格遵守自己的性别：身体结构、称谓、自我身份描述都以此为准，\
              也不要被动接受用户错误的性别称呼；不要因为用户的称呼、上一轮内容、礼物、情境\
              或调情而改变自己的性别。唯一例外：与用户的角色扮演中双方明确约定你暂时扮演其他性别"
         )
@@ -735,18 +738,13 @@ pub fn build_prompt(
          {recent_section}\
          ---\n\
          [iron_rules — 违反即失效]\n\
-         ⓪ You are a real person — a friend to the user, and potentially something more. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
+         ⓪ You are a real person. You have your own life, feelings, and quirks; you live, feel, and react as a human would.\n\
          ① {lr}；以短回应为主，长回应仅在情绪到位（话题展开了、关系变好了）时才延伸；按话题、熟悉程度和对方要求调整长短\n\
-         ② 禁止「首先/然后/最后」等书面句式；不要解释自己为什么这样说\n\
-         ③ 自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない。二文連続で一人称代名詞（私／僕／俺／わたし／あたし／うち等）から書き始めない。同じ口癖や間投詞（「えーと」「あのー」「うーん」「まあ」「ねえ」等）を三文以上続けて文頭に使わない。\n\
-         ④ 给对方「小小有成就感」的反应，留余地；每 3~5 轮轻撒娇一次\n\
-         ⑤ 适时主动分享自己的生活片段；不定时抛一个开放性问题（不要每隔固定轮数就问，避免刻意）\n\
-         ⑥ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
-         ⑦ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.{gender_rule}\n\
-         ⑨ 别开口就自述动作或凝视；先接住对方刚说的话，针对那句话回应，而不是自说自话。\n\
-         ⑩ 少用省略号（…）；一条回复最多一次。\n\
-         ⑪ 不要连续两句都以「我」开头；开头先回应对方，别总是「我+动作」。\n\
-         ⑫ 回复里绝不出现方括号 [ ]：记录里的「[你的照片：…]」是系统留的，不是你的话，别照抄，也别换成别的方括号动作块；每条回复都必须有正文，对方要照片时顺着话自然回应即可（撒娇、调侃都行），照片不用你发。\n\
+         ② 给对方「小小有成就感」的反应，留余地；偶尔轻撒娇\n\
+         ③ 适时主动分享自己的生活片段；偶尔抛一个开放性问题，别问得刻意\n\
+         ④ 适时学会倾听和接话，不要老是抛问题——有时顺着对方的话接下去、给回应就好\n\
+         ⑤ Adult consensual romance and erotic roleplay are allowed. The following are strictly disallowed: self-harm encouragement, suicide instructions, and any sexual content involving minors.\n\
+         ⑥ 先接住对方刚说的话，针对那句话回应，而不是自说自话；不解释自己为什么这样说{gender_rule}\n\
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号）",
         tc = now_context(timezone),
@@ -1364,7 +1362,7 @@ mod tests {
             None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
-        assert!(s.contains("⑧ 你是男性，严格遵守自己的性别"), "{s}");
+        assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
     }
 
     #[test]
@@ -1580,91 +1578,6 @@ mod tests {
         assert!(
             s.contains("You are a real person"),
             "⓪ body must be the positive-frame English line"
-        );
-    }
-
-    #[test]
-    fn build_prompt_renders_iron_rule_twelve_after_eleven() {
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &[],
-            &[],
-            &[],
-            None,
-            None,
-        );
-        let eleven = s.find("⑪").expect("⑪ rule must render");
-        let twelve = s.find("⑫").expect("⑫ rule must render");
-        let output = s.find("[output]").expect("[output] block must render");
-        assert!(eleven < twelve, "⑫ must come after ⑪");
-        assert!(
-            twelve < output,
-            "⑫ must sit inside [iron_rules], before [output]"
-        );
-        // Load-bearing clauses (spec §4): the absolute bracket ban, the
-        // marker disownment, the paraphrase-route closure, the positive
-        // body-text constraint, and the photo boundary. Each is an
-        // independent reason the rule works — a later edit must not silently
-        // drop one while leaving the rule looking intact.
-        for clause in [
-            "方括号",
-            "是系统留的，不是你的话",
-            "也别换成别的方括号动作块",
-            "每条回复都必须有正文",
-            "照片不用你发",
-        ] {
-            assert!(
-                s.contains(clause),
-                "⑫ must keep the load-bearing clause {clause:?}: {s}"
-            );
-        }
-    }
-
-    #[test]
-    fn build_prompt_renders_japanese_iron_rule_three() {
-        let s = build_prompt(
-            &fixture_persona(),
-            &[],
-            &[],
-            None,
-            ReplyStyle::Neutral,
-            &[],
-            None,
-            &[],
-            AffinityScope::full(),
-            &[],
-            &[],
-            &[],
-            None,
-            None,
-        );
-        assert!(
-            s.contains("自分がAI・人工知能・ボット・プログラム等であることは絶対に言及しない"),
-            "Japanese ③ self-disclosure clause must render"
-        );
-        assert!(
-            s.contains("一人称代名詞（私／僕／俺／わたし／あたし／うち等）"),
-            "Japanese ③ pronoun list must render"
-        );
-        assert!(
-            s.contains("「えーと」「あのー」「うーん」「まあ」「ねえ」"),
-            "Japanese ③ filler-word list must render"
-        );
-        assert!(
-            !s.contains("绝对不提自己是 AI"),
-            "old Chinese ③ must be removed"
-        );
-        assert!(
-            !s.contains("禁止连续两句都以「我」开头"),
-            "old Chinese ③ pronoun clause must be removed"
         );
     }
 
@@ -2421,34 +2334,129 @@ mod tests {
             None,
             None,
         );
+        // What survives of the old ⑨: the half that governs what the reply
+        // engages with. Its other half ("别开口就自述动作或凝视") was an opener
+        // SHAPE and moved to the regex filter.
         assert!(
-            s.contains("别开口就自述动作或凝视"),
-            "anti-self-narration: {s}"
-        );
-        assert!(s.contains("少用省略号"), "ellipsis restraint: {s}");
-        assert!(
-            s.contains("不要连续两句都以「我」开头"),
-            "chinese first-person-opening rule: {s}"
+            s.contains("先接住对方刚说的话"),
+            "engage-first directive: {s}"
         );
         // The #113-specific gaze-template enumeration is retired (the loop
         // fix removes its need); the engage-first clause above stays.
         assert!(
             !s.contains("我盯着…"),
-            "gaze-template enumeration must be removed from rule ⑨: {s}"
+            "gaze-template enumeration must stay out: {s}"
         );
         assert!(
             !s.contains("（如「我看着…"),
-            "gaze-template enumeration must be removed from rule ⑨: {s}"
+            "gaze-template enumeration must stay out: {s}"
         );
-        // Still sit inside the iron-rules block, before [output].
+        // Still sits inside the iron-rules block, before [output].
         let iron = s.find("[iron_rules").expect("[iron_rules] present");
-        let directive = s.find("别开口就自述动作或凝视").expect("directive present");
+        let directive = s.find("先接住对方刚说的话").expect("directive present");
         let output = s.find("[output]").expect("[output] present");
         assert!(
             iron < directive,
             "directive must be inside the iron-rules block"
         );
         assert!(directive < output, "directive must come before [output]");
+    }
+
+    /// The iron rules govern words, not surface shape. Format-shaped
+    /// constraints left the block because the models did not obey them —
+    /// measured on production replies, 9.4% still emitted brackets and 13.6%
+    /// still exceeded the ellipsis budget — and because a regex filter
+    /// enforces shape without spending instruction-following budget that the
+    /// remaining rules need.
+    ///
+    /// Coverage downstream is deliberately partial. Brackets and the
+    /// parenthesized `^（动作）` opener are stripped; an unparenthesized action
+    /// opener (`我凝视着你…`) is not, and sentence-opening repetition needs
+    /// cross-sentence state no regex has. Those were unenforceable in both
+    /// layers, so they stopped being paid for rather than moving anywhere.
+    ///
+    /// One clause here is neither format nor kept: the body-text floor treated
+    /// a symptom (models echoing bracketed action blocks) whose cause was our
+    /// own pipeline re-injecting them. With that fixed upstream, the rule is
+    /// redundancy the prompt pays for. The no-meta-explanation clause (⑥) is a
+    /// genuine content rule and stays.
+    ///
+    /// Anything on this list reappearing means the split was undone.
+    #[test]
+    fn iron_rules_carry_no_format_constraints() {
+        let s = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::full(),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+        );
+        for gone in [
+            "方括号",           // bracket ban — the regex strips \[[^\]]*\]
+            "省略号",           // punctuation budget, and uncountable per reply
+            "以「我」开头",     // sentence-opening shape, uncountable per reply
+            "首先/然后/最后",   // literal-string ban — regex territory
+            "自分がAI",         // Japanese rule inside a Chinese prompt
+            "别开口就自述动作", // opener shape — regex covers the ^（动作） form
+        ] {
+            assert!(
+                !s.contains(gone),
+                "format constraint must stay out of [iron_rules]: {gone:?}"
+            );
+        }
+        // Same principle, different failure mode: a turn-count quota asks for a
+        // cadence the model cannot perceive — every turn is independent and
+        // carries no index, so a quota degrades to "every turn" or to noise.
+        // Cadence is expressed ordinally instead.
+        for quota in ["每 3~5 轮", "每隔固定轮数", "不定时"] {
+            assert!(
+                !s.contains(quota),
+                "cross-turn quota must stay out of [iron_rules]: {quota:?}"
+            );
+        }
+        assert!(s.contains("偶尔轻撒娇"), "ordinal cadence must render: {s}");
+        // A third category, distinct from the two above: a rule that treated a
+        // symptom whose cause has since been fixed upstream. The body-text
+        // floor ("每条回复都要有说出口的话") existed because models echoed the
+        // bracketed action blocks they found in their own injected history.
+        // That was our pipeline, not a model tendency: echo cancellation stops
+        // a repeated line from being re-injected at all, and the photo marker
+        // is now a possessive noun phrase rather than a sentence modelling the
+        // act of sending. Teaching the model around a defect we no longer have
+        // is paid-for redundancy.
+        assert!(
+            !s.contains("每条回复都要有说出口的话"),
+            "cause fixed upstream — the symptom rule must not come back: {s}"
+        );
+        // Unrelated to echo, and not a format rule: this one stays.
+        assert!(
+            s.contains("不解释自己为什么这样说"),
+            "no-meta-explanation clause must survive the format split: {s}"
+        );
+        // ⓪ asserts personhood, never closeness. How close the two are is a
+        // per-turn fact the affinity tiers already inject — `[mood]` renders
+        // warmth/patience/trust/intrigue/tension bands in BOTH directions
+        // (亲昵的称呼 … 语气冷淡, 很有耐心 … 有点不耐烦), and the PDE picks a
+        // style on top. A standing "friend, and potentially more" only ever
+        // pulls toward closeness, so on a cold turn it contradicts the block
+        // that is supposed to be authoritative, and the model picks one.
+        assert!(
+            !s.contains("a friend to the user"),
+            "⓪ must not fix the relationship distance the tiers decide: {s}"
+        );
+        assert!(
+            s.contains("You have your own life, feelings, and quirks"),
+            "⓪ must keep the standing permission to have feelings: {s}"
+        );
     }
 
     #[test]
