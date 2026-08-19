@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Dynamic anti-repetition: mine over-used sentence-openings from a persona's
-//! recent assistant turns so the chat prompt can discourage them this turn.
-//! Pure + unit-testable (no I/O).
+//! Anti-repetition, in two halves. `overused_openings` mines over-used
+//! sentence-openings from a persona's recent assistant turns so the chat
+//! prompt can discourage them before generation. `Injected` (and, from the
+//! echo-cancellation change, `cancel_echo`) work on the other side: what the
+//! model is allowed to condition on. Pure + unit-testable (no I/O).
 
 use std::collections::{HashMap, HashSet};
+
+/// One history row as it will reach the model: the role string the provider
+/// sees, and the exact text that will be sent. Produced by
+/// `handlers::model_facing_history`, which is the only layer that knows what
+/// is injected and what it looks like once image markers are folded in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Injected {
+    pub role: String,
+    pub text: String,
+}
 
 /// Leading characters of a turn's first sentence that define its "opening".
 /// CJK-aware (counted in `char`s, not bytes). Tunable.

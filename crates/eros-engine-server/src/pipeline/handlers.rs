@@ -130,8 +130,8 @@ pub(crate) fn effective_user_text(msg: &eros_engine_store::chat::ChatMessage) ->
 /// `[你给对方发送了一张照片：{caption}]` marker appended when `metadata.image` is
 /// present. Used by `assemble_chat_request` so the model knows it previously
 /// sent an image in that turn.
-pub(crate) fn model_facing_assistant_text(msg: eros_engine_store::chat::ChatMessage) -> String {
-    let mut text = msg.content;
+pub(crate) fn model_facing_assistant_text(msg: &eros_engine_store::chat::ChatMessage) -> String {
+    let mut text = msg.content.clone();
     if let Some(img) = msg.metadata.as_ref().and_then(|md| md.get("image")) {
         let caption = img
             .get("caption")
@@ -233,43 +233,61 @@ pub(crate) fn recall_query_text(msg: &eros_engine_store::chat::ChatMessage) -> S
         .unwrap_or_default()
 }
 
+/// Map chronological history rows to what will actually reach the model.
+///
+/// Channel-marked rows (voice / product_qa) are out of companion context —
+/// they must never re-enter the model's own conversation history, even though
+/// `history()` itself stays unfiltered for the client route and the voice
+/// window. Unknown roles are skipped. `user` and TIP `gift_user` rows both
+/// fold to the "user" role: a tip turn IS a user turn to the model
+/// (OpenRouter only knows system/user/assistant), and gift_user is tip-only
+/// now (the legacy in-app Gift Event endpoint was removed), so no tip/legacy
+/// gate is needed. Assistant rows always feed `content` (their
+/// `pre_filter_content` is the pre-output-filter original and must never
+/// re-enter the prompt).
+///
+/// Split out of `assemble_chat_request` so echo cancellation can key on the
+/// exact string the provider receives — no other layer can compute it.
+pub(crate) fn model_facing_history(
+    history: Vec<eros_engine_store::chat::ChatMessage>,
+) -> Vec<crate::repetition::Injected> {
+    let mut out = Vec::with_capacity(history.len());
+    for msg in history {
+        if msg.channel.is_some() {
+            continue;
+        }
+        let (role, text) = match msg.role.as_str() {
+            "user" | "gift_user" => ("user", model_facing_user_text(&msg)),
+            "assistant" => ("assistant", model_facing_assistant_text(&msg)),
+            _ => continue,
+        };
+        out.push(crate::repetition::Injected {
+            role: role.to_string(),
+            text,
+        });
+    }
+    out
+}
+
 /// Materialise a ChatRequest from a pre-resolved model + system prompt +
-/// chronological history. `audit` carries the caller's OpenRouter passthrough
-/// when the driving event was a `UserMessage`; gift / proactive pass `None`.
+/// already-materialised history (see `model_facing_history`). `audit` carries
+/// the caller's OpenRouter passthrough when the driving event was a
+/// `UserMessage`; gift / proactive pass `None`.
 fn assemble_chat_request(
     resolved: ResolvedModel,
     system_prompt: String,
-    history: Vec<eros_engine_store::chat::ChatMessage>,
+    injected: Vec<crate::repetition::Injected>,
     audit: Option<&LlmAudit>,
 ) -> ChatRequest {
-    let mut messages = Vec::with_capacity(history.len() + 1);
+    let mut messages = Vec::with_capacity(injected.len() + 1);
     messages.push(ChatMessage {
         role: "system".to_string(),
         content: system_prompt,
     });
-    for msg in history {
-        // Channel-marked rows (voice / product_qa) are out of companion
-        // context — they must never re-enter the model's own conversation
-        // history, even though `history()` itself stays unfiltered for the
-        // client route and the voice window.
-        if msg.channel.is_some() {
-            continue;
-        }
-        // User and TIP gift_user rows feed the MODEL-FACING text under the "user"
-        // role — a tip turn IS a user turn to the model (OpenRouter only knows
-        // system/user/assistant). gift_user is tip-only now (the legacy in-app
-        // Gift Event endpoint was removed), so no tip/legacy gate is needed.
-        // Assistant rows always feed `content` (their pre_filter_content is the
-        // pre-output-filter original and must never re-enter the prompt).
-        let (role, content) = match msg.role.as_str() {
-            "user" => ("user", model_facing_user_text(&msg)),
-            "gift_user" => ("user", model_facing_user_text(&msg)),
-            "assistant" => ("assistant", model_facing_assistant_text(msg)),
-            _ => continue,
-        };
+    for m in injected {
         messages.push(ChatMessage {
-            role: role.to_string(),
-            content,
+            role: m.role,
+            content: m.text,
         });
     }
 
@@ -831,7 +849,7 @@ pub(super) async fn build_reply_request(
         assemble_chat_request(
             resolved,
             system_prompt,
-            history,
+            model_facing_history(history),
             audit_from_event(&input.event),
         ),
         injected_tags,
@@ -1760,7 +1778,12 @@ mod tests {
             reasoning: None,
             retry_depth: 0,
         };
-        let req = assemble_chat_request(resolved, "SYS".into(), vec![tip, plain, assistant], None);
+        let req = assemble_chat_request(
+            resolved,
+            "SYS".into(),
+            model_facing_history(vec![tip, plain, assistant]),
+            None,
+        );
 
         // Sampling knobs flow from ResolvedModel onto the ChatRequest.
         assert_eq!(req.sampling.top_p, Some(0.9));
@@ -1814,7 +1837,7 @@ mod tests {
         let req = assemble_chat_request(
             resolved,
             "SYS".into(),
-            vec![product_qa_user, product_qa_assistant, plain],
+            model_facing_history(vec![product_qa_user, product_qa_assistant, plain]),
             None,
         );
 
@@ -1949,7 +1972,7 @@ mod tests {
                 "caption": "在咖啡店笑着"
             }})),
         );
-        let out = model_facing_assistant_text(row);
+        let out = model_facing_assistant_text(&row);
         assert!(out.contains("这是我的回复"));
         assert!(out.contains("[你给对方发送了一张照片：在咖啡店笑着]"));
         assert!(
@@ -1965,14 +1988,14 @@ mod tests {
             "",
             Some(serde_json::json!({ "image": { "prompt": "a long english image prompt" } })),
         );
-        let out = model_facing_assistant_text(row);
+        let out = model_facing_assistant_text(&row);
         assert_eq!(out, "[你给对方发送了一张照片]");
     }
 
     #[test]
     fn assistant_row_without_image_metadata_unchanged() {
         let row = assistant_row("普通回复", None);
-        assert_eq!(model_facing_assistant_text(row), "普通回复");
+        assert_eq!(model_facing_assistant_text(&row), "普通回复");
     }
 
     /// Even when `image` carries neither `prompt` nor `caption` (e.g. an older
@@ -1987,9 +2010,48 @@ mod tests {
             Some(serde_json::json!({ "image": { "url": "https://x/y.png" } })),
         );
         assert_eq!(
-            model_facing_assistant_text(row),
+            model_facing_assistant_text(&row),
             "普通回复\n\n[你给对方发送了一张照片]"
         );
+    }
+
+    #[test]
+    fn model_facing_history_keeps_distinct_photos_distinct() {
+        // Same prose, different photo captions ⇒ different injected strings.
+        // Echo cancellation keys on this string (design §4.2), so collapsing
+        // these two would delete a photo the persona actually sent.
+        let mut a = user_row("给你看~", None);
+        a.role = "assistant".into();
+        a.metadata = Some(serde_json::json!({ "image": { "caption": "海边的黄昏" } }));
+        let mut b = user_row("给你看~", None);
+        b.role = "assistant".into();
+        b.metadata = Some(serde_json::json!({ "image": { "caption": "厨房里的猫" } }));
+
+        let out = model_facing_history(vec![a, b]);
+        assert_eq!(out.len(), 2);
+        assert_ne!(
+            out[0].text, out[1].text,
+            "different captions must not collapse to one injected string"
+        );
+        assert!(out[0].text.contains("海边的黄昏"));
+        assert!(out[1].text.contains("厨房里的猫"));
+        assert_eq!(out[0].role, "assistant");
+    }
+
+    #[test]
+    fn model_facing_history_drops_channel_rows_and_folds_gift_user() {
+        // Same contract assemble_chat_request had before the split: channel-
+        // marked rows never reach the model, gift_user is promoted to "user".
+        let mut qa = user_row("这个产品是什么", None);
+        qa.channel = Some("product_qa".into());
+        let mut tip = user_row("(打赏 $5)", None);
+        tip.role = "gift_user".into();
+        let plain = user_row("普通消息", None);
+
+        let out = model_facing_history(vec![qa, tip, plain]);
+        let texts: Vec<&str> = out.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["(打赏 $5)", "普通消息"]);
+        assert!(out.iter().all(|m| m.role == "user"));
     }
 
     /// End-to-end check of the cutoff semantics that `fetch_recent_turn_pairs`
