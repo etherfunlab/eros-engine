@@ -193,25 +193,53 @@ impl<'a> ChatQueueRepo<'a> {
         Ok(())
     }
 
-    pub async fn mark_failed(&self, queue_id: Uuid, error: &str) -> Result<(), sqlx::Error> {
+    /// Terminal failure + its consumer-visible signal in ONE transaction: the
+    /// `failed` flip and the `system_error` chat row land together or not at
+    /// all. Split writes leave orphan states — a `failed` turn with no
+    /// visible signal, or a stranded claim that gets a second signal from the
+    /// reaper.
+    pub async fn mark_failed_with_notice(
+        &self,
+        queue_id: Uuid,
+        session_id: Uuid,
+        error: &str,
+        notice_content: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE engine.chat_turn_queue \
              SET status = 'failed', last_error = $2 WHERE id = $1",
         )
         .bind(queue_id)
         .bind(error)
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'system_error', $2)",
+        )
+        .bind(session_id)
+        .bind(notice_content)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    /// Stale-claim recovery (worker died mid-turn). One transaction, two
-    /// statements: exhausted claims go terminal (returned so the caller can
-    /// write `system_error` rows); the rest go back to `pending`.
+    /// Stale-claim recovery (worker died mid-turn). One transaction:
+    /// exhausted claims go terminal WITH their consumer-visible
+    /// `system_error` rows (atomic — a terminal `failed` turn without its
+    /// signal must be impossible); the rest go back to `pending`. Returned
+    /// rows are for the caller's logging only.
     pub async fn reap_stale(
         &self,
         stale: Duration,
         max_attempts: i32,
+        notice_content: &str,
     ) -> Result<Vec<ReapedTurn>, sqlx::Error> {
         let stale_secs = stale.as_secs_f64();
         let mut tx = self.pool.begin().await?;
@@ -227,6 +255,23 @@ impl<'a> ChatQueueRepo<'a> {
         .bind(max_attempts)
         .fetch_all(&mut *tx)
         .await?;
+        if !failed.is_empty() {
+            let sessions: Vec<Uuid> = failed.iter().map(|(_, s, _)| *s).collect();
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content) \
+                 SELECT unnest($1::uuid[]), 'system_error', $2",
+            )
+            .bind(&sessions)
+            .bind(notice_content)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = ANY($1)",
+            )
+            .bind(&sessions)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE engine.chat_turn_queue \
              SET status = 'pending', claimed_at = NULL, \
@@ -640,12 +685,31 @@ mod tests {
         .unwrap();
 
         let failed = repo
-            .reap_stale(std::time::Duration::from_secs(300), 3)
+            .reap_stale(std::time::Duration::from_secs(300), 3, "出错了")
             .await
             .unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].queue_id, q2);
         assert_eq!(failed[0].user_message_id, m2);
+        // The terminal flip and its signal row are one transaction.
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(session2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1, "exhausted turn's session gets its signal row");
+        let young_notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(young_notices, 0, "released turn's session gets none");
         let s1: String =
             sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
                 .bind(q1)
@@ -664,7 +728,7 @@ mod tests {
         seed_queued(&pool, session_id, user_id, "fresh", 5).await;
         let t = repo.claim_next().await.unwrap().unwrap();
         let reaped = repo
-            .reap_stale(std::time::Duration::from_secs(300), 3)
+            .reap_stale(std::time::Duration::from_secs(300), 3, "出错了")
             .await
             .unwrap();
         assert!(reaped.is_empty());
@@ -675,5 +739,33 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(st, "claimed", "fresh claim untouched by the reaper");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_failed_with_notice_writes_both_or_neither(pool: PgPool) {
+        let (user_id, session_id) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        seed_queued(&pool, session_id, user_id, "x", 10).await;
+        let t = repo.claim_next().await.unwrap().unwrap();
+        repo.mark_failed_with_notice(t.queue_id, session_id, "upstream 500", "出错了")
+            .await
+            .unwrap();
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(t.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(last_error.as_deref(), Some("upstream 500"));
+        let notice: String = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notice, "出错了");
     }
 }

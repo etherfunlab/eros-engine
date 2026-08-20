@@ -249,20 +249,32 @@ pub(crate) fn parse_chat_queue_config(
     generation_timeout_raw: Option<&str>,
 ) -> ChatQueueConfig {
     let flag = |raw: Option<&str>| raw.map(|v| v == "1" || v == "true").unwrap_or(false);
+    // Zero/negative values fall back to defaults, like unparseable ones:
+    // tick=0 panics tokio's interval, max_attempts<=0 makes the first failure
+    // terminal, pending_cap<=0 rejects every enqueue, and a zero timeout or
+    // stale window flails. Concurrency 0 stays meaningful (claim nothing —
+    // the reap-only kill switch).
+    let secs = |raw: Option<&str>, default: u64| {
+        Duration::from_secs(
+            raw.and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v >= 1)
+                .unwrap_or(default),
+        )
+    };
     ChatQueueConfig {
         disabled: flag(disabled_raw),
-        tick: Duration::from_secs(tick_raw.and_then(|v| v.parse().ok()).unwrap_or(5)),
+        tick: secs(tick_raw, 5),
         concurrency: concurrency_raw.and_then(|v| v.parse().ok()).unwrap_or(4),
-        claim_stale: Duration::from_secs(
-            claim_stale_raw.and_then(|v| v.parse().ok()).unwrap_or(300),
-        ),
-        max_attempts: max_attempts_raw.and_then(|v| v.parse().ok()).unwrap_or(3),
-        pending_cap: pending_cap_raw.and_then(|v| v.parse().ok()).unwrap_or(20),
-        generation_timeout: Duration::from_secs(
-            generation_timeout_raw
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-        ),
+        claim_stale: secs(claim_stale_raw, 300),
+        max_attempts: max_attempts_raw
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(3),
+        pending_cap: pending_cap_raw
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(20),
+        generation_timeout: secs(generation_timeout_raw, 300),
     }
 }
 
@@ -768,6 +780,27 @@ mod tests {
         assert_eq!(g.max_attempts, 3);
         assert_eq!(g.pending_cap, 20);
         assert_eq!(g.generation_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn chat_queue_config_zero_and_negative_fall_back_except_concurrency() {
+        // tick=0 would panic tokio's interval; max_attempts/pending_cap <= 0
+        // would make the first failure terminal / reject every enqueue.
+        let z = parse_chat_queue_config(
+            None,
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("-1"),
+            Some("0"),
+            Some("0"),
+        );
+        assert_eq!(z.tick, Duration::from_secs(5));
+        assert_eq!(z.concurrency, 0, "0 = claim nothing, the reap-only switch");
+        assert_eq!(z.claim_stale, Duration::from_secs(300));
+        assert_eq!(z.max_attempts, 3);
+        assert_eq!(z.pending_cap, 20);
+        assert_eq!(z.generation_timeout, Duration::from_secs(300));
     }
 
     #[test]

@@ -77,10 +77,25 @@ pub(crate) async fn drain_once(
     let cfg = &state.config.chat_queue;
     let repo = ChatQueueRepo { pool: &state.pool };
     // Reap BEFORE claiming: a stale claim blocks its whole session in
-    // claim_next's in-flight guard.
-    let reaped = repo.reap_stale(cfg.claim_stale, cfg.max_attempts).await?;
+    // claim_next's in-flight guard. The threshold is generation_timeout +
+    // claim_stale, NOT claim_stale alone: a live drive legitimately holds its
+    // claim for up to generation_timeout, and reaping inside that window
+    // releases a turn whose original drive is still running — a second claim
+    // then drives it concurrently and the two ladders overwrite each other.
+    // claim_stale is the grace AFTER the generation deadline.
+    let reaped = repo
+        .reap_stale(
+            cfg.generation_timeout + cfg.claim_stale,
+            cfg.max_attempts,
+            FAILURE_NOTICE,
+        )
+        .await?;
     for t in &reaped {
-        write_failure_row(state, t.session_id).await;
+        tracing::warn!(
+            queue_id = %t.queue_id,
+            session_id = %t.session_id,
+            "chat-queue: stale exhausted claim reaped to failed"
+        );
     }
     let mut spawned = 0;
     loop {
@@ -107,30 +122,48 @@ pub(crate) async fn drain_once(
 
 /// The terminal-failure signal a Realtime consumer can see (spec §6):
 /// role='system_error', the role the old async path once produced.
-async fn write_failure_row(state: &AppState, session_id: Uuid) {
-    let chat_repo = ChatRepo { pool: &state.pool };
-    if let Err(e) = chat_repo
-        .append_message(session_id, "system_error", "AI 回复失败，请稍后再试")
-        .await
-    {
-        tracing::warn!(%session_id, "chat-queue: system_error row write failed: {e}");
-    }
-}
+const FAILURE_NOTICE: &str = "AI 回复失败，请稍后再试";
 
 async fn process_turn(state: AppState, turn: ClaimedTurn) {
     let cfg = state.config.chat_queue.clone();
-    let repo = ChatQueueRepo { pool: &state.pool };
     let outcome =
         match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn)).await {
             Ok(o) => o,
             Err(_) => TurnOutcome::Failure("generation timeout".into()),
         };
+    settle_turn(&state, &turn, outcome).await;
+    // This session may have a next stacked turn — wake the loop now rather
+    // than waiting out a tick.
+    state.chat_queue_notify.notify_one();
+}
+
+/// Apply the completion ladder to a driven turn. Before going terminal,
+/// re-check the served guard: a generation timeout can win the race against a
+/// reply that persisted moments earlier (its Done frame never tallied), and
+/// marking that turn `failed` would pair a served reply with a spurious
+/// `system_error` row. A guard error falls through to the failure path — the
+/// pre-fix behavior.
+pub(crate) async fn settle_turn(state: &AppState, turn: &ClaimedTurn, outcome: TurnOutcome) {
+    let cfg = &state.config.chat_queue;
+    let repo = ChatQueueRepo { pool: &state.pool };
     let res = match outcome {
         TurnOutcome::Success => repo.mark_done(turn.queue_id).await,
         TurnOutcome::Failure(msg) => {
             if turn.attempts >= cfg.max_attempts {
-                write_failure_row(&state, turn.session_id).await;
-                repo.mark_failed(turn.queue_id, &msg).await
+                if matches!(
+                    turn_already_served(state, turn.user_message_id).await,
+                    Ok(true)
+                ) {
+                    repo.mark_done(turn.queue_id).await
+                } else {
+                    repo.mark_failed_with_notice(
+                        turn.queue_id,
+                        turn.session_id,
+                        &msg,
+                        FAILURE_NOTICE,
+                    )
+                    .await
+                }
             } else {
                 repo.release(turn.queue_id, &msg).await
             }
@@ -139,9 +172,21 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
     if let Err(e) = res {
         tracing::warn!(queue_id = %turn.queue_id, "chat-queue: ladder update failed: {e}");
     }
-    // This session may have a next stacked turn — wake the loop now rather
-    // than waiting out a tick.
-    state.chat_queue_notify.notify_one();
+}
+
+/// True when the driving user row already has a persisted assistant reply, or
+/// was deliberately ghosted — either way the turn is complete and must not be
+/// driven (or failed) again.
+async fn turn_already_served(state: &AppState, user_message_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
+                        WHERE user_message_id = $1 AND role = 'assistant') \
+             OR COALESCE((SELECT ghost_decision FROM engine.chat_messages \
+                          WHERE id = $1), false)",
+    )
+    .bind(user_message_id)
+    .fetch_one(&state.pool)
+    .await
 }
 
 /// Rebuild the turn from the queue row + message row and drive `run_stream`
@@ -157,16 +202,7 @@ async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
     // error (logged and swallowed) leaving the row claimed until the reaper
     // releases it, a generation timeout that dropped the Done tally. A served
     // or deliberately ghosted driving row IS a completed turn.
-    match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
-                        WHERE user_message_id = $1 AND role = 'assistant') \
-             OR COALESCE((SELECT ghost_decision FROM engine.chat_messages \
-                          WHERE id = $1), false)",
-    )
-    .bind(turn.user_message_id)
-    .fetch_one(&state.pool)
-    .await
-    {
+    match turn_already_served(state, turn.user_message_id).await {
         Ok(true) => {
             tracing::info!(
                 queue_id = %turn.queue_id,
@@ -794,5 +830,108 @@ data: [DONE]\n\n";
             "the driving message must reach the model even when evicted from \
              the newest-20 window; got {sent}",
         );
+    }
+
+    /// Seed a session + enqueued turn and claim it, returning the state and a
+    /// ClaimedTurn pinned to its final attempt (so a Failure settles terminal).
+    async fn seed_final_attempt_turn(pool: &PgPool) -> (crate::state::AppState, ClaimedTurn) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let state = crate::routes::companion::test_state(pool.clone());
+        let repo = ChatQueueRepo { pool };
+        let EnqueueOutcome::Queued { .. } = repo
+            .enqueue_user_message(
+                session_id,
+                "hi",
+                "01JW0000000000000000000S3T",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+        let mut turn = repo.claim_next().await.unwrap().unwrap();
+        turn.attempts = state.config.chat_queue.max_attempts;
+        (state, turn)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_failure_with_persisted_reply_settles_done(pool: PgPool) {
+        // The generation-timeout race: run_stream persisted the reply, the
+        // timeout won before its Done frame tallied. The settle must notice
+        // the served reply and go done — not pair it with a system_error.
+        let (state, turn) = seed_final_attempt_turn(&pool).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id) \
+             VALUES ($1, 'assistant', 'served moments before the timeout', $2)",
+        )
+        .bind(turn.session_id)
+        .bind(turn.user_message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("generation timeout".into()),
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "done", "a served turn must never settle failed");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 0, "no spurious failure signal next to a reply");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_failure_without_reply_goes_failed_with_one_notice(pool: PgPool) {
+        let (state, turn) = seed_final_attempt_turn(&pool).await;
+
+        settle_turn(&state, &turn, TurnOutcome::Failure("upstream 500".into())).await;
+
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(last_error.as_deref(), Some("upstream 500"));
+        let notices: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, vec![FAILURE_NOTICE.to_string()]);
     }
 }
