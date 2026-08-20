@@ -635,14 +635,14 @@ pub async fn send_message_stream(
                 let guard = guard.take();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    // Kept alive for the rest of this task so the mpsc
-                    // channel does not close the instant `drive_to_exhaustion`
-                    // (and its own `tx`) is dropped on the timeout arm below —
-                    // that would end the SSE body on bare EOF, indistinguishable
-                    // from success, even though a `system_error` row lands in
-                    // history. Sending the terminal Error frame through this
-                    // clone first means it reaches the body before the channel
-                    // actually closes.
+                    // Held only until the timeout arm below has a chance to
+                    // use it — see the explicit `drop` right after this
+                    // `match`. Without this clone, the timeout arm would have
+                    // nothing to send through: `tx` itself is moved into
+                    // `drive_to_exhaustion` and dropped with that future the
+                    // instant the timeout fires, which would end the SSE body
+                    // on bare EOF, indistinguishable from success, even
+                    // though a `system_error` row lands in history.
                     let timeout_tx = tx.clone();
                     let outcome = match tokio::time::timeout(
                         drive_state.config.chat_queue.generation_timeout,
@@ -670,6 +670,14 @@ pub async fn send_message_stream(
                             )
                         }
                     };
+                    // `UnboundedSender::send` enqueues synchronously, so the
+                    // timeout arm's Error frame (if any) is already buffered
+                    // by this point — dropping the clone here, rather than
+                    // holding it to the end of the task, restores the
+                    // success-path behavior the tests document: the SSE body
+                    // closes the instant the drive future returns, not after
+                    // `settle_turn`'s DB write and `notify_one`.
+                    drop(timeout_tx);
                     crate::pipeline::chat_queue::settle_turn(
                         &drive_state,
                         &turn,
