@@ -152,7 +152,9 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
 /// reply that persisted moments earlier (its Done frame never tallied), and
 /// marking that turn `failed` would pair a served reply with a spurious
 /// `system_error` row. A guard error falls through to the failure path — the
-/// pre-fix behavior.
+/// pre-fix behavior. The `mode` decides what a Failure means: `Ladder`
+/// retries until `max_attempts`, `TerminalOnFailure` goes terminal on the
+/// first failure (spec §6).
 pub(crate) async fn settle_turn(
     state: &AppState,
     turn: &ClaimedTurn,
@@ -207,8 +209,10 @@ async fn turn_already_served(state: &AppState, user_message_id: Uuid) -> Result<
 }
 
 /// Rebuild the turn from the queue row + message row and drive `run_stream`
-/// to exhaustion, discarding frames. Persistence, PDE, filters, ghosting and
-/// post-process all live inside the generator already (spec §6 Execution).
+/// to exhaustion, forwarding every frame to the optional tap (frames are
+/// discarded when no tap is attached). Persistence, PDE, filters, ghosting
+/// and post-process all live inside the generator already (spec §6
+/// Execution).
 async fn drive_turn(
     state: &AppState,
     turn: &ClaimedTurn,
@@ -1029,7 +1033,7 @@ data: [DONE]\n\n";
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn drive_tap_receives_the_frame_stream(pool: PgPool) {
-        let (state, _mock, user_message_id) =
+        let (state, _mock, _user_message_id) =
             seed_driveable_turn(&pool, "01JW00000000000000000000T1").await;
         let repo = ChatQueueRepo { pool: &pool };
         let turn = repo.claim_next().await.unwrap().unwrap();
@@ -1042,33 +1046,13 @@ data: [DONE]\n\n";
         while let Ok(f) = rx.try_recv() {
             frames.push(f);
         }
-        // Same PDE tolerance as drain_once_serves_an_enqueued_turn: a reply
-        // turn must surface its Done through the tap; a ghosted turn has no
-        // Done to surface.
-        let assistant: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM engine.chat_messages \
-             WHERE user_message_id = $1 AND role = 'assistant'",
-        )
-        .bind(user_message_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        if assistant > 0 {
-            assert!(
-                frames
-                    .iter()
-                    .any(|f| matches!(f, ProtocolFrame::Done { .. })),
-                "a served reply's Done frame must reach the tap; got {frames:?}"
-            );
-        } else {
-            let ghosted: bool =
-                sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
-                    .bind(user_message_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert!(ghosted, "no reply and no ghost — the drive lost the turn");
-        }
+        // The PDE ghost arm (stream.rs ActionType::Ghost) yields Meta → Done →
+        // final, same as a reply — so BOTH branches produce a Done and the
+        // assertion below must not be conditional on which one PDE picked.
+        assert!(
+            frames.iter().any(|f| matches!(f, ProtocolFrame::Done { .. })),
+            "every completed turn (reply or ghost) surfaces its Done through the tap; got {frames:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

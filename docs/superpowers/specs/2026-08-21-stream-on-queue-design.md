@@ -45,7 +45,10 @@ capability, idempotent user-row upsert):
 1. Persists the user row **and** a queue row in the same transaction (§4).
 2. Spawns a **detached tokio task** that owns the generator: it drives `run_stream` to
    exhaustion, tallies Done/Error frames exactly like the worker path, and settles the
-   queue row (§6).
+   queue row (§6). The detached task wraps its drive in `tokio::time::timeout` with
+   `CHAT_QUEUE_GEN_TIMEOUT_SECS`, exactly as the worker's `process_turn` does: the reap
+   threshold's arithmetic (§7) assumes every drive is bounded by the generation timeout,
+   and an unbounded handler drive could be reaped and re-driven while still running.
 3. Builds the SSE body from a subscription to the task's **frame tap** — an
    `mpsc::unbounded` channel the drive task forwards every frame into. Send errors
    (receiver dropped) are ignored.
@@ -116,9 +119,12 @@ Worst-case recovery latency at defaults is ~10 minutes, same as the async path.
 ## 8. Unchanged surface
 
 SSE frame contract and keepalives; the 409 duplicate-in-progress response; the per-user
-stream slot cap; the ghost/PDE/post-process pipeline; the async endpoint's behavior in
-every regard (PR A must show zero async-path behavior change); the voice endpoint; all
-`CHAT_QUEUE_*` knobs and their meanings.
+stream slot cap — with one qualification: the `StreamSlotGuard` moves from the SSE body
+into the detached drive task, so the cap keeps bounding three concurrent *generations* per
+user (not merely three connections); a client that disconnects and immediately resends
+still holds its old slot until the background drive settles; the ghost/PDE/post-process
+pipeline; the async endpoint's behavior in every regard (PR A must show zero async-path
+behavior change); the voice endpoint; all `CHAT_QUEUE_*` knobs and their meanings.
 
 ## 9. Delivery: two serial PRs
 
@@ -144,5 +150,16 @@ every regard (PR A must show zero async-path behavior change); the voice endpoin
   deploying (queue section mentions stream turns riding the table), each with their
   `.zh.md` mirrors; llm-audit/prompt-traits unaffected (already widened);
   `.env.example` unchanged.
+- Extract the drive-to-exhaustion loop (frame tally + tap forward + `classify_outcome`)
+  out of `drive_turn` into a shared function that accepts a prebuilt
+  `PersistedUserMessage` and a prefetched `CompanionPersona`; the worker's `drive_turn`
+  keeps its rebuild-from-row path and calls the shared loop, the stream handler calls it
+  directly with what the request already resolved — zero added DB round trips on the hot
+  path. The tap parameter migrates to the shared function.
+- Move `StreamSlotGuard` into the detached drive task (see §8).
+- Known async-path answer change, deliberate: once stream turns have queue rows, a
+  replayed `client_msg_id` for a terminally-failed stream turn answers `failed` where it
+  previously answered `already_queued`; also update the store comment 'no queue row means
+  the turn is mid-flight on the STREAM path' which becomes false.
 
 Each PR: branch off dev → PR → codex review → CI green → squash-merge, one at a time.
