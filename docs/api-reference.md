@@ -196,9 +196,15 @@ alive that were declared and **never constructed** before v1.4.0:
 | Gateway `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **(new)** |
 | Gateway `config` (local misconfiguration) | `internal` |
 | Gateway `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+| Whole-turn generation budget exceeded (`CHAT_QUEUE_GEN_TIMEOUT_SECS`) | `generation_timeout` **(new)** |
 
-Add arms for `rate_limited` and `timeout`; both carry `retryable: true`, so a
-default arm that reports a permanent failure is now wrong.
+Add arms for `rate_limited`, `timeout`, and `generation_timeout`; all three
+carry `retryable: true`, so a default arm that reports a permanent failure is
+now wrong. `generation_timeout` is distinct from `timeout`: `timeout` is a
+single upstream call's own gateway-level deadline, while `generation_timeout`
+is the detached stream task's whole-turn wall-clock budget expiring — it can
+fire even when every individual upstream call so far succeeded, just
+cumulatively too slowly.
 
 **Optional: tier selection.** The body may include a `tier` string —
 type `String`, regex `^[a-z0-9_]{1,32}$` (returns `400` if malformed).

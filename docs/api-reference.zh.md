@@ -176,9 +176,13 @@ provider 响应体里带的错误码，有才出现。
 | 网关 `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **（新）** |
 | 网关 `config`（本地配置错误） | `internal` |
 | 网关 `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+| 整轮生成超出 `CHAT_QUEUE_GEN_TIMEOUT_SECS` 预算 | `generation_timeout` **（新）** |
 
-请补上 `rate_limited` 和 `timeout` 两个分支；两者都带 `retryable: true`，
-所以默认分支若报「永久失败」，现在就是错的。
+请补上 `rate_limited`、`timeout`、`generation_timeout` 三个分支；三者都带
+`retryable: true`，所以默认分支若报「永久失败」，现在就是错的。
+`generation_timeout` 与 `timeout` 不同：`timeout` 是单次上游调用自己的网关层
+截止线，`generation_timeout` 则是流式 detached 任务的整轮墙钟预算耗尽 ——
+即便到目前为止每次上游调用都成功了，只是累计太慢，它也会触发。
 
 **可选：tier 选择。** 请求体可附加 `tier` 字符串 ——
 类型 `String`，正则 `^[a-z0-9_]{1,32}$`（格式错返回 `400`）。
