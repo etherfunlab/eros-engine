@@ -7,7 +7,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::chat::{upsert_user_message_in_tx, UpsertUserOutcome};
+use crate::chat::{upsert_user_message_in_tx, ChatMessage, UpsertUserOutcome};
 
 pub struct ChatQueueRepo<'a> {
     pub pool: &'a PgPool,
@@ -31,6 +31,25 @@ pub enum EnqueueOutcome {
         user_message_id: Uuid,
     },
     DepthExceeded,
+}
+
+/// Outcome of a born-claimed (stream-path) enqueue. Mirrors
+/// `UpsertUserOutcome` so the stream handler keeps its existing replay /
+/// duplicate responses; only `Inserted` grows a queue row (spec §4).
+#[derive(Debug)]
+pub enum ClaimedEnqueueOutcome {
+    Claimed {
+        user_message_id: Uuid,
+        queue_id: Uuid,
+    },
+    Replay {
+        user_message_id: Uuid,
+        ghost: bool,
+        assistant_chain: Vec<ChatMessage>,
+    },
+    DuplicateInProgress {
+        user_message_id: Uuid,
+    },
 }
 
 impl<'a> ChatQueueRepo<'a> {
@@ -103,6 +122,66 @@ impl<'a> ChatQueueRepo<'a> {
                     // mid-flight on the STREAM path — same "being handled" answer.
                     _ => EnqueueOutcome::AlreadyQueued { user_message_id },
                 })
+            }
+        }
+    }
+
+    /// Stream-path enqueue: user row + a BORN-CLAIMED queue row in one
+    /// transaction (spec §4). The row never passes through `pending` — the
+    /// caller drives it directly and it is invisible to `claim_next` while
+    /// live, but its `claimed` status still blocks the session's async turns
+    /// (one-way serialization, spec §5). No depth cap: the stream path has
+    /// its own per-user slot cap.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_user_message_claimed(
+        &self,
+        session_id: Uuid,
+        content: &str,
+        client_msg_id: &str,
+        role: &str,
+        metadata: Option<&serde_json::Value>,
+        user_id: Uuid,
+        params: &serde_json::Value,
+    ) -> Result<ClaimedEnqueueOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let outcome =
+            upsert_user_message_in_tx(&mut tx, session_id, content, client_msg_id, role, metadata)
+                .await?;
+        match outcome {
+            UpsertUserOutcome::Inserted { message_id } => {
+                let queue_id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO engine.chat_turn_queue \
+                         (session_id, user_message_id, user_id, params, \
+                          status, claimed_at, attempts) \
+                     VALUES ($1, $2, $3, $4, 'claimed', now(), 1) RETURNING id",
+                )
+                .bind(session_id)
+                .bind(message_id)
+                .bind(user_id)
+                .bind(params)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(ClaimedEnqueueOutcome::Claimed {
+                    user_message_id: message_id,
+                    queue_id,
+                })
+            }
+            UpsertUserOutcome::Replay {
+                user_message_id,
+                ghost,
+                assistant_chain,
+            } => {
+                tx.commit().await?;
+                Ok(ClaimedEnqueueOutcome::Replay {
+                    user_message_id,
+                    ghost,
+                    assistant_chain,
+                })
+            }
+            UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
+                tx.commit().await?;
+                Ok(ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id })
             }
         }
     }
@@ -767,5 +846,170 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notice, "出错了");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn enqueue_claimed_inserts_a_claimed_row_and_blocks_only_its_session(pool: PgPool) {
+        let (user_a, session_a) = seed_session(&pool).await;
+        let (user_b, session_b) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+
+        let ClaimedEnqueueOutcome::Claimed {
+            user_message_id,
+            queue_id,
+        } = repo
+            .enqueue_user_message_claimed(
+                session_a,
+                "hi",
+                "01JW00000000000000000000CL",
+                "user",
+                None,
+                user_a,
+                &serde_json::json!({"tier": "warm"}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Claimed");
+        };
+        let (status, attempts, claimed_at, params): (
+            String,
+            i32,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<serde_json::Value>,
+        ) = sqlx::query_as(
+            "SELECT status, attempts, claimed_at, params \
+                 FROM engine.chat_turn_queue WHERE id = $1",
+        )
+        .bind(queue_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "claimed", "born claimed — never pending");
+        assert_eq!(attempts, 1, "the handler's own drive is attempt #1");
+        assert!(claimed_at.is_some());
+        assert_eq!(params, Some(serde_json::json!({"tier": "warm"})));
+        let mid_check: Uuid =
+            sqlx::query_scalar("SELECT user_message_id FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mid_check, user_message_id);
+
+        // One-way serialization (spec §4/§5): the claimed row blocks claim_next
+        // for ITS session's pending rows, and no other session.
+        seed_queued(
+            &pool,
+            session_a,
+            user_a,
+            "queued behind the stream turn",
+            10,
+        )
+        .await;
+        seed_queued(&pool, session_b, user_b, "other session", 5).await;
+        let t = repo
+            .claim_next()
+            .await
+            .unwrap()
+            .expect("session B is claimable");
+        assert_eq!(t.session_id, session_b);
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "session A blocked by the born-claimed row; B already in flight"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn enqueue_claimed_replays_an_answered_message(pool: PgPool) {
+        let (user_id, session_id) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let mid: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'user', 'hello', '01JW00000000000000000000RP') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id) \
+             VALUES ($1, 'assistant', 'hi there', $2)",
+        )
+        .bind(session_id)
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ClaimedEnqueueOutcome::Replay {
+            user_message_id,
+            ghost,
+            assistant_chain,
+        } = repo
+            .enqueue_user_message_claimed(
+                session_id,
+                "hello",
+                "01JW00000000000000000000RP",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Replay");
+        };
+        assert_eq!(user_message_id, mid);
+        assert!(!ghost);
+        assert_eq!(assistant_chain.len(), 1);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_turn_queue WHERE user_message_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "a replay creates no queue row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn enqueue_claimed_reports_duplicate_in_progress(pool: PgPool) {
+        let (user_id, session_id) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let mid: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, client_msg_id) \
+             VALUES ($1, 'user', 'hello', '01JW00000000000000000000DP') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id } = repo
+            .enqueue_user_message_claimed(
+                session_id,
+                "hello",
+                "01JW00000000000000000000DP",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected DuplicateInProgress");
+        };
+        assert_eq!(user_message_id, mid);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_turn_queue WHERE user_message_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
     }
 }
