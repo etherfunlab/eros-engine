@@ -15,9 +15,11 @@ use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityAxis, AffinityScope, MemoryScope};
+use eros_engine_core::types::HistoryAnchor;
 use eros_engine_llm::model_config::StyleKey;
-use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+use eros_engine_store::chat::{ChatRepo, ChatSession, UpsertUserOutcome};
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
@@ -83,7 +85,7 @@ impl AffinityScopeDto {
 ///
 /// Reference-image URLs travel on the `image_request` frame; the engine
 /// never draws, so there is no engine-side draw request carrying them.
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ImageReplyParams {
     #[serde(default)]
     pub force: bool,
@@ -170,7 +172,7 @@ fn image_url_is_valid(url: &str) -> bool {
     !host.is_empty()
 }
 
-fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
+pub(crate) fn validate_payload(req: &StreamSendRequest) -> Result<(), AppError> {
     // Content may be empty only when a tip or an image_url is attached. A
     // forced image turn gets no exemption: the composer's strongest input is
     // the user's message (spec 2026-08-03 §2.3).
@@ -298,7 +300,7 @@ pub(crate) fn aspect_ratio_supported(ar: &str) -> bool {
 /// `[tasks.chat_image_prompt_compose]` nothing can write the prompt, so the
 /// request is refused pre-stream instead of degrading to a generic portrait.
 /// Separate from `validate_payload`, which stays pure/config-free.
-fn validate_image_capability(
+pub(crate) fn validate_image_capability(
     req: &StreamSendRequest,
     model_config: &eros_engine_llm::model_config::ModelConfig,
 ) -> Result<(), AppError> {
@@ -315,6 +317,160 @@ fn validate_image_capability(
         }));
     }
     Ok(())
+}
+
+/// Session-load / ownership / voice-channel / instance_id / persona-exists
+/// pre-flight shared by the stream handler (and, in turn, its async sibling).
+pub(crate) async fn resolve_text_turn(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> Result<(ChatSession, CompanionPersona, Uuid), AppError> {
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::NOT_FOUND,
+            code: "session_not_found",
+            message: "session not found".into(),
+            user_message: "会话不存在".into(),
+            original_user_message_id: None,
+        })
+    })?;
+    if session.user_id != user_id {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::FORBIDDEN,
+            code: "session_forbidden",
+            message: "session not owned by JWT user".into(),
+            user_message: "无权访问该会话".into(),
+            original_user_message_id: None,
+        }));
+    }
+    // Channel-scoped, mirroring the voice endpoint's own gate: this handler
+    // writes text-channel rows, so it must not operate on a voice session.
+    // Without this, a text turn lands in a voice conversation's history and
+    // the two channels interleave in a single transcript — and it is what let
+    // a text `client_msg_id` collide with the voice barge-in lookups
+    // (2026-08-11-voice-barge-in-interrupt-design.md). Those lookups now filter
+    // `channel = 'voice'` themselves, so this is defence in depth on the
+    // writing side rather than the only guard.
+    if session.channel == "voice" {
+        return Err(AppError::StreamPre(StreamPreError {
+            status: StatusCode::CONFLICT,
+            code: "wrong_channel",
+            message: "session is a voice-channel session".into(),
+            user_message: "该会话是语音会话".into(),
+            original_user_message_id: None,
+        }));
+    }
+    let instance_id = session.instance_id.ok_or_else(|| {
+        AppError::StreamPre(StreamPreError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: "session has no instance_id".into(),
+            user_message: "服务出现问题，请稍后再试".into(),
+            original_user_message_id: None,
+        })
+    })?;
+    // Verify the instance still exists and is active (404 otherwise) before
+    // opening the stream. (Previously this load also fed the NFT-ownership gate.)
+    // The loaded persona is threaded into `run_stream` below so the turn does
+    // not re-issue the same `load_companion` query inside the generator.
+    let persona_repo = PersonaRepo { pool: &state.pool };
+    let persona = persona_repo
+        .load_companion(instance_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
+    Ok((session, persona, instance_id))
+}
+
+/// Resolve the optional reply anchor. A present-but-unresolvable id does not
+/// fail the request — we drop history for this turn and flag it (DropHistory).
+pub(crate) async fn resolve_history_anchor(
+    chat_repo: &ChatRepo<'_>,
+    session_id: Uuid,
+    reply_to: Option<Uuid>,
+) -> Result<HistoryAnchor, AppError> {
+    let history_anchor = match reply_to {
+        None => HistoryAnchor::Latest,
+        Some(id) => match chat_repo.message_sent_at_in_session(session_id, id).await? {
+            Some(sent_at) => HistoryAnchor::At {
+                message_id: id,
+                sent_at,
+            },
+            None => HistoryAnchor::DropHistory,
+        },
+    };
+    Ok(history_anchor)
+}
+
+// Build metadata: conditionally include tips_amount_usd, tier, and image_url.
+// tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
+pub(crate) fn build_user_row_metadata(
+    req: &StreamSendRequest,
+    history_anchor: &HistoryAnchor,
+) -> Option<serde_json::Value> {
+    let mut meta_map = serde_json::Map::new();
+    if let Some(amount) = req.tips_amount_usd {
+        meta_map.insert("tips_amount_usd".into(), serde_json::json!(amount));
+    }
+    if let Some(t) = req.tier.as_deref() {
+        meta_map.insert("tier".into(), serde_json::json!(t));
+    }
+    if let Some(url) = req.image_url.as_deref() {
+        meta_map.insert("image_url".into(), serde_json::json!(url));
+    }
+    // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
+    // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
+    // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
+    // An operator diffing the two can spot allow-list misconfiguration or
+    // frontend/backend shape drift.
+    if let Some(ms) = req.memory_scope.as_ref() {
+        meta_map.insert(
+            "memory_scope_raw".into(),
+            serde_json::to_value(ms).expect("MemoryScope serializes"),
+        );
+    }
+    if let Some(asd) = req.affinity_scope.as_ref() {
+        meta_map.insert(
+            "affinity_scope_raw".into(),
+            serde_json::to_value(asd).expect("AffinityScopeDto serializes"),
+        );
+    }
+    if let Some(pt) = req.prompt_traits.as_ref() {
+        // PromptTraitDto does not derive Serialize (lives in companion.rs).
+        // Hand-build the JSON shape — `{tag, text}` per element — so an empty
+        // input vec round-trips as `[]` (not omitted).
+        let arr: Vec<serde_json::Value> = pt
+            .iter()
+            .map(|t| serde_json::json!({"tag": t.tag, "text": t.text}))
+            .collect();
+        meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
+    }
+    match history_anchor {
+        HistoryAnchor::At { message_id, .. } => {
+            meta_map.insert("reply_to_message_id".into(), serde_json::json!(message_id));
+        }
+        HistoryAnchor::DropHistory => {
+            meta_map.insert("reply_to_error".into(), serde_json::json!("not_found"));
+        }
+        HistoryAnchor::Latest => {}
+    }
+    if meta_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(meta_map))
+    }
+}
+
+pub(crate) fn persisted_content_role(req: &StreamSendRequest) -> (String, &'static str) {
+    match req.tips_amount_usd {
+        Some(amount) if req.content.is_empty() => (
+            format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
+            "gift_user",
+        ),
+        Some(_) => (req.content.clone(), "gift_user"),
+        None => (req.content.clone(), "user"),
+    }
 }
 
 #[utoipa::path(
@@ -371,60 +527,8 @@ pub async fn send_message_stream(
         })
     })?;
 
+    let (_session, persona, instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
     let chat_repo = ChatRepo { pool: &state.pool };
-    let session = chat_repo.get_session(session_id).await?.ok_or_else(|| {
-        AppError::StreamPre(StreamPreError {
-            status: StatusCode::NOT_FOUND,
-            code: "session_not_found",
-            message: "session not found".into(),
-            user_message: "会话不存在".into(),
-            original_user_message_id: None,
-        })
-    })?;
-    if session.user_id != user_id {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::FORBIDDEN,
-            code: "session_forbidden",
-            message: "session not owned by JWT user".into(),
-            user_message: "无权访问该会话".into(),
-            original_user_message_id: None,
-        }));
-    }
-    // Channel-scoped, mirroring the voice endpoint's own gate: this handler
-    // writes text-channel rows, so it must not operate on a voice session.
-    // Without this, a text turn lands in a voice conversation's history and
-    // the two channels interleave in a single transcript — and it is what let
-    // a text `client_msg_id` collide with the voice barge-in lookups
-    // (2026-08-11-voice-barge-in-interrupt-design.md). Those lookups now filter
-    // `channel = 'voice'` themselves, so this is defence in depth on the
-    // writing side rather than the only guard.
-    if session.channel == "voice" {
-        return Err(AppError::StreamPre(StreamPreError {
-            status: StatusCode::CONFLICT,
-            code: "wrong_channel",
-            message: "session is a voice-channel session".into(),
-            user_message: "该会话是语音会话".into(),
-            original_user_message_id: None,
-        }));
-    }
-    let instance_id = session.instance_id.ok_or_else(|| {
-        AppError::StreamPre(StreamPreError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
-            message: "session has no instance_id".into(),
-            user_message: "服务出现问题，请稍后再试".into(),
-            original_user_message_id: None,
-        })
-    })?;
-    // Verify the instance still exists and is active (404 otherwise) before
-    // opening the stream. (Previously this load also fed the NFT-ownership gate.)
-    // The loaded persona is threaded into `run_stream` below so the turn does
-    // not re-issue the same `load_companion` query inside the generator.
-    let persona_repo = PersonaRepo { pool: &state.pool };
-    let persona = persona_repo
-        .load_companion(instance_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("instance not found".into()))?;
     // Acquire a stream slot. `StreamSlotGuard` is now `'static` (holds Arc),
     // so it can be moved into the SSE body below.
     let guard = state
@@ -443,80 +547,11 @@ pub async fn send_message_stream(
     // Resolve the optional reply anchor BEFORE the upsert so the outcome can be
     // recorded in the new row's metadata. A present-but-unresolvable id does not
     // fail the request — we drop history for this turn and flag it (DropHistory).
-    use eros_engine_core::types::HistoryAnchor;
-    let history_anchor = match req.reply_to_message_id {
-        None => HistoryAnchor::Latest,
-        Some(id) => match chat_repo.message_sent_at_in_session(session_id, id).await? {
-            Some(sent_at) => HistoryAnchor::At {
-                message_id: id,
-                sent_at,
-            },
-            None => HistoryAnchor::DropHistory,
-        },
-    };
+    let history_anchor =
+        resolve_history_anchor(&chat_repo, session_id, req.reply_to_message_id).await?;
 
-    // Build metadata: conditionally include tips_amount_usd, tier, and image_url.
-    // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
-    let mut meta_map = serde_json::Map::new();
-    if let Some(amount) = req.tips_amount_usd {
-        meta_map.insert("tips_amount_usd".into(), serde_json::json!(amount));
-    }
-    if let Some(t) = req.tier.as_deref() {
-        meta_map.insert("tier".into(), serde_json::json!(t));
-    }
-    if let Some(url) = req.image_url.as_deref() {
-        meta_map.insert("image_url".into(), serde_json::json!(url));
-    }
-    // Pre-validation, pre-resolve raw snapshot of what the frontend sent.
-    // The `_raw` suffix distinguishes these from the post-resolve `memory_scope`
-    // / `affinity_scope` / `prompt_traits` written on the matching assistant row.
-    // An operator diffing the two can spot allow-list misconfiguration or
-    // frontend/backend shape drift.
-    if let Some(ms) = req.memory_scope.as_ref() {
-        meta_map.insert(
-            "memory_scope_raw".into(),
-            serde_json::to_value(ms).expect("MemoryScope serializes"),
-        );
-    }
-    if let Some(asd) = req.affinity_scope.as_ref() {
-        meta_map.insert(
-            "affinity_scope_raw".into(),
-            serde_json::to_value(asd).expect("AffinityScopeDto serializes"),
-        );
-    }
-    if let Some(pt) = req.prompt_traits.as_ref() {
-        // PromptTraitDto does not derive Serialize (lives in companion.rs).
-        // Hand-build the JSON shape — `{tag, text}` per element — so an empty
-        // input vec round-trips as `[]` (not omitted).
-        let arr: Vec<serde_json::Value> = pt
-            .iter()
-            .map(|t| serde_json::json!({"tag": t.tag, "text": t.text}))
-            .collect();
-        meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
-    }
-    match history_anchor {
-        HistoryAnchor::At { message_id, .. } => {
-            meta_map.insert("reply_to_message_id".into(), serde_json::json!(message_id));
-        }
-        HistoryAnchor::DropHistory => {
-            meta_map.insert("reply_to_error".into(), serde_json::json!("not_found"));
-        }
-        HistoryAnchor::Latest => {}
-    }
-    let persisted_metadata: Option<serde_json::Value> = if meta_map.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(meta_map))
-    };
-
-    let (persisted_content, persisted_role) = match req.tips_amount_usd {
-        Some(amount) if req.content.is_empty() => (
-            format!("(打赏 ${})", crate::prompt::fmt_amount(amount)),
-            "gift_user",
-        ),
-        Some(_) => (req.content.clone(), "gift_user"),
-        None => (req.content.clone(), "user"),
-    };
+    let persisted_metadata = build_user_row_metadata(&req, &history_anchor);
+    let (persisted_content, persisted_role) = persisted_content_role(&req);
     let outcome = chat_repo
         .upsert_user_message_idempotent(
             session_id,
