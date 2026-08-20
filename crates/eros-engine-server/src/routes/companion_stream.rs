@@ -19,12 +19,13 @@ use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityAxis, AffinityScope, MemoryScope};
 use eros_engine_core::types::HistoryAnchor;
 use eros_engine_llm::model_config::StyleKey;
-use eros_engine_store::chat::{ChatRepo, ChatSession, UpsertUserOutcome};
+use eros_engine_store::chat::{ChatRepo, ChatSession};
+use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedEnqueueOutcome, ClaimedTurn};
 use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
-use crate::pipeline::stream::{replay_stream, run_stream, PersistedUserMessage, ProtocolFrame};
+use crate::pipeline::stream::{replay_stream, PersistedUserMessage, ProtocolFrame};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
@@ -39,7 +40,7 @@ const MAX_CLIENT_MSG_ID_LEN: usize = 36;
 const CONCURRENT_STREAMS_PER_USER: u32 = 3;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
-#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityScopeName {
     Full,
@@ -49,7 +50,7 @@ pub enum AffinityScopeName {
     None,
 }
 
-#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum AffinityScopeDto {
     Named(AffinityScopeName),
@@ -373,8 +374,9 @@ pub(crate) async fn resolve_text_turn(
     })?;
     // Verify the instance still exists and is active (404 otherwise) before
     // opening the stream. (Previously this load also fed the NFT-ownership gate.)
-    // The loaded persona is threaded into `run_stream` below so the turn does
-    // not re-issue the same `load_companion` query inside the generator.
+    // The loaded persona is threaded into the detached drive task's
+    // `run_stream` call below so the turn does not re-issue the same
+    // `load_companion` query inside the generator.
     let persona_repo = PersonaRepo { pool: &state.pool };
     let persona = persona_repo
         .load_companion(instance_id)
@@ -502,7 +504,7 @@ pub async fn send_message_stream(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Extension(AuthUser(user_id)): Extension<AuthUser>,
-    Json(mut req): Json<StreamSendRequest>,
+    Json(req): Json<StreamSendRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Validate payload first — before any DB call — so 422/400 never waste a roundtrip.
     validate_payload(&req)?;
@@ -517,7 +519,7 @@ pub async fn send_message_stream(
                 original_user_message_id: None,
             })
         })?;
-    let audit = validate_llm_audit(req.audit.take()).map_err(|e| {
+    let audit = validate_llm_audit(req.audit.clone()).map_err(|e| {
         AppError::StreamPre(StreamPreError {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_payload",
@@ -543,6 +545,11 @@ pub async fn send_message_stream(
                 original_user_message_id: None,
             })
         })?;
+    // Held here as an Option: the Claimed arm below moves it into the
+    // detached drive task (spec §8 — the cap bounds generations, not
+    // connections), so the SSE body's own guard slot is `None` on that path
+    // and `Some` only on Replay, where the body is still the sole owner.
+    let mut guard = Some(guard);
 
     // Resolve the optional reply anchor BEFORE the upsert so the outcome can be
     // recorded in the new row's metadata. A present-but-unresolvable id does not
@@ -552,22 +559,40 @@ pub async fn send_message_stream(
 
     let persisted_metadata = build_user_row_metadata(&req, &history_anchor);
     let (persisted_content, persisted_role) = persisted_content_role(&req);
-    let outcome = chat_repo
-        .upsert_user_message_idempotent(
+    let params_value = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
+        tier: req.tier.clone(),
+        memory_scope: req.memory_scope,
+        affinity_scope: req.affinity_scope.clone(),
+        prompt_traits: req.prompt_traits.clone(),
+        audit: req.audit.clone(),
+        tips_amount_usd: req.tips_amount_usd,
+        image_url: req.image_url.clone(),
+        image: req.image.clone(),
+        reply_to_message_id: req.reply_to_message_id,
+    })
+    .expect("QueuedTurnParams serializes");
+    let queue_repo = ChatQueueRepo { pool: &state.pool };
+    let outcome = queue_repo
+        .enqueue_user_message_claimed(
             session_id,
             &persisted_content,
             &req.client_msg_id,
             persisted_role,
             persisted_metadata.as_ref(),
+            user_id,
+            &params_value,
         )
         .await?;
     // Resolve the proto stream. Replay returns early with a boxed stream;
-    // Inserted continues to run_stream below. Boxing erases the concrete type
-    // so both branches can feed the same SSE wrapper.
+    // Claimed drives the turn on a detached task and taps its frames.
+    // Boxing erases the concrete type so both branches can feed the same
+    // SSE wrapper.
     let proto: std::pin::Pin<Box<dyn futures_util::Stream<Item = ProtocolFrame> + Send>> =
         match outcome {
-            UpsertUserOutcome::Inserted { message_id } => {
-                let state_arc = Arc::new(state.clone());
+            ClaimedEnqueueOutcome::Claimed {
+                user_message_id,
+                queue_id,
+            } => {
                 let memory_scope = req.memory_scope.unwrap_or_default();
                 let affinity_scope = req
                     .affinity_scope
@@ -575,7 +600,7 @@ pub async fn send_message_stream(
                     .map(AffinityScopeDto::resolve)
                     .unwrap_or_default();
                 let user_msg = PersistedUserMessage {
-                    user_message_id: message_id,
+                    user_message_id,
                     session_id,
                     user_id,
                     instance_id,
@@ -590,9 +615,57 @@ pub async fn send_message_stream(
                     image: req.image.clone(),
                     history_anchor,
                 };
-                Box::pin(run_stream(state_arc, user_msg, Some(persona)))
+                let turn = ClaimedTurn {
+                    queue_id,
+                    session_id,
+                    user_message_id,
+                    user_id,
+                    attempts: 1,
+                    params: Some(params_value),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProtocolFrame>();
+                // The detached task owns the generation (spec §3): the SSE
+                // body below is only a tap, so a client disconnect never
+                // cancels the drive. The task also owns the StreamSlotGuard
+                // (spec §8: the cap bounds generations, not connections) and
+                // settles TerminalOnFailure (spec §6: no background retry).
+                let drive_state = state.clone();
+                let guard = guard.take();
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let outcome = match tokio::time::timeout(
+                        drive_state.config.chat_queue.generation_timeout,
+                        crate::pipeline::chat_queue::drive_to_exhaustion(
+                            Arc::new(drive_state.clone()),
+                            user_msg,
+                            Some(persona),
+                            Some(tx),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(o) => o,
+                        Err(_) => crate::pipeline::chat_queue::TurnOutcome::Failure(
+                            "generation timeout".into(),
+                        ),
+                    };
+                    crate::pipeline::chat_queue::settle_turn(
+                        &drive_state,
+                        &turn,
+                        outcome,
+                        crate::pipeline::chat_queue::SettleMode::TerminalOnFailure,
+                    )
+                    .await;
+                    // Queued async turns on this session become claimable now.
+                    drive_state.chat_queue_notify.notify_one();
+                });
+                Box::pin(async_stream::stream! {
+                    while let Some(frame) = rx.recv().await {
+                        yield frame;
+                    }
+                })
             }
-            UpsertUserOutcome::DuplicateInProgress { user_message_id } => {
+            ClaimedEnqueueOutcome::DuplicateInProgress { user_message_id } => {
                 return Err(AppError::StreamPre(StreamPreError {
                     status: StatusCode::CONFLICT,
                     code: "duplicate_in_progress",
@@ -601,7 +674,7 @@ pub async fn send_message_stream(
                     original_user_message_id: Some(user_message_id),
                 }));
             }
-            UpsertUserOutcome::Replay {
+            ClaimedEnqueueOutcome::Replay {
                 ghost,
                 assistant_chain,
                 ..
@@ -767,6 +840,98 @@ mod tests {
     fn build_router(state: AppState) -> Router {
         let (axum, _api) = crate::routes::router(state.clone()).split_for_parts();
         axum.with_state(state)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn stream_turn_rides_the_queue_and_settles_done(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-q\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let chat_repo = ChatRepo { pool: &pool };
+        let session_id = chat_repo
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "hi",
+            "client_msg_id": "01J4444444444444444444444Q"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Consume the response body to completion, as the existing
+        // happy-path stream test does.
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+        // The detached drive task's settle_turn() write races the SSE body's
+        // completion: the tap channel closes (ending the body) the instant
+        // drive_to_exhaustion returns, which is BEFORE settle_turn's UPDATE
+        // lands. Poll for the terminal status rather than reading once —
+        // mirrors pipeline::chat_queue's own wait_for_status test helper,
+        // used for the identical spawn-then-settle race on the worker path.
+        let (status, attempts): (String, i32) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                loop {
+                    let row: Option<(String, i32)> = sqlx::query_as(
+                        "SELECT q.status, q.attempts FROM engine.chat_turn_queue q \
+                         JOIN engine.chat_messages m ON m.id = q.user_message_id \
+                         WHERE m.session_id = $1 AND m.client_msg_id = '01J4444444444444444444444Q'",
+                    )
+                    .bind(session_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                    if let Some((status, attempts)) = row {
+                        if status == "done" || status == "failed" {
+                            return (status, attempts);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            },
+        )
+        .await
+        .expect("queue row should reach a terminal status");
+        assert_eq!(status, "done", "a served stream turn settles its queue row");
+        assert_eq!(
+            attempts, 1,
+            "born claimed: the handler drive is the only attempt"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
