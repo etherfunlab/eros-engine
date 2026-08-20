@@ -842,6 +842,29 @@ mod tests {
         axum.with_state(state)
     }
 
+    // Mirrors pipeline::chat_queue's own `wait_for_status` worker-test helper
+    // (cross-module test helpers are not shared): the detached drive task's
+    // settle_turn() write races the SSE body's completion, so tests must poll
+    // for the terminal status rather than reading once.
+    async fn wait_for_status(pool: &PgPool, queue_id: Uuid, wanted: &[&str]) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let s: String =
+                    sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                        .bind(queue_id)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                if wanted.contains(&s.as_str()) {
+                    return s;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("turn should reach a terminal status")
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn stream_turn_rides_the_queue_and_settles_done(pool: PgPool) {
         use wiremock::matchers::path as wm_path;
@@ -932,6 +955,221 @@ data: [DONE]\n\n";
             attempts, 1,
             "born claimed: the handler drive is the only attempt"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn disconnect_mid_generation_still_persists_and_settles(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-q\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream")
+                    // Keeps the generation in flight past the point where we
+                    // drop the response below, proving the detached task
+                    // survives a client disconnect mid-generation (spec §3).
+                    .set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let chat_repo = ChatRepo { pool: &pool };
+        let session_id = chat_repo
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "hi",
+            "client_msg_id": "01J4444444444444444444444D"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop(resp); // client disconnects: the SSE body (the tap receiver) is dropped
+
+        // The detached task must finish the turn with nobody listening.
+        let queue_id: Uuid = sqlx::query_scalar(
+            "SELECT q.id FROM engine.chat_turn_queue q \
+             JOIN engine.chat_messages m ON m.id = q.user_message_id \
+             WHERE m.session_id = $1 AND m.client_msg_id = '01J4444444444444444444444D'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status = wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+        assert_eq!(status, "done");
+        let user_message_id: Uuid =
+            sqlx::query_scalar("SELECT user_message_id FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let assistant: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            assistant > 0 || ghosted,
+            "the reply must persist (or ghost) after the client is gone"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn failed_stream_turn_goes_terminal_without_retry(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Zero-Done failure recipe, adapted from pipeline::chat_queue's
+        // `failing_turn_releases_then_goes_terminal_with_system_error` to
+        // enter through the HTTP router instead of `drain_once`. See that
+        // test's comment for why product_qa — not the plain chat_companion
+        // path — is the way to reach zero-Done+Error (Failure) through the
+        // real pipeline: chat_companion's per-attempt loop always persists
+        // and yields a Done frame (⇒ Success) before chain exhaustion runs,
+        // and a cleared phrase table only matters for that path anyway —
+        // product_qa's own hand-rolled exhaustion arm persists nothing and
+        // emits only an Error frame.
+        sqlx::query(
+            "UPDATE engine.error_handling_config \
+             SET payload = '[]'::jsonb \
+             WHERE kind = 'chat_stream_failure_fallback_phrases'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mock = MockServer::start().await;
+        let verdict = serde_json::json!({ "action": "product_qa", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        // Both product_qa executor candidates fail — the chain exhausts.
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("qa/exec-a"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("qa/exec-b"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let chat_repo = ChatRepo { pool: &pool };
+        let session_id = chat_repo
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n\
+                 [tasks.chat_product_qa]\nmodel=\"qa/exec-a\"\nfallback=[\"qa/exec-b\"]\nretry_depth=1\n\
+                 filter_prompt=\"Answer using the product docs below.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "这个产品能用几年",
+            "client_msg_id": "01J4444444444444444444444F"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+        let queue_id: Uuid = sqlx::query_scalar(
+            "SELECT q.id FROM engine.chat_turn_queue q \
+             JOIN engine.chat_messages m ON m.id = q.user_message_id \
+             WHERE m.session_id = $1 AND m.client_msg_id = '01J4444444444444444444444F'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status = wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+        assert_eq!(status, "failed", "stream turns never release for retry");
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT attempts FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "terminal on the first failure — no ladder");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1, "terminal failure leaves exactly one signal row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
