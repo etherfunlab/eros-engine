@@ -124,14 +124,24 @@ pub(crate) async fn drain_once(
 /// role='system_error', the role the old async path once produced.
 const FAILURE_NOTICE: &str = "AI 回复失败，请稍后再试";
 
+/// Who is settling decides what a failure means (spec §6): the worker ladder
+/// retries up to max_attempts; a handler-driven stream turn gets exactly one
+/// attempt — its user saw the Error frame and will resend, so a background
+/// retry would race that resend into a double reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleMode {
+    Ladder,
+    TerminalOnFailure,
+}
+
 async fn process_turn(state: AppState, turn: ClaimedTurn) {
     let cfg = state.config.chat_queue.clone();
     let outcome =
-        match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn)).await {
+        match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn, None)).await {
             Ok(o) => o,
             Err(_) => TurnOutcome::Failure("generation timeout".into()),
         };
-    settle_turn(&state, &turn, outcome).await;
+    settle_turn(&state, &turn, outcome, SettleMode::Ladder).await;
     // This session may have a next stacked turn — wake the loop now rather
     // than waiting out a tick.
     state.chat_queue_notify.notify_one();
@@ -142,14 +152,23 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
 /// reply that persisted moments earlier (its Done frame never tallied), and
 /// marking that turn `failed` would pair a served reply with a spurious
 /// `system_error` row. A guard error falls through to the failure path — the
-/// pre-fix behavior.
-pub(crate) async fn settle_turn(state: &AppState, turn: &ClaimedTurn, outcome: TurnOutcome) {
+/// pre-fix behavior. The `mode` decides what a Failure means: `Ladder`
+/// retries until `max_attempts`, `TerminalOnFailure` goes terminal on the
+/// first failure (spec §6).
+pub(crate) async fn settle_turn(
+    state: &AppState,
+    turn: &ClaimedTurn,
+    outcome: TurnOutcome,
+    mode: SettleMode,
+) {
     let cfg = &state.config.chat_queue;
     let repo = ChatQueueRepo { pool: &state.pool };
     let res = match outcome {
         TurnOutcome::Success => repo.mark_done(turn.queue_id).await,
         TurnOutcome::Failure(msg) => {
-            if turn.attempts >= cfg.max_attempts {
+            let terminal =
+                mode == SettleMode::TerminalOnFailure || turn.attempts >= cfg.max_attempts;
+            if terminal {
                 if matches!(
                     turn_already_served(state, turn.user_message_id).await,
                     Ok(true)
@@ -190,9 +209,15 @@ async fn turn_already_served(state: &AppState, user_message_id: Uuid) -> Result<
 }
 
 /// Rebuild the turn from the queue row + message row and drive `run_stream`
-/// to exhaustion, discarding frames. Persistence, PDE, filters, ghosting and
-/// post-process all live inside the generator already (spec §6 Execution).
-async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
+/// to exhaustion, forwarding every frame to the optional tap (frames are
+/// discarded when no tap is attached). Persistence, PDE, filters, ghosting
+/// and post-process all live inside the generator already (spec §6
+/// Execution).
+async fn drive_turn(
+    state: &AppState,
+    turn: &ClaimedTurn,
+    tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
+) -> TurnOutcome {
     let chat_repo = ChatRepo { pool: &state.pool };
 
     // Replay guard. `run_stream` has none of its own — the stream path's guard
@@ -297,10 +322,15 @@ async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
     let mut done_frames = 0usize;
     let mut last_error: Option<String> = None;
     while let Some(frame) = stream.next().await {
-        match frame {
+        match &frame {
             ProtocolFrame::Done { .. } => done_frames += 1,
-            ProtocolFrame::Error { message, .. } => last_error = Some(message),
+            ProtocolFrame::Error { message, .. } => last_error = Some(message.clone()),
             _ => {}
+        }
+        // The tap is an observer: a dropped receiver (client gone) must
+        // never stop or slow the drive (spec §3).
+        if let Some(tx) = &tap {
+            let _ = tx.send(frame);
         }
     }
     classify_outcome(done_frames, last_error)
@@ -889,6 +919,7 @@ data: [DONE]\n\n";
             &state,
             &turn,
             TurnOutcome::Failure("generation timeout".into()),
+            SettleMode::Ladder,
         )
         .await;
 
@@ -914,7 +945,13 @@ data: [DONE]\n\n";
     async fn terminal_failure_without_reply_goes_failed_with_one_notice(pool: PgPool) {
         let (state, turn) = seed_final_attempt_turn(&pool).await;
 
-        settle_turn(&state, &turn, TurnOutcome::Failure("upstream 500".into())).await;
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::Ladder,
+        )
+        .await;
 
         let (status, last_error): (String, Option<String>) =
             sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
@@ -933,5 +970,223 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(notices, vec![FAILURE_NOTICE.to_string()]);
+    }
+
+    /// Happy-path mock + session + enqueued turn, ready to drive. Returns the
+    /// MockServer too — dropping it would kill the mock endpoint mid-drive.
+    async fn seed_driveable_turn(
+        pool: &PgPool,
+        client_msg_id: &str,
+    ) -> (crate::state::AppState, MockServer, Uuid) {
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" back\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-q\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let repo = ChatQueueRepo { pool };
+        let EnqueueOutcome::Queued {
+            user_message_id, ..
+        } = repo
+            .enqueue_user_message(
+                session_id,
+                "hi",
+                client_msg_id,
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+        (state, mock, user_message_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drive_tap_receives_the_frame_stream(pool: PgPool) {
+        let (state, _mock, _user_message_id) =
+            seed_driveable_turn(&pool, "01JW00000000000000000000T1").await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let turn = repo.claim_next().await.unwrap().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        assert!(matches!(outcome, TurnOutcome::Success));
+
+        let mut frames = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            frames.push(f);
+        }
+        // The PDE ghost arm (stream.rs ActionType::Ghost) yields Meta → Done →
+        // final, same as a reply — so BOTH branches produce a Meta and a Done
+        // and the assertions below must not be conditional on which one PDE
+        // picked. Asserting both frame kinds pins "every frame is forwarded",
+        // not just the tally-relevant ones.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Meta { .. })),
+            "the turn's Meta frame must reach the tap; got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| matches!(f, ProtocolFrame::Done { .. })),
+            "every completed turn (reply or ghost) surfaces its Done through the tap; got {frames:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drive_survives_a_dropped_tap(pool: PgPool) {
+        let (state, _mock, user_message_id) =
+            seed_driveable_turn(&pool, "01JW00000000000000000000T2").await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let turn = repo.claim_next().await.unwrap().unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProtocolFrame>();
+        drop(rx); // client disconnected before the first frame
+        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Success),
+            "a dead tap must not stop the drive"
+        );
+        let assistant: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            assistant > 0 || ghosted,
+            "the turn must complete (reply or ghost) with nobody listening"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_mode_fails_a_first_attempt_failure(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1; // far below max — the mode, not the ladder, decides
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::TerminalOnFailure,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed", "stream turns get exactly one attempt");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ladder_mode_still_releases_a_first_attempt_failure(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1;
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::Ladder,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "the worker ladder still retries");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_mode_respects_the_served_guard(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id) \
+             VALUES ($1, 'assistant', 'already served', $2)",
+        )
+        .bind(turn.session_id)
+        .bind(turn.user_message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("generation timeout".into()),
+            SettleMode::TerminalOnFailure,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 0);
     }
 }
