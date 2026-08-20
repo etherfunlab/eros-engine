@@ -721,7 +721,25 @@ pub(super) async fn build_reply_request(
         _ => eros_engine_core::types::HistoryAnchor::Latest,
     };
     let history = match history_fetch_for(history_anchor) {
-        HistoryFetch::Latest => chat_repo.history(session_id, HISTORY_WINDOW, 0).await?,
+        HistoryFetch::Latest => {
+            let mut rows = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
+            // The prompt's model-facing messages come ONLY from this vector, so
+            // a driving row missing from it means the model answers a message
+            // it never sees. On the stream path the driving row is always the
+            // newest row and this is a no-op; on the async worker path a LIFO
+            // burst (or anything that landed while the turn waited) can bury it
+            // past HISTORY_WINDOW. Pin it back at its chronological position —
+            // older than everything in the window, so it goes first.
+            if !rows.iter().any(|m| m.id == user_message_id) {
+                if let Some(driving) = chat_repo
+                    .message_by_id_in_session(session_id, user_message_id)
+                    .await?
+                {
+                    rows.insert(0, driving);
+                }
+            }
+            rows
+        }
         HistoryFetch::Anchored(anchor) => {
             chat_repo
                 .history_anchored(session_id, user_message_id, anchor, HISTORY_WINDOW)

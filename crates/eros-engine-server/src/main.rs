@@ -375,6 +375,7 @@ async fn run_server() -> Result<()> {
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
         world_configured,
         stories_configured,
+        chat_queue_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth
@@ -404,6 +405,10 @@ async fn run_server() -> Result<()> {
     // WORLD_TOWN_DISABLED is set, or [tasks.world_director] is absent — no
     // posts can exist without the director (town spec §3).
     tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
+
+    // Chat-queue worker: drives async-endpoint turns (spec
+    // 2026-08-20-async-chat-endpoint-design). Inert when CHAT_QUEUE_DISABLED.
+    tokio::spawn(crate::pipeline::chat_queue::worker(state.clone()));
 
     let app: Router = open_router
         .with_state(state)

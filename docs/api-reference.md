@@ -460,6 +460,39 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 The engine never draws and no draw-lifecycle frames exist: the consumer
 receives `image_request` and calls its own image vendor.
 
+### `POST /v2/comp/chat/{session_id}/message/async`
+
+Enqueue-only chat turn — the async alternative to the stream endpoint above,
+for callers that cannot hold an SSE connection open (bot gateways, background
+senders). Same body (`StreamSendRequest`) and the same validation and
+auth/ownership/`wrong_channel` checks as `message/stream` (`client_msg_id` is
+required on both), and no reply is ever returned here: a background worker
+drives the same generation pipeline and the reply lands in
+`engine.chat_messages`, picked up via the history route or Supabase
+Realtime.
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/v2/comp/chat/<session_id>/message/async
+```
+
+| Case | Response |
+|---|---|
+| New message enqueued | `202 {"status":"queued","user_message_id":...}` |
+| Redelivery of a still-pending/claimed `client_msg_id` | `202 {"status":"already_queued",...}` |
+| Redelivery of an already-processed `client_msg_id` | `200 {"status":"already_completed",...}` |
+| Redelivery of a terminally failed `client_msg_id` | `200 {"status":"failed",...}` — retry with a fresh `client_msg_id` |
+| Per-session pending depth over `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
+| Other pre-stream failures | same `StreamPreError` shape and codes as `message/stream` above |
+
+Queue order is strict per-session LIFO — the newest pending message in a
+session is processed first — and every enqueued message eventually gets a
+turn; nothing is coalesced or dropped, only reordered. Worker config
+(`CHAT_QUEUE_*` env vars): see
+[Deploying → Operational notes](deploying.md#operational-notes). Design:
+[async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md).
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
@@ -1253,6 +1286,8 @@ error type. The table below covers the plain shape:
 
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
+- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/.../message/async`)
+- `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
 - `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)
 - `crates/eros-engine-server/src/routes/world_town.rs` — World Town feed and comments (`/world/town/*`)

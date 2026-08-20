@@ -10,8 +10,10 @@ eros-engine 在流式 chat 路由上暴露一个不透明的 OpenRouter 透传�
 
 ## Inbound：请求体的 `audit` 字段
 
-`POST /comp/chat/{session_id}/message/stream` 在必填的 `content` /
-`client_msg_id` 之外，接受可选的 `audit` 对象：
+`POST /comp/chat/{session_id}/message/stream` 与
+`POST /v2/comp/chat/{session_id}/message/async` 在必填的 `content` /
+`client_msg_id` 之外，都接受可选的 `audit` 对象；走 async 端点时，
+该字段随队列传递，由 worker 重新校验：
 
 ```jsonc
 {

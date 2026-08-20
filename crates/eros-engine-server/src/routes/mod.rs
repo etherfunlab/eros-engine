@@ -17,6 +17,7 @@ use crate::state::AppState;
 
 pub mod bff;
 pub mod companion;
+pub mod companion_async;
 pub mod companion_stream;
 pub mod dto;
 pub mod health;
@@ -34,6 +35,7 @@ pub mod world_town;
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let comp = OpenApiRouter::new()
         .merge(companion::router())
+        .merge(companion_async::router())
         .merge(companion_stream::router())
         .merge(voice::router())
         .merge(bff::router())
@@ -52,6 +54,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .merge(health::router())
         .merge(companion::router())
+        .merge(companion_async::router())
         .merge(companion_stream::router())
         .merge(voice::router())
         .merge(bff::router())

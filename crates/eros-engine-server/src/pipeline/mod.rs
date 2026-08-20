@@ -3,6 +3,7 @@
 //! `log_openrouter_usage`) plus the chat / post-process / dreaming
 //! submodules. The streaming chat entry point is `stream::run_stream`.
 
+pub mod chat_queue;
 pub mod dreaming;
 pub mod handlers;
 pub mod post_process;

@@ -398,6 +398,35 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
 
+### `POST /v2/comp/chat/{session_id}/message/async`
+
+只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
+网关、后台发送器）。请求体、字段校验与鉴权/归属/`wrong_channel` 检查都与
+`message/stream` 相同（两边的 `client_msg_id` 都是必填），且这里永远不返回回复内容：后台 worker
+跑同一条生成管线，回复落在 `engine.chat_messages`，从历史接口或 Supabase
+Realtime 读取。
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
+  http://localhost:8080/v2/comp/chat/<session_id>/message/async
+```
+
+| 情形 | 响应 |
+|---|---|
+| 新消息入队 | `202 {"status":"queued","user_message_id":...}` |
+| 重投一个仍在 pending/claimed 的 `client_msg_id` | `202 {"status":"already_queued",...}` |
+| 重投一个已处理的 `client_msg_id` | `200 {"status":"already_completed",...}` |
+| 重投一个终态失败的 `client_msg_id` | `200 {"status":"failed",...}`——换个新 `client_msg_id` 重试 |
+| 单会话待处理深度超过 `CHAT_QUEUE_PENDING_CAP` | `429 rate_limited` |
+| 其余流前失败 | 与 `message/stream` 相同的 `StreamPreError` 形状与错误码 |
+
+队列顺序是严格的单会话 LIFO——会话里最新的待处理消息最先处理——每条入队消息
+最终都会被处理；不会被合并或丢弃，只会被重新排序。Worker 配置
+（`CHAT_QUEUE_*` 环境变量）见
+[部署 → 運維注意事項](deploying.zh.md#運維注意事項)。设计文档：
+[async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md)。
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。
@@ -1112,6 +1141,8 @@ session 403）。
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
+- `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/.../message/async`）
+- `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）
 - `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）
 - `crates/eros-engine-server/src/routes/bff/companion.rs`——BFF `/bff/v1/comp/chat/*`

@@ -32,6 +32,10 @@ pub struct AppState {
     /// operator env-var kill switches for a subsystem that IS configured.
     /// Read by `fetch_stories_context`'s gating.
     pub stories_configured: bool,
+    /// Wake-up for the chat-queue worker: the async endpoint nudges it after a
+    /// successful enqueue so single sends start generating immediately instead
+    /// of waiting out a poll tick (spec §6 Wake-up).
+    pub chat_queue_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -213,6 +217,67 @@ pub(crate) fn parse_world_config(
     }
 }
 
+/// Knobs for the async chat-turn queue worker (spec
+/// docs/superpowers/specs/2026-08-20-async-chat-endpoint-design.md §6).
+/// Defaults: enabled, 5s poll tick, 4-way concurrency, 300s stale-claim
+/// threshold, 3 max attempts before a turn goes terminally `failed`, a
+/// 20-deep per-session pending cap, and a 300s per-turn generation timeout.
+/// `pending_cap` is read by the v2 async endpoint's depth check; the rest
+/// are consumed by `pipeline::chat_queue::worker`.
+#[derive(Clone, Debug)]
+pub struct ChatQueueConfig {
+    pub disabled: bool,
+    pub tick: Duration,
+    pub concurrency: usize,
+    pub claim_stale: Duration,
+    pub max_attempts: i32,
+    pub pending_cap: i64,
+    pub generation_timeout: Duration,
+}
+
+/// Pure parser for the seven `CHAT_QUEUE_*` env vars. Mirrors
+/// `parse_world_config`'s style: the boolean accepts "1"/"true", and every
+/// numeric knob falls back to its default on a missing or unparsable value —
+/// a garbage env var must degrade to the default, never poison the field.
+pub(crate) fn parse_chat_queue_config(
+    disabled_raw: Option<&str>,
+    tick_raw: Option<&str>,
+    concurrency_raw: Option<&str>,
+    claim_stale_raw: Option<&str>,
+    max_attempts_raw: Option<&str>,
+    pending_cap_raw: Option<&str>,
+    generation_timeout_raw: Option<&str>,
+) -> ChatQueueConfig {
+    let flag = |raw: Option<&str>| raw.map(|v| v == "1" || v == "true").unwrap_or(false);
+    // Zero/negative values fall back to defaults, like unparseable ones:
+    // tick=0 panics tokio's interval, max_attempts<=0 makes the first failure
+    // terminal, pending_cap<=0 rejects every enqueue, and a zero timeout or
+    // stale window flails. Concurrency 0 stays meaningful (claim nothing —
+    // the reap-only kill switch).
+    let secs = |raw: Option<&str>, default: u64| {
+        Duration::from_secs(
+            raw.and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v >= 1)
+                .unwrap_or(default),
+        )
+    };
+    ChatQueueConfig {
+        disabled: flag(disabled_raw),
+        tick: secs(tick_raw, 5),
+        concurrency: concurrency_raw.and_then(|v| v.parse().ok()).unwrap_or(4),
+        claim_stale: secs(claim_stale_raw, 300),
+        max_attempts: max_attempts_raw
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(3),
+        pending_cap: pending_cap_raw
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(20),
+        generation_timeout: secs(generation_timeout_raw, 300),
+    }
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -320,6 +385,8 @@ pub struct ServerConfig {
     pub chat_echo_cancellation_disabled: bool,
     /// World memories subsystem configuration.
     pub world: WorldConfig,
+    /// Async chat-turn queue worker configuration (`CHAT_QUEUE_*` env vars).
+    pub chat_queue: ChatQueueConfig,
 }
 
 impl ServerConfig {
@@ -382,6 +449,15 @@ impl ServerConfig {
                     .ok()
                     .as_deref(),
                 std::env::var("WORLD_TICK_SECS").ok().as_deref(),
+            ),
+            chat_queue: parse_chat_queue_config(
+                std::env::var("CHAT_QUEUE_DISABLED").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_TICK_SECS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_CONCURRENCY").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_CLAIM_STALE_SECS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_MAX_ATTEMPTS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_PENDING_CAP").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_GEN_TIMEOUT_SECS").ok().as_deref(),
             ),
         }
     }
@@ -657,6 +733,74 @@ mod tests {
         let c = parse_world_config(None, None, None, Some("yes"), Some("0"), None);
         assert!(!c.stories_disabled, "only 1/true count");
         assert!(!c.stories_prompt_disabled);
+    }
+
+    #[test]
+    fn chat_queue_config_defaults_when_env_unset() {
+        let c = parse_chat_queue_config(None, None, None, None, None, None, None);
+        assert!(!c.disabled);
+        assert_eq!(c.tick, Duration::from_secs(5));
+        assert_eq!(c.concurrency, 4);
+        assert_eq!(c.claim_stale, Duration::from_secs(300));
+        assert_eq!(c.max_attempts, 3);
+        assert_eq!(c.pending_cap, 20);
+        assert_eq!(c.generation_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn chat_queue_config_honours_overrides_and_rejects_garbage() {
+        let c = parse_chat_queue_config(
+            Some("1"),
+            Some("30"),
+            Some("8"),
+            Some("600"),
+            Some("5"),
+            Some("50"),
+            Some("120"),
+        );
+        assert!(c.disabled);
+        assert_eq!(c.tick, Duration::from_secs(30));
+        assert_eq!(c.concurrency, 8);
+        assert_eq!(c.claim_stale, Duration::from_secs(600));
+        assert_eq!(c.max_attempts, 5);
+        assert_eq!(c.pending_cap, 50);
+        assert_eq!(c.generation_timeout, Duration::from_secs(120));
+        let g = parse_chat_queue_config(
+            None,
+            Some("abc"),
+            Some("-1"),
+            Some(""),
+            Some("zero"),
+            Some("x"),
+            Some("y"),
+        );
+        assert_eq!(g.tick, Duration::from_secs(5), "garbage keeps default");
+        assert_eq!(g.concurrency, 4);
+        assert_eq!(g.claim_stale, Duration::from_secs(300));
+        assert_eq!(g.max_attempts, 3);
+        assert_eq!(g.pending_cap, 20);
+        assert_eq!(g.generation_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn chat_queue_config_zero_and_negative_fall_back_except_concurrency() {
+        // tick=0 would panic tokio's interval; max_attempts/pending_cap <= 0
+        // would make the first failure terminal / reject every enqueue.
+        let z = parse_chat_queue_config(
+            None,
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("-1"),
+            Some("0"),
+            Some("0"),
+        );
+        assert_eq!(z.tick, Duration::from_secs(5));
+        assert_eq!(z.concurrency, 0, "0 = claim nothing, the reap-only switch");
+        assert_eq!(z.claim_stale, Duration::from_secs(300));
+        assert_eq!(z.max_attempts, 3);
+        assert_eq!(z.pending_cap, 20);
+        assert_eq!(z.generation_timeout, Duration::from_secs(300));
     }
 
     #[test]

@@ -11,8 +11,10 @@ metadata semantics are the caller's responsibility.
 
 ## Inbound: the `audit` request field
 
-`POST /comp/chat/{session_id}/message/stream` accepts an optional `audit`
-object alongside the required `content` / `client_msg_id`:
+`POST /comp/chat/{session_id}/message/stream` and
+`POST /v2/comp/chat/{session_id}/message/async` both accept an optional
+`audit` object alongside the required `content` / `client_msg_id` — on the
+async endpoint the field rides the queue and is re-validated in the worker:
 
 ```jsonc
 {
