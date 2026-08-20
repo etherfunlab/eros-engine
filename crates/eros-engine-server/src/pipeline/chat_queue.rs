@@ -1047,8 +1047,16 @@ data: [DONE]\n\n";
             frames.push(f);
         }
         // The PDE ghost arm (stream.rs ActionType::Ghost) yields Meta → Done →
-        // final, same as a reply — so BOTH branches produce a Done and the
-        // assertion below must not be conditional on which one PDE picked.
+        // final, same as a reply — so BOTH branches produce a Meta and a Done
+        // and the assertions below must not be conditional on which one PDE
+        // picked. Asserting both frame kinds pins "every frame is forwarded",
+        // not just the tally-relevant ones.
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, ProtocolFrame::Meta { .. })),
+            "the turn's Meta frame must reach the tap; got {frames:?}"
+        );
         assert!(
             frames.iter().any(|f| matches!(f, ProtocolFrame::Done { .. })),
             "every completed turn (reply or ghost) surfaces its Done through the tap; got {frames:?}"
