@@ -726,6 +726,53 @@ mod tests {
     }
 
     #[test]
+    fn chat_queue_config_defaults_when_env_unset() {
+        let c = parse_chat_queue_config(None, None, None, None, None, None, None);
+        assert!(!c.disabled);
+        assert_eq!(c.tick, Duration::from_secs(5));
+        assert_eq!(c.concurrency, 4);
+        assert_eq!(c.claim_stale, Duration::from_secs(300));
+        assert_eq!(c.max_attempts, 3);
+        assert_eq!(c.pending_cap, 20);
+        assert_eq!(c.generation_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn chat_queue_config_honours_overrides_and_rejects_garbage() {
+        let c = parse_chat_queue_config(
+            Some("1"),
+            Some("30"),
+            Some("8"),
+            Some("600"),
+            Some("5"),
+            Some("50"),
+            Some("120"),
+        );
+        assert!(c.disabled);
+        assert_eq!(c.tick, Duration::from_secs(30));
+        assert_eq!(c.concurrency, 8);
+        assert_eq!(c.claim_stale, Duration::from_secs(600));
+        assert_eq!(c.max_attempts, 5);
+        assert_eq!(c.pending_cap, 50);
+        assert_eq!(c.generation_timeout, Duration::from_secs(120));
+        let g = parse_chat_queue_config(
+            None,
+            Some("abc"),
+            Some("-1"),
+            Some(""),
+            Some("zero"),
+            Some("x"),
+            Some("y"),
+        );
+        assert_eq!(g.tick, Duration::from_secs(5), "garbage keeps default");
+        assert_eq!(g.concurrency, 4);
+        assert_eq!(g.claim_stale, Duration::from_secs(300));
+        assert_eq!(g.max_attempts, 3);
+        assert_eq!(g.pending_cap, 20);
+        assert_eq!(g.generation_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
     fn bool_flag_accepts_one_and_true() {
         assert!(parse_bool_flag(Some("1")));
         assert!(parse_bool_flag(Some("true")));

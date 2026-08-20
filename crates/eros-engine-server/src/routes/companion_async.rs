@@ -393,6 +393,56 @@ mod tests {
         assert_eq!(body["user_message_id"], json!(user_msg_id.to_string()));
     }
 
+    // Test 4: per-session pending cap → the first `pending_cap` distinct
+    // turns enqueue (202), the next one 429s {"code":"rate_limited"} and
+    // persists no chat_messages row for the rejected client_msg_id.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn async_429_when_pending_cap_reached(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let mut state = test_state(pool.clone());
+        state.config.chat_queue.pending_cap = 2;
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        for n in 1..=2 {
+            let client_msg_id = format!("01JV00000000000000000001{n}A");
+            let (status, body) = post_json(
+                &mut app,
+                &async_uri(session_id),
+                &token,
+                json!({"content": format!("turn {n}"), "client_msg_id": client_msg_id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "turn {n} body: {body}");
+            assert_eq!(body["status"], "queued");
+        }
+
+        let rejected_client_msg_id = "01JV000000000000000000013A";
+        let (status, body) = post_json(
+            &mut app,
+            &async_uri(session_id),
+            &token,
+            json!({"content":"one too many","client_msg_id": rejected_client_msg_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+        assert_eq!(body["code"], "rate_limited");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE session_id = $1 AND client_msg_id = $2",
+        )
+        .bind(session_id)
+        .bind(rejected_client_msg_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "depth-capped turn must not persist a message row");
+    }
+
     // Test 5: voice-channel session → 409 {"code":"wrong_channel"}, nothing
     // persisted.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
