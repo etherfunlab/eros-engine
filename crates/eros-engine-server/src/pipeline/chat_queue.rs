@@ -124,6 +124,16 @@ pub(crate) async fn drain_once(
 /// role='system_error', the role the old async path once produced.
 const FAILURE_NOTICE: &str = "AI 回复失败，请稍后再试";
 
+/// Who is settling decides what a failure means (spec §6): the worker ladder
+/// retries up to max_attempts; a handler-driven stream turn gets exactly one
+/// attempt — its user saw the Error frame and will resend, so a background
+/// retry would race that resend into a double reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleMode {
+    Ladder,
+    TerminalOnFailure,
+}
+
 async fn process_turn(state: AppState, turn: ClaimedTurn) {
     let cfg = state.config.chat_queue.clone();
     let outcome =
@@ -131,7 +141,7 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
             Ok(o) => o,
             Err(_) => TurnOutcome::Failure("generation timeout".into()),
         };
-    settle_turn(&state, &turn, outcome).await;
+    settle_turn(&state, &turn, outcome, SettleMode::Ladder).await;
     // This session may have a next stacked turn — wake the loop now rather
     // than waiting out a tick.
     state.chat_queue_notify.notify_one();
@@ -143,13 +153,20 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
 /// marking that turn `failed` would pair a served reply with a spurious
 /// `system_error` row. A guard error falls through to the failure path — the
 /// pre-fix behavior.
-pub(crate) async fn settle_turn(state: &AppState, turn: &ClaimedTurn, outcome: TurnOutcome) {
+pub(crate) async fn settle_turn(
+    state: &AppState,
+    turn: &ClaimedTurn,
+    outcome: TurnOutcome,
+    mode: SettleMode,
+) {
     let cfg = &state.config.chat_queue;
     let repo = ChatQueueRepo { pool: &state.pool };
     let res = match outcome {
         TurnOutcome::Success => repo.mark_done(turn.queue_id).await,
         TurnOutcome::Failure(msg) => {
-            if turn.attempts >= cfg.max_attempts {
+            let terminal =
+                mode == SettleMode::TerminalOnFailure || turn.attempts >= cfg.max_attempts;
+            if terminal {
                 if matches!(
                     turn_already_served(state, turn.user_message_id).await,
                     Ok(true)
@@ -898,6 +915,7 @@ data: [DONE]\n\n";
             &state,
             &turn,
             TurnOutcome::Failure("generation timeout".into()),
+            SettleMode::Ladder,
         )
         .await;
 
@@ -923,7 +941,13 @@ data: [DONE]\n\n";
     async fn terminal_failure_without_reply_goes_failed_with_one_notice(pool: PgPool) {
         let (state, turn) = seed_final_attempt_turn(&pool).await;
 
-        settle_turn(&state, &turn, TurnOutcome::Failure("upstream 500".into())).await;
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::Ladder,
+        )
+        .await;
 
         let (status, last_error): (String, Option<String>) =
             sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
@@ -1079,5 +1103,98 @@ data: [DONE]\n\n";
             assistant > 0 || ghosted,
             "the turn must complete (reply or ghost) with nobody listening"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_mode_fails_a_first_attempt_failure(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1; // far below max — the mode, not the ladder, decides
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::TerminalOnFailure,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed", "stream turns get exactly one attempt");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ladder_mode_still_releases_a_first_attempt_failure(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1;
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("upstream 500".into()),
+            SettleMode::Ladder,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "the worker ladder still retries");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn terminal_mode_respects_the_served_guard(pool: PgPool) {
+        let (state, mut turn) = seed_final_attempt_turn(&pool).await;
+        turn.attempts = 1;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id) \
+             VALUES ($1, 'assistant', 'already served', $2)",
+        )
+        .bind(turn.session_id)
+        .bind(turn.user_message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_turn(
+            &state,
+            &turn,
+            TurnOutcome::Failure("generation timeout".into()),
+            SettleMode::TerminalOnFailure,
+        )
+        .await;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(turn.queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(turn.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 0);
     }
 }
