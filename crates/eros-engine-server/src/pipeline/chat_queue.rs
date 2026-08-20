@@ -208,6 +208,36 @@ async fn turn_already_served(state: &AppState, user_message_id: Uuid) -> Result<
     .await
 }
 
+/// Drive `run_stream` to exhaustion for an already-built turn: tally the
+/// Done/Error frames, forward every frame to the optional tap, classify.
+/// The worker's `drive_turn` rebuilds its turn from the queue row and
+/// delegates here; the stream handler calls this directly with what the
+/// request already resolved — no extra DB round trips (spec §9 PR B).
+pub(crate) async fn drive_to_exhaustion(
+    state: Arc<AppState>,
+    user_msg: PersistedUserMessage,
+    persona: Option<eros_engine_core::persona::CompanionPersona>,
+    tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
+) -> TurnOutcome {
+    let stream = run_stream(state, user_msg, persona);
+    futures_util::pin_mut!(stream);
+    let mut done_frames = 0usize;
+    let mut last_error: Option<String> = None;
+    while let Some(frame) = stream.next().await {
+        match &frame {
+            ProtocolFrame::Done { .. } => done_frames += 1,
+            ProtocolFrame::Error { message, .. } => last_error = Some(message.clone()),
+            _ => {}
+        }
+        // The tap is an observer: a dropped receiver (client gone) must
+        // never stop or slow the drive (spec §3).
+        if let Some(tx) = &tap {
+            let _ = tx.send(frame);
+        }
+    }
+    classify_outcome(done_frames, last_error)
+}
+
 /// Rebuild the turn from the queue row + message row and drive `run_stream`
 /// to exhaustion, forwarding every frame to the optional tap (frames are
 /// discarded when no tap is attached). Persistence, PDE, filters, ghosting
@@ -317,23 +347,7 @@ async fn drive_turn(
         history_anchor,
     };
 
-    let stream = run_stream(Arc::new(state.clone()), user_msg, None);
-    futures_util::pin_mut!(stream);
-    let mut done_frames = 0usize;
-    let mut last_error: Option<String> = None;
-    while let Some(frame) = stream.next().await {
-        match &frame {
-            ProtocolFrame::Done { .. } => done_frames += 1,
-            ProtocolFrame::Error { message, .. } => last_error = Some(message.clone()),
-            _ => {}
-        }
-        // The tap is an observer: a dropped receiver (client gone) must
-        // never stop or slow the drive (spec §3).
-        if let Some(tx) = &tap {
-            let _ = tx.send(frame);
-        }
-    }
-    classify_outcome(done_frames, last_error)
+    drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap).await
 }
 
 #[cfg(test)]
