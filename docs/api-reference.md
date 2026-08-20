@@ -464,9 +464,9 @@ receives `image_request` and calls its own image vendor.
 
 Enqueue-only chat turn — the async alternative to the stream endpoint above,
 for callers that cannot hold an SSE connection open (bot gateways, background
-senders). Same body (`StreamSendRequest`) and the same
-auth/ownership/`wrong_channel` checks as `message/stream`, but `client_msg_id`
-is **required**, and no reply is ever returned here: a background worker
+senders). Same body (`StreamSendRequest`) and the same validation and
+auth/ownership/`wrong_channel` checks as `message/stream` (`client_msg_id` is
+required on both), and no reply is ever returned here: a background worker
 drives the same generation pipeline and the reply lands in
 `engine.chat_messages`, picked up via the history route or Supabase
 Realtime.

@@ -110,7 +110,7 @@ pub(crate) async fn drain_once(
 async fn write_failure_row(state: &AppState, session_id: Uuid) {
     let chat_repo = ChatRepo { pool: &state.pool };
     if let Err(e) = chat_repo
-        .append_message(session_id, "system_error", "AI reply failed")
+        .append_message(session_id, "system_error", "AI 回复失败，请稍后再试")
         .await
     {
         tracing::warn!(%session_id, "chat-queue: system_error row write failed: {e}");
@@ -195,11 +195,18 @@ async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
         return TurnOutcome::Failure("user message or instance_id missing".into());
     };
 
-    let params: QueuedTurnParams = turn
-        .params
-        .clone()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+    // A malformed blob silently re-drives a gift / image turn as plain text,
+    // so say so in the log rather than swallowing the error.
+    let params: QueuedTurnParams = match turn.params.clone() {
+        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
+            tracing::warn!(
+                queue_id = %turn.queue_id,
+                "chat-queue: unreadable params blob, driving as a plain turn: {e}"
+            );
+            QueuedTurnParams::default()
+        }),
+        None => QueuedTurnParams::default(),
+    };
     // Re-run the pure validators the endpoint already ran; they cannot fail
     // here on rows the endpoint accepted, and a defensive failure just means
     // empty traits / no audit.

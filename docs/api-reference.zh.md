@@ -401,8 +401,8 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 ### `POST /v2/comp/chat/{session_id}/message/async`
 
 只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
-网关、后台发送器）。请求体与鉴权/归属/`wrong_channel` 检查都与 `message/stream`
-相同，但 `client_msg_id` 是**必填**的，且这里永远不返回回复内容：后台 worker
+网关、后台发送器）。请求体、字段校验与鉴权/归属/`wrong_channel` 检查都与
+`message/stream` 相同（两边的 `client_msg_id` 都是必填），且这里永远不返回回复内容：后台 worker
 跑同一条生成管线，回复落在 `engine.chat_messages`，从历史接口或 Supabase
 Realtime 读取。
 
