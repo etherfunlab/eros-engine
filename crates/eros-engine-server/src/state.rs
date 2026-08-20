@@ -32,6 +32,10 @@ pub struct AppState {
     /// operator env-var kill switches for a subsystem that IS configured.
     /// Read by `fetch_stories_context`'s gating.
     pub stories_configured: bool,
+    /// Wake-up for the chat-queue worker: the async endpoint nudges it after a
+    /// successful enqueue so single sends start generating immediately instead
+    /// of waiting out a poll tick (spec §6 Wake-up).
+    pub chat_queue_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Parse `OPENROUTER_USAGE_HIDDEN_KEYS` into a `HashSet<String>`.
@@ -213,6 +217,57 @@ pub(crate) fn parse_world_config(
     }
 }
 
+/// Knobs for the async chat-turn queue worker (spec
+/// docs/superpowers/specs/2026-08-20-async-chat-endpoint-design.md §6).
+/// Defaults: enabled, 5s poll tick, 4-way concurrency, 300s stale-claim
+/// threshold, 3 max attempts before a turn goes terminally `failed`, a
+/// 20-deep per-session pending cap, and a 300s per-turn generation timeout.
+/// Only `pending_cap` is read yet (by the v2 async endpoint's depth check);
+/// the rest are consumed by the worker sweeper landing in a later task —
+/// `#[allow(dead_code)]` is transitional, not a design call.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ChatQueueConfig {
+    pub disabled: bool,
+    pub tick: Duration,
+    pub concurrency: usize,
+    pub claim_stale: Duration,
+    pub max_attempts: i32,
+    pub pending_cap: i64,
+    pub generation_timeout: Duration,
+}
+
+/// Pure parser for the seven `CHAT_QUEUE_*` env vars. Mirrors
+/// `parse_world_config`'s style: the boolean accepts "1"/"true", and every
+/// numeric knob falls back to its default on a missing or unparsable value —
+/// a garbage env var must degrade to the default, never poison the field.
+pub(crate) fn parse_chat_queue_config(
+    disabled_raw: Option<&str>,
+    tick_raw: Option<&str>,
+    concurrency_raw: Option<&str>,
+    claim_stale_raw: Option<&str>,
+    max_attempts_raw: Option<&str>,
+    pending_cap_raw: Option<&str>,
+    generation_timeout_raw: Option<&str>,
+) -> ChatQueueConfig {
+    let flag = |raw: Option<&str>| raw.map(|v| v == "1" || v == "true").unwrap_or(false);
+    ChatQueueConfig {
+        disabled: flag(disabled_raw),
+        tick: Duration::from_secs(tick_raw.and_then(|v| v.parse().ok()).unwrap_or(5)),
+        concurrency: concurrency_raw.and_then(|v| v.parse().ok()).unwrap_or(4),
+        claim_stale: Duration::from_secs(
+            claim_stale_raw.and_then(|v| v.parse().ok()).unwrap_or(300),
+        ),
+        max_attempts: max_attempts_raw.and_then(|v| v.parse().ok()).unwrap_or(3),
+        pending_cap: pending_cap_raw.and_then(|v| v.parse().ok()).unwrap_or(20),
+        generation_timeout: Duration::from_secs(
+            generation_timeout_raw
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        ),
+    }
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -320,6 +375,8 @@ pub struct ServerConfig {
     pub chat_echo_cancellation_disabled: bool,
     /// World memories subsystem configuration.
     pub world: WorldConfig,
+    /// Async chat-turn queue worker configuration (`CHAT_QUEUE_*` env vars).
+    pub chat_queue: ChatQueueConfig,
 }
 
 impl ServerConfig {
@@ -382,6 +439,15 @@ impl ServerConfig {
                     .ok()
                     .as_deref(),
                 std::env::var("WORLD_TICK_SECS").ok().as_deref(),
+            ),
+            chat_queue: parse_chat_queue_config(
+                std::env::var("CHAT_QUEUE_DISABLED").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_TICK_SECS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_CONCURRENCY").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_CLAIM_STALE_SECS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_MAX_ATTEMPTS").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_PENDING_CAP").ok().as_deref(),
+                std::env::var("CHAT_QUEUE_GEN_TIMEOUT_SECS").ok().as_deref(),
             ),
         }
     }

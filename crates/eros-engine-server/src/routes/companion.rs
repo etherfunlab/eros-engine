@@ -357,7 +357,7 @@ impl From<&AffinityDeltasDto> for AffinityDeltas {
 }
 
 /// Caller-supplied prompt-injection fragment. See `docs/prompt-traits.md`.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PromptTraitDto {
     /// ASCII identifier, regex `^[a-z0-9_]{1,32}$`. Used for logging.
     pub tag: String,
@@ -368,7 +368,7 @@ pub struct PromptTraitDto {
 
 /// Caller-supplied OpenRouter audit passthrough. All three fields are
 /// optional; engine never inspects content. See `docs/llm-audit.md`.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LlmAuditDto {
     /// Free-form caller identifier (recommended: hash of internal user id).
     /// `chars ≤ 256`. Forwarded as OpenRouter wire `user`.
@@ -1030,6 +1030,9 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
             // Echo cancellation ON in tests — matches the production default.
             chat_echo_cancellation_disabled: false,
             world: crate::state::parse_world_config(None, None, None, None, None, None),
+            chat_queue: crate::state::parse_chat_queue_config(
+                None, None, None, None, None, None, None,
+            ),
         },
         openrouter: Arc::new(eros_engine_llm::openrouter::OpenRouterClient::new(
             "stub".into(),
@@ -1046,6 +1049,7 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
         stream_slots: std::sync::Arc::new(crate::state::StreamSlots::default()),
         world_configured: false,
         stories_configured: false,
+        chat_queue_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     }
 }
 

@@ -375,6 +375,7 @@ async fn run_server() -> Result<()> {
         stream_slots: Arc::new(crate::state::StreamSlots::default()),
         world_configured,
         stories_configured,
+        chat_queue_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Compose the OpenAPI-aware router. routes::router applies the auth
