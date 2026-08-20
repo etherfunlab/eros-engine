@@ -127,7 +127,7 @@ const FAILURE_NOTICE: &str = "AI 回复失败，请稍后再试";
 async fn process_turn(state: AppState, turn: ClaimedTurn) {
     let cfg = state.config.chat_queue.clone();
     let outcome =
-        match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn)).await {
+        match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn, None)).await {
             Ok(o) => o,
             Err(_) => TurnOutcome::Failure("generation timeout".into()),
         };
@@ -192,7 +192,11 @@ async fn turn_already_served(state: &AppState, user_message_id: Uuid) -> Result<
 /// Rebuild the turn from the queue row + message row and drive `run_stream`
 /// to exhaustion, discarding frames. Persistence, PDE, filters, ghosting and
 /// post-process all live inside the generator already (spec §6 Execution).
-async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
+async fn drive_turn(
+    state: &AppState,
+    turn: &ClaimedTurn,
+    tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
+) -> TurnOutcome {
     let chat_repo = ChatRepo { pool: &state.pool };
 
     // Replay guard. `run_stream` has none of its own — the stream path's guard
@@ -297,10 +301,15 @@ async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
     let mut done_frames = 0usize;
     let mut last_error: Option<String> = None;
     while let Some(frame) = stream.next().await {
-        match frame {
+        match &frame {
             ProtocolFrame::Done { .. } => done_frames += 1,
-            ProtocolFrame::Error { message, .. } => last_error = Some(message),
+            ProtocolFrame::Error { message, .. } => last_error = Some(message.clone()),
             _ => {}
+        }
+        // The tap is an observer: a dropped receiver (client gone) must
+        // never stop or slow the drive (spec §3).
+        if let Some(tx) = &tap {
+            let _ = tx.send(frame);
         }
     }
     classify_outcome(done_frames, last_error)
@@ -933,5 +942,142 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(notices, vec![FAILURE_NOTICE.to_string()]);
+    }
+
+    /// Happy-path mock + session + enqueued turn, ready to drive. Returns the
+    /// MockServer too — dropping it would kill the mock endpoint mid-drive.
+    async fn seed_driveable_turn(
+        pool: &PgPool,
+        client_msg_id: &str,
+    ) -> (crate::state::AppState, MockServer, Uuid) {
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" back\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4},\"id\":\"gen-q\",\"model\":\"primary\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let repo = ChatQueueRepo { pool };
+        let EnqueueOutcome::Queued {
+            user_message_id, ..
+        } = repo
+            .enqueue_user_message(
+                session_id,
+                "hi",
+                client_msg_id,
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+        (state, mock, user_message_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drive_tap_receives_the_frame_stream(pool: PgPool) {
+        let (state, _mock, user_message_id) =
+            seed_driveable_turn(&pool, "01JW00000000000000000000T1").await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let turn = repo.claim_next().await.unwrap().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        assert!(matches!(outcome, TurnOutcome::Success));
+
+        let mut frames = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            frames.push(f);
+        }
+        // Same PDE tolerance as drain_once_serves_an_enqueued_turn: a reply
+        // turn must surface its Done through the tap; a ghosted turn has no
+        // Done to surface.
+        let assistant: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if assistant > 0 {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| matches!(f, ProtocolFrame::Done { .. })),
+                "a served reply's Done frame must reach the tap; got {frames:?}"
+            );
+        } else {
+            let ghosted: bool =
+                sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                    .bind(user_message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(ghosted, "no reply and no ghost — the drive lost the turn");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drive_survives_a_dropped_tap(pool: PgPool) {
+        let (state, _mock, user_message_id) =
+            seed_driveable_turn(&pool, "01JW00000000000000000000T2").await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let turn = repo.claim_next().await.unwrap().unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProtocolFrame>();
+        drop(rx); // client disconnected before the first frame
+        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        assert!(
+            matches!(outcome, TurnOutcome::Success),
+            "a dead tap must not stop the drive"
+        );
+        let assistant: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ghosted: bool =
+            sqlx::query_scalar("SELECT ghost_decision FROM engine.chat_messages WHERE id = $1")
+                .bind(user_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            assistant > 0 || ghosted,
+            "the turn must complete (reply or ghost) with nobody listening"
+        );
     }
 }
