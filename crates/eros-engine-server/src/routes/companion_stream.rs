@@ -25,7 +25,9 @@ use eros_engine_store::persona::PersonaRepo;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, StreamPreError};
-use crate::pipeline::stream::{replay_stream, PersistedUserMessage, ProtocolFrame};
+use crate::pipeline::stream::{
+    replay_stream, PersistedUserMessage, ProtocolFrame, StreamErrorCode,
+};
 use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
@@ -633,6 +635,15 @@ pub async fn send_message_stream(
                 let guard = guard.take();
                 tokio::spawn(async move {
                     let _guard = guard;
+                    // Kept alive for the rest of this task so the mpsc
+                    // channel does not close the instant `drive_to_exhaustion`
+                    // (and its own `tx`) is dropped on the timeout arm below —
+                    // that would end the SSE body on bare EOF, indistinguishable
+                    // from success, even though a `system_error` row lands in
+                    // history. Sending the terminal Error frame through this
+                    // clone first means it reaches the body before the channel
+                    // actually closes.
+                    let timeout_tx = tx.clone();
                     let outcome = match tokio::time::timeout(
                         drive_state.config.chat_queue.generation_timeout,
                         crate::pipeline::chat_queue::drive_to_exhaustion(
@@ -645,9 +656,19 @@ pub async fn send_message_stream(
                     .await
                     {
                         Ok(o) => o,
-                        Err(_) => crate::pipeline::chat_queue::TurnOutcome::Failure(
-                            "generation timeout".into(),
-                        ),
+                        Err(_) => {
+                            let _ = timeout_tx.send(ProtocolFrame::Error {
+                                code: StreamErrorCode::GenerationTimeout,
+                                retryable: true,
+                                message: "generation timeout".into(),
+                                user_message: "生成超时，请稍后再试".into(),
+                                upstream_status: None,
+                                provider_code: None,
+                            });
+                            crate::pipeline::chat_queue::TurnOutcome::Failure(
+                                "generation timeout".into(),
+                            )
+                        }
                     };
                     crate::pipeline::chat_queue::settle_turn(
                         &drive_state,
@@ -916,9 +937,25 @@ data: [DONE]\n\n";
             .unwrap();
         let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        // Consume the response body to completion, as the existing
-        // happy-path stream test does.
-        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        // Capture the body (rather than discard it) and assert the frame
+        // sequence: without this, nothing in the suite proves frames survive
+        // the mpsc hop into the SSE body — a tap forward regressed to a
+        // no-op would stay green.
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&body).unwrap();
+        let meta_at = body_text
+            .find("\"type\":\"meta\"")
+            .expect("meta frame reaches the SSE body");
+        let done_at = body_text
+            .find("\"type\":\"done\"")
+            .expect("done frame reaches the SSE body");
+        let final_at = body_text
+            .find("\"type\":\"final\"")
+            .expect("final frame reaches the SSE body");
+        assert!(
+            meta_at < done_at && done_at < final_at,
+            "frame order preserved through the tap"
+        );
 
         // The detached drive task's settle_turn() write races the SSE body's
         // completion: the tap channel closes (ending the body) the instant
@@ -955,6 +992,107 @@ data: [DONE]\n\n";
             attempts, 1,
             "born claimed: the handler drive is the only attempt"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn generation_timeout_surfaces_terminal_error_frame(pool: PgPool) {
+        // Proves the detached task's timeout arm no longer ends the SSE body
+        // on bare EOF (indistinguishable from success) while a system_error
+        // row lands in history — it now sends a terminal Error frame through
+        // a held-open sender clone before settling the turn.
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream")
+                    // 10s comfortably outlasts the 100ms generation_timeout
+                    // below no matter how much setup work runs first — the
+                    // timeout arm always wins this race.
+                    .set_delay(std::time::Duration::from_secs(10)),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let chat_repo = ChatRepo { pool: &pool };
+        let session_id = chat_repo
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        // Shrink the whole-turn wall-clock budget so the detached task's
+        // timeout arm fires long before the mock's 10s delayed response.
+        state.config.chat_queue.generation_timeout = std::time::Duration::from_millis(100);
+        let mut app = build_router(state);
+        let token = mint_jwt(user_id);
+        let body = serde_json::to_vec(&json!({
+            "content": "hi",
+            "client_msg_id": "01J4444444444444444444444T"
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/comp/chat/{session_id}/message/stream"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body_text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body_text.contains("\"type\":\"error\""),
+            "no error frame in body: {body_text}"
+        );
+        assert!(
+            body_text.contains("generation timeout"),
+            "error frame missing timeout message: {body_text}"
+        );
+        assert!(
+            body_text.contains("\"code\":\"generation_timeout\""),
+            "error frame missing generation_timeout code: {body_text}"
+        );
+
+        let queue_id: Uuid = sqlx::query_scalar(
+            "SELECT q.id FROM engine.chat_turn_queue q \
+             JOIN engine.chat_messages m ON m.id = q.user_message_id \
+             WHERE m.session_id = $1 AND m.client_msg_id = '01J4444444444444444444444T'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status = wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+        assert_eq!(
+            status, "failed",
+            "a timed-out turn goes terminal, not silently done"
+        );
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'system_error'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1, "terminal timeout leaves exactly one signal row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
