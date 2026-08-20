@@ -651,6 +651,79 @@ pub enum VoiceUserInsert {
     Duplicate(Uuid),
 }
 
+/// Core of `upsert_user_message_idempotent`, callable inside a caller-owned
+/// transaction so the async enqueue path can add a queue row atomically.
+/// Does NOT begin or commit — the caller owns the transaction boundary.
+pub(crate) async fn upsert_user_message_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: Uuid,
+    content: &str,
+    client_msg_id: &str,
+    role: &str,
+    metadata: Option<&serde_json::Value>,
+) -> Result<UpsertUserOutcome, sqlx::Error> {
+    // Widened role filter: tip path writes 'gift_user', and idempotency is
+    // keyed on (session_id, client_msg_id) regardless of which user-side
+    // role was originally persisted.
+    let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
+        "SELECT * FROM engine.chat_messages \
+         WHERE session_id = $1 AND client_msg_id = $2 \
+           AND role IN ('user', 'gift_user') \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(client_msg_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some(row) = existing {
+        let assistant_chain: Vec<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant' \
+             ORDER BY sent_at ASC",
+        )
+        .bind(row.id)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        return Ok(if !assistant_chain.is_empty() {
+            UpsertUserOutcome::Replay {
+                user_message_id: row.id,
+                ghost: false,
+                assistant_chain,
+            }
+        } else if row.ghost_decision {
+            UpsertUserOutcome::Replay {
+                user_message_id: row.id,
+                ghost: true,
+                assistant_chain: vec![],
+            }
+        } else {
+            UpsertUserOutcome::DuplicateInProgress {
+                user_message_id: row.id,
+            }
+        });
+    }
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO engine.chat_messages \
+             (session_id, role, content, client_msg_id, metadata) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(session_id)
+    .bind(role)
+    .bind(content)
+    .bind(client_msg_id)
+    .bind(metadata)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(UpsertUserOutcome::Inserted { message_id: id })
+}
+
 impl<'a> ChatRepo<'a> {
     /// Insert a user message keyed by `client_msg_id` with permanent
     /// idempotency. The partial unique index on `(session_id, client_msg_id)`
@@ -669,70 +742,11 @@ impl<'a> ChatRepo<'a> {
         metadata: Option<&serde_json::Value>,
     ) -> Result<UpsertUserOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-
-        // Widened role filter: tip path writes 'gift_user', and idempotency is
-        // keyed on (session_id, client_msg_id) regardless of which user-side
-        // role was originally persisted.
-        let existing: Option<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-            "SELECT * FROM engine.chat_messages \
-             WHERE session_id = $1 AND client_msg_id = $2 \
-               AND role IN ('user', 'gift_user') \
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(client_msg_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(row) = existing {
-            let assistant_chain: Vec<ChatMessage> = sqlx::query_as::<_, ChatMessage>(
-                "SELECT * FROM engine.chat_messages \
-                 WHERE user_message_id = $1 AND role = 'assistant' \
-                 ORDER BY sent_at ASC",
-            )
-            .bind(row.id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-
-            return Ok(if !assistant_chain.is_empty() {
-                UpsertUserOutcome::Replay {
-                    user_message_id: row.id,
-                    ghost: false,
-                    assistant_chain,
-                }
-            } else if row.ghost_decision {
-                UpsertUserOutcome::Replay {
-                    user_message_id: row.id,
-                    ghost: true,
-                    assistant_chain: vec![],
-                }
-            } else {
-                UpsertUserOutcome::DuplicateInProgress {
-                    user_message_id: row.id,
-                }
-            });
-        }
-
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO engine.chat_messages \
-                 (session_id, role, content, client_msg_id, metadata) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
-        )
-        .bind(session_id)
-        .bind(role)
-        .bind(content)
-        .bind(client_msg_id)
-        .bind(metadata)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
+        let outcome =
+            upsert_user_message_in_tx(&mut tx, session_id, content, client_msg_id, role, metadata)
+                .await?;
         tx.commit().await?;
-        Ok(UpsertUserOutcome::Inserted { message_id: id })
+        Ok(outcome)
     }
 
     /// Mark a user message as having received a `ghost` decision from the

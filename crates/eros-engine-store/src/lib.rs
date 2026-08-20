@@ -4,6 +4,7 @@
 pub mod affinity;
 pub mod character_insight;
 pub mod chat;
+pub mod chat_queue;
 pub mod decision;
 pub mod error_handling;
 pub mod human_insight;
