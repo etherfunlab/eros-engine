@@ -102,6 +102,11 @@ per-session strictness for stream is a gate we can add later without new mechani
 | Handler task (normal path) | **Single attempt.** Terminal immediately: `failed` + the `system_error` chat row (atomic, via the existing `mark_failed_with_notice`) | A connected user saw the Error frame and will resend — a background retry would race that resend into a double reply. A disconnected user gets the `system_error` row as their failure signal instead of a silent black hole. |
 | Worker (crash recovery only, §7) | The async ladder, unchanged (release/retry up to `CHAT_QUEUE_MAX_ATTEMPTS`, then terminal) | By then no client is attached; the turn is indistinguishable from an async turn. |
 
+A panic inside the detached drive task is treated as crash recovery (§7): the task never
+settles, the row stays `claimed`, and the reaper hands it to the worker ladder — so a
+panicking stream turn can receive up to the ladder's remaining attempts rather than
+exactly one.
+
 Success and ghost outcomes classify exactly as the worker path (`classify_outcome`): any
 Done ⇒ done; zero Done + zero Error ⇒ ghost ⇒ done.
 
@@ -115,6 +120,15 @@ collects it after `CHAT_QUEUE_GEN_TIMEOUT_SECS + CHAT_QUEUE_CLAIM_STALE_SECS`; t
 goes `pending`; the worker claims it and blind-drives it from its params. The existing
 replay guard prevents double replies if the reply had already persisted before the crash.
 Worst-case recovery latency at defaults is ~10 minutes, same as the async path.
+
+This recovery applies to every in-flight stream turn at deploy time: the process is
+killed, the rows stay `claimed`, and roughly `GEN_TIMEOUT + CLAIM_STALE` later the worker
+blind-drives them to completion. That is the feature working as designed — the turn is
+answered instead of lost — with one known cost: a user who resent their message after the
+cut gets both the resent turn's reply and, later, the resurrected turn's reply (the replay
+guard keys on the original `user_message_id`, and a resend is a new message). Bounding that
+exposure (shorter `CHAT_QUEUE_CLAIM_STALE_SECS`, draining before the deploy switch) is a
+deployment-configuration concern, not an engine mechanism.
 
 ## 8. Unchanged surface
 
