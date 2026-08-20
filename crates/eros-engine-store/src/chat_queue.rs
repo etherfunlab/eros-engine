@@ -118,8 +118,9 @@ impl<'a> ChatQueueRepo<'a> {
                 tx.commit().await?;
                 Ok(match status.as_deref() {
                     Some("failed") => EnqueueOutcome::Failed { user_message_id },
-                    // pending / claimed → queued; no queue row means the turn is
-                    // mid-flight on the STREAM path — same "being handled" answer.
+                    // pending / claimed → queued. A missing queue row is a turn
+                    // persisted before stream turns rode the queue (legacy rows)
+                    // — same "being handled" answer is still the safe reply.
                     _ => EnqueueOutcome::AlreadyQueued { user_message_id },
                 })
             }

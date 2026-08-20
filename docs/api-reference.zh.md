@@ -104,6 +104,8 @@ data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_to
 data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
+生成与连接是解耦的：客户端中途断线，回复仍会完整生成并落入历史（从历史接口或 Supabase Realtime 取），断线后失败的轮次会留下一条 `system_error`。stream 轮次与异步端点共用同一张队列表（单次尝试，不做后台重试）。
+
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
