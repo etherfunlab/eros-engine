@@ -406,6 +406,10 @@ async fn run_server() -> Result<()> {
     // posts can exist without the director (town spec §3).
     tokio::spawn(crate::pipeline::world_town::sweeper(state.clone()));
 
+    // Chat-queue worker: drives async-endpoint turns (spec
+    // 2026-08-20-async-chat-endpoint-design). Inert when CHAT_QUEUE_DISABLED.
+    tokio::spawn(crate::pipeline::chat_queue::worker(state.clone()));
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))

@@ -222,11 +222,9 @@ pub(crate) fn parse_world_config(
 /// Defaults: enabled, 5s poll tick, 4-way concurrency, 300s stale-claim
 /// threshold, 3 max attempts before a turn goes terminally `failed`, a
 /// 20-deep per-session pending cap, and a 300s per-turn generation timeout.
-/// Only `pending_cap` is read yet (by the v2 async endpoint's depth check);
-/// the rest are consumed by the worker sweeper landing in a later task —
-/// `#[allow(dead_code)]` is transitional, not a design call.
+/// `pending_cap` is read by the v2 async endpoint's depth check; the rest
+/// are consumed by `pipeline::chat_queue::worker`.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ChatQueueConfig {
     pub disabled: bool,
     pub tick: Duration,

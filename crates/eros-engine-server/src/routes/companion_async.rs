@@ -31,7 +31,7 @@ use crate::state::AppState;
 /// Per-turn request knobs snapshotted into `chat_turn_queue.params` at
 /// enqueue time and replayed by the worker at generation time. Field-for-field
 /// the optional tail of `StreamSendRequest`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct QueuedTurnParams {
     #[serde(default)]
     pub tier: Option<String>,
