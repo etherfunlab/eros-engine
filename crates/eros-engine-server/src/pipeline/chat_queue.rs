@@ -149,6 +149,36 @@ async fn process_turn(state: AppState, turn: ClaimedTurn) {
 /// post-process all live inside the generator already (spec §6 Execution).
 async fn drive_turn(state: &AppState, turn: &ClaimedTurn) -> TurnOutcome {
     let chat_repo = ChatRepo { pool: &state.pool };
+
+    // Replay guard. `run_stream` has none of its own — the stream path's guard
+    // lives in the handler, which the worker bypasses — so every re-drive of an
+    // already-answered turn double-replies. Re-drives are reachable: process
+    // death between `insert_assistant_batch` and `mark_done`, a `mark_done`
+    // error (logged and swallowed) leaving the row claimed until the reaper
+    // releases it, a generation timeout that dropped the Done tally. A served
+    // or deliberately ghosted driving row IS a completed turn.
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM engine.chat_messages \
+                        WHERE user_message_id = $1 AND role = 'assistant') \
+             OR COALESCE((SELECT ghost_decision FROM engine.chat_messages \
+                          WHERE id = $1), false)",
+    )
+    .bind(turn.user_message_id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(true) => {
+            tracing::info!(
+                queue_id = %turn.queue_id,
+                user_message_id = %turn.user_message_id,
+                "chat-queue: turn already answered — skipping re-drive"
+            );
+            return TurnOutcome::Success;
+        }
+        Ok(false) => {}
+        Err(e) => return TurnOutcome::Failure(format!("replay guard failed: {e}")),
+    }
+
     let row: Option<(String, Option<Uuid>)> = match sqlx::query_as(
         "SELECT m.content, s.instance_id \
          FROM engine.chat_messages m JOIN engine.chat_sessions s ON s.id = m.session_id \
@@ -517,5 +547,245 @@ data: [DONE]\n\n";
         .await
         .unwrap();
         assert_eq!(n, 1, "terminal failure must leave a system_error row");
+    }
+
+    /// Replay guard. The stream path's already-answered guard lives in the
+    /// handler, which the worker bypasses entirely — so a re-drive of a turn
+    /// whose reply is already persisted (worker death after
+    /// `insert_assistant_batch` but before `mark_done`, a swallowed
+    /// `mark_done` error, a generation
+    /// timeout that dropped the Done tally) would double-reply into the
+    /// session. The guard must short-circuit before any upstream call.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_whose_reply_is_already_persisted_is_not_re_driven(pool: PgPool) {
+        use eros_engine_store::chat::{AssistantInsert, ChatRepo};
+
+        // Any upstream call at all is a failure of this test; a 500 keeps a
+        // regression from silently persisting a second reply.
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let repo = ChatQueueRepo { pool: &pool };
+        let EnqueueOutcome::Queued {
+            queue_id,
+            user_message_id,
+        } = repo
+            .enqueue_user_message(
+                session_id,
+                "在吗",
+                "01JW000000000000000000003A",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+
+        // The reply landed; the queue row never reached `done` (crash / DB
+        // blip) and the reaper handed it back as claimable.
+        ChatRepo { pool: &pool }
+            .insert_assistant_batch(
+                session_id,
+                user_message_id,
+                &[AssistantInsert {
+                    id: ulid::Ulid::new().into(),
+                    content: "已经回过了".into(),
+                    assistant_action_type: "reply".into(),
+                    continues_from_message_id: None,
+                    truncated: false,
+                    model: None,
+                    usage: None,
+                    generation_id: None,
+                    filter_audit: None,
+                    metadata: None,
+                    llm_attempts: None,
+                    gateway_errors: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+
+        let status = wait_for_status(&pool, queue_id, &["done", "failed", "pending"]).await;
+        assert_eq!(status, "done", "an already-served turn settles as done");
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "the guard must fire before any upstream call",
+        );
+        let assistant: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages \
+             WHERE user_message_id = $1 AND role = 'assistant'",
+        )
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assistant, 1, "a re-drive must not append a second reply");
+    }
+
+    /// Spec §9. On the worker path the driving message is NOT the newest row
+    /// in its session: a LIFO burst (and any exchange that landed while the
+    /// turn waited) can bury it past `HISTORY_WINDOW` = 20. The prompt's
+    /// model-facing messages come only from that window, so without a pin the
+    /// model answers a message it never sees.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_old_driving_message_is_pinned_into_the_prompt(pool: PgPool) {
+        use wiremock::matchers::body_string_contains;
+
+        const DRIVING: &str = "我的暗号是 ZQ-8817";
+
+        let mock = MockServer::start().await;
+        // Judge → reply_text, so the turn is never ghosted and the chat call
+        // definitely fires.
+        let verdict = serde_json::json!({ "action": "reply_text", "inner_state": "" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action and inner_state.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let repo = ChatQueueRepo { pool: &pool };
+        let EnqueueOutcome::Queued {
+            queue_id,
+            user_message_id,
+        } = repo
+            .enqueue_user_message(
+                session_id,
+                DRIVING,
+                "01JW000000000000000000004A",
+                "user",
+                None,
+                user_id,
+                &serde_json::json!({}),
+                20,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Queued");
+        };
+
+        // 24 rows land after it — twelve exchanges, more than the 20-row
+        // window — so the driving row is no longer in `history()`'s result.
+        // Explicit `sent_at` offsets keep the DESC ordering tie-free.
+        for i in 0..12i64 {
+            for (offset, role, content) in [
+                (2 * i + 1, "user", format!("后来的提问 {i}")),
+                (2 * i + 2, "assistant", format!("后来的回答 {i}")),
+            ] {
+                sqlx::query(
+                    "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                     VALUES ($1, $2, $3, now() + make_interval(secs => $4::float8))",
+                )
+                .bind(session_id)
+                .bind(role)
+                .bind(content)
+                .bind(offset as f64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let in_window: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT id FROM engine.chat_messages \
+             WHERE session_id = $1 ORDER BY sent_at DESC LIMIT 20) w WHERE w.id = $2",
+        )
+        .bind(session_id)
+        .bind(user_message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            in_window, 0,
+            "test setup must actually evict the driving row from the window",
+        );
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        assert_eq!(drain_once(&state, &sem).await.unwrap(), 1);
+        let status = wait_for_status(&pool, queue_id, &["done", "failed"]).await;
+        assert_eq!(status, "done");
+
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+            .expect("the chat generation call must have fired");
+        let sent = String::from_utf8_lossy(&chat_req.body);
+        assert!(
+            sent.contains(DRIVING),
+            "the driving message must reach the model even when evicted from \
+             the newest-20 window; got {sent}",
+        );
     }
 }

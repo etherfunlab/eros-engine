@@ -287,6 +287,24 @@ impl<'a> ChatRepo<'a> {
         .await
     }
 
+    /// Full row for message `id` within `session_id`; `None` if the id is not
+    /// in this session (or does not exist). Used to pin a driving message back
+    /// into the prompt when a burst of newer traffic pushed it out of the
+    /// newest-N `history()` window.
+    pub async fn message_by_id_in_session(
+        &self,
+        session_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<ChatMessage>, sqlx::Error> {
+        sqlx::query_as::<_, ChatMessage>(
+            "SELECT * FROM engine.chat_messages WHERE id = $1 AND session_id = $2",
+        )
+        .bind(id)
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
+    }
+
     /// History for a quote-anchored turn, chronological.
     ///
     /// `anchor = Some(ts)` (rewind): returns **at most `limit` rows total**,
