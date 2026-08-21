@@ -18,7 +18,9 @@ use eros_engine_store::chat::ChatRepo;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::routes::companion::resolve_or_create_session;
-use crate::routes::companion::{require_session_for_user, HistoryQuery, StartChatRequest};
+use crate::routes::companion::{
+    is_false, require_session_for_user, HistoryQuery, StartChatRequest,
+};
 use crate::state::AppState;
 
 // ─── DTOs ───────────────────────────────────────────────────────────
@@ -55,6 +57,15 @@ pub struct BffHistoryEntry {
     /// answer (excluded from companion context). Omitted for normal turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// Present (always `true`) only on assistant rows whose turn delegated an
+    /// image to the consumer (`metadata.image` marker recorded) — key-presence
+    /// contract like `read_at`. Recover the payload via
+    /// `GET /comp/chat/{session_id}/messages/{message_id}/image-request`; a 404
+    /// there on a flagged row means the composed prompt was never recorded
+    /// (fail-open audit) — genuinely unrecoverable. Spec:
+    /// docs/superpowers/specs/2026-08-21-image-turn-discovery-design.md.
+    #[serde(skip_serializing_if = "is_false")]
+    pub image: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -158,6 +169,7 @@ async fn bff_get_history(
             tips_amount_usd: r.tips_amount_usd,
             channel: r.channel,
             read_at: r.read_at,
+            image: r.image,
         })
         .collect();
     let total = messages.len();
@@ -216,6 +228,7 @@ async fn bff_start_chat(
                 tips_amount_usd: r.tips_amount_usd,
                 channel: r.channel,
                 read_at: r.read_at,
+                image: r.image,
             })
             .collect()
     };
@@ -551,6 +564,94 @@ mod tests {
         assert_eq!(history[0]["role"], "user");
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_flags_image_turns(pool: PgPool) {
+        // `image: true` is present only on rows carrying the `metadata.image`
+        // marker — the discovery half of the image-request recovery endpoint
+        // (spec 2026-08-21-image-turn-discovery-design.md). Every other row
+        // omits the key rather than sending false; a NULL metadata column
+        // must decode as omitted, not error.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, assistant_action_type, metadata, sent_at) \
+             VALUES ($1, 'user', 'draw yourself', NULL, NULL, now() - interval '2 seconds'), \
+                    ($1, 'assistant', 'sure', 'reply', NULL, now() - interval '1 second'), \
+                    ($1, 'assistant', '', 'reply', \
+                     '{\"image\": {\"prompt\": \"dusk\", \"image_ref\": \"previous\"}}', now())",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[0].get("image").is_none(),
+            "user row omits the key rather than sending false: {}",
+            messages[0]
+        );
+        assert!(
+            messages[1].get("image").is_none(),
+            "plain assistant row omits the key: {}",
+            messages[1]
+        );
+        assert_eq!(messages[2]["image"], json!(true), "image turn is flagged");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_start_bundle_flags_image_turns(pool: PgPool) {
+        // The cold-mount start bundle serializes history through the same DTO
+        // and must inherit the flag — it is the path a cold mount actually
+        // uses (spec 2026-08-21-image-turn-discovery-design.md §3).
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, assistant_action_type, metadata, sent_at) \
+             VALUES ($1, 'assistant', 'sure', 'reply', NULL, now() - interval '1 second'), \
+                    ($1, 'assistant', '', 'reply', \
+                     '{\"image\": {\"prompt\": \"dusk\", \"image_ref\": \"previous\"}}', now())",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            bff_start_request(&token, json!({ "genome_id": genome_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+        assert_eq!(body["session_id"], json!(session_id.to_string()));
+        let history = body["history"].as_array().expect("history array");
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0].get("image").is_none(),
+            "plain assistant row omits the key: {}",
+            history[0]
+        );
+        assert_eq!(history[1]["image"], json!(true), "image turn is flagged");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

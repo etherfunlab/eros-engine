@@ -518,21 +518,34 @@ Paginated message history, newest first. `limit` defaults to 20 (capped at 50).
 {
   "session_id": "…",
   "messages": [
-    { "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" },
-    { "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
-    { "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
+    { "id": "…", "role": "assistant", "content": "Bishop.", "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "user",      "content": "hi…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" },
+    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true }
   ],
-  "total": 3
+  "total": 4
 }
 ```
 
-`role` ∈ `user | assistant | gift_user | system_error`. `gift_user` is a tip
+`id` is the stable message id (the `engine.chat_messages` row key) — it is
+what the `image-request` route below takes. `role` ∈
+`user | assistant | gift_user | system_error`. `gift_user` is a tip
 turn (sent via `tips_amount_usd` on the stream route, above). Each entry also
 carries an optional `channel` field — `"product_qa"` marks an
 out-of-character product answer (excluded from companion context/memory,
 same as its live-stream `action_type`); the field is omitted for normal
 turns. `read_at` is a read receipt and is **omitted entirely while unread** —
 see the route below.
+
+`image: true` is present only on assistant rows whose turn delegated an image
+to the consumer; every other row omits the key (never `false`). It is the
+discovery half of the `image-request` route: feed the flagged entry's `id` to
+that route instead of probing every assistant message. A `404` from that
+route **on a flagged row** means the composed prompt was never recorded —
+genuinely unrecoverable; surface it as such rather than silently dropping
+the image. The flag also tells a rehydrating client that a turn promised an
+image (the `image_request` SSE frame is the turn's last frame and wire-only —
+a disconnect before it fires would otherwise be undetectable from history).
 
 ### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
 
@@ -547,7 +560,9 @@ ownership checks are the same as `history`.
 
 Fields mirror the SSE frame: `composed_prompt` is base64(`STANDARD`) of the
 UTF-8 wire prompt; `image_ref` may be absent on rows persisted before the
-marker carried it. `404` when the message is not an image turn — or when the
+marker carried it. **Absent `image_ref` means unknown, not `face`** — a
+consumer that defaults it to `face` will redraw a `previous`-ref turn against
+the wrong reference image. `404` when the message is not an image turn — or when the
 turn's compose event was never recorded (the audit write is fail-open); in
 that case the prompt is genuinely unrecoverable and the consumer should
 treat the turn as text-only.
@@ -1125,7 +1140,12 @@ and `read_at`, the read receipt described under `POST /comp/chat/{session_id}/re
 (omitted while unread). `id` is the
 `chat_messages` row primary key (UUID); `client_msg_id` is the id the FE
 sent during streaming (`null` for rows that never carried one, e.g.
-assistant turns). Same auth, ownership check, and
+assistant turns). `image: true` marks an assistant row whose turn delegated
+an image (omitted on every other row, never `false`) — the same key-presence
+contract and `image-request` discovery semantics as the canonical history
+route above, including the "404 on a flagged row = unrecoverable" reading.
+The `POST /bff/v1/comp/chat/start` bundle serializes history through this
+same entry shape and therefore carries the flag too. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -1137,9 +1157,10 @@ round-trip.
   "messages": [
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…", "read_at": "…" },
     { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…", "read_at": "…" },
-    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" }
+    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
+    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true }
   ],
-  "total": 3
+  "total": 4
 }
 ```
 

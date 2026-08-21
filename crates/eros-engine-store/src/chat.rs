@@ -108,6 +108,11 @@ pub struct ChatMessageSlim {
     /// Read receipt (migration 0053). See `ChatMessage::read_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
+    /// `true` iff the row's `metadata.image` marker is present — the turn
+    /// delegated an image to the consumer. Projected as
+    /// `(metadata->'image' IS NOT NULL)` so the slim query stays slim.
+    /// Spec: docs/superpowers/specs/2026-08-21-image-turn-discovery-design.md.
+    pub image: bool,
 }
 
 pub struct ChatRepo<'a> {
@@ -369,7 +374,8 @@ impl<'a> ChatRepo<'a> {
         let mut rows = sqlx::query_as::<_, ChatMessageSlim>(
             "SELECT id, role, content, sent_at, client_msg_id, \
                     (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
-                    channel, read_at \
+                    channel, read_at, \
+                    (metadata->'image' IS NOT NULL) AS image \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
