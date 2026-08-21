@@ -446,19 +446,28 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 {
   "session_id": "…",
   "messages": [
-    { "role": "assistant", "content": "Bishop。", "sent_at": "…", "read_at": "…" },
-    { "role": "user",      "content": "嗨…",     "sent_at": "…", "read_at": "…" },
-    { "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" }
+    { "id": "…", "role": "assistant", "content": "Bishop。", "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "user",      "content": "嗨…",     "sent_at": "…", "read_at": "…" },
+    { "id": "…", "role": "assistant", "content": "…", "sent_at": "…", "channel": "product_qa" },
+    { "id": "…", "role": "assistant", "content": "",  "sent_at": "…", "image": true }
   ],
-  "total": 3
+  "total": 4
 }
 ```
 
-`role` ∈ `user | assistant | gift_user | system_error`。`gift_user` 是打赏轮
-（通过上面 stream 路由的 `tips_amount_usd` 发起）。每条记录还带一个可选的
+`id` 是稳定的消息 id（`engine.chat_messages` 行主键），下面的 `image-request`
+路由收的就是它。`role` ∈ `user | assistant | gift_user | system_error`。
+`gift_user` 是打赏轮（通过上面 stream 路由的 `tips_amount_usd` 发起）。每条记录还带一个可选的
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
 外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。`read_at` 是已读
 回执，**未读时整个键都不出现** —— 见下面这条路由。
+
+`image: true` 只出现在把画图委托给消费方的 assistant 行上；其余行整个键省略
+（不会是 `false`）。它是 `image-request` 路由的发现半边：把带标记那条的 `id`
+喂给该路由即可，不必逐条试探。带标记的行在那条路由拿到 `404`，意味着
+composed prompt 当时就没记下来——真的取不回来了，应当如实呈现，而不是把图
+静默丢掉。这个标记同时让重连的客户端知道某一轮承诺过一张图（`image_request`
+SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 history 本来无从察觉）。
 
 ### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
 
@@ -471,7 +480,8 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 ```
 
 字段与 SSE 帧一致：`composed_prompt` 是 UTF-8 wire prompt 的 base64（`STANDARD`）；
-`image_ref` 在该键加入前落库的旧行上缺省。消息不是图片轮、或该轮的 compose
+`image_ref` 在该键加入前落库的旧行上缺省。**缺省是「未知」，不是 `face`**——
+把缺省默认成 `face`，会让 `previous` 参照的轮次拿错参考图重画。消息不是图片轮、或该轮的 compose
 事件当时没写成（审计写入是 fail-open）时返回 `404`——后者意味着 prompt 已无从取回，
 消费方应把该轮当纯文本处理。
 
@@ -990,6 +1000,11 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 省略该字段。还有 `read_at`，即 `POST /comp/chat/{session_id}/read` 那节说的
 已读回执，未读时省略。`id` 是 `chat_messages` 行的主鍵（UUID）；
 `client_msg_id` 是前端串流時帶上的 id（沒帶的行為 `null`，例如 assistant 回合）。
+`image: true` 标记把画图委托给消费方的 assistant 行（其余行整个键省略，
+不会是 `false`）——键出现即为真的约定、`image-request` 补取路由的发现语义，
+连同「带标记的行 404 = 真的取不回来」的读法，都与上面 canonical history
+一节相同。`POST /bff/v1/comp/chat/start` 打包的历史走的是同一个条目形状，
+所以同样带这个标记。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
 （canonical 默認 20），因為 BFF 是為「冷啟動一次拉一整屏 backscroll」設計的。
@@ -1000,9 +1015,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
   "messages": [
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
     { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
-    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" }
+    { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
+    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true }
   ],
-  "total": 3
+  "total": 4
 }
 ```
 

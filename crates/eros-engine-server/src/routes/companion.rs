@@ -106,8 +106,16 @@ pub struct HistoryQuery {
     pub offset: Option<i64>,
 }
 
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ChatHistoryEntry {
+    /// Stable message id — the `engine.chat_messages` row primary key (UUID).
+    /// Feeds `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
+    /// when rehydrating an image turn.
+    pub id: Uuid,
     pub role: String,
     pub content: String,
     pub sent_at: DateTime<Utc>,
@@ -127,6 +135,13 @@ pub struct ChatHistoryEntry {
     /// "no receipt", never as "not yet read".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
+    /// Present (always `true`) only on assistant rows whose turn delegated an
+    /// image to the consumer (`metadata.image` marker recorded) — key-presence
+    /// contract like `read_at`. Recover the payload via the `image-request`
+    /// endpoint; a 404 there on a flagged row means the composed prompt was
+    /// never recorded (fail-open audit) — genuinely unrecoverable.
+    #[serde(skip_serializing_if = "is_false")]
+    pub image: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -741,6 +756,8 @@ async fn get_history(
     let entries: Vec<ChatHistoryEntry> = rows
         .into_iter()
         .map(|m| ChatHistoryEntry {
+            id: m.id,
+            image: m.metadata.as_ref().and_then(|md| md.get("image")).is_some(),
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,
@@ -2414,6 +2431,65 @@ mod tests {
         let (status, body) = send_request(&mut router, mark_read_request(session_id, &jwt)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["marked"], 0, "a repeat call reports no transitions");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn history_carries_id_and_image_flag(pool: PgPool) {
+        // Discovery half of the image-request endpoint (spec
+        // 2026-08-21-image-turn-discovery-design.md): every entry is
+        // addressable by its row id, and image turns are flagged so a
+        // rehydrating client knows which ids to feed the recovery endpoint.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let user_row: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'draw yourself', now() - interval '2 seconds') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let plain_row: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'assistant', 'sure', now() - interval '1 second') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (image_row, _) =
+            seed_image_turn(&pool, session_id, user_id, Some("dusk rooftop")).await;
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        for (m, id) in messages.iter().zip([user_row, plain_row, image_row]) {
+            assert_eq!(m["id"], id.to_string(), "entries echo their row id: {m}");
+        }
+        assert!(
+            messages[0].get("image").is_none(),
+            "user row omits the key rather than sending false: {}",
+            messages[0]
+        );
+        assert!(
+            messages[1].get("image").is_none(),
+            "plain assistant row omits the key: {}",
+            messages[1]
+        );
+        assert_eq!(messages[2]["image"], true, "image turn is flagged");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

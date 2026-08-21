@@ -974,6 +974,7 @@ mod tests {
             tips_amount_usd: None,
             channel: None,
             read_at: None,
+            image: false,
         }
     }
 
