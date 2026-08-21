@@ -16,6 +16,15 @@ use ulid::Ulid;
 /// `RateLimited` and `Timeout` are spec-defined codes (§1.5). Both are now
 /// derived from the failure in hand by [`stream_error_code_for`] rather than
 /// hardcoded, so every construction site can reach them.
+///
+/// `GenerationTimeout` is distinct from `Timeout`: `Timeout` reports a single
+/// upstream call's own open/total/idle deadline (a [`stream_error_code_for`]
+/// `AttemptFailure::Gateway` outcome). `GenerationTimeout` reports the
+/// detached stream task's whole-turn wall-clock budget
+/// (`chat_queue.generation_timeout`) expiring around `drive_to_exhaustion` —
+/// which can fire even when every individual upstream call so far succeeded,
+/// just cumulatively too slowly. Consumers that would retry a bare `Timeout`
+/// immediately should not do the same for `GenerationTimeout`.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamErrorCode {
@@ -23,6 +32,7 @@ pub enum StreamErrorCode {
     RateLimited,
     Internal,
     Timeout,
+    GenerationTimeout,
 }
 
 /// Action type tag carried by the `meta` frame's `action_type` field.

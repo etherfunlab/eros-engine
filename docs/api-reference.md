@@ -112,6 +112,8 @@ data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_to
 data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
+The generation is detached from the connection: if the client disconnects mid-turn, the reply still completes and persists to history (pick it up via history or Supabase Realtime), and a turn that fails after disconnect leaves a `system_error` row. Stream turns are recorded in the same queue table as the async endpoint (single attempt, no background retry).
+
 Frame fields worth noting:
 
 - **`meta`** — `message_id`, `action_type`, `model` (the served model id; may be omitted), and `continues_from` (optional — the previous message id when this turn continues a retry chain). `action_type` is one of `reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa` (a plain-text reply is reported as `reply`, not `reply_text` — there is no `reply_text` on the wire). `product_qa` marks an out-of-character product answer routed by the PDE judge (see [model-config.md](model-config.md)); it is excluded from companion context/memory but reported the same way on both the live stream and replay. Clients must tolerate unknown `action_type` values (new ones may be added without a major-version bump).
@@ -194,9 +196,15 @@ alive that were declared and **never constructed** before v1.4.0:
 | Gateway `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **(new)** |
 | Gateway `config` (local misconfiguration) | `internal` |
 | Gateway `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+| Whole-turn generation budget exceeded (`CHAT_QUEUE_GEN_TIMEOUT_SECS`) | `generation_timeout` **(new)** |
 
-Add arms for `rate_limited` and `timeout`; both carry `retryable: true`, so a
-default arm that reports a permanent failure is now wrong.
+Add arms for `rate_limited`, `timeout`, and `generation_timeout`; all three
+carry `retryable: true`, so a default arm that reports a permanent failure is
+now wrong. `generation_timeout` is distinct from `timeout`: `timeout` is a
+single upstream call's own gateway-level deadline, while `generation_timeout`
+is the detached stream task's whole-turn wall-clock budget expiring — it can
+fire even when every individual upstream call so far succeeded, just
+cumulatively too slowly.
 
 **Optional: tier selection.** The body may include a `tier` string —
 type `String`, regex `^[a-z0-9_]{1,32}$` (returns `400` if malformed).

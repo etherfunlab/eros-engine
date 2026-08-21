@@ -104,6 +104,8 @@ data: {"type":"done","message_id":"01J...","truncated":false,"usage":{"prompt_to
 data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retries_chat":0,"retries_filter":0}
 ```
 
+生成与连接是解耦的：客户端中途断线，回复仍会完整生成并落入历史（从历史接口或 Supabase Realtime 取），断线后失败的轮次会留下一条 `system_error`。stream 轮次与异步端点共用同一张队列表（单次尝试，不做后台重试）。
+
 帧字段说明：
 
 - **`meta`** —— `message_id`、`action_type`、`model`（实际服务的模型 id，可能省略），以及 `continues_from`（可选，本轮续接重试链时为上一条消息 id）。`action_type` 是以下之一：`reply` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`（纯文本回复报告为 `reply`，不是 `reply_text`——线上协议里没有 `reply_text`）。`product_qa` 标记由 PDE 判断器路由的出戏产品问答（见 [model-config.zh.md](model-config.zh.md)）；它被排除在伴侣上下文/记忆之外，但实时流与重放上报告的方式相同。客户端必须容忍未知的 `action_type` 值（新值可能在不打大版本号的情况下新增）。
@@ -174,9 +176,13 @@ provider 响应体里带的错误码，有才出现。
 | 网关 `open_timeout` / `total_timeout` / `idle_timeout` | `timeout` **（新）** |
 | 网关 `config`（本地配置错误） | `internal` |
 | 网关 `transport` / `decode` / `chain_exhausted` | `upstream_unavailable` |
+| 整轮生成超出 `CHAT_QUEUE_GEN_TIMEOUT_SECS` 预算 | `generation_timeout` **（新）** |
 
-请补上 `rate_limited` 和 `timeout` 两个分支；两者都带 `retryable: true`，
-所以默认分支若报「永久失败」，现在就是错的。
+请补上 `rate_limited`、`timeout`、`generation_timeout` 三个分支；三者都带
+`retryable: true`，所以默认分支若报「永久失败」，现在就是错的。
+`generation_timeout` 与 `timeout` 不同：`timeout` 是单次上游调用自己的网关层
+截止线，`generation_timeout` 则是流式 detached 任务的整轮墙钟预算耗尽 ——
+即便到目前为止每次上游调用都成功了，只是累计太慢，它也会触发。
 
 **可选：tier 选择。** 请求体可附加 `tier` 字符串 ——
 类型 `String`，正则 `^[a-z0-9_]{1,32}$`（格式错返回 `400`）。
