@@ -48,6 +48,29 @@ pub struct ImageComposeEventRepo<'a> {
 }
 
 impl ImageComposeEventRepo<'_> {
+    /// The composed wire prompt recorded on one compose event, scoped to the
+    /// session that owns it — the session predicate is the ownership check,
+    /// so a message whose `compose_event_id` points at another session's
+    /// event resolves to `None`, never to someone else's prompt. `None` also
+    /// when the row is gone or the compose never produced a prompt — the
+    /// write is fail-open, so absence is a legal state the caller must
+    /// surface, not an error.
+    pub async fn composed_prompt_in_session(
+        &self,
+        event_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT composed_prompt FROM engine.chat_images_events \
+             WHERE id = $1 AND session_id = $2",
+        )
+        .bind(event_id)
+        .bind(session_id)
+        .fetch_optional(self.pool)
+        .await
+        .map(Option::flatten)
+    }
+
     /// Append one audit row and return its id. The caller stamps that id onto
     /// the assistant row (`metadata.image.compose_event_id`) — this table has
     /// no `message_id`, so the returned id IS the linkage.

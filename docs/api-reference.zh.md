@@ -373,7 +373,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `aspect_ratio` | `String` | 无 | 允许值：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`；省略时不存在（PDE 计划 → 请求 → 不存在）。非法时返回 `422`。 |
 | `prompt_variant` | `String` | 无 | 选择 `[tasks.chat_image_prompt_compose].filter_prompt` 的一个变体：按下标（`"0"`、`"1"`）或按 key（`"a"`、`"b"`），取决于该任务的配置形态（见 [model-config.zh.md](model-config.zh.md)）。`"raw"` 不带任何特殊含义：只有当该部署把某个变体配置在这个字面量 key 下时才会命中，和其他任意变体名一样。下标/key 没命中——包括未配置的 `"raw"`——都会回退到引擎内置的合成器提示词，绝不报 `422` 或其他错误。该任务未配置，或配置为单一纯字符串提示词时，此字段被忽略。 |
 
-**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。只要审计写入本身成功，就会带一个 `compose_event_id` 指针——不管合成本身有没有成功——它是通往 `engine.chat_images_events` 的可达链接，拼装出的**线上 wire** prompt 实际存在那张表里（`metadata.image` 标记从不重复存它）；详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。不记录参考类型。
+**参考图选择（`image_ref`）。** PDE verdict 带有 `image_ref`（`"face"` \| `"previous"`，默认 `"face"`），并附带在下方的 `image_request` 帧中——聊天流本身不会把它解析成实际 URL。`previous` 且无可用图时回退到 `face` 的规则，以及 `face_ref_url` / `prev_image_url` 参考图 URL，都属于消费方自己调用的图像供应商（引擎没有绘图端点）。持久化的 `metadata.image` 标记记录合成器决定的图片主题、画幅，以及它的 `caption`（合成器随 prompt 一起返回的一句话描述；没有则为 `None`——聊天历史和 judge transcript 只读回 caption，从不读回那段长 prompt），加上——仅当合成器 LLM 调用成功时——审计三元组 `compose_variant`（命中的 `filter_prompt` key/下标，纯字符串或内置提示词时缺省）、`compose_model` 和 `compose_generation_id`。三元组缺失意味着本轮没有成功合成（fail-open 降级，或合成器未配置）。只要审计写入本身成功，就会带一个 `compose_event_id` 指针——不管合成本身有没有成功——它是通往 `engine.chat_images_events` 的可达链接，拼装出的**线上 wire** prompt 实际存在那张表里（`metadata.image` 标记从不重复存它）；详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。标记同时记录 `image_ref`（`"face"` \| `"previous"`），让完整的 `image_request` 载荷事后仍可取回（该键加入之前落库的旧行没有）。
 
 校验：同一轮同时有 `force` 和 `tips_amount_usd` → `422`。`force` 而部署未配置
 `[tasks.chat_image_prompt_compose]` → `422`（合成器是唯一的提示词来源；没有它，
@@ -403,6 +403,11 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `product_qa`：`meta(action_type=product_qa) → delta* → done → final` — 形状与普通文本回复相同，由独立的模型链（`[tasks.chat_product_qa]`）流式生成，而非 `chat_companion`；落库时带 `channel='product_qa'`，重放时同样报告为 `product_qa`。
 
 引擎从不绘图，也不存在任何绘图生命周期帧：消费方收到 `image_request` 后自行调用图像供应商。
+
+这个帧本身只在线上（wire-only）。发帧时不在场的消费方——异步轮次，或中途断线的
+stream 客户端——事后可通过
+[`GET /comp/chat/{session_id}/messages/{message_id}/image-request`](#get-compchatsession_idmessagesmessage_idimage-request)
+取回同一份载荷；历史里的图片轮以 assistant 行上的 `metadata.image` 为识别标志。
 
 ### `POST /v2/comp/chat/{session_id}/message/async`
 
@@ -454,6 +459,21 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 `channel` 字段——`"product_qa"` 标记出戏产品问答（排除在伴侣上下文/记忆之
 外，与其在实时流上的 `action_type` 一致）；普通轮次省略该字段。`read_at` 是已读
 回执，**未读时整个键都不出现** —— 见下面这条路由。
+
+### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
+
+取回一条已落库图片轮的 `image_request` 载荷——给没收到 SSE 帧的消费方
+（异步轮次；帧发出前就断线的 stream 客户端）的补取通道。鉴权与会话归属检查与
+`history` 相同。
+
+```json
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4" }
+```
+
+字段与 SSE 帧一致：`composed_prompt` 是 UTF-8 wire prompt 的 base64（`STANDARD`）；
+`image_ref` 在该键加入前落库的旧行上缺省。消息不是图片轮、或该轮的 compose
+事件当时没写成（审计写入是 fail-open）时返回 `404`——后者意味着 prompt 已无从取回，
+消费方应把该轮当纯文本处理。
 
 ### `POST /comp/chat/{session_id}/read`
 

@@ -549,6 +549,64 @@
         ]
       }
     },
+    "/comp/chat/{session_id}/messages/{message_id}/image-request": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "The delegated `image_request` payload for one persisted image turn.",
+        "description": "The SSE frame is wire-only: an async turn, or a stream client that\ndisconnected before the frame fired, never receives it. This endpoint\nrecovers the same payload from what the turn persisted — `metadata.image`\non the assistant row plus the composed prompt on its `chat_images_events`\naudit row. 404 when the message is not an image turn, or when the compose\nevent was never recorded (the audit write is fail-open) — in that case\nthe prompt is genuinely unrecoverable and the consumer should treat the\nturn as text-only.",
+        "operationId": "get_image_request_payload",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "Assistant image-turn message id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageRequestPayloadResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session/message not found, not an image turn, or prompt unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/chat/{session_id}/read": {
       "post": {
         "tags": [
@@ -2265,6 +2323,36 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "ImageRequestPayloadResponse": {
+        "type": "object",
+        "description": "The recoverable `image_request` payload (same fields as the SSE frame,\nminus the frame discriminator).",
+        "required": [
+          "message_id",
+          "composed_prompt"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "composed_prompt": {
+            "type": "string",
+            "description": "Base64 (STANDARD) of the UTF-8 composed prompt — identical encoding\nto the SSE frame's `composed_prompt`."
+          },
+          "image_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"face\"` | `\"previous\"`. Absent on rows persisted before the marker\ncarried it."
+          },
+          "message_id": {
+            "type": "string"
           }
         }
       },

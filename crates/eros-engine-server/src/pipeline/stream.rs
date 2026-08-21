@@ -191,9 +191,14 @@ fn build_image_request_frame(
 /// 2026-08-02; absence = no successful compose this turn — raw skip,
 /// fail-open, or task not configured). Also stores `compose_event_id`, the
 /// `chat_images_events` row id — the pointer that makes the audit table
-/// reachable from a message (spec 2026-08-14). Deliberately NOT stored: the
-/// composed wire prompt (the consumer's job), url, or success/failure of the
-/// draw. Pure.
+/// reachable from a message (spec 2026-08-14) — and `image_ref`
+/// (`face`|`previous`), so the full `image_request` payload stays
+/// recoverable via `GET .../messages/{id}/image-request` for consumers that
+/// were not on the wire when the frame fired (async turns, disconnected
+/// streams). Deliberately NOT stored: the composed wire prompt (it lives on
+/// the compose event — one authoritative home), url, or success/failure of
+/// the draw. Pure.
+#[allow(clippy::too_many_arguments)]
 fn build_delegated_image_marker(
     subject: &str,
     caption: Option<&str>,
@@ -202,8 +207,10 @@ fn build_delegated_image_marker(
     compose_model: Option<&str>,
     compose_generation_id: Option<&str>,
     compose_event_id: Option<Uuid>,
+    image_ref: eros_engine_core::types::ImageRef,
 ) -> serde_json::Value {
     let mut m = serde_json::json!({ "prompt": subject });
+    m["image_ref"] = serde_json::to_value(image_ref).expect("ImageRef serializes");
     if let Some(c) = caption.filter(|s| !s.trim().is_empty()) {
         m["caption"] = serde_json::Value::String(c.to_string());
     }
@@ -4554,6 +4561,7 @@ pub fn run_stream(
                         img.compose_model.as_deref(),
                         img.compose_generation_id.as_deref(),
                         img.compose_event_id,
+                        plan.image_ref,
                     );
                     image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
@@ -5099,6 +5107,7 @@ pub fn run_stream(
                             img.compose_model.as_deref(),
                             img.compose_generation_id.as_deref(),
                             img.compose_event_id,
+                            plan.image_ref,
                         );
                         if let Err(e) = chat_repo
                             .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
@@ -5617,15 +5626,26 @@ mod tests {
             None,
             None,
             None,
+            eros_engine_core::types::ImageRef::Previous,
         );
         assert_eq!(m["prompt"], "on a rooftop");
         assert_eq!(m["caption"], "在天台");
         assert_eq!(m["aspect_ratio"], "3:4");
+        assert_eq!(m["image_ref"], "previous");
     }
 
     #[test]
     fn delegated_image_marker_omits_absent_caption() {
-        let m = build_delegated_image_marker("on a rooftop", None, None, None, None, None, None);
+        let m = build_delegated_image_marker(
+            "on a rooftop",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            eros_engine_core::types::ImageRef::Face,
+        );
         assert_eq!(m["prompt"], "on a rooftop");
         assert!(
             m.get("caption").is_none(),
@@ -17019,13 +17039,15 @@ data: [DONE]\n\n"
             None,
             None,
             None,
+            eros_engine_core::types::ImageRef::Face,
         );
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
+        assert_eq!(marker["image_ref"], "face");
         assert_eq!(
             marker.as_object().unwrap().len(),
-            2,
-            "marker must be minimal"
+            3,
+            "marker must be minimal: prompt + aspect + image_ref"
         );
         // The §5 regression guard: transcript still annotates it as a prior
         // image. With no caption, that annotation is the bare marker — the
@@ -17039,9 +17061,18 @@ data: [DONE]\n\n"
         );
         assert_ne!(line.trim(), "", "image turn must not be a blank line");
 
-        // No aspect => still a valid one-key marker that annotates (bare, same reason).
-        let m2 = build_delegated_image_marker("a portrait", None, None, None, None, None, None);
-        assert_eq!(m2.as_object().unwrap().len(), 1);
+        // No aspect => prompt + image_ref only; still annotates (bare, same reason).
+        let m2 = build_delegated_image_marker(
+            "a portrait",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            eros_engine_core::types::ImageRef::Face,
+        );
+        assert_eq!(m2.as_object().unwrap().len(), 2);
         let w2 = serde_json::json!({ "image": m2 });
         assert_eq!(
             assistant_transcript_line("", Some(&w2)),
@@ -17061,13 +17092,14 @@ data: [DONE]\n\n"
             Some("served/model"),
             Some("gen-xyz"),
             None,
+            eros_engine_core::types::ImageRef::Face,
         );
         assert_eq!(m["prompt"], "beach at sunset");
         assert_eq!(m["aspect_ratio"], "3:4");
         assert_eq!(m["compose_variant"], "b");
         assert_eq!(m["compose_model"], "served/model");
         assert_eq!(m["compose_generation_id"], "gen-xyz");
-        assert_eq!(m.as_object().unwrap().len(), 5);
+        assert_eq!(m.as_object().unwrap().len(), 6);
 
         // No generation id from the provider → key absent, not null.
         let m2 = build_delegated_image_marker(
@@ -17078,6 +17110,7 @@ data: [DONE]\n\n"
             Some("served/model"),
             None,
             None,
+            eros_engine_core::types::ImageRef::Face,
         );
         assert_eq!(m2["compose_model"], "served/model");
         assert!(m2
@@ -17088,8 +17121,8 @@ data: [DONE]\n\n"
         assert!(m2.as_object().unwrap().get("compose_variant").is_none());
         assert_eq!(
             m2.as_object().unwrap().len(),
-            2,
-            "prompt + compose_model only"
+            3,
+            "prompt + image_ref + compose_model only"
         );
     }
 
