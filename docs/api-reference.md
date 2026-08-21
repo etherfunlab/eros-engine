@@ -432,7 +432,9 @@ succeeded — independent of whether the compose call did — and is the
 reachable link to `engine.chat_images_events`, where the composed **wire**
 prompt actually lives (the `metadata.image` marker never duplicates it); see
 [LLM audit → Image-path event tables](llm-audit.md#image-path-event-tables).
-The reference kind is not recorded.
+The marker also records `image_ref` (`"face"` | `"previous"`), so the full
+`image_request` payload stays recoverable after the fact (absent on rows
+persisted before it was added).
 
 Validation: `force` + `tips_amount_usd` on the same turn → `422`. `force`
 while `[tasks.chat_image_prompt_compose]` is not configured → `422` (the
@@ -467,6 +469,13 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 
 The engine never draws and no draw-lifecycle frames exist: the consumer
 receives `image_request` and calls its own image vendor.
+
+The frame itself is wire-only. A consumer that was not connected when it
+fired — an async turn, or a stream client that disconnected mid-turn — can
+recover the same payload afterwards via
+[`GET /comp/chat/{session_id}/messages/{message_id}/image-request`](#get-compchatsession_idmessagesmessage_idimage-request):
+an image turn is recognizable in history by `metadata.image` on the
+assistant row.
 
 ### `POST /v2/comp/chat/{session_id}/message/async`
 
@@ -524,6 +533,24 @@ out-of-character product answer (excluded from companion context/memory,
 same as its live-stream `action_type`); the field is omitted for normal
 turns. `read_at` is a read receipt and is **omitted entirely while unread** —
 see the route below.
+
+### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
+
+The delegated `image_request` payload for one persisted image turn — the
+recovery path for consumers that never received the SSE frame (async turns;
+stream clients that disconnected before the frame fired). Auth and session
+ownership checks are the same as `history`.
+
+```json
+{ "message_id": "01J…", "composed_prompt": "5YaZ5a6e…", "image_ref": "previous", "aspect_ratio": "3:4" }
+```
+
+Fields mirror the SSE frame: `composed_prompt` is base64(`STANDARD`) of the
+UTF-8 wire prompt; `image_ref` may be absent on rows persisted before the
+marker carried it. `404` when the message is not an image turn — or when the
+turn's compose event was never recorded (the audit write is fail-open); in
+that case the prompt is genuinely unrecoverable and the consumer should
+treat the turn as text-only.
 
 ### `POST /comp/chat/{session_id}/read`
 
