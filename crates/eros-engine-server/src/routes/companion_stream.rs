@@ -964,6 +964,24 @@ data: [DONE]\n\n";
             meta_at < done_at && done_at < final_at,
             "frame order preserved through the tap"
         );
+        // Delta frames carry the actual generated text — a tap that forwarded
+        // only the control frames would still pass the ordering assertions
+        // above. Deltas only exist on the reply path, so gate on it (PDE may
+        // ghost the turn, and a ghost yields Meta → Done → Final with no
+        // Delta).
+        if body_text.contains("\"action_type\":\"reply\"") {
+            let delta_at = body_text
+                .find("\"type\":\"delta\"")
+                .expect("delta frames reach the SSE body");
+            assert!(
+                meta_at < delta_at && delta_at < done_at,
+                "delta sits between meta and done"
+            );
+            assert!(
+                body_text.contains("hi") && body_text.contains(" there"),
+                "the generated text reaches the client; got {body_text}"
+            );
+        }
 
         // The detached drive task's settle_turn() write races the SSE body's
         // completion: the tap channel closes (ending the body) the instant
