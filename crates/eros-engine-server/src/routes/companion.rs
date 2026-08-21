@@ -829,7 +829,7 @@ async fn get_image_request_payload(
             AppError::NotFound("prompt unavailable (compose event was never recorded)".into())
         })?;
     let prompt = eros_engine_store::image_events::ImageComposeEventRepo { pool: &state.pool }
-        .composed_prompt(compose_event_id)
+        .composed_prompt_in_session(compose_event_id, session_id)
         .await?
         .ok_or_else(|| AppError::NotFound("prompt unavailable".into()))?;
     use base64::Engine as _;
@@ -2574,6 +2574,92 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "no such message");
+
+        // Malformed compose_event_id in the marker (corrupt metadata).
+        let seed_with_marker = |marker: serde_json::Value| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_messages \
+                         (session_id, role, content, assistant_action_type, metadata) \
+                     VALUES ($1, 'assistant', '', 'reply', \
+                             jsonb_build_object('image', $2::jsonb)) \
+                     RETURNING id",
+                )
+                .bind(session_id)
+                .bind(serde_json::to_string(&marker).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let malformed =
+            seed_with_marker(serde_json::json!({"prompt": "p", "compose_event_id": "not-a-uuid"}))
+                .await;
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, malformed, &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "malformed event id");
+
+        // Dangling compose_event_id (event row never landed / was purged).
+        let dangling = seed_with_marker(
+            serde_json::json!({"prompt": "p", "compose_event_id": Uuid::new_v4().to_string()}),
+        )
+        .await;
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, dangling, &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "dangling event id");
+
+        // Event row exists but composed_prompt is NULL (standalone-endpoint
+        // exhausted shape).
+        let null_event: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_images_events \
+                 (source, user_id, session_id, status, inputs, attempts) \
+             VALUES ('chat_reply_image', $1, $2, 'exhausted', '{}', 1) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let null_prompt = seed_with_marker(
+            serde_json::json!({"prompt": "p", "compose_event_id": null_event.to_string()}),
+        )
+        .await;
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, null_prompt, &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "NULL composed_prompt");
+
+        // A marker pointing at ANOTHER session's compose event must not leak
+        // that session's prompt — the event lookup is session-scoped.
+        let other_genome = seed_genome(&pool, "Vega").await;
+        let other_instance = seed_instance(&pool, other_genome, user_id).await;
+        let other_session = seed_session(&pool, user_id, other_instance).await;
+        let foreign_event: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_images_events \
+                 (source, user_id, session_id, status, inputs, composed_prompt, attempts) \
+             VALUES ('chat_reply_image', $1, $2, 'ok', '{}', 'secret prompt', 1) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(other_session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cross = seed_with_marker(
+            serde_json::json!({"prompt": "p", "compose_event_id": foreign_event.to_string()}),
+        )
+        .await;
+        let (status, _) =
+            send_request(&mut router, image_request_request(session_id, cross, &jwt)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cross-session event pointer");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
