@@ -761,6 +761,92 @@ async fn get_history(
     }))
 }
 
+/// The recoverable `image_request` payload (same fields as the SSE frame,
+/// minus the frame discriminator).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ImageRequestPayloadResponse {
+    #[schema(value_type = String)]
+    pub message_id: Uuid,
+    /// Base64 (STANDARD) of the UTF-8 composed prompt — identical encoding
+    /// to the SSE frame's `composed_prompt`.
+    pub composed_prompt: String,
+    /// `"face"` | `"previous"`. Absent on rows persisted before the marker
+    /// carried it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+}
+
+/// The delegated `image_request` payload for one persisted image turn.
+///
+/// The SSE frame is wire-only: an async turn, or a stream client that
+/// disconnected before the frame fired, never receives it. This endpoint
+/// recovers the same payload from what the turn persisted — `metadata.image`
+/// on the assistant row plus the composed prompt on its `chat_images_events`
+/// audit row. 404 when the message is not an image turn, or when the compose
+/// event was never recorded (the audit write is fail-open) — in that case
+/// the prompt is genuinely unrecoverable and the consumer should treat the
+/// turn as text-only.
+#[utoipa::path(
+    get,
+    path = "/comp/chat/{session_id}/messages/{message_id}/image-request",
+    tag = "companion",
+    params(
+        ("session_id" = Uuid, Path, description = "Chat session id"),
+        ("message_id" = Uuid, Path, description = "Assistant image-turn message id")
+    ),
+    responses(
+        (status = 200, body = ImageRequestPayloadResponse),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "not your session"),
+        (status = 404, description = "session/message not found, not an image turn, or prompt unavailable")
+    ),
+    security(("bearer" = []))
+)]
+async fn get_image_request_payload(
+    State(state): State<AppState>,
+    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
+    Extension(AuthUser(user_id)): Extension<AuthUser>,
+) -> Result<Json<ImageRequestPayloadResponse>, AppError> {
+    require_session_for_user(&state, session_id, user_id).await?;
+    let chat_repo = ChatRepo { pool: &state.pool };
+    let msg = chat_repo
+        .message_by_id_in_session(session_id, message_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such message".into()))?;
+    let image = msg
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("image"))
+        .cloned()
+        .ok_or_else(|| AppError::NotFound("not an image turn".into()))?;
+    let compose_event_id = image
+        .get("compose_event_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| {
+            AppError::NotFound("prompt unavailable (compose event was never recorded)".into())
+        })?;
+    let prompt = eros_engine_store::image_events::ImageComposeEventRepo { pool: &state.pool }
+        .composed_prompt(compose_event_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("prompt unavailable".into()))?;
+    use base64::Engine as _;
+    Ok(Json(ImageRequestPayloadResponse {
+        message_id,
+        composed_prompt: base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes()),
+        image_ref: image
+            .get("image_ref")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        aspect_ratio: image
+            .get("aspect_ratio")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    }))
+}
+
 /// All sessions for the JWT user. The `{user_id}` path parameter MUST
 /// match the JWT's user_id; mismatch returns 403.
 #[utoipa::path(
@@ -980,6 +1066,7 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(start_chat))
         .routes(routes!(get_history))
+        .routes(routes!(get_image_request_payload))
         .routes(routes!(list_sessions))
         .routes(routes!(get_profile))
         .routes(routes!(get_character_profile))
@@ -2355,5 +2442,154 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(&mut router, mark_read_request(session_id, &jwt)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "an archived session is gone");
+    }
+
+    /// Seed one assistant image-turn row plus (optionally) its compose event,
+    /// returning (message_id, compose_event_id).
+    async fn seed_image_turn(
+        pool: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        composed_prompt: Option<&str>,
+    ) -> (Uuid, Option<Uuid>) {
+        let event_id = match composed_prompt {
+            Some(p) => Some(
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_images_events \
+                         (source, user_id, session_id, status, inputs, \
+                          composed_prompt, attempts) \
+                     VALUES ('chat_reply_image', $1, $2, 'ok', '{}', $3, 1) \
+                     RETURNING id",
+                )
+                .bind(user_id)
+                .bind(session_id)
+                .bind(p)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            ),
+            None => None,
+        };
+        let mut marker = serde_json::json!({
+            "prompt": "on a rooftop at dusk",
+            "aspect_ratio": "3:4",
+            "image_ref": "previous",
+        });
+        if let Some(id) = event_id {
+            marker["compose_event_id"] = serde_json::Value::String(id.to_string());
+        }
+        // Persisted action type is 'reply' even for image turns (the wire
+        // FrameActionType is separate; CHECK in migration 0012 allows only
+        // reply/gift_reaction) — mirrors run_stream's own AssistantInsert.
+        let message_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, assistant_action_type, metadata) \
+             VALUES ($1, 'assistant', '', 'reply', jsonb_build_object('image', $2::jsonb)) \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(serde_json::to_string(&marker).unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (message_id, event_id)
+    }
+
+    fn image_request_request(session_id: Uuid, message_id: Uuid, jwt: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!(
+                "/comp/chat/{session_id}/messages/{message_id}/image-request"
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_request_returns_the_frame_payload(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let prompt = "写实照片，面部参照，黄昏天台";
+        let (message_id, _) = seed_image_turn(&pool, session_id, user_id, Some(prompt)).await;
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut router,
+            image_request_request(session_id, message_id, &mint_test_jwt(user_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["message_id"], message_id.to_string());
+        // Same encoding as the SSE frame: STANDARD base64 of the UTF-8 prompt.
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["composed_prompt"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), prompt);
+        assert_eq!(body["image_ref"], "previous");
+        assert_eq!(body["aspect_ratio"], "3:4");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_request_404s_on_non_image_turns_and_missing_events(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        // A plain text assistant row is not an image turn.
+        let text_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', 'hello') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, text_id, &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "not an image turn");
+
+        // An image turn whose compose event was never recorded (fail-open
+        // audit write) has no retrievable prompt.
+        let (orphan_id, _) = seed_image_turn(&pool, session_id, user_id, None).await;
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, orphan_id, &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "prompt unavailable");
+
+        // Unknown message id.
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, Uuid::new_v4(), &jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no such message");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_request_enforces_session_ownership(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, owner).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let (message_id, _) = seed_image_turn(&pool, session_id, owner, Some("p")).await;
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, _) = send_request(
+            &mut router,
+            image_request_request(session_id, message_id, &mint_test_jwt(Uuid::new_v4())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "not your session");
     }
 }
