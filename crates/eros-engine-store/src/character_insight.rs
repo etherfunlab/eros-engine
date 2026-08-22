@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Preserves the pre-1.6.0 public path: `existing_keys` and
+/// `parse_error_payload` were `pub` in this module since v1.3.0. Their
+/// canonical home is now the crate root (`crate::existing_keys`,
+/// `crate::parse_error_payload`); this re-export keeps
+/// `eros_engine_store::character_insight::{existing_keys, parse_error_payload}`
+/// resolving for anyone pinned at `"1"`.
+pub use crate::{existing_keys, parse_error_payload};
+
 /// The parsed, typed columns ready to UPSERT. Owned values so the caller can
 /// move them straight into `.bind(...)`.
 #[derive(Debug, Default, PartialEq)]
@@ -252,7 +260,8 @@ impl CharacterInsightEventRepo<'_> {
 mod tests {
     use super::*;
     use crate::testutil::seed_persona_instance;
-    use crate::{existing_keys, parse_error_payload};
+    // existing_keys / parse_error_payload are already in scope via this
+    // module's `pub use crate::{existing_keys, parse_error_payload}` above.
 
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0047_creates_all_three_tables(pool: PgPool) {
