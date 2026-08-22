@@ -22,6 +22,19 @@ pub enum AppError {
     BadRequest(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// The resource exists but its state does not permit the action — e.g.
+    /// editing a message that is not an image turn.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// A well-formed request whose values are not acceptable.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+    /// A capability the deployment did not configure.
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+    /// A per-user concurrency cap was reached.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
     /// A provider failure surfaced with the provider's own status. Used by the
     /// standalone compose endpoint, whose caller needs "the provider failed my
     /// call" distinguishable from "the engine broke". Scoped to that endpoint:
@@ -117,6 +130,10 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            AppError::Unprocessable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unprocessable"),
+            AppError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, "not_implemented"),
+            AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         (
