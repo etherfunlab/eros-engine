@@ -397,7 +397,9 @@ max_tokens = 1200
 # has its own block below, [tasks.insight_structuring]; delete that block and
 # stage 2 runs on this block's parameters, never on the global default model.
 # 1200 tokens is a legacy combined budget kept as-is so copying this file
-# changes nothing; tune the two stages independently now that they are split.
+# changes nothing. See the comment above [tasks.insight_structuring] for why
+# stage 2 keeps the same number rather than shrinking to match the
+# character/user structuring blocks.
 # Optional: force the extraction model's reasoning off (default = model decides).
 #reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
@@ -450,11 +452,19 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 # it fills. To change what stage 1 extracts, edit
 # [tasks.insight_extraction].filter_prompt above.
 # Delete this block and stage 2 runs on the extraction block's parameters.
+#
+# max_tokens = 1200 deliberately keeps the pre-split combined budget. The
+# COMPANION_INSIGHTS_SCHEMA this stage fills has ~19 top-level keys plus a
+# nested matching_preferences object, and the prompt asks the model to
+# re-emit complete updated values, so output grows with profile tenure —
+# unlike the character/user structuring blocks below, whose ten-column
+# schemas fit comfortably in 600. If you tune this stage's budget apart from
+# stage 1, lower it knowing the human schema is much larger than those two.
 [tasks.insight_structuring]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
-max_tokens = 600
+max_tokens = 1200
 
 # ─── Character insights (EXPERIMENTAL, v1.3.0) ──────────────────────────────
 # Builds a profile of the AI CHARACTER from the conversation, the mirror of
