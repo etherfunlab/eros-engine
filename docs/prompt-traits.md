@@ -16,7 +16,7 @@ persona system prompt.
 ```
 
 Accepted on `POST /comp/chat/{session_id}/message/stream` and on
-`POST /v2/comp/chat/{session_id}/message/async`, where the traits ride the
+`POST /v2/comp/session/{session_id}/message/async`, where the traits ride the
 queue and are re-validated in the worker.
 
 ## What the engine does

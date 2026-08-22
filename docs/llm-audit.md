@@ -12,7 +12,7 @@ metadata semantics are the caller's responsibility.
 ## Inbound: the `audit` request field
 
 `POST /comp/chat/{session_id}/message/stream` and
-`POST /v2/comp/chat/{session_id}/message/async` both accept an optional
+`POST /v2/comp/session/{session_id}/message/async` both accept an optional
 `audit` object alongside the required `content` / `client_msg_id` — on the
 async endpoint the field rides the queue and is re-validated in the worker:
 
@@ -174,9 +174,11 @@ as shown above.
   OpenRouter `model` / `usage` / `generation_id` triple **is** persisted, on
   `chat_messages.model` / `.usage` / `.generation_id` for the chat completion
   (mirrored on `companion_affinity_events` for the affinity eval, on
-  `companion_insights_events` for each `insight_extraction` call, on
+  `companion_insights_events` for each `insight_extraction` /
+  `insight_structuring` call of the human chain, on
   `engine.character_insights_events` for each call of the experimental
-  character chain (§"Character insights" below), on
+  character chain and on `engine.user_insights_events` for each call of the
+  experimental user chain (§"Character and user insights" below), on
   `companion_decision_events` for each `pde_decision` judge run, on
   `chat_images_events` for every image-composer call, and on
   `chat_vision_events` for every `chat_vision` describe — see
@@ -370,27 +372,36 @@ Rust types — one serializer, not two. `llm_attempts` / `gateway_errors` on the
 Affinity-eval and `chat_vision` failures are written to their tables but never
 surface on the wire, by design.
 
-## Character insights (experimental)
+## Character and user insights (experimental)
 
-`engine.character_insights_events` is the audit trail for the experimental
-character-insight chain (v1.3.0,
-[design spec](superpowers/specs/2026-08-15-character-insights-design.md)) —
-the mirror of `companion_insights_events` but for the AI character rather
-than the human. This is the whole point of that chain having two separate
-config task names (`character_insight_extraction` /
-`character_insight_structuring`) instead of one shared one the way the human
-chain shares `insight_extraction` for both its stages: it lets OpenRouter
-accounting and this table tell the extraction call apart from the structuring
-call. Concretely:
+`engine.character_insights_events` and `engine.user_insights_events` are the
+audit trails for the two experimental per-relationship chains —
+`character_insights` (v1.3.0,
+[design spec](superpowers/specs/2026-08-15-character-insights-design.md)),
+the AI character's own conversation-derived profile, and `user_insights`
+(v1.6.0,
+[design spec](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md)),
+the real user's profile *inside that one relationship*. Same table shape on
+both, one row per OpenRouter call that returned a response:
 
 - **`stage`** is `'extraction'` or `'structuring'` — naming the config block
-  each row came from, so `stage='structuring'` tells you which
-  `[tasks.*]` block to go tune with no lookup table in between. This is
-  unlike the human chain's `companion_insights_events.stage`, which uses
-  `'facts'` / `'structured'` and predates the config split.
+  each row came from (`character_insight_extraction` /
+  `character_insight_structuring`, or `user_insight_extraction` /
+  `user_insight_structuring`), so `stage='structuring'` tells you which
+  `[tasks.*]` block to go tune with no lookup table in between.
 - **Both rows of one extraction run share a `run_id`** — the extraction call
   and the structuring call it fed are joinable without going through
   `session_id`/`message_id`.
+
+**`companion_insights_events.stage` is the deliberate exception.** The human
+chain's two stages now live behind their own separate config blocks too
+(`insight_extraction` / `insight_structuring`, since the structuring split),
+and the stage-2 call reports `insight_structuring` as its wire task name —
+but the audit row it lands on still writes `stage='structured'`, not
+`stage='structuring'`. `companion_insights_events` keeps its older
+`'facts'`/`'structured'` vocabulary on purpose: the table is live and
+downstream consumers already read it by that stage value, so renaming it to
+match the two experimental tables is not worth the migration.
 
 ## Image-path event tables
 
