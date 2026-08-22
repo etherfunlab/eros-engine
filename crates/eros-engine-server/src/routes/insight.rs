@@ -219,7 +219,8 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use crate::routes::companion::{build_router, mint_test_jwt, test_state};
+    use crate::routes::companion::test_state;
+    use crate::routes::companion::testutil::{build_router, mint_test_jwt};
 
     /// The full app router, auth layer included — the same composition the
     /// companion route tests use, so these tests exercise the real 401 path
