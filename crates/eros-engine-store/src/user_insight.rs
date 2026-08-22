@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn project_columns_reads_all_ten_and_drops_non_string_array_items() {
+    fn project_columns_drops_non_string_array_items_and_ignores_unknown_keys() {
         let c = project_columns(&serde_json::json!({
             "location": "深圳南山",
             "occupation": "后端工程师",
@@ -493,6 +493,71 @@ mod tests {
         assert_eq!(c.personal_values.as_deref(), Some("说到做到"));
         assert_eq!(c.likes, vec!["爬山".to_string()]);
         assert_eq!(c.relationships, vec!["母亲住在老家".to_string()]);
+    }
+
+    #[test]
+    fn project_columns_reads_every_field_from_the_top_level() {
+        // Ten DISTINCT values, distinct from every other test in this file, so
+        // a swapped str_field(insights, "habits") <-> str_field(insights,
+        // "vulnerabilities") (or any other pairwise swap) fails here instead
+        // of compiling silently.
+        let v = serde_json::json!({
+            "location": "在成都出差，下周三回",
+            "occupation": "做用户增长，刚转正",
+            "current_situation": "手头项目要 validate，压力大",
+            "desires": "想攒钱换个大一点的房子",
+            "vulnerabilities": "受不了被当众否定",
+            "habits": "喜欢边跑步边听播客",
+            "personal_values": "认为公平比效率更重要",
+            "likes": ["秋天的桂花香"],
+            "dislikes": ["迟到不打招呼的人"],
+            "relationships": ["表哥在同一家公司不同组"]
+        });
+        let c = project_columns(&v);
+        assert_eq!(c.location.as_deref(), Some("在成都出差，下周三回"));
+        assert_eq!(c.occupation.as_deref(), Some("做用户增长，刚转正"));
+        assert_eq!(
+            c.current_situation.as_deref(),
+            Some("手头项目要 validate，压力大")
+        );
+        assert_eq!(c.desires.as_deref(), Some("想攒钱换个大一点的房子"));
+        assert_eq!(c.vulnerabilities.as_deref(), Some("受不了被当众否定"));
+        assert_eq!(c.habits.as_deref(), Some("喜欢边跑步边听播客"));
+        assert_eq!(c.personal_values.as_deref(), Some("认为公平比效率更重要"));
+        assert_eq!(c.likes, vec!["秋天的桂花香"]);
+        assert_eq!(c.dislikes, vec!["迟到不打招呼的人"]);
+        assert_eq!(c.relationships, vec!["表哥在同一家公司不同组"]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn apply_extraction_round_trips_all_ten_columns(pool: PgPool) {
+        // Ten DISTINCT values. Seven of the eleven binds are Option<String> and
+        // three are Vec<String>, so a positional swap inside either group is
+        // type-correct and silent — only distinct values catch it. This also
+        // covers every COALESCE target and every reverse-projection key.
+        let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
+        let all = serde_json::json!({
+            "location": "u-loc-1",
+            "occupation": "u-occ-2",
+            "current_situation": "u-cur-3",
+            "desires": "u-des-4",
+            "vulnerabilities": "u-vul-5",
+            "habits": "u-hab-6",
+            "personal_values": "u-val-7",
+            "likes": ["u-lik-8"],
+            "dislikes": ["u-dis-9"],
+            "relationships": ["u-rel-10"]
+        });
+
+        let repo = UserInsightRepo { pool: &pool };
+        repo.apply_extraction(instance_id, &all).await.unwrap();
+
+        let row = repo.load(instance_id).await.unwrap().expect("row");
+        let back = existing_as_extraction_json(&row);
+        assert_eq!(
+            back, all,
+            "every column must survive the write→read→project cycle in place"
+        );
     }
 
     #[test]
