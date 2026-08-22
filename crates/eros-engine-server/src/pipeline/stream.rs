@@ -197,9 +197,10 @@ fn build_image_request_frame(
 /// were not on the wire when the frame fired (async turns, disconnected
 /// streams). Deliberately NOT stored: the composed wire prompt (it lives on
 /// the compose event — one authoritative home), url, or success/failure of
-/// the draw. Pure.
+/// the draw. `edit_of` is set only by the image-edit endpoint: the message
+/// this picture is a revision of. Absent on ordinary chat image turns. Pure.
 #[allow(clippy::too_many_arguments)]
-fn build_delegated_image_marker(
+pub(crate) fn build_delegated_image_marker(
     subject: &str,
     caption: Option<&str>,
     aspect_ratio: Option<&str>,
@@ -208,6 +209,7 @@ fn build_delegated_image_marker(
     compose_generation_id: Option<&str>,
     compose_event_id: Option<Uuid>,
     image_ref: eros_engine_core::types::ImageRef,
+    edit_of: Option<Uuid>,
 ) -> serde_json::Value {
     let mut m = serde_json::json!({ "prompt": subject });
     m["image_ref"] = serde_json::to_value(image_ref).expect("ImageRef serializes");
@@ -228,6 +230,9 @@ fn build_delegated_image_marker(
     }
     if let Some(id) = compose_event_id {
         m["compose_event_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(id) = edit_of {
+        m["edit_of"] = serde_json::Value::String(id.to_string());
     }
     m
 }
@@ -3128,27 +3133,17 @@ pub(crate) struct ComposeRun {
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
-/// Generate the image prompt (and its caption) via the optional composer LLM.
-/// Walks `[model] + fallback` on transport failure (error/timeout/empty);
-/// returns a `ComposeRun` carrying the parsed prompt/caption plus the audit
-/// trio in `outcome` on first success, or `outcome: None` (caller falls back
-/// to an empty subject — the portrait path) alongside how many models were
-/// attempted and why the last one failed. Never blocks or fails the image
-/// turn. Mirrors `run_input_filter`.
-///
-/// Shared with `routes/persona.rs`: the standalone compose endpoint's
-/// non-stream mode maps an `outcome: None` here to a 502 instead of the chat
-/// path's fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
-pub(crate) async fn run_image_prompt_compose(
-    state: &AppState,
-    c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
+/// Render the chat composer's five-slot payload, substituting the placeholders
+/// the prompt expects for empty slots. Extracted from `run_image_prompt_compose`
+/// so that function is only the chain walk and can serve a second composer
+/// (the image-edit endpoint) with a different payload. Pure.
+pub(crate) fn render_compose_payload(
     persona: &eros_engine_core::persona::CompanionPersona,
     recent_scene: &str,
     latest_user_msg: &str,
     aspect_ratio: Option<&str>,
     style: &str,
-) -> ComposeRun {
-    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
+) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -3164,7 +3159,26 @@ pub(crate) async fn run_image_prompt_compose(
         latest_user_msg
     };
     let ar = aspect_ratio.unwrap_or("（未指定）");
-    let user_payload = compose_user_payload(appearance, scene, latest, style, ar);
+    compose_user_payload(appearance, scene, latest, style, ar)
+}
+
+/// Walk `[model] + fallback` for a composer task, named by `task`, on
+/// transport failure (error/timeout/empty); returns a `ComposeRun` carrying
+/// the parsed prompt/caption plus the audit trio in `outcome` on first
+/// success, or `outcome: None` (caller falls back to an empty subject — the
+/// portrait path) alongside how many models were attempted and why the last
+/// one failed. Never blocks or fails the image turn. Mirrors `run_input_filter`.
+///
+/// Shared with `routes/persona.rs`: the standalone compose endpoint's
+/// non-stream mode maps an `outcome: None` here to a 502 instead of the chat
+/// path's fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
+pub(crate) async fn run_image_prompt_compose(
+    state: &AppState,
+    c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
+    user_payload: &str,
+    task: &'static str,
+) -> ComposeRun {
+    use eros_engine_llm::openrouter::{ChatMessage, ChatRequest};
     let chain: Vec<String> = std::iter::once(c.model.clone())
         .chain(c.fallback_model.iter().cloned())
         .collect();
@@ -3186,14 +3200,14 @@ pub(crate) async fn run_image_prompt_compose(
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: user_payload.clone(),
+                    content: user_payload.to_string(),
                 },
             ],
             temperature: c.temperature as f32,
             max_tokens: c.max_tokens,
             sampling: c.sampling,
             reasoning: c.reasoning.clone(),
-            task: Some("chat_image_prompt_compose".into()),
+            task: Some(task.into()),
             ..Default::default()
         };
         let resp = match tokio::time::timeout(FILTER_TIMEOUT, state.openrouter.execute(req)).await {
@@ -3201,9 +3215,7 @@ pub(crate) async fn run_image_prompt_compose(
             Ok(Err(e)) => {
                 tracing::warn!(model = %model_id, error = %e, "image-compose: model error; next");
                 failures.push(eros_engine_llm::failure::AttemptFailure::from_llm_error(
-                    "chat_image_prompt_compose",
-                    model_id,
-                    &e,
+                    task, model_id, &e,
                 ));
                 last_failure = Some(operation_failure_pointer(&failures));
                 // Transport failure: nothing came back, so any identity
@@ -3216,10 +3228,7 @@ pub(crate) async fn run_image_prompt_compose(
             }
             Err(_) => {
                 tracing::warn!(model = %model_id, "image-compose: timeout; next");
-                failures.push(filter_timeout_failure(
-                    "chat_image_prompt_compose",
-                    model_id,
-                ));
+                failures.push(filter_timeout_failure(task, model_id));
                 last_failure = Some(operation_failure_pointer(&failures));
                 last_model = None;
                 last_generation_id = None;
@@ -3227,7 +3236,7 @@ pub(crate) async fn run_image_prompt_compose(
                 continue;
             }
         };
-        super::log_openrouter_usage("chat_image_prompt_compose", None, &resp);
+        super::log_openrouter_usage(task, None, &resp);
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
@@ -3425,11 +3434,14 @@ async fn build_delegated_image_prompt(
             run_image_prompt_compose(
                 state,
                 &c,
-                persona,
-                pde_transcript,
-                latest_user_msg,
-                inputs.aspect_ratio.as_deref(),
-                &style_str,
+                &render_compose_payload(
+                    persona,
+                    pde_transcript,
+                    latest_user_msg,
+                    inputs.aspect_ratio.as_deref(),
+                    &style_str,
+                ),
+                "chat_image_prompt_compose",
             )
             .await
         }
@@ -4565,6 +4577,7 @@ pub fn run_stream(
                         img.compose_generation_id.as_deref(),
                         img.compose_event_id,
                         plan.image_ref,
+                        None,
                     );
                     image_only_caption = img.caption.clone();
                     let row = eros_engine_store::chat::AssistantInsert {
@@ -5111,6 +5124,7 @@ pub fn run_stream(
                             img.compose_generation_id.as_deref(),
                             img.compose_event_id,
                             plan.image_ref,
+                            None,
                         );
                         if let Err(e) = chat_repo
                             .merge_assistant_image_meta(user_msg.session_id, msg_uuid, &marker)
@@ -5630,6 +5644,7 @@ mod tests {
             None,
             None,
             eros_engine_core::types::ImageRef::Previous,
+            None,
         );
         assert_eq!(m["prompt"], "on a rooftop");
         assert_eq!(m["caption"], "在天台");
@@ -5648,6 +5663,7 @@ mod tests {
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
         );
         assert_eq!(m["prompt"], "on a rooftop");
         assert!(
@@ -17058,6 +17074,7 @@ data: [DONE]\n\n"
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
         );
         assert_eq!(marker["prompt"], "beach at sunset");
         assert_eq!(marker["aspect_ratio"], "3:4");
@@ -17089,6 +17106,7 @@ data: [DONE]\n\n"
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
         );
         assert_eq!(m2.as_object().unwrap().len(), 2);
         let w2 = serde_json::json!({ "image": m2 });
@@ -17111,6 +17129,7 @@ data: [DONE]\n\n"
             Some("gen-xyz"),
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
         );
         assert_eq!(m["prompt"], "beach at sunset");
         assert_eq!(m["aspect_ratio"], "3:4");
@@ -17129,6 +17148,7 @@ data: [DONE]\n\n"
             None,
             None,
             eros_engine_core::types::ImageRef::Face,
+            None,
         );
         assert_eq!(m2["compose_model"], "served/model");
         assert!(m2
@@ -17286,5 +17306,89 @@ data: [DONE]\n\n"
         }
         let read_at = read_at.expect("the turn handed the message to the judge, so it was read");
         assert!(read_at >= sent_at, "read after the row was written");
+    }
+
+    // ── Task 2: render_compose_payload / build_delegated_image_marker(edit_of) ──
+
+    /// Build a `CompanionPersona` with `art_metadata.appearance` set, matching
+    /// the construction pattern from `pde_test_persona` above.
+    fn test_persona_with_appearance(
+        appearance: &str,
+    ) -> eros_engine_core::persona::CompanionPersona {
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let oid = uuid::Uuid::new_v4();
+        CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "Mia".into(),
+                system_prompt: "You are Mia.".into(),
+                tip_personality: Some("normal".into()),
+                art_metadata: serde_json::json!({ "appearance": appearance }),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: oid,
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn render_compose_payload_fills_empty_slots_with_placeholders() {
+        // Locks the placeholder behaviour that used to live inside
+        // run_image_prompt_compose: the extraction must not change what the
+        // chat path sends.
+        let persona = test_persona_with_appearance("");
+        let out = render_compose_payload(&persona, "  ", "", None, "realistic");
+        assert!(out.contains("[人物外观]\n（无）"), "got {out}");
+        assert!(out.contains("[最近场景]\n（无）"), "got {out}");
+        assert!(out.contains("[对方最新消息]\n（无）"), "got {out}");
+        assert!(out.contains("[画幅]\n（未指定）"), "got {out}");
+        assert!(out.contains("[风格]\nrealistic"), "got {out}");
+    }
+
+    #[test]
+    fn render_compose_payload_passes_real_values_through() {
+        let persona = test_persona_with_appearance("银发红瞳");
+        let out = render_compose_payload(&persona, "在天台", "拍张照", Some("3:4"), "anime");
+        assert!(out.contains("[人物外观]\n银发红瞳"), "got {out}");
+        assert!(out.contains("[最近场景]\n在天台"), "got {out}");
+        assert!(out.contains("[对方最新消息]\n拍张照"), "got {out}");
+        assert!(out.contains("[画幅]\n3:4"), "got {out}");
+    }
+
+    #[test]
+    fn delegated_image_marker_carries_edit_of_only_when_present() {
+        let id = Uuid::new_v4();
+        let with = build_delegated_image_marker(
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            eros_engine_core::types::ImageRef::Previous,
+            Some(id),
+        );
+        assert_eq!(with["edit_of"], serde_json::json!(id.to_string()));
+        assert_eq!(with["image_ref"], serde_json::json!("previous"));
+
+        let without = build_delegated_image_marker(
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            eros_engine_core::types::ImageRef::Face,
+            None,
+        );
+        assert!(without.get("edit_of").is_none(), "got {without}");
     }
 }
