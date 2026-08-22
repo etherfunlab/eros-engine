@@ -137,6 +137,9 @@ pub struct AffinityEventRow {
     pub state_before: Option<serde_json::Value>,
     /// Post-turn state (migration 0049). NULL on pre-4.1 rows.
     pub state_after: Option<serde_json::Value>,
+    /// The user message that drove this turn (migration 0056). NULL on
+    /// `proactive` / `time_decay` rows and on rows written before 0056.
+    pub user_message_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -285,7 +288,7 @@ impl<'a> AffinityRepo<'a> {
         event_type: Option<&str>,
     ) -> Result<Vec<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.user_message_id, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -310,7 +313,7 @@ impl<'a> AffinityRepo<'a> {
         session_id: Uuid,
     ) -> Result<Option<AffinityEventRow>, sqlx::Error> {
         sqlx::query_as::<_, AffinityEventRow>(
-            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.created_at \
+            "SELECT e.id, e.event_type, e.deltas, e.effective_deltas, e.label_changes, e.effective_line_deltas, e.state_before, e.state_after, e.user_message_id, e.created_at \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1 \
@@ -383,6 +386,9 @@ impl<'a> AffinityRepo<'a> {
     /// `levels`: the judge's absolute endpoint reads. A `Some` overwrites the
     /// stored level; a `None` (omitted field / skipped eval) holds it. The
     /// endpoint values themselves are recomputed either way.
+    ///
+    /// `user_message_id`: the user message that drove the turn; `None` for
+    /// proactive / time-decay writes.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern
     pub async fn persist_with_event(
         &self,
@@ -397,6 +403,7 @@ impl<'a> AffinityRepo<'a> {
         levels: EndpointLevelReads,
         llm_attempts: Option<serde_json::Value>,
         gateway_errors: Option<serde_json::Value>,
+        user_message_id: Option<Uuid>,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -578,8 +585,8 @@ impl<'a> AffinityRepo<'a> {
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, label_changes, effective_line_deltas, context, \
                 state_before, state_after, model, usage, generation_id, \
-                llm_attempts, gateway_errors) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                llm_attempts, gateway_errors, user_message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(current.id)
         .bind(event_type)
@@ -595,6 +602,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(meta.and_then(|m| m.generation_id.clone()))
         .bind(llm_attempts)
         .bind(gateway_errors)
+        .bind(user_message_id)
         .execute(&mut *tx)
         .await?;
 
@@ -617,7 +625,11 @@ impl<'a> AffinityRepo<'a> {
     /// audit row that never existed in the table, and the next turn, reading
     /// the row under lock, would show the relationship jumping back up with no
     /// event to explain it. Both snapshots come off the row.
-    pub async fn record_ghost(&self, affinity: &mut Affinity) -> Result<(), sqlx::Error> {
+    pub async fn record_ghost(
+        &self,
+        affinity: &mut Affinity,
+        user_message_id: Option<Uuid>,
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
         let before = sqlx::query_as::<_, AffinityRow>(
@@ -649,14 +661,15 @@ impl<'a> AffinityRepo<'a> {
         sqlx::query(
             "INSERT INTO engine.companion_affinity_events \
                (affinity_id, event_type, deltas, effective_deltas, effective_line_deltas, context, \
-                state_before, state_after) \
-             VALUES ($1, 'ghost', '{}'::jsonb, $2, $3, '{}'::jsonb, $4, $5)",
+                state_before, state_after, user_message_id) \
+             VALUES ($1, 'ghost', '{}'::jsonb, $2, $3, '{}'::jsonb, $4, $5, $6)",
         )
         .bind(affinity.id)
         .bind(zero)
         .bind(zero_line)
         .bind(state_snapshot(&before))
         .bind(state_snapshot(&after))
+        .bind(user_message_id)
         .execute(&mut *tx)
         .await?;
 
@@ -691,6 +704,7 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
         )
@@ -852,6 +866,7 @@ mod tests {
                 EndpointLevelReads::default(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -909,6 +924,7 @@ mod tests {
             EndpointLevelReads::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -959,6 +975,7 @@ mod tests {
                 ctx,
                 None,
                 EndpointLevelReads::default(),
+                None,
                 None,
                 None,
             )
@@ -1035,6 +1052,7 @@ mod tests {
             EndpointLevelReads::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1072,8 +1090,8 @@ mod tests {
         assert_eq!(a.ghost_streak, 0);
         assert_eq!(a.total_ghosts, 0);
 
-        repo.record_ghost(&mut a).await.unwrap();
-        repo.record_ghost(&mut a).await.unwrap();
+        repo.record_ghost(&mut a, None).await.unwrap();
+        repo.record_ghost(&mut a, None).await.unwrap();
 
         let reloaded = repo.load(session_id).await.unwrap().unwrap();
         assert_eq!(reloaded.ghost_streak, 2);
@@ -1107,6 +1125,7 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
         )
@@ -1166,6 +1185,7 @@ mod tests {
             EndpointLevelReads::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1195,6 +1215,7 @@ mod tests {
             serde_json::json!({}),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
         )
@@ -1257,6 +1278,7 @@ mod tests {
                     EndpointLevelReads::default(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1314,6 +1336,7 @@ mod tests {
                 EndpointLevelReads::default(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1369,6 +1392,7 @@ mod tests {
             serde_json::json!({ "affinity_reason": "他坦白了" }),
             None,
             EndpointLevelReads::default(),
+            None,
             None,
             None,
         )
@@ -1440,7 +1464,7 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        repo.record_ghost(&mut a).await.unwrap();
+        repo.record_ghost(&mut a, None).await.unwrap();
 
         let eff: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT effective_deltas FROM engine.companion_affinity_events \
@@ -1493,6 +1517,7 @@ mod tests {
                 EndpointLevelReads::default(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1513,6 +1538,7 @@ mod tests {
                 serde_json::json!({}),
                 None,
                 EndpointLevelReads::default(),
+                None,
                 None,
                 None,
             )
@@ -1976,7 +2002,7 @@ mod tests {
             "precondition: 30 days must cool the in-memory copy below the row"
         );
 
-        repo.record_ghost(&mut in_memory).await.unwrap();
+        repo.record_ghost(&mut in_memory, None).await.unwrap();
 
         let (before, after): (serde_json::Value, serde_json::Value) = sqlx::query_as(
             "SELECT state_before, state_after FROM engine.companion_affinity_events \
@@ -2144,6 +2170,7 @@ mod tests {
             serde_json::json!({}),
             None,
             levels,
+            None,
             None,
             None,
         )
@@ -2319,6 +2346,7 @@ mod tests {
             EndpointLevelReads::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2415,7 +2443,7 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
-        repo.record_ghost(&mut a).await.unwrap();
+        repo.record_ghost(&mut a, None).await.unwrap();
 
         let (before, after): (Option<serde_json::Value>, Option<serde_json::Value>) =
             sqlx::query_as(
@@ -2435,5 +2463,154 @@ mod tests {
             assert_eq!(before.get(k), after.get(k), "a ghost moves no axis ({k})");
         }
         assert_ne!(before.get("total_ghosts"), after.get("total_ghosts"));
+    }
+
+    /// Read the newest event's `user_message_id` for a session straight from
+    /// the table, so these tests don't depend on the row struct being right.
+    async fn newest_event_user_message_id(pool: &PgPool, session_id: Uuid) -> Option<Uuid> {
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT e.user_message_id \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 \
+             ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_stores_user_message_id(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let umid = insert_cutoff_msg(&pool, session_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            Some(umid),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            newest_event_user_message_id(&pool, session_id).await,
+            Some(umid)
+        );
+        // The row struct carries it too, on both readers.
+        let latest = repo.latest_turn_event(session_id).await.unwrap().unwrap();
+        assert_eq!(latest.user_message_id, Some(umid));
+        let listed = repo.list_events(session_id, 10, 0, None).await.unwrap();
+        assert_eq!(listed[0].user_message_id, Some(umid));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_none_reads_back_null(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        persist_rule(&repo, &mut a, AffinityDeltas::default()).await;
+
+        assert_eq!(newest_event_user_message_id(&pool, session_id).await, None);
+        let latest = repo.latest_turn_event(session_id).await.unwrap().unwrap();
+        assert_eq!(latest.user_message_id, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn record_ghost_stores_user_message_id(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let umid = insert_cutoff_msg(&pool, session_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        repo.record_ghost(&mut a, Some(umid)).await.unwrap();
+
+        assert_eq!(
+            newest_event_user_message_id(&pool, session_id).await,
+            Some(umid)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_message_id_is_a_real_foreign_key(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+
+        // An id that is not a chat_messages row must be rejected by the DB,
+        // not silently stored — proves the FK exists, not just the column.
+        let err = repo
+            .record_ghost(&mut a, Some(Uuid::new_v4()))
+            .await
+            .expect_err("unknown message id must violate the FK");
+        let db_err = err.as_database_error().expect("a database error");
+        assert!(
+            db_err.is_foreign_key_violation(),
+            "expected a foreign-key violation, got {db_err:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleting_the_message_nulls_the_pointer_and_keeps_the_event(pool: PgPool) {
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = make_session(&pool, user_id, instance_id).await;
+        let umid = insert_cutoff_msg(&pool, session_id).await;
+        let mut a = repo
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        repo.record_ghost(&mut a, Some(umid)).await.unwrap();
+
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(umid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // SET NULL, not CASCADE: the event survives, the pointer is blanked.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "event row must survive the message delete");
+        assert_eq!(newest_event_user_message_id(&pool, session_id).await, None);
     }
 }
