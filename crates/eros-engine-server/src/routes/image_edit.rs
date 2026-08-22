@@ -217,6 +217,61 @@ mod payload_tests {
         let out = compose_edit_payload("银发红瞳", "   ", None, "换套衣服", "anime", "3:4");
         assert!(out.contains("[原图]\n（无）"), "got {out}");
     }
+
+    #[test]
+    fn edit_inputs_json_has_exactly_the_seven_documented_keys() {
+        // A renamed or dropped key on this audit row is a silent contract
+        // break for anyone reading `engine.chat_images_events`; lock the key
+        // SET so it fails here instead of shipping.
+        use eros_engine_core::persona::{CompanionPersona, PersonaGenome, PersonaInstance};
+        let iid = uuid::Uuid::new_v4();
+        let gid = uuid::Uuid::new_v4();
+        let persona = CompanionPersona {
+            instance_id: iid,
+            genome: PersonaGenome {
+                id: gid,
+                name: "Mia".into(),
+                system_prompt: "You are Mia.".into(),
+                tip_personality: Some("normal".into()),
+                art_metadata: serde_json::json!({ "appearance": "银发红瞳" }),
+            },
+            instance: PersonaInstance {
+                id: iid,
+                genome_id: gid,
+                owner_uid: uuid::Uuid::new_v4(),
+                status: "active".into(),
+            },
+        };
+        let value = super::compose_edit_inputs_json(
+            &persona,
+            uuid::Uuid::new_v4(),
+            "在天台看夕阳的少女",
+            Some("在天台看夕阳"),
+            "换套衣服",
+            "anime",
+            Some("3:4"),
+        );
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "appearance",
+                "aspect_ratio",
+                "instruction",
+                "source_caption",
+                "source_message_id",
+                "source_subject",
+                "style",
+            ],
+            "got {value}"
+        );
+    }
 }
 
 /// Revise an existing image turn.
@@ -664,6 +719,27 @@ mod tests {
                 &token,
                 json!({"instruction": "换套衣服", "aspect_ratio": "7:3"}),
             ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_edit_422_when_instruction_exceeds_max_chars(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let too_long = "换".repeat(MAX_INSTRUCTION_CHARS + 1);
+        let (status, _) = send_request(
+            &mut app,
+            edit_req(session_id, mid, &token, json!({"instruction": too_long})),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

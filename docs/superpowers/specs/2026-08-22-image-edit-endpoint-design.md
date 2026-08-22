@@ -81,9 +81,11 @@ third meaning on the request body would make the docs unreadable.
 | 403 | session not owned by the JWT user | `not your session` |
 | 404 | no such message in this session | `no such message` |
 | **409** | message exists but has no `metadata.image` | `not an image turn` |
+| 409 | the source image turn has no originating user message, or the session has no persona instance | (unreachable on every engine-written path; the edit has nothing to attach to) |
 | 422 | `instruction` blank, `aspect_ratio` off the allow-list | validation message |
 | 501 | no composer configured (§3.1) | `image prompt composer not configured` |
-| 502 | composer chain exhausted | `image prompt composer failed` |
+| 429 | per-user in-flight cap reached (`CONCURRENT_STREAMS_PER_USER`, shared with chat/voice/compose) | `per-user in-flight cap reached` |
+| 5XX | composer chain exhausted | `image prompt composer failed` |
 | 200 | — | `ImageEditResponse` |
 
 **409, not 404, for "not an image turn".** The message *was* found; what is
@@ -113,8 +115,11 @@ pub struct ImageEditResponse {
     pub composed_prompt: String,
     /// Always `"previous"` on an edit turn; see §3.3.
     pub image_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<String>,
-    /// The composer's caption for the new picture; `null` when it gave none.
+    /// The composer's caption for the new picture; the field is omitted
+    /// entirely (not `null`) when it gave none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
 }
 ```
@@ -255,17 +260,24 @@ composer refuses or fails, and on which models.
   row interleaves wherever its `created_at` falls. Accepted — the voice and
   chat pipelines already write to one session concurrently, and the edit row
   carries no state the in-flight turn reads.
-- One composer call per request, no per-user cap. Every call is audited
-  (§3.4). Default-open; the gate gets ratcheted if the reading says so.
+- One composer call per request, guarded by the same per-user in-flight cap as
+  chat, voice and the standalone composer (`CONCURRENT_STREAMS_PER_USER`, 429
+  over cap). Not a new gate: it is the throttle every user-triggered LLM entry
+  point already carries, and omitting it would have made this the only
+  unbounded one. Every call is audited (§3.4).
 
 ## 4. Implementation shape
 
 - `crates/eros-engine-server/src/routes/image_edit.rs` — DTOs, handler,
   `router()`; merged (not nested) into both `router()` and
   `router_for_openapi()` in `routes/mod.rs`, like `insight.rs`.
-- `pipeline/stream.rs` — `run_image_prompt_compose` takes `(payload, task)`;
-  new `compose_edit_payload(...)` and `compose_edit_inputs_json(...)` pure
-  functions; `build_delegated_image_marker` gains `edit_of`.
+- `pipeline/stream.rs` — the shared refactor only: `render_compose_payload`,
+  the parameterized `run_image_prompt_compose`, and `build_delegated_image_marker`
+  gaining `edit_of`. The edit-specific renderers (`compose_edit_payload`,
+  `render_edit_payload`, `compose_edit_inputs_json`) live in
+  `routes/image_edit.rs` instead, alongside the handler that is their only
+  caller — `stream.rs` is already the workspace's largest file, and a
+  single-caller function does not earn a place in it.
 - `crates/eros-engine-llm/src/model_config.rs` — `DEFAULT_EDIT_PROMPT`,
   `resolve_image_edit_compose`, `KNOWN_CHAT_TASKS` entry, validator case.
 - `crates/eros-engine-store/migrations/0057_…` — CHECK widening.

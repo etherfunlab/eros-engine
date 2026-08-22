@@ -442,6 +442,65 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 [部署 → 運維注意事項](deploying.zh.md#運維注意事項)。设计文档：
 [async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md)。
 
+### `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
+
+改一张角色已经发过的图。`{message_id}` 指向一个图片回合 —— 历史里带
+`"image": true` 的那条消息。引擎用这张图的画面主体加上这条指令合成新的图片
+提示词，落一条新的纯图片 assistant 消息，并返回它的 `image_request` 载荷；
+消费方照常画，与聊天里的图片回合一致。
+
+```json
+{
+  "instruction": "换套衣服",
+  "style": "realistic",
+  "aspect_ratio": "3:4",
+  "prompt_variant": "a"
+}
+```
+
+- `instruction` —— 必填，非空白，≤4096 字。要改什么，用用户自己的话写。
+  它是画图的输入，不是一条聊天消息：只记在审计行上，不落成对话。
+- `style` —— `realistic`（缺省）| `semi_realistic` | `anime`。传原图用的风格；
+  引擎不会把风格记在消息上。
+- `aspect_ratio` —— `1:1` | `3:4` | `4:3` | `9:16` | `16:9`。缺省沿用原图回合的。
+- `prompt_variant` —— 选 `[tasks.chat_image_edit_compose].filter_prompt` 的变体，
+  规则与聊天路径的 `image.prompt_variant` 相同。
+
+```json
+{
+  "message_id": "…",
+  "edit_of": "…",
+  "composed_prompt": "<base64>",
+  "image_ref": "previous",
+  "aspect_ratio": "3:4",
+  "caption": "换了条裙子"
+}
+```
+
+`composed_prompt` 是 UTF-8 提示词的 base64（STANDARD）—— 与 SSE `image_request`
+帧、恢复端点的编码一致，现成的画图链路可直接消费。`image_ref` 恒为 `previous`，
+在编辑回合里它指的是 **`edit_of` 那张图**，不是消费方最后画的那张。
+
+新消息就是一个普通的图片回合：历史里带 `"image": true`，提示词可经
+`GET /comp/chat/{session_id}/messages/{message_id}/image-request` 恢复。它的
+`metadata.image` 另外带一个 `edit_of`。编辑出来的图还可以再编辑。
+
+回合的其余部分一概不跑：不做 PDE 判定、不动好感度、不抽 insight 与记忆。
+新行沿用原图行的 `user_message_id` —— 这次编辑属于原图所回应的那个回合。
+
+| 状态码 | 含义 |
+|---|---|
+| 403 | 不是你的 session |
+| 404 | session 不存在，或该 session 里没有这条消息 |
+| **409** | 消息存在，但不是图片回合 |
+| 422 | `instruction` 空白，或 `aspect_ratio` 不支持 |
+| 501 | `[tasks.chat_image_edit_compose]` 与 `[tasks.chat_image_prompt_compose]` 都没配 |
+| 429 | 达到每用户并发上限（3，与 chat/voice/compose 共用） |
+| 5XX | 合成链走完仍无输出 —— 透传供应商自己的状态码与响应体，与 compose 端点一致。**不落任何消息**，可安全重试 |
+
+需要 `[tasks.chat_image_edit_compose]` **或** `[tasks.chat_image_prompt_compose]`：
+只配后者时，编辑走聊天合成器的模型链，用引擎内置的编辑提示词。
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 分頁讀消息歷史，最新在前。`limit` 默认 20（上限 50）。

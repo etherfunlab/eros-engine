@@ -400,6 +400,13 @@ prompt，或者独立端点 `POST /persona/{instance_id}/image/compose` 的任�
 | `gateway_errors` | `JSONB?` | 我们通往 provider 的路断掉的每一个 hop。一个都没有时为 NULL。 |
 | `created_at` | `TIMESTAMPTZ` | |
 
+- `image_edit` —— `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`。
+  它的 `inputs` 是七个键，不是聊天合成器的五个：`appearance`、`source_message_id`、
+  `source_subject`、`source_caption`、`instruction`、`style`、`aspect_ratio`。
+  看 `source` 就知道该按哪种形状读。按 `status` 分组查
+  `engine.chat_images_events WHERE source = 'image_edit'`，就是「编辑被用得多不多、
+  合成器多久拒一次」的读数。
+
 `status` 刻意只有三个值：`exhausted` 表示「这次调用没产出可用的合成结果」，
 涵盖包括流式端点中途死掉在内的所有原因，具体区分交给 `last_failure`。
 

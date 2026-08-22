@@ -452,6 +452,14 @@ delegated image prompt, or the standalone `POST
 | `gateway_errors` | `JSONB?` | Every hop where our path to the provider broke. NULL when there were none. |
 | `created_at` | `TIMESTAMPTZ` | |
 
+- `image_edit` — `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`.
+  Its `inputs` carries seven keys rather than the chat composer's five:
+  `appearance`, `source_message_id`, `source_subject`, `source_caption`,
+  `instruction`, `style`, `aspect_ratio`. `source` says which shape to expect.
+  `engine.chat_images_events WHERE source = 'image_edit'` grouped by `status`
+  is the reading for how often edits are asked for and how often the composer
+  refuses.
+
 `status` is deliberately three values: `exhausted` means "no usable compose
 result from this call" for every reason including a mid-stream death on the
 streaming endpoint, and `last_failure` carries the distinction.
