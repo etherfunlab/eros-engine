@@ -2112,14 +2112,22 @@ impl ModelConfig {
             None | Some(PromptSpec::Plain(_)) => None,
             Some(_) => selected.and(variant).map(str::to_string),
         };
-        if selected.is_none()
-            && variant.is_some()
-            && edit_cfg.is_some_and(|c| c.filter_prompt.is_some())
-        {
-            tracing::warn!(
+        match compose_variant_log_event(
+            selected,
+            variant,
+            edit_cfg.is_some_and(|c| c.filter_prompt.is_some()),
+        ) {
+            Some(ComposeVariantLogEvent::Mismatch) => tracing::warn!(
                 variant = ?cap_for_log(variant.unwrap_or_default(), 64),
                 "image-edit: variant not found; using the built-in prompt"
-            );
+            ),
+            Some(ComposeVariantLogEvent::Selected) => {
+                tracing::debug!(
+                    variant = ?cap_for_log(variant.unwrap_or_default(), 64),
+                    "image-edit: variant selected"
+                )
+            }
+            None => {}
         }
         let compose_prompt = selected
             .map(str::trim)
