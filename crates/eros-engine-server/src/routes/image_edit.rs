@@ -540,6 +540,11 @@ mod tests {
     }
 
     const EDIT_TASK_TOML: &str = "[tasks.chat_image_edit_compose]\nmodel = \"editor\"\n";
+    /// No `[tasks.chat_image_edit_compose]` — the config every existing
+    /// deployment is already in. Exercises the fallback branch of
+    /// `resolve_image_edit_compose` and the handler's
+    /// `.expect("has_task checked above")`.
+    const COMPOSE_ONLY_TOML: &str = "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n";
 
     /// A user row plus an assistant image turn pointing back at it. Returns
     /// (user_message_id, image_message_id).
@@ -899,6 +904,45 @@ mod tests {
         assert!(
             sent.contains("[修改要求]"),
             "the edit payload must be sent: {sent}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn image_edit_falls_back_to_the_compose_chain_and_the_built_in_edit_prompt(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+
+        let mock = MockServer::start().await;
+        mount_editor(&mock).await;
+        // Only [tasks.chat_image_prompt_compose] is configured — no
+        // [tasks.chat_image_edit_compose] block at all.
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), COMPOSE_ONLY_TOML);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(session_id, mid, &token, json!({"instruction": "换套衣服"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        // The chat composer's chain drove the call (its model is "composer"),
+        // but the built-in EDIT prompt was used — never the chat composer's
+        // own filter_prompt, which is written to compose from conversation
+        // context, not to revise a picture.
+        let reqs = mock.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            sent.contains("composer"),
+            "the compose block's model must drive the fallback chain: {sent}"
+        );
+        assert!(
+            sent.contains("You revise a picture"),
+            "the built-in EDIT prompt must be used, not the chat composer's own prompt: {sent}"
         );
     }
 

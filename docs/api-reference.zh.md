@@ -490,6 +490,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 | 状态码 | 含义 |
 |---|---|
+| 401 | bearer 缺失或无效 |
 | 403 | 不是你的 session |
 | 404 | session 不存在，或该 session 里没有这条消息 |
 | **409** | 消息存在，但不是图片回合 |

@@ -341,7 +341,7 @@ model_name_display_override = true
 #max_tokens   = 700
 #reasoning    = { enabled = false }
 #
-# This is the ONLY task whose `filter_prompt` accepts VARIANTS. The consumer
+# This task's `filter_prompt` accepts VARIANTS. The consumer
 # picks one per chat turn via `image.prompt_variant` on the send-message body.
 # Three shapes:
 #

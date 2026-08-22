@@ -490,6 +490,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
+| `chat_image_edit_compose` | `routes::image_edit`，通过 `resolve_image_edit_compose()`（`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit` 的图片-EDIT 合成器；根据一条指令改写角色已发过的图。**即便对该端点本身也是可选的**——块缺失时端点走 `[tasks.chat_image_prompt_compose]` 的模型链与参数，配上引擎内置的编辑 prompt；两块都缺失时端点回 501） | live（可选） |
 | `chat_vision` | `pipeline::stream`，通过 `resolve_vision()`（视觉预处理阶段：在 reply prompt 前将 `image_url` 附件描述为 JSON；任务块缺失或 `filter_prompt` 为空白时关闭） | live（opt-in） |
 | `chat_product_qa` | `pipeline::stream`，通过 `resolve_product_qa()`（PDE `product_qa` 动作的出戏产品问答执行器；任务块缺失或 `filter_prompt` 为空白时关闭；还需要 LLM PDE 已启用） | live（opt-in） |
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
@@ -511,6 +512,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
+- `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose`，通过 `resolve_image_edit_compose()`（图片-EDIT 合成器，编辑端点每次请求都会解析；编辑块缺失时回退到 `[tasks.chat_image_prompt_compose]` 的模型链——详见下文）
 
 `embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器
 `ModelConfig::resolve_embedding()`，在 `main.rs` 启动时调用一次来构建
@@ -624,7 +626,7 @@ max_tokens   = 700
 
 **内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
 
-**变体（variants）。** 这是**唯一**一个 `filter_prompt` 接受纯字符串以外形态的任务。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
+**变体（variants）。** 这个任务的 `filter_prompt` 接受纯字符串以外的形态（`[tasks.chat_image_edit_compose]` 的也接受，见下文）。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
 
 ```toml
 filter_prompt = "…"                       # 单一提示词；prompt_variant 被忽略
@@ -649,13 +651,39 @@ b = """
 
 `prompt_variant = "raw"` 不带任何特殊含义。它和其他任意变体名一样，只有当该部署把某个变体配置在这个字面量 key 下（不论大小写）时才会命中；下标/key 没命中——包括未配置的 `"raw"`——都会像其他任何 miss 一样回退到上面的内置提示词，绝不报错。`raw` 不再是保留字：表里出现字面量为 `raw` 的 key 可以正常启动。
 
-变体只在这一个任务上生效。任何其他任务的数组/表形态 `filter_prompt` 都会拒绝启动，而不是留在那里永远选不到。本任务自己的 `[tasks.chat_image_prompt_compose.tiers.*]` 块则**不论写什么**都会拒绝启动——合成器解析时永远不走 tier，整个块都不可达（见上方"tier 块只对两个任务生效"）。
+变体只在这一个任务和 `[tasks.chat_image_edit_compose]` 上生效。任何其他任务的数组/表形态 `filter_prompt` 都会拒绝启动，而不是留在那里永远选不到。本任务自己的 `[tasks.chat_image_prompt_compose.tiers.*]` 块则**不论写什么**都会拒绝启动——合成器解析时永远不走 tier，整个块都不可达（见上方"tier 块只对两个任务生效"）。
 
 调用点：`crates/eros-engine-server/src/pipeline/stream.rs`，通过 `model_config.rs` 中的 `resolve_image_prompt_compose()`。
 
 **审计。** 一次成功的合成器调用——包括上面提到的"非 JSON 回退路径"，它同样算作成功——会向图片轮次的 `chat_messages.metadata.image` 写入三个键：`compose_variant`（命中了 `filter_prompt` 的哪个 key/下标；纯字符串或内置提示词时缺失；按调用方传入的值记录（已 trim），不做归一化——例如索引形态里 `"01"` 命中下标 1，审计时仍记为 `"01"`）、`compose_model`（实际应答的模型），以及 `compose_generation_id`。只有当合成器调用本身失败（fail-open 降级）或该任务未配置时，三者才会缺失——语义与 affinity 审计三元组的 NULL 语义一致（`raw` 已不带特殊含义，因此不再是这里的独立情形）。合成器的 `caption` 单独持久化为 `metadata.image.caption`：只要回复解析为带非空 `caption` 字段的 JSON 就会被设置，否则为 `None`——包括"成功但非 JSON"的回复，此时整段回复变成 `prompt`，没有 caption。`metadata.image.prompt`——合成器的 `prompt` 字段，也就是真正的出图主体——**会**持久化在每个图片轮次上；它正是 `build_delegated_image_marker` 写入、与上面审计三元组同行的那个字段。
 
 **每一次合成器调用——不论成功失败、不论来自哪个调用方——都会另外落一行到 `engine.chat_images_events`**（迁移 0045）：完整的 usage 块、拼装出的 wire prompt（`composed_prompt`——style 预设 + 人格外观 + subject，也就是图像供应商实际会收到的那个字符串）、链路遍历的事实（`attempts` / `last_failure`），以及合成器当时看到的五个原始输入。`metadata.image.compose_event_id` 指向那一行——反向查找走 assistant 行 → `compose_event_id` → `chat_images_events`，绝不是反过来。用量/费用和拼装出的 wire prompt **不会**重复写进 `chat_messages.metadata.image` 本身；要对账，要么 join `compose_event_id` 去查审计表，要么拿 generation id 去供应商日志里对。详见 [LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)。设计文档：`docs/superpowers/specs/2026-08-02-image-compose-audit-design.md`（上面 `metadata.image` 的键）与 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`（`chat_images_events`）。
+
+### `[tasks.chat_image_edit_compose]` — 图片-EDIT 合成器（可选）
+
+为 `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
+供电（见 [api-reference.zh.md](api-reference.zh.md)）：前端指定一个已存在的
+图片回合和一条指令（"换套衣服"），这个任务从那张图的画面主体加上指令合成
+新的图片 prompt。结构与上面的 `[tasks.chat_image_prompt_compose]` 相同
+（`model`、`fallback`、`retry_depth`、`temperature`、`max_tokens`、
+`reasoning`、采样旋钮），`filter_prompt` 同样是**可选**的，接受同样的三种
+形态（纯字符串 / 按下标 / 按 key），通过编辑请求体上的 `prompt_variant`
+逐次选择。
+
+**即便对该端点本身，这个块也是可选的。** 块缺失时，端点走
+`[tasks.chat_image_prompt_compose]` 的模型链与参数，用引擎内置的编辑
+prompt，而不是聊天合成器自己的 `filter_prompt`（那个是为从对话上下文生成
+图片写的，不是为改一张既有图片写的）——所以配置好图片轮次就已经足够拿到
+编辑能力，不需要额外配置。**两个块都缺失**时端点回 501。要给编辑单独配
+模型或单独调 prompt，就配这个块。
+
+因为回退路径是通过 `[tasks.chat_image_prompt_compose]` 本身解析的
+（`resolve("chat_image_prompt_compose", None)`），它会像一次真正的聊天出图
+合成调用一样，推进该任务的 `model` round-robin 游标——没配编辑块的部署上，
+编辑流量会影响**下一次聊天出图合成**落到哪个模型上。
+
+调用点：`crates/eros-engine-server/src/routes/image_edit.rs`，通过
+`model_config.rs` 中的 `resolve_image_edit_compose()`。
 
 ### `[tasks.chat_vision]` — 图片输入（视觉预处理阶段，opt-in）
 
@@ -915,7 +943,7 @@ model = { "x-ai/grok-4.20" = 0.8, "z-ai/glm-4.7-flash" = 0.2 }  # weighted rando
 
 去重之后，链会被截断到 `retry_depth` 条——每次调用先试 primary，再最多试 `retry_depth` 个 fallback，截断点之后的条目永远不会被尝试。`retry_depth` 可在任务级设置，在两个 tier 感知任务上还可按 tier 覆盖（tier > 任务默认块）。
 
-默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`chat_product_qa`、`chat_image_prompt_compose`）用 `1`（primary + 第一个 fallback）。
+默认值按任务不同。通用 `resolve()` 用 `2`（primary + 2 个 fallback——所以 `chat_companion` 每轮流式聊天 burst 最多试 3 个模型）；单一用途任务（`chat_output_filter`、`chat_input_filter`、`chat_vision`、`pde_decision`、`chat_product_qa`、`chat_image_prompt_compose`、`chat_image_edit_compose`）用 `1`（primary + 第一个 fallback）。
 
 ## 稳定性承诺
 

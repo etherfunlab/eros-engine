@@ -567,6 +567,7 @@ insight or memory extraction. The new row inherits the source's
 
 | Status | Meaning |
 |---|---|
+| 401 | missing or invalid bearer |
 | 403 | not your session |
 | 404 | unknown session, or no such message in it |
 | **409** | the message exists but is not an image turn |

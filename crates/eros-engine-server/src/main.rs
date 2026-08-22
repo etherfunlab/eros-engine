@@ -254,7 +254,8 @@ async fn run_server() -> Result<()> {
     // [tasks.insight_extraction] would otherwise surface as "filter_prompt is
     // unset" (telling an operator who just set it to set it) instead of the
     // accurate "uses a variant shape, but only [tasks.chat_image_prompt_compose]
-    // reads variants" from `validate_prompt_variants`.
+    // and [tasks.chat_image_edit_compose] read variants" from
+    // `validate_prompt_variants`.
     if let Err(msg) = model_config.validate_prompt_variants() {
         anyhow::bail!(msg);
     }

@@ -82,7 +82,7 @@ third meaning on the request body would make the docs unreadable.
 | 404 | no such message in this session | `no such message` |
 | **409** | message exists but has no `metadata.image` | `not an image turn` |
 | 409 | the source image turn has no originating user message, or the session has no persona instance | (unreachable on every engine-written path; the edit has nothing to attach to) |
-| 422 | `instruction` blank, `aspect_ratio` off the allow-list | validation message |
+| 422 | `instruction` blank, `instruction` over `MAX_INSTRUCTION_CHARS` (4096 — parity with the standalone composer's `content` limit), or `aspect_ratio` off the allow-list | validation message |
 | 501 | no composer configured (§3.1) | `image prompt composer not configured` |
 | 429 | per-user in-flight cap reached (`CONCURRENT_STREAMS_PER_USER`, shared with chat/voice/compose) | `per-user in-flight cap reached` |
 | 5XX | composer chain exhausted | `image prompt composer failed` |
@@ -151,6 +151,15 @@ The compose block is the gate — an operator who enabled image turns gets edits
 with no further config, on the same models, with the engine prompt. The edit
 block exists so the prompt and the model can be tuned separately once there is
 a reading to tune against (the `image_edit` audit rows, §3.4).
+
+In fallback mode `resolve_image_edit_compose` resolves the chain by calling
+`resolve("chat_image_prompt_compose", None)` — the same call the chat path's
+own `resolve_image_prompt_compose` makes. On a round-robin or weighted
+`model`, that call advances the **same** cursor both call sites share (it
+lives on the one `ModelSpec` stored under `[tasks.chat_image_prompt_compose]`
+in `ModelConfig::tasks`). Correct given the two features deliberately share a
+chain, but worth stating: on a deployment with no edit block configured,
+edit traffic shifts which model the *next chat image compose* call lands on.
 
 Housekeeping that comes with a new task: `KNOWN_CHAT_TASKS` gains
 `chat_image_edit_compose`; the wire `task` on the composer call is
@@ -266,6 +275,17 @@ composer refuses or fails, and on which models.
   over cap). Not a new gate: it is the throttle every user-triggered LLM entry
   point already carries, and omitting it would have made this the only
   unbounded one. Every call is audited (§3.4).
+- **Idempotent chat replay picks up edit rows.** `upsert_user_message_in_tx`
+  (the dedup path behind `POST /comp/chat/{session_id}/message/stream` and the
+  async endpoint) selects a replayed turn's `assistant_chain` by
+  `WHERE user_message_id = $1 AND role = 'assistant'` — no `channel` filter,
+  no restriction to rows the streaming pipeline itself wrote. Because an edit
+  row's `user_message_id` is the source's, it lands in that `assistant_chain`
+  when its originating turn is replayed. Traced and harmless: `replay_stream`
+  skips the `Delta` frame on any row with empty `content` (every image-only
+  row, edits included) and never emits an `image_request` frame at all — it
+  already treats a chat-path image-only row this way, and an edit row is
+  wire-identical to one for this purpose.
 
 ## 4. Implementation shape
 
@@ -316,7 +336,12 @@ composer refuses or fails, and on which models.
   the built-in prompt.
 - `DEFAULT_EDIT_PROMPT` is non-empty and names both output fields (guards a
   broken-constant edit).
-- The shipped example config parses with the new task present.
+- The shipped example config still parses and boots with the new task's block
+  left commented out, exactly like the composer block above it — implemented
+  as `committed_example_config_leaves_the_image_edit_task_commented_out`,
+  which also asserts `validate_prompt_variants` accepts it. This guards
+  against a stray uncomment turning the example into a config that calls a
+  model nobody asked for, not against the block being absent altogether.
 
 **Server (`sqlx::test`, mocked OpenRouter, mirroring the recovery-endpoint
 tests):**

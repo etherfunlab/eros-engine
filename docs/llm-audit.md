@@ -338,7 +338,7 @@ strictly finer than one would have been: it separates `chat_companion` from
 | `chat_output_filter` | `chat_messages` | assistant |
 | `chat_input_filter` | `chat_messages` | **user** |
 | `chat_vision` | `chat_vision_events` | — |
-| `chat_image_prompt_compose` | `chat_images_events` | — |
+| `chat_image_prompt_compose` / `chat_image_edit_compose` | `chat_images_events` | — |
 | `pde_decision` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 
@@ -427,13 +427,14 @@ deployment.
 ### `engine.chat_images_events`
 
 One row per image-composer LLM call, from **any** caller — a chat turn's
-delegated image prompt, or the standalone `POST
-/persona/{instance_id}/image/compose` endpoint in either streaming mode.
+delegated image prompt, the standalone `POST
+/persona/{instance_id}/image/compose` endpoint in either streaming mode, or
+`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`.
 
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | `UUID` | Row id — see linkage below. |
-| `source` | `TEXT` | `chat_reply_text_image` \| `chat_reply_image` \| `compose_endpoint` \| `compose_endpoint_stream`. |
+| `source` | `TEXT` | `chat_reply_text_image` \| `chat_reply_image` \| `compose_endpoint` \| `compose_endpoint_stream` \| `image_edit` (see below). |
 | `user_id` | `UUID` | |
 | `instance_id` | `UUID?` | Persona instance; NULL when the caller has none in scope. |
 | `session_id` | `UUID?` | Chat session; NULL on the standalone endpoint (no session). |
@@ -441,14 +442,14 @@ delegated image prompt, or the standalone `POST
 | `inputs` | `JSONB` | The five composer slots, structured: `{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`. Empty slots are `""`, not the `（无）` placeholder the prompt renders — that substitution is a rendering detail, not an input. `latest_user_msg` differs by `source`: `chat_reply_image` passes the raw `user_msg.content`, while `chat_reply_text_image` passes `effective_user_msg` — the post-input-filter rewrite. Both faithfully record what the composer actually saw on that turn; an operator diffing rows across the two sources should expect the difference, not read it as an inconsistency. |
 | `subject` | `TEXT?` | The composer's own `prompt` field. NULL unless `status = "ok"`. |
 | `caption` | `TEXT?` | NULL when the composer produced none, including the non-JSON fallback reply, where the whole reply becomes `subject` instead. |
-| `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows, which fail without assembling anything. |
+| `composed_prompt` | `TEXT?` | The assembled wire string — style preset + persona appearance + subject, i.e. exactly what the downstream consumer is handed. Stored on **every** row that produced one, including `exhausted` and `not_configured` on the chat path (the portrait fallback still assembles a wire prompt, and this column is then the only record anywhere of what was drawn). NULL only on the standalone endpoint's `exhausted` rows and the `image_edit` endpoint's `exhausted` rows — both fail without assembling anything (the edit endpoint has no portrait fallback either). |
 | `variant` | `TEXT?` | The resolved `prompt_variant` key; `"raw"` is an ordinary key, not a skip. |
 | `model` | `TEXT?` | The model that answered, on success. Also populated on `exhausted` whenever the LAST attempt got a response back at all: `empty`/`empty_prompt` on the chat path and the non-stream endpoint (both walk `run_image_prompt_compose`'s shared chain), and on the standalone endpoint's streaming mode also a candidate that streamed metadata (model/generation_id/usage) and then broke — that evidence is retained because the provider answered and may have been billed. NULL when no response ever came back on any path: a break or timeout that captured nothing at all, or `not_configured` (no call was made). **Since v1.4.0 the "did the provider answer?" test lives ENTIRELY in this trio** (`model` / `generation_id` / `usage`); `last_failure` no longer doubles as a second, coarser copy of it, which is why the two labels that used to encode it (`stream_open_failed` / `stream_died_midway`) are gone. |
 | `usage` | `JSONB?` | Full unfiltered OpenRouter usage block, `serde_json::to_value`'d — `OPENROUTER_USAGE_HIDDEN_KEYS` filters the wire copy only, never this. Travels with `model`: populated exactly where `model` is. |
 | `generation_id` | `TEXT?` | Travels with `model`. |
 | `attempts` | `SMALLINT` | Models actually called off `[primary, ...fallback]`; `0` for `not_configured`. |
 | `last_failure` | `TEXT?` | Why the last attempt failed; NULL when `status = "ok"` or `"not_configured"` (no attempt was made, so there is nothing to have failed). Values: `empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`. A free column, not a CHECK — the vocabulary grows as new failure modes get labeled. The first two are **content verdicts**: the call succeeded and was billed, its output was just unusable. The last two are **pointer values** naming which of the two columns below holds the per-hop detail; since v1.4.0 they replace `model_error` / `timeout` and the streaming mode's `stream_open_failed` / `stream_died_midway` — each of those covered a provider status AND a local timeout under one label, so all four are retired and the column now reads the same whichever endpoint wrote the row (see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors)). **`empty` is also reachable in streaming mode**, not just the chain-walk paths — a candidate that never opens (no content chunk) but whose stream ends normally reports `empty`, same label as the chain-walk's content-level blank-reply arm, because both mean the same thing: the provider answered and may have been billed. |
-| `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure, `task = "chat_image_prompt_compose"`. NULL when there were none — see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors). |
+| `llm_attempts` | `JSONB?` | Every hop where the provider answered with a failure. `task = "chat_image_prompt_compose"` on every row except `source = "image_edit"`, where it is `"chat_image_edit_compose"` — even when the edit ran on the compose task's fallback chain, see [Model config → image-EDIT composer](model-config.md#taskschat_image_edit_compose--image-edit-composer-optional). NULL when there were none — see [Failed attempts](#failed-attempts-llm_attempts--gateway_errors). |
 | `gateway_errors` | `JSONB?` | Every hop where our path to the provider broke. NULL when there were none. |
 | `created_at` | `TIMESTAMPTZ` | |
 
