@@ -1181,6 +1181,221 @@
         "tags": [
           "companion"
         ],
+        "summary": "Deprecated path alias for [`send_message_async`].",
+        "description": "The pre-rename path, kept working for one release so clients can migrate.\nRemoved in the release after 1.6.0. `chat` as an entity segment carrying a\n`session_id` is what the v2 convention forbids (spec §4.2/§4.6); the\ncanonical spelling is `/v2/comp/session/{session_id}/message/async`.\n\nA plain `.route()` would also work, but would leave the alias undocumented\nin the OpenAPI spec — which is where consumers look to learn it is going\naway.",
+        "operationId": "send_message_async_legacy_path",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Deprecated alias — see POST /v2/comp/session/{session_id}/message/async.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncSendResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Deprecated alias — see POST /v2/comp/session/{session_id}/message/async.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncSendResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/instance/{instance_id}/insight/character": {
+      "get": {
+        "tags": [
+          "insight"
+        ],
+        "operationId": "get_character_insight",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharacterInsightResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/instance/{instance_id}/insight/user": {
+      "get": {
+        "tags": [
+          "insight"
+        ],
+        "operationId": "get_user_insight",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInsightResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/session/{session_id}/message/async": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
         "operationId": "send_message_async",
         "parameters": [
           {
@@ -1287,98 +1502,6 @@
                 }
               }
             }
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/v2/comp/instance/{instance_id}/insight/character": {
-      "get": {
-        "tags": [
-          "insight"
-        ],
-        "operationId": "get_character_insight",
-        "parameters": [
-          {
-            "name": "instance_id",
-            "in": "path",
-            "description": "Persona instance id owned by the JWT user",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CharacterInsightResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "instance is not owned by the JWT user"
-          },
-          "404": {
-            "description": "no such active instance"
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ]
-      }
-    },
-    "/v2/comp/instance/{instance_id}/insight/user": {
-      "get": {
-        "tags": [
-          "insight"
-        ],
-        "operationId": "get_user_insight",
-        "parameters": [
-          {
-            "name": "instance_id",
-            "in": "path",
-            "description": "Persona instance id owned by the JWT user",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserInsightResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "missing or invalid bearer"
-          },
-          "403": {
-            "description": "instance is not owned by the JWT user"
-          },
-          "404": {
-            "description": "no such active instance"
           }
         },
         "security": [

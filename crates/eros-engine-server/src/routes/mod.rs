@@ -64,3 +64,12 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(persona::router())
         .merge(insight::router())
 }
+
+/// The generated OpenAPI document as JSON, for tests that assert on the wire
+/// contract itself (path presence, `deprecated` flags) rather than on handler
+/// behaviour.
+#[cfg(test)]
+pub(crate) fn openapi_for_tests() -> serde_json::Value {
+    let (_router, api) = router_for_openapi().split_for_parts();
+    serde_json::to_value(api).expect("openapi serialises")
+}
