@@ -36,9 +36,10 @@ impl<'a> SessionArchiveRepo<'a> {
     /// `companion_affinity_events` goes with its parent through the existing
     /// ON DELETE CASCADE — accepted, not worked around. The audit tables an
     /// operator needs (`companion_decision_events`, `character_insights_events`,
-    /// `chat_vision_events`, `chat_images_events`) hold `session_id` without a
-    /// foreign key and are untouched; with the transcript now surviving too,
-    /// those records still point at something readable.
+    /// `user_insights_events`, `chat_vision_events`, `chat_images_events`) hold
+    /// `session_id` without a foreign key and are untouched; with the
+    /// transcript now surviving too, those records still point at something
+    /// readable.
     ///
     /// `persona_story_insights.digest` is cleared, not the row: the row's
     /// other columns (`occupation`, `city`, `life_rhythm`, ...) are the
@@ -48,13 +49,13 @@ impl<'a> SessionArchiveRepo<'a> {
     /// gets the same treatment as `character_insights` above without taking
     /// the rest of the row's life facts with it.
     ///
-    /// The `character_insights` delete and the `persona_story_insights` update
-    /// are both keyed on `instance_id` alone, unlike the two `user_id +
-    /// instance_id` deletes above them. That's safe: `persona_instances.owner_uid`
-    /// is never updated anywhere in this workspace (only ever set once, at
-    /// INSERT), so the instance identifies its owner for the entire life of the
-    /// row and there is no window in which `instance_id` alone could resolve to
-    /// the wrong relationship.
+    /// The `character_insights` delete, the `user_insights` delete, and the
+    /// `persona_story_insights` update are all keyed on `instance_id` alone,
+    /// unlike the two `user_id + instance_id` deletes above them. That's safe:
+    /// `persona_instances.owner_uid` is never updated anywhere in this
+    /// workspace (only ever set once, at INSERT), so the instance identifies
+    /// its owner for the entire life of the row and there is no window in
+    /// which `instance_id` alone could resolve to the wrong relationship.
     ///
     /// `persona_instances.status` is deliberately not written: the user still
     /// owns the persona, and ownership is the client's business.
@@ -98,6 +99,15 @@ impl<'a> SessionArchiveRepo<'a> {
             .execute(&mut *tx)
             .await?;
 
+        // user_insights is character_insights' counterpart: the same
+        // per-relationship, record-only profile but of the real user rather
+        // than the persona. Same key, same treatment, deleted alongside it so
+        // both sides of the relationship go cold together.
+        sqlx::query("DELETE FROM engine.user_insights WHERE instance_id = $1")
+            .bind(instance_id)
+            .execute(&mut *tx)
+            .await?;
+
         // UPDATE, not DELETE: this row also carries the persona's own typed
         // life base (occupation, city, ...), which lives only here — deleting
         // the row would take those with it. Only `digest` is this
@@ -122,6 +132,7 @@ mod tests {
     use super::SessionArchiveRepo;
     use crate::chat::ChatRepo;
     use crate::testutil::seed_persona_instance;
+    use crate::user_insight::{UserInsightEventInsert, UserInsightEventRepo, UserInsightRepo};
     use sqlx::PgPool;
     use uuid::Uuid;
 
@@ -275,6 +286,74 @@ mod tests {
         )
         .await;
         assert_eq!(insights, 0, "character insights are deleted");
+    }
+
+    /// `user_insights` is `character_insights`' counterpart — same key, same
+    /// per-relationship record-only shape, same treatment: archiving deletes
+    /// it too. But `user_insights_events` and `user_insights_snapshot` are
+    /// append-only audit trails, exactly like `character_insights_events` /
+    /// `character_insights_snapshot`, and must survive; this is the assertion
+    /// that catches a future change turning the counterpart delete into
+    /// something broader than it should be.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deletes_user_insights_but_keeps_its_audit_trail(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        seed_relationship(&pool, user_id, instance_id).await;
+
+        UserInsightRepo { pool: &pool }
+            .apply_extraction(
+                instance_id,
+                &serde_json::json!({ "occupation": "vet tech" }),
+            )
+            .await
+            .unwrap();
+
+        UserInsightEventRepo { pool: &pool }
+            .record(UserInsightEventInsert {
+                run_id: Uuid::new_v4(),
+                instance_id,
+                session_id: None,
+                message_id: None,
+                stage: "extraction",
+                status: "ok",
+                payload: Some(serde_json::json!({ "facts": [] })),
+                meta: crate::OpenRouterCallMeta::default(),
+            })
+            .await
+            .unwrap();
+
+        SessionArchiveRepo { pool: &pool }
+            .archive_relationship(user_id, instance_id)
+            .await
+            .unwrap();
+
+        let insights = count(
+            &pool,
+            "SELECT count(*) FROM engine.user_insights WHERE instance_id = $1",
+            instance_id,
+        )
+        .await;
+        assert_eq!(insights, 0, "user insights are deleted");
+
+        let events = count(
+            &pool,
+            "SELECT count(*) FROM engine.user_insights_events WHERE instance_id = $1",
+            instance_id,
+        )
+        .await;
+        assert_eq!(events, 1, "the user insights audit trail must survive");
+
+        let snapshots = count(
+            &pool,
+            "SELECT count(*) FROM engine.user_insights_snapshot WHERE instance_id = $1",
+            instance_id,
+        )
+        .await;
+        assert_eq!(
+            snapshots, 1,
+            "the user insights snapshot history must survive"
+        );
     }
 
     /// Every channel goes, and a second call is a no-op that still succeeds.
