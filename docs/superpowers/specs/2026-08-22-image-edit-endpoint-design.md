@@ -95,10 +95,10 @@ v1 recovery endpoint answers 404 for the same condition, and that stays frozen
 this is an action on a resource that does exist.
 
 Nothing is persisted on any non-200 path except the `exhausted` audit row on
-502 (§3.4). A 502 leaves no assistant message: there is **no portrait
-fallback** here. The chat path falls back to a plain portrait because a turn
-that promised a picture must ship one; an edit that ignores its instruction is
-worse than an error, and the consumer can simply retry.
+chain exhaustion (§3.4). An exhausted chain leaves no assistant message: there
+is **no portrait fallback** here. The chat path falls back to a plain portrait
+because a turn that promised a picture must ship one; an edit that ignores its
+instruction is worse than an error, and the consumer can simply retry.
 
 ### 2.4 Response
 
@@ -247,8 +247,9 @@ to add `'image_edit'`. `inputs` for that source carries the seven keys in
 §3.3, not the chat composer's five — `inputs` is free-form JSONB and the
 `source` column says which shape to expect. `docs/llm-audit.md` documents both.
 
-A 502 writes one `exhausted` row with `attempts` / `last_failure` / the failure
-list, `composed_prompt = NULL` — the same as the standalone composer's 502.
+An exhausted chain writes one `exhausted` row with `attempts` / `last_failure` /
+the failure list, `composed_prompt = NULL` — the same as the standalone
+composer's own exhaustion path.
 
 `chat_images_events WHERE source = 'image_edit'` grouped by `status` and by day
 is the reading for this feature: how often edits are requested, how often the
@@ -322,9 +323,9 @@ tests):**
 
 - The full ladder: 403 foreign session, 404 unknown session, 404 unknown
   message, **409** on a text message, 422 blank instruction, 501 with no
-  composer task, 502 on chain exhaustion.
-- 502 writes exactly one `image_edit` / `exhausted` audit row and **no**
-  assistant row.
+  composer task, 5XX on chain exhaustion.
+- An exhausted chain writes exactly one `image_edit` / `exhausted` audit row
+  and **no** assistant row.
 - Success: response fields; a new assistant row exists with `content = ""`,
   `user_message_id` equal to the source's, `metadata.image.edit_of` equal to
   the source id, `image_ref = "previous"`, and a `compose_event_id` that
