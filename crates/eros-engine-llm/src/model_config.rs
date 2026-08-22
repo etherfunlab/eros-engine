@@ -5278,6 +5278,21 @@ filter_prompt = "   "
     }
 
     #[test]
+    fn insight_structuring_absent_block_reproduces_the_pre_split_parameters() {
+        // The split must be a no-op for anyone who does not add the new block.
+        let toml = "[tasks.insight_extraction]\nmodel = \"ins/m\"\nfallback = [\"fb/m\"]\n\
+                    temperature = 0.2\nmax_tokens = 1200\nfilter_prompt = \"p\"\n";
+        let cfg = ModelConfig::from_toml_str(toml).unwrap();
+
+        let stage1 = cfg.resolve("insight_extraction", None);
+        let stage2 = cfg.resolve_structuring("insight_structuring", "insight_extraction");
+
+        assert_eq!(stage2.model, stage1.model);
+        assert_eq!(stage2.max_tokens, stage1.max_tokens);
+        assert_eq!(stage2.temperature, stage1.temperature);
+    }
+
+    #[test]
     fn known_chat_tasks_covers_the_three_new_blocks() {
         for t in [
             "insight_structuring",

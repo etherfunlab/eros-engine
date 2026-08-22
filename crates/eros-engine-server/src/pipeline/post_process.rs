@@ -893,6 +893,13 @@ async fn evaluate_affinity(
 
 const INSIGHT_TASK: &str = "insight_extraction";
 
+/// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so OpenRouter
+/// accounting and `[[providers.*.body]]` rules can tell the two stages apart,
+/// and so `max_tokens` stops being one number covering two very different
+/// outputs. An absent `[tasks.insight_structuring]` block resolves to stage
+/// 1's parameters — identical to the pre-split behaviour.
+const INSIGHT_STRUCTURING_TASK: &str = "insight_structuring";
+
 /// Per-call audit captured from one insight_extraction OpenRouter call that
 /// returned a response. `None` (at the call site) means the call got no response
 /// (transport error / timeout) → no row is written.
@@ -1132,7 +1139,7 @@ async fn extract_structured_insights(
 
     let prompt = crate::prompt::extract_structured_insights_prompt(facts, existing_insights);
 
-    let resolved = model_config.resolve(INSIGHT_TASK, None);
+    let resolved = model_config.resolve_structuring(INSIGHT_STRUCTURING_TASK, INSIGHT_TASK);
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
@@ -1145,13 +1152,13 @@ async fn extract_structured_insights(
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
-        task: Some(INSIGHT_TASK.into()),
+        task: Some(INSIGHT_STRUCTURING_TASK.into()),
         ..Default::default()
     };
 
     let (raw, meta) = match llm.execute(req).await {
         Ok(r) => {
-            super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &r);
+            super::log_openrouter_usage(INSIGHT_STRUCTURING_TASK, Some(session_id), &r);
             (r.reply.trim().to_string(), call_meta(&r))
         }
         Err(_) => return (empty(), None),
@@ -1172,18 +1179,33 @@ async fn extract_structured_insights(
             } else {
                 "ok"
             };
-            let audit = CallAudit {
-                status,
-                payload: Some(v.clone()),
-                meta,
-            };
-            (v, Some(audit))
+            // Record which columns arrived pre-filled. Without it, a fact that
+            // does not appear in the output is ambiguous between "dropped" and
+            // "judged already covered".
+            let mut audited = v.clone();
+            if let Some(o) = audited.as_object_mut() {
+                o.insert(
+                    "_existing_keys".into(),
+                    serde_json::json!(existing_keys(existing_insights)),
+                );
+            }
+            (
+                v,
+                Some(CallAudit {
+                    status,
+                    payload: Some(audited),
+                    meta,
+                }),
+            )
         }
+        // The unparseable reply is KEPT: a whole-turn refusal and malformed
+        // JSON were otherwise the same row, and refusal is the likeliest way
+        // a mined fact goes missing.
         None => (
             empty(),
             Some(CallAudit {
                 status: "parse_error",
-                payload: None,
+                payload: Some(parse_error_payload(&raw)),
                 meta,
             }),
         ),
@@ -2515,6 +2537,200 @@ mod tests {
             payload["details"],
             serde_json::json!([]),
             "no details key ⇒ []"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_payload_carries_existing_keys(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        // Pre-fill two columns so `_existing_keys` has something to list.
+        sqlx::query(
+            "INSERT INTO engine.human_insights (user_id, city, occupation) VALUES ($1,$2,$3)",
+        )
+        .bind(user_id)
+        .bind("深圳")
+        .bind("后端工程师")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'structured'",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let keys = payload.unwrap()["_existing_keys"].clone();
+        let mut keys: Vec<String> = serde_json::from_value(keys).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["city".to_string(), "occupation".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_parse_error_keeps_the_raw_reply(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", "抱歉，我无法处理这个请求。"),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let (status, payload): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT status, payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'structured'",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "parse_error");
+        assert_eq!(payload.unwrap()["raw"], "抱歉，我无法处理这个请求。");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_stage_values_are_unchanged(pool: sqlx::PgPool) {
+        // Regression lock on spec §3.2: the stage vocabulary of the LIVE table
+        // stays 'facts' / 'structured'. Downstream audit scripts read it.
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let mut stages: Vec<String> = sqlx::query_scalar(
+            "SELECT stage FROM engine.companion_insights_events WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        stages.sort();
+        assert_eq!(stages, vec!["facts".to_string(), "structured".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_chain_reports_distinct_wire_task_names_per_stage(pool: sqlx::PgPool) {
+        // OpenRouter accounting and [[providers.*.body]] rules can only tell the
+        // two stages apart if they arrive under different task names. Before the
+        // split both calls reported "insight_extraction".
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let (state, seen_tasks) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n\
+             [[providers.openrouter.body]]\ntasks = [\"insight_extraction\"]\n\
+             params = { task = \"insight_extraction\" }\n\
+             [[providers.openrouter.body]]\ntasks = [\"insight_structuring\"]\n\
+             params = { task = \"insight_structuring\" }\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let tasks = seen_tasks.lock().unwrap().clone();
+        assert_eq!(
+            tasks,
+            vec![
+                Some("insight_extraction".to_string()),
+                Some("insight_structuring".to_string()),
+            ],
+            "stage 2 must no longer report the stage-1 task name"
         );
     }
 
