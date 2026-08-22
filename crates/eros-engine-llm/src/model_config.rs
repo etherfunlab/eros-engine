@@ -2210,6 +2210,13 @@ impl ModelConfig {
         self.resolve_extract("character_insight_extraction")
     }
 
+    /// Stage 1 of the user chain. Prompt-bearing, so the shared extract
+    /// resolver applies. `None` — the task is absent, or its `filter_prompt`
+    /// is blank — is the whole chain's off switch: no block, no calls, no rows.
+    pub fn resolve_user_insight_extract(&self) -> Option<ResolvedExtract> {
+        self.resolve_extract("user_insight_extraction")
+    }
+
     /// Parameters for a structuring (stage-2) call: the dedicated block when
     /// present, else the stage-1 block's.
     ///
@@ -2372,6 +2379,7 @@ impl ModelConfig {
             "insight_extraction",
             "memory_extraction",
             "character_insight_extraction",
+            "user_insight_extraction",
         ] {
             if self.tasks.contains_key(name) && self.resolve_extract(name).is_none() {
                 return Err(format!(
@@ -2484,26 +2492,45 @@ impl ModelConfig {
     /// max_tokens, sampling, reasoning) stays configurable; those are the whole
     /// point of the block existing separately from stage 1.
     ///
-    /// Deliberately NOT folded together with the affinity gate: they are two
-    /// short checks with different rationales, and this codebase prefers three
-    /// similar sites to a premature abstraction. The third — the human chain's
-    /// `insight_structuring`, once that split lands — is the moment to unify.
+    /// Covers all three structuring blocks. The affinity gate stays separate:
+    /// it enforces the same rule for a different reason and has its own error
+    /// text, and merging them would buy nothing but one fewer function.
     pub fn validate_structuring_prompt_unset(&self) -> Result<(), String> {
-        const STRUCTURING_TASK: &str = "character_insight_structuring";
-        let has_prompt = self
-            .tasks
-            .get(STRUCTURING_TASK)
-            .is_some_and(|t| t.filter_prompt.is_some());
-        if has_prompt {
-            return Err(format!(
-                "[tasks.{STRUCTURING_TASK}].filter_prompt is set, but the structuring stage's \
-                 prompt is engine-owned and deliberately not configurable — it was never read, \
-                 and eros-engine refuses to boot rather than let it silently no-op. The prompt \
-                 must stay in lockstep with the character_insights columns it fills. Remove the \
-                 key; model/fallback/temperature/max_tokens/sampling/reasoning remain \
-                 configurable. To change what stage 1 extracts, set \
-                 [tasks.character_insight_extraction].filter_prompt instead."
-            ));
+        // (stage-2 task, the table its prompt must stay in lockstep with,
+        //  the stage-1 task whose filter_prompt IS configurable)
+        const STRUCTURING_TASKS: [(&str, &str, &str); 3] = [
+            (
+                "character_insight_structuring",
+                "character_insights",
+                "character_insight_extraction",
+            ),
+            (
+                "user_insight_structuring",
+                "user_insights",
+                "user_insight_extraction",
+            ),
+            (
+                "insight_structuring",
+                "human_insights",
+                "insight_extraction",
+            ),
+        ];
+        for (task, table, stage1) in STRUCTURING_TASKS {
+            let has_prompt = self
+                .tasks
+                .get(task)
+                .is_some_and(|t| t.filter_prompt.is_some());
+            if has_prompt {
+                return Err(format!(
+                    "[tasks.{task}].filter_prompt is set, but the structuring stage's prompt is \
+                     engine-owned and deliberately not configurable — it was never read, and \
+                     eros-engine refuses to boot rather than let it silently no-op. The prompt \
+                     must stay in lockstep with the {table} columns it fills. Remove the key; \
+                     model/fallback/temperature/max_tokens/sampling/reasoning remain \
+                     configurable. To change what stage 1 extracts, set \
+                     [tasks.{stage1}].filter_prompt instead."
+                ));
+            }
         }
         Ok(())
     }
@@ -2652,6 +2679,9 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "memory_extraction",
     "character_insight_extraction",
     "character_insight_structuring",
+    "insight_structuring",
+    "user_insight_extraction",
+    "user_insight_structuring",
     "affinity_evaluation",
     "world_director",
     "world_stories_director",
@@ -5132,6 +5162,133 @@ filter_prompt = "   "
         // [[providers.*.body]].tasks, so both must be registered.
         assert!(KNOWN_CHAT_TASKS.contains(&"character_insight_extraction"));
         assert!(KNOWN_CHAT_TASKS.contains(&"character_insight_structuring"));
+    }
+
+    #[test]
+    fn resolve_user_insight_extract_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_user_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_user_insight_extract_none_when_prompt_blank() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"   \"\n",
+        )
+        .unwrap();
+        assert!(cfg.resolve_user_insight_extract().is_none());
+    }
+
+    #[test]
+    fn resolve_user_insight_extract_some_when_prompt_set() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_extraction]\nmodel = \"u/m\"\nfilter_prompt = \"mine user facts\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_user_insight_extract().expect("resolved");
+        assert_eq!(r.model, "u/m");
+        assert_eq!(r.extract_prompt, "mine user facts");
+    }
+
+    #[test]
+    fn validate_extraction_prompts_refuses_blank_user_insight_prompt() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_extraction]\nmodel = \"m\"\nfilter_prompt = \"\"\n",
+        )
+        .unwrap();
+        let err = cfg.validate_extraction_prompts().unwrap_err();
+        assert!(err.contains("user_insight_extraction"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_extraction_prompts_passes_when_user_insight_block_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.validate_extraction_prompts().is_ok());
+    }
+
+    #[test]
+    fn validate_structuring_prompt_unset_refuses_each_of_the_three_blocks() {
+        // One case per block: a loop that only covered the first would pass a
+        // single-case test and still ship the bug.
+        for (task, table) in [
+            ("character_insight_structuring", "character_insights"),
+            ("user_insight_structuring", "user_insights"),
+            ("insight_structuring", "human_insights"),
+        ] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.{task}]\nmodel = \"m\"\nfilter_prompt = \"nope\"\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_structuring_prompt_unset().unwrap_err();
+            assert!(err.contains(task), "error must name {task}, got: {err}");
+            assert!(err.contains(table), "error must name {table}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_structuring_prompt_unset_refuses_a_blank_prompt_too() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_structuring]\nmodel = \"m\"\nfilter_prompt = \"\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_err());
+    }
+
+    #[test]
+    fn validate_structuring_prompt_unset_passes_on_parameters_only_blocks() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_structuring]\nmodel = \"m\"\nmax_tokens = 600\n\
+             [tasks.insight_structuring]\nmodel = \"m\"\nmax_tokens = 600\n",
+        )
+        .unwrap();
+        assert!(cfg.validate_structuring_prompt_unset().is_ok());
+    }
+
+    #[test]
+    fn resolve_structuring_falls_back_to_stage_one_model_for_the_user_chain() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_extraction]\nmodel = \"stage-one/m\"\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_structuring("user_insight_structuring", "user_insight_extraction");
+        // Assert the stage-1 model SPECIFICALLY — "not empty" would pass on the
+        // global-default fall-through this method exists to prevent.
+        assert_eq!(r.model, "stage-one/m");
+    }
+
+    #[test]
+    fn resolve_structuring_uses_the_user_stage_two_block_when_present() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.user_insight_extraction]\nmodel = \"stage-one/m\"\nfilter_prompt = \"p\"\n\
+             [tasks.user_insight_structuring]\nmodel = \"stage-two/m\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_structuring("user_insight_structuring", "user_insight_extraction");
+        assert_eq!(r.model, "stage-two/m");
+    }
+
+    #[test]
+    fn resolve_structuring_falls_back_to_stage_one_model_for_the_human_chain() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.insight_extraction]\nmodel = \"human-stage-one/m\"\nfilter_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_structuring("insight_structuring", "insight_extraction");
+        assert_eq!(r.model, "human-stage-one/m");
+    }
+
+    #[test]
+    fn known_chat_tasks_covers_the_three_new_blocks() {
+        for t in [
+            "insight_structuring",
+            "user_insight_extraction",
+            "user_insight_structuring",
+        ] {
+            assert!(
+                KNOWN_CHAT_TASKS.contains(&t),
+                "missing from KNOWN_CHAT_TASKS: {t}"
+            );
+        }
     }
 
     #[test]

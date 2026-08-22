@@ -393,9 +393,11 @@ max_tokens = 1200
 # Remove this entire [tasks.insight_extraction] section to disable per-turn fact
 # extraction. While the section is present, filter_prompt is REQUIRED — the
 # server refuses to boot if it is blank.
-# One task block serves BOTH extraction stages: Stage 1 (this prompt: facts +
-# per-fact details) and Stage 2 (the built-in structured-schema prompt). 1200
-# tokens covers the dual-track Stage-1 output and the 18-field Stage-2 object.
+# Stage 1 of the human chain (this prompt: facts + per-fact details). Stage 2
+# has its own block below, [tasks.insight_structuring]; delete that block and
+# stage 2 runs on this block's parameters, never on the global default model.
+# 1200 tokens is a legacy combined budget kept as-is so copying this file
+# changes nothing; tune the two stages independently now that they are split.
 # Optional: force the extraction model's reasoning off (default = model decides).
 #reasoning = { enabled = false }
 # Facts-stage system instruction. The server sends the turn ("用户: …\nAI: …")
@@ -439,6 +441,20 @@ content 表达规则：第三人称、以「用户」开头；保留原始信息
 严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
 {"facts":["用户事实1"],"details":[{"content":"用户事实1","category":"preference","domain":"hobby","evidence_type":"explicit_statement","temporality":"atemporal","persistence":"stable","confidence":"high"}]}
 """
+
+# Stage 2 of the human chain: turns stage-1 facts plus the existing
+# human_insights row into the typed object. NO filter_prompt here — that prompt
+# is built in the engine (prompt.rs) and is not configurable; setting the key
+# REFUSES TO BOOT (in any shape, blank included) rather than being silently
+# ignored, because it has to stay in lockstep with the human_insights columns
+# it fills. To change what stage 1 extracts, edit
+# [tasks.insight_extraction].filter_prompt above.
+# Delete this block and stage 2 runs on the extraction block's parameters.
+[tasks.insight_structuring]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 600
 
 # ─── Character insights (EXPERIMENTAL, v1.3.0) ──────────────────────────────
 # Builds a profile of the AI CHARACTER from the conversation, the mirror of
@@ -514,6 +530,70 @@ content 表达规则：第三人称、以「角色」开头；保留原始信息
 # [tasks.character_insight_extraction].filter_prompt above.
 # Delete this block and stage 2 runs on the extraction block's parameters.
 [tasks.character_insight_structuring]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 600
+
+# ─── User insights (EXPERIMENTAL, v1.6.0) ───────────────────────────────────
+# Builds a profile of the REAL USER *inside one relationship* — the mirror of
+# character_insight_extraction, keyed on the same persona_instance. This is NOT
+# human_insights: that table is global, feeds prompt injection and matching,
+# and is filled by [tasks.insight_extraction]. This one is per-relationship and
+# database-only — nothing reads user_insights back into any prompt. Downstream
+# reads it at GET /v2/comp/instance/{instance_id}/insight/user.
+#
+# COST: two extra OpenRouter calls per produced message per turn, on top of the
+# human and character chains — six insight-side calls per produced message in
+# total. It also grows engine.user_insights_snapshot by one row per turn that
+# yields insights, with no retention policy yet (v1.6.0).
+#
+# Delete [tasks.user_insight_extraction] to turn the feature off — it is the
+# switch, and stage 2 cannot run without its facts.
+[tasks.user_insight_extraction]
+model = "anthropic/claude-haiku-4.5"
+fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
+temperature = 0.2
+max_tokens = 800
+filter_prompt = """
+你是真人用户事实提取器。从这一轮对话中提取关于【真人用户】的、本回合新出现的、可长期复用的原子事实。
+
+对话身份（必须严格区分）：
+- 「用户:」= 屏幕前的真人，这是唯一的提取对象；「AI:」= 虚构 AI 角色，不是提取对象。
+- 只有用户在本回合实际说出口的内容，才可能成为用户事实。
+- 角色的发言、设定、经历都不是用户事实，只能作为理解用户发言的上下文。
+
+铁律 —— 只提取「这一轮真的说出口的当下信息」：
+- 不要从角色的话里反推用户；不要把角色对用户的猜测当成事实。
+- 「他大概是个很忙的人」是推测，不提取；「他说他这周连着加了三天班」是当下信息，提取。
+
+提取维度（只提取这些）：
+- location: 用户此刻/近期人在哪
+- occupation: 用户实际在做的工作
+- current_situation: 他最近的处境与正在经历的事
+- desires: 他说出口的想要与期待
+- vulnerabilities: 他露出的软肋、不安、害怕的事
+- habits: 他描述的作息与生活习惯
+- personal_values: 他表达的在意的事与价值取向
+- likes / dislikes: 他提到的喜好与厌恶
+- relationships: 他提到的人（家人、朋友、同事）
+
+原子化：每条事实只表达一个主要命题。
+
+content 表达规则：第三人称、以「用户」开头；保留原始信息的具体程度、否定、条件、程度与不确定性；写成简洁、可独立理解的完整句子；不使用评价性或诊断性语言。
+
+- 成人、性、粗口、政治、宗教、药物、心理状态、癖好、禁忌兴趣与敏感偏好都正常记录；忠实保留用户原意，不淡化、不委婉化、不遗漏，也不扩写。你不负责安全审核、道德判断或风险过滤。
+- 不得为填充数组编造信息，不得重复表达同一事实。一次最多 8 条。没有新的用户事实时返回空数组。
+
+严格输出 JSON，且只能是以下结构。facts 与 details 长度必须完全相同，facts[i] 必须与 details[i].content 完全相同；没有事实时输出 {"facts":[],"details":[]}。不得输出说明、Markdown、代码围栏或任何其他文本：
+{"facts":["用户说他这周连着加了三天班"],"details":[{"content":"用户说他这周连着加了三天班","field":"current_situation","evidence_type":"explicit_statement","confidence":"high"}]}
+"""
+
+# Stage 2 of the user chain. Same contract as the other two structuring blocks:
+# NO filter_prompt (the prompt lives in prompt.rs and setting the key refuses
+# to boot). Delete this block and stage 2 runs on the extraction block's
+# parameters.
+[tasks.user_insight_structuring]
 model = "anthropic/claude-haiku-4.5"
 fallback = ["deepseek/deepseek-v4-flash","google/gemini-3.1-flash-lite"]
 temperature = 0.2
