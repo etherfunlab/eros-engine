@@ -2473,8 +2473,9 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Boot gate for `[tasks.character_insight_structuring].filter_prompt` —
-    /// the second key in this config that parses but is never read.
+    /// Boot gate for the structuring stages' `filter_prompt` keys —
+    /// `[tasks.character_insight_structuring]`, `[tasks.user_insight_structuring]`,
+    /// and `[tasks.insight_structuring]` all parse the key but never read it.
     ///
     /// The character chain's structuring stage builds its prompt in
     /// `prompt.rs`: the ten-column schema it must emit is the same schema
