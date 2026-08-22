@@ -2622,7 +2622,13 @@ mod tests {
         let session_id = seed_session(&pool, instance_id).await;
         let message_id = seed_assistant_message(&pool, session_id).await;
 
-        let state = state_with_mock_openrouter(
+        // Recording variant so we can prove the stage-2 call never went out,
+        // not just that the DB ended up with no second row (a stray call
+        // that hits the mock's catch-all and 500s is swallowed by
+        // `structure_user_insights`'s `Err(e) =>` arm the same way a call
+        // that never happened would be — the row count alone can't tell
+        // them apart).
+        let (state, recorder) = state_with_mock_openrouter_recording(
             pool.clone(),
             "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
             vec![("user-facts-sentinel", r#"{"facts":[],"details":[]}"#)],
@@ -2639,6 +2645,12 @@ mod tests {
             None,
         )
         .await;
+
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            1,
+            "exactly one outbound call (stage 1); no stage-2 call when stage 1 is empty"
+        );
 
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT stage, status FROM engine.user_insights_events WHERE instance_id = $1",
@@ -2665,7 +2677,11 @@ mod tests {
         let session_id = seed_session(&pool, instance_id).await;
         let message_id = seed_assistant_message(&pool, session_id).await;
 
-        let state = state_with_mock_openrouter(
+        // Recording variant so "no calls" is proven directly (the recorder
+        // pushes one entry per outbound request that reaches the mock,
+        // matched or not) rather than inferred from an empty events table,
+        // which a stray call that 500s and gets swallowed would also produce.
+        let (state, recorder) = state_with_mock_openrouter_recording(
             pool.clone(),
             "[tasks.chat_companion]\nmodel=\"c/m\"\n",
             vec![],
@@ -2682,6 +2698,11 @@ mod tests {
             None,
         )
         .await;
+
+        assert!(
+            recorder.lock().unwrap().is_empty(),
+            "no task block ⇒ no outbound calls at all"
+        );
 
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM engine.user_insights_events WHERE instance_id = $1",
