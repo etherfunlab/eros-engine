@@ -15,6 +15,7 @@ pub mod persona;
 pub mod pool;
 pub mod session_archive;
 pub mod story;
+pub mod user_insight;
 pub mod world;
 pub mod world_town;
 
