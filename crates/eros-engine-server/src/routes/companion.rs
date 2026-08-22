@@ -1157,6 +1157,25 @@ pub(crate) fn test_state(pool: sqlx::PgPool) -> AppState {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn mint_test_jwt(uid: uuid::Uuid) -> String {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
+    encode(
+        &Header::default(),
+        &json!({ "sub": uid.to_string(), "exp": exp }),
+        &EncodingKey::from_secret(TEST_SECRET.as_ref()),
+    )
+    .expect("test jwt encodes")
+}
+
+#[cfg(test)]
+pub(crate) fn build_router(state: AppState) -> axum::Router {
+    let (axum_router, _api) = crate::routes::router(state.clone()).split_for_parts();
+    axum_router.with_state(state)
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Integration tests
 //

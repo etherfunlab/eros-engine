@@ -21,6 +21,7 @@ pub mod companion_async;
 pub mod companion_stream;
 pub mod dto;
 pub mod health;
+pub mod insight;
 pub mod persona;
 pub mod voice;
 pub mod world_town;
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(insight::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
@@ -60,4 +62,5 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(insight::router())
 }
