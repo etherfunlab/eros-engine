@@ -64,6 +64,15 @@ pub struct AsyncSendResponse {
     pub user_message_id: Uuid,
 }
 
+/// Enqueue a chat turn for asynchronous delivery.
+///
+/// Validates and persists the user message, then hands the turn to a
+/// background worker; the assistant reply is generated out-of-band and lands
+/// in this session's history over whatever channel the client already polls
+/// or subscribes to (SSE / GET history) — this endpoint itself never returns
+/// reply content. Idempotent on `client_msg_id`: redelivering a turn that is
+/// already queued, completed, or terminally failed returns that outcome
+/// instead of enqueueing a duplicate.
 #[utoipa::path(
     post,
     path = "/v2/comp/session/{session_id}/message/async",
@@ -203,16 +212,12 @@ pub async fn send_message_async(
     Ok((status, Json(body)))
 }
 
-/// Deprecated path alias for [`send_message_async`].
+/// Deprecated alias for [`send_message_async`], removed after 1.6.0.
 ///
 /// The pre-rename path, kept working for one release so clients can migrate.
-/// Removed in the release after 1.6.0. `chat` as an entity segment carrying a
-/// `session_id` is what the v2 convention forbids (spec §4.2/§4.6); the
-/// canonical spelling is `/v2/comp/session/{session_id}/message/async`.
-///
-/// A plain `.route()` would also work, but would leave the alias undocumented
-/// in the OpenAPI spec — which is where consumers look to learn it is going
-/// away.
+// A plain `.route()` would also work, but would leave the alias undocumented
+// in the OpenAPI spec — which is where consumers look to learn it is going
+// away.
 #[utoipa::path(
     post,
     path = "/v2/comp/chat/{session_id}/message/async",

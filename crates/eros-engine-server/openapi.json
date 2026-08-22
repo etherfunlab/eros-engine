@@ -1181,8 +1181,8 @@
         "tags": [
           "companion"
         ],
-        "summary": "Deprecated path alias for [`send_message_async`].",
-        "description": "The pre-rename path, kept working for one release so clients can migrate.\nRemoved in the release after 1.6.0. `chat` as an entity segment carrying a\n`session_id` is what the v2 convention forbids (spec §4.2/§4.6); the\ncanonical spelling is `/v2/comp/session/{session_id}/message/async`.\n\nA plain `.route()` would also work, but would leave the alias undocumented\nin the OpenAPI spec — which is where consumers look to learn it is going\naway.",
+        "summary": "Deprecated alias for [`send_message_async`], removed after 1.6.0.",
+        "description": "The pre-rename path, kept working for one release so clients can migrate.",
         "operationId": "send_message_async_legacy_path",
         "parameters": [
           {
@@ -1396,6 +1396,8 @@
         "tags": [
           "companion"
         ],
+        "summary": "Enqueue a chat turn for asynchronous delivery.",
+        "description": "Validates and persists the user message, then hands the turn to a\nbackground worker; the assistant reply is generated out-of-band and lands\nin this session's history over whatever channel the client already polls\nor subscribes to (SSE / GET history) — this endpoint itself never returns\nreply content. Idempotent on `client_msg_id`: redelivering a turn that is\nalready queued, completed, or terminally failed returns that outcome\ninstead of enqueueing a duplicate.",
         "operationId": "send_message_async",
         "parameters": [
           {
