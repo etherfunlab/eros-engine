@@ -328,10 +328,13 @@ change** — `companion_insights_events.payload` is already nullable `JSONB`.
 
    With the block absent, parameters resolve to stage 1's — byte-identical to
    today's behaviour. The one behaviour change that lands regardless is the wire
-   task name, and that is the entire point of the split: OpenRouter accounting
-   and `[[providers.*.body]]` rules can finally tell the two stages apart, and
-   `max_tokens` stops being one number covering two very different outputs (the
-   human block's `1200` is a combined budget).
+   task name, and that is most of the point of the split: the engine's own
+   `log_openrouter_usage` line and `[[providers.*.body]]` rules can finally
+   tell the two stages apart, and `max_tokens` stops being one number covering
+   two very different outputs (the human block's `1200` is a combined budget).
+   `task` is config routing only and is never serialized to OpenRouter, so this
+   does not help OpenRouter-side accounting — its dashboard only ever sees
+   `model` and `user`.
 
 2. **`parse_error` records the raw reply** via `parse_error_payload`, instead of
    `NULL`. The likeliest shape of "a fact got dropped" is not one field going

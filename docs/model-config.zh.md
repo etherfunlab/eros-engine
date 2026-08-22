@@ -226,6 +226,15 @@ provider 服务的所有任务。规则按声明顺序生效，后面的规则�
 `chat` 才能使用 body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖
 端点。
 
+**升级风险：`tasks` 按精确字符串匹配，不按链匹配。** 人类链以前两个 stage
+共用同一个 wire 任务名（`insight_extraction`）；拆分 structuring 之后，
+stage 1 仍报 `insight_extraction`，stage 2 改报 `insight_structuring`
+（见下文任务名表）。一条拆分之前写的规则——`tasks = ["insight_extraction"]`
+——现在只限定到 stage 1，会悄悄不再作用于 stage 2：不会有启动警告，因为
+`insight_structuring` 是一个合法任务名，只是不在这条规则的列表里。如果一条
+规则本来是想覆盖人类链的两个 stage，就要把两个都列上：
+`tasks = ["insight_extraction", "insight_structuring"]`。
+
 在用 body 规则代替任务块之前先掂量一下取舍：规则是**按 provider 限定**的，
 而 `fallback` 链会跨 provider——一个 primary 和 fallback 分别落在不同
 `[providers]` 条目上的任务，同一个参数得声明两遍，两边还可能悄悄不一致；

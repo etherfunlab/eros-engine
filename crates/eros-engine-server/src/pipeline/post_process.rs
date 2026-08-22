@@ -893,11 +893,15 @@ async fn evaluate_affinity(
 
 const INSIGHT_TASK: &str = "insight_extraction";
 
-/// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so OpenRouter
-/// accounting and `[[providers.*.body]]` rules can tell the two stages apart,
-/// and so `max_tokens` stops being one number covering two very different
-/// outputs. An absent `[tasks.insight_structuring]` block resolves to stage
-/// 1's parameters — identical to the pre-split behaviour.
+/// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so the engine's
+/// own `log_openrouter_usage` line and `[[providers.*.body]]` rules can tell
+/// the two stages apart, and so `max_tokens` stops being one number covering
+/// two very different outputs. This does NOT help OpenRouter-side accounting:
+/// `task` is config routing only and is never serialized to the wire (see
+/// `ChatRequest::task` in eros-engine-llm), so OpenRouter's own dashboard
+/// only ever sees `model` and `user`. An absent `[tasks.insight_structuring]`
+/// block resolves to stage 1's parameters — identical to the pre-split
+/// behaviour.
 const INSIGHT_STRUCTURING_TASK: &str = "insight_structuring";
 
 /// Per-call audit captured from one insight_extraction OpenRouter call that

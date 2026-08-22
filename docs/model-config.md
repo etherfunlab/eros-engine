@@ -242,6 +242,16 @@ warns and never applies (that call builds its own body and takes no
 chat-shaped parameters). Custom providers must declare `chat` to use body
 rules; the reserved `openrouter` entry may declare rules alone.
 
+**Upgrade hazard: `tasks` matches by exact string, not by chain.** The human
+chain used to report a single wire task name (`insight_extraction`) for both
+its stages; since the structuring split it reports `insight_extraction` for
+stage 1 and `insight_structuring` for stage 2 (see the task table below). A
+rule written before the split — `tasks = ["insight_extraction"]` — now scopes
+to stage 1 only. It silently stops applying to stage 2: there is no boot
+warning, because `insight_structuring` is a known task name, just not the one
+your rule lists. If a rule is meant to cover both stages of the human chain,
+list both: `tasks = ["insight_extraction", "insight_structuring"]`.
+
 Weigh the trade-off before reaching for a body rule instead of the task
 block: rules are **provider-scoped** while a `fallback` chain crosses
 providers, so a task whose primary and fallback live on different
