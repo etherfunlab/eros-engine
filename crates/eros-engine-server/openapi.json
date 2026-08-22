@@ -1876,6 +1876,14 @@
           },
           "state_after": {
             "description": "Post-turn absolute state — axes, both line scores, both tiers, both\njudge levels. Absent on rows written before migration 0049.\n\nTakes the place of client-side accumulation: with this, a consumer\nadopts the authoritative absolute value every turn instead of adding\ndeltas to a running total. It is a WRITE-TIME snapshot, so after an\nabsence only `GET /bff/v1/comp/affinity/{sid}` is correct — that one\nrefreshes the derived endpoints at read."
+          },
+          "user_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The user message (`chat_messages.id`) that drove this turn, for\nattaching the delta to a specific message. Absent on `proactive` /\n`time_decay` events and on rows written before migration 0056."
           }
         }
       },

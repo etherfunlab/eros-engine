@@ -345,6 +345,10 @@ NULL DEFAULT 2`，范围检查 `1..=3`）——权威判官档位——并用档
   `warmth_grade`/`patience_grade`（仅本轮实际读到时）、
   `boost_warmth`/`boost_patience`（当轮生效的 B 值）、`decay_factor`、
   `units`（当轮生效的按线单位）。被收税的回合另有 `cross_penalty_assessed`。
+- `user_message_id` —— 驱动本轮的用户消息（migration `0056`）。对 `chat_messages`
+  的真外键，`ON DELETE SET NULL`。`proactive` / `time_decay` 行以及迁移前写入的行为
+  `NULL`，不回填。assistant 行经 `chat_messages.user_message_id` 指向同一条消息，
+  所以一个事件对应的回复用 join 取。
 
 ### 逐回合标签变动
 

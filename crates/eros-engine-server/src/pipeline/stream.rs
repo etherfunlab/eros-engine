@@ -4156,7 +4156,10 @@ pub fn run_stream(
                 if let Err(e) = chat_repo.mark_user_message_ghosted(user_msg.user_message_id).await {
                     tracing::warn!("stream: ghost mark failed: {e}");
                 }
-                if let Err(e) = affinity_repo.record_ghost(&mut affinity).await {
+                if let Err(e) = affinity_repo
+                    .record_ghost(&mut affinity, Some(user_msg.user_message_id))
+                    .await
+                {
                     tracing::warn!("stream: record_ghost failed: {e}");
                 }
                 yield ProtocolFrame::Meta {
@@ -12428,6 +12431,21 @@ data: [DONE]\n\n";
             judge_sent.contains("pde/judge") && judge_sent.contains("[亲密度]"),
             "the single call must be the PDE judge (carries build_pde_ctx); got {judge_sent}",
         );
+
+        // The ghost event points at the user row that drove the turn. The
+        // ghost arm writes it inline (not spawned), so it is committed by
+        // the time the stream has been collected.
+        let ghost_umid: Option<Uuid> = sqlx::query_scalar(
+            "SELECT e.user_message_id \
+             FROM engine.companion_affinity_events e \
+             JOIN engine.companion_affinity a ON a.id = e.affinity_id \
+             WHERE a.session_id = $1 AND e.event_type = 'ghost'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ghost_umid, Some(umid));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

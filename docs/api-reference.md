@@ -1256,6 +1256,7 @@ Query parameters (both optional):
       "ghost_streak": 0, "total_ghosts": 2,
       "updated_at": "2026-08-17T14:02:11.412Z"
     },
+    "user_message_id": "…",
     "created_at": "…"
   }
 }
@@ -1279,6 +1280,10 @@ reports all-zero `effective_deltas`.
   instead of adding deltas to a running total. It is a **write-time**
   snapshot — after an absence only `GET /bff/v1/comp/affinity/{session_id}`
   is correct, because that route refreshes the derived endpoints at read.
+- `user_message_id` — the user message (`chat_messages.id`) that drove this
+  turn; attach the delta to that message or to its replies
+  (`chat_messages.user_message_id`). Absent on `proactive` / `time_decay`
+  events and on rows written before migration `0056`.
 
 ### `GET /bff/v1/comp/affinity/{session_id}`
 

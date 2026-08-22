@@ -49,6 +49,11 @@ pub struct BffAffinityDelta {
     /// refreshes the derived endpoints at read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_after: Option<serde_json::Value>,
+    /// The user message (`chat_messages.id`) that drove this turn, for
+    /// attaching the delta to a specific message. Absent on `proactive` /
+    /// `time_decay` events and on rows written before migration 0056.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -152,6 +157,7 @@ async fn bff_get_affinity_delta(
             effective_deltas_computed,
             label_changes,
             state_after: r.state_after,
+            user_message_id: r.user_message_id,
             created_at: r.created_at,
         })
     });
@@ -445,6 +451,77 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    async fn seed_user_message(pool: &PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'seed') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Like `seed_event`, with the 0056 turn pointer set.
+    async fn seed_event_for_message(
+        pool: &PgPool,
+        affinity_id: Uuid,
+        user_message_id: Uuid,
+        secs_ago: i64,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.companion_affinity_events \
+               (affinity_id, event_type, deltas, effective_deltas, user_message_id, created_at) \
+             VALUES ($1, 'message', '{}'::jsonb, $2, $3, now() - make_interval(secs => $4)) \
+             RETURNING id",
+        )
+        .bind(affinity_id)
+        .bind(json!({ "warmth": 0.05 }))
+        .bind(user_message_id)
+        .bind(secs_ago as f64)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_delta_echoes_user_message_id(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
+        let umid = seed_user_message(&pool, session_id).await;
+        seed_event_for_message(&pool, aid, umid, 10).await;
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["event"]["user_message_id"], json!(umid.to_string()));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_affinity_delta_omits_user_message_id_when_null(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let aid = seed_affinity(&pool, session_id, user_id, instance_id).await;
+        seed_event(&pool, aid, "message", 0.05, 10).await; // pre-0056-shaped row
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) = send_request(&mut app, req(&token, session_id)).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(
+            body["event"].get("user_message_id").is_none(),
+            "key must be absent, not null: {body}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

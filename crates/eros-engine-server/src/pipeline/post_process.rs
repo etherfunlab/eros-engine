@@ -99,9 +99,13 @@ pub async fn run(
         return;
     }
 
-    let user_msg = match &event {
-        Event::UserMessage { content, .. } => content.clone(),
-        _ => String::new(),
+    let (user_msg, user_message_id) = match &event {
+        Event::UserMessage {
+            content,
+            message_id,
+            ..
+        } => (content.clone(), Some(*message_id)),
+        _ => (String::new(), None),
     };
     // As of 4.0 the request's affinity scope is read-side only (prompt
     // injection gating); nothing in the write path consumes it any more.
@@ -225,6 +229,7 @@ pub async fn run(
             affinity_meta,
             levels,
             &eval_failures,
+            user_message_id,
         )
         .await;
     };
@@ -295,6 +300,7 @@ async fn persist_affinity(
     meta: Option<eros_engine_store::OpenRouterCallMeta>,
     levels: eros_engine_core::affinity::EndpointLevelReads,
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
+    user_message_id: Option<Uuid>,
 ) {
     // Recheck: the affinity evaluator's LLM call (or a sibling post_process
     // future) may have run long enough for the archive endpoint to commit
@@ -336,7 +342,7 @@ async fn persist_affinity(
 
     match action {
         ActionType::Ghost => {
-            if let Err(e) = repo.record_ghost(&mut affinity).await {
+            if let Err(e) = repo.record_ghost(&mut affinity, user_message_id).await {
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
         }
@@ -372,6 +378,7 @@ async fn persist_affinity(
                     levels,
                     llm_attempts,
                     gateway_errors,
+                    user_message_id,
                 )
                 .await
             {
@@ -1839,6 +1846,20 @@ mod tests {
         .unwrap()
     }
 
+    /// A `role='user'` row for the turn under test. Since migration 0056 the
+    /// affinity event FK-references it, so a `run()` test that asserts on
+    /// affinity rows must seed it and pass its id in the `Event`.
+    async fn seed_user_message(pool: &sqlx::PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'seed') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// Mock OpenRouter that replies with the first entry whose
     /// `prompt_substring` appears anywhere in the outbound request, and
     /// records each request's wire `task` name, in order.
@@ -3112,13 +3133,14 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        let umid = seed_user_message(&pool, session_id).await;
 
         // "hi" is short enough to trip both the PDE's short-message rule delta
         // (a patience penalty) AND `eval_skip_reason`'s `short_user_msg` gate,
         // so the LLM affinity eval never fires while the rule delta still does.
         let event = Event::UserMessage {
             content: "hi".into(),
-            message_id: Uuid::new_v4(),
+            message_id: umid,
             prompt_traits: Vec::new(),
             audit: None,
             tier: None,
@@ -3165,8 +3187,8 @@ mod tests {
         )
         .await;
 
-        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT e.event_type, e.context \
+        let rows: Vec<(String, serde_json::Value, Option<Uuid>)> = sqlx::query_as(
+            "SELECT e.event_type, e.context, e.user_message_id \
              FROM engine.companion_affinity_events e \
              JOIN engine.companion_affinity a ON a.id = e.affinity_id \
              WHERE a.session_id = $1",
@@ -3194,6 +3216,11 @@ mod tests {
             "the LLM affinity eval must still be skipped (the guaranteed-neutral \
              half of the contract); context: {:?}",
             rows[0].1
+        );
+        assert_eq!(
+            rows[0].2,
+            Some(umid),
+            "the event must point at the user message that drove the turn"
         );
 
         // 4.0: patience is a derived endpoint. A skipped eval holds the
@@ -3255,6 +3282,7 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
+        let umid = seed_user_message(&pool, session_id).await;
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
@@ -3273,7 +3301,7 @@ mod tests {
 
         let event = Event::UserMessage {
             content: "我今天过得还不错，你呢".into(),
-            message_id: Uuid::new_v4(),
+            message_id: umid,
             prompt_traits: Vec::new(),
             audit: None,
             tier: None,
@@ -3384,6 +3412,7 @@ mod tests {
             .load_or_create(session_id, user_id, instance_id)
             .await
             .unwrap();
+        let umid = seed_user_message(&pool, session_id).await;
 
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
@@ -3402,7 +3431,7 @@ mod tests {
 
         let event = Event::UserMessage {
             content: "我今天过得还不错，你呢".into(),
-            message_id: Uuid::new_v4(),
+            message_id: umid,
             prompt_traits: Vec::new(),
             audit: None,
             tier: None,
@@ -3517,6 +3546,7 @@ mod tests {
                 patience: Some(3),
             },
             &[],
+            None,
         )
         .await;
 
@@ -4053,6 +4083,7 @@ mod tests {
             None,
             eros_engine_core::affinity::EndpointLevelReads::default(),
             &[],
+            None,
         )
         .await;
 
