@@ -1398,8 +1398,11 @@ async fn extract_character_facts(
                 }),
             )
         }
-        // Unlike the human chain, the unparseable reply is KEPT: a whole-turn
-        // refusal and malformed JSON are otherwise the same row.
+        // The unparseable reply is KEPT: a whole-turn refusal and malformed
+        // JSON are otherwise the same row. All three chains' structuring
+        // stages keep it too (including the human chain's, since its
+        // stage-2 split); `extract_facts`, the human chain's own extraction
+        // stage, is the one place that still discards it.
         None => (
             vec![],
             Some(CallAudit {
