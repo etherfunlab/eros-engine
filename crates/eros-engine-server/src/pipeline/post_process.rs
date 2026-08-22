@@ -1627,7 +1627,15 @@ async fn extract_user_facts(
     assistant_msg: &str,
     audit_user: Option<&str>,
 ) -> (Vec<String>, Option<CallAudit>) {
-    if assistant_msg.trim().is_empty() {
+    // Unlike extract_character_facts (which mines only the AI's line and so
+    // only needs assistant_msg non-blank), this chain mines the USER's line
+    // from a two-party turn. run()'s outer guard checks `!user_msg.is_empty()`
+    // without trimming, so a whitespace-only user turn still reaches here; if
+    // this only checked assistant_msg, that turn would spend a call asking
+    // the model to mine *user* facts from "用户:    \nAI: <reply>" — exactly
+    // the input most likely to produce the cross-attribution the prompt's own
+    // rules exist to prevent. Require both sides non-blank.
+    if user_msg.trim().is_empty() || assistant_msg.trim().is_empty() {
         return (vec![], None);
     }
     let Some(resolved) = state.model_config.resolve_user_insight_extract() else {
@@ -2928,6 +2936,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 0, "no block, no calls, no rows");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_extraction_skips_whitespace_only_user_msg(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        // The task block IS configured (unlike the "off" test above), so if
+        // extract_user_facts guarded only assistant_msg — the bug this test
+        // catches — this whitespace-only user turn would still fire a real
+        // call. The recorder proves it never reaches the mock at all.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
+            vec![],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "   ",
+            "那你通勤久吗",
+            None,
+        )
+        .await;
+
+        assert!(
+            recorder.lock().unwrap().is_empty(),
+            "whitespace-only user_msg ⇒ no LLM call, even with a real AI reply"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.user_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no call, no event row");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
