@@ -544,7 +544,11 @@ mod tests {
     /// deployment is already in. Exercises the fallback branch of
     /// `resolve_image_edit_compose` and the handler's
     /// `.expect("has_task checked above")`.
-    const COMPOSE_ONLY_TOML: &str = "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n";
+    ///
+    /// The compose block carries its own `filter_prompt` so the fallback test
+    /// below has something to prove was NOT used — without it, a handler that
+    /// wrongly reused the chat composer's prompt would still pass.
+    const COMPOSE_ONLY_TOML: &str = "[tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"CHAT COMPOSER PROMPT MUST NOT BE USED FOR EDITS\"\n";
 
     /// A user row plus an assistant image turn pointing back at it. Returns
     /// (user_message_id, image_message_id).
@@ -943,6 +947,10 @@ mod tests {
         assert!(
             sent.contains("You revise a picture"),
             "the built-in EDIT prompt must be used, not the chat composer's own prompt: {sent}"
+        );
+        assert!(
+            !sent.contains("CHAT COMPOSER PROMPT MUST NOT BE USED FOR EDITS"),
+            "the chat composer's filter_prompt must never reach the edit call: {sent}"
         );
     }
 

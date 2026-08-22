@@ -499,6 +499,12 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 | 429 | 达到每用户并发上限（3，与 chat/voice/compose 共用） |
 | 5XX | 合成链走完仍无输出 —— 透传供应商自己的状态码与响应体，与 compose 端点一致。**不落任何消息**，可安全重试 |
 
+请求体反序列化失败（缺 `instruction`、`style` 类型不对）或路径里的 UUID 格式不对，
+会被 axum 的 extractor 挡在上述判定之前，返回框架自身的纯文本 400/422 ——
+不是本端点的 `{"error", "message"}` 形状。上表里的 422（`instruction` 空白、
+`aspect_ratio` 不支持）是反序列化成功之后，按文中所述顺序、
+排在 ownership 与状态判定之后才触发的。
+
 需要 `[tasks.chat_image_edit_compose]` **或** `[tasks.chat_image_prompt_compose]`：
 只配后者时，编辑走聊天合成器的模型链，用引擎内置的编辑提示词。
 

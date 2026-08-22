@@ -576,6 +576,13 @@ insight or memory extraction. The new row inherits the source's
 | 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
 | 5XX | composer chain exhausted — the provider's own status and body, as on the compose endpoint. **No message is persisted**; retry is safe |
 
+A body that fails to deserialize (missing `instruction`, wrong type for
+`style`) or a malformed path UUID is rejected by axum's extractors before any
+of the above, with a framework-shaped plain-text 400/422 — not the
+`{"error", "message"}` shape this endpoint returns. The 422 cases in the table
+above (blank `instruction`, unsupported `aspect_ratio`) are ones the request
+deserialized successfully into, gated after ownership and state as described.
+
 Requires `[tasks.chat_image_edit_compose]` **or** `[tasks.chat_image_prompt_compose]`:
 with only the latter, edits run on the chat composer's chain using the engine's
 built-in edit prompt.
