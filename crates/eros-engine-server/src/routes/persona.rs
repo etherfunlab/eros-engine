@@ -25,8 +25,9 @@ use crate::error::{AppError, StreamPreError};
 use crate::pipeline::handlers::compose_image_prompt;
 use crate::pipeline::stream::{
     compose_inputs_json, compose_user_payload, error_frame_fields_from_last,
-    operation_failure_pointer, parse_compose_reply, record_compose_event, run_image_prompt_compose,
-    split_failures, stream_error_code_for, StreamErrorCode, FILTER_TIMEOUT,
+    operation_failure_pointer, parse_compose_reply, record_compose_event, render_compose_payload,
+    run_image_prompt_compose, split_failures, stream_error_code_for, StreamErrorCode,
+    FILTER_TIMEOUT,
 };
 use crate::routes::companion_stream::aspect_ratio_supported;
 use crate::state::{AppState, StreamSlotGuard};
@@ -176,13 +177,14 @@ fn validate(req: &ComposeRequest) -> Result<(), AppError> {
 /// has no typed failure at all — those calls succeeded and were billed — so it
 /// falls back to the chain-scoped `ChainExhausted`, with the coarse tag folded
 /// into the message.
-fn compose_chain_exhausted(
+pub(crate) fn compose_chain_exhausted(
     failures: &[eros_engine_llm::failure::AttemptFailure],
     last_failure: Option<&str>,
+    task: &'static str,
 ) -> AppError {
     let f = failures.last().cloned().unwrap_or_else(|| {
         eros_engine_llm::failure::AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
-            task: "chat_image_prompt_compose".into(),
+            task: task.into(),
             model: None,
             kind: eros_engine_llm::failure::GatewayKind::ChainExhausted,
             message: format!(
@@ -330,11 +332,14 @@ pub async fn compose_image(
     let run = run_image_prompt_compose(
         &state,
         &resolved,
-        &persona,
-        &scene,
-        &content,
-        req.aspect_ratio.as_deref(),
-        &style_str,
+        &render_compose_payload(
+            &persona,
+            &scene,
+            &content,
+            req.aspect_ratio.as_deref(),
+            &style_str,
+        ),
+        "chat_image_prompt_compose",
     )
     .await;
 
@@ -384,7 +389,11 @@ pub async fn compose_image(
             },
         )
         .await;
-        return Err(compose_chain_exhausted(&run.failures, run.last_failure));
+        return Err(compose_chain_exhausted(
+            &run.failures,
+            run.last_failure,
+            "chat_image_prompt_compose",
+        ));
     };
 
     let composed_prompt = compose_image_prompt(style_key, &persona, &outcome.prompt);
@@ -731,7 +740,11 @@ async fn compose_stream(
             },
         )
         .await;
-        return Err(compose_chain_exhausted(&chain_failures, Some(last_failure)));
+        return Err(compose_chain_exhausted(
+            &chain_failures,
+            Some(last_failure),
+            "chat_image_prompt_compose",
+        ));
     };
 
     let frames = async_stream::stream! {

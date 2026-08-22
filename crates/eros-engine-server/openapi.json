@@ -1513,6 +1513,89 @@
         ]
       }
     },
+    "/v2/comp/session/{session_id}/message/{message_id}/image/edit": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Revise an existing image turn.",
+        "description": "The instruction is an input to a picture, not something the user said to\nthe character: it is recorded on the audit row, never as a chat message.\nThe new assistant row inherits the source's `user_message_id`, so the edit\nbelongs to the turn the original picture answered.",
+        "operationId": "edit_image",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "The image turn to revise",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageEditRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageEditResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "not your session"
+          },
+          "404": {
+            "description": "session or message not found"
+          },
+          "409": {
+            "description": "the message is not an image turn"
+          },
+          "422": {
+            "description": "blank instruction or unsupported aspect_ratio"
+          },
+          "429": {
+            "description": "per-user in-flight cap reached"
+          },
+          "501": {
+            "description": "no image composer configured on this deployment"
+          },
+          "5XX": {
+            "description": "composer chain exhausted; the provider's own status passes through, same body as the compose endpoint"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/world/town/{user_id}/feed": {
       "get": {
         "tags": [
@@ -2617,6 +2700,79 @@
           "total": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "ImageEditRequest": {
+        "type": "object",
+        "required": [
+          "instruction"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same allow-list as the chat path. Defaults to the source turn's\n`aspect_ratio`."
+          },
+          "instruction": {
+            "type": "string",
+            "description": "What to change, in the user's words (\"换套衣服\"). Required, non-blank."
+          },
+          "prompt_variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`[tasks.chat_image_edit_compose].filter_prompt` variant, with the same\nselection rules as the chat path's `image.prompt_variant`."
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Style preset for the new picture. Default `realistic`; pass the style\nthe source was drawn with — the engine does not record it."
+          }
+        }
+      },
+      "ImageEditResponse": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "edit_of",
+          "composed_prompt",
+          "image_ref"
+        ],
+        "properties": {
+          "aspect_ratio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The composer's caption for the new picture."
+          },
+          "composed_prompt": {
+            "type": "string",
+            "description": "Base64 (STANDARD) of the UTF-8 composed prompt — the same encoding as\nthe SSE `image_request` frame, so an existing draw path consumes it\nunchanged."
+          },
+          "edit_of": {
+            "type": "string",
+            "description": "The image turn this revises."
+          },
+          "image_ref": {
+            "type": "string",
+            "description": "Always `\"previous\"`: on an edit turn that means the `edit_of` picture."
+          },
+          "message_id": {
+            "type": "string",
+            "description": "The new assistant message."
           }
         }
       },

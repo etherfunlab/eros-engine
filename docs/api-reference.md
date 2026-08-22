@@ -512,6 +512,81 @@ turn; nothing is coalesced or dropped, only reordered. Worker config
 [Deploying → Operational notes](deploying.md#operational-notes). Design:
 [async chat endpoint spec](superpowers/specs/2026-08-20-async-chat-endpoint-design.md).
 
+### `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`
+
+Revise a picture the character already sent. `{message_id}` is an image turn —
+a message whose history entry carries `"image": true`. The engine composes a new
+image prompt from that picture's subject plus the instruction, persists a new
+image-only assistant message, and returns its `image_request` payload; the
+consumer draws it, exactly as for a chat image turn.
+
+```json
+{
+  "instruction": "换套衣服",
+  "style": "realistic",
+  "aspect_ratio": "3:4",
+  "prompt_variant": "a"
+}
+```
+
+- `instruction` — required, non-blank, ≤4096 chars. What to change, in the
+  user's words. It is an input to a picture, not a chat message: it is recorded
+  on the audit row and never persisted as conversation.
+- `style` — `realistic` (default) | `semi_realistic` | `anime`. Pass the style
+  the source was drawn with; the engine does not record it on the message.
+- `aspect_ratio` — `1:1` | `3:4` | `4:3` | `9:16` | `16:9`. Defaults to the
+  source turn's.
+- `prompt_variant` — selects a `[tasks.chat_image_edit_compose].filter_prompt`
+  variant, with the same rules as the chat path's `image.prompt_variant`.
+
+```json
+{
+  "message_id": "…",
+  "edit_of": "…",
+  "composed_prompt": "<base64>",
+  "image_ref": "previous",
+  "aspect_ratio": "3:4",
+  "caption": "换了条裙子"
+}
+```
+
+`composed_prompt` is base64(STANDARD) of the UTF-8 wire prompt — the same
+encoding as the SSE `image_request` frame and the recovery endpoint, so an
+existing draw path consumes it unchanged. `image_ref` is always `previous`, and
+on an edit turn that means **the `edit_of` picture**, not whatever the consumer
+drew last.
+
+The new message is an ordinary image turn: it appears in history with
+`"image": true` and its prompt is recoverable via
+`GET /comp/chat/{session_id}/messages/{message_id}/image-request`. Its
+`metadata.image` additionally carries `edit_of`. An edit can itself be edited.
+
+Nothing else about a turn runs: no PDE decision, no affinity movement, no
+insight or memory extraction. The new row inherits the source's
+`user_message_id` — the edit belongs to the turn the original picture answered.
+
+| Status | Meaning |
+|---|---|
+| 401 | missing or invalid bearer |
+| 403 | not your session |
+| 404 | unknown session, or no such message in it |
+| **409** | the message exists but is not an image turn |
+| 422 | blank `instruction`, or unsupported `aspect_ratio` |
+| 501 | neither `[tasks.chat_image_edit_compose]` nor `[tasks.chat_image_prompt_compose]` is configured |
+| 429 | per-user in-flight cap reached (3, shared with chat/voice/compose) |
+| 5XX | composer chain exhausted — the provider's own status and body, as on the compose endpoint. **No message is persisted**; retry is safe |
+
+A body that fails to deserialize (missing `instruction`, wrong type for
+`style`) or a malformed path UUID is rejected by axum's extractors before any
+of the above, with a framework-shaped plain-text 400/422 — not the
+`{"error", "message"}` shape this endpoint returns. The 422 cases in the table
+above (blank `instruction`, unsupported `aspect_ratio`) are ones the request
+deserialized successfully into, gated after ownership and state as described.
+
+Requires `[tasks.chat_image_edit_compose]` **or** `[tasks.chat_image_prompt_compose]`:
+with only the latter, edits run on the chat composer's chain using the engine's
+built-in edit prompt.
+
 ### `GET /comp/chat/{session_id}/history?limit=20&offset=0`
 
 Paginated message history, newest first. `limit` defaults to 20 (capped at 50).

@@ -81,9 +81,11 @@ third meaning on the request body would make the docs unreadable.
 | 403 | session not owned by the JWT user | `not your session` |
 | 404 | no such message in this session | `no such message` |
 | **409** | message exists but has no `metadata.image` | `not an image turn` |
-| 422 | `instruction` blank, `aspect_ratio` off the allow-list | validation message |
+| 409 | the source image turn has no originating user message, or the session has no persona instance | (unreachable on every engine-written path; the edit has nothing to attach to) |
+| 422 | `instruction` blank, `instruction` over `MAX_INSTRUCTION_CHARS` (4096 — parity with the standalone composer's `content` limit), or `aspect_ratio` off the allow-list | validation message |
 | 501 | no composer configured (§3.1) | `image prompt composer not configured` |
-| 502 | composer chain exhausted | `image prompt composer failed` |
+| 429 | per-user in-flight cap reached (`CONCURRENT_STREAMS_PER_USER`, shared with chat/voice/compose) | `per-user in-flight cap reached` |
+| 5XX | composer chain exhausted | `image prompt composer failed` |
 | 200 | — | `ImageEditResponse` |
 
 **409, not 404, for "not an image turn".** The message *was* found; what is
@@ -93,10 +95,10 @@ v1 recovery endpoint answers 404 for the same condition, and that stays frozen
 this is an action on a resource that does exist.
 
 Nothing is persisted on any non-200 path except the `exhausted` audit row on
-502 (§3.4). A 502 leaves no assistant message: there is **no portrait
-fallback** here. The chat path falls back to a plain portrait because a turn
-that promised a picture must ship one; an edit that ignores its instruction is
-worse than an error, and the consumer can simply retry.
+chain exhaustion (§3.4). An exhausted chain leaves no assistant message: there
+is **no portrait fallback** here. The chat path falls back to a plain portrait
+because a turn that promised a picture must ship one; an edit that ignores its
+instruction is worse than an error, and the consumer can simply retry.
 
 ### 2.4 Response
 
@@ -113,8 +115,11 @@ pub struct ImageEditResponse {
     pub composed_prompt: String,
     /// Always `"previous"` on an edit turn; see §3.3.
     pub image_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<String>,
-    /// The composer's caption for the new picture; `null` when it gave none.
+    /// The composer's caption for the new picture; the field is omitted
+    /// entirely (not `null`) when it gave none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
 }
 ```
@@ -146,6 +151,15 @@ The compose block is the gate — an operator who enabled image turns gets edits
 with no further config, on the same models, with the engine prompt. The edit
 block exists so the prompt and the model can be tuned separately once there is
 a reading to tune against (the `image_edit` audit rows, §3.4).
+
+In fallback mode `resolve_image_edit_compose` resolves the chain by calling
+`resolve("chat_image_prompt_compose", None)` — the same call the chat path's
+own `resolve_image_prompt_compose` makes. On a round-robin or weighted
+`model`, that call advances the **same** cursor both call sites share (it
+lives on the one `ModelSpec` stored under `[tasks.chat_image_prompt_compose]`
+in `ModelConfig::tasks`). Correct given the two features deliberately share a
+chain, but worth stating: on a deployment with no edit block configured,
+edit traffic shifts which model the *next chat image compose* call lands on.
 
 Housekeeping that comes with a new task: `KNOWN_CHAT_TASKS` gains
 `chat_image_edit_compose`; the wire `task` on the composer call is
@@ -242,8 +256,9 @@ to add `'image_edit'`. `inputs` for that source carries the seven keys in
 §3.3, not the chat composer's five — `inputs` is free-form JSONB and the
 `source` column says which shape to expect. `docs/llm-audit.md` documents both.
 
-A 502 writes one `exhausted` row with `attempts` / `last_failure` / the failure
-list, `composed_prompt = NULL` — the same as the standalone composer's 502.
+An exhausted chain writes one `exhausted` row with `attempts` / `last_failure` /
+the failure list, `composed_prompt = NULL` — the same as the standalone
+composer's own exhaustion path.
 
 `chat_images_events WHERE source = 'image_edit'` grouped by `status` and by day
 is the reading for this feature: how often edits are requested, how often the
@@ -255,17 +270,35 @@ composer refuses or fails, and on which models.
   row interleaves wherever its `created_at` falls. Accepted — the voice and
   chat pipelines already write to one session concurrently, and the edit row
   carries no state the in-flight turn reads.
-- One composer call per request, no per-user cap. Every call is audited
-  (§3.4). Default-open; the gate gets ratcheted if the reading says so.
+- One composer call per request, guarded by the same per-user in-flight cap as
+  chat, voice and the standalone composer (`CONCURRENT_STREAMS_PER_USER`, 429
+  over cap). Not a new gate: it is the throttle every user-triggered LLM entry
+  point already carries, and omitting it would have made this the only
+  unbounded one. Every call is audited (§3.4).
+- **Idempotent chat replay picks up edit rows.** `upsert_user_message_in_tx`
+  (the dedup path behind `POST /comp/chat/{session_id}/message/stream` and the
+  async endpoint) selects a replayed turn's `assistant_chain` by
+  `WHERE user_message_id = $1 AND role = 'assistant'` — no `channel` filter,
+  no restriction to rows the streaming pipeline itself wrote. Because an edit
+  row's `user_message_id` is the source's, it lands in that `assistant_chain`
+  when its originating turn is replayed. Traced and harmless: `replay_stream`
+  skips the `Delta` frame on any row with empty `content` (every image-only
+  row, edits included) and never emits an `image_request` frame at all — it
+  already treats a chat-path image-only row this way, and an edit row is
+  wire-identical to one for this purpose.
 
 ## 4. Implementation shape
 
 - `crates/eros-engine-server/src/routes/image_edit.rs` — DTOs, handler,
   `router()`; merged (not nested) into both `router()` and
   `router_for_openapi()` in `routes/mod.rs`, like `insight.rs`.
-- `pipeline/stream.rs` — `run_image_prompt_compose` takes `(payload, task)`;
-  new `compose_edit_payload(...)` and `compose_edit_inputs_json(...)` pure
-  functions; `build_delegated_image_marker` gains `edit_of`.
+- `pipeline/stream.rs` — the shared refactor only: `render_compose_payload`,
+  the parameterized `run_image_prompt_compose`, and `build_delegated_image_marker`
+  gaining `edit_of`. The edit-specific renderers (`compose_edit_payload`,
+  `render_edit_payload`, `compose_edit_inputs_json`) live in
+  `routes/image_edit.rs` instead, alongside the handler that is their only
+  caller — `stream.rs` is already the workspace's largest file, and a
+  single-caller function does not earn a place in it.
 - `crates/eros-engine-llm/src/model_config.rs` — `DEFAULT_EDIT_PROMPT`,
   `resolve_image_edit_compose`, `KNOWN_CHAT_TASKS` entry, validator case.
 - `crates/eros-engine-store/migrations/0057_…` — CHECK widening.
@@ -303,16 +336,21 @@ composer refuses or fails, and on which models.
   the built-in prompt.
 - `DEFAULT_EDIT_PROMPT` is non-empty and names both output fields (guards a
   broken-constant edit).
-- The shipped example config parses with the new task present.
+- The shipped example config still parses and boots with the new task's block
+  left commented out, exactly like the composer block above it — implemented
+  as `committed_example_config_leaves_the_image_edit_task_commented_out`,
+  which also asserts `validate_prompt_variants` accepts it. This guards
+  against a stray uncomment turning the example into a config that calls a
+  model nobody asked for, not against the block being absent altogether.
 
 **Server (`sqlx::test`, mocked OpenRouter, mirroring the recovery-endpoint
 tests):**
 
 - The full ladder: 403 foreign session, 404 unknown session, 404 unknown
   message, **409** on a text message, 422 blank instruction, 501 with no
-  composer task, 502 on chain exhaustion.
-- 502 writes exactly one `image_edit` / `exhausted` audit row and **no**
-  assistant row.
+  composer task, 5XX on chain exhaustion.
+- An exhausted chain writes exactly one `image_edit` / `exhausted` audit row
+  and **no** assistant row.
 - Success: response fields; a new assistant row exists with `content = ""`,
   `user_message_id` equal to the source's, `metadata.image.edit_of` equal to
   the source id, `image_ref = "previous"`, and a `compose_event_id` that

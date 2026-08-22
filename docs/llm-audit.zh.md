@@ -299,7 +299,7 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 | `chat_output_filter` | `chat_messages` | assistant |
 | `chat_input_filter` | `chat_messages` | **user** |
 | `chat_vision` | `chat_vision_events` | — |
-| `chat_image_prompt_compose` | `chat_images_events` | — |
+| `chat_image_prompt_compose` / `chat_image_edit_compose` | `chat_images_events` | — |
 | `pde_decision` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 
@@ -375,13 +375,14 @@ wire 上报的任务名是 `insight_structuring`——但它落到的审计行�
 ### `engine.chat_images_events`
 
 每次图片合成器 LLM 调用一行，来自**任意** caller——聊天轮次里委托的图片
-prompt，或者独立端点 `POST /persona/{instance_id}/image/compose` 的任一种
-流式模式。
+prompt、独立端点 `POST /persona/{instance_id}/image/compose` 的任一种
+流式模式，或者
+`POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`。
 
 | 列 | 类型 | 含义 |
 |---|---|---|
 | `id` | `UUID` | 行 id——见下面的关联关系。 |
-| `source` | `TEXT` | `chat_reply_text_image` \| `chat_reply_image` \| `compose_endpoint` \| `compose_endpoint_stream`。 |
+| `source` | `TEXT` | `chat_reply_text_image` \| `chat_reply_image` \| `compose_endpoint` \| `compose_endpoint_stream` \| `image_edit`（见下文）。 |
 | `user_id` | `UUID` | |
 | `instance_id` | `UUID?` | 角色实例；caller 没有实例上下文时为 NULL。 |
 | `session_id` | `UUID?` | 聊天 session；独立端点没有 session，恒为 NULL。 |
@@ -389,16 +390,23 @@ prompt，或者独立端点 `POST /persona/{instance_id}/image/compose` 的任�
 | `inputs` | `JSONB` | 合成器的五个槽位，结构化保存：`{appearance, recent_scene, latest_user_msg, style, aspect_ratio}`。空槽位记为 `""`，不是 prompt 渲染时用的 `（无）` 占位符——那个替换是渲染细节，不是输入本身。`latest_user_msg` 按 `source` 不同而不同：`chat_reply_image` 传的是原始的 `user_msg.content`，而 `chat_reply_text_image` 传的是 `effective_user_msg`——input filter 改写之后的版本。两者都如实记录了合成器那一轮实际看到的内容；跨这两个 source 比对行的运维应该预期这个差异，不要当成不一致。 |
 | `subject` | `TEXT?` | 合成器自己的 `prompt` 字段。`status = "ok"` 之外恒为 NULL。 |
 | `caption` | `TEXT?` | 合成器没写 caption 时为 NULL，包括非 JSON 回退的情形——此时整段回复变成 `subject`。 |
-| `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行是 NULL——它失败时根本没拼装任何东西。 |
+| `composed_prompt` | `TEXT?` | 拼装出的线上 wire 字符串——style 预设 + 角色外观 + subject，也就是下游消费方实际拿到的那个字符串。**每一行只要产出过它就会保存**，包括聊天路径上的 `exhausted` 和 `not_configured`（肖像回退仍会拼出一个 wire prompt，这一列就是唯一记录了当时画的到底是什么的地方）；只有独立端点的 `exhausted` 行和 `image_edit` 端点的 `exhausted` 行是 NULL——两者失败时都没拼装任何东西（编辑端点同样没有肖像回退）。 |
 | `variant` | `TEXT?` | 解析出的 `prompt_variant` key；`"raw"` 是普通 key，不是跳过标记。 |
 | `model` | `TEXT?` | 成功时是应答的模型。`exhausted` 时也可能有值——只要最后一次尝试确实拿到过应答：聊天路径和非流式端点共用的 `empty`/`empty_prompt`（都走 `run_image_prompt_compose` 那一套共享的链路遍历），以及独立端点流式模式下先流出 metadata（model/generation_id/usage）、之后才断掉的候选——那份证据会被保留，因为 provider 应答了，可能已经计费。只有在任意路径上完全没有应答回来时才是 NULL：什么都没捕获到就断掉或超时，或者 `not_configured`（压根没发起调用）。**自 v1.4.0 起，「provider 到底有没有应答」这条判据完全由这三列**（`model` / `generation_id` / `usage`）承担；`last_failure` 不再兼任它的粗粒度副本，这也正是当初用来编码它的两个标签（`stream_open_failed` / `stream_died_midway`）被取消的原因。 |
 | `usage` | `JSONB?` | 完整未过滤的 OpenRouter usage 块，`serde_json::to_value` 出来的——`OPENROUTER_USAGE_HIDDEN_KEYS` 只过滤 wire 上那份回显，从不影响这里。与 `model` 同步：`model` 有值的地方它才有值。 |
 | `generation_id` | `TEXT?` | 与 `model` 同步。 |
 | `attempts` | `SMALLINT` | 实际调用了 `[primary, ...fallback]` 里多少个模型；`not_configured` 时为 `0`。 |
 | `last_failure` | `TEXT?` | 最后一次尝试为什么失败；`status = "ok"` 或 `"not_configured"`（压根没发起尝试，也就无所谓失败）时为 NULL。取值：`empty` \| `empty_prompt` \| `upstream_error` \| `gateway_error`。自由文本列，不是 CHECK——这个词表会随新失败模式的出现而增长。前两个是**内容裁决**：调用成功了也计费了，只是产出不可用。后两个是**指针值**，指明下面两列中哪一列存着逐 hop 的细节；自 v1.4.0 起它们取代了 `model_error` / `timeout` 以及流式模式的 `stream_open_failed` / `stream_died_midway`——那四个标签里每一个都同时覆盖了 provider 状态和本地超时，所以一并退役，这一列现在无论由哪个端点写入读起来都一样（见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)）。**`empty` 在流式模式下也能出现**，不止链路遍历那两条路径——一个候选压根没开流（没有内容块），但流本身正常结束，也记 `empty`，跟链路遍历里内容层面「空回复」那一支同名，因为两者说的是同一件事：provider 应答了，可能已经计费。 |
-| `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop，`task = "chat_image_prompt_compose"`。一个都没有时为 NULL——见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)。 |
+| `llm_attempts` | `JSONB?` | provider 应答了但报了失败的每一个 hop。除 `source = "image_edit"` 外都是 `task = "chat_image_prompt_compose"`；`image_edit` 行恒为 `"chat_image_edit_compose"`——即便这次编辑实际走的是合成任务的回退链，见[模型配置 → 图片-EDIT 合成器](model-config.zh.md#taskschat_image_edit_compose--图片-edit-合成器可选)。一个都没有时为 NULL——见[失败的尝试](#失败的尝试llm_attempts--gateway_errors)。 |
 | `gateway_errors` | `JSONB?` | 我们通往 provider 的路断掉的每一个 hop。一个都没有时为 NULL。 |
 | `created_at` | `TIMESTAMPTZ` | |
+
+- `image_edit` —— `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`。
+  它的 `inputs` 是七个键，不是聊天合成器的五个：`appearance`、`source_message_id`、
+  `source_subject`、`source_caption`、`instruction`、`style`、`aspect_ratio`。
+  看 `source` 就知道该按哪种形状读。按 `status` 分组查
+  `engine.chat_images_events WHERE source = 'image_edit'`，就是「编辑被用得多不多、
+  合成器多久拒一次」的读数。
 
 `status` 刻意只有三个值：`exhausted` 表示「这次调用没产出可用的合成结果」，
 涵盖包括流式端点中途死掉在内的所有原因，具体区分交给 `last_failure`。

@@ -551,6 +551,7 @@ input filter has no triggers, timing, or tiers).
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
+| `chat_image_edit_compose` | `routes::image_edit` via `resolve_image_edit_compose()` (image-EDIT composer for `POST /v2/comp/session/{session_id}/message/{message_id}/image/edit`; revises a picture the character already sent from an instruction. **Optional even for the endpoint** — with this block absent the endpoint runs on `[tasks.chat_image_prompt_compose]`'s chain and parameters with the engine's built-in edit prompt; with both blocks absent the endpoint answers 501) | live (optional) |
 | `chat_vision` | `pipeline::stream` via `resolve_vision()` (vision pre-stage: describes an `image_url` attachment into JSON before the reply prompt; off when task block absent or `filter_prompt` blank) | live (opt-in) |
 | `chat_product_qa` | `pipeline::stream` via `resolve_product_qa()` (out-of-character product-QA executor for the PDE `product_qa` action; off when task block absent or `filter_prompt` blank; also requires the LLM PDE) | live (opt-in) |
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
@@ -572,6 +573,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `insight_structuring`, `affinity_evaluation`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
+- `crates/eros-engine-server/src/routes/image_edit.rs` → `chat_image_edit_compose` via `resolve_image_edit_compose()` (image-EDIT composer, resolved on every request to the edit endpoint; falls back to `[tasks.chat_image_prompt_compose]`'s chain when the edit block is absent — see below)
 
 `embedding` doesn't go through the generic `resolve()` path above — it has
 its own resolver, `ModelConfig::resolve_embedding()`, called once at boot
@@ -728,9 +730,10 @@ image-model provider and the downstream deployment, not this step. A
 non-blank `filter_prompt` overrides it (and must honor the JSON contract
 above); a blank/absent one falls back to it.
 
-**Variants.** This is the **only** task whose `filter_prompt` accepts more than a
-plain string. The consumer picks one per chat turn via `image.prompt_variant` on
-the send-message body. Three shapes:
+**Variants.** This task's `filter_prompt` accepts more than a plain string (so
+does `[tasks.chat_image_edit_compose]`'s — see below). The consumer picks one
+per chat turn via `image.prompt_variant` on the send-message body. Three
+shapes:
 
 ```toml
 filter_prompt = "…"                       # one prompt; prompt_variant is ignored
@@ -769,8 +772,9 @@ index or key — `"raw"` included, if unconfigured — falls back to the built-i
 prompt above like any other miss, never an error. `raw` is not reserved: a
 table key literally named `raw` boots fine.
 
-Variants are honored on this task only. An array/table `filter_prompt` on any
-other task refuses to boot rather than sit there unreachable. This task's own
+Variants are honored on this task and `[tasks.chat_image_edit_compose]` only.
+An array/table `filter_prompt` on any other task refuses to boot rather than
+sit there unreachable. This task's own
 `[tasks.chat_image_prompt_compose.tiers.*]` blocks refuse to boot in **any**
 shape — the composer always resolves with no tier, so the whole block is
 unreachable (see "Tier blocks are limited to two tasks" above).
@@ -813,6 +817,37 @@ tables](llm-audit.md#image-path-event-tables). Specs:
 (`metadata.image` keys above) and
 `docs/superpowers/specs/2026-08-14-image-audit-events-design.md`
 (`chat_images_events`).
+
+### `[tasks.chat_image_edit_compose]` — image-EDIT composer (optional)
+
+Powers `POST
+/v2/comp/session/{session_id}/message/{message_id}/image/edit` (see
+[api-reference.md](api-reference.md)): the consumer names an existing image
+turn and an instruction ("换套衣服"), and this task composes a new image
+prompt from that picture's subject plus the instruction. Same shape as
+`[tasks.chat_image_prompt_compose]` above (`model`, `fallback`,
+`retry_depth`, `temperature`, `max_tokens`, `reasoning`, sampling knobs), and
+`filter_prompt` is likewise **optional** and accepts the same three shapes
+(plain / array-by-index / table-by-key), selected per request via
+`prompt_variant` on the edit body.
+
+**This block is optional even for the endpoint.** With it absent, the
+endpoint runs on `[tasks.chat_image_prompt_compose]`'s chain and parameters,
+using the engine's built-in edit prompt instead of the chat composer's own
+`filter_prompt` (which is written to compose from conversation context, not
+to revise a picture) — so configuring image turns is already enough to get
+edits, with no further config. With **both** blocks absent, the endpoint
+answers 501. Configure this block to give edits their own model or their own
+prompt.
+
+Because the fallback path resolves through `[tasks.chat_image_prompt_compose]`
+itself (`resolve("chat_image_prompt_compose", None)`), it advances that
+task's round-robin `model` cursor exactly like a chat image compose call
+does — heavy edit traffic on a deployment with no edit block shifts which
+model the *next chat image compose* lands on.
+
+Call site: `crates/eros-engine-server/src/routes/image_edit.rs` via
+`resolve_image_edit_compose()` in `model_config.rs`.
 
 ### `[tasks.chat_vision]` — image input (vision pre-stage, opt-in)
 
@@ -1111,7 +1146,7 @@ After the primary is selected, any occurrence of that exact id is removed from t
 
 After deduplication the chain is truncated to `retry_depth` entries — a call tries the primary, then at most `retry_depth` fallbacks; anything past the truncation point is never tried. `retry_depth` is settable task-level, and per tier on the two tier-aware tasks (tier > task default).
 
-The default differs by task. The generic `resolve()` uses `2` (primary + 2 fallbacks — so `chat_companion` tries at most 3 models per streaming chat burst); the single-purpose tasks (`chat_output_filter`, `chat_input_filter`, `chat_vision`, `pde_decision`, `chat_product_qa`, `chat_image_prompt_compose`) use `1` (primary + first fallback).
+The default differs by task. The generic `resolve()` uses `2` (primary + 2 fallbacks — so `chat_companion` tries at most 3 models per streaming chat burst); the single-purpose tasks (`chat_output_filter`, `chat_input_filter`, `chat_vision`, `pde_decision`, `chat_product_qa`, `chat_image_prompt_compose`, `chat_image_edit_compose`) use `1` (primary + first fallback).
 
 ## Stability commitments
 

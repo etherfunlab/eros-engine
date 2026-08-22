@@ -369,4 +369,70 @@ mod tests {
         .expect("query relrowsecurity for chat_vision_events");
         assert!(enabled, "RLS must be enabled on engine.chat_vision_events");
     }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn image_edit_is_an_accepted_source(pool: PgPool) {
+        let repo = ImageComposeEventRepo { pool: &pool };
+        let id = repo
+            .record(ImageComposeEventInsert {
+                llm_attempts: None,
+                gateway_errors: None,
+                source: "image_edit",
+                user_id: Uuid::new_v4(),
+                instance_id: Some(Uuid::new_v4()),
+                session_id: Some(Uuid::new_v4()),
+                status: "ok",
+                inputs: serde_json::json!({ "instruction": "换套衣服" }),
+                subject: Some("SUBJECT"),
+                caption: Some("换了条裙子"),
+                composed_prompt: Some("STYLE\n银发红瞳\nSUBJECT"),
+                variant: None,
+                model: Some("m"),
+                usage: None,
+                generation_id: Some("g"),
+                attempts: 1,
+                last_failure: None,
+            })
+            .await
+            .expect("the widened CHECK must accept image_edit");
+
+        let (source, instruction): (String, String) = sqlx::query_as(
+            "SELECT source, inputs->>'instruction' FROM engine.chat_images_events WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(source, "image_edit");
+        assert_eq!(instruction, "换套衣服");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unknown_source_is_still_rejected(pool: PgPool) {
+        // The widening must not have dropped the constraint outright.
+        let repo = ImageComposeEventRepo { pool: &pool };
+        let err = repo
+            .record(ImageComposeEventInsert {
+                llm_attempts: None,
+                gateway_errors: None,
+                source: "not_a_real_source",
+                user_id: Uuid::new_v4(),
+                instance_id: None,
+                session_id: None,
+                status: "ok",
+                inputs: serde_json::json!({}),
+                subject: None,
+                caption: None,
+                composed_prompt: None,
+                variant: None,
+                model: None,
+                usage: None,
+                generation_id: None,
+                attempts: 0,
+                last_failure: None,
+            })
+            .await
+            .expect_err("an unknown source must violate the CHECK");
+        assert!(err.as_database_error().is_some(), "got {err:?}");
+    }
 }
