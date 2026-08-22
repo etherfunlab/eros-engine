@@ -23,14 +23,15 @@ use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::character_insight::{
-    existing_as_extraction_json as character_existing_json, existing_keys, parse_error_payload,
-    CharacterInsightEventInsert, CharacterInsightEventRepo, CharacterInsightRepo,
+    existing_as_extraction_json as character_existing_json, CharacterInsightEventInsert,
+    CharacterInsightEventRepo, CharacterInsightRepo,
 };
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{existing_as_extraction_json, HumanInsightRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use eros_engine_store::persona::PersonaRepo;
+use eros_engine_store::{existing_keys, parse_error_payload};
 
 use crate::state::AppState;
 

@@ -30,6 +30,33 @@ pub struct OpenRouterCallMeta {
     pub usage: Option<serde_json::Value>,
 }
 
+/// How many characters of an unparseable LLM reply are kept in a `parse_error`
+/// audit row. Enough to tell a refusal from a truncated object; short enough
+/// that a runaway reply cannot bloat the table.
+pub const RAW_PAYLOAD_MAX_CHARS: usize = 2000;
+
+/// Audit payload for a `parse_error` row: the reply itself, truncated. Without
+/// it a whole-turn refusal and malformed JSON produce the same row — and
+/// refusal is the likeliest way a mined fact goes missing. Truncation counts
+/// characters, not bytes: byte slicing would panic mid-codepoint.
+///
+/// Shared by all three insight chains (human, character, user).
+pub fn parse_error_payload(raw: &str) -> serde_json::Value {
+    let truncated: String = raw.chars().take(RAW_PAYLOAD_MAX_CHARS).collect();
+    serde_json::json!({ "raw": truncated })
+}
+
+/// Names — never values — of the columns that were already populated when a
+/// structuring call was made. The structurer's input is facts PLUS the existing
+/// profile, so without this a fact missing from the output is ambiguous between
+/// "dropped" and "judged already covered".
+pub fn existing_keys(existing: Option<&serde_json::Value>) -> Vec<String> {
+    existing
+        .and_then(|v| v.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Test helpers shared across this crate's `#[cfg(test)]` modules.
 #[cfg(test)]
 pub(crate) mod testutil {
@@ -60,6 +87,39 @@ pub(crate) mod testutil {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod audit_helper_tests {
+    use super::{existing_keys, parse_error_payload, RAW_PAYLOAD_MAX_CHARS};
+
+    #[test]
+    fn parse_error_payload_truncates_by_chars_not_bytes() {
+        // Multi-byte on purpose: byte slicing would panic mid-codepoint.
+        let raw: String = "汉".repeat(RAW_PAYLOAD_MAX_CHARS + 10);
+        let v = parse_error_payload(&raw);
+        let kept = v["raw"].as_str().expect("raw is a string");
+        assert_eq!(kept.chars().count(), RAW_PAYLOAD_MAX_CHARS);
+    }
+
+    #[test]
+    fn parse_error_payload_keeps_short_replies_whole() {
+        let v = parse_error_payload("I can't help with that.");
+        assert_eq!(v["raw"], "I can't help with that.");
+    }
+
+    #[test]
+    fn existing_keys_lists_names_and_never_values() {
+        let existing = serde_json::json!({"location": "公司", "likes": ["下雨天的味道"]});
+        let mut keys = existing_keys(Some(&existing));
+        keys.sort();
+        assert_eq!(keys, vec!["likes".to_string(), "location".to_string()]);
+    }
+
+    #[test]
+    fn existing_keys_none_is_empty() {
+        assert!(existing_keys(None).is_empty());
     }
 }
 

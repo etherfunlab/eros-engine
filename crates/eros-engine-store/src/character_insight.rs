@@ -204,31 +204,6 @@ impl CharacterInsightRepo<'_> {
 
 // ─── Audit ─────────────────────────────────────────────────────────
 
-/// How many characters of an unparseable reply are kept. Enough to tell a
-/// refusal from a truncated object; short enough that a runaway reply cannot
-/// bloat the table.
-const RAW_PAYLOAD_MAX_CHARS: usize = 2000;
-
-/// Audit payload for a `parse_error` row. The human chain stores NULL here,
-/// which makes a whole-turn refusal indistinguishable from malformed JSON —
-/// and refusal is the likeliest way a mined fact goes missing. Truncation
-/// counts characters, not bytes: byte slicing would panic mid-codepoint.
-pub fn parse_error_payload(raw: &str) -> serde_json::Value {
-    let truncated: String = raw.chars().take(RAW_PAYLOAD_MAX_CHARS).collect();
-    serde_json::json!({ "raw": truncated })
-}
-
-/// Names — never values — of the columns that were already populated when the
-/// structuring call was made. The structurer's input is facts PLUS the
-/// existing profile, so without this a fact missing from the output is
-/// ambiguous between "dropped" and "judged already covered".
-pub fn existing_keys(existing: Option<&serde_json::Value>) -> Vec<String> {
-    existing
-        .and_then(|v| v.as_object())
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
 /// One `character_insights_events` row to insert. `payload` is the
 /// `{facts, details}` object (`stage='extraction'`), the structured object plus
 /// `_existing_keys` (`stage='structuring'`), or `{raw}` on a parse error.
@@ -277,6 +252,7 @@ impl CharacterInsightEventRepo<'_> {
 mod tests {
     use super::*;
     use crate::testutil::seed_persona_instance;
+    use crate::{existing_keys, parse_error_payload};
 
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0047_creates_all_three_tables(pool: PgPool) {
