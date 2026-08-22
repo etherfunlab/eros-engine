@@ -242,6 +242,16 @@ warns and never applies (that call builds its own body and takes no
 chat-shaped parameters). Custom providers must declare `chat` to use body
 rules; the reserved `openrouter` entry may declare rules alone.
 
+**Upgrade hazard: `tasks` matches by exact string, not by chain.** The human
+chain used to report a single wire task name (`insight_extraction`) for both
+its stages; since the structuring split it reports `insight_extraction` for
+stage 1 and `insight_structuring` for stage 2 (see the task table below). A
+rule written before the split — `tasks = ["insight_extraction"]` — now scopes
+to stage 1 only. It silently stops applying to stage 2: there is no boot
+warning, because `insight_structuring` is a known task name, just not the one
+your rule lists. If a rule is meant to cover both stages of the human chain,
+list both: `tasks = ["insight_extraction", "insight_structuring"]`.
+
 Weigh the trade-off before reaching for a body rule instead of the task
 block: rules are **provider-scoped** while a `fallback` chain crosses
 providers, so a task whose primary and fallback live on different
@@ -536,7 +546,8 @@ input filter has no triggers, timing, or tiers).
 | Name | Consumed by | Status |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers` via `resolve()` (chat completions; tip turns ride the same reply path) | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts` and `extract_structured_insights` (fact mining + typed `human_insights` upsert) | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts` (stage 1 of the human chain — per-turn fact mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `character_insight_extraction` / `user_insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | live |
+| `insight_structuring` | `pipeline::post_process::extract_structured_insights` (stage 2 of the human chain — turns stage 1's mined facts plus the existing `human_insights` row into the typed profile object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `human_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | live |
 | `chat_output_filter` | `pipeline::stream` via `resolve_output_filter()` (optional second-pass rewrite of the chat reply before delivery) | live |
 | `pde_decision` | `pipeline::stream` (opt-in LLM judge via `run_pde_decision`, called from `run_stream`; rules engine used when `filter_prompt` is absent or the LLM call fails) | live (opt-in) |
 | `chat_image_prompt_compose` | `pipeline::stream` (image-prompt composer; **required for image turns** — the PDE judge writes no seed, so without this task the engine reports 可发图=否 and downgrades image actions. Generates the prompt from turn context and returns JSON `{prompt, caption}`; `caption` is persisted to `metadata.image.caption` and is what history-facing renders read) | live (required for images) |
@@ -545,6 +556,8 @@ input filter has no triggers, timing, or tiers).
 | `affinity_evaluation` | `pipeline::post_process` (per-turn affinity verdict — four graded line axes plus two absolute 1..3 endpoint levels, converted engine-side; runs after each Reply turn, fire-and-forget; **takes no `filter_prompt`** — the prompt is engine-owned and setting the key refuses to boot — **in any form, an explicit blank included**. Unlike every other task here, blank does not mean "off", so omit the key entirely. See issue #210) | live |
 | `character_insight_extraction` | `pipeline::post_process` (stage 1 of the character chain — experimental, EXPERIMENTAL — per-turn fact miner for the AI **character**, the mirror of `insight_extraction`'s human-side mining. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
 | `character_insight_structuring` | `pipeline::post_process` (stage 2 of the character chain — experimental — turns stage 1's mined facts plus the existing `character_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `character_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
+| `user_insight_extraction` | `pipeline::post_process` (stage 1 of the user chain — experimental — per-turn fact miner for the real **user**, but scoped to one relationship rather than the global `insight_extraction`. Prompt-bearing; joins the required-`filter_prompt` gate alongside `insight_extraction` / `character_insight_extraction` / `memory_extraction`. This block is the whole chain's on/off switch — off when the task block is absent) | experimental (opt-in) |
+| `user_insight_structuring` | `pipeline::post_process` (stage 2 of the user chain — experimental — turns stage 1's mined facts plus the existing `user_insights` row into the typed ten-column object. **Parameters-only, takes no `filter_prompt`** — its prompt is built in `prompt.rs` and must stay in lockstep with the `user_insights` columns it fills, so setting the key refuses to boot, **in any shape, an explicit blank included** — same treatment as `affinity_evaluation`. Absent block ⇒ stage 2 resolves on stage 1's model/budget, never the global default) | experimental (opt-in) |
 | `memory_extraction` | dreaming sweeper (session-end memory consolidation; off when task block absent) | live (opt-in) |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
@@ -557,7 +570,7 @@ input filter has no triggers, timing, or tiers).
 A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_config.resolve("<name>", ...)` somewhere. The current call sites are:
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`, `chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `character_insight_extraction`, `character_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `insight_structuring`, `affinity_evaluation`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `memory_extraction` via the dreaming sweeper
 
 `embedding` doesn't go through the generic `resolve()` path above — it has
@@ -996,24 +1009,27 @@ once at boot; `AppState.embed: Arc<EmbeddingRouter>` serves `embed_query` /
 
 ### Enabling / disabling extraction
 
-`insight_extraction` (per-turn fact mining), `memory_extraction` (session-end
-dreaming sweeper), and `character_insight_extraction` (stage 1 of the
-experimental character chain, §"Task names" above) are controlled by the
-**presence of their `[tasks.*_extraction]` section** — this is
-`validate_extraction_prompts()`'s gate, and all three names are in it:
+`insight_extraction` (stage 1 of the human chain, per-turn fact mining),
+`memory_extraction` (session-end dreaming sweeper), `character_insight_extraction`
+(stage 1 of the experimental character chain, §"Task names" above), and
+`user_insight_extraction` (stage 1 of the experimental user chain) are
+controlled by the **presence of their `[tasks.*_extraction]` section** — this
+is `validate_extraction_prompts()`'s gate, and all four names are in it:
 
 - **Section present** → `filter_prompt` is **required**; the server refuses to boot
   if it is blank or absent.
 - **Section absent** → that extraction is **off**. The engine boots and runs without
   it (`insight_extraction` is skipped per turn; the dreaming sweeper stays inert;
-  the character chain — both stages — never runs).
+  the character chain — both stages — never runs; the user chain — both
+  stages — never runs).
 
-`character_insight_structuring` (stage 2 of the character chain) is
+`insight_structuring`, `character_insight_structuring`, and
+`user_insight_structuring` — stage 2 of each of the three chains — are
 **deliberately NOT in this gate**, because this gate *requires* a prompt and
-stage 2 must not have one. It is gated in the opposite direction instead: its
-prompt is built in `prompt.rs`, so setting `filter_prompt` on it refuses to boot
-(see `affinity_evaluation` above — same dead-config rule). "Not in this gate"
-means "gated the other way", not "ungated".
+no stage-2 block may have one. Each is gated in the opposite direction
+instead: its prompt is built in `prompt.rs`, so setting `filter_prompt` on it
+refuses to boot (see `affinity_evaluation` above — same dead-config rule).
+"Not in this gate" means "gated the other way", not "ungated".
 
 If you copy the shipped example and blank out
 `[tasks.character_insight_extraction].filter_prompt` expecting the feature to

@@ -91,7 +91,7 @@ Relationship 层查询改为过滤 `instance_id = $2`，并多一条 `content NO
 1. **逐轮原文写入**（`write_turn`，post-process）——在**每一个**实质轮次都跑：用户话语非空，且至少有一条非空的助手消息。它只把**用户话语**embed 进两个层，不存助手的回复文本——助手回复经记忆召回重新进入模型自己的 prompt 会形成反馈回路，让后续回复反复出现同一句话（issue #113）。关系层那一份带 `用户：` 前缀，召回出来后仍能认出是用户原话。这些行的 `category` 和 `metadata` 都是 NULL。
 2. **Dreaming-lite 清扫器**（`[tasks.memory_extraction]`，`pipeline::dreaming`）——后台的、由 session 闲置触发的一遍，问 LLM 要值得长期保留的记忆候选。它**只写 profile 层**，带 `category ∈ {fact, preference, event, emotion, relation}`（模型自创的其它类别一律收敛成 `fact`），外加一份不透明的 `metadata`。
 
-`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出直接 UPSERT 进扁平的 `human_insights` 表（按列增量合并；见 [api-reference.zh.md](api-reference.zh.md#get-compuseruser_idprofile)），不在这里 embed。
+`insight_extraction` 是**另一条**流水线，不往这张表写任何东西——它的结构化产出直接 UPSERT 进扁平的 `human_insights` 表（按列增量合并；见 [api-reference.zh.md](api-reference.zh.md#get-compuseruser_idprofile)），不在这里 embed。另外两条实验性、按关系分开的链（`character_insight_*`、`user_insight_*`）也是同样的写法，各自 UPSERT 进自己的扁平表——`character_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightcharacter)）和 `user_insights`（见 [api-reference.zh.md](api-reference.zh.md#get-v2compinstanceinstance_idinsightuser)）；跟 `human_insights` 一样，这两张表都不会 embed 进这张表，也都不会被注入任何 chat、voice 或 PDE prompt。
 
 所以 embedding 是每个实质轮次生成一次，不是「只有 LLM 挑出来的高光才生成」。
 

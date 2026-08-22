@@ -21,6 +21,7 @@ pub mod companion_async;
 pub mod companion_stream;
 pub mod dto;
 pub mod health;
+pub mod insight;
 pub mod persona;
 pub mod voice;
 pub mod world_town;
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(insight::router())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     OpenApiRouter::new().merge(health::router()).merge(comp)
@@ -60,4 +62,14 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(bff::router())
         .merge(world_town::router())
         .merge(persona::router())
+        .merge(insight::router())
+}
+
+/// The generated OpenAPI document as JSON, for tests that assert on the wire
+/// contract itself (path presence, `deprecated` flags) rather than on handler
+/// behaviour.
+#[cfg(test)]
+pub(crate) fn openapi_for_tests() -> serde_json::Value {
+    let (_router, api) = router_for_openapi().split_for_parts();
+    serde_json::to_value(api).expect("openapi serialises")
 }

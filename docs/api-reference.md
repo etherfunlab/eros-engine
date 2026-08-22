@@ -477,7 +477,7 @@ recover the same payload afterwards via
 an image turn is recognizable in history by `metadata.image` on the
 assistant row.
 
-### `POST /v2/comp/chat/{session_id}/message/async`
+### `POST /v2/comp/session/{session_id}/message/async`
 
 Enqueue-only chat turn — the async alternative to the stream endpoint above,
 for callers that cannot hold an SSE connection open (bot gateways, background
@@ -488,10 +488,12 @@ drives the same generation pipeline and the reply lands in
 `engine.chat_messages`, picked up via the history route or Supabase
 Realtime.
 
+The old path (`POST /v2/comp/chat/{session_id}/message/async`) still works as a deprecated alias — a pure delegation to this route, marked `deprecated` in the OpenAPI spec — and is removed in the release after 1.6.0.
+
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
-  http://localhost:8080/v2/comp/chat/<session_id>/message/async
+  http://localhost:8080/v2/comp/session/<session_id>/message/async
 ```
 
 | Case | Response |
@@ -998,6 +1000,51 @@ The flat, typed `character_insights` row for one relationship (`persona_instance
 
 `updated_at: null` means this instance has no `character_insights` row yet — the character extraction chain has not produced a result — and every other field is `null`/`[]` in that response, same convention as the human profile above. Results are database-only: nothing here is read back into any chat prompt.
 
+This route is v1 and frozen — it keeps working and is not going away. The v2
+equivalent, with the same fields under the v2 path convention, is
+`GET /v2/comp/instance/{instance_id}/insight/character` (below).
+
+### `GET /v2/comp/instance/{instance_id}/insight/character`
+
+`CharacterInsightResponse` — the `character_insights` row, under the v2 API
+convention (the entity segment before the id names what the id belongs to;
+`insight` replaces v1's overloaded `profile`). Same fields as v1's
+[`GET /comp/instance/{instance_id}/profile`](#get-compinstanceinstance_idprofile)
+above. `GET`, authenticated, keyed on the relationship rather than the user:
+the instance's `owner_uid` must equal the JWT's user_id, else `403`; an
+unknown or archived (`status <> 'active'`) instance is `404`; no row yet is
+`200` with every field `null`/`[]` and `updated_at: null` — same convention
+as the v1 routes.
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": null,
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": null
+}
+```
+
+### `GET /v2/comp/instance/{instance_id}/insight/user`
+
+`UserInsightResponse` — the `user_insights` row, the real user's profile
+*inside this one relationship*. Same ten fields, same shape, same ownership/
+404/no-row rules as `.../insight/character` above. **This is not
+`human_insights`**, the global profile served at
+[`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) above:
+`user_insights` is per-relationship, database-only, and record-only —
+nothing reads it back into any chat, voice, or PDE prompt. Experimental
+(v1.6.0) — see
+[2026-08-22-user-insights-and-api-v2-design.md](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md).
+
 ### `DELETE /comp/instance/{instance_id}/sessions`
 
 Soft-delete every session this user holds with one persona instance. The instance's `owner_uid` MUST match the JWT's user_id; otherwise 403. An unknown instance is 404 — unlike the profile route above, a dormant (`status <> 'active'`) instance is accepted, because a client may clear the conversations of a relationship it has already marked over.
@@ -1342,7 +1389,8 @@ error type. The table below covers the plain shape:
 
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
-- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/.../message/async`)
+- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`, plus the deprecated `v2/comp/chat/{session_id}/message/async` alias)
+- `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
 - `crates/eros-engine-server/src/routes/persona.rs` — standalone image-prompt composition (`/persona/{instance_id}/image/compose`)

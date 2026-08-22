@@ -226,6 +226,15 @@ provider 服务的所有任务。规则按声明顺序生效，后面的规则�
 `chat` 才能使用 body 规则；保留名 `openrouter` 条目可以只声明规则而不覆盖
 端点。
 
+**升级风险：`tasks` 按精确字符串匹配，不按链匹配。** 人类链以前两个 stage
+共用同一个 wire 任务名（`insight_extraction`）；拆分 structuring 之后，
+stage 1 仍报 `insight_extraction`，stage 2 改报 `insight_structuring`
+（见下文任务名表）。一条拆分之前写的规则——`tasks = ["insight_extraction"]`
+——现在只限定到 stage 1，会悄悄不再作用于 stage 2：不会有启动警告，因为
+`insight_structuring` 是一个合法任务名，只是不在这条规则的列表里。如果一条
+规则本来是想覆盖人类链的两个 stage，就要把两个都列上：
+`tasks = ["insight_extraction", "insight_structuring"]`。
+
 在用 body 规则代替任务块之前先掂量一下取舍：规则是**按 provider 限定**的，
 而 `fallback` 链会跨 provider——一个 primary 和 fallback 分别落在不同
 `[providers]` 条目上的任务，同一个参数得声明两遍，两边还可能悄悄不一致；
@@ -476,7 +485,8 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | 名称 | 使用方 | 状态 |
 |---|---|---|
 | `chat_companion` | `pipeline::handlers`，通过 `resolve()`（chat completion；tip 轮次使用相同的 reply 路径） | live |
-| `insight_extraction` | `pipeline::post_process::extract_facts` 和 `extract_structured_insights`（事实挖掘 + 类型化 `human_insights` 增量写入） | live |
+| `insight_extraction` | `pipeline::post_process::extract_facts`（人类链 stage 1——逐轮事实挖掘。持有 prompt，与 `character_insight_extraction` / `user_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | live |
+| `insight_structuring` | `pipeline::post_process::extract_structured_insights`（人类链 stage 2——把 stage 1 挖掘出的事实加上已有的 `human_insights` 行，转成类型化的画像对象。**仅参数，不接受 `filter_prompt`**——它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `human_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | live |
 | `chat_output_filter` | `pipeline::stream`，通过 `resolve_output_filter()`（交付前对 chat 回复进行可选的二次改写） | live |
 | `pde_decision` | `pipeline::stream`（通过 `run_pde_decision` 实现的 opt-in LLM 判断器，由 `run_stream` 调用；缺少 `filter_prompt` 或 LLM 调用失败时使用规则引擎） | live（opt-in） |
 | `chat_image_prompt_compose` | `pipeline::stream`（出图 prompt 合成器；**图片轮次必需** —— PDE judge 不再写种子，未配置该任务时引擎报 可发图=否 并把图片动作降级为纯文本。它从当轮上下文生成 prompt，返回 JSON `{prompt, caption}`；`caption` 落到 `metadata.image.caption`，是聊天历史与 judge transcript 实际读取的字段） | live（图片必需） |
@@ -485,6 +495,8 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 | `affinity_evaluation` | `pipeline::post_process`（每轮好感度裁决——四个档位线轴加 warmth/patience 两个 1..3 绝对档，由引擎侧换算；每个 Reply 轮次后以 fire-and-forget 方式运行；**不接受 `filter_prompt`** —— 该 prompt 由引擎持有，设置该键会拒绝启动——**任何写法都算，包括显式留空**。与这里其它任务不同，空白在这里不等于"关闭"，请直接不写这个键。见 issue #210） | live |
 | `character_insight_extraction` | `pipeline::post_process`（角色链 stage 1 —— 实验特性 —— 针对 AI **角色**的逐轮事实挖掘，是 `insight_extraction` 人类侧挖掘的镜像。持有 prompt，与 `insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链（两个 stage）的总开关——任务块缺失即关闭） | experimental（opt-in） |
 | `character_insight_structuring` | `pipeline::post_process`（角色链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `character_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `character_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
+| `user_insight_extraction` | `pipeline::post_process`（用户链 stage 1 —— 实验特性 —— 针对真人**用户**的逐轮事实挖掘，但按关系分开，而不是全局的 `insight_extraction`。持有 prompt，与 `insight_extraction` / `character_insight_extraction` / `memory_extraction` 共用同一个必填-`filter_prompt` 闸门。这个块是整条链的总开关——任务块缺失即关闭） | experimental（opt-in） |
+| `user_insight_structuring` | `pipeline::post_process`（用户链 stage 2 —— 实验特性 —— 把 stage 1 挖掘出的事实加上已有的 `user_insights` 行，转成类型化的十列对象。**仅参数，不接受 `filter_prompt`** —— 它的 prompt 写在 `prompt.rs` 里，必须与它要填的 `user_insights` 列保持同步，所以设置该键会拒绝启动，**任何写法都算，包括显式留空**——与 `affinity_evaluation` 同样处理。块缺失时 stage 2 会退回到 stage 1 的模型/预算，绝不退到全局默认） | experimental（opt-in） |
 | `memory_extraction` | dreaming sweeper（会话结束时进行 memory 整合；任务块缺失时关闭） | live（opt-in） |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
@@ -497,7 +509,7 @@ SSE `final` frame 的 `filtered` 字段在客户端收到的是非原始输出�
 只有当引擎确实在某处调用 `model_config.resolve("<name>", ...)` 时，`[tasks.<name>]` 条目才有意义。当前调用点如下：
 
 - `crates/eros-engine-server/src/pipeline/handlers.rs` → `chat_companion`、`chat_output_filter`
-- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`affinity_evaluation`、`character_insight_extraction`、`character_insight_structuring`
+- `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`、`insight_structuring`、`affinity_evaluation`、`character_insight_extraction`、`character_insight_structuring`、`user_insight_extraction`、`user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`memory_extraction`，通过 dreaming sweeper
 
 `embedding` 不走上面这条通用 `resolve()` 路径——它有自己的解析器
@@ -812,21 +824,23 @@ write 全部路由离开 Voyage 的部署不再需要这个变量。
 
 ### 启用/禁用 extraction
 
-`insight_extraction`（每轮事实挖掘）、`memory_extraction`（会话结束时的
-dreaming sweeper）和 `character_insight_extraction`（实验性角色链的
-stage 1，见上文"任务名"一节）都由各自 `[tasks.*_extraction]` **章节是否
-存在**控制——这就是 `validate_extraction_prompts()` 的闸门，三个名字都在
-这个闸门里：
+`insight_extraction`（人类链 stage 1，每轮事实挖掘）、`memory_extraction`
+（会话结束时的 dreaming sweeper）、`character_insight_extraction`（实验性
+角色链的 stage 1，见上文"任务名"一节）和 `user_insight_extraction`（实验性
+用户链的 stage 1）都由各自 `[tasks.*_extraction]` **章节是否存在**控制——
+这就是 `validate_extraction_prompts()` 的闸门，四个名字都在这个闸门里：
 
 - **章节存在** → `filter_prompt` **必填**；若为空白或缺失，服务器会拒绝启动。
 - **章节缺失** → 该 extraction **关闭**。引擎可以正常启动和运行（每轮跳过
-  `insight_extraction`；dreaming sweeper 保持不生效；角色链两个 stage 都不会跑）。
+  `insight_extraction`；dreaming sweeper 保持不生效；角色链两个 stage 都不会
+  跑；用户链两个 stage 都不会跑）。
 
-`character_insight_structuring`（角色链 stage 2）**故意不在这个闸门里**——
-因为这个闸门要求必须有 prompt，而 stage 2 必须没有。它被反方向的闸门管着：
-它的 prompt 写死在 `prompt.rs` 里，所以给它设置 `filter_prompt` 会拒绝启动
-（见上面的 `affinity_evaluation`，同一条死配置规则）。「不在这个闸门里」
-是「被另一个闸门管着」，不是「没人管」。
+`insight_structuring`、`character_insight_structuring`、
+`user_insight_structuring`——三条链各自的 stage 2——**故意都不在这个闸门
+里**：因为这个闸门要求必须有 prompt，而任何 stage 2 都必须没有。它们各自
+被反方向的闸门管着：prompt 写死在 `prompt.rs` 里，所以给它设置
+`filter_prompt` 会拒绝启动（见上面的 `affinity_evaluation`，同一条死配置
+规则）。「不在这个闸门里」是「被另一个闸门管着」，不是「没人管」。
 
 如果照抄示例配置、把
 `[tasks.character_insight_extraction].filter_prompt` 清空，指望功能安静关掉，

@@ -329,9 +329,12 @@ from the human chain, which serves both stages from a single
 Each call carries its own `task` name on the wire
 (`character_insight_extraction` / `character_insight_structuring`), where the
 human chain reports `insight_extraction` for both. That is most of the point of
-splitting: OpenRouter accounting and `[[providers.*.body]]` rules can finally
-tell the two apart, and `max_tokens` stops being one number covering two very
-different outputs (the human block's `1200` is a combined budget).
+splitting: the engine's own `log_openrouter_usage` line and
+`[[providers.*.body]]` rules can finally tell the two apart, and `max_tokens`
+stops being one number covering two very different outputs (the human block's
+`1200` is a combined budget). `task` is config routing only and is never
+serialized to OpenRouter, so this does not help OpenRouter-side accounting —
+its dashboard only ever sees `model` and `user`.
 
 `status` follows the same `ok` / `empty` / `parse_error` rules as the human side.
 

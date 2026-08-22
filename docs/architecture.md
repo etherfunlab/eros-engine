@@ -65,7 +65,11 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
                          per-column incremental)
                        - character insight (LLM extracts facts about the AI
                          persona → character_insights UPSERT, experimental)
-                       (the four run concurrently via tokio::join!)
+                       - user insight (LLM extracts facts about the real user,
+                         scoped to this relationship → user_insights UPSERT,
+                         experimental — NOT human_insights, not injected into
+                         any prompt)
+                       (the five run concurrently via tokio::join!)
 ```
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply / Proactive the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
@@ -182,6 +186,7 @@ crates/
 │       ├── insight.rs        # InsightEventRepo (companion_insights_events audit rows)
 │       ├── human_insight.rs  # HumanInsightRepo (typed profile columns, per-field UPSERT)
 │       ├── character_insight.rs # CharacterInsightRepo + event/snapshot repos (AI character's profile, experimental)
+│       ├── user_insight.rs   # UserInsightRepo + event/snapshot repos (the real user's per-relationship profile, experimental)
 │       └── persona.rs        # PersonaRepo (upsert_genome for seeding)
 └── eros-engine-server/
     └── src/

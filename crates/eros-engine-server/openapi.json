@@ -752,7 +752,7 @@
           "companion"
         ],
         "summary": "Soft-delete every session this user holds with one persona instance.",
-        "description": "The conversation stops being visible and stops being resumable, and the\nrelationship state — affinity, relationship-layer memories, character\ninsights — is deleted so the next conversation starts genuinely cold. The\ntranscript in `chat_messages` is NOT deleted: it is evidence, and the audit\ntables that reference a session by id finally point at something readable.\n\nKeyed by instance because the instance is the unit of a relationship;\narchiving one session and leaving its siblings resumable would not give the\ncaller the fresh start it asked for. Every channel goes, voice included.\n\nIdempotent: a second call returns 200 with `archived_sessions: 0`.\n\nThere is no restore endpoint by design. Reviving a session is an operator\naction and `UPDATE engine.chat_sessions SET archived = false WHERE id = …`\nis the whole of it; the relationship state stays gone.",
+        "description": "The conversation stops being visible and stops being resumable, and the\nrelationship state — affinity, relationship-layer memories, character\ninsights, user insights — is deleted so the next conversation starts\ngenuinely cold. The transcript in `chat_messages` is NOT deleted: it is\nevidence, and the audit tables that reference a session by id finally\npoint at something readable.\n\nKeyed by instance because the instance is the unit of a relationship;\narchiving one session and leaving its siblings resumable would not give the\ncaller the fresh start it asked for. Every channel goes, voice included.\n\nIdempotent: a second call returns 200 with `archived_sessions: 0`.\n\nThere is no restore endpoint by design. Reviving a session is an operator\naction and `UPDATE engine.chat_sessions SET archived = false WHERE id = …`\nis the whole of it; the relationship state stays gone.",
         "operationId": "archive_instance_sessions",
         "parameters": [
           {
@@ -1181,6 +1181,223 @@
         "tags": [
           "companion"
         ],
+        "summary": "Deprecated alias for [`send_message_async`], removed after 1.6.0.",
+        "description": "The pre-rename path, kept working for one release so clients can migrate.",
+        "operationId": "send_message_async_legacy_path",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Deprecated alias — see POST /v2/comp/session/{session_id}/message/async.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncSendResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Deprecated alias — see POST /v2/comp/session/{session_id}/message/async.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsyncSendResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/instance/{instance_id}/insight/character": {
+      "get": {
+        "tags": [
+          "insight"
+        ],
+        "operationId": "get_character_insight",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharacterInsightResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/instance/{instance_id}/insight/user": {
+      "get": {
+        "tags": [
+          "insight"
+        ],
+        "operationId": "get_user_insight",
+        "parameters": [
+          {
+            "name": "instance_id",
+            "in": "path",
+            "description": "Persona instance id owned by the JWT user",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInsightResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "instance is not owned by the JWT user"
+          },
+          "404": {
+            "description": "no such active instance"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/session/{session_id}/message/async": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Enqueue a chat turn for asynchronous delivery.",
+        "description": "Validates and persists the user message, then hands the turn to a\nbackground worker; the assistant reply is generated out-of-band and lands\nin this session's history over whatever channel the client already polls\nor subscribes to (SSE / GET history) — this endpoint itself never returns\nreply content. Idempotent on `client_msg_id`: redelivering a turn that is\nalready queued, completed, or terminally failed returns that outcome\ninstead of enqueueing a duplicate.",
         "operationId": "send_message_async",
         "parameters": [
           {
@@ -1938,6 +2155,89 @@
           "chemistry": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "CharacterInsightResponse": {
+        "type": "object",
+        "description": "The AI character's side of one relationship's profile.\n\nDeliberately NOT the v1 `CharacterProfileResponse`, which carries the same\nfields: that type is the frozen response of `GET\n/comp/instance/{instance_id}/profile` and stays exactly as shipped. Two\nstructs is the price of freezing v1, and what lets this pair diverge later.",
+        "required": [
+          "instance_id",
+          "likes",
+          "dislikes",
+          "relationships"
+        ],
+        "properties": {
+          "current_situation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "desires": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dislikes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "habits": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "likes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personal_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` when the character has no insights row yet."
+          },
+          "vulnerabilities": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -2858,6 +3158,89 @@
               {
                 "$ref": "#/components/schemas/LabelTransitionDto"
               }
+            ]
+          }
+        }
+      },
+      "UserInsightResponse": {
+        "type": "object",
+        "description": "The real user's side of one relationship's profile — what he has revealed\nHERE. Not the global `human_insights` profile, which v1 serves at\n`GET /comp/user/{user_id}/profile`.",
+        "required": [
+          "instance_id",
+          "likes",
+          "dislikes",
+          "relationships"
+        ],
+        "properties": {
+          "current_situation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "desires": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dislikes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "habits": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "likes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occupation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personal_values": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` when this relationship has no user-insights row yet."
+          },
+          "vulnerabilities": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         }

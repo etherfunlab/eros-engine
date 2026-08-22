@@ -905,6 +905,67 @@ pub fn extract_character_insights_prompt(
     )
 }
 
+/// Schema description used in `extract_user_insights_prompt`. Mirrors the JSON
+/// shape that `UserInsightRepo::apply_extraction` accepts (projected by
+/// `user_insight::project_columns`).
+///
+/// The subject is the REAL USER, and the scope is this one relationship —
+/// what he has revealed here, not a global profile. The global profile is
+/// `human_insights`, filled by a different chain, and nothing in this schema
+/// is meant to keep it in sync.
+pub const USER_INSIGHTS_SCHEMA: &str = r#"
+user_insights schema（真人用户画像；所有字段可选；只输出下列字段，不要新增/编造字段名）：
+{
+  "location": "string — 用户此刻/近期人在哪，写出具体场景。例：还在公司，加班到十点",
+  "occupation": "string — 用户实际在做的工作，以对话为准。例：在一家做支付的公司写后端",
+  "current_situation": "string — 他最近的处境与正在经历的事，写成一两句具体总结。例：刚换组，连着两周在赶版本",
+  "desires": "string — 他说出口的想要与期待。例：想年底攒够假期回一趟老家",
+  "vulnerabilities": "string — 他露出的软肋、不安、害怕的事。例：怕被说不够努力，所以不敢先下班",
+  "habits": "string — 他描述的作息与生活习惯，写出具体模式。例：习惯半夜写代码，早上靠咖啡撑着",
+  "personal_values": "string — 他表达的在意的事与价值取向。例：把说到做到看得很重，讨厌临时放鸽子",
+  "likes": ["array of strings — 他提到的喜好，每项 4~12 个汉字的具体短语，带一个实际细节。例：周末喜欢去爬山"],
+  "dislikes": ["array of strings — 他提到的厌恶，每项一个具体短语。例：讨厌开没有结论的会"],
+  "relationships": ["array of strings — 他提到的人，带关系与一个细节。例：母亲住在老家，每周通一次电话"]
+}
+填写规范：
+- schema 描述的是【真人用户】本人 —— location、occupation 等都指用户，绝不是 AI 角色。
+- 只填【用户事实】清楚支持的字段；对已支持的内容尽量写足细节与情境，用完整短语或句子，不要用单个词/标签凑数。
+- 绝不虚构、外推或编造事实中没有的信息。
+- 只输出上表列出的字段名，不要新增、不要改名。
+- 仅输出一个 JSON 对象，不要 markdown、不要解释。
+"#;
+
+/// Structuring-stage prompt for the user chain: take the facts mined in the
+/// extraction stage plus the user's existing per-relationship profile
+/// (reverse-projected from `user_insights`), and fill in whatever fields the
+/// model is confident about. Output expected as a JSON object matching
+/// `USER_INSIGHTS_SCHEMA`.
+pub fn extract_user_insights_prompt(
+    facts: &[String],
+    existing_insights: Option<&serde_json::Value>,
+) -> String {
+    let facts_str = facts
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing_str = existing_insights
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+
+    format!(
+        "以下是从对话中提取的【真人用户】事实：\n\
+         {facts_str}\n\n\
+         现有的用户画像（user_insights，供参考；如新事实能让某个已有字段更完整或更准确，\
+         请输出更新后的完整版本覆盖旧值，不要因为字段已存在就跳过或原样重复）：\n\
+         {existing_str}\n\n\
+         请根据上方的【用户事实】，填充以下 schema 中你有信心的字段。\
+         schema 描述的是【真人用户】本人——location、occupation 等都指用户，绝不是 AI 角色：\n\
+         {USER_INSIGHTS_SCHEMA}\n\n\
+         仅输出 JSON，不要任何解释。",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2509,5 +2570,50 @@ mod tests {
             p.contains("\"location\": \"公司\""),
             "the existing profile must be serialized into the prompt, not just the schema"
         );
+    }
+
+    #[test]
+    fn user_insights_prompt_renders_all_ten_field_names() {
+        let p = extract_user_insights_prompt(&["用户说他在深圳南山上班".into()], None);
+        for field in [
+            "location",
+            "occupation",
+            "current_situation",
+            "desires",
+            "vulnerabilities",
+            "habits",
+            "personal_values",
+            "likes",
+            "dislikes",
+            "relationships",
+        ] {
+            assert!(p.contains(field), "missing field name: {field}");
+        }
+    }
+
+    #[test]
+    fn user_insights_prompt_carries_the_anti_attribution_clause() {
+        let p = extract_user_insights_prompt(&["用户说他在深圳南山上班".into()], None);
+        // The mirror of the character prompt's clause, pointing the other way.
+        assert!(p.contains("【真人用户】本人"));
+        assert!(p.contains("绝不是 AI 角色"));
+    }
+
+    #[test]
+    fn user_insights_prompt_renders_facts_as_bullets_and_existing_as_json() {
+        let existing = serde_json::json!({"location": "深圳南山"});
+        let p = extract_user_insights_prompt(
+            &["用户说他在深圳南山上班".into(), "用户想年底请长假".into()],
+            Some(&existing),
+        );
+        assert!(p.contains("- 用户说他在深圳南山上班"));
+        assert!(p.contains("- 用户想年底请长假"));
+        assert!(p.contains("\"location\""));
+    }
+
+    #[test]
+    fn user_insights_prompt_renders_empty_existing_as_empty_object() {
+        let p = extract_user_insights_prompt(&["用户想年底请长假".into()], None);
+        assert!(p.contains("{}"));
     }
 }

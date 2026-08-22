@@ -23,14 +23,19 @@ use eros_engine_llm::model_config::ModelConfig;
 use eros_engine_llm::openrouter::{ChatMessage, ChatRequest, OpenRouterClient};
 use eros_engine_store::affinity::AffinityRepo;
 use eros_engine_store::character_insight::{
-    existing_as_extraction_json as character_existing_json, existing_keys, parse_error_payload,
-    CharacterInsightEventInsert, CharacterInsightEventRepo, CharacterInsightRepo,
+    existing_as_extraction_json as character_existing_json, CharacterInsightEventInsert,
+    CharacterInsightEventRepo, CharacterInsightRepo,
 };
 use eros_engine_store::chat::ChatRepo;
 use eros_engine_store::human_insight::{existing_as_extraction_json, HumanInsightRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
 use eros_engine_store::persona::PersonaRepo;
+use eros_engine_store::user_insight::{
+    existing_as_extraction_json as user_existing_json, UserInsightEventInsert,
+    UserInsightEventRepo, UserInsightRepo,
+};
+use eros_engine_store::{existing_keys, parse_error_payload};
 
 use crate::state::AppState;
 
@@ -241,7 +246,30 @@ pub async fn run(
         }
     };
 
-    tokio::join!(fut_insight, fut_memory, fut_affinity, fut_character_insight);
+    let fut_user_insight = async {
+        for m in &produced {
+            if !user_msg.is_empty() && !m.full_text.is_empty() {
+                extract_user_insights(
+                    &state,
+                    session_id,
+                    instance_id,
+                    m.message_id,
+                    &user_msg,
+                    &m.full_text,
+                    client_id.as_deref(),
+                )
+                .await;
+            }
+        }
+    };
+
+    tokio::join!(
+        fut_insight,
+        fut_memory,
+        fut_affinity,
+        fut_character_insight,
+        fut_user_insight
+    );
 }
 
 // ─── Affinity persistence ──────────────────────────────────────────
@@ -865,6 +893,17 @@ async fn evaluate_affinity(
 
 const INSIGHT_TASK: &str = "insight_extraction";
 
+/// Stage 2 of the human chain. Split out from `INSIGHT_TASK` so the engine's
+/// own `log_openrouter_usage` line and `[[providers.*.body]]` rules can tell
+/// the two stages apart, and so `max_tokens` stops being one number covering
+/// two very different outputs. This does NOT help OpenRouter-side accounting:
+/// `task` is config routing only and is never serialized to the wire (see
+/// `ChatRequest::task` in eros-engine-llm), so OpenRouter's own dashboard
+/// only ever sees `model` and `user`. An absent `[tasks.insight_structuring]`
+/// block resolves to stage 1's parameters — identical to the pre-split
+/// behaviour.
+const INSIGHT_STRUCTURING_TASK: &str = "insight_structuring";
+
 /// Per-call audit captured from one insight_extraction OpenRouter call that
 /// returned a response. `None` (at the call site) means the call got no response
 /// (transport error / timeout) → no row is written.
@@ -1104,7 +1143,7 @@ async fn extract_structured_insights(
 
     let prompt = crate::prompt::extract_structured_insights_prompt(facts, existing_insights);
 
-    let resolved = model_config.resolve(INSIGHT_TASK, None);
+    let resolved = model_config.resolve_structuring(INSIGHT_STRUCTURING_TASK, INSIGHT_TASK);
     let req = ChatRequest {
         model: resolved.model,
         fallback_model: resolved.fallback_model,
@@ -1117,13 +1156,13 @@ async fn extract_structured_insights(
         sampling: resolved.sampling,
         user: audit_user.map(String::from),
         reasoning: resolved.reasoning,
-        task: Some(INSIGHT_TASK.into()),
+        task: Some(INSIGHT_STRUCTURING_TASK.into()),
         ..Default::default()
     };
 
     let (raw, meta) = match llm.execute(req).await {
         Ok(r) => {
-            super::log_openrouter_usage(INSIGHT_TASK, Some(session_id), &r);
+            super::log_openrouter_usage(INSIGHT_STRUCTURING_TASK, Some(session_id), &r);
             (r.reply.trim().to_string(), call_meta(&r))
         }
         Err(_) => return (empty(), None),
@@ -1144,18 +1183,33 @@ async fn extract_structured_insights(
             } else {
                 "ok"
             };
-            let audit = CallAudit {
-                status,
-                payload: Some(v.clone()),
-                meta,
-            };
-            (v, Some(audit))
+            // Record which columns arrived pre-filled. Without it, a fact that
+            // does not appear in the output is ambiguous between "dropped" and
+            // "judged already covered".
+            let mut audited = v.clone();
+            if let Some(o) = audited.as_object_mut() {
+                o.insert(
+                    "_existing_keys".into(),
+                    serde_json::json!(existing_keys(existing_insights)),
+                );
+            }
+            (
+                v,
+                Some(CallAudit {
+                    status,
+                    payload: Some(audited),
+                    meta,
+                }),
+            )
         }
+        // The unparseable reply is KEPT: a whole-turn refusal and malformed
+        // JSON were otherwise the same row, and refusal is the likeliest way
+        // a mined fact goes missing.
         None => (
             empty(),
             Some(CallAudit {
                 status: "parse_error",
-                payload: None,
+                payload: Some(parse_error_payload(&raw)),
                 meta,
             }),
         ),
@@ -1348,8 +1402,11 @@ async fn extract_character_facts(
                 }),
             )
         }
-        // Unlike the human chain, the unparseable reply is KEPT: a whole-turn
-        // refusal and malformed JSON are otherwise the same row.
+        // The unparseable reply is KEPT: a whole-turn refusal and malformed
+        // JSON are otherwise the same row. All three chains' structuring
+        // stages keep it too (including the human chain's, since its
+        // stage-2 split); `extract_facts`, the human chain's own extraction
+        // stage, is the one place that still discards it.
         None => (
             vec![],
             Some(CallAudit {
@@ -1453,11 +1510,432 @@ async fn structure_character_insights(
     }
 }
 
+// ─── User insights ─────────────────────────────────────────────────
+
+const USER_EXTRACTION_TASK: &str = "user_insight_extraction";
+const USER_STRUCTURING_TASK: &str = "user_insight_structuring";
+
+/// Top-level entry for the user chain: extraction → structuring → incremental
+/// `user_insights` apply. Writes one `user_insights_events` row per OpenRouter
+/// call that returned a response, tied by a shared `run_id`. Every failure is
+/// fail-open and warn-only; nothing here may break the turn.
+///
+/// The result is DB-only by design — nothing reads `user_insights` back into a
+/// prompt (spec §6). This is NOT the `human_insights` chain: that one is keyed
+/// on `user_id`, is global, and is what feeds injection and matching.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct audit/context key
+async fn extract_user_insights(
+    state: &AppState,
+    session_id: Uuid,
+    instance_id: Uuid,
+    message_id: Uuid,
+    user_msg: &str,
+    assistant_msg: &str,
+    audit_user: Option<&str>,
+) {
+    let run_id = Uuid::new_v4();
+
+    let (facts, facts_audit) =
+        extract_user_facts(state, session_id, user_msg, assistant_msg, audit_user).await;
+    if let Some(a) = facts_audit {
+        write_user_event(
+            &state.pool,
+            run_id,
+            instance_id,
+            session_id,
+            message_id,
+            "extraction",
+            a,
+        )
+        .await;
+    }
+    if facts.is_empty() {
+        return;
+    }
+
+    let repo = UserInsightRepo { pool: &state.pool };
+    // A failed load must ABORT the run, not degrade to "no existing profile".
+    // The structuring prompt asks for complete replacement values, so running it
+    // without the stored row yields fields derived from this turn alone — and
+    // `apply_extraction` would then overwrite however many turns of accumulated
+    // profile with that narrower answer. `Ok(None)` is different: it genuinely
+    // means no row yet, and proceeds.
+    let existing = match repo.load(instance_id).await {
+        Ok(row) => row.map(|r| user_existing_json(&r)),
+        Err(e) => {
+            tracing::warn!("user_insights load failed, skipping structuring: {e}");
+            return;
+        }
+    };
+
+    let (structured, struct_audit) =
+        structure_user_insights(state, session_id, &facts, existing.as_ref(), audit_user).await;
+    if let Some(a) = struct_audit {
+        write_user_event(
+            &state.pool,
+            run_id,
+            instance_id,
+            session_id,
+            message_id,
+            "structuring",
+            a,
+        )
+        .await;
+    }
+    if structured.as_object().is_none_or(|o| o.is_empty()) {
+        return;
+    }
+
+    // Recheck: the two calls above may together have run long enough for the
+    // archive endpoint to commit while this task was inside them. Without this,
+    // the apply below would put a `user_insights` row right back for an
+    // instance the archive just deleted it from.
+    if !session_still_live(state, session_id).await {
+        return;
+    }
+
+    if let Err(e) = repo.apply_extraction(instance_id, &structured).await {
+        tracing::warn!("user_insights apply failed: {e}");
+    }
+}
+
+/// Fail-open insert of one `user_insights_events` row.
+async fn write_user_event(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    instance_id: Uuid,
+    session_id: Uuid,
+    message_id: Uuid,
+    stage: &'static str,
+    audit: CallAudit,
+) {
+    let repo = UserInsightEventRepo { pool };
+    let ev = UserInsightEventInsert {
+        run_id,
+        instance_id,
+        session_id: Some(session_id),
+        message_id: Some(message_id),
+        stage,
+        status: audit.status,
+        payload: audit.payload,
+        meta: audit.meta,
+    };
+    if let Err(e) = repo.record(ev).await {
+        tracing::warn!("user insight event ({stage}) persist failed: {e}");
+    }
+}
+
+/// Stage 1. `None` for the resolved task is the feature's off switch — no
+/// block, no calls, no rows.
+async fn extract_user_facts(
+    state: &AppState,
+    session_id: Uuid,
+    user_msg: &str,
+    assistant_msg: &str,
+    audit_user: Option<&str>,
+) -> (Vec<String>, Option<CallAudit>) {
+    // Unlike extract_character_facts (which mines only the AI's line and so
+    // only needs assistant_msg non-blank), this chain mines the USER's line
+    // from a two-party turn. run()'s outer guard checks `!user_msg.is_empty()`
+    // without trimming, so a whitespace-only user turn still reaches here; if
+    // this only checked assistant_msg, that turn would spend a call asking
+    // the model to mine *user* facts from "用户:    \nAI: <reply>" — exactly
+    // the input most likely to produce the cross-attribution the prompt's own
+    // rules exist to prevent. Require both sides non-blank.
+    if user_msg.trim().is_empty() || assistant_msg.trim().is_empty() {
+        return (vec![], None);
+    }
+    let Some(resolved) = state.model_config.resolve_user_insight_extract() else {
+        return (vec![], None);
+    };
+
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: resolved.extract_prompt,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: crate::prompt::facts_user_message(user_msg, assistant_msg),
+            },
+        ],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(USER_EXTRACTION_TASK.into()),
+        ..Default::default()
+    };
+
+    let (raw, meta) = match state.openrouter.execute(req).await {
+        Ok(resp) => {
+            super::log_openrouter_usage(USER_EXTRACTION_TASK, Some(session_id), &resp);
+            (resp.reply.trim().to_string(), call_meta(&resp))
+        }
+        Err(e) => {
+            tracing::warn!("user fact extraction LLM call failed: {e}");
+            return (vec![], None);
+        }
+    };
+
+    match super::parse_llm_json::<serde_json::Value>(&raw) {
+        Some(v) => {
+            let facts = extract_facts_array(&v);
+            // `details` is opaque: the engine never validates its items nor
+            // zips them against `facts`. That contract is prompt-level.
+            let details = extract_details_array(&v);
+            let status = if facts.is_empty() { "empty" } else { "ok" };
+            let payload = serde_json::json!({ "facts": facts, "details": details });
+            (
+                facts,
+                Some(CallAudit {
+                    status,
+                    payload: Some(payload),
+                    meta,
+                }),
+            )
+        }
+        None => (
+            vec![],
+            Some(CallAudit {
+                status: "parse_error",
+                payload: Some(parse_error_payload(&raw)),
+                meta,
+            }),
+        ),
+    }
+}
+
+/// Stage 2. Parameters come from the dedicated block when present, else stage
+/// 1's — never from global defaults (see `resolve_structuring`).
+async fn structure_user_insights(
+    state: &AppState,
+    session_id: Uuid,
+    facts: &[String],
+    existing: Option<&serde_json::Value>,
+    audit_user: Option<&str>,
+) -> (serde_json::Value, Option<CallAudit>) {
+    let empty = || serde_json::Value::Object(serde_json::Map::new());
+    if facts.is_empty() {
+        return (empty(), None);
+    }
+
+    let prompt = crate::prompt::extract_user_insights_prompt(facts, existing);
+    let resolved = state
+        .model_config
+        .resolve_structuring(USER_STRUCTURING_TASK, USER_EXTRACTION_TASK);
+
+    let req = ChatRequest {
+        model: resolved.model,
+        fallback_model: resolved.fallback_model,
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }],
+        temperature: resolved.temperature as f32,
+        max_tokens: resolved.max_tokens,
+        sampling: resolved.sampling,
+        user: audit_user.map(String::from),
+        reasoning: resolved.reasoning,
+        task: Some(USER_STRUCTURING_TASK.into()),
+        ..Default::default()
+    };
+
+    let (raw, meta) = match state.openrouter.execute(req).await {
+        Ok(r) => {
+            super::log_openrouter_usage(USER_STRUCTURING_TASK, Some(session_id), &r);
+            (r.reply.trim().to_string(), call_meta(&r))
+        }
+        Err(e) => {
+            tracing::warn!("user structuring LLM call failed: {e}");
+            return (empty(), None);
+        }
+    };
+
+    match super::parse_llm_json::<serde_json::Value>(&raw) {
+        Some(v) if v.is_object() => {
+            let status = if v.as_object().is_some_and(|o| o.is_empty()) {
+                "empty"
+            } else {
+                "ok"
+            };
+            // Record which columns arrived pre-filled. Without it, a fact that
+            // does not appear in the output is ambiguous between "dropped" and
+            // "judged already covered".
+            let mut audited = v.clone();
+            if let Some(o) = audited.as_object_mut() {
+                o.insert(
+                    "_existing_keys".into(),
+                    serde_json::json!(existing_keys(existing)),
+                );
+            }
+            (
+                v,
+                Some(CallAudit {
+                    status,
+                    payload: Some(audited),
+                    meta,
+                }),
+            )
+        }
+        _ => (
+            empty(),
+            Some(CallAudit {
+                status: "parse_error",
+                payload: Some(parse_error_payload(&raw)),
+                meta,
+            }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routes::companion::testutil::seed_persona_instance;
     use uuid::Uuid;
+
+    // ─── Shared test seeding + mock-OpenRouter helpers ────────────────
+    //
+    // Extracted from the setup `insight_extraction_writes_two_events_
+    // sharing_run_id` used to build inline; both the human-chain insight
+    // tests and the new user-insight tests below need the same shape.
+
+    /// Seed a throwaway persona_instances row (genome + instance, random
+    /// owner) and return its id. The user-insight chain is keyed on this,
+    /// not on a user_id.
+    async fn seed_instance(pool: &sqlx::PgPool) -> Uuid {
+        seed_persona_instance(pool, Uuid::new_v4()).await
+    }
+
+    /// Seed a live (unarchived) chat_sessions row for `instance_id`, with a
+    /// random user_id — `session_still_live`'s only requirement is that the
+    /// row exists and isn't archived.
+    async fn seed_session(pool: &sqlx::PgPool, instance_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Seed one assistant chat_messages row in `session_id` and return its id.
+    async fn seed_assistant_message(pool: &sqlx::PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'assistant', 'seed') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Mock OpenRouter that replies with the first entry whose
+    /// `prompt_substring` appears anywhere in the outbound request, and
+    /// records each request's wire `task` name, in order.
+    ///
+    /// `ChatRequest.task` is config-routing-only and is never put on the
+    /// wire by `OpenRouterClient::execute` (see its field doc) — there is no
+    /// default HTTP-layer signal to read it back from. This harness makes it
+    /// observable the same way production already puts arbitrary data on the
+    /// wire (spec 2026-08-02-provider-body-params): a caller that wants a
+    /// request's task recorded as `Some(..)` rather than `None` must add a
+    /// `[[providers.openrouter.body]]` rule to `model_config_toml` for that
+    /// task, echoing the task name back into the body under a `task` key —
+    /// e.g. `tasks = ["foo"]` / `params = { task = "foo" }`. A request whose
+    /// task has no matching rule records `None`.
+    ///
+    /// The backing `MockServer` is deliberately leaked (`Box::leak`): it must
+    /// outlive this function so the returned `AppState` keeps serving
+    /// requests, and each call binds a fresh, isolated port, so the leak is
+    /// bounded by one test process.
+    async fn state_with_mock_openrouter_recording(
+        pool: sqlx::PgPool,
+        model_config_toml: &str,
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> (
+        AppState,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct Recording {
+            replies: Vec<(&'static str, &'static str)>,
+            recorder: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+        impl Respond for Recording {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let task = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|v| v.get("task").and_then(|t| t.as_str()).map(String::from));
+                self.recorder.lock().unwrap().push(task);
+
+                let body_str = String::from_utf8_lossy(&request.body);
+                match self.replies.iter().find(|(sub, _)| body_str.contains(sub)) {
+                    Some((_, content)) => {
+                        let body = serde_json::json!({
+                            "id": "gen-mock",
+                            "model": "mock/model",
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                            "choices": [{"message": {"content": content}}],
+                        });
+                        ResponseTemplate::new(200).set_body_json(body)
+                    }
+                    None => ResponseTemplate::new(500).set_body_string(format!(
+                        "state_with_mock_openrouter: no reply configured for request body: {body_str}"
+                    )),
+                }
+            }
+        }
+
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/v1/chat/completions"))
+            .respond_with(Recording {
+                replies,
+                recorder: recorder.clone(),
+            })
+            .mount(&mock)
+            .await;
+        let mock: &'static MockServer = Box::leak(Box::new(mock));
+
+        let cfg = eros_engine_llm::model_config::ModelConfig::from_toml_str(model_config_toml)
+            .expect("valid model_config_toml");
+        let body_rules = cfg.openrouter_body_rules();
+
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = std::sync::Arc::new(cfg);
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            )
+            .with_openrouter_body_rules(body_rules),
+        );
+        (state, recorder)
+    }
+
+    /// The common case: same mock, recorder discarded.
+    async fn state_with_mock_openrouter(
+        pool: sqlx::PgPool,
+        model_config_toml: &str,
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> AppState {
+        state_with_mock_openrouter_recording(pool, model_config_toml, replies)
+            .await
+            .0
+    }
 
     #[test]
     fn client_id_from_event_forwards_user_only() {
@@ -2027,53 +2505,21 @@ mod tests {
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn insight_extraction_details_absent_persists_empty_array(pool: sqlx::PgPool) {
-        use wiremock::matchers::{body_string_contains, method, path as wm_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock = MockServer::start().await;
-
-        // Stage-1 facts call → non-empty facts, old-prompt shape (no `details`
-        // key). Matched by a substring unique to the system message
-        // (filter_prompt sentinel).
-        let facts_body = serde_json::json!({
-            "id": "gen-facts", "model": "ins/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "{\"facts\":[\"用户在深圳工作\"]}"}}],
-        });
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("facts-sys-prompt-sentinel"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(facts_body))
-            .mount(&mock)
-            .await;
-
-        // Stage-2 structured call. Matched by a substring unique to
-        // extract_structured_insights_prompt.
-        let struct_body = serde_json::json!({
-            "id": "gen-struct", "model": "ins/m",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "choices": [{"message": {"content": "{\"city\":\"深圳\"}"}}],
-        });
-        Mock::given(method("POST"))
-            .and(wm_path("/api/v1/chat/completions"))
-            .and(body_string_contains("填充以下 schema"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(struct_body))
-            .mount(&mock)
-            .await;
-
-        let mut state = crate::routes::companion::test_state(pool.clone());
-        state.model_config = std::sync::Arc::new(
-            eros_engine_llm::model_config::ModelConfig::from_toml_str(
-                "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
-            )
-            .unwrap(),
-        );
-        state.openrouter = std::sync::Arc::new(
-            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
-                "k".into(),
-                format!("{}/api/v1/chat/completions", mock.uri()),
-            ),
-        );
+        // Neither response `id` nor call count is asserted below, so this one
+        // (unlike its `_sharing_run_id` and `.expect(0)`-guarded siblings
+        // above) can safely go through the shared mock-router helper.
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户在深圳工作"]}"#,
+                ),
+                ("填充以下 schema", r#"{"city":"深圳"}"#),
+            ],
+        )
+        .await;
 
         let user_id = uuid::Uuid::new_v4();
         let session_id = uuid::Uuid::new_v4();
@@ -2107,6 +2553,480 @@ mod tests {
             serde_json::json!([]),
             "no details key ⇒ []"
         );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_payload_carries_existing_keys(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        // Pre-fill two columns so `_existing_keys` has something to list.
+        sqlx::query(
+            "INSERT INTO engine.human_insights (user_id, city, occupation) VALUES ($1,$2,$3)",
+        )
+        .bind(user_id)
+        .bind("深圳")
+        .bind("后端工程师")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'structured'",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let keys = payload.unwrap()["_existing_keys"].clone();
+        let mut keys: Vec<String> = serde_json::from_value(keys).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["city".to_string(), "occupation".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_parse_error_keeps_the_raw_reply(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", "抱歉，我无法处理这个请求。"),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let (status, payload): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT status, payload FROM engine.companion_insights_events \
+             WHERE user_id = $1 AND stage = 'structured'",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "parse_error");
+        assert_eq!(payload.unwrap()["raw"], "抱歉，我无法处理这个请求。");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_structuring_stage_values_are_unchanged(pool: sqlx::PgPool) {
+        // Regression lock on spec §3.2: the stage vocabulary of the LIVE table
+        // stays 'facts' / 'structured'. Downstream audit scripts read it.
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let mut stages: Vec<String> = sqlx::query_scalar(
+            "SELECT stage FROM engine.companion_insights_events WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        stages.sort();
+        assert_eq!(stages, vec!["facts".to_string(), "structured".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn human_chain_reports_distinct_wire_task_names_per_stage(pool: sqlx::PgPool) {
+        // OpenRouter accounting and [[providers.*.body]] rules can only tell the
+        // two stages apart if they arrive under different task names. Before the
+        // split both calls reported "insight_extraction".
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+        let user_id = uuid::Uuid::new_v4();
+
+        let (state, seen_tasks) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.insight_extraction]\nmodel=\"ins/m\"\nfilter_prompt=\"facts-sys-prompt-sentinel\"\n\
+             [[providers.openrouter.body]]\ntasks = [\"insight_extraction\"]\n\
+             params = { task = \"insight_extraction\" }\n\
+             [[providers.openrouter.body]]\ntasks = [\"insight_structuring\"]\n\
+             params = { task = \"insight_structuring\" }\n",
+            vec![
+                (
+                    "facts-sys-prompt-sentinel",
+                    r#"{"facts":["用户想年底请长假"],"details":[]}"#,
+                ),
+                ("companion_insights", r#"{"life_rhythm":"想年底请长假"}"#),
+            ],
+        )
+        .await;
+
+        extract_insights(
+            &state,
+            session_id,
+            user_id,
+            message_id,
+            "我想请个长假",
+            "那你想去哪",
+            None,
+        )
+        .await;
+
+        let tasks = seen_tasks.lock().unwrap().clone();
+        assert_eq!(
+            tasks,
+            vec![
+                Some("insight_extraction".to_string()),
+                Some("insight_structuring".to_string()),
+            ],
+            "stage 2 must no longer report the stage-1 task name"
+        );
+    }
+
+    /// Proves the `task`-capture contract documented on
+    /// `state_with_mock_openrouter_recording` actually round-trips: with a
+    /// `[[providers.openrouter.body]]` rule echoing the task name onto the
+    /// wire, the recorder observes it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn state_with_mock_openrouter_recording_captures_task_via_body_rules(pool: sqlx::PgPool) {
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool,
+            "[providers.openrouter]\n\
+             [[providers.openrouter.body]]\ntasks = [\"probe_task\"]\n\
+             params = { task = \"probe_task\" }\n",
+            vec![("probe", r#"{"ok":true}"#)],
+        )
+        .await;
+
+        let _ = state
+            .openrouter
+            .execute(eros_engine_llm::openrouter::ChatRequest {
+                model: "u/m".into(),
+                messages: vec![eros_engine_llm::openrouter::ChatMessage {
+                    role: "user".into(),
+                    content: "probe".into(),
+                }],
+                temperature: 0.5,
+                max_tokens: 16,
+                task: Some("probe_task".into()),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            recorder.lock().unwrap().as_slice(),
+            [Some("probe_task".to_string())],
+        );
+    }
+
+    // ─── User insight chain ────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_extraction_writes_two_events_and_the_row(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
+            vec![
+                (
+                    "user-facts-sentinel",
+                    r#"{"facts":["用户说他在深圳南山上班"],"details":[]}"#,
+                ),
+                ("user_insights schema", r#"{"location":"深圳南山"}"#),
+            ],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "我在南山上班",
+            "那你通勤久吗",
+            None,
+        )
+        .await;
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT stage, status FROM engine.user_insights_events \
+             WHERE instance_id = $1 ORDER BY stage",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "extraction + structuring; got {rows:?}");
+        assert_eq!(rows[0], ("extraction".to_string(), "ok".to_string()));
+        assert_eq!(rows[1], ("structuring".to_string(), "ok".to_string()));
+
+        let run_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT run_id FROM engine.user_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_ids.len(), 1, "both stages share one run_id");
+
+        let location: Option<String> =
+            sqlx::query_scalar("SELECT location FROM engine.user_insights WHERE instance_id = $1")
+                .bind(instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(location.as_deref(), Some("深圳南山"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_extraction_empty_facts_writes_one_event_and_no_row(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        // Recording variant so we can prove the stage-2 call never went out,
+        // not just that the DB ended up with no second row (a stray call
+        // that hits the mock's catch-all and 500s is swallowed by
+        // `structure_user_insights`'s `Err(e) =>` arm the same way a call
+        // that never happened would be — the row count alone can't tell
+        // them apart).
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
+            vec![("user-facts-sentinel", r#"{"facts":[],"details":[]}"#)],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "嗯",
+            "嗯嗯",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.lock().unwrap().len(),
+            1,
+            "exactly one outbound call (stage 1); no stage-2 call when stage 1 is empty"
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT stage, status FROM engine.user_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "no stage-2 call when stage 1 is empty");
+        assert_eq!(rows[0], ("extraction".to_string(), "empty".to_string()));
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM engine.user_insights WHERE instance_id = $1")
+                .bind(instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_chain_is_off_when_the_stage_one_block_is_absent(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        // Recording variant so "no calls" is proven directly (the recorder
+        // pushes one entry per outbound request that reaches the mock,
+        // matched or not) rather than inferred from an empty events table,
+        // which a stray call that 500s and gets swallowed would also produce.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.chat_companion]\nmodel=\"c/m\"\n",
+            vec![],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "我在南山上班",
+            "那你通勤久吗",
+            None,
+        )
+        .await;
+
+        assert!(
+            recorder.lock().unwrap().is_empty(),
+            "no task block ⇒ no outbound calls at all"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.user_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no block, no calls, no rows");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_extraction_skips_whitespace_only_user_msg(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        // The task block IS configured (unlike the "off" test above), so if
+        // extract_user_facts guarded only assistant_msg — the bug this test
+        // catches — this whitespace-only user turn would still fire a real
+        // call. The recorder proves it never reaches the mock at all.
+        let (state, recorder) = state_with_mock_openrouter_recording(
+            pool.clone(),
+            "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
+            vec![],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "   ",
+            "那你通勤久吗",
+            None,
+        )
+        .await;
+
+        assert!(
+            recorder.lock().unwrap().is_empty(),
+            "whitespace-only user_msg ⇒ no LLM call, even with a real AI reply"
+        );
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM engine.user_insights_events WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no call, no event row");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn user_insight_structuring_parse_error_keeps_the_raw_reply(pool: sqlx::PgPool) {
+        let instance_id = seed_instance(&pool).await;
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_assistant_message(&pool, session_id).await;
+
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.user_insight_extraction]\nmodel=\"u/m\"\nfilter_prompt=\"user-facts-sentinel\"\n",
+            vec![
+                (
+                    "user-facts-sentinel",
+                    r#"{"facts":["用户说他在深圳南山上班"],"details":[]}"#,
+                ),
+                ("user_insights schema", "抱歉，我无法处理这个请求。"),
+            ],
+        )
+        .await;
+
+        extract_user_insights(
+            &state,
+            session_id,
+            instance_id,
+            message_id,
+            "我在南山上班",
+            "那你通勤久吗",
+            None,
+        )
+        .await;
+
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM engine.user_insights_events \
+             WHERE instance_id = $1 AND stage = 'structuring'",
+        )
+        .bind(instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(payload.unwrap()["raw"], "抱歉，我无法处理这个请求。");
     }
 
     #[test]

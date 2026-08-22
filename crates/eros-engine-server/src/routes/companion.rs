@@ -972,9 +972,10 @@ async fn get_character_profile(
 ///
 /// The conversation stops being visible and stops being resumable, and the
 /// relationship state — affinity, relationship-layer memories, character
-/// insights — is deleted so the next conversation starts genuinely cold. The
-/// transcript in `chat_messages` is NOT deleted: it is evidence, and the audit
-/// tables that reference a session by id finally point at something readable.
+/// insights, user insights — is deleted so the next conversation starts
+/// genuinely cold. The transcript in `chat_messages` is NOT deleted: it is
+/// evidence, and the audit tables that reference a session by id finally
+/// point at something readable.
 ///
 /// Keyed by instance because the instance is the unit of a relationship;
 /// archiving one session and leaving its siblings resumable would not give the

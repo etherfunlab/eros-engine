@@ -409,7 +409,7 @@ stream 客户端——事后可通过
 [`GET /comp/chat/{session_id}/messages/{message_id}/image-request`](#get-compchatsession_idmessagesmessage_idimage-request)
 取回同一份载荷；历史里的图片轮以 assistant 行上的 `metadata.image` 为识别标志。
 
-### `POST /v2/comp/chat/{session_id}/message/async`
+### `POST /v2/comp/session/{session_id}/message/async`
 
 只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
 网关、后台发送器）。请求体、字段校验与鉴权/归属/`wrong_channel` 检查都与
@@ -417,10 +417,14 @@ stream 客户端——事后可通过
 跑同一条生成管线，回复落在 `engine.chat_messages`，从历史接口或 Supabase
 Realtime 读取。
 
+旧路径 `POST /v2/comp/chat/{session_id}/message/async` 仍然可用——纯转发到这条
+路由——但在 OpenAPI spec 里标记为 `deprecated`，会在 1.6.0 之后的下一个 release
+中移除。
+
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"content":"hi","client_msg_id":"01J3333333333333333333333A"}' \
-  http://localhost:8080/v2/comp/chat/<session_id>/message/async
+  http://localhost:8080/v2/comp/session/<session_id>/message/async
 ```
 
 | 情形 | 响应 |
@@ -867,6 +871,47 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 `updated_at` 为 `null` 表示这个 instance 还没有 `character_insights` 行——角色抽取链还没跑出结果——这时其余字段也都是 `null`/`[]`，和上面人类画像同一套约定。结果只落库：这里的任何内容都不会被读回任何 chat prompt。
 
+这条路由是 v1，冻结不动——它会继续可用，不会被移除。v2 的对应端点、同一套
+字段、v2 路径形状，是下面的 `GET /v2/comp/instance/{instance_id}/insight/character`。
+
+### `GET /v2/comp/instance/{instance_id}/insight/character`
+
+`CharacterInsightResponse`——`character_insights` 行，走 v2 API 约定（id
+前面的实体段名说明这个 id 属于谁；`insight` 取代了 v1 里那个身兼数职的
+`profile`）。字段与上面 v1 的
+[`GET /comp/instance/{instance_id}/profile`](#get-compinstanceinstance_idprofile)
+完全相同。`GET`、要鉴权、按关系（而不是按用户）取键：该 instance 的
+`owner_uid` **必须**等于 JWT 的 user_id，否则 `403`；未知或已归档
+（`status <> 'active'`）的 instance 返回 `404`；还没有行时返回 `200`，每个
+字段都是 `null`/`[]`，`updated_at` 为 `null`——与 v1 各路由同一套约定。
+
+```json
+{
+  "instance_id": "8a1f0c2e-4b6d-4f8a-9c31-2d5e7f0a1b3c",
+  "location": null,
+  "occupation": null,
+  "current_situation": null,
+  "desires": null,
+  "vulnerabilities": null,
+  "habits": null,
+  "personal_values": null,
+  "likes": [],
+  "dislikes": [],
+  "relationships": [],
+  "updated_at": null
+}
+```
+
+### `GET /v2/comp/instance/{instance_id}/insight/user`
+
+`UserInsightResponse`——`user_insights` 行，真人用户**在这一段关系里**
+展现出的画像。同样十个字段、同样形状、同样的归属/404/无行规则，跟上面的
+`.../insight/character` 一致。**这不是** `human_insights`——上面
+[`GET /comp/user/{user_id}/profile`](#get-compuseruser_idprofile) 服务的那个
+全局画像：`user_insights` 是按关系分开、只落库、只记录的——不会被读回任何
+chat、voice 或 PDE prompt。实验特性（v1.6.0）——详见
+[2026-08-22-user-insights-and-api-v2-design.md](superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md)。
+
 ### `DELETE /comp/instance/{instance_id}/sessions`
 
 软删除这个用户与某个 persona instance 之间的全部 session。该 instance 的 `owner_uid` **必须**等于 JWT 的 user_id；否则 403。未知 instance 返回 404 —— 与上面的画像路由不同，已休眠（`status <> 'active'`）的 instance 是接受的：客户端可能先标记关系结束、再来清对话。
@@ -1183,7 +1228,8 @@ session 403）。
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
-- `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/.../message/async`）
+- `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`，以及已废弃的别名 `v2/comp/chat/{session_id}/message/async`）
+- `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）
 - `crates/eros-engine-server/src/routes/persona.rs`——独立图片提示词合成（`/persona/{instance_id}/image/compose`）

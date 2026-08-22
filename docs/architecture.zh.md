@@ -65,7 +65,10 @@ spawn post_process     tokio::spawn——跟返回響應並行：
                           按列增量更新）
                         - character insight（LLM 抽 AI 角色自身的事实 →
                           character_insights UPSERT，实验特性）
-                        （四个 future 经 tokio::join! 并发执行）
+                        - user insight（LLM 抽真人用户的事实，按这段关系分开
+                          → user_insights UPSERT，实验特性——不是
+                          human_insights，不会被注入任何 prompt）
+                        （五个 future 经 tokio::join! 并发执行）
 ```
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply / Proactive 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
@@ -174,6 +177,7 @@ crates/
 │       ├── insight.rs        # InsightEventRepo（companion_insights_events 审计行）
 │       ├── human_insight.rs  # HumanInsightRepo（类型化画像列，按字段 UPSERT）
 │       ├── character_insight.rs # CharacterInsightRepo + 事件/快照 repo（AI 角色自己的画像，实验特性）
+│       ├── user_insight.rs   # UserInsightRepo + 事件/快照 repo（真人用户按关系分开的画像，实验特性）
 │       └── persona.rs        # PersonaRepo（upsert_genome 給 seed 用）
 └── eros-engine-server/
     └── src/
