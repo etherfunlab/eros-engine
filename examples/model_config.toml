@@ -377,10 +377,43 @@ model_name_display_override = true
 # index or key falls back to the BUILT-IN prompt above, same as any other miss
 # — never an error.
 #
-# Variants are honored on THIS task only. An array/table `filter_prompt` on any
-# other task refuses to boot rather than sit there unreachable. A
-# [tasks.chat_image_prompt_compose.tiers.*] block refuses to boot in ANY shape:
-# the composer resolves with no tier, so the whole block is unreachable.
+# Variants are honored on this task and [tasks.chat_image_edit_compose] only.
+# An array/table `filter_prompt` on any other task refuses to boot rather than
+# sit there unreachable. A [tasks.chat_image_prompt_compose.tiers.*] block
+# refuses to boot in ANY shape: the composer resolves with no tier, so the
+# whole block is unreachable.
+#filter_prompt = """
+#…your override here…
+#"""
+
+# ── Image-EDIT composer (chat_image_edit_compose) ───────────────────────────
+# Powers POST /v2/comp/session/{session_id}/message/{message_id}/image/edit:
+# the consumer names an existing image turn and an instruction ("换套衣服"),
+# and the engine composes a NEW image prompt from that picture's subject and
+# force-emits an image turn for it. Same JSON contract as the composer above
+# ({"prompt": …, "caption": …}) and the same variant rules for filter_prompt.
+#
+# This block is OPTIONAL EVEN FOR THE ENDPOINT. With it absent the edit
+# endpoint runs on [tasks.chat_image_prompt_compose]'s chain and parameters,
+# using the engine's built-in EDIT prompt — so configuring image turns is
+# enough to get edits. The chat composer's own filter_prompt is never reused
+# here: it is written to compose from conversation context, not to revise a
+# picture. With BOTH blocks absent the endpoint answers 501.
+#
+# Configure this block to give edits their own model or their own prompt —
+# worth doing once engine.chat_images_events (source = 'image_edit') shows how
+# often edits are asked for and how often the composer refuses.
+#[tasks.chat_image_edit_compose]
+#model        = "x-ai/grok-4"
+#fallback     = ["google/gemini-3.1-flash-lite"]
+#retry_depth  = 1
+#temperature  = 0.7
+#max_tokens   = 700
+#reasoning    = { enabled = false }
+#
+# `filter_prompt` accepts the same three shapes as the composer above (plain /
+# array-by-index / table-by-key), selected per request via `prompt_variant` on
+# the edit body, with the same "a miss falls back to the built-in" rule.
 #filter_prompt = """
 #…your override here…
 #"""
