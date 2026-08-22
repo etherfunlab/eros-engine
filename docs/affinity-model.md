@@ -416,6 +416,11 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `boost_warmth`/`boost_patience` (the B values in force), `decay_factor`,
   and `units` (the per-line units in force). `cross_penalty_assessed` joins
   them whenever a turn was taxed.
+- `user_message_id` — the user message that drove the turn (migration
+  `0056`). A real FK to `chat_messages`, `ON DELETE SET NULL`. `NULL` on
+  `proactive` / `time_decay` rows and on rows written before the migration;
+  nothing is backfilled. Assistant rows point at the same message through
+  `chat_messages.user_message_id`, so the replies for an event are a join.
 
 ### Per-turn label changes
 
