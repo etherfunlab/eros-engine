@@ -183,19 +183,22 @@ impl ChatVisionEventRepo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{seed_chat_message, seed_chat_session, seed_persona_instance};
     use sqlx::PgPool;
 
     #[sqlx::test(migrations = "./migrations")]
     async fn compose_event_round_trips_ok_and_exhausted(pool: PgPool) {
         let repo = ImageComposeEventRepo { pool: &pool };
         let user = Uuid::new_v4();
-        let session = Uuid::new_v4();
+        // instance_id and session_id are FK-referenced since 0058.
+        let instance = seed_persona_instance(&pool, user).await;
+        let session = seed_chat_session(&pool, user).await;
 
         let ok_id = repo
             .record(ImageComposeEventInsert {
                 source: "chat_reply_text_image",
                 user_id: user,
-                instance_id: Some(Uuid::new_v4()),
+                instance_id: Some(instance),
                 session_id: Some(session),
                 status: "ok",
                 inputs: serde_json::json!({
@@ -295,8 +298,9 @@ mod tests {
     async fn vision_event_round_trips_ok_and_not_configured(pool: PgPool) {
         let repo = ChatVisionEventRepo { pool: &pool };
         let user = Uuid::new_v4();
-        let session = Uuid::new_v4();
-        let msg_ok = Uuid::new_v4();
+        // session_id and message_id are FK-referenced since 0058.
+        let session = seed_chat_session(&pool, user).await;
+        let msg_ok = seed_chat_message(&pool, session).await;
 
         repo.record(ChatVisionEventInsert {
             user_id: user,
@@ -320,7 +324,7 @@ mod tests {
         repo.record(ChatVisionEventInsert {
             user_id: user,
             session_id: session,
-            message_id: Uuid::new_v4(),
+            message_id: seed_chat_message(&pool, session).await,
             status: "not_configured",
             image_url: "https://example.invalid/b.jpg",
             vision: None,
@@ -373,14 +377,17 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn image_edit_is_an_accepted_source(pool: PgPool) {
         let repo = ImageComposeEventRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let instance = seed_persona_instance(&pool, user).await;
+        let session = seed_chat_session(&pool, user).await;
         let id = repo
             .record(ImageComposeEventInsert {
                 llm_attempts: None,
                 gateway_errors: None,
                 source: "image_edit",
-                user_id: Uuid::new_v4(),
-                instance_id: Some(Uuid::new_v4()),
-                session_id: Some(Uuid::new_v4()),
+                user_id: user,
+                instance_id: Some(instance),
+                session_id: Some(session),
                 status: "ok",
                 inputs: serde_json::json!({ "instruction": "换套衣服" }),
                 subject: Some("SUBJECT"),

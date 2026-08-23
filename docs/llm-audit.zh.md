@@ -360,15 +360,21 @@ wire 上报的任务名是 `insight_structuring`——但它落到的审计行�
 调用。两张表都是**尽力而为的遥测，不是有保证的账本**：INSERT 会被 await，
 但有一个较短的 `AUDIT_WRITE_TIMEOUT` 兜底，出错或超时都会 `warn!` 一条日志
 然后丢弃——一次审计写入失败或卡住只是丢掉这一行事件，绝不影响这一轮对话
-（与 `companion_decision_events` 同样的纪律）。两张表都没有外键：一行可能
-比它指向的东西活得更久，也可能先于它存在。
+（与 `companion_decision_events` 同样的纪律）。自迁移 0058 起，这两张表
+——连同 `companion_decision_events` 和 `companion_insights_events`——的
+`instance_id` / `session_id` / `message_id` 都带上了真正的外键，一律
+`ON DELETE SET NULL`。一行仍然可以比它指向的东西活得更久，但不能再先于它存在。
+`user_id` 刻意不加：给「这行归谁」那一列加外键，不是删掉证据，就是把唯一能
+查到它的把手置空。
 
 与 `chat_messages`（从 `chat_sessions` 级联删除）不同，删除一个 session
-并不会连带删掉这两张表里的行——两张表都保存着原文用户文本
+并不会连带删掉这两张表里的行——只会把 `session_id` 指针置空，行本身留下，
+因为审计表的意义正在于线索比它指向的东西活得久。两张表都保存着原文用户文本
 （`chat_images_events.inputs.latest_user_msg` / `.recent_scene`；
 `chat_vision_events.image_url`，往往是带签名、带 token 的 URL）。
 **deployer 必须把这两张表纳入自己的用户数据擦除流程**——引擎不会替你做这件
-事；擦除策略是 deployer 的责任，不是引擎的。两张表也都没有配套的清理策略：
+事；擦除策略是 deployer 的责任，不是引擎的 —— 删除账号同样不会波及这两张表。
+两张表也都没有配套的清理策略：
 只要部署一直跑着，行数就会无限增长，如果这对你的部署有影响，请自行规划
 分区方案或清理 cron。
 
@@ -457,8 +463,8 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 |---|---|---|
 | `id` | `UUID` | |
 | `user_id` | `UUID` | |
-| `session_id` | `UUID` | |
-| `message_id` | `UUID` | 携带这张图片的 `role='user'` 行。 |
+| `session_id` | `UUID?` | 一定会写入；只有在 0058 的 `ON DELETE SET NULL` 因 session 被删而触发时才为 NULL。 |
+| `message_id` | `UUID?` | 携带这张图片的 `role='user'` 行。同上：一定会写入，那一行被删时置空。 |
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`。 |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | 解析出的 describe 结果（`description` / `ocr_text` / `people` / `scene`）。成功时与 `chat_messages.metadata.vision` 重复——这份冗余的代价是可以接受的：不用 join `chat_messages` 建立分母，这张表就能直接回答「跑了多少次 describe、describe 的是什么、成功率多少」。 |

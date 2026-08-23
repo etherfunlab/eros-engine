@@ -2335,8 +2335,9 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
-        let session_id = uuid::Uuid::new_v4();
-        let message_id = uuid::Uuid::new_v4();
+        // Both are FK-referenced by the insight event since migration 0058.
+        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
+        let message_id = seed_user_message(&pool, session_id).await;
 
         extract_insights(
             &state,
@@ -2429,14 +2430,11 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
+        // Both are FK-referenced by the insight event since migration 0058.
+        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
+        let message_id = seed_user_message(&pool, session_id).await;
         extract_insights(
-            &state,
-            uuid::Uuid::new_v4(),
-            user_id,
-            uuid::Uuid::new_v4(),
-            "hi there",
-            "嗯嗯",
-            None,
+            &state, session_id, user_id, message_id, "hi there", "嗯嗯", None,
         )
         .await;
 
@@ -2500,14 +2498,11 @@ mod tests {
         );
 
         let user_id = uuid::Uuid::new_v4();
+        // Both are FK-referenced by the insight event since migration 0058.
+        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
+        let message_id = seed_user_message(&pool, session_id).await;
         extract_insights(
-            &state,
-            uuid::Uuid::new_v4(),
-            user_id,
-            uuid::Uuid::new_v4(),
-            "hi there",
-            "嗯嗯",
-            None,
+            &state, session_id, user_id, message_id, "hi there", "嗯嗯", None,
         )
         .await;
 
@@ -2543,8 +2538,9 @@ mod tests {
         .await;
 
         let user_id = uuid::Uuid::new_v4();
-        let session_id = uuid::Uuid::new_v4();
-        let message_id = uuid::Uuid::new_v4();
+        // Both are FK-referenced by the insight event since migration 0058.
+        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
+        let message_id = seed_user_message(&pool, session_id).await;
 
         extract_insights(
             &state,
@@ -3622,13 +3618,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let instance_id = seed_persona_instance(&pool, user_id).await;
         let state = crate::routes::companion::test_state(pool.clone());
-        let session_id = Uuid::new_v4();
+        let session_id = seed_session(&pool, instance_id).await;
+        let message_id = seed_user_message(&pool, session_id).await;
 
         extract_character_insights(
             &state,
             session_id,
             instance_id,
-            Uuid::new_v4(),
+            message_id,
             "你今天在忙什么",
             "还在公司，加班到十点",
             None,
@@ -3738,7 +3735,7 @@ mod tests {
             &state,
             session_id,
             instance_id,
-            uuid::Uuid::new_v4(),
+            seed_user_message(&pool, session_id).await,
             "你今天在忙什么",
             "还在公司，加班到十点",
             None,
@@ -3863,11 +3860,14 @@ mod tests {
             ),
         );
 
+        // Both are FK-referenced by the event row since migration 0058.
+        let session_id = seed_session(&pool, seed_instance(&pool).await).await;
+        let message_id = seed_user_message(&pool, session_id).await;
         extract_character_insights(
             &state,
-            uuid::Uuid::new_v4(),
+            session_id,
             instance_id,
-            uuid::Uuid::new_v4(),
+            message_id,
             "你今天在忙什么",
             "还在公司，加班到十点",
             None,

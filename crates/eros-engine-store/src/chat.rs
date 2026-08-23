@@ -2760,10 +2760,12 @@ mod tests {
 
         let session = throwaway_session(&pool).await;
         let repo = ChatRepo { pool: &pool };
+        // user_message_id is FK-referenced since 0058.
+        let driving = crate::testutil::seed_chat_message(&pool, session.id).await;
         let id = Uuid::new_v4();
         repo.insert_assistant_batch(
             session.id,
-            Uuid::new_v4(),
+            driving,
             &[AssistantInsert {
                 id,
                 content: "hi".into(),

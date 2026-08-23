@@ -66,6 +66,7 @@ impl DecisionEventRepo<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{seed_chat_message, seed_chat_session};
     use sqlx::PgPool;
 
     #[sqlx::test(migrations = "./migrations")]
@@ -73,12 +74,15 @@ mod tests {
         let repo = DecisionEventRepo { pool: &pool };
         let run_ok = Uuid::new_v4();
         let user = Uuid::new_v4();
+        // Both are FK-referenced since 0058; a fabricated id no longer inserts.
+        let session = seed_chat_session(&pool, user).await;
+        let message = seed_chat_message(&pool, session).await;
 
         repo.record(DecisionEventInsert {
             run_id: run_ok,
             user_id: user,
-            session_id: Some(Uuid::new_v4()),
-            message_id: Some(Uuid::new_v4()),
+            session_id: Some(session),
+            message_id: Some(message),
             status: "ok",
             action: Some("reply_text"),
             proposed_action: Some("ghost"),

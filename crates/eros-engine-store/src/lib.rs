@@ -89,6 +89,36 @@ pub(crate) mod testutil {
         .await
         .unwrap()
     }
+
+    /// Persist a chat session (with its own instance) and return its id. Same
+    /// reason as `seed_persona_instance`: since 0058 the four audit-event
+    /// tables FK-reference `chat_sessions.id`, so a fabricated `Uuid::new_v4()`
+    /// session id no longer inserts.
+    pub(crate) async fn seed_chat_session(pool: &PgPool, owner: Uuid) -> Uuid {
+        let instance_id = seed_persona_instance(pool, owner).await;
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(owner)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Persist one `role='user'` message in `session_id` and return its id, for
+    /// the audit tables that FK-reference `chat_messages.id` since 0058.
+    pub(crate) async fn seed_chat_message(pool: &PgPool, session_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content) \
+             VALUES ($1, 'user', 'seed') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +208,163 @@ mod migration_tests {
                 deltype,
                 Some(b'c' as i8),
                 "engine.{table}.instance_id must carry an ON DELETE CASCADE FK to persona_instances"
+            );
+        }
+    }
+
+    /// 0058 closed the FK gap across `engine.*`. Pins each constraint's
+    /// existence AND its ON DELETE action, because the action is the design:
+    /// SET NULL ('n') keeps an audit row alive after what it points at is gone,
+    /// where the default NO ACTION ('a') — what a bare `REFERENCES` produces —
+    /// would block the delete instead.
+    ///
+    /// Attribution columns are absent by design, not oversight; see the
+    /// blanket test below for which and why.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0058_reference_columns_carry_fks_with_the_right_action(pool: PgPool) {
+        // (table, column, parent, expected confdeltype)
+        let cases = [
+            (
+                "chat_images_events",
+                "instance_id",
+                "persona_instances",
+                b'n',
+            ),
+            ("chat_images_events", "session_id", "chat_sessions", b'n'),
+            ("chat_vision_events", "session_id", "chat_sessions", b'n'),
+            ("chat_vision_events", "message_id", "chat_messages", b'n'),
+            (
+                "companion_insights_events",
+                "session_id",
+                "chat_sessions",
+                b'n',
+            ),
+            (
+                "companion_insights_events",
+                "message_id",
+                "chat_messages",
+                b'n',
+            ),
+            (
+                "companion_decision_events",
+                "session_id",
+                "chat_sessions",
+                b'n',
+            ),
+            (
+                "companion_decision_events",
+                "message_id",
+                "chat_messages",
+                b'n',
+            ),
+            (
+                "character_insights_events",
+                "session_id",
+                "chat_sessions",
+                b'n',
+            ),
+            (
+                "character_insights_events",
+                "message_id",
+                "chat_messages",
+                b'n',
+            ),
+            ("user_insights_events", "session_id", "chat_sessions", b'n'),
+            ("user_insights_events", "message_id", "chat_messages", b'n'),
+            ("chat_messages", "user_message_id", "chat_messages", b'n'),
+            (
+                "chat_messages",
+                "continues_from_message_id",
+                "chat_messages",
+                b'n',
+            ),
+        ];
+        for (table, column, parent, want) in cases {
+            let deltype: Option<i8> = sqlx::query_scalar(
+                "SELECT c.confdeltype::text::\"char\" FROM pg_constraint c \
+                 JOIN unnest(c.conkey) k(attnum) ON true \
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+                 WHERE c.contype = 'f' \
+                   AND c.conrelid = ('engine.' || $1)::regclass \
+                   AND c.confrelid = ('engine.' || $3)::regclass \
+                   AND a.attname = $2",
+            )
+            .bind(table)
+            .bind(column)
+            .bind(parent)
+            .fetch_optional(&pool)
+            .await
+            .expect("query reference-column foreign key")
+            .flatten();
+            assert_eq!(
+                deltype,
+                Some(want as i8),
+                "engine.{table}.{column} must carry an FK to {parent} with \
+                 confdeltype '{}'",
+                want as char
+            );
+        }
+    }
+
+    /// The rule the above encodes: every column in `engine.*` that names
+    /// another table's row carries a foreign key. Fails when a new table or
+    /// column ships without one, which is how the gap 0058 closed opened in the
+    /// first place — table by table, each one copying the last.
+    ///
+    /// Attribution columns are the deliberate exclusion — the one column a row
+    /// has that leads back to a person. An FK there either deletes the evidence
+    /// or blanks the only handle anyone could find it by. That is every
+    /// `user_id` / `owner_uid`, plus `instance_id` on the four insights tables
+    /// that carry neither. `run_id` is a correlation id, not a reference.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_reference_column_in_engine_has_a_foreign_key(pool: PgPool) {
+        let unlinked: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.relname::text, a.attname::text \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'engine' AND c.relkind = 'r' \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.atttypid = 'uuid'::regtype \
+               AND a.attname <> 'id' \
+               AND a.attname NOT IN ('user_id', 'owner_uid', 'run_id') \
+               AND NOT (a.attname = 'instance_id' AND c.relname IN ( \
+                     'character_insights_events', 'character_insights_snapshot', \
+                     'user_insights_events', 'user_insights_snapshot')) \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint fk \
+                     JOIN unnest(fk.conkey) k(attnum) ON k.attnum = a.attnum \
+                     WHERE fk.contype = 'f' AND fk.conrelid = c.oid) \
+             ORDER BY 1, 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("scan engine.* for unlinked uuid columns");
+        assert!(
+            unlinked.is_empty(),
+            "every uuid column naming another table's row needs a foreign key \
+             (see CLAUDE.md, 关联列与外键); unlinked: {unlinked:?}"
+        );
+    }
+
+    /// The SET NULL FKs above are only expressible because 0058 dropped these
+    /// two NOT NULLs. If either came back, deleting a session would error
+    /// instead of blanking the pointer.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_0058_vision_event_pointers_are_nullable(pool: PgPool) {
+        for column in ["session_id", "message_id"] {
+            let nullable: String = sqlx::query_scalar(
+                "SELECT is_nullable FROM information_schema.columns \
+                 WHERE table_schema = 'engine' AND table_name = 'chat_vision_events' \
+                   AND column_name = $1",
+            )
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .expect("query is_nullable for chat_vision_events");
+            assert_eq!(
+                nullable, "YES",
+                "chat_vision_events.{column} must be nullable for ON DELETE SET NULL"
             );
         }
     }

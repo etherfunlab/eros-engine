@@ -58,8 +58,9 @@ mod tests {
         let repo = InsightEventRepo { pool: &pool };
         let run_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let message_id = Uuid::new_v4();
+        // Both are FK-referenced since 0058; a fabricated id no longer inserts.
+        let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
 
         repo.record(InsightEventInsert {
             run_id,
@@ -127,16 +128,20 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0025_creates_events_table_and_affinity_audit_cols(pool: PgPool) {
-        // companion_insights_events exists with every column.
+        // companion_insights_events exists with every column. session_id and
+        // message_id are FK-referenced since 0058, so they have to be real.
+        let user_id = Uuid::new_v4();
+        let session_id = crate::testutil::seed_chat_session(&pool, user_id).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
         sqlx::query(
             "INSERT INTO engine.companion_insights_events \
                (run_id, user_id, session_id, message_id, stage, status, payload, model, usage, generation_id) \
              VALUES ($1,$2,$3,$4,'facts','ok','[]'::jsonb,'m','{}'::jsonb,'g')",
         )
         .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(session_id)
+        .bind(message_id)
         .execute(&pool)
         .await
         .expect("insert into companion_insights_events");
