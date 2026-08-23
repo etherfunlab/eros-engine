@@ -488,7 +488,7 @@ drives the same generation pipeline and the reply lands in
 `engine.chat_messages`, picked up via the history route or Supabase
 Realtime.
 
-The old path (`POST /v2/comp/chat/{session_id}/message/async`) still works as a deprecated alias — a pure delegation to this route, marked `deprecated` in the OpenAPI spec — and is removed in the release after 1.6.0.
+The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s — see [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md).
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -1469,7 +1469,7 @@ error type. The table below covers the plain shape:
 
 - `crates/eros-engine-server/src/routes/companion.rs` — chat-lifecycle / profile handlers
 - `crates/eros-engine-server/src/routes/companion_stream.rs` — streaming chat turn (`message/stream`), incl. tip + `image_url` handling
-- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`, plus the deprecated `v2/comp/chat/{session_id}/message/async` alias)
+- `crates/eros-engine-server/src/routes/companion_async.rs` — enqueue-only chat turn (`v2/comp/session/{session_id}/message/async`)
 - `crates/eros-engine-server/src/routes/insight.rs` — v2 relationship-scoped insight profiles (`v2/comp/instance/{instance_id}/insight/character`, `.../insight/user`)
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs` — async chat-turn queue worker
 - `crates/eros-engine-server/src/routes/voice.rs` — voice-channel turn (`voice/{session_id}/turn/stream`)
