@@ -417,9 +417,8 @@ stream 客户端——事后可通过
 跑同一条生成管线，回复落在 `engine.chat_messages`，从历史接口或 Supabase
 Realtime 读取。
 
-旧路径 `POST /v2/comp/chat/{session_id}/message/async` 仍然可用——纯转发到这条
-路由——但在 OpenAPI spec 里标记为 `deprecated`，会在 1.6.0 之后的下一个 release
-中移除。
+改名前的路径 `POST /v2/comp/chat/{session_id}/message/async` 已在 1.6.0 移除，现在返回 404（带有效 bearer 时；`require_auth`
+仍先于路由匹配返回 401）——见 [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md)。
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -1298,7 +1297,7 @@ session 403）。
 
 - `crates/eros-engine-server/src/routes/companion.rs`——对话生命周期 / 画像 handler
 - `crates/eros-engine-server/src/routes/companion_stream.rs`——流式对话轮（`message/stream`），含打赏 + `image_url` 处理
-- `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`，以及已废弃的别名 `v2/comp/chat/{session_id}/message/async`）
+- `crates/eros-engine-server/src/routes/companion_async.rs`——只入队的对话轮（`v2/comp/session/{session_id}/message/async`）
 - `crates/eros-engine-server/src/routes/insight.rs`——按关系分开的 v2 画像端点（`v2/comp/instance/{instance_id}/insight/character`、`.../insight/user`）
 - `crates/eros-engine-server/src/pipeline/chat_queue.rs`——异步对话轮队列 worker
 - `crates/eros-engine-server/src/routes/voice.rs`——语音频道轮（`voice/{session_id}/turn/stream`）

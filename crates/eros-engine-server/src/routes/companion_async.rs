@@ -4,7 +4,7 @@
 //! Spec: docs/superpowers/specs/2026-08-20-async-chat-endpoint-design.md
 //! Renamed from /v2/comp/chat/{session_id}/message/async by the v2 convention
 //! (docs/superpowers/specs/2026-08-22-user-insights-and-api-v2-design.md §4.6);
-//! the old path stays as a deprecated alias for one release.
+//! the old path was removed in 1.6.0 (see docs/migrating/async-chat-v1-6-0.md).
 //! The /v2 prefix exists to avoid any confusion with the long-removed
 //! /comp/chat/{id}/message_async endpoint (deleted in v0.2.0, a3f86ea).
 
@@ -212,55 +212,8 @@ pub async fn send_message_async(
     Ok((status, Json(body)))
 }
 
-/// Deprecated alias for [`send_message_async`], removed after 1.6.0.
-///
-/// The pre-rename path, kept working for one release so clients can migrate.
-// A plain `.route()` would also work, but would leave the alias undocumented
-// in the OpenAPI spec — which is where consumers look to learn it is going
-// away.
-#[utoipa::path(
-    post,
-    path = "/v2/comp/chat/{session_id}/message/async",
-    tag = "companion",
-    params(("session_id" = Uuid, Path, description = "Chat session id")),
-    request_body = StreamSendRequest,
-    responses(
-        (status = 202, description = "Deprecated alias — see \
-            POST /v2/comp/session/{session_id}/message/async.", body = AsyncSendResponse),
-        (status = 200, description = "Deprecated alias — see \
-            POST /v2/comp/session/{session_id}/message/async.", body = AsyncSendResponse),
-        (status = 400, body = StreamPreErrorBody),
-        (status = 401, description = "missing or invalid bearer"),
-        (status = 403, body = StreamPreErrorBody),
-        (status = 404, body = StreamPreErrorBody),
-        (status = 409, body = StreamPreErrorBody),
-        (status = 422, body = StreamPreErrorBody),
-        (status = 429, body = StreamPreErrorBody),
-    ),
-    security(("bearer" = []))
-)]
-// utoipa 5.5.0 reads `deprecated` from the standard Rust attribute (see
-// `AttributesExt::has_deprecated` in utoipa-gen), not from a key inside
-// `#[utoipa::path(...)]` — a bare `deprecated,` there is a macro parse error.
-#[deprecated(
-    since = "1.6.0",
-    note = "use POST /v2/comp/session/{session_id}/message/async instead; \
-        removed in the release after 1.6.0"
-)]
-pub async fn send_message_async_legacy_path(
-    state: State<AppState>,
-    path: Path<Uuid>,
-    auth: Extension<AuthUser>,
-    req: Json<StreamSendRequest>,
-) -> Result<(StatusCode, Json<AsyncSendResponse>), AppError> {
-    send_message_async(state, path, auth, req).await
-}
-
 pub fn router() -> OpenApiRouter<AppState> {
-    #[allow(deprecated)]
-    OpenApiRouter::new()
-        .routes(routes!(send_message_async))
-        .routes(routes!(send_message_async_legacy_path))
+    OpenApiRouter::new().routes(routes!(send_message_async))
 }
 
 #[cfg(test)]
@@ -540,73 +493,20 @@ mod tests {
         assert_eq!(rows, 0, "a rejected async turn must not persist any row");
     }
 
-    // The alias must dispatch to the exact same handler as the canonical
-    // path, not merely resemble it, so drive both through a real, seeded,
-    // authenticated enqueue and compare the actual `queued` outcome.
-    //
-    // An earlier version of this test compared unauthenticated 401s on both
-    // paths. That comparison cannot fail: `require_auth` is layered on the
-    // whole merged `comp` router (see `routes::router`), so it 401s a
-    // request before axum even attempts to match a path — an unmatched path
-    // 401s identically to a matched one. Confirmed empirically: commenting
-    // out the alias's `.routes(...)` registration in `router()` left that
-    // version of this test green. This version, which needs the request to
-    // actually reach `send_message_async` to get a 202, fails as expected
-    // under the same change (see task-8-report.md for the transcript).
-    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn canonical_and_legacy_async_paths_behave_identically(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let genome_id = seed_genome(&pool, "Aria").await;
-        let instance_id = seed_instance(&pool, genome_id, user_id).await;
-        let session_id = seed_session(&pool, user_id, instance_id).await;
-
-        let mut app = build_router(test_state(pool.clone()));
-        let token = mint_test_jwt(user_id);
-
-        let (canonical_status, canonical_body) = post_json(
-            &mut app,
-            &async_uri(session_id),
-            &token,
-            json!({"content":"via canonical","client_msg_id":"01JV000000000000000000005A"}),
-        )
-        .await;
-        assert_eq!(
-            canonical_status,
-            StatusCode::ACCEPTED,
-            "canonical body: {canonical_body}"
-        );
-        assert_eq!(canonical_body["status"], "queued");
-
-        let (legacy_status, legacy_body) = post_json(
-            &mut app,
-            &format!("/v2/comp/chat/{session_id}/message/async"),
-            &token,
-            json!({"content":"via legacy alias","client_msg_id":"01JV000000000000000000006A"}),
-        )
-        .await;
-        assert_eq!(
-            legacy_status,
-            StatusCode::ACCEPTED,
-            "legacy body: {legacy_body}"
-        );
-        assert_eq!(legacy_body["status"], "queued");
-    }
-
+    // The pre-rename path is gone from the spec, not merely unrouted: a
+    // consumer reading openapi.json must see exactly one async path.
     #[test]
-    fn openapi_marks_only_the_legacy_async_path_deprecated() {
+    fn openapi_has_no_legacy_async_path() {
         let spec = crate::routes::openapi_for_tests();
         let paths = spec["paths"].as_object().expect("paths object");
 
-        let legacy = &paths["/v2/comp/chat/{session_id}/message/async"]["post"];
-        assert_eq!(
-            legacy["deprecated"], true,
-            "the alias must be marked deprecated"
-        );
-
-        let canonical = &paths["/v2/comp/session/{session_id}/message/async"]["post"];
         assert!(
-            canonical.get("deprecated").is_none() || canonical["deprecated"] == false,
-            "the canonical path must NOT be deprecated"
+            paths.contains_key("/v2/comp/session/{session_id}/message/async"),
+            "canonical async path must be in the spec"
+        );
+        assert!(
+            !paths.contains_key("/v2/comp/chat/{session_id}/message/async"),
+            "the removed /v2/comp/chat alias must not be in the spec"
         );
     }
 }
