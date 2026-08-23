@@ -120,8 +120,13 @@ pub struct ChatMessageSlim {
     /// resolve (those carry `metadata.reply_to_error` instead, which stays an
     /// audit-only key). Lets a history viewer re-render the quoted bubble after
     /// a cold mount.
+    ///
+    /// Carried as raw text, not `::uuid`: `metadata` is unconstrained JSONB, and
+    /// a cast that meets one malformed value fails the whole page rather than
+    /// the one row. The caller parses and drops what does not parse — the same
+    /// thing the canonical history route does with its own extract.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to_message_id: Option<Uuid>,
+    pub reply_to_message_id: Option<String>,
 }
 
 pub struct ChatRepo<'a> {
@@ -318,7 +323,7 @@ impl<'a> ChatRepo<'a> {
                     (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
                     channel, read_at, \
                     (metadata->'image' IS NOT NULL) AS image, \
-                    (metadata->>'reply_to_message_id')::uuid AS reply_to_message_id \
+                    metadata->>'reply_to_message_id' AS reply_to_message_id \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \
