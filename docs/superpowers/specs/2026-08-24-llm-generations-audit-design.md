@@ -121,24 +121,37 @@ task-scoped form, and a global time scan over an audit table is not a hot path.
 ### 4.1 The helper already exists
 
 `pipeline::log_openrouter_usage(task, session_id, &resp)` is already called
-from **19 of the 22** LLM call sites, and it already carries exactly the five
-facts this table stores. Streaming arms that never own a whole `ChatResponse`
-already synthesise one for it (`stream.rs` product-QA arm, `persona.rs`
-compose arm). The change is to make that function persist as well as trace:
+from **19 of the 23** LLM call sites, and it already carries exactly the five
+facts this table stores. The change is to make that function persist as well as
+trace:
 
 ```rust
 // crates/eros-engine-server/src/pipeline/mod.rs
-pub(super) async fn record_generation<'a>(
+pub(super) struct GenerationRecord<'a> {
+    pub task: &'a str,
+    pub session_id: Option<Uuid>,
+    pub generation_id: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub usage: Option<&'a serde_json::Value>,
+}
+
+pub(super) async fn record_generation(
     pool: &PgPool,
-    task: &str,
-    session_id: Option<Uuid>,
-    resp: &'a ChatResponse,
-) -> Option<&'a str>
+    rec: GenerationRecord<'_>,
+) -> Option<String>
 ```
 
 Renamed, because it now records a fact to two sinks rather than emitting a log
 line. The existing `tracing::info!` stays inside it verbatim — the structured
 log line is what operators grep today and nothing about it changes.
+
+**Five loose fields, not `&ChatResponse`.** Four streaming arms never own a
+`ChatResponse` — they hold `last_gen_id` / `model_id` / `usage_full` as
+separate locals — and two of them (`stream.rs` product-QA, `persona.rs`
+compose) today synthesise a fake `ChatResponse` with an empty `reply` purely to
+satisfy the logger's parameter. Taking the fields directly deletes those
+synthetic values instead of adding two more. A named-field struct rather than
+five positional `Option`s, matching `DecisionEventInsert` and its siblings.
 
 Backed by `LlmGenerationRepo::record` in a new
 `crates/eros-engine-store/src/generation.rs`, issuing:
@@ -163,13 +176,27 @@ Call sites stop reading `resp.generation_id` and use what `record_generation`
 returns:
 
 ```rust
-let gen = record_generation(&pool, TASK, Some(session_id), &resp).await;
-// ... write the child row with `gen`, not `resp.generation_id`
+let gen = record_generation(&state.pool, GenerationRecord {
+    task: TASK,
+    session_id: Some(session_id),
+    generation_id: resp.generation_id.as_deref(),
+    model: resp.model.as_deref(),
+    usage: resp.usage.as_ref(),
+}).await;
+// ... write the child row with `gen.as_deref()`, not `resp.generation_id`
 ```
 
 `Some(id)` — the parent row is committed, the child may reference it.
 `None` — either upstream gave no id, or the parent write failed (§6). Either
 way the child must store `NULL`.
+
+In the four streaming arms the returned value is **rebound onto `last_gen_id`**
+at the point the stream loop ends, so every persist site downstream in that arm
+picks up the degraded value with no further edit:
+
+```rust
+last_gen_id = record_generation(&state.pool, GenerationRecord { .. }).await;
+```
 
 This is what makes the foreign keys in Release B safe by construction: there is
 no path that yields a `generation_id` to a child writer without the parent row
@@ -177,14 +204,16 @@ already existing.
 
 ### 4.3 Call sites
 
-Nineteen sites need only the new parameter and `.await`. Three need a call
-that does not exist yet, and five need a real `session_id`:
+Nineteen sites need only the new parameter and `.await`. Four need a call that
+does not exist yet, one needs its existing call moved, and five need a real
+`session_id`:
 
 | task | site | change |
 |---|---|---|
-| `chat_companion` | `stream.rs` main reply arm | **new call** — synthesise a `ChatResponse` from `last_gen_id` / `served_model` / `usage_full`, as the product-QA arm already does |
-| `chat_voice` | `voice.rs` stream arm | **new call**, same synthesis |
-| `chat_image_edit_compose` | `image_edit.rs` | **new call** |
+| `chat_companion` | `stream.rs` live arm + filtered arm | **new call** — rebind `last_gen_id` where the stream loop ends, covering all of that arm's persist sites at once |
+| `chat_voice` | `voice.rs` stream arm | **new call**, same rebind |
+| `chat_image_edit_compose` | `image_edit.rs`, both terminal paths | **new call** — the exhausted path was billed too |
+| `chat_product_qa` | `stream.rs` product-QA arm | existing call **moves earlier**: today it runs after the persist, which would leave the child pointing at an uncommitted parent |
 | `chat_output_filter`, `chat_input_filter`, `pde_decision`, `chat_vision`, `chat_image_prompt_compose` (chat path) | `stream.rs` | pass the **real `session_id`** instead of today's `None` |
 
 That last row is a fix, not a rename. Those sites pass `None` because a log
@@ -210,8 +239,8 @@ them, `llm_generations` becomes their only record in the database.
 paths that would each have to write the parent separately. The call site is
 the only place that holds `(task, session_id, response)` together exactly once.
 
-No trait, no middleware, no wrapper type: one function, twenty-two call sites,
-three lines each.
+No trait, no middleware, no wrapper type: one function, twenty-three call
+sites, three lines each.
 
 ## 5. Reading it
 
