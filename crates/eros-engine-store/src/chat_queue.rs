@@ -282,6 +282,7 @@ impl<'a> ChatQueueRepo<'a> {
         &self,
         queue_id: Uuid,
         session_id: Uuid,
+        user_message_id: Uuid,
         error: &str,
         notice_content: &str,
     ) -> Result<(), sqlx::Error> {
@@ -294,12 +295,17 @@ impl<'a> ChatQueueRepo<'a> {
         .bind(error)
         .execute(&mut *tx)
         .await?;
+        // Bound to the turn that failed, like every assistant row. Without it a
+        // client routing replies per driving message has to guess "latest user
+        // row in the session", which is wrong the moment another turn arrives
+        // in between.
         sqlx::query(
-            "INSERT INTO engine.chat_messages (session_id, role, content) \
-             VALUES ($1, 'system_error', $2)",
+            "INSERT INTO engine.chat_messages (session_id, role, content, user_message_id) \
+             VALUES ($1, 'system_error', $2, $3)",
         )
         .bind(session_id)
         .bind(notice_content)
+        .bind(user_message_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
@@ -337,11 +343,18 @@ impl<'a> ChatQueueRepo<'a> {
         .await?;
         if !failed.is_empty() {
             let sessions: Vec<Uuid> = failed.iter().map(|(_, s, _)| *s).collect();
+            // Each notice carries the driving message of the turn it belongs to
+            // — the RETURNING above already knows it per row. Unnest both arrays
+            // in step so the pairing survives the batch.
+            let driving: Vec<Uuid> = failed.iter().map(|(_, _, m)| *m).collect();
             sqlx::query(
-                "INSERT INTO engine.chat_messages (session_id, role, content) \
-                 SELECT unnest($1::uuid[]), 'system_error', $2",
+                "INSERT INTO engine.chat_messages \
+                   (session_id, role, content, user_message_id) \
+                 SELECT s, 'system_error', $3, m \
+                 FROM unnest($1::uuid[], $2::uuid[]) AS t(s, m)",
             )
             .bind(&sessions)
+            .bind(&driving)
             .bind(notice_content)
             .execute(&mut *tx)
             .await?;
@@ -739,6 +752,52 @@ mod tests {
         assert!(repo.claim_next().await.unwrap().is_some());
     }
 
+    /// #295: each reaped turn's notice names the message that drove it. The
+    /// reaper fails a whole batch in one INSERT, so the risk is not "no id" but
+    /// a CROSS-PAIRED one — session A's notice carrying session B's driving
+    /// message. Two turns, reaped together, each checked against its own.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reap_stale_binds_each_notice_to_its_own_driving_message(pool: PgPool) {
+        let (user_a, session_a) = seed_session(&pool).await;
+        let (user_b, session_b) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let (msg_a, q_a) = seed_queued(&pool, session_a, user_a, "a", 100).await;
+        let (msg_b, q_b) = seed_queued(&pool, session_b, user_b, "b", 100).await;
+        for q in [q_a, q_b] {
+            sqlx::query(
+                "UPDATE engine.chat_turn_queue SET status='claimed', attempts=3, \
+                 claimed_at = now() - interval '1 hour' WHERE id = $1",
+            )
+            .bind(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let failed = repo
+            .reap_stale(std::time::Duration::from_secs(300), 3, "出错了")
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 2, "both exhausted claims go terminal");
+
+        for (session, driving) in [(session_a, msg_a), (session_b, msg_b)] {
+            let got: Option<Uuid> = sqlx::query_scalar(
+                "SELECT user_message_id FROM engine.chat_messages \
+                 WHERE session_id = $1 AND role = 'system_error'",
+            )
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                got,
+                Some(driving),
+                "the notice in session {session} must name that session's own \
+                 driving message, not the other turn's"
+            );
+        }
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn reap_stale_releases_young_attempts_and_fails_exhausted_ones(pool: PgPool) {
         let (user_id, session_id) = seed_session(&pool).await;
@@ -827,9 +886,15 @@ mod tests {
         let repo = ChatQueueRepo { pool: &pool };
         seed_queued(&pool, session_id, user_id, "x", 10).await;
         let t = repo.claim_next().await.unwrap().unwrap();
-        repo.mark_failed_with_notice(t.queue_id, session_id, "upstream 500", "出错了")
-            .await
-            .unwrap();
+        repo.mark_failed_with_notice(
+            t.queue_id,
+            session_id,
+            t.user_message_id,
+            "upstream 500",
+            "出错了",
+        )
+        .await
+        .unwrap();
         let (status, last_error): (String, Option<String>) =
             sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
                 .bind(t.queue_id)
@@ -838,8 +903,10 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "failed");
         assert_eq!(last_error.as_deref(), Some("upstream 500"));
-        let notice: String = sqlx::query_scalar(
-            "SELECT content FROM engine.chat_messages \
+        // The notice is bound to the turn that failed (#295): a client routing
+        // replies per driving message must not have to guess "latest user row".
+        let (notice, driving): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT content, user_message_id FROM engine.chat_messages \
              WHERE session_id = $1 AND role = 'system_error'",
         )
         .bind(session_id)
@@ -847,6 +914,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notice, "出错了");
+        assert_eq!(driving, Some(t.user_message_id));
     }
 
     #[sqlx::test(migrations = "./migrations")]

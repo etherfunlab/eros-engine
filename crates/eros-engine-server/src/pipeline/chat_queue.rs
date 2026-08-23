@@ -178,6 +178,7 @@ pub(crate) async fn settle_turn(
                     repo.mark_failed_with_notice(
                         turn.queue_id,
                         turn.session_id,
+                        turn.user_message_id,
                         &msg,
                         FAILURE_NOTICE,
                     )

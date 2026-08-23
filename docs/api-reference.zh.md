@@ -543,7 +543,12 @@ composed prompt 当时就没记下来——真的取不回来了，应当如实�
 SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 history 本来无从察觉）。
 
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见上面**可选：引用**）：
-它引用的那条消息的 id，一定在同一个 session 里。键出现即为真的
+它引用的那条消息的 id，一定在同一个 session 里。
+
+`user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
+`system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
+陈旧认领回收器是在客户端早已断线之后才写它们的，history 是客户端唯一能读到的
+地方 —— 而一条不知道对应哪一轮的通知没有用。不要假设最新那条 user 行就是它。键出现即为真的
 约定同上——普通轮次省略；锚点没解析成功的轮次也省略，因为没有可指的气泡。
 那次失败以 `metadata.reply_to_error` 记在行上，只供审计；客户端要知道自己的
 引用被丢掉了，应当看它发出那一轮的 SSE，而不是翻 history。
@@ -1125,6 +1130,8 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 连同「带标记的行 404 = 真的取不回来」的读法，都与上面 canonical history
 一节相同。`POST /bff/v1/comp/chat/start` 打包的历史走的是同一个条目形状，
 所以同样带这个标记。
+`user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
+`system_error` 通知行上都有，user 行省略。
 `reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
 一节）——它引用的那条消息的 id，一定在同一个 session 里；
 普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
