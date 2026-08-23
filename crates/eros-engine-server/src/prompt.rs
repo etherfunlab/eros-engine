@@ -29,6 +29,7 @@ use eros_engine_core::affinity::Affinity;
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::AffinityScope;
 use eros_engine_core::types::PromptTrait;
+use eros_engine_core::types::QuotedMessage;
 use eros_engine_core::types::ReplyStyle;
 
 /// World-memories injection payload: the persona's resident digest plus
@@ -115,6 +116,37 @@ fn period_cn(hour: u32) -> &'static str {
 /// UTC+8 — an unset persona then shares their wall clock rather than guessing.
 fn now_context(timezone: Option<&str>) -> String {
     now_context_at(Utc::now(), timezone)
+}
+
+/// How long ago a quoted line was said, in coarse buckets. The point of a
+/// quote is usually that the line is *not* recent, and "3 天前" is the whole
+/// difference between a callback and a same-breath correction. Deliberately
+/// coarse: the model reads ordinals, not clocks.
+fn relative_age(sent_at: chrono::DateTime<Utc>) -> String {
+    relative_age_from(Utc::now(), sent_at)
+}
+
+fn relative_age_from(now: chrono::DateTime<Utc>, sent_at: chrono::DateTime<Utc>) -> String {
+    let mins = (now - sent_at).num_minutes();
+    match mins {
+        // Negative = clock skew between the row and this host; treat as now.
+        i64::MIN..=0 => "刚刚说".into(),
+        1..=59 => format!("{mins} 分钟前说"),
+        _ => {
+            let hours = mins / 60;
+            match hours {
+                1..=23 => format!("{hours} 小时前说"),
+                _ => {
+                    let days = hours / 24;
+                    if days <= 30 {
+                        format!("{days} 天前说")
+                    } else {
+                        "很久以前说".into()
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn now_context_at(now: chrono::DateTime<Utc>, timezone: Option<&str>) -> String {
@@ -503,6 +535,9 @@ pub fn build_prompt(
     // World-stories injection (stories spec §5.4). `None` or empty ⇒ the
     // [world_stories] block is omitted, prompt byte-identical.
     stories: Option<&StoriesContext>,
+    // The line this turn quotes (caller's `reply_to_message_id`, resolved).
+    // `None` ⇒ the `[quote]` block is omitted. History is unaffected either way.
+    quote: Option<&QuotedMessage>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -688,6 +723,27 @@ pub fn build_prompt(
         _ => String::new(),
     };
 
+    // Volatile (per-turn) quote block: the user tapped a specific line and is
+    // replying to THAT, which the tail window alone cannot express — the quoted
+    // line may be days back, or buried under unrelated turns. Renders the line
+    // with its speaker and relative age; history is untouched. `None` ⇒ omitted.
+    let quote_section = match quote {
+        Some(q) => {
+            let speaker = if q.role == "assistant" {
+                name
+            } else {
+                "用户"
+            };
+            format!(
+                "\n[quote]（用户这一轮回复的是下面这句话，{age}的，不是最后一条消息；\
+                 先接住它，再往下说）\n{speaker}：{}",
+                q.content.trim(),
+                age = relative_age(q.sent_at),
+            )
+        }
+        None => String::new(),
+    };
+
     // 铁律 ⑦: gender-consistency reinforcement (redundancy = weighting). Only for
     // binary genders, with a role-play exception. Skipped for non-binary/absent.
     // Rendered LAST so the numbering stays contiguous whether or not it fires —
@@ -732,7 +788,7 @@ pub fn build_prompt(
          [user_profile]\n{profile_str}\n\
          \n\
          [shared_memories]\n{rel_str}{world_section}{stories_section}\
-         {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}\n\
+         {attitude}{state}{hints_section}{tone_section}{avoid_section}{emotional_section}{quote_section}\n\
          \n\
          [now]\n{tc}\n\
          {recent_section}\
@@ -1075,6 +1131,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(
             !p.contains("[additional_guidance]"),
@@ -1114,6 +1171,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(
             p.contains("[additional_guidance]"),
@@ -1148,6 +1206,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         let topics = p.find("[topics]").expect("topics");
         let traits_i = p.find("[additional_guidance]").expect("traits");
@@ -1173,6 +1232,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1208,9 +1268,120 @@ mod tests {
                 &[],
                 None,
                 None,
+                None,
             );
             assert!(!p.contains("[reply_tone]"), "no section for {tone:?}: {p}");
         }
+    }
+
+    fn quoted(role: &str, content: &str, minutes_ago: i64) -> QuotedMessage {
+        QuotedMessage {
+            message_id: uuid::Uuid::nil(),
+            role: role.into(),
+            content: content.into(),
+            sent_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+        }
+    }
+
+    #[test]
+    fn build_prompt_renders_quote_with_speaker_and_age() {
+        // The persona's own line is attributed to the persona; anything else
+        // reads as the user's. Age is what separates a callback from a
+        // same-breath correction, so it renders alongside.
+        let mine = quoted("assistant", "那我们礼拜六去看展", 60 * 24 * 3);
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            Some(&mine),
+        );
+        assert!(p.contains("[quote]"), "section present: {p}");
+        assert!(
+            p.contains("Aria：那我们礼拜六去看展"),
+            "an assistant row is attributed to the persona: {p}"
+        );
+        assert!(p.contains("3 天前说"), "relative age renders: {p}");
+        assert!(
+            p.find("[quote]").unwrap() < p.find("[now]").unwrap(),
+            "[quote] renders in the volatile block before [now]"
+        );
+
+        let theirs = quoted("user", "我上次说的那个地方", 0);
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            Some(&theirs),
+        );
+        assert!(
+            p.contains("用户：我上次说的那个地方"),
+            "a user row is attributed to the user: {p}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_quote_when_none() {
+        let p = build_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            ReplyStyle::Neutral,
+            &[],
+            None,
+            &[],
+            AffinityScope::default(),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        );
+        assert!(!p.contains("[quote]"), "no quote ⇒ no section: {p}");
+    }
+
+    #[test]
+    fn relative_age_buckets_are_coarse_and_never_negative() {
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let ago = |secs: i64| relative_age_from(now, now - chrono::Duration::seconds(secs));
+        assert_eq!(ago(0), "刚刚说");
+        assert_eq!(ago(59), "刚刚说");
+        assert_eq!(ago(60), "1 分钟前说");
+        assert_eq!(ago(59 * 60), "59 分钟前说");
+        assert_eq!(ago(60 * 60), "1 小时前说");
+        assert_eq!(ago(23 * 3600), "23 小时前说");
+        assert_eq!(ago(24 * 3600), "1 天前说");
+        assert_eq!(ago(30 * 24 * 3600), "30 天前说");
+        assert_eq!(ago(31 * 24 * 3600), "很久以前说");
+        // Clock skew between the row's host and this one must not render a
+        // negative age — it reads as a future message to the model.
+        assert_eq!(
+            relative_age_from(now, now + chrono::Duration::hours(2)),
+            "刚刚说"
+        );
     }
 
     #[test]
@@ -1228,6 +1399,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1279,6 +1451,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         // head, then the constant guard, then identity.
         assert!(s.starts_with("AUTHORED HEAD\n\n"), "{s}");
@@ -1312,6 +1485,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         // No head → starts with the guard, which still precedes identity.
         assert!(
@@ -1340,6 +1514,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1376,6 +1551,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1421,6 +1597,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，男性，24 岁，INFP 性格。"), "{s}");
         assert!(s.contains("⑦ 你是男性，严格遵守自己的性别"), "{s}");
@@ -1443,6 +1620,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1474,6 +1652,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(s.contains("你是 Aria，24 岁，INFP 性格。"), "{s}");
         assert!(!s.contains("⑧"), "no gender → no ⑧: {s}");
@@ -1496,6 +1675,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1527,6 +1707,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(s.contains("你所在时区：Asia/Tokyo。"), "{s}");
     }
@@ -1551,6 +1732,7 @@ mod tests {
             &pairs,
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1608,6 +1790,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(
             !s.contains("[recent_conversation]"),
@@ -1630,6 +1813,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1663,6 +1847,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         let groups = vec![("基础画像".to_string(), vec!["住在上海".to_string()])];
         let b = build_prompt(
@@ -1678,6 +1863,7 @@ mod tests {
             &[],
             &["我看着你".to_string()],
             &["最近聊得不错".to_string()],
+            None,
             None,
             None,
         );
@@ -1717,6 +1903,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         let b = build_prompt(
             &p,
@@ -1731,6 +1918,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -1760,6 +1948,7 @@ mod tests {
             &[],
             &["我看着你".to_string(), "我盯着你".to_string()],
             &[],
+            None,
             None,
             None,
         );
@@ -1795,6 +1984,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(!s.contains("[avoid_repetition]"), "{s}");
     }
@@ -1819,6 +2009,7 @@ mod tests {
             &[],
             &[],
             &reasons,
+            None,
             None,
             None,
         );
@@ -1858,6 +2049,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(!s.contains("[emotional_context]"), "{s}");
     }
@@ -1882,6 +2074,7 @@ mod tests {
             &[],
             &[],
             Some(&world),
+            None,
             None,
         );
         let block_at = p.find("[world_memories]").expect("block present");
@@ -1910,6 +2103,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(!without.contains("[world_memories]"));
         // Empty context must also omit the block AND be byte-identical.
@@ -1928,6 +2122,7 @@ mod tests {
             &[],
             &[],
             Some(&empty),
+            None,
             None,
         );
         assert_eq!(without, with_empty, "empty world ⇒ byte-identical prompt");
@@ -1954,6 +2149,7 @@ mod tests {
             &[],
             None,
             Some(&stories),
+            None,
         );
         let at = p.find("[world_stories]").expect("block present");
         assert!(p[at..].contains("开店倒计时一周"));
@@ -1980,6 +2176,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(!without.contains("[world_stories]"));
         let with_empty = build_prompt(
@@ -1997,6 +2194,7 @@ mod tests {
             &[],
             None,
             Some(&StoriesContext::default()),
+            None,
         );
         assert_eq!(without, with_empty, "empty stories ⇒ byte-identical prompt");
     }
@@ -2298,6 +2496,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(p.contains("warmth=") && p.contains("intimacy=") && p.contains("tension="));
         assert!(!p.contains("trust=") && !p.contains("intrigue=") && !p.contains("patience="));
@@ -2323,6 +2522,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );
@@ -2394,6 +2594,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         // What survives of the old ⑨: the half that governs what the reply
         // engages with. Its other half ("别开口就自述动作或凝视") was an opener
@@ -2458,6 +2659,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             None,
         );

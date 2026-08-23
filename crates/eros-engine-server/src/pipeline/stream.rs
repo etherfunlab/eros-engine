@@ -3856,9 +3856,10 @@ pub struct PersistedUserMessage {
     pub image_url: Option<String>,
     /// Image reply parameters supplied by the client, forwarded from the request.
     pub image: Option<crate::routes::companion_stream::ImageReplyParams>,
-    /// Where this turn's main history is anchored (resolved from the request's
-    /// `reply_to_message_id`). `Latest` for ordinary turns.
-    pub history_anchor: eros_engine_core::types::HistoryAnchor,
+    /// The message this turn quotes, resolved from the request's
+    /// `reply_to_message_id`. `None` for ordinary turns and for an id that did
+    /// not resolve; history is the normal window either way.
+    pub quote: Option<eros_engine_core::types::QuotedMessage>,
 }
 
 /// Produce a stream of `ProtocolFrame` events for a single burst. The
@@ -3946,7 +3947,7 @@ pub fn run_stream(
                 memory_scope: user_msg.memory_scope,
                 affinity_scope: user_msg.affinity_scope,
                 tips_amount_usd: user_msg.tips_amount_usd,
-                history_anchor: user_msg.history_anchor,
+                quote: user_msg.quote.clone(),
             },
             affinity: affinity.clone(),
             persona,
@@ -4666,7 +4667,7 @@ pub fn run_stream(
                         memory_scope: user_msg.memory_scope,
                         affinity_scope: user_msg.affinity_scope,
                         tips_amount_usd: user_msg.tips_amount_usd,
-                        history_anchor: user_msg.history_anchor,
+                        quote: user_msg.quote.clone(),
                     };
                     let user_id_bg = user_msg.user_id;
                     let instance_id_bg = user_msg.instance_id;
@@ -5181,7 +5182,7 @@ pub fn run_stream(
                     memory_scope: user_msg.memory_scope,
                     affinity_scope: user_msg.affinity_scope,
                     tips_amount_usd: user_msg.tips_amount_usd,
-                    history_anchor: user_msg.history_anchor,
+                    quote: user_msg.quote.clone(),
                 };
                 let user_id_bg = user_msg.user_id;
                 let instance_id_bg = user_msg.instance_id;
@@ -6414,7 +6415,7 @@ mod tests {
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             affinity: pde_test_affinity(),
             persona: pde_test_persona(),
@@ -6659,7 +6660,7 @@ mod tests {
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7021,7 +7022,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7119,7 +7120,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7256,7 +7257,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7401,7 +7402,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7512,7 +7513,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7614,7 +7615,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7726,7 +7727,7 @@ data: [DONE]\n\n";
                     force: true,
                     ..Default::default()
                 }),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -7909,7 +7910,7 @@ data: [DONE]\n\n";
                     prompt_variant: prompt_variant.map(str::to_string),
                     ..Default::default()
                 }),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -8012,7 +8013,7 @@ data: [DONE]\n\n";
                     force: true,
                     ..Default::default()
                 }),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -8507,7 +8508,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://example.invalid/u.jpg".into()),
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -8631,7 +8632,7 @@ data: [DONE]\n\n";
                     force: true,
                     ..Default::default()
                 }),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -8756,7 +8757,7 @@ data: [DONE]\n\n";
                 // keeps the judge's reply_text_image. NOT forced — force now
                 // means reply_image (spec 2026-08-03 §1).
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -8938,7 +8939,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -9072,7 +9073,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -9241,7 +9242,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -9424,7 +9425,7 @@ data: [DONE]\n\n";
                 // keeps the judge's reply_text_image. NOT forced — force now
                 // means reply_image (spec 2026-08-03 §1).
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -9597,7 +9598,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -9916,7 +9917,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10041,7 +10042,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10179,7 +10180,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10341,7 +10342,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10456,7 +10457,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10571,7 +10572,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10667,7 +10668,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(20.0),
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10775,7 +10776,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -10885,7 +10886,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11014,7 +11015,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11216,7 +11217,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11342,7 +11343,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11465,7 +11466,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11576,7 +11577,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(0.5),
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11752,7 +11753,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/y.png".into()),
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -11951,7 +11952,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/bad.png".into()),
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12099,7 +12100,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/522.png".into()),
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12236,7 +12237,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: Some("https://x/523.png".into()),
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12395,7 +12396,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12553,7 +12554,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12685,7 +12686,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -12841,7 +12842,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13088,7 +13089,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13292,7 +13293,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13440,7 +13441,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13571,7 +13572,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13608,6 +13609,141 @@ data: [DONE]\n\n";
         assert!(
             chat_sent.contains("[inner_state]") && chat_sent.contains("有点开心"),
             "inner_state still injected alongside tone; got {chat_sent}",
+        );
+    }
+
+    /// Quoting an old line adds the `[quote]` block and changes nothing else.
+    /// The rewind this endpoint used to do (history truncated at the anchor)
+    /// is gone: replying to something from last week must not cost the model
+    /// everything said since. Both halves are asserted here.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn run_stream_quote_injects_the_block_without_truncating_history(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let judge_body = serde_json::json!({
+            "id": "gj", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": r#"{"action":"reply_text"}"#}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"id\":\"g\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        // The quoted line, then two turns that landed after it. Under the old
+        // rewind semantics those two would be excluded from the prompt.
+        let chat_repo = ChatRepo { pool: &pool };
+        let anchor = chat_repo
+            .append_message(session_id, "assistant", "那我们礼拜六去看展")
+            .await
+            .unwrap();
+        chat_repo
+            .append_message(session_id, "user", "AFTERWARDS-ONE")
+            .await
+            .unwrap();
+        chat_repo
+            .append_message(session_id, "assistant", "AFTERWARDS-TWO")
+            .await
+            .unwrap();
+
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "等等，那个展",
+                "01JQUOTE00000000000000000A",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "等等，那个展".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Some(eros_engine_core::types::QuotedMessage {
+                    message_id: anchor,
+                    role: "assistant".into(),
+                    content: "那我们礼拜六去看展".into(),
+                    sent_at: chrono::Utc::now(),
+                }),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.contains("REPLY"), "quoted turn still replies");
+
+        let reqs = mock.received_requests().await.unwrap();
+        let chat_req = reqs
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+            .expect("the chat call must have fired");
+        let chat_sent = String::from_utf8_lossy(&chat_req.body);
+        assert!(
+            chat_sent.contains("[quote]") && chat_sent.contains("那我们礼拜六去看展"),
+            "the quoted line must reach the chat prompt as a [quote] block; got {chat_sent}",
+        );
+        assert!(
+            chat_sent.contains("AFTERWARDS-ONE") && chat_sent.contains("AFTERWARDS-TWO"),
+            "a quote must NOT rewind history — turns after the anchor stay in the \
+             window; got {chat_sent}",
         );
     }
 
@@ -13696,7 +13832,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13833,7 +13969,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -13984,7 +14120,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: Some(1.0),
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -14220,7 +14356,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -14336,7 +14472,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -14476,7 +14612,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -14571,7 +14707,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -15170,7 +15306,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             affinity: test_affinity(),
             persona: test_persona(),
@@ -15226,7 +15362,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -15370,7 +15506,7 @@ data: [DONE]\n\n";
                 memory_scope: Default::default(),
                 affinity_scope: Default::default(),
                 tips_amount_usd: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             affinity: test_affinity(),
             persona: p,
@@ -15763,7 +15899,7 @@ data: [DONE]\n\n";
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )
@@ -17268,7 +17404,7 @@ data: [DONE]\n\n"
                 tips_amount_usd: None,
                 image_url: None,
                 image: None,
-                history_anchor: Default::default(),
+                quote: Default::default(),
             },
             None,
         )

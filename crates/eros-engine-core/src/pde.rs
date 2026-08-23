@@ -287,7 +287,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         }
     }
 
@@ -301,7 +301,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: Some(amount),
-            history_anchor: Default::default(),
+            quote: Default::default(),
         }
     }
 

@@ -293,16 +293,20 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**Optional: reply anchor (rewind).** The body may include
-`reply_to_message_id` — the UUID of a `chat_messages` row in this session to
-anchor this turn's context on. When it resolves, history rewinds to (and
-includes) that message: rows sent after it are excluded from the prompt, and
-the anchor is recorded on the persisted user row's
-`metadata.reply_to_message_id`. A present-but-unresolvable id (unknown, or
-belonging to another session) does not fail the request — history is dropped
-for this turn (only the current message is in context) and the row's
-`metadata.reply_to_error` is set to `"not_found"`. Omit the field for the
-normal latest-history behavior.
+**Optional: quote.** The body may include `reply_to_message_id` — the UUID of a
+`chat_messages` row in this session that this turn replies to. When it
+resolves, the quoted line is rendered into the reply prompt as a `[quote]`
+block (its text, whether the persona or the user said it, and how long ago),
+and the anchor is recorded on the persisted user row's
+`metadata.reply_to_message_id`, from which both history routes echo it back.
+
+**A quote points at one line; it does not rewind the conversation.** The
+history window is the same newest-N with or without it, so quoting something
+from last week costs the model nothing that was said since. A
+present-but-unresolvable id (unknown, or belonging to another session) does not
+fail the request and does not change the context either: the turn simply runs
+without a `[quote]` block, and the row's `metadata.reply_to_error` is set to
+`"not_found"`.
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -624,9 +628,9 @@ the image. The flag also tells a rehydrating client that a turn promised an
 image (the `image_request` SSE frame is the turn's last frame and wire-only —
 a disconnect before it fires would otherwise be undetectable from history).
 
-`reply_to_message_id` echoes the reply anchor a `user` row was sent with (see
-**Optional: reply anchor (rewind)** above): the id of the row it quoted, always
-in this same session. Same key-presence contract — omitted on ordinary turns,
+`reply_to_message_id` echoes the quote a `user` row was sent with (see
+**Optional: quote** above): the id of the row it quoted, always in this same
+session. Same key-presence contract — omitted on ordinary turns,
 and omitted when the anchor failed to resolve, since there is no bubble to
 point at. That failure is recorded as `metadata.reply_to_error` on the row and
 stays audit-only; a client that needs to know its quote was dropped should read
@@ -1276,8 +1280,8 @@ contract and `image-request` discovery semantics as the canonical history
 route above, including the "404 on a flagged row = unrecoverable" reading.
 The `POST /bff/v1/comp/chat/start` bundle serializes history through this
 same entry shape and therefore carries the flag too. `reply_to_message_id`
-echoes the reply anchor a `user` row was sent with (see the stream route's
-**reply anchor** section) — the id of the row it quoted, always in this same
+echoes the quote a `user` row was sent with (see the stream route's
+**Optional: quote** section) — the id of the row it quoted, always in this same
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional

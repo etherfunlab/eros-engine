@@ -70,28 +70,30 @@ pub enum Event {
         /// gets a tip fragment. `None` for normal messages.
         #[serde(default)]
         tips_amount_usd: Option<f64>,
-        /// Optional caller-supplied reply anchor (#reply_to). Defaults to
-        /// `Latest` (normal tail window) when absent.
+        /// The message this turn quotes, resolved from the caller's
+        /// `reply_to_message_id`. `None` on ordinary turns and when the id did
+        /// not resolve. Never affects which history rows are injected — a
+        /// quote points at one line, it does not rewind the conversation.
         #[serde(default)]
-        history_anchor: HistoryAnchor,
+        quote: Option<QuotedMessage>,
     },
     ProactiveTrigger,
     AppOpen,
 }
 
-/// Where the turn's main conversation history is anchored. `Latest` (default):
-/// the normal tail window. `At`: rewind to a quoted message — history up to and
-/// including `sent_at`, then the new message. `DropHistory`: the caller's
-/// `reply_to_message_id` was unresolvable, so inject no prior turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum HistoryAnchor {
-    #[default]
-    Latest,
-    At {
-        message_id: Uuid,
-        sent_at: DateTime<Utc>,
-    },
-    DropHistory,
+/// A message the caller quoted via `reply_to_message_id`, resolved to its text.
+/// Rendered as the prompt's `[quote]` block so the model knows which line the
+/// user is pointing at — the history window is untouched either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotedMessage {
+    pub message_id: Uuid,
+    /// `chat_messages.role` of the quoted row — decides whether the prompt
+    /// attributes the line to the user or to the persona.
+    pub role: String,
+    pub content: String,
+    /// When the quoted line was sent. Renders as a relative age ("3 天前") so
+    /// the model can tell a callback to an old message from a same-breath one.
+    pub sent_at: DateTime<Utc>,
 }
 
 /// Which reference image an image turn should build on. `Face` = the static
@@ -350,26 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn history_anchor_defaults_to_latest_and_event_omits_it() {
-        // Default is Latest.
-        assert_eq!(HistoryAnchor::default(), HistoryAnchor::Latest);
-
-        // An event JSON without `history_anchor` still parses, defaulting to Latest.
+    fn quote_defaults_to_none_and_event_omits_it() {
+        // An event JSON without `quote` still parses, defaulting to None.
         let raw = r#"{"UserMessage":{"content":"hi","message_id":"00000000-0000-0000-0000-000000000001"}}"#;
         let ev: Event = serde_json::from_str(raw).unwrap();
         match ev {
-            Event::UserMessage { history_anchor, .. } => {
-                assert_eq!(history_anchor, HistoryAnchor::Latest);
-            }
+            Event::UserMessage { quote, .. } => assert_eq!(quote, None),
             _ => panic!("expected UserMessage"),
         }
 
-        // At{...} round-trips through serde.
-        let at = HistoryAnchor::At {
+        // A resolved quote round-trips through serde — the queue path
+        // serializes the whole event.
+        let q = QuotedMessage {
             message_id: uuid::Uuid::nil(),
+            role: "assistant".into(),
+            content: "那我们礼拜六去看展".into(),
             sent_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
         };
-        let s = serde_json::to_string(&at).unwrap();
-        assert_eq!(serde_json::from_str::<HistoryAnchor>(&s).unwrap(), at);
+        let s = serde_json::to_string(&q).unwrap();
+        assert_eq!(serde_json::from_str::<QuotedMessage>(&s).unwrap(), q);
     }
 }

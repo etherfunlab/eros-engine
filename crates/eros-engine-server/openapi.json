@@ -3176,7 +3176,7 @@
               "null"
             ],
             "format": "uuid",
-            "description": "Optional id of a `chat_messages` row in this session to anchor context on.\nWhen valid, history rewinds to (and includes) that message; when present\nbut unresolvable, history is dropped for this turn (recorded in metadata)."
+            "description": "Optional id of a `chat_messages` row in this session that this turn\nquotes. When it resolves, the quoted line is rendered into the prompt's\n`[quote]` block; when present but unresolvable the turn runs without one\n(recorded in metadata). History is never truncated either way."
           },
           "tier": {
             "type": [

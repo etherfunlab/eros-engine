@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use eros_engine_core::persona::CompanionPersona;
 use eros_engine_core::scope::{AffinityAxis, AffinityScope, MemoryScope};
-use eros_engine_core::types::HistoryAnchor;
+use eros_engine_core::types::QuotedMessage;
 use eros_engine_llm::model_config::StyleKey;
 use eros_engine_store::chat::{ChatRepo, ChatSession};
 use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedEnqueueOutcome, ClaimedTurn};
@@ -132,9 +132,10 @@ pub struct StreamSendRequest {
     pub image_url: Option<String>,
     #[serde(default)]
     pub image: Option<ImageReplyParams>,
-    /// Optional id of a `chat_messages` row in this session to anchor context on.
-    /// When valid, history rewinds to (and includes) that message; when present
-    /// but unresolvable, history is dropped for this turn (recorded in metadata).
+    /// Optional id of a `chat_messages` row in this session that this turn
+    /// quotes. When it resolves, the quoted line is rendered into the prompt's
+    /// `[quote]` block; when present but unresolvable the turn runs without one
+    /// (recorded in metadata). History is never truncated either way.
     #[serde(default)]
     pub reply_to_message_id: Option<Uuid>,
 }
@@ -387,31 +388,34 @@ pub(crate) async fn resolve_text_turn(
     Ok((session, persona, instance_id))
 }
 
-/// Resolve the optional reply anchor. A present-but-unresolvable id does not
-/// fail the request — we drop history for this turn and flag it (DropHistory).
-pub(crate) async fn resolve_history_anchor(
+/// Resolve the caller's `reply_to_message_id` into the message it quotes. A
+/// present-but-unresolvable id does not fail the request and does not touch
+/// history — the turn simply runs without a `[quote]` block, and
+/// `build_user_row_metadata` records `reply_to_error` on the persisted row.
+pub(crate) async fn resolve_quote(
     chat_repo: &ChatRepo<'_>,
     session_id: Uuid,
     reply_to: Option<Uuid>,
-) -> Result<HistoryAnchor, AppError> {
-    let history_anchor = match reply_to {
-        None => HistoryAnchor::Latest,
-        Some(id) => match chat_repo.message_sent_at_in_session(session_id, id).await? {
-            Some(sent_at) => HistoryAnchor::At {
-                message_id: id,
-                sent_at,
-            },
-            None => HistoryAnchor::DropHistory,
-        },
+) -> Result<Option<QuotedMessage>, AppError> {
+    let Some(id) = reply_to else {
+        return Ok(None);
     };
-    Ok(history_anchor)
+    Ok(chat_repo
+        .message_by_id_in_session(session_id, id)
+        .await?
+        .map(|m| QuotedMessage {
+            message_id: m.id,
+            role: m.role,
+            content: m.content,
+            sent_at: m.sent_at,
+        }))
 }
 
 // Build metadata: conditionally include tips_amount_usd, tier, and image_url.
 // tier is omitted entirely (not written as null) when absent — keeps JSONB shape sparse.
 pub(crate) fn build_user_row_metadata(
     req: &StreamSendRequest,
-    history_anchor: &HistoryAnchor,
+    quote: Option<&QuotedMessage>,
 ) -> Option<serde_json::Value> {
     let mut meta_map = serde_json::Map::new();
     if let Some(amount) = req.tips_amount_usd {
@@ -450,14 +454,19 @@ pub(crate) fn build_user_row_metadata(
             .collect();
         meta_map.insert("prompt_traits_raw".into(), serde_json::Value::Array(arr));
     }
-    match history_anchor {
-        HistoryAnchor::At { message_id, .. } => {
-            meta_map.insert("reply_to_message_id".into(), serde_json::json!(message_id));
+    // A quote that resolved is the anchor the history routes hand back; one the
+    // caller asked for but we could not find leaves an audit-only error marker.
+    match (quote, req.reply_to_message_id) {
+        (Some(q), _) => {
+            meta_map.insert(
+                "reply_to_message_id".into(),
+                serde_json::json!(q.message_id),
+            );
         }
-        HistoryAnchor::DropHistory => {
+        (None, Some(_)) => {
             meta_map.insert("reply_to_error".into(), serde_json::json!("not_found"));
         }
-        HistoryAnchor::Latest => {}
+        (None, None) => {}
     }
     if meta_map.is_empty() {
         None
@@ -553,13 +562,12 @@ pub async fn send_message_stream(
     // and `Some` only on Replay, where the body is still the sole owner.
     let mut guard = Some(guard);
 
-    // Resolve the optional reply anchor BEFORE the upsert so the outcome can be
+    // Resolve the quoted message BEFORE the upsert so the outcome can be
     // recorded in the new row's metadata. A present-but-unresolvable id does not
-    // fail the request — we drop history for this turn and flag it (DropHistory).
-    let history_anchor =
-        resolve_history_anchor(&chat_repo, session_id, req.reply_to_message_id).await?;
+    // fail the request — the turn just runs without a [quote] block.
+    let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
 
-    let persisted_metadata = build_user_row_metadata(&req, &history_anchor);
+    let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
     let (persisted_content, persisted_role) = persisted_content_role(&req);
     let params_value = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
         tier: req.tier.clone(),
@@ -615,7 +623,7 @@ pub async fn send_message_stream(
                     tips_amount_usd: req.tips_amount_usd,
                     image_url: req.image_url.clone(),
                     image: req.image.clone(),
-                    history_anchor,
+                    quote: quote.clone(),
                 };
                 let turn = ClaimedTurn {
                     queue_id,
@@ -1681,6 +1689,69 @@ data: [DONE]\n\n";
         assert_eq!(stored["affinity_scope_raw"], serde_json::json!("chemistry"));
         assert_eq!(stored["prompt_traits_raw"][0]["tag"], "nsfw_boost");
         assert_eq!(stored["prompt_traits_raw"][0]["text"], "be daring");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn resolve_quote_carries_content_and_scopes_by_session(pool: PgPool) {
+        use eros_engine_store::chat::ChatRepo;
+        let user_id = Uuid::new_v4();
+        let genome_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_genomes (name, system_prompt, art_metadata) \
+             VALUES ('S', 'p', '{}'::jsonb) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let instance_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.persona_instances (genome_id, owner_uid) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(genome_id).bind(user_id).fetch_one(&pool).await.unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            sessions.push(
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO engine.chat_sessions (user_id, instance_id) \
+                     VALUES ($1, $2) RETURNING id",
+                )
+                .bind(user_id)
+                .bind(instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            );
+        }
+        let chat_repo = ChatRepo { pool: &pool };
+        let msg = chat_repo
+            .append_message(sessions[0], "assistant", "那我们礼拜六去看展")
+            .await
+            .unwrap();
+
+        // No id at all → no quote, and no DB round-trip to make one.
+        assert!(resolve_quote(&chat_repo, sessions[0], None)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Resolvable → the whole line, not just its id: the prompt renders the
+        // text, so resolution has to fetch it here.
+        let q = resolve_quote(&chat_repo, sessions[0], Some(msg))
+            .await
+            .unwrap()
+            .expect("in-session id resolves");
+        assert_eq!(q.message_id, msg);
+        assert_eq!(q.role, "assistant");
+        assert_eq!(q.content, "那我们礼拜六去看展");
+
+        // Real id, wrong session → None (never leaks another session's text).
+        assert!(resolve_quote(&chat_repo, sessions[1], Some(msg))
+            .await
+            .unwrap()
+            .is_none());
+        // Unknown id → None, not an error.
+        assert!(resolve_quote(&chat_repo, sessions[0], Some(Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
