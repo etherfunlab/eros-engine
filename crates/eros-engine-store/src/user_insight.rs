@@ -251,6 +251,9 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn migration_0055_creates_all_three_tables(pool: PgPool) {
+        // session_id / message_id are FK-referenced since 0058.
+        let seeded_session = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
+        let seeded_message = crate::testutil::seed_chat_message(&pool, seeded_session).await;
         let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
 
         sqlx::query(
@@ -276,8 +279,8 @@ mod tests {
         )
         .bind(Uuid::new_v4())
         .bind(instance_id)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
+        .bind(seeded_session)
+        .bind(seeded_message)
         .execute(&pool)
         .await
         .expect("insert into user_insights_events");
@@ -431,13 +434,16 @@ mod tests {
     async fn event_repo_round_trips_payload_usage_and_generation_id(pool: PgPool) {
         let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
         let run_id = Uuid::new_v4();
+        // session_id / message_id are FK-referenced since 0058.
+        let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
 
         UserInsightEventRepo { pool: &pool }
             .record(UserInsightEventInsert {
                 run_id,
                 instance_id,
-                session_id: Some(Uuid::new_v4()),
-                message_id: Some(Uuid::new_v4()),
+                session_id: Some(session_id),
+                message_id: Some(message_id),
                 stage: "structuring",
                 status: "ok",
                 payload: Some(serde_json::json!({"location": "深圳南山", "_existing_keys": []})),

@@ -410,16 +410,26 @@ describe call. Both are **best-effort telemetry, not a guaranteed ledger**:
 the INSERT is awaited, bounded by a short `AUDIT_WRITE_TIMEOUT`, and its
 error OR timeout is `warn!`ed and dropped — a failed or stalled audit
 write costs the event row, never the turn (same discipline as
-`companion_decision_events`). Neither table carries a foreign key: a row may
-outlive or precede anything it refers to.
+`companion_decision_events`). Since migration 0058 both tables — and
+`companion_decision_events` and `companion_insights_events` with them — carry
+real foreign keys on their `instance_id` / `session_id` / `message_id`
+pointers, all `ON DELETE SET NULL` and all `NOT VALID` — binding on every row
+written from here on, with the handful of pre-existing dangling ids left as
+they are. A row can still outlive what it refers to; it can no longer precede
+it. `user_id` deliberately carries none: an FK on the
+column a row is attributed by would either delete the evidence or blank the only
+handle it can be found under.
 
 Unlike `chat_messages`, which cascades from `chat_sessions`, deleting a
-session does not reach either table — both persist verbatim user text
+session does not reach either table — it blanks the `session_id` pointer and
+leaves the row, since the point of an audit table is that the trail outlives
+what it points at. Both persist verbatim user text
 (`chat_images_events.inputs.latest_user_msg` / `.recent_scene`;
 `chat_vision_events.image_url`, often a signed, token-bearing URL). **Deployers
 must include both tables in their own user-data erasure routine** — the
 engine does not do this for you; erasure policy is the deployer's
-responsibility, not the engine's. Neither table ships with a pruning policy
+responsibility, not the engine's — deleting the account does not reach these
+tables either. Neither table ships with a pruning policy
 either: both grow without bound for as long as the deployment runs, so plan a
 partition scheme or a pruning cron yourselves if that matters for your
 deployment.
@@ -522,8 +532,8 @@ product_qa / image-only turns will overstate coverage.
 |---|---|---|
 | `id` | `UUID` | |
 | `user_id` | `UUID` | |
-| `session_id` | `UUID` | |
-| `message_id` | `UUID` | The `role='user'` row carrying the image. |
+| `session_id` | `UUID?` | Always written; NULL only after 0058's `ON DELETE SET NULL` fires on a deleted session. |
+| `message_id` | `UUID?` | The `role='user'` row carrying the image. Same: always written, blanked if that row is deleted. |
 | `status` | `TEXT` | `ok` \| `exhausted` \| `not_configured`. |
 | `image_url` | `TEXT` | |
 | `vision` | `JSONB?` | The parsed describe (`description` / `ocr_text` / `people` / `scene`). Duplicates `chat_messages.metadata.vision` on success — the accepted price of this table answering "how many describes ran, on what, at what success rate" without joining `chat_messages` to establish a denominator. |

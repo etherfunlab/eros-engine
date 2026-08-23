@@ -294,7 +294,10 @@ mod tests {
         assert_eq!(row.likes, vec!["下雨天的味道"]);
         assert_eq!(row.relationships, vec!["妹妹在读高三"]);
 
-        // Events table exists with every column.
+        // Events table exists with every column. session_id and message_id are
+        // FK-referenced since 0058, so they have to name real rows.
+        let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
         sqlx::query(
             "INSERT INTO engine.character_insights_events \
                (run_id, instance_id, session_id, message_id, stage, status, payload, \
@@ -303,8 +306,8 @@ mod tests {
         )
         .bind(Uuid::new_v4())
         .bind(instance_id)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
+        .bind(session_id)
+        .bind(message_id)
         .execute(&pool)
         .await
         .expect("insert into character_insights_events");
@@ -707,8 +710,9 @@ mod tests {
         let instance_id = seed_persona_instance(&pool, Uuid::new_v4()).await;
         let repo = CharacterInsightEventRepo { pool: &pool };
         let run_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let message_id = Uuid::new_v4();
+        // session_id / message_id are FK-referenced since 0058.
+        let session_id = crate::testutil::seed_chat_session(&pool, Uuid::new_v4()).await;
+        let message_id = crate::testutil::seed_chat_message(&pool, session_id).await;
 
         repo.record(CharacterInsightEventInsert {
             run_id,
