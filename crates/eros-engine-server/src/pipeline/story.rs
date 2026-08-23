@@ -337,7 +337,17 @@ async fn direct_story(
         .execute(req)
         .await
         .map_err(|e| format!("world_stories_director LLM call failed: {e}"))?;
-    super::log_openrouter_usage(STORY_TASK, None, &raw);
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: STORY_TASK,
+            session_id: None,
+            generation_id: raw.generation_id.as_deref(),
+            model: raw.model.as_deref(),
+            usage: raw.usage.as_ref(),
+        },
+    )
+    .await;
 
     let output = parse_story_output(&raw.reply)
         .ok_or_else(|| "world_stories_director output did not parse".to_string())?;
@@ -643,6 +653,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 0, "empty events ⇒ no memory rows");
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE task = 'world_stories_director'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the sweeper must record its generation");
+        assert!(model.is_some());
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

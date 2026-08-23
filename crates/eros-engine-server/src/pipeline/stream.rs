@@ -691,6 +691,21 @@ fn drive_chat_burst(
                 let effective_ghost = is_ghost_fallback || regex_ghost;
 
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                // Parent row FIRST, then every read below stores what came back.
+                // Rebinding here — the one point this attempt's stream has ended
+                // and nothing has read `last_gen_id` yet — is what keeps the
+                // persist and the Done frame consistent without touching either.
+                last_gen_id = super::record_generation(
+                    &state.pool,
+                    super::GenerationRecord {
+                        task: "chat_companion",
+                        session_id: Some(session_id),
+                        generation_id: last_gen_id.as_deref(),
+                        model: Some(model_id.as_str()),
+                        usage: usage_full.as_ref(),
+                    },
+                )
+                .await;
                 // One turn, one authoritative list: only the row that CONCLUDES
                 // the turn carries it. `!truncated` is exactly that row here —
                 // the served reply, the last-attempt empty ghost, or the
@@ -1053,6 +1068,24 @@ fn drive_chat_burst(
                 "chat stream attempt"
             );
 
+            // Hoisted above the three exit branches below: the parent row has
+            // to be written once, at the one point this attempt's stream has
+            // ended and nothing has read `last_gen_id` yet, so all four of the
+            // arm's reads (two persists, two Done frames) store what came back
+            // without a single edit of their own.
+            let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+            last_gen_id = super::record_generation(
+                &state.pool,
+                super::GenerationRecord {
+                    task: "chat_companion",
+                    session_id: Some(session_id),
+                    generation_id: last_gen_id.as_deref(),
+                    model: Some(model_id.as_str()),
+                    usage: usage_full.as_ref(),
+                },
+            )
+            .await;
+
             if empty_completion {
                 if idx + 1 == chain.len() {
                     // Last attempt served a 200 OK with an empty body: ghost
@@ -1067,8 +1100,6 @@ fn drive_chat_burst(
                     let is_ghost = !plan_action.promises_image();
                     let msg_ulid = Ulid::new();
                     let msg_uuid: Uuid = msg_ulid.into();
-                    let usage_full =
-                        last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
                     // Filtered mode never persists a superseded attempt, so both
                     // of its persist sites ARE concluding rows — no `truncated`
                     // gate needed here, unlike live mode.
@@ -1280,7 +1311,7 @@ fn drive_chat_burst(
                     Some(f) => {
                     let hits = f.trigger.should_filter(&bare_model_id, &tag_refs, random_draw);
                     match hits {
-                        Some(h) => match run_output_filter(&state, f, &cleaned).await {
+                        Some(h) => match run_output_filter(&state, session_id, f, &cleaned).await {
                             Ok(out) => {
                                 let mut o = outcome.lock().unwrap();
                                 o.filtered = true;
@@ -1360,7 +1391,6 @@ fn drive_chat_burst(
                 };
             }
 
-            let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
             let (llm_attempts, gateway_errors) = split_failures(&chain_failures);
             let row = eros_engine_store::chat::AssistantInsert {
                 llm_attempts,
@@ -1794,6 +1824,7 @@ pub(crate) fn error_frame_fields_from_last(
 /// per-attempt audit log into `chat_messages.metadata`).
 async fn run_output_filter(
     state: &AppState,
+    session_id: Uuid,
     f: &eros_engine_llm::model_config::ResolvedOutputFilter,
     original: &str,
 ) -> Result<RunFilterOutcome, FilterFailOpen> {
@@ -1852,7 +1883,17 @@ async fn run_output_filter(
                 continue;
             }
         };
-        super::log_openrouter_usage("chat_output_filter", None, &resp);
+        let generation_id = super::record_generation(
+            &state.pool,
+            super::GenerationRecord {
+                task: "chat_output_filter",
+                session_id: Some(session_id),
+                generation_id: resp.generation_id.as_deref(),
+                model: resp.model.as_deref(),
+                usage: resp.usage.as_ref(),
+            },
+        )
+        .await;
         let text = resp.reply.trim().to_string();
         // Empty reply check before the validity gate: "model returned literally
         // nothing" is distinguished from "model returned a short non-empty
@@ -1886,7 +1927,7 @@ async fn run_output_filter(
             retries_filter: idx as u32,
             filter_model,
             f_client_msg_id,
-            f_generation_id: resp.generation_id,
+            f_generation_id: generation_id,
             attempts,
             failures,
         });
@@ -2115,6 +2156,8 @@ struct LastParseAttempt {
 /// the rest of the chain before the caller falls back to the rule engine.
 async fn run_pde_decision(
     client: &eros_engine_llm::openrouter::OpenRouterClient,
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
     p: &eros_engine_llm::model_config::ResolvedPde,
     ctx: &str,
 ) -> PdeDecisionRun {
@@ -2172,7 +2215,17 @@ async fn run_pde_decision(
                 continue;
             }
         };
-        super::log_openrouter_usage("pde_decision", None, &resp);
+        let generation_id = super::record_generation(
+            pool,
+            super::GenerationRecord {
+                task: "pde_decision",
+                session_id: Some(session_id),
+                generation_id: resp.generation_id.as_deref(),
+                model: resp.model.as_deref(),
+                usage: resp.usage.as_ref(),
+            },
+        )
+        .await;
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "pde: empty reply; next");
@@ -2187,7 +2240,7 @@ async fn run_pde_decision(
                     raw: None,
                     model: resp.model.or_else(|| Some(model_id.clone())),
                     usage: resp.usage,
-                    generation_id: resp.generation_id,
+                    generation_id,
                     failures,
                 };
             }
@@ -2198,7 +2251,7 @@ async fn run_pde_decision(
                     raw: text,
                     model: resp.model.or_else(|| Some(model_id.clone())),
                     usage: resp.usage,
-                    generation_id: resp.generation_id,
+                    generation_id,
                 });
                 continue;
             }
@@ -2601,6 +2654,7 @@ struct VisionRun {
 /// content-level failures also advance the chain.
 async fn run_vision(
     state: &AppState,
+    session_id: Uuid,
     v: &eros_engine_llm::model_config::ResolvedVision,
     image_url: &str,
     caption: &str,
@@ -2663,16 +2717,26 @@ async fn run_vision(
                 continue;
             }
         };
-        super::log_openrouter_usage("chat_vision", None, &resp);
+        let generation_id = super::record_generation(
+            &state.pool,
+            super::GenerationRecord {
+                task: "chat_vision",
+                session_id: Some(session_id),
+                generation_id: resp.generation_id.as_deref(),
+                model: resp.model.as_deref(),
+                usage: resp.usage.as_ref(),
+            },
+        )
+        .await;
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "chat_vision: empty reply; next");
             last_failure = Some("empty");
             // Content-level failure: the provider answered and was billed
-            // above by `log_openrouter_usage`, even though the reply was
+            // above by `record_generation`, even though the reply was
             // blank. Record who answered in case the whole chain exhausts.
             last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
-            last_generation_id = resp.generation_id.clone();
+            last_generation_id = generation_id.clone();
             last_usage = resp.usage.clone();
             continue;
         }
@@ -2682,7 +2746,7 @@ async fn run_vision(
                 tracing::warn!(model = %model_id, "chat_vision: unparseable describe JSON; next");
                 last_failure = Some("unparseable");
                 last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
-                last_generation_id = resp.generation_id.clone();
+                last_generation_id = generation_id.clone();
                 last_usage = resp.usage.clone();
                 continue;
             }
@@ -2691,7 +2755,7 @@ async fn run_vision(
             tracing::warn!(model = %model_id, invalidity = %reason, "chat_vision: invalid describe; next");
             last_failure = Some(reason);
             last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
-            last_generation_id = resp.generation_id.clone();
+            last_generation_id = generation_id.clone();
             last_usage = resp.usage.clone();
             continue;
         }
@@ -2700,7 +2764,7 @@ async fn run_vision(
             outcome: Some(VisionOutcome {
                 vision: serde_json::to_value(&vision).unwrap_or(serde_json::Value::Null),
                 vision_model,
-                v_generation_id: resp.generation_id,
+                v_generation_id: generation_id,
                 usage: resp.usage,
             }),
             attempts,
@@ -2893,6 +2957,7 @@ async fn build_input_filter_transcript(
 /// it carries whatever was accumulated before that point and nothing more.
 async fn run_input_filter(
     state: &AppState,
+    session_id: Uuid,
     f: &eros_engine_llm::model_config::ResolvedInputFilter,
     recent_transcript: &str,
     raw_input: &str,
@@ -2949,7 +3014,17 @@ async fn run_input_filter(
                 continue;
             }
         };
-        super::log_openrouter_usage("chat_input_filter", None, &resp);
+        let generation_id = super::record_generation(
+            &state.pool,
+            super::GenerationRecord {
+                task: "chat_input_filter",
+                session_id: Some(session_id),
+                generation_id: resp.generation_id.as_deref(),
+                model: resp.model.as_deref(),
+                usage: resp.usage.as_ref(),
+            },
+        )
+        .await;
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "input-filter: empty reply; next");
@@ -2986,7 +3061,7 @@ async fn run_input_filter(
                 rewritten_text: content,
                 filter_model,
                 reason: verdict.reason.filter(|r| !r.trim().is_empty()),
-                f_generation_id: resp.generation_id,
+                f_generation_id: generation_id,
             }),
             failures,
         );
@@ -3118,7 +3193,7 @@ pub(crate) struct ComposeRun {
     pub(crate) last_failure: Option<&'static str>,
     /// The most recent post-response identifiers, captured on a CONTENT-level
     /// failure (`empty` / `empty_prompt`) — the provider answered and
-    /// `log_openrouter_usage` already logged the call, but the reply itself
+    /// `record_generation` already logged the call, but the reply itself
     /// was unusable. `None` when every attempt failed at the transport level
     /// (`model_error` / `timeout`), where no response — and nothing to
     /// attribute usage to — ever came back. `outcome: Some(_)` never needs
@@ -3172,8 +3247,11 @@ pub(crate) fn render_compose_payload(
 /// Shared with `routes/persona.rs`: the standalone compose endpoint's
 /// non-stream mode maps an `outcome: None` here to a 502 instead of the chat
 /// path's fail-open (spec 2026-08-03 §3.6 — no portrait fallback there).
+/// `session_id` is `Some` from the chat path; the standalone endpoint has no
+/// session to attribute the generation to, so it passes `None`.
 pub(crate) async fn run_image_prompt_compose(
     state: &AppState,
+    session_id: Option<Uuid>,
     c: &eros_engine_llm::model_config::ResolvedImagePromptCompose,
     user_payload: &str,
     task: &'static str,
@@ -3236,16 +3314,26 @@ pub(crate) async fn run_image_prompt_compose(
                 continue;
             }
         };
-        super::log_openrouter_usage(task, None, &resp);
+        let generation_id = super::record_generation(
+            &state.pool,
+            super::GenerationRecord {
+                task,
+                session_id,
+                generation_id: resp.generation_id.as_deref(),
+                model: resp.model.as_deref(),
+                usage: resp.usage.as_ref(),
+            },
+        )
+        .await;
         let text = resp.reply.trim().to_string();
         if text.is_empty() {
             tracing::warn!(model = %model_id, "image-compose: empty reply; next");
             last_failure = Some("empty");
             // Content-level failure: the provider answered (and was billed
-            // above by `log_openrouter_usage`) even though the reply was
+            // above by `record_generation`) even though the reply was
             // blank. Record who answered in case the whole chain exhausts.
             last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
-            last_generation_id = resp.generation_id.clone();
+            last_generation_id = generation_id.clone();
             last_usage = resp.usage.clone();
             continue;
         }
@@ -3254,7 +3342,7 @@ pub(crate) async fn run_image_prompt_compose(
             tracing::warn!(model = %model_id, "image-compose: empty prompt after parse; next");
             last_failure = Some("empty_prompt");
             last_model = Some(resp.model.clone().unwrap_or_else(|| model_id.clone()));
-            last_generation_id = resp.generation_id.clone();
+            last_generation_id = generation_id.clone();
             last_usage = resp.usage.clone();
             continue;
         }
@@ -3263,7 +3351,7 @@ pub(crate) async fn run_image_prompt_compose(
                 prompt,
                 caption,
                 model: resp.model.unwrap_or_else(|| model_id.clone()),
-                generation_id: resp.generation_id,
+                generation_id,
                 usage: resp.usage,
                 variant: c.variant_key.clone(),
             }),
@@ -3433,6 +3521,7 @@ async fn build_delegated_image_prompt(
         Some(c) => {
             run_image_prompt_compose(
                 state,
+                Some(session_id),
                 &c,
                 &render_compose_payload(
                     persona,
@@ -4039,7 +4128,14 @@ pub fn run_stream(
                             }
                         });
                     }
-                    let run = run_pde_decision(&state.openrouter, p, &ctx).await;
+                    let run = run_pde_decision(
+                        &state.openrouter,
+                        &state.pool,
+                        user_msg.session_id,
+                        p,
+                        &ctx,
+                    )
+                    .await;
                     let plan = match (&run.status, &run.verdict) {
                         (PdeStatus::Ok, Some(v)) => {
                             let action = guard_action(
@@ -4462,6 +4558,21 @@ pub fn run_stream(
                 }
 
                 let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                // Parent row BEFORE the persist below: the child stores what
+                // comes back, so it can never point at a row that does not
+                // exist yet. The chain-exhausted branch above already cleared
+                // the trio, so a canned fallback phrase records nothing.
+                last_gen_id = super::record_generation(
+                    &state.pool,
+                    super::GenerationRecord {
+                        task: PRODUCT_QA_TASK,
+                        session_id: Some(user_msg.session_id),
+                        generation_id: last_gen_id.as_deref(),
+                        model: served_model.as_deref(),
+                        usage: usage_full.as_ref(),
+                    },
+                )
+                .await;
                 // This executor persists exactly ONE row per turn — it has no
                 // superseded-bubble concept — so this row is always the
                 // concluding row and always owns the whole list.
@@ -4483,18 +4594,6 @@ pub fn run_stream(
                 {
                     tracing::warn!("stream: product_qa persist failed: {e}");
                 }
-                super::log_openrouter_usage(
-                    PRODUCT_QA_TASK,
-                    Some(user_msg.session_id),
-                    &eros_engine_llm::openrouter::ChatResponse {
-                        reply: String::new(), // usage log only — never echo content
-                        generation_id: last_gen_id.clone(),
-                        model: served_model.clone(),
-                        usage: usage_full.clone(),
-                        finish_reason: None,
-                        failures: Vec::new(),
-                    },
-                );
 
                 let mut usage_wire = usage_full;
                 filter_usage_keys(&mut usage_wire, &state.config.openrouter_usage_hidden_keys);
@@ -4714,7 +4813,14 @@ pub fn run_stream(
                     if let Some(image_url) = user_msg.image_url.as_deref() {
                         let (run, status) = match state.model_config.resolve_vision() {
                             Some(v) => {
-                                let run = run_vision(&state, &v, image_url, &user_msg.content).await;
+                                let run = run_vision(
+                                    &state,
+                                    user_msg.session_id,
+                                    &v,
+                                    image_url,
+                                    &user_msg.content,
+                                )
+                                .await;
                                 let status = if run.outcome.is_some() { "ok" } else { "exhausted" };
                                 (run, status)
                             }
@@ -4851,8 +4957,14 @@ pub fn run_stream(
                             .await
                             .transcript
                         };
-                        let (rewrite, in_failures) =
-                            run_input_filter(&state, &f, &transcript, &user_msg.content).await;
+                        let (rewrite, in_failures) = run_input_filter(
+                            &state,
+                            user_msg.session_id,
+                            &f,
+                            &transcript,
+                            &user_msg.content,
+                        )
+                        .await;
                         // Best-effort audit write, written whether or not a
                         // rewrite was produced — this is the gap
                         // `set_user_input_rewrite` (fires only on success)
@@ -12596,6 +12708,137 @@ data: [DONE]\n\n";
         );
     }
 
+    /// The chat reply's generation lands in the parent table with the session
+    /// it belongs to, and `chat_messages.generation_id` points at that same
+    /// row. The `session_id` half is the point: it is what lets a chat turn's
+    /// provider spend be attributed to its conversation from Postgres alone.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn chat_companion_generation_is_recorded_and_linked(pool: PgPool) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Judge ("pde/judge"): a plain `reply_text` verdict so the turn takes
+        // the normal live-mode chat path.
+        let verdict = serde_json::json!({ "action": "reply_text" }).to_string();
+        let judge_body = serde_json::json!({
+            "id": "gen-judge-1", "model": "pde/judge",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "choices": [{"message": {"content": verdict}}],
+        });
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("pde/judge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(judge_body))
+            .mount(&mock)
+            .await;
+
+        // Chat ("deepseek/x"): the terminal SSE chunk carries the generation id
+        // and a usage block — without an `id` there is nothing to record and the
+        // assertions below could only ever fail.
+        let chat_body = "data: {\"choices\":[{\"delta\":{\"content\":\"REPLY\"}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10},\"id\":\"gen-chat-1\",\"model\":\"deepseek/x\"}\n\ndata: [DONE]\n\n";
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("deepseek/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(chat_body, "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide the action.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "k".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let chat_repo = ChatRepo { pool: &pool };
+        let umid = match chat_repo
+            .upsert_user_message_idempotent(
+                session_id,
+                "在吗",
+                "01JGENLINK00000000000000AA",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+
+        let frames: Vec<ProtocolFrame> = run_stream(
+            std::sync::Arc::new(state),
+            PersistedUserMessage {
+                user_message_id: umid,
+                session_id,
+                user_id,
+                instance_id,
+                content: "在吗".into(),
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: Default::default(),
+                affinity_scope: Default::default(),
+                tips_amount_usd: None,
+                image_url: None,
+                image: None,
+                quote: Default::default(),
+            },
+            None,
+        )
+        .collect()
+        .await;
+
+        let deltas: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                ProtocolFrame::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas.contains("REPLY"),
+            "the turn must have served the mocked reply; got {frames:?}",
+        );
+
+        let (task, sid): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT task, session_id FROM engine.llm_generations \
+             WHERE generation_id = 'gen-chat-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the chat reply must record its generation");
+        assert_eq!(task, "chat_companion");
+        assert_eq!(sid, Some(session_id), "the chat turn's session, not NULL");
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM engine.chat_messages \
+             WHERE session_id = $1 AND role = 'assistant'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("gen-chat-1"));
+    }
+
     /// A judge call that failed is audited twice over: `status` becomes the
     /// pointer value (`error` / `timeout` are retired), the provider's own
     /// status lands in `llm_attempts`, and — because the judge is one of spec
@@ -15630,8 +15873,8 @@ data: [DONE]\n\n";
         }
     }
 
-    #[tokio::test]
-    async fn pde_parse_error_walks_to_next_model() {
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pde_parse_error_walks_to_next_model(pool: PgPool) {
         use wiremock::matchers::{body_string_contains, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -15659,14 +15902,14 @@ data: [DONE]\n\n";
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
-        let run = run_pde_decision(&client, &p, "ctx").await;
+        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
         assert_eq!(run.status, PdeStatus::Ok);
         assert_eq!(run.verdict.unwrap().action, PdeAction::ReplyText);
         assert_eq!(run.model.as_deref(), Some("model-b"));
     }
 
-    #[tokio::test]
-    async fn pde_request_puts_configured_sampling_on_the_wire() {
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pde_request_puts_configured_sampling_on_the_wire(pool: PgPool) {
         // Issue #246 end-to-end lock. ChatRequest derives Default and every
         // call-site literal ends in `..Default::default()`, so a site that
         // forgets `sampling` still COMPILES and silently sends nothing — the
@@ -15694,7 +15937,7 @@ data: [DONE]\n\n";
             presence_penalty: Some(0.15),
             repetition_penalty: Some(1.25),
         };
-        let run = run_pde_decision(&client, &p, "ctx").await;
+        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
         assert_eq!(run.status, PdeStatus::Ok);
 
         let sent: serde_json::Value = mock
@@ -15711,8 +15954,8 @@ data: [DONE]\n\n";
         assert_eq!(sent["repetition_penalty"], 1.25);
     }
 
-    #[tokio::test]
-    async fn pde_unset_sampling_stays_off_the_wire() {
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pde_unset_sampling_stays_off_the_wire(pool: PgPool) {
         // The other half of the contract: an untuned task must produce a
         // byte-identical body to before #246 — no key, not a default value.
         use wiremock::matchers::path as wm_path;
@@ -15733,7 +15976,9 @@ data: [DONE]\n\n";
         );
         let p = test_resolved_pde(vec!["model-a".into()]);
         assert_eq!(
-            run_pde_decision(&client, &p, "ctx").await.status,
+            run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx")
+                .await
+                .status,
             PdeStatus::Ok
         );
 
@@ -15758,8 +16003,8 @@ data: [DONE]\n\n";
         }
     }
 
-    #[tokio::test]
-    async fn pde_whole_chain_parse_error_preserves_last_raw() {
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn pde_whole_chain_parse_error_preserves_last_raw(pool: PgPool) {
         use wiremock::matchers::path as wm_path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -15776,7 +16021,7 @@ data: [DONE]\n\n";
             format!("{}/api/v1/chat/completions", mock.uri()),
         );
         let p = test_resolved_pde(vec!["model-a".into(), "model-b".into()]);
-        let run = run_pde_decision(&client, &p, "ctx").await;
+        let run = run_pde_decision(&client, &pool, Uuid::new_v4(), &p, "ctx").await;
         assert_eq!(run.status, PdeStatus::ParseError);
         assert_eq!(run.raw.as_deref(), Some("nope"));
         assert!(run.verdict.is_none());

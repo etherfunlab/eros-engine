@@ -854,6 +854,20 @@ pub fn run_voice_turn(
         // gets the FULL unfiltered usage; the wire `Done` frame below gets a
         // separate, hidden-keys-filtered copy (mirrors the text/replay paths).
         let usage_full = last_usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+        // Parent row BEFORE the persist below: the chain has ended and nothing
+        // has read `last_gen_id` yet, so the assistant row and the Done frame
+        // both store what came back rather than an id with no parent.
+        last_gen_id = crate::pipeline::record_generation(
+            &state.pool,
+            crate::pipeline::GenerationRecord {
+                task: "chat_voice",
+                session_id: Some(turn.session_id),
+                generation_id: last_gen_id.as_deref(),
+                model: served_model.as_deref(),
+                usage: usage_full.as_ref(),
+            },
+        )
+        .await;
         // Symmetric with the chat stream's assistant row: the resolved 6-bool
         // scope, not a back-projected label (spec 2026-08-14; the legacy
         // `relationship_scope` key shipped for one release in v1.2.0).

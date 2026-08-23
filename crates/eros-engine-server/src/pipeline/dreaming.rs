@@ -260,7 +260,17 @@ async fn classify_session(
         .await
         .map_err(|e| format!("memory_extraction LLM call failed: {e}"))?;
 
-    super::log_openrouter_usage(MEMORY_TASK, Some(session_id), &raw);
+    super::record_generation(
+        &state.pool,
+        super::GenerationRecord {
+            task: MEMORY_TASK,
+            session_id: Some(session_id),
+            generation_id: raw.generation_id.as_deref(),
+            model: raw.model.as_deref(),
+            usage: raw.usage.as_ref(),
+        },
+    )
+    .await;
 
     let candidates = parse_memory_candidates(&raw.reply);
 
@@ -680,6 +690,14 @@ mod tests {
         assert_eq!(written, 0, "empty memories → no rows");
         // mock.expect(1) is verified on MockServer drop: the request carried the
         // configured system prompt sentinel.
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT model FROM engine.llm_generations WHERE task = 'memory_extraction'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the sweeper must record its generation");
+        assert!(model.is_some());
     }
 
     /// Spec 2026-08-09-voice-dreaming-ingestion §1: voice rows now reach the
