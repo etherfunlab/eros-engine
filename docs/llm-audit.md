@@ -413,8 +413,10 @@ write costs the event row, never the turn (same discipline as
 `companion_decision_events`). Since migration 0058 both tables — and
 `companion_decision_events` and `companion_insights_events` with them — carry
 real foreign keys on their `instance_id` / `session_id` / `message_id`
-pointers, all `ON DELETE SET NULL`. A row can still outlive what it refers to;
-it can no longer precede it. `user_id` deliberately carries none: an FK on the
+pointers, all `ON DELETE SET NULL` and all `NOT VALID` — binding on every row
+written from here on, with the handful of pre-existing dangling ids left as
+they are. A row can still outlive what it refers to; it can no longer precede
+it. `user_id` deliberately carries none: an FK on the
 column a row is attributed by would either delete the evidence or blank the only
 handle it can be found under.
 

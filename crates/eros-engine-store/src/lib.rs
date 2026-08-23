@@ -91,9 +91,10 @@ pub(crate) mod testutil {
     }
 
     /// Persist a chat session (with its own instance) and return its id. Same
-    /// reason as `seed_persona_instance`: since 0058 the four audit-event
-    /// tables FK-reference `chat_sessions.id`, so a fabricated `Uuid::new_v4()`
-    /// session id no longer inserts.
+    /// reason as `seed_persona_instance`: since 0058 six event tables
+    /// FK-reference `chat_sessions.id` — images, vision, the two companion_*
+    /// and the two *_insights_events — so a fabricated `Uuid::new_v4()` session
+    /// id no longer inserts.
     pub(crate) async fn seed_chat_session(pool: &PgPool, owner: Uuid) -> Uuid {
         let instance_id = seed_persona_instance(pool, owner).await;
         sqlx::query_scalar::<_, Uuid>(
@@ -108,7 +109,8 @@ pub(crate) mod testutil {
     }
 
     /// Persist one `role='user'` message in `session_id` and return its id, for
-    /// the audit tables that FK-reference `chat_messages.id` since 0058.
+    /// the six event tables and `chat_messages.user_message_id` itself, all of
+    /// which FK-reference `chat_messages.id` since 0058.
     pub(crate) async fn seed_chat_message(pool: &PgPool, session_id: Uuid) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO engine.chat_messages (session_id, role, content) \
@@ -315,7 +317,16 @@ mod migration_tests {
     /// has that leads back to a person. An FK there either deletes the evidence
     /// or blanks the only handle anyone could find it by. That is every
     /// `user_id` / `owner_uid`, plus `instance_id` on the four insights tables
-    /// that carry neither. `run_id` is a correlation id, not a reference.
+    /// that carry neither.
+    ///
+    /// `run_id` is excluded per table, not by name: on the four insight/decision
+    /// event tables it is a correlation token tying the stages of one run
+    /// together, with no `runs` table behind it. Excluding the NAME schema-wide
+    /// would silently exempt a future `run_id` that really does reference
+    /// something.
+    ///
+    /// Covers `relkind` `'r'` and `'p'` — a partitioned table can carry an FK
+    /// and must not slip through. Materialized views cannot, so they are out.
     #[sqlx::test(migrations = "./migrations")]
     async fn every_reference_column_in_engine_has_a_foreign_key(pool: PgPool) {
         let unlinked: Vec<(String, String)> = sqlx::query_as(
@@ -323,14 +334,17 @@ mod migration_tests {
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = 'engine' AND c.relkind = 'r' \
+             WHERE n.nspname = 'engine' AND c.relkind IN ('r', 'p') \
                AND a.attnum > 0 AND NOT a.attisdropped \
                AND a.atttypid = 'uuid'::regtype \
                AND a.attname <> 'id' \
-               AND a.attname NOT IN ('user_id', 'owner_uid', 'run_id') \
+               AND a.attname NOT IN ('user_id', 'owner_uid') \
                AND NOT (a.attname = 'instance_id' AND c.relname IN ( \
                      'character_insights_events', 'character_insights_snapshot', \
                      'user_insights_events', 'user_insights_snapshot')) \
+               AND NOT (a.attname = 'run_id' AND c.relname IN ( \
+                     'companion_insights_events', 'companion_decision_events', \
+                     'character_insights_events', 'user_insights_events')) \
                AND NOT EXISTS ( \
                      SELECT 1 FROM pg_constraint fk \
                      JOIN unnest(fk.conkey) k(attnum) ON k.attnum = a.attnum \

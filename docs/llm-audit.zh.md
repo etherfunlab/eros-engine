@@ -363,7 +363,9 @@ wire 上报的任务名是 `insight_structuring`——但它落到的审计行�
 （与 `companion_decision_events` 同样的纪律）。自迁移 0058 起，这两张表
 ——连同 `companion_decision_events` 和 `companion_insights_events`——的
 `instance_id` / `session_id` / `message_id` 都带上了真正的外键，一律
-`ON DELETE SET NULL`。一行仍然可以比它指向的东西活得更久，但不能再先于它存在。
+`ON DELETE SET NULL`，且一律 `NOT VALID` —— 约束对此后写入的每一行生效，
+迁移前就已经指向被删父行的少数几个 id 原样留着。一行仍然可以比它指向的东西
+活得更久，但不能再先于它存在。
 `user_id` 刻意不加：给「这行归谁」那一列加外键，不是删掉证据，就是把唯一能
 查到它的把手置空。
 

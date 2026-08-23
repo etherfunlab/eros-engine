@@ -13,11 +13,9 @@
 -- Supabase table editor, so working out which turn a row belongs to means
 -- guessing by timestamp — which is what 0056 said it was replacing.
 --
--- This closes the whole set except the attribution columns (below). user_id in
--- particular has a second reason to stay unconstrained: it would be this
--- schema's only reference into auth.users, and a validated constraint scans at
--- deploy time — one account deleted between the orphan check and the deploy
--- would abort the migration and the engine would not boot.
+-- This closes the whole set except the attribution columns (below). user_id has
+-- a second reason to stay unconstrained: it would be this schema's only
+-- reference into auth.users.
 --
 -- ON DELETE, per column:
 --
@@ -27,9 +25,11 @@
 --   log after the conversation is gone.
 --
 -- No FK at all on an ATTRIBUTION column — the one column a row has that leads
--- back to a person. Deleting the row destroys evidence; blanking it leaves a
--- row nobody can ever find again. Both are worse than no constraint. That is
--- why no user_id / owner_uid here carries one, and why instance_id on
+-- back to a person. CASCADE destroys the evidence; SET NULL leaves a row nobody
+-- can ever find again; RESTRICT / NO ACTION does preserve both, but at the cost
+-- of letting an append-only audit table veto the deletion of a core row, which
+-- audit must never do. All three are worse than no constraint. That is why no
+-- user_id / owner_uid here carries one, and why instance_id on
 -- character_insights_events, user_insights_events and their two snapshot tables
 -- does not either: those four tables have no user_id and no owner_uid, so
 -- instance_id is the only attribution they have, and
@@ -64,24 +64,36 @@
 -- leave either pointer NULL where before it could not. The application is the
 -- only thing keeping them populated at write time.
 --
--- VALIDATED vs NOT VALID. Every column here was checked against production
--- first. Only four carry rows whose parent was already deleted —
--- chat_images_events.session_id, and both pointers on companion_insights_events
--- and companion_decision_events — and those go in NOT VALID: the constraint
--- binds every future row while the existing dangling ids stay put. They are
--- deliberately NOT backfilled to NULL, because two audit rows sharing one dead
--- message_id are still recognizably the same turn, and that correlation is the
--- only thing those ids have left. Everything else goes in validated.
+-- EVERY CONSTRAINT IS NOT VALID, including the columns production came back
+-- clean on. A validated ADD CONSTRAINT scans the table as it is at deploy time,
+-- and a failed scan rolls back the migration — which here means the engine does
+-- not boot, with no rollback path. Between the orphan check that informed this
+-- file and the moment it actually runs, one row pointing at a since-deleted
+-- parent is enough to trigger that. NOT VALID removes the entire class: no scan,
+-- so nothing to fail on, and enforcement on every future INSERT and on any
+-- UPDATE of the key is identical either way. What is given up is only the
+-- retrospective guarantee about rows that already exist.
 --
--- STATEMENT ORDER IS DELIBERATE. sqlx runs this whole file in ONE transaction,
--- so every lock any statement takes is held until the last one commits. Each
--- ADD FOREIGN KEY takes SHARE ROW EXCLUSIVE on the PARENT too, which blocks
--- ordinary writes to chat_sessions / chat_messages / persona_instances — the
--- hot tables. So the index builds, which scan the child tables and lock nothing
--- else, all run FIRST. CREATE INDEX CONCURRENTLY is unavailable: it cannot run
--- inside a transaction.
+-- Four columns genuinely do carry dangling ids today — chat_images_events
+-- .session_id, and both pointers on companion_insights_events and
+-- companion_decision_events. They are deliberately NOT backfilled to NULL,
+-- because two audit rows sharing one dead message_id are still recognizably the
+-- same turn, and that correlation is the only thing those ids have left. A
+-- later migration may clean up and VALIDATE; nothing here depends on it.
+--
+-- STATEMENT ORDER. sqlx runs this whole file in ONE transaction, so every lock
+-- any statement takes is held until the last one commits — ordering changes
+-- when a lock is ACQUIRED, never when it is released. CREATE INDEX takes SHARE,
+-- which already blocks writes to the table it indexes; ADD FOREIGN KEY takes
+-- SHARE ROW EXCLUSIVE on the child AND on the parent. So the goal is narrow but
+-- real: every index build on an audit table finishes before the first statement
+-- that touches a hot table, and the statements touching chat_messages —
+-- its own index and its two self-referential FKs — sit as late as their
+-- dependencies allow. chat_messages still becomes write-blocked at the first FK
+-- naming it as parent, which is unavoidable in a single transaction.
+-- CREATE INDEX CONCURRENTLY is not an option: it cannot run inside one.
 
--- ─── Indexes first: child-table locks only, and the slowest work here ───
+-- ─── Audit-table indexes first: no hot table is touched yet ────────
 --
 -- An unindexed FK makes the parent's ON DELETE action seq-scan the child.
 -- Columns already covered as the leading column of an existing composite index
@@ -109,9 +121,6 @@ CREATE INDEX idx_user_insights_events_session
     ON engine.user_insights_events (session_id);
 CREATE INDEX idx_user_insights_events_message
     ON engine.user_insights_events (message_id);
-CREATE INDEX idx_chat_messages_continues_from
-    ON engine.chat_messages (continues_from_message_id)
-    WHERE continues_from_message_id IS NOT NULL;
 
 -- ─── Nullability, so SET NULL is expressible ────────────────────────
 
@@ -119,59 +128,61 @@ ALTER TABLE engine.chat_vision_events
     ALTER COLUMN session_id DROP NOT NULL,
     ALTER COLUMN message_id DROP NOT NULL;
 
--- ─── SET NULL, validated: verified orphan-free ──────────────────────
+-- ─── The constraints ───────────────────────────────────────────────
 
 ALTER TABLE engine.chat_images_events
     ADD CONSTRAINT chat_images_events_instance_id_fkey
     FOREIGN KEY (instance_id) REFERENCES engine.persona_instances(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.chat_vision_events
     ADD CONSTRAINT chat_vision_events_session_id_fkey
     FOREIGN KEY (session_id) REFERENCES engine.chat_sessions(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.chat_vision_events
     ADD CONSTRAINT chat_vision_events_message_id_fkey
     FOREIGN KEY (message_id) REFERENCES engine.chat_messages(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.character_insights_events
     ADD CONSTRAINT character_insights_events_session_id_fkey
     FOREIGN KEY (session_id) REFERENCES engine.chat_sessions(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.character_insights_events
     ADD CONSTRAINT character_insights_events_message_id_fkey
     FOREIGN KEY (message_id) REFERENCES engine.chat_messages(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.user_insights_events
     ADD CONSTRAINT user_insights_events_session_id_fkey
     FOREIGN KEY (session_id) REFERENCES engine.chat_sessions(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.user_insights_events
     ADD CONSTRAINT user_insights_events_message_id_fkey
     FOREIGN KEY (message_id) REFERENCES engine.chat_messages(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 -- The two self-referential pointers on chat_messages. `user_message_id` is the
 -- "which turn is this" pointer downstream routes replies by; 0056 chose SET
 -- NULL for the identical pointer on companion_affinity_events, and this matches
 -- it. A session delete cascades every message away regardless.
 
+CREATE INDEX idx_chat_messages_continues_from
+    ON engine.chat_messages (continues_from_message_id)
+    WHERE continues_from_message_id IS NOT NULL;
+
 ALTER TABLE engine.chat_messages
     ADD CONSTRAINT chat_messages_user_message_id_fkey
     FOREIGN KEY (user_message_id) REFERENCES engine.chat_messages(id)
-    ON DELETE SET NULL;
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.chat_messages
     ADD CONSTRAINT chat_messages_continues_from_message_id_fkey
     FOREIGN KEY (continues_from_message_id) REFERENCES engine.chat_messages(id)
-    ON DELETE SET NULL;
-
--- ─── SET NULL, NOT VALID: pre-existing rows point at deleted parents ─
+    ON DELETE SET NULL NOT VALID;
 
 ALTER TABLE engine.chat_images_events
     ADD CONSTRAINT chat_images_events_session_id_fkey
