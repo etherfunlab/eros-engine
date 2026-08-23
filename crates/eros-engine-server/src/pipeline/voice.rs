@@ -976,6 +976,7 @@ mod tests {
             read_at: None,
             image: false,
             reply_to_message_id: None,
+            user_message_id: None,
         }
     }
 

@@ -175,13 +175,8 @@ pub(crate) async fn settle_turn(
                 ) {
                     repo.mark_done(turn.queue_id).await
                 } else {
-                    repo.mark_failed_with_notice(
-                        turn.queue_id,
-                        turn.session_id,
-                        &msg,
-                        FAILURE_NOTICE,
-                    )
-                    .await
+                    repo.mark_failed_with_notice(turn.queue_id, &msg, FAILURE_NOTICE)
+                        .await
                 }
             } else {
                 repo.release(turn.queue_id, &msg).await

@@ -149,6 +149,11 @@ pub struct ChatHistoryEntry {
     /// contract as `read_at`; the BFF history entry carries the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<Uuid>,
+    /// The `role='user'` row whose turn produced this row — set on assistant
+    /// rows and on `system_error` notices. Same key-presence contract; the BFF
+    /// history entry carries the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -764,6 +769,7 @@ async fn get_history(
         .into_iter()
         .map(|m| ChatHistoryEntry {
             id: m.id,
+            user_message_id: m.user_message_id,
             image: m.metadata.as_ref().and_then(|md| md.get("image")).is_some(),
             reply_to_message_id: m
                 .metadata

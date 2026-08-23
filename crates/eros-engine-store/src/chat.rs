@@ -127,6 +127,12 @@ pub struct ChatMessageSlim {
     /// thing the canonical history route does with its own extract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
+    /// The `role='user'` row that drove the turn this row belongs to. Set on
+    /// assistant rows, and on the `system_error` notices the queue worker and
+    /// the stale-claim reaper write (#295) — those are written after the client
+    /// has disconnected, so history is the only place it can read them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<Uuid>,
 }
 
 pub struct ChatRepo<'a> {
@@ -323,7 +329,8 @@ impl<'a> ChatRepo<'a> {
                     (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
                     channel, read_at, \
                     (metadata->'image' IS NOT NULL) AS image, \
-                    metadata->>'reply_to_message_id' AS reply_to_message_id \
+                    metadata->>'reply_to_message_id' AS reply_to_message_id, \
+                    user_message_id \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \

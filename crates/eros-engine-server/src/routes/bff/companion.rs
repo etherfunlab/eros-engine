@@ -74,6 +74,12 @@ pub struct BffHistoryEntry {
     /// losing it on refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<Uuid>,
+    /// The `role='user'` row whose turn produced this row — set on assistant
+    /// rows and on `system_error` notices. Lets a client attach a reply, or a
+    /// failure notice, to the message that caused it instead of assuming the
+    /// newest user row is the one. Omitted on user rows themselves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<Uuid>,
 }
 
 /// Parse the raw `metadata->>'reply_to_message_id'` text the slim projection
@@ -186,6 +192,7 @@ async fn bff_get_history(
             read_at: r.read_at,
             image: r.image,
             reply_to_message_id: parse_anchor(r.reply_to_message_id),
+            user_message_id: r.user_message_id,
         })
         .collect();
     let total = messages.len();
@@ -246,6 +253,7 @@ async fn bff_start_chat(
                 read_at: r.read_at,
                 image: r.image,
                 reply_to_message_id: parse_anchor(r.reply_to_message_id),
+                user_message_id: r.user_message_id,
             })
             .collect()
     };
@@ -883,6 +891,67 @@ mod tests {
         assert!(
             failed.get("reply_to_error").is_none(),
             "reply_to_error stays audit-only; got {failed}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_carries_user_message_id_on_replies_and_error_notices(pool: PgPool) {
+        // #295: a `system_error` notice is written after the client has already
+        // disconnected, so history is the only place it can be read — and it is
+        // useless without the turn it belongs to. Assistant rows carry the same
+        // field; user rows omit it.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let driving: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'hi', now() - interval '3 seconds') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, user_message_id, sent_at) \
+             VALUES ($1, 'assistant', 'hey', $2, now() - interval '2 seconds'),
+                    ($1, 'system_error', '出错了', $2, now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .bind(driving)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        for role in ["assistant", "system_error"] {
+            let m = messages
+                .iter()
+                .find(|m| m["role"] == role)
+                .unwrap_or_else(|| panic!("{role} row"));
+            assert_eq!(
+                m["user_message_id"],
+                json!(driving.to_string()),
+                "a {role} row names the turn it belongs to; got {m}"
+            );
+        }
+        let u = messages
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("user row");
+        assert!(
+            u.get("user_message_id").is_none(),
+            "the driving row itself omits the key; got {u}"
         );
     }
 

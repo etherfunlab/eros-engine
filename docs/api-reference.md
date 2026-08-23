@@ -630,7 +630,14 @@ a disconnect before it fires would otherwise be undetectable from history).
 
 `reply_to_message_id` echoes the quote a `user` row was sent with (see
 **Optional: quote** above): the id of the row it quoted, always in this same
-session. Same key-presence contract — omitted on ordinary turns,
+session.
+
+`user_message_id` names the `role='user'` row whose turn produced this row. It
+is present on assistant rows and on `system_error` notices, and omitted on the
+user rows themselves. The notices matter most: the queue worker and the
+stale-claim reaper write them after the client has already disconnected, so
+history is the only place a client can find them — and a notice is useless
+without knowing which turn failed. Do not assume the newest user row is the one. Same key-presence contract — omitted on ordinary turns,
 and omitted when the anchor failed to resolve, since there is no bubble to
 point at. That failure is recorded as `metadata.reply_to_error` on the row and
 stays audit-only; a client that needs to know its quote was dropped should read
@@ -1279,7 +1286,9 @@ an image (omitted on every other row, never `false`) — the same key-presence
 contract and `image-request` discovery semantics as the canonical history
 route above, including the "404 on a flagged row = unrecoverable" reading.
 The `POST /bff/v1/comp/chat/start` bundle serializes history through this
-same entry shape and therefore carries the flag too. `reply_to_message_id`
+same entry shape and therefore carries the flag too. `user_message_id` names the
+`role='user'` row whose turn produced this row — present on assistant rows and
+on `system_error` notices, omitted on user rows. `reply_to_message_id`
 echoes the quote a `user` row was sent with (see the stream route's
 **Optional: quote** section) — the id of the row it quoted, always in this same
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
