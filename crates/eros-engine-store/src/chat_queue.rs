@@ -278,23 +278,33 @@ impl<'a> ChatQueueRepo<'a> {
     /// all. Split writes leave orphan states — a `failed` turn with no
     /// visible signal, or a stranded claim that gets a second signal from the
     /// reaper.
+    /// Takes neither the session nor the driving message: both come back from
+    /// the flip's own `RETURNING`, so the notice cannot be filed against a
+    /// session the message does not belong to. The foreign key only checks that
+    /// the message exists, not whose it is — reading the pair off one row makes
+    /// the mismatch unrepresentable instead of merely unlikely. It also makes
+    /// the two writes agree on a queue id that matches nothing: previously that
+    /// flipped no row and still wrote a notice.
     pub async fn mark_failed_with_notice(
         &self,
         queue_id: Uuid,
-        session_id: Uuid,
-        user_message_id: Uuid,
         error: &str,
         notice_content: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        let flipped: Option<(Uuid, Uuid)> = sqlx::query_as(
             "UPDATE engine.chat_turn_queue \
-             SET status = 'failed', last_error = $2 WHERE id = $1",
+             SET status = 'failed', last_error = $2 WHERE id = $1 \
+             RETURNING session_id, user_message_id",
         )
         .bind(queue_id)
         .bind(error)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let Some((session_id, user_message_id)) = flipped else {
+            tx.commit().await?;
+            return Ok(());
+        };
         // Bound to the turn that failed, like every assistant row. Without it a
         // client routing replies per driving message has to guess "latest user
         // row in the session", which is wrong the moment another turn arrives
@@ -886,15 +896,9 @@ mod tests {
         let repo = ChatQueueRepo { pool: &pool };
         seed_queued(&pool, session_id, user_id, "x", 10).await;
         let t = repo.claim_next().await.unwrap().unwrap();
-        repo.mark_failed_with_notice(
-            t.queue_id,
-            session_id,
-            t.user_message_id,
-            "upstream 500",
-            "出错了",
-        )
-        .await
-        .unwrap();
+        repo.mark_failed_with_notice(t.queue_id, "upstream 500", "出错了")
+            .await
+            .unwrap();
         let (status, last_error): (String, Option<String>) =
             sqlx::query_as("SELECT status, last_error FROM engine.chat_turn_queue WHERE id = $1")
                 .bind(t.queue_id)
@@ -915,6 +919,38 @@ mod tests {
         .unwrap();
         assert_eq!(notice, "出错了");
         assert_eq!(driving, Some(t.user_message_id));
+        // The notice's session and driving message come off the same queue row,
+        // so a notice can never be filed against a session its message does not
+        // belong to.
+        let notice_session: Uuid = sqlx::query_scalar(
+            "SELECT m.session_id FROM engine.chat_messages m \
+             WHERE m.id = (SELECT id FROM engine.chat_messages \
+                           WHERE session_id = $1 AND role = 'system_error')",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notice_session, session_id);
+    }
+
+    /// A queue id that matches nothing must write nothing. Before the flip
+    /// started reading its own `RETURNING`, this updated no row and still filed
+    /// a `system_error` notice.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_failed_with_notice_is_a_noop_on_an_unknown_queue_id(pool: PgPool) {
+        seed_session(&pool).await;
+        ChatQueueRepo { pool: &pool }
+            .mark_failed_with_notice(Uuid::new_v4(), "upstream 500", "出错了")
+            .await
+            .unwrap();
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.chat_messages WHERE role = 'system_error'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 0, "no queue row flipped ⇒ no notice");
     }
 
     #[sqlx::test(migrations = "./migrations")]
