@@ -1985,6 +1985,14 @@
             "format": "date-time",
             "description": "When this message reached the party it was addressed to — set by\n`POST /comp/chat/{session_id}/read` on an `assistant` row, and by the\nengine itself on a `user` row (the moment the turn handed the message to\nits first model; delivery, not that model's acknowledgement). Omitted\nwhile unread; permanently omitted on tips and voice `user` rows, which\nhave no reader. Absence means \"no receipt\", not \"not yet read\"."
           },
+          "reply_to_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The message this `user` row quoted — the `reply_to_message_id` the\ncaller sent, already validated to belong to this session, so it always\nnames another row in the same history page or an older one. Omitted on\nordinary turns and on turns whose anchor failed to resolve (there is no\nbubble to point at). Lets a cold mount re-render the quote instead of\nlosing it on refresh."
+          },
           "role": {
             "type": "string",
             "description": "\"user\" | \"assistant\" | \"gift_user\" | \"system_error\""
@@ -2332,6 +2340,14 @@
             ],
             "format": "date-time",
             "description": "When this message reached the party it was addressed to. On an\n`assistant` row: when the client called `POST /comp/chat/{id}/read` —\nthe human read it. On a `user` row: when the engine handed the message\nto the first model of the turn (\"delivered to a model\", not that\nmodel's acknowledgement). **Omitted while unread**, so a client tests\nfor the key's presence; there is no `null` form. Omitted forever on\ntips and on voice `user` rows, which have no reader — treat absence as\n\"no receipt\", never as \"not yet read\"."
+          },
+          "reply_to_message_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The message this `user` row quoted — the `reply_to_message_id` it was\nsent with, validated at send time to belong to this session. Omitted on\nordinary turns and on turns whose anchor failed to resolve (those record\n`metadata.reply_to_error`, which stays audit-only). Same key-presence\ncontract as `read_at`; the BFF history entry carries the same field."
           },
           "role": {
             "type": "string"

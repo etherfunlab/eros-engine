@@ -624,6 +624,14 @@ the image. The flag also tells a rehydrating client that a turn promised an
 image (the `image_request` SSE frame is the turn's last frame and wire-only —
 a disconnect before it fires would otherwise be undetectable from history).
 
+`reply_to_message_id` echoes the reply anchor a `user` row was sent with (see
+**Optional: reply anchor (rewind)** above): the id of the row it quoted, always
+in this same session. Same key-presence contract — omitted on ordinary turns,
+and omitted when the anchor failed to resolve, since there is no bubble to
+point at. That failure is recorded as `metadata.reply_to_error` on the row and
+stays audit-only; a client that needs to know its quote was dropped should read
+the SSE turn it sent, not history.
+
 ### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
 
 The delegated `image_request` payload for one persisted image turn — the
@@ -1267,7 +1275,11 @@ an image (omitted on every other row, never `false`) — the same key-presence
 contract and `image-request` discovery semantics as the canonical history
 route above, including the "404 on a flagged row = unrecoverable" reading.
 The `POST /bff/v1/comp/chat/start` bundle serializes history through this
-same entry shape and therefore carries the flag too. Same auth, ownership check, and
+same entry shape and therefore carries the flag too. `reply_to_message_id`
+echoes the reply anchor a `user` row was sent with (see the stream route's
+**reply anchor** section) — the id of the row it quoted, always in this same
+session; omitted on ordinary turns and on turns whose anchor failed to resolve,
+so a cold mount can re-render the quote without keeping local state. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -1280,9 +1292,10 @@ round-trip.
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…", "read_at": "…" },
     { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…", "read_at": "…" },
     { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
-    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true }
+    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true },
+    { "id": "c9d0e1f2-…", "client_msg_id": "c_def", "role": "user",      "content": "wait, about that", "sent_at": "…", "reply_to_message_id": "3cc06c53-…" }
   ],
-  "total": 4
+  "total": 5
 }
 ```
 

@@ -113,6 +113,15 @@ pub struct ChatMessageSlim {
     /// `(metadata->'image' IS NOT NULL)` so the slim query stays slim.
     /// Spec: docs/superpowers/specs/2026-08-21-image-turn-discovery-design.md.
     pub image: bool,
+    /// Reply anchor this `user` row quoted, from
+    /// `metadata->>'reply_to_message_id'` — the `chat_messages` id the caller
+    /// passed as `reply_to_message_id` on send, already validated to live in
+    /// this session. NULL on ordinary turns and on turns whose anchor failed to
+    /// resolve (those carry `metadata.reply_to_error` instead, which stays an
+    /// audit-only key). Lets a history viewer re-render the quoted bubble after
+    /// a cold mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<Uuid>,
 }
 
 pub struct ChatRepo<'a> {
@@ -375,7 +384,8 @@ impl<'a> ChatRepo<'a> {
             "SELECT id, role, content, sent_at, client_msg_id, \
                     (metadata->>'tips_amount_usd')::float8 AS tips_amount_usd, \
                     channel, read_at, \
-                    (metadata->'image' IS NOT NULL) AS image \
+                    (metadata->'image' IS NOT NULL) AS image, \
+                    (metadata->>'reply_to_message_id')::uuid AS reply_to_message_id \
              FROM engine.chat_messages \
              WHERE session_id = $1 \
              ORDER BY sent_at DESC \

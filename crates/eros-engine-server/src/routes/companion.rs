@@ -142,6 +142,13 @@ pub struct ChatHistoryEntry {
     /// never recorded (fail-open audit) — genuinely unrecoverable.
     #[serde(skip_serializing_if = "is_false")]
     pub image: bool,
+    /// The message this `user` row quoted — the `reply_to_message_id` it was
+    /// sent with, validated at send time to belong to this session. Omitted on
+    /// ordinary turns and on turns whose anchor failed to resolve (those record
+    /// `metadata.reply_to_error`, which stays audit-only). Same key-presence
+    /// contract as `read_at`; the BFF history entry carries the same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -758,6 +765,12 @@ async fn get_history(
         .map(|m| ChatHistoryEntry {
             id: m.id,
             image: m.metadata.as_ref().and_then(|md| md.get("image")).is_some(),
+            reply_to_message_id: m
+                .metadata
+                .as_ref()
+                .and_then(|md| md.get("reply_to_message_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok()),
             role: m.role,
             content: m.content,
             sent_at: m.sent_at,
@@ -2491,6 +2504,76 @@ mod tests {
             messages[1]
         );
         assert_eq!(messages[2]["image"], true, "image turn is flagged");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn history_carries_the_reply_anchor_of_quoted_turns(pool: PgPool) {
+        // The send path records the resolved anchor on the user row's
+        // `metadata.reply_to_message_id`; history hands it back so a client can
+        // re-render the quote. An anchor that failed to resolve leaves only
+        // `reply_to_error`, which is audit-only and never surfaced.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Nova").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let anchor: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'the earlier plan', now() - interval '3 seconds') RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'wait, about that', \
+                     jsonb_build_object('reply_to_message_id', $2::text), \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'stale quote', \
+                     '{\"reply_to_error\": \"not_found\"}'::jsonb, \
+                     now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .bind(anchor)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let jwt = mint_test_jwt(user_id);
+        let mut router = build_router(test_state(pool.clone()));
+
+        let (status, body) = send_request(
+            &mut router,
+            Request::builder()
+                .uri(format!("/comp/chat/{session_id}/history"))
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[0].get("reply_to_message_id").is_none(),
+            "an ordinary row omits the key: {}",
+            messages[0]
+        );
+        assert_eq!(
+            messages[1]["reply_to_message_id"],
+            anchor.to_string(),
+            "the quoting row echoes its anchor: {}",
+            messages[1]
+        );
+        assert!(
+            messages[2].get("reply_to_message_id").is_none(),
+            "an unresolved anchor has no bubble to point at: {}",
+            messages[2]
+        );
+        assert!(
+            messages[2].get("reply_to_error").is_none(),
+            "reply_to_error stays audit-only: {}",
+            messages[2]
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

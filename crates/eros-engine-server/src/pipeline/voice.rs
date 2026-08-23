@@ -975,6 +975,7 @@ mod tests {
             channel: None,
             read_at: None,
             image: false,
+            reply_to_message_id: None,
         }
     }
 
