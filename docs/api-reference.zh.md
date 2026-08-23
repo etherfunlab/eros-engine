@@ -417,8 +417,8 @@ stream 客户端——事后可通过
 跑同一条生成管线，回复落在 `engine.chat_messages`，从历史接口或 Supabase
 Realtime 读取。
 
-改名前的路径 `POST /v2/comp/chat/{session_id}/message/async` 已在 1.6.0 移除，现在返回 404
-——见 [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md)。
+改名前的路径 `POST /v2/comp/chat/{session_id}/message/async` 已在 1.6.0 移除，现在返回 404（带有效 bearer 时；`require_auth`
+仍先于路由匹配返回 401）——见 [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md)。
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \

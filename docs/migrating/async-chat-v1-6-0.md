@@ -7,10 +7,12 @@
 original spelling of the enqueue-only chat turn shipped in `v1.5.0` — is gone.
 It was renamed to `POST /v2/comp/session/{session_id}/message/async` under the
 v2 path convention (`session` is the entity the id belongs to; `chat` is not an
-entity), and the old path is no longer registered: it now returns **404**.
+entity), and the old path is no longer registered: an authenticated request to it now
+returns **404** (an unauthenticated one still gets `require_auth`'s **401**,
+as on every `comp` path).
 
 **If you do nothing, every async send fails.** The engine does not fall back;
-a 404 on this path is the whole symptom.
+a 404 on this path with a valid bearer is the whole symptom.
 
 **Fix:** replace the `chat` segment with `session` in the URL. Nothing else
 changes — request body (`StreamSendRequest`), auth, idempotency on

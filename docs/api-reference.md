@@ -488,7 +488,7 @@ drives the same generation pipeline and the reply lands in
 `engine.chat_messages`, picked up via the history route or Supabase
 Realtime.
 
-The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s — see [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md).
+The pre-rename path `POST /v2/comp/chat/{session_id}/message/async` was removed in 1.6.0 and now 404s (for an authenticated request; `require_auth` still 401s first) — see [`docs/migrating/async-chat-v1-6-0.md`](migrating/async-chat-v1-6-0.md).
 
 ```bash
 curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
