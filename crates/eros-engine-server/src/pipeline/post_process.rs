@@ -1976,7 +1976,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
         // Only `user` is taken; session_id/metadata are ignored by design.
         assert_eq!(client_id_from_event(&event).as_deref(), Some("u_abc"));
@@ -1993,7 +1993,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
         assert_eq!(client_id_from_event(&event), None);
     }
@@ -3147,7 +3147,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
 
         // Mirrors what `pde::decide` would compute for a short user message
@@ -3308,7 +3308,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3438,7 +3438,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyImage,
@@ -3968,7 +3968,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             tips_amount_usd: None,
-            history_anchor: Default::default(),
+            quote: Default::default(),
         };
         let plan = ActionPlan {
             action_type: ActionType::ReplyText,

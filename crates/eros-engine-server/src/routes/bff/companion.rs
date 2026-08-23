@@ -66,6 +66,21 @@ pub struct BffHistoryEntry {
     /// docs/superpowers/specs/2026-08-21-image-turn-discovery-design.md.
     #[serde(skip_serializing_if = "is_false")]
     pub image: bool,
+    /// The message this `user` row quoted — the `reply_to_message_id` the
+    /// caller sent, already validated to belong to this session, so it always
+    /// names another row in the same history page or an older one. Omitted on
+    /// ordinary turns and on turns whose anchor failed to resolve (there is no
+    /// bubble to point at). Lets a cold mount re-render the quote instead of
+    /// losing it on refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<Uuid>,
+}
+
+/// Parse the raw `metadata->>'reply_to_message_id'` text the slim projection
+/// carries. Anything that is not a UUID is dropped rather than surfaced — the
+/// column is unconstrained JSONB, and one bad row must not fail the page.
+fn parse_anchor(raw: Option<String>) -> Option<Uuid> {
+    raw.and_then(|s| Uuid::parse_str(&s).ok())
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -170,6 +185,7 @@ async fn bff_get_history(
             channel: r.channel,
             read_at: r.read_at,
             image: r.image,
+            reply_to_message_id: parse_anchor(r.reply_to_message_id),
         })
         .collect();
     let total = messages.len();
@@ -229,6 +245,7 @@ async fn bff_start_chat(
                 channel: r.channel,
                 read_at: r.read_at,
                 image: r.image,
+                reply_to_message_id: parse_anchor(r.reply_to_message_id),
             })
             .collect()
     };
@@ -784,6 +801,134 @@ mod tests {
             assert!(
                 m.get("prompt_traits").is_none(),
                 "BFF must not surface prompt_traits from metadata; got {m}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_exposes_reply_to_message_id_on_quoted_rows(pool: PgPool) {
+        // The anchor is written by the send path onto the user row's
+        // `metadata.reply_to_message_id`; history must hand it back so a cold
+        // mount can re-render the quote. A turn whose anchor failed to resolve
+        // carries `reply_to_error` instead — audit-only, never surfaced.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        let anchor: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'the earlier plan', now() - interval '3 seconds') \
+             RETURNING id",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'wait, about that', \
+                     jsonb_build_object('reply_to_message_id', $2::text), \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'stale quote', \
+                     '{\"reply_to_error\": \"not_found\"}'::jsonb, \
+                     now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .bind(anchor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+
+        let quoting = messages
+            .iter()
+            .find(|m| m["content"] == "wait, about that")
+            .expect("quoting row");
+        assert_eq!(
+            quoting["reply_to_message_id"],
+            json!(anchor.to_string()),
+            "the quoting row must carry its anchor; got {quoting}"
+        );
+
+        let anchored = messages
+            .iter()
+            .find(|m| m["content"] == "the earlier plan")
+            .expect("anchor row");
+        assert!(
+            anchored.get("reply_to_message_id").is_none(),
+            "an ordinary row must omit reply_to_message_id; got {anchored}"
+        );
+
+        let failed = messages
+            .iter()
+            .find(|m| m["content"] == "stale quote")
+            .expect("failed-anchor row");
+        assert!(
+            failed.get("reply_to_message_id").is_none(),
+            "an unresolved anchor has no bubble to point at; got {failed}"
+        );
+        assert!(
+            failed.get("reply_to_error").is_none(),
+            "reply_to_error stays audit-only; got {failed}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn bff_history_survives_a_malformed_reply_anchor(pool: PgPool) {
+        // `metadata` is unconstrained JSONB. A `::uuid` cast in the projection
+        // would fail the WHOLE page on one bad value; the anchor is carried as
+        // text and parsed per row instead, so a junk value costs its own key
+        // and nothing else.
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+
+        sqlx::query(
+            "INSERT INTO engine.chat_messages \
+                 (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'junk string', \
+                     '{\"reply_to_message_id\": \"not-a-uuid\"}'::jsonb, \
+                     now() - interval '3 seconds'),
+                    ($1, 'user', 'junk number', \
+                     '{\"reply_to_message_id\": 42}'::jsonb, \
+                     now() - interval '2 seconds'),
+                    ($1, 'user', 'json null', \
+                     '{\"reply_to_message_id\": null}'::jsonb, \
+                     now() - interval '1 second')",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool);
+        let mut app = build_router(state);
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) =
+            send_request(&mut app, bff_history_request(&token, session_id, "")).await;
+        assert_eq!(status, StatusCode::OK, "the page still renders: {body}");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3, "every row survives: {body}");
+        for m in messages {
+            assert!(
+                m.get("reply_to_message_id").is_none(),
+                "an unparseable anchor is dropped, not surfaced; got {m}"
             );
         }
     }

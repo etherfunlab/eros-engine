@@ -25,7 +25,7 @@ use crate::routes::companion::{
     validate_llm_audit, validate_prompt_traits, LlmAuditDto, PromptTraitDto,
 };
 use crate::routes::companion_stream::{
-    build_user_row_metadata, persisted_content_role, resolve_history_anchor, resolve_text_turn,
+    build_user_row_metadata, persisted_content_role, resolve_quote, resolve_text_turn,
     validate_image_capability, validate_payload, AffinityScopeDto, ImageReplyParams,
     StreamPreErrorBody, StreamSendRequest,
 };
@@ -130,9 +130,8 @@ pub async fn send_message_async(
     let (_session, _persona, _instance_id) = resolve_text_turn(&state, session_id, user_id).await?;
 
     let chat_repo = ChatRepo { pool: &state.pool };
-    let history_anchor =
-        resolve_history_anchor(&chat_repo, session_id, req.reply_to_message_id).await?;
-    let persisted_metadata = build_user_row_metadata(&req, &history_anchor);
+    let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
+    let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
     let (persisted_content, persisted_role) = persisted_content_role(&req);
 
     let params = serde_json::to_value(QueuedTurnParams {

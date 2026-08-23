@@ -265,13 +265,17 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
   http://localhost:8080/comp/chat/<session_id>/message/stream
 ```
 
-**可选：回复锚点（回卷）。** 请求体可附加 `reply_to_message_id` ——
-本 session 内某条 `chat_messages` 行的 UUID，把本轮上下文锚定到那条消息。
-解析成功时，历史回卷到（且包含）那条消息：晚于它发送的行不进入 prompt，
-锚点记录在落库的用户行的 `metadata.reply_to_message_id` 上。传了但解析
-不到（id 不存在，或属于别的 session）不会让请求失败——本轮丢弃历史
-（上下文里只剩当前这条消息），并在该行的 `metadata.reply_to_error` 写入
-`"not_found"`。省略该字段即为正常的最新历史行为。
+**可选：引用。** 请求体可附加 `reply_to_message_id` —— 本 session 内某条
+`chat_messages` 行的 UUID，表示这一轮是在回复那条消息。解析成功时，被引用
+那句会以 `[quote]` 块进入回复 prompt（原文、是角色还是用户说的、以及多久
+之前说的），锚点记录在落库的用户行的 `metadata.reply_to_message_id` 上，
+两条 history 路由都从那里回显。
+
+**引用只是指向一句话，不回卷对话。** 带不带引用，历史窗口都是同样的最新
+N 条，所以引用上周的某句话不会让模型丢掉这期间说过的任何内容。传了但解析
+不到（id 不存在，或属于别的 session）同样不会让请求失败、也不改变上下文：
+这一轮只是没有 `[quote]` 块，并在该行的 `metadata.reply_to_error` 写入
+`"not_found"`。
 
 ```bash
 curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -537,6 +541,12 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 composed prompt 当时就没记下来——真的取不回来了，应当如实呈现，而不是把图
 静默丢掉。这个标记同时让重连的客户端知道某一轮承诺过一张图（`image_request`
 SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 history 本来无从察觉）。
+
+`reply_to_message_id` 回显 `user` 行发送时带的引用（见上面**可选：引用**）：
+它引用的那条消息的 id，一定在同一个 session 里。键出现即为真的
+约定同上——普通轮次省略；锚点没解析成功的轮次也省略，因为没有可指的气泡。
+那次失败以 `metadata.reply_to_error` 记在行上，只供审计；客户端要知道自己的
+引用被丢掉了，应当看它发出那一轮的 SSE，而不是翻 history。
 
 ### `GET /comp/chat/{session_id}/messages/{message_id}/image-request`
 
@@ -1115,6 +1125,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 连同「带标记的行 404 = 真的取不回来」的读法，都与上面 canonical history
 一节相同。`POST /bff/v1/comp/chat/start` 打包的历史走的是同一个条目形状，
 所以同样带这个标记。
+`reply_to_message_id` 回显 `user` 行发送时带的引用（见 stream 路由的**可选：引用**
+一节）——它引用的那条消息的 id，一定在同一个 session 里；
+普通轮次、以及锚点没解析成功的轮次都省略该字段，这样冷启动不必自己存状态
+就能把引用重新渲染出来。
 鑒權、ownership 檢查、`limit ∈ [1, 50]` 夾取
 都與 canonical history 路由相同。**刻意差異：** 默認 `limit` 是 50
 （canonical 默認 20），因為 BFF 是為「冷啟動一次拉一整屏 backscroll」設計的。
@@ -1126,9 +1140,10 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
     { "id": "3cc06c53-…", "client_msg_id": "c_abc", "role": "user",      "content": "alpha", "sent_at": "…" },
     { "id": "9f2e7a10-…", "client_msg_id": null,    "role": "assistant", "content": "beta",  "sent_at": "…" },
     { "id": "a1b2c3d4-…", "client_msg_id": null,    "role": "assistant", "content": "gamma", "sent_at": "…", "channel": "product_qa" },
-    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true }
+    { "id": "b5c6d7e8-…", "client_msg_id": null,    "role": "assistant", "content": "",      "sent_at": "…", "image": true },
+    { "id": "c9d0e1f2-…", "client_msg_id": "c_def", "role": "user",      "content": "wait, about that", "sent_at": "…", "reply_to_message_id": "3cc06c53-…" }
   ],
-  "total": 4
+  "total": 5
 }
 ```
 

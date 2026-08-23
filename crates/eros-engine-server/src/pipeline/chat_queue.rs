@@ -309,20 +309,21 @@ async fn drive_turn(
         crate::routes::companion::validate_llm_audit(params.audit.clone()).unwrap_or_default();
 
     // Spec §9: an older-than-latest driving message must see everything that
-    // landed after it — HistoryAnchor::Latest is exactly "the most recent
-    // window as of now". reply_to quotes still anchor explicitly.
-    let history_anchor = match params.reply_to_message_id {
-        None => eros_engine_core::types::HistoryAnchor::Latest,
+    // landed after it, so history is always the most recent window. A quote
+    // only adds the [quote] block on top of it.
+    let quote = match params.reply_to_message_id {
+        None => None,
         Some(id) => match chat_repo
-            .message_sent_at_in_session(turn.session_id, id)
+            .message_by_id_in_session(turn.session_id, id)
             .await
         {
-            Ok(Some(sent_at)) => eros_engine_core::types::HistoryAnchor::At {
-                message_id: id,
-                sent_at,
-            },
-            Ok(None) => eros_engine_core::types::HistoryAnchor::DropHistory,
-            Err(e) => return TurnOutcome::Failure(format!("anchor resolve failed: {e}")),
+            Ok(row) => row.map(|m| eros_engine_core::types::QuotedMessage {
+                message_id: m.id,
+                role: m.role,
+                content: m.content,
+                sent_at: m.sent_at,
+            }),
+            Err(e) => return TurnOutcome::Failure(format!("quote resolve failed: {e}")),
         },
     };
 
@@ -344,7 +345,7 @@ async fn drive_turn(
         tips_amount_usd: params.tips_amount_usd,
         image_url: params.image_url.clone(),
         image: params.image.clone(),
-        history_anchor,
+        quote,
     };
 
     drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap).await
