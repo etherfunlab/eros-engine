@@ -84,7 +84,11 @@ OPENROUTER_USAGE_HIDDEN_KEYS=cost,cost_details
 - 未设或空 → 维持现状（完整透传）。
 
 后台路径（`pipeline::dreaming`、`pipeline::post_process`、
-`pipeline::world`、`pipeline::story`）的 usage 只通过 `tracing::info!` 字段输出：
+`pipeline::world`、`pipeline::story`）从不把这三个字段返回给 client——它们本来
+就没有 client 连着。它们真正产出的是：`pipeline::record_generation` 打的、
+与其它所有调用点相同的那行 `tracing::info!`，外加——自 migration `0059`
+起——`engine.llm_generations` 里的一行记录；见下面的
+[LLM 生成记录表](#llm-生成记录表)。
 
 ```
 openrouter: call completed session=… generation_id=… model=…
@@ -94,23 +98,101 @@ prompt_tokens=… completion_tokens=… total_tokens=… cost=…
 - `world_director` —— World Memories 导演清扫（后台）。每个已加入的 owner 每
   `interval_hours` 调一次。`user` = `11111111-1111-1111-1111-111111111112`
   （world 子系统哨兵，与 dreaming 的 `11111111-1111-1111-1111-111111111111`
-  不同）。Usage/cost 通过 tracing 字段输出，走
-  `log_openrouter_usage("world_director", None, …)`；不出现在任何 client 帧上。
+  不同）。落库时 `task = "world_director"`；不出现在任何 client 帧上。
 - `world_comment` —— World Town 每小时评论轮（后台）。每个有新动态的 owner
   批量调一次。`user` = `11111111-1111-1111-1111-111111111112`（world 子系统
-  共享哨兵）。Usage/cost 通过 tracing 字段输出，走
-  `log_openrouter_usage("world_comment", None, …)`；不出现在任何 client 帧上。
+  共享哨兵）。落库时 `task = "world_comment"`；不出现在任何 client 帧上。
 - `world_reply` —— World Town 回复响应器（后台）。每条经防抖的用户留言调一
-  次，按 owner 每 UTC 自然日封顶。同一个哨兵 user；usage/cost 通过 tracing
-  字段输出，走 `log_openrouter_usage("world_reply", None, …)`；不出现在任何
-  client 帧上。
+  次，按 owner 每 UTC 自然日封顶。同一个哨兵 user；落库时
+  `task = "world_reply"`；不出现在任何 client 帧上。
 - `world_stories_director` —— World Stories 导演（后台），模块
   `pipeline::story`。作为 `world_director` 同一个 sweeper tick 的第二阶段
   运行；每个被认领的 persona instance 按自己的 `interval_hours` 调一次。
   `user` = `11111111-1111-1111-1111-111111111113`（story 子系统哨兵，延续
-  dreaming/world 的序列）。Usage/cost 通过 tracing 字段输出，走
-  `log_openrouter_usage("world_stories_director", None, …)`；不出现在任何
-  client 帧上。
+  dreaming/world 的序列）。落库时 `task = "world_stories_director"`；不出现在
+  任何 client 帧上。
+
+## LLM 生成记录表
+
+Migration `0059` 新增 `engine.llm_generations`：每一次**可计费的 LLM
+生成**一行——「可计费」指 provider 返回了 `generation_id` 的那次响应，这正是
+provider 计费的单位，也是它自己日志暴露的单位：
+
+```sql
+CREATE TABLE engine.llm_generations (
+    generation_id TEXT PRIMARY KEY,
+    session_id    UUID REFERENCES engine.chat_sessions(id) ON DELETE SET NULL,
+    task          TEXT NOT NULL,
+    model         TEXT,
+    usage         JSONB,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`pipeline::record_generation` 在引擎里的每一个 LLM 调用点写这一行，取代了旧的
+`log_openrouter_usage`。它仍然打出上面那行完全相同的 `openrouter: call
+completed` tracing——落库是额外加的，不是取代那行日志。
+
+**完整的任务词表。** 每一个会发起 chat-completion 调用的 `[tasks.*]` key
+现在都会写这张表：`chat_companion`、`chat_voice`、`chat_product_qa`、
+`chat_input_filter`、`chat_output_filter`、`chat_vision`、
+`chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
+`affinity_evaluation`、`insight_extraction`、`insight_structuring`、
+`character_insight_extraction`、`character_insight_structuring`、
+`user_insight_extraction`、`user_insight_structuring`、`memory_extraction`、
+`world_director`、`world_stories_director`、`world_comment`、`world_reply`。
+
+**其中五个此前在数据库里完全没有留下任何痕迹**——`world_director`、
+`world_stories_director`、`world_comment`、`world_reply`、
+`memory_extraction`。`engine.llm_generations` 现在是它们唯一的记录。
+
+### 怎么读
+
+`usage` 落库是**未过滤**的，`cost` 也在里面。`OPENROUTER_USAGE_HIDDEN_KEYS`
+只在返回给 client 的那份上剔除 key（见上文）；数据库里的这份从来就是完整的，
+以后也一直是。
+
+按任务统计某个时间窗口的花费：
+
+```sql
+SELECT task,
+       count(*)                       AS calls,
+       sum((usage->>'cost')::numeric) AS cost
+FROM engine.llm_generations
+WHERE created_at >= now() - interval '7 days'
+GROUP BY task ORDER BY cost DESC;
+```
+
+### 失败语义：fail-open
+
+父行写入失败时——最常见的原因是 `session_id` 已经解析不出来了——helper 打一条
+`warn!`，返回 `None`，而不是让这一轮失败。调用方把这个 `None` 存进自己那个子表
+的 `generation_id` 列，值为 `NULL`，回复照常送达，跟审计写入成功时一模一样。
+**对那一次调用而言，上面那行 tracing 和 provider 自己的日志，就是仅剩的
+记录**——审计行就这么没了。
+
+### 还没有外键
+
+**子表的 `generation_id` 列——`chat_messages`、`companion_affinity_events`、
+`companion_insights_events`、`companion_decision_events`、
+`chat_images_events`、`chat_vision_events`、`character_insights_events`、
+`user_insights_events`——目前都不引用这张表。** 现在还不能加：`fly.toml` 在
+流量切到新机器之前就跑 `migrate`，如果外键跟这条写入路径同一个 release 上线，
+仍在服务真实流量的旧机器写子行时就会撞上约束。之后的 release 会连同一次历史
+数据回填一起把外键补上。在那之前，两边在实践中对得上，但没有约束保证——不要
+从这份文档读出「这个关联今天已经强制生效」的结论。
+
+### 两个已知的局限
+
+**一条走了好几个 fallback 模型的链路，一轮可能写出好几行。** 每一个拿到过
+`generation_id` 的候选响应都单独落一行，不管它的内容最终有没有被采用——
+每一个都单独计过费，所以每一个都是这张表要记的单位。
+
+**语音和 product-QA 这两条链只记被采用的那次尝试。** 两者都在每个候选开始时
+把手上的 `generation_id` 清空，等候选循环结束后才调用一次
+`record_generation`，用的是被采用的那次尝试留下的值。一个已经流式返回、
+已经计费的候选，如果链路随后换到了下一个模型，就不会留下任何一行。主聊天链路
+是在逐候选循环内部记录的，没有这个缺口。
 
 ## App-attribution headers
 
@@ -172,7 +254,11 @@ material 会直接拒绝加载，而不是像以前那样在构造时 warn-and-d
   `existing_insights` 上下文现在是从 `human_insights` 反向投影出来的（不再是
   已废弃的 JSONB blob），LLM 吐出的任何 schema 之外的 key 仍然会进事件
   payload，但不会落在其它任何地方——以后做 events↔store 对账时，要按
-  payload key 与 `human_insights` 列集合的交集比较，不能直接判等。
+  payload key 与 `human_insights` 列集合的交集比较，不能直接判等。自
+  migration `0059` 起，上面这些调用——加上 `chat_voice`、`chat_product_qa`、
+  `chat_input_filter`、`chat_output_filter`，以及此前一行都不写的那五个
+  后台 sweeper——现在也都会在 `engine.llm_generations` 里各落一行；见上面的
+  [LLM 生成记录表](#llm-生成记录表)。
 - **不 hash。**引擎不会变换 `user` —— caller 负责送 hash。
 - **不消毒。**`metadata` 的 key / value 只检查 size / shape，不查内容。
 - **不解读。**引擎不会按 audit 字段分组、聚合、报警。Caller 自己接。
@@ -491,13 +577,14 @@ CHECK 里——事后收窄 CHECK 要过一次 migration，而这个仓库的一
 
 ## 可观测性
 
-除了主聊天回复（`chat_companion`）和语音回合（`chat_voice`）之外，每次
-成功的 OpenRouter 调用，引擎都会打一条 info 级别日志，带
-`generation_id` / `model` 以及 best-effort 解析出来的 token / cost。这
-两个调用量最大的任务不走这条日志——它们各自的 per-attempt 日志是一条
-`stream_metrics` 事件（`model` / `attempt` / `ttft_ms` / `total_ms` /
-`outcome`），没有 `generation_id` 也没有 cost 明细。`audit` 对象本身
-不写入日志——它只转发给上游，从不回写进引擎日志。
+`record_generation`——引擎里每一个 LLM 调用点都会走它——会打一条 info 级别的
+`openrouter: call completed` 日志，带 `generation_id` / `model` 以及
+best-effort 解析出来的 token / cost，并把同样的事实落成一行（见上面的
+[LLM 生成记录表](#llm-生成记录表)）。`chat_companion` 和 `chat_voice`
+这两个调用量最大的任务，额外还有一条 per-attempt 的 `stream_metrics` 事件
+（`model` / `attempt` / `ttft_ms` / `total_ms` / `outcome`），是其它任务没有
+的——那条日志说的是单次尝试的流式耗时，不是生成身份，比这张表出现得更早。
+`audit` 对象本身不写入日志——它只转发给上游，从不回写进引擎日志。
 
 ## 为什么不持久化？
 

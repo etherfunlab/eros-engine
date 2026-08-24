@@ -352,12 +352,16 @@ re-enrolling resumes the same world/life.
 
 ## Audit & cost
 
-The three World Memories / Town tasks log token usage as tracing fields via
-the shared world sentinel user `11111111-1111-1111-1111-111111111112`;
-`world_stories_director` logs under its own sentinel
-`11111111-1111-1111-1111-111111111113` (dreaming = `…111`, world = `…112`,
-stories = `…113` — per-subsystem spend attribution; see
-[LLM / OpenRouter audit](llm-audit.md)). Steady-state cost per enrolled owner
+The three World Memories / Town tasks tag every call with the shared world
+sentinel user `11111111-1111-1111-1111-111111111112`; `world_stories_director`
+tags its own calls with sentinel `11111111-1111-1111-1111-111111111113`
+(dreaming = `…111`, world = `…112`, stories = `…113` — per-subsystem spend
+attribution). Since migration `0059`, all four also write one row per call to
+`engine.llm_generations` (`task = world_director` / `world_stories_director` /
+`world_comment` / `world_reply`), in addition to the `openrouter: call
+completed` tracing line — previously they left no database trace at all. See
+[LLM / OpenRouter audit → LLM generations
+ledger](llm-audit.md#llm-generations-ledger). Steady-state cost per enrolled owner
 **with a worldview** per day is bounded by: 1 director call + at most
 `24h/round_secs` comment rounds (only those with activity) + at most
 `daily_cap` replies + up to `24h/interval_hours` story calls per

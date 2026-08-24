@@ -309,11 +309,16 @@ context_days = 7            # 每轮喂给导演的聊天/亲密度证据窗口
 
 ## 审计与成本
 
-World Memories / Town 三个任务都以共享的世界哨兵用户
-`11111111-1111-1111-1111-111111111112` 把 token 用量记为 tracing 字段；
-`world_stories_director` 用自己的哨兵 `11111111-1111-1111-1111-111111111113`
-（dreaming = `…111`、world = `…112`、stories = `…113`——按子系统分摊花费；见
-[LLM / OpenRouter 审计](llm-audit.zh.md)）。稳态下每个**已配置世界观**的
+World Memories / Town 三个任务都用共享的世界哨兵用户
+`11111111-1111-1111-1111-111111111112` 标记每次调用；`world_stories_director`
+用自己的哨兵 `11111111-1111-1111-1111-111111111113`（dreaming = `…111`、
+world = `…112`、stories = `…113`——按子系统分摊花费）。自 migration `0059`
+起，这四个任务的每次调用也都会在 `engine.llm_generations` 里各落一行
+（`task = world_director` / `world_stories_director` / `world_comment` /
+`world_reply`），在 `openrouter: call completed` 这行 tracing 之外——此前它们
+在数据库里完全没有留下任何痕迹。见
+[LLM / OpenRouter 审计 → LLM 生成记录表](llm-audit.zh.md#llm-生成记录表)。
+稳态下每个**已配置世界观**的
 注册 owner 每天的成本上界是：1 次导演调用 + 至多 `24h/round_secs` 次评论轮
 （且只有有活动的那些）+ 至多 `daily_cap` 条回复 + 每个**近期有聊天的**
 instance 至多 `24h/interval_hours` 次故事回合——没人碰的世界依然恰好只花
