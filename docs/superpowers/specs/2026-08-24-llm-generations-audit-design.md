@@ -352,20 +352,40 @@ forward only.
 
 ## 5. Reading it
 
-Cost per task for a window:
+Cost per task for a window. **Never sum `cost` without reporting how many
+rows carried one** — the reason is below the query, and it is not a detail:
 
 ```sql
 SELECT task,
        count(*)                                  AS calls,
-       sum((usage->>'cost')::numeric)            AS cost
+       count(*) FILTER (WHERE usage ? 'cost')    AS priced,
+       sum((usage->>'cost')::numeric)            AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
-GROUP BY task ORDER BY cost DESC;
+GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
 
 `usage` is stored **unfiltered**, including `cost`. `OPENROUTER_USAGE_HIDDEN_KEYS`
 strips keys on the way out to clients only; the database has always kept the
 whole object and continues to.
+
+**`cost` is a provider-dependent key, not a guaranteed one.** OpenRouter
+returns it; Venice direct does not put it in `usage` at all. Measured on
+production 22 minutes after 1.6.1 went live: 44 of 204 rows carried a `cost`
+(21.6%), with 160 rows served by Venice direct.
+
+`priced` is what makes the number readable. A task served entirely by Venice
+sums to `NULL`, which is honest. **The dangerous case is a mixed task**: at
+that measurement `chat_companion` ran on both `deepseek/deepseek-v4-flash-0731`
+(OpenRouter, priced) and `gemma-4-uncensored@venice` (unpriced), so a bare
+`sum(cost)` returned a plausible figure covering 18 of its 27 calls. A number
+that looks like a total and is two thirds of one is worse than a `NULL`.
+
+Deriving the missing cost from tokens and a price table is deliberately **not**
+done: it would make the engine a second authority on what a call cost, and
+that table drifts against the provider's real pricing with no signal. The
+provider's own dashboard remains the authority for unpriced rows; this table's
+job is to tell you which rows those are.
 
 ## 6. Failure semantics — fail-open, and what it costs
 

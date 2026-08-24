@@ -148,20 +148,36 @@ completed` tracing——落库是额外加的，不是取代那行日志。
 
 ### 怎么读
 
-`usage` 落库是**未过滤**的，`cost` 也在里面。`OPENROUTER_USAGE_HIDDEN_KEYS`
-只在返回给 client 的那份上剔除 key（见上文）；数据库里的这份从来就是完整的，
-以后也一直是。
+`usage` 落库是**未过滤**的，供应商发了什么就存什么，`cost` 在的话也一并存下。
+`OPENROUTER_USAGE_HIDDEN_KEYS` 只在返回给 client 的那份上剔除 key（见上文）；
+数据库里的这份从来就是完整的，以后也一直是。
 
-按任务统计某个时间窗口的花费：
+按任务统计某个时间窗口的花费。**求 `cost` 的和时，必须同时数出有多少行真的
+带了这个键：**
 
 ```sql
 SELECT task,
-       count(*)                       AS calls,
-       sum((usage->>'cost')::numeric) AS cost
+       count(*)                                AS calls,
+       count(*) FILTER (WHERE usage ? 'cost')  AS priced,
+       sum((usage->>'cost')::numeric)          AS cost_of_priced
 FROM engine.llm_generations
 WHERE created_at >= now() - interval '7 days'
-GROUP BY task ORDER BY cost DESC;
+GROUP BY task ORDER BY cost_of_priced DESC NULLS LAST;
 ```
+
+**`cost` 是取决于供应商的键，不是保证有的。** OpenRouter 会在 `usage` 里返回
+它，Venice 直连则完全不发这个键。同时用了两者的部署——参考部署就是——只有一部分
+行带 `cost`。
+
+`priced` 是让这个和能读的那一列。整条链路都跑在不带价的供应商上的 task，和是
+`NULL`，这很诚实、也一眼看得出。有坑的是**混合**的 task：一个 `[tasks.*]` 的主
+模型带价、fallback 不带价，那么它会给出一个看着挺像样的总额，实际只覆盖了一部分
+调用。先看 `priced / calls`，再决定信不信 `cost_of_priced`。
+
+engine 不会拿 token 数乘一张价格表去折算缺失的成本。那等于让 engine 成为「这次
+调用花了多少钱」的第二个权威来源，而那张表会跟供应商的真实定价漂移，且漂了没有
+任何信号。不带价的那些行，权威在供应商自己的后台，`generation_id` 就是 join
+过去的那把键——这正是这张表存在的意义。
 
 ### 失败语义：fail-open
 
