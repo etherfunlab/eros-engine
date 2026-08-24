@@ -1625,17 +1625,6 @@ fn filter_output_invalidity(text: &str, finish_reason: Option<&str>) -> Option<&
 /// Per-model timeout for a single filter LLM call.
 pub(crate) const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Cap on a single audit-table INSERT (`chat_images_events` /
-/// `chat_vision_events`). Fail-open already covers a write that errors —
-/// this bounds one that stalls instead: a saturated pool or a wedged
-/// connection must not delay the turn's own response (the image marker, the
-/// endpoint's JSON body, the pre-stream 502, the terminal SSE frame) behind
-/// an await that never returns. Deliberately much shorter than
-/// `FILTER_TIMEOUT`: this is one local Postgres round trip, not a
-/// network LLM call, so a generous LLM-sized budget would hide exactly the
-/// stall this timeout exists to bound.
-pub(crate) const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// `[tasks.*]` key the out-of-character product-answer executor serves. Stamped
 /// on every failure that executor records, so one `chat_messages` row says which
 /// chain broke without the reader inferring it from `channel`.
@@ -3117,7 +3106,7 @@ pub(crate) async fn record_compose_event(
     ev: eros_engine_store::image_events::ImageComposeEventInsert<'_>,
 ) -> Option<uuid::Uuid> {
     let repo = eros_engine_store::image_events::ImageComposeEventRepo { pool };
-    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, repo.record(ev)).await {
+    match tokio::time::timeout(super::AUDIT_WRITE_TIMEOUT, repo.record(ev)).await {
         Ok(Ok(id)) => Some(id),
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "chat_images_events: audit write failed");
@@ -4863,7 +4852,7 @@ pub fn run_stream(
                         // not detached, so write ordering holds — only
                         // bounded.
                         match tokio::time::timeout(
-                            AUDIT_WRITE_TIMEOUT,
+                            super::AUDIT_WRITE_TIMEOUT,
                             repo.record(eros_engine_store::image_events::ChatVisionEventInsert {
                                 llm_attempts: vision_attempts,
                                 gateway_errors: vision_gateways,

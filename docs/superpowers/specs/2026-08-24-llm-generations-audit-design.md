@@ -407,6 +407,19 @@ already a hundredfold margin, and the worst case falls to 2 s per turn. One
 constant — no per-turn budget object, no shared deadline threaded through the
 call sites.
 
+**"One constant" is literal.** The repo carried two, same name, sibling
+modules: `pipeline/mod.rs` at 2 s for `llm_generations`, and
+`pipeline/stream.rs` at 3 s for `chat_images_events` / `chat_vision_events`,
+the latter predating this work. Changing only one would have widened the
+split to 0.5 s against 3 s. All three are the same operation — a single-row
+fail-open INSERT into the same database — so `stream.rs`'s copy is deleted
+and its two call sites read `super::AUDIT_WRITE_TIMEOUT`. The image and
+vision writes come down from 3 s with the same argument, and the same
+consequence when they trip: one telemetry row lost, never a turn.
+
+The timed-out `warn!` also switches from `timeout_secs` to `timeout_ms` —
+`Duration::as_secs()` on 500 ms logs `0`.
+
 **Land it before Release A reaches production, if the ordering allows.** The
 8 s exposure was introduced by 1.6.1, which is tagged but not deployed, so it
 has never run against real traffic. Shipping the constant in whatever build
