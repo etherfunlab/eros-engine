@@ -1,16 +1,20 @@
 # `engine.llm_generations` — one row per LLM generation — Design
 
 - **Date:** 2026-08-24
-- **Status:** Release A **released** as 1.6.1 and **not yet deployed** —
-  production runs 1.6.0. Release B not started. The two words are not
-  interchangeable here: §7.3's whole argument for validated foreign keys
-  rests on the code *serving traffic* already writing parent rows, which a
-  git tag does not establish. §7.0 is the check that does.
+- **Status:** Release A **deployed** — 1.6.1 reached production 2026-08-24
+  18:08 CST, and §7.0's precondition now passes. 1.6.2 is released (§4.5, the
+  timeout unification) and not yet deployed. B1 and B2 not started.
+  "Released" and "deployed" are not interchangeable anywhere in this document:
+  §7.3's argument for validated foreign keys rests on the code *serving
+  traffic* already writing parent rows, and a git tag does not establish that.
 - **Type:** New parent table + write-path change at every LLM call site;
   then foreign keys, a backfill, and column drops on eight live tables
 - **Owner:** enriquephl (sole dev)
-- **Target:** Release A ships in `eros-engine` 1.6.1. **Two PRs and two
-  separate releases** (§8 is a hard constraint, not a preference)
+- **Target:** **Three releases, not two.** Release A shipped in 1.6.1;
+  B1 and B2 follow, each after its predecessor's rollout completes. §8 is a
+  hard constraint in both directions, not a preference — the split between
+  B1 and B2 exists because the original two-release plan would have broken
+  production (§7 preamble).
 - **Depends on:** migrations through `0058`. Production is on `0054`, so
   `0055`–`0058` ship alongside Release A.
 
@@ -467,9 +471,38 @@ Two numbers to watch once Release A is deployed, both already emitted:
   either produces;
 - pool `acquire_timeout` errors.
 
-## 7. Release B — migration `0060_llm_generation_fks.sql`
+## 7. Release B — and why it is two releases, not one
 
-One file, one transaction, in this order.
+Release B was specified as one migration doing four things: backfill, index,
+constrain, and drop the now-redundant child columns. **The drop cannot ship
+with the other three.** It is the same deploy-order hazard §8 describes,
+pointing the other way, and the original §8 only covered one direction.
+
+Every child INSERT in `eros-engine-store` names `model` and `usage`
+explicitly — `character_insight.rs`, `affinity.rs`, `decision.rs`,
+`image_events.rs` (twice), `insight.rs` (twice), `user_insight.rs` (twice).
+`release_command = "migrate"` runs **before** traffic moves. Drop those columns
+and, for the length of the rollout, every machine still serving traffic issues
+`INSERT ... (model, usage, ...)` against columns that no longer exist. For
+`chat_messages` that is a user's reply failing to persist — the exact outcome
+§8 exists to prevent.
+
+So the work splits by which side of the rollout each half is safe on:
+
+| | contents | why its migration is safe when it runs |
+|---|---|---|
+| **B1** | code stops writing `model` / `usage` to the eight child tables (reads move to a join); migration `0060`: backfill, eight indexes, eight validated foreign keys | the build serving traffic is Release A, which already writes parent rows (§7.0) |
+| **B2** | migration `0061`: `DROP` the redundant columns | the build serving traffic is B1, which no longer writes them |
+
+The foreign keys ride in B1 rather than B2 because they are already safe there
+— gating them behind the drop would delay the guarantee for no reason.
+
+**B2 has its own precondition, symmetric to §7.0:** do not run `0061` until B1
+is deployed. There is no equivalent one-query check, because the evidence is an
+absence — the running code no longer writing two columns. Check
+`fly image show -a eros-engine` shows B1's version on **every** machine, and
+that no INSERT in `eros-engine-store` still names `model` or `usage` on those
+tables.
 
 ### 7.0 Precondition — Release A must be *deployed*, and this is how you check
 
@@ -492,14 +525,18 @@ If the query returns false, every foreign key in this migration is a live
 failure mode: the running code writes `generation_id` into child rows with no
 parent, and for `chat_messages` that is a user's reply failing to persist.
 
-### 7.1 Backfill
+### 7.1 Backfill (B1)
 
-Roughly 55,000 historical rows across the eight tables (production, measured
-2026-08-24) — **a moving figure, not a fixed one.** The same measurement put
-the eight tables at ~2,700 new generations a day, so the backfill grows by
-that much for every day Release B waits. Re-measure before writing the
-migration; nothing in the design depends on the number, but the runtime
-estimate in §7.3 does.
+**56,675** child references need a parent row, out of 57,142 total (production,
+measured 2026-08-24 19:30 CST, shortly after 1.6.1 was deployed; the 467
+difference is what 1.6.1 has already written). **A moving figure** — the same
+tables take ~2,700 new generations a day, so the backfill grows by that much
+for every day B1 waits. Re-measure before writing the migration; nothing in the
+design depends on the number, but the runtime estimate in §7.3 does.
+
+**All 57,142 references are distinct.** No `generation_id` appears in two source
+tables, so the `ON CONFLICT` tiebreak below never actually fires — it stays as a
+guard, not as a policy anyone has to reason about.
 
 Each source contributes `DISTINCT ON (generation_id)` with a literal `task`:
 
@@ -509,7 +546,7 @@ Each source contributes `DISTINCT ON (generation_id)` with a literal `task`:
 | `chat_messages` `channel = 'voice'` | `chat_voice` |
 | `chat_messages` `channel = 'product_qa'` | `chat_product_qa` |
 | `chat_messages.f_generation_id` | `chat_output_filter` |
-| `companion_affinity_events` | `affinity_evaluation` |
+| `companion_affinity_events` (see below — no `session_id`) | `affinity_evaluation` |
 | `companion_insights_events` `stage = 'facts'` / `'structured'` | `insight_extraction` / `insight_structuring` |
 | `companion_decision_events` | `pde_decision` |
 | `chat_images_events` `source = 'image_edit'` | `chat_image_edit_compose` |
@@ -521,6 +558,19 @@ Each source contributes `DISTINCT ON (generation_id)` with a literal `task`:
 Timestamps come from `sent_at` (`chat_messages`) or `created_at` (all others),
 so backfilled rows keep their real position in time.
 
+**`companion_affinity_events` has no `session_id` column.** It carries
+`affinity_id` and a nullable `user_message_id`, and nothing else that reaches a
+session. Its only route is `user_message_id → chat_messages.session_id`, and
+that route is mostly empty: of its 8,119 rows carrying a `generation_id`, **211
+have a `user_message_id`** (2.6%), all of which resolve. So this source
+contributes 211 rows with a session and 7,908 with `NULL`.
+
+That is not a defect to fix in the backfill. `session_id` is nullable precisely
+because some generations have no conversation to attribute to, and an affinity
+evaluation predating the `user_message_id` column has no surviving link to one.
+Inventing it — by joining on timestamps, or on the affinity row's own owner —
+would put a guess in a column whose whole value is that it is not one.
+
 **Every `session_id` goes through `LEFT JOIN engine.chat_sessions` and lands as
 `NULL` when it does not resolve.** Migration 0058 recorded that
 `chat_images_events`, `companion_insights_events` and `companion_decision_events`
@@ -528,11 +578,14 @@ carry dangling session ids and deliberately left them dangling. Copying one into
 `llm_generations.session_id` would violate this table's own — validated —
 foreign key and abort the migration, taking the engine's boot with it.
 
-Every insert carries `ON CONFLICT (generation_id) DO NOTHING`. Where the same
-id appears in two source tables the first writer wins; the ordering above is
-the tiebreak and no such collision is expected.
+Measured 2026-08-24, this is load-bearing rather than defensive: **26** distinct
+dangling session ids in `companion_insights_events`, **24** in
+`companion_decision_events`, **2** in `chat_images_events`. Drop the `LEFT JOIN`
+and the migration aborts.
 
-### 7.2 Indexes, then constraints
+Every insert carries `ON CONFLICT (generation_id) DO NOTHING`.
+
+### 7.2 Indexes, then constraints (B1)
 
 An index on each of the eight `generation_id` columns — none has one today, and
 an unindexed child column makes the parent's `ON DELETE` seq-scan it.
@@ -547,7 +600,7 @@ is written by a separate `UPDATE` path (`mark_filtered`) that would need its own
 degrade branch, and production has exactly **one** non-null value in it. The
 constraint would buy nothing and add a second failure mode to the filter path.
 
-### 7.3 Validated, not `NOT VALID`
+### 7.3 Validated, not `NOT VALID` (B1)
 
 These constraints are added **validated**, reversing migration 0058's blanket
 rule. The difference is where the orphans could come from:
@@ -564,10 +617,10 @@ rule. The difference is where the orphans could come from:
   migration is Release A, which already writes parents. There is no source of
   an orphan.
 
-55,000 rows scan in milliseconds. Taking the retrospective guarantee here is
+57,000 rows scan in milliseconds. Taking the retrospective guarantee here is
 free; skipping it would leave a permanent "someday" on the table.
 
-### 7.4 Drop the redundant columns
+### 7.4 Drop the redundant columns — migration `0061` (B2)
 
 `model` and `usage` come off all eight child tables. The same generation's
 model and usage now live in exactly one place, reached by a join on
@@ -580,8 +633,21 @@ Verified before writing this spec: `eros-engine-web` reads none of these
 columns (`SELECT` on `engine.chat_messages` was revoked from `service_role` in
 its migration `018`, and no web RPC references `model` or `usage` on any
 `engine.*` table), and no engine read path outside test assertions selects
-them. The work is deleting `.bind()` calls and rewriting the tests that assert
-on them.
+them.
+
+**The code change belongs to B1; only the `DROP` is B2.** Every child INSERT
+in `eros-engine-store` names both columns explicitly —
+`character_insight.rs`, `affinity.rs`, `decision.rs`, `image_events.rs`
+(twice), `insight.rs` (twice), `user_insight.rs` (twice). B1 removes those
+column names and their `.bind()` calls and rewrites the tests that assert on
+them; B2's migration then drops columns nothing writes. Doing both in one
+release means the machines serving traffic during `release_command = "migrate"`
+INSERT into columns that no longer exist (§7 preamble, §8).
+
+Between the two releases the columns exist and hold `NULL` for anything B1
+wrote. That is the intended intermediate state, not a defect to paper over:
+the same generation's model and usage are already in the parent table, reached
+by a join.
 
 **Known property, not a Release-B surprise: `llm_generations.model` is
 heterogeneous across tasks.** The two `chat_companion` streaming arms
@@ -595,15 +661,22 @@ tasks needs to know the two are not the same kind of value.
 
 ### 7.5 Documentation
 
-`docs/llm-audit.md` and `docs/llm-audit.zh.md` describe the current split
-("background paths emit usage only as tracing fields") and must be rewritten
-around the new table. `docs/architecture.md` gains the table. Scan
-`docs/api-reference.md` for any response field sourced from a dropped column.
+Release A already rewrote `docs/llm-audit.md` / `.zh.md` around the new table
+and added it to `docs/architecture.md`, and 1.6.2 deleted the "Two known
+limits" entry that §4.5 closed. What is left is column-specific and splits the
+same way the code does:
 
-`docs/llm-audit.md` and `.zh.md` carry a **"Two known limits"** section whose
-second limit is exactly the §4.5 gap. That limit is deleted by this PR, not
-edited — the remaining one (a fallback chain writing several rows for one
-turn) stays and stops being a pair.
+- **B1** — those two docs describe the eight child `model` / `usage` columns as
+  a later-release item. B1 makes them stop being written, so the wording moves
+  from "will be dropped" to "no longer written; dropped in the next release,
+  read through the join". Both languages.
+- **B2** — the columns are gone; every reference to them becomes the join, and
+  the "later-release item" framing disappears entirely.
+
+Scan `docs/api-reference.md` in B1 for any response field sourced from one of
+the dropped columns. Nothing is expected — §7.4 verified no read path outside
+test assertions selects them — but the scan is cheap and the failure mode is a
+documented API field that silently starts returning `NULL`.
 
 ### 7.6 Retention — none, and the numbers that would change that
 
@@ -657,21 +730,39 @@ parents that happen to have no children, and it contradicts the repo's own
 rule that a nullable reference column takes `SET NULL`. A future retention
 decision can `ALTER` the constraint; nothing here forecloses it.
 
-## 8. Deploy order is a hard constraint
-
-**Release A must be fully rolled out before Release B's migration runs.**
+## 8. Deploy order is a hard constraint, in both directions
 
 `infra/engine/fly.toml` sets `release_command = "migrate"`, which Fly runs
-**before** traffic moves to the new machines. The moment Release B's foreign
-keys exist, the machines still serving traffic are running Release A — or, if
-the two were merged into one release, the *previous* build, which writes
-`generation_id` into child rows without ever writing a parent. Every such
-insert would violate the constraint, and for `chat_messages` that is a user's
-reply failing to persist.
+**before** traffic moves to the new machines. For the length of every rollout,
+therefore, **the previous build's code runs against the new build's schema.**
+That single fact generates two separate constraints, and this design tripped
+over one of each.
 
-Merging the two PRs into one release breaks production. They are separate
-releases with a completed rollout in between, and PR 2 does not open until
-Release A is live.
+**A schema change that adds a requirement must ship AFTER the code that
+satisfies it.** Release B's foreign keys require every child `generation_id` to
+have a parent row. If they shipped with Release A's write path in one release,
+the machines still serving traffic during the migration would be the build
+*before* Release A — writing `generation_id` into child rows with no parent.
+Every such insert violates the constraint, and for `chat_messages` that is a
+user's reply failing to persist. Hence A, then B.
+
+**A schema change that removes something must ship AFTER the code that stopped
+using it.** B2 drops `model` and `usage` from the eight child tables, but every
+child INSERT in `eros-engine-store` names those columns. If the drop shipped
+with the code that stops naming them, the machines still serving traffic during
+the migration would issue `INSERT ... (model, usage, ...)` against columns that
+no longer exist — the same user-visible failure, from the opposite cause. Hence
+B1, then B2.
+
+The general rule, which is what to check against any future migration here:
+**during a rollout the old code must be correct against the new schema.**
+Additive-and-permissive changes satisfy it for free. Anything that constrains
+or removes needs a release boundary, and which side it goes on depends on
+whether the code has to start doing something or stop doing it.
+
+Three releases, each with a completed rollout in between. No PR opens until its
+predecessor is live — verified for B1 by §7.0's query, and for B2 by §7's
+preamble.
 
 ## 9. Testing
 
@@ -712,10 +803,24 @@ Assert the abandoned generation has a row while the persisted message's
 phrase is not attributed to a real generation, and the move must not undo
 that.
 
-**Migration 0060** — a sqlx test that migrates to `0059`, inserts child rows
-including one with a dangling `session_id`, runs `0060`, and asserts: parent
-rows exist with the right `task`, the dangling one landed as `NULL`, the
-constraints are `convalidated`, and the dropped columns are gone.
+**Migration 0060 (B1)** — a sqlx test that migrates to `0059`, inserts child
+rows across several source tables including one with a dangling `session_id`
+and one `companion_affinity_events` row with a `NULL` `user_message_id`, runs
+`0060`, and asserts: parent rows exist with the right `task`, the dangling
+session landed as `NULL`, the affinity row without a `user_message_id` landed
+as `NULL` while one with a resolvable id kept its session, and the constraints
+report `convalidated`.
+
+**Migration 0061 (B2)** — migrates through `0060`, runs `0061`, asserts the
+dropped columns are gone. Kept separate from the `0060` test because they ship
+in different releases and a combined test would pass on a tree that cannot be
+deployed.
+
+**The B1 write path** — for each of the eight child tables, insert through the
+repo and assert the row's `model` and `usage` columns are `NULL` while the
+parent row carries both. This is the assertion that makes B2's `DROP` safe, and
+it is the one a reviewer is most likely to consider redundant: the columns
+still exist in B1, so nothing visibly breaks without it.
 
 ## 10. Out of scope
 
