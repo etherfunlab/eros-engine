@@ -1,9 +1,9 @@
 # `engine.llm_generations` — one row per LLM generation — Design
 
 - **Date:** 2026-08-24
-- **Status:** Release A **deployed** — 1.6.1 reached production 2026-08-24
-  18:08 CST, and §7.0's precondition now passes. 1.6.2 is released (§4.5, the
-  timeout unification) and not yet deployed. B1 and B2 not started.
+- **Status:** Release A **deployed**, and 1.6.2 (§4.5's drains and moves, the
+  timeout unification) **deployed** on 2026-08-25. §7.0's precondition passes.
+  B1 and B2 not started.
   "Released" and "deployed" are not interchangeable anywhere in this document:
   §7.3's argument for validated foreign keys rests on the code *serving
   traffic* already writing parent rows, and a git tag does not establish that.
@@ -483,9 +483,30 @@ constrain, and drop the now-redundant child columns. **The drop cannot ship
 with the other three.** It is the same deploy-order hazard §8 describes,
 pointing the other way, and the original §8 only covered one direction.
 
-Every child INSERT in `eros-engine-store` names `model` and `usage`
-explicitly — `character_insight.rs`, `affinity.rs`, `decision.rs`,
-`image_events.rs` (twice), `insight.rs` (twice), `user_insight.rs` (twice).
+**Ten** production INSERT statements in `eros-engine-store` name `model` and
+`usage` explicitly, across eight tables — `chat_messages` three times, every
+other table once. This list is what B1 works from and what B2's safety rests
+on; a missed site is a column dropped out from under a live write:
+
+| statement | table |
+|---|---|
+| `chat.rs:984` | `chat_messages` (companion) |
+| `chat.rs:1159` | `chat_messages` (voice) |
+| `chat.rs:1225` | `chat_messages` (product-QA) |
+| `affinity.rs:585` | `companion_affinity_events` |
+| `insight.rs:31` | `companion_insights_events` |
+| `decision.rs:40` | `companion_decision_events` |
+| `image_events.rs:79` | `chat_images_events` |
+| `image_events.rs:159` | `chat_vision_events` |
+| `character_insight.rs:238` | `character_insights_events` |
+| `user_insight.rs:224` | `user_insights_events` |
+
+Line numbers as of `03db5af`; the anchor is the statement, not the line. Two
+`chat_messages` INSERTs and the `'ghost'` affinity INSERT (`affinity.rs:661`)
+name neither column and need no change — verified rather than assumed, because
+"every INSERT into these tables" and "every INSERT that names these columns"
+are different sets and only the second one is the work.
+
 `release_command = "migrate"` runs **before** traffic moves. Drop those columns
 and, for the length of the rollout, every machine still serving traffic issues
 `INSERT ... (model, usage, ...)` against columns that no longer exist. For
@@ -532,14 +553,15 @@ parent, and for `chat_messages` that is a user's reply failing to persist.
 
 ### 7.1 Backfill (B1)
 
-**56,675** child references need a parent row, out of 57,142 total (production,
-measured 2026-08-24 19:30 CST, shortly after 1.6.1 was deployed; the 467
-difference is what 1.6.1 has already written). **A moving figure** — the same
-tables take ~2,700 new generations a day, so the backfill grows by that much
-for every day B1 waits. Re-measure before writing the migration; nothing in the
-design depends on the number, but the runtime estimate in §7.3 does.
+**56,636** child references need a parent row, out of 59,112 total (production,
+measured 2026-08-25, with 1.6.2 serving traffic; the 2,476 difference is what
+1.6.1 and 1.6.2 have already written). **A moving figure** — the same tables
+take ~2,700 new generations a day, so the backlog shrinks only as fast as old
+rows are deleted while the parent-covered share grows. Re-measure before
+writing the migration; nothing in the design depends on the number, but the
+runtime estimate in §7.3 does.
 
-**All 57,142 references are distinct.** No `generation_id` appears in two source
+**All 59,112 references are distinct.** No `generation_id` appears in two source
 tables, so the `ON CONFLICT` tiebreak below never actually fires — it stays as a
 guard, not as a policy anyone has to reason about.
 
@@ -601,7 +623,7 @@ dangling session ids in `companion_insights_events`, **24** in
 and the migration aborts.
 
 Every insert carries `ON CONFLICT (generation_id) DO NOTHING`, which is what
-absorbs the rows 1.6.1 has already written — 474 of them at the time of
+absorbs the rows 1.6.1 and 1.6.2 have already written — 2,476 at the time of
 measurement, growing until B1 ships.
 
 **Give every `DISTINCT ON (generation_id)` an explicit `ORDER BY generation_id,
@@ -707,8 +729,22 @@ free; skipping it would leave a permanent "someday" on the table.
 model and usage now live in exactly one place, reached by a join on
 `generation_id`.
 
-`chat_messages.filter_model` goes too: it is the model of the
-`f_generation_id` generation, which is in the parent table.
+**`chat_messages.filter_model` stays.** An earlier draft of this section had
+it dropped alongside the rest, on the reading that it is the model of the
+`f_generation_id` generation and therefore already in the parent table. It is
+not. Measured 2026-08-25, the column holds two kinds of value:
+
+| `filter_model` | rows | with `f_generation_id` |
+|---|---|---|
+| `<regex>` | 2,024 | **0** |
+| an actual model slug | 1 | 1 |
+
+The dominant value is a sentinel written by the regex arm of the output filter
+(`stream.rs`), which performs no generation at all — there is no parent row for
+it to join to, and none should exist. Dropping the column would erase "the
+regex filter fired here" from 2,024 rows in exchange for de-duplicating one.
+The column is a discriminator that happens to be spelled like a model name,
+not a redundant copy. It keeps its writes in B1 and survives B2.
 
 Verified before writing this spec: `eros-engine-web` reads none of these
 columns (`SELECT` on `engine.chat_messages` was revoked from `service_role` in
@@ -717,9 +753,8 @@ its migration `018`, and no web RPC references `model` or `usage` on any
 them.
 
 **The code change belongs to B1; only the `DROP` is B2.** Every child INSERT
-in `eros-engine-store` names both columns explicitly —
-`character_insight.rs`, `affinity.rs`, `decision.rs`, `image_events.rs`
-(twice), `insight.rs` (twice), `user_insight.rs` (twice). B1 removes those
+that names both columns is enumerated in the §7 preamble — ten statements,
+three of them in `chat.rs`. B1 removes those
 column names and their `.bind()` calls and rewrites the tests that assert on
 them; B2's migration then drops columns nothing writes. Doing both in one
 release means the machines serving traffic during `release_command = "migrate"`
