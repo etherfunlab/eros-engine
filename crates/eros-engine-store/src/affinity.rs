@@ -2368,11 +2368,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(generation_id.as_deref(), Some("gen-aff"));
-        // `seed_generation` writes the parent with task='test' and no model or
-        // usage; what this pins is that the join reaches it at all, which is
-        // the whole mechanism B2 leaves behind.
-        assert_eq!(model, None);
-        assert_eq!(usage, None);
+        // Through the join, not off the row: these are what `seed_generation`
+        // put in the PARENT. Break the join and both come back NULL.
+        assert_eq!(model.as_deref(), Some(crate::testutil::SEEDED_MODEL));
+        assert_eq!(usage, Some(crate::testutil::seeded_usage()));
     }
 
     #[sqlx::test(migrations = "./migrations")]

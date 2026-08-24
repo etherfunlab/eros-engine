@@ -772,9 +772,9 @@ mod tests {
         assert_eq!(rows[0].0, "extraction");
         assert_eq!(rows[0].1, "ok");
         assert_eq!(rows[0].2.as_deref(), Some("gen-x"));
-        // Since B1 usage comes from the parent row, which `seed_generation`
-        // writes without one. The join reaching it is the point.
-        assert_eq!(rows[0].4, None);
+        // Through the join: this is the PARENT's usage. Break the join and it
+        // comes back NULL.
+        assert_eq!(rows[0].4, Some(crate::testutil::seeded_usage()));
         assert_eq!(rows[1].0, "structuring");
         assert_eq!(rows[1].1, "parse_error");
         // The refusal text survives instead of the human chain's NULL.

@@ -119,9 +119,9 @@ mod tests {
             rows[0].3,
             Some(serde_json::json!({"facts": ["用户在深圳工作"], "details": []}))
         );
-        // Since B1 usage comes from the parent row, which `seed_generation`
-        // writes without one. The join reaching it is what this pins.
-        assert_eq!(rows[0].4, None);
+        // Through the join: this is the PARENT's usage. Break the join and it
+        // comes back NULL.
+        assert_eq!(rows[0].4, Some(crate::testutil::seeded_usage()));
         assert_eq!(rows[1].0, "structured");
         assert_eq!(rows[1].1, "parse_error");
         assert_eq!(rows[1].2, None); // default meta ⇒ NULL generation_id

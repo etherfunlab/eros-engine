@@ -481,9 +481,9 @@ mod tests {
             payload,
             Some(serde_json::json!({"location": "深圳南山", "_existing_keys": []}))
         );
-        // Since B1 usage comes from the parent row, which `seed_generation`
-        // writes without one. The join reaching it is what this pins.
-        assert_eq!(usage, None);
+        // Through the join: this is the PARENT's usage. Break the join and it
+        // comes back NULL.
+        assert_eq!(usage, Some(crate::testutil::seeded_usage()));
     }
 
     #[test]

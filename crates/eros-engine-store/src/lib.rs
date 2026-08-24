@@ -113,6 +113,14 @@ pub(crate) mod testutil {
         .unwrap()
     }
 
+    /// The `model` every `seed_generation` parent carries.
+    pub(crate) const SEEDED_MODEL: &str = "seeded/model";
+
+    /// The `usage` block every `seed_generation` parent carries.
+    pub(crate) fn seeded_usage() -> serde_json::Value {
+        serde_json::json!({ "total_tokens": 7 })
+    }
+
     /// Persist one `engine.llm_generations` parent so a test may put `id` in a
     /// child row's `generation_id`. Since 0060 all eight of those columns carry
     /// a VALIDATED foreign key, so a fabricated id no longer inserts — same
@@ -123,14 +131,22 @@ pub(crate) mod testutil {
     /// and a test that needed a REAL task value would be testing the backfill,
     /// which `migration_0060_backfill_assigns_the_right_task_and_session` owns.
     ///
+    /// `model` and `usage` are non-NULL for a reason: since B1 the child rows
+    /// no longer carry them, so tests that used to assert on a child column now
+    /// assert through a join to here. Seeding NULLs would let those tests pass
+    /// just as happily with the join deleted — `SEEDED_MODEL` / `seeded_usage`
+    /// are what gives them something only a working join can return.
+    ///
     /// `ON CONFLICT DO NOTHING` so a test may seed the same id twice — several
     /// exercise a replay or a double-write race on one generation.
     pub(crate) async fn seed_generation(pool: &PgPool, id: &str) {
         sqlx::query(
-            "INSERT INTO engine.llm_generations (generation_id, task) \
-             VALUES ($1, 'test') ON CONFLICT (generation_id) DO NOTHING",
+            "INSERT INTO engine.llm_generations (generation_id, task, model, usage) \
+             VALUES ($1, 'test', $2, $3) ON CONFLICT (generation_id) DO NOTHING",
         )
         .bind(id)
+        .bind(SEEDED_MODEL)
+        .bind(seeded_usage())
         .execute(pool)
         .await
         .expect("seed llm_generations parent");

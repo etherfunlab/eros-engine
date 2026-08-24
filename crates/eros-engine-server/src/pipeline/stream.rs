@@ -4511,6 +4511,11 @@ pub fn run_stream(
                             // `last_usage` still resets even though the row no
                             // longer stores usage: it feeds the wire `Done`
                             // frame, which must not report a phantom spend.
+                            // `served_model` does NOT need resetting and no
+                            // longer is: its last read is the
+                            // `record_generation` call above this block, and
+                            // the `Done` frame carries no model. Resetting it
+                            // here would be dead.
                             last_usage = None;
                             last_gen_id = None;
                             yield ProtocolFrame::Delta {
